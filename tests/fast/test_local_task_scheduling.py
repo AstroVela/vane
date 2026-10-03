@@ -287,3 +287,202 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
         connection.close()
         runtime.close(kill=True)
     assert runtime.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
+
+def test_heap_progress_grant_bypasses_blocked_producer_in_the_same_pool():
+    capacity = LocalExecutionCapacity(max_slots=None, resource_limit=ResourceVector(cpu=2, heap_bytes=100))
+    progress = capacity.reserve_task_progress(
+        {"upstream": ResourceVector(cpu=1, heap_bytes=40), "downstream": ResourceVector(cpu=1, heap_bytes=40)}
+    )
+    pool = _pool(capacity, "shared", heap=40)
+    blocker = _pool(capacity, "cpu", heap=0)
+    upstream = _take(pool.create_task_authority(progress.bind("upstream")))
+    cpu = _take(blocker.create_authority())
+    second = pool.create_task_authority(progress.bind("upstream"))
+    downstream = pool.create_task_authority(progress.bind("downstream"))
+    consumer = None
+    try:
+        second.request(0)
+        downstream.request(0)
+        assert second.state()["state"] == downstream.state()["state"] == "requested"
+        cpu.release()
+        assert second.state()["state"] == "requested"
+        assert downstream.state()["state"] == "ready"
+        consumer = downstream.take(0)
+        assert capacity.resource_snapshot()["usage"]["heap_bytes"] == 80
+        consumer.complete_execution()
+        assert second.state()["state"] == "requested"
+        upstream.complete_execution()
+        assert second.state()["state"] == "ready"
+        second.close()
+        assert capacity.resource_snapshot()["task_progress"]["protected_heap_bytes"] == 80
+    finally:
+        if consumer is not None:
+            consumer.release()
+        cpu.release()
+        upstream.release()
+        pool.close()
+        blocker.close()
+        progress.shutdown()
+        progress.shutdown()
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+    assert capacity.resource_snapshot()["task_progress"]["queries"] == 0
+
+
+def test_prepared_tasks_protect_cpu_from_later_resident_startup():
+    from vane.execution.udf_local_resources import LocalProcessCapacityError
+
+    capacity = LocalExecutionCapacity(max_slots=None, resource_limit=ResourceVector(cpu=1, heap_bytes=100))
+    progress = capacity.reserve_task_progress({"task": ResourceVector(cpu=1, heap_bytes=40)})
+    with pytest.raises(LocalProcessCapacityError, match="node CPU/heap resource capacity"):
+        capacity.reserve_resident(ResourceVector(cpu=1))
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+    progress.shutdown()
+    release = capacity.reserve_resident(ResourceVector(cpu=1))
+    release()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("entrypoint", ["runtime", "native"])
+@pytest.mark.parametrize(
+    "scenario", ["resident_fits", "resident_exhausts_cpu", "heap_unreserved", "heap_reserved", "heap_impossible"]
+)
+def test_small_transport_pipeline_completes_or_rejects_before_execution(monkeypatch, entrypoint, scenario):
+    import gc
+    import uuid
+
+    import pyarrow as pa
+
+    import vane
+    from vane.execution import ref_bundle, udf_subprocess
+    from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.udf_local_model import LocalModelRuntime
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    udf_subprocess._shutdown_global_task_runtime()
+    resident = scenario.startswith("resident")
+    node_cpus = 1 if scenario == "resident_exhausts_cpu" else 2
+    tasks = udf_subprocess._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=node_cpus, heap_bytes=1024**3)
+    )
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+
+    def expand(table):
+        return pa.table({"blob": [b"x" * 65_536 for _ in range(table.num_rows)]})
+
+    def consume(table):
+        return pa.table({"size": [len(value.as_py()) for value in table.column(0)]})
+
+    class Consume:
+        def __call__(self, table):
+            return consume(table)
+
+    heap = (
+        (400 if scenario == "heap_reserved" else 600) * 1024**2
+        if scenario in {"heap_reserved", "heap_impossible"}
+        else None
+    )
+    impossible = scenario in {"resident_exhausts_cpu", "heap_impossible"}
+    try:
+        with vane.connect(config={"threads": 1}) as connection:
+            relation = (
+                connection.sql("SELECT unnest([0,1,2,3])::BIGINT AS x")
+                .map_batches(
+                    expand,
+                    schema={"blob": vane.sqltypes.BLOB},
+                    execution_backend="subprocess_task",
+                    batch_size=1,
+                    min_task_batch_size=1,
+                    task_input_max_bytes=8,
+                    memory_bytes=heap,
+                )
+                .map_batches(
+                    Consume if resident else consume,
+                    schema={"size": vane.sqltypes.BIGINT},
+                    execution_backend="subprocess_actor" if resident else "subprocess_task",
+                    actor_number=1 if resident else None,
+                    batch_size=1,
+                    min_task_batch_size=1,
+                    task_input_max_bytes=70_000,
+                    memory_bytes=heap,
+                )
+            )
+            if entrypoint == "native":
+                if impossible:
+                    with pytest.raises(vane.Error, match="actor residency and task progress"):
+                        relation.fetchall()
+                else:
+                    for _ in range(2):
+                        assert relation.fetchall() == [(65_536,)] * 4
+            else:
+                plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                    connection
+                )
+                with LocalModelRuntime(
+                    session_id=plan.session_id(),
+                    session_config=plan.session_config(),
+                    request_limit=RequestAdmissionLimits(1, 1),
+                    track_graph=True,
+                ) as runtime:
+                    if impossible:
+                        with pytest.raises(ValueError, match="actor residency and task progress"):
+                            runtime.request().execute(plan, {}, conn=connection, execution_timeout=15)
+                    else:
+                        result = runtime.request().execute(plan, {}, conn=connection, execution_timeout=15)
+                        assert [
+                            value for table in result.partition_payloads for value in table.column(0).to_pylist()
+                        ] == [65_536] * 4
+                        del result
+            if impossible:
+                assert tasks.stats()["total_workers"] == 0
+    finally:
+        tasks.close(kill=True)
+        gc.collect()
+        snapshot = tasks.execution_capacity.resource_snapshot()
+        assert snapshot["usage"] == ResourceVector().to_dict()
+        assert snapshot["task_progress"]["queries"] == 0
+        assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_model_prewarm_retries_after_another_runtime_returns_node_capacity(monkeypatch):
+    from vane import pickle as vane_pickle
+    from vane.execution import udf_subprocess
+    from vane.execution.udf_local_model import LocalModelRuntime
+    from vane.execution.udf_local_resources import LocalProcessCapacityError
+
+    udf_subprocess._shutdown_global_task_runtime()
+    tasks = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = {
+        "function_pickle": vane_pickle.dumps(Identity),
+        "call_mode": "map_batches",
+        "execution_backend": "subprocess_actor",
+        "actor_number": 1,
+        "cpus": 1,
+    }
+    first = LocalModelRuntime(session_id="first", session_config={})
+    second = LocalModelRuntime(session_id="second", session_config={})
+    try:
+        first_model = first.register("identity", version="1", payload=payload)
+        second_model = second.register("identity", version="1", payload=payload)
+        first_model.prewarm()
+        for _ in range(2):
+            with pytest.raises(LocalProcessCapacityError, match="node CPU/heap resource capacity"):
+                second_model.prewarm()
+        first.close()
+        assert tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+        second_model.prewarm()
+        with second_model.acquire() as borrow:
+            assert len(borrow.pool.worker_pids()) == 1
+    finally:
+        first.close(kill=True)
+        second.close(kill=True)
+        tasks.close(kill=True)
+    assert tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()

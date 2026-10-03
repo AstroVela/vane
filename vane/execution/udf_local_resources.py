@@ -13,6 +13,10 @@ import psutil
 from vane.execution.resources import ResourceVector
 
 
+class LocalProcessCapacityError(ValueError):
+    """Node capacity is temporarily owned; no worker construction was attempted."""
+
+
 def local_process_capacity() -> ResourceVector:
     cpus = max(1, os.cpu_count() or 1)
     if hasattr(os, "sched_getaffinity"):

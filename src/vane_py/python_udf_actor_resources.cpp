@@ -318,9 +318,10 @@ public:
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
 		if (prepared_statements.find(&info.prepared_statement) == prepared_statements.end() &&
-		    HasLocalActorUDF(info.prepared_statement)) {
+		    HasLocalSubprocessUDF(info.prepared_statement)) {
 			// Cached plans retain their bind data, including handles of pools
-			// closed at the previous QueryEnd. Rebind before a new execution.
+			// closed at the previous QueryEnd, including task progress bindings.
+			// Rebind before a new execution.
 			return RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		PrepareOnce(context, info.prepared_statement);
@@ -330,7 +331,7 @@ public:
 	RebindQueryInfo OnRebindPreparedStatement(ClientContext &, BindPreparedStatementCallbackInfo &info,
 	                                          RebindQueryInfo current_rebind) override {
 		if (Enabled() && current_rebind != RebindQueryInfo::ATTEMPT_TO_REBIND &&
-		    HasLocalActorUDF(info.prepared_statement)) {
+		    HasLocalSubprocessUDF(info.prepared_statement)) {
 			return RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		return RebindQueryInfo::DO_NOT_REBIND;
@@ -382,7 +383,7 @@ public:
 	}
 
 private:
-	static bool HasLocalActorUDF(PreparedStatementData &prepared) {
+	static bool HasLocalSubprocessUDF(PreparedStatementData &prepared) {
 		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
 			return false;
 		}
@@ -390,7 +391,8 @@ private:
 		CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), bind_nodes);
 		for (auto *bind_data : bind_nodes) {
 			string backend;
-			if (PayloadStringField(bind_data->payload, "execution_backend", backend) && backend == "subprocess_actor") {
+			if (PayloadStringField(bind_data->payload, "execution_backend", backend) &&
+			    (backend == "subprocess_actor" || backend == "subprocess_task")) {
 				return true;
 			}
 		}
@@ -479,7 +481,7 @@ private:
 			if (!PayloadStringField(bind_data->payload, "execution_backend", backend)) {
 				continue;
 			}
-			if (backend == "subprocess_actor") {
+			if (backend == "subprocess_actor" || backend == "subprocess_task") {
 				subprocess_nodes.append(BuildUDFNode(node_id, *bind_data, context));
 			} else if (backend == "ray_actor" && !bind_data->actor_handles) {
 				throw InvalidInputException("ray_actor UDF execution requires driver-precreated actor handles from a "

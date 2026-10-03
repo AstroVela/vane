@@ -28,6 +28,7 @@ from vane.execution.udf_actor_pool_lifecycle import (
     actor_pool_cleanup_pending,
     rollback_actor_pools,
 )
+from vane.execution.udf_admission import LocalTaskProgress
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
@@ -269,6 +270,7 @@ class LocalModelRuntime:
     ) -> list[
         LocalSubprocessActorPool
         | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
         | QueryTaskAdmission
         | QueryDataScope
         | QueryInputCleanup
@@ -311,6 +313,7 @@ class LocalModelRuntime:
     ) -> list[
         LocalSubprocessActorPool
         | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
         | QueryTaskAdmission
         | QueryDataScope
         | QueryInputCleanup
@@ -369,6 +372,8 @@ class LocalModelRuntime:
                 raise ValueError("UDF node already has a local resource graph binding")
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
+            if "local_task_progress" in options:
+                raise ValueError("UDF node already has a task progress binding")
             if "local_data_scope" in options:
                 raise ValueError("UDF node already has a query data binding")
             if "local_input_cleanup" in options:
@@ -490,8 +495,9 @@ class LocalModelRuntime:
                 ) from cleanup_errors[0]
             raise
         return [
-            *resources,
+            *[owner for owner in resources if not isinstance(owner, LocalTaskProgress)],
             *[owner for owner in (query, data_query, input_query, executor_query, graph_scope) if owner is not None],
+            *[owner for owner in resources if isinstance(owner, LocalTaskProgress)],
         ]
 
     def prewarm(self, name: str) -> None:

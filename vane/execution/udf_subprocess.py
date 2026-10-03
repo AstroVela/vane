@@ -77,6 +77,8 @@ from vane.execution.udf_admission import (
     LocalExecutionCapacity,
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
+    LocalTaskProgress,
+    LocalTaskProgressBinding,
 )
 from vane.execution.udf_data_admission import DataAdmissionAuthority
 from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
@@ -1855,8 +1857,10 @@ class _TaskWorkerPool:
             resources=self.resources,
         )
 
-    def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
-        return self.admission_slots.create_authority()
+    def create_admission_authority(
+        self, progress: LocalTaskProgressBinding | None = None
+    ) -> LocalSlotAdmissionAuthority:
+        return self.admission_slots.create_task_authority(progress)
 
     def acquire_ref(self) -> None:
         with self.runtime.cond:
@@ -3292,7 +3296,9 @@ def _validate_local_actor_pool_contract(actor_pool: Any) -> int:
 def ensure_local_subprocess_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
-) -> tuple[list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]], dict[str, Any]]:
+) -> tuple[
+    list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress], dict[str, Any]
+]:
     """Pre-create local subprocess actors and inject them into UDF nodes."""
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_local_subprocess_actor_pools_for_nodes(
@@ -3309,10 +3315,59 @@ def ensure_local_subprocess_actor_pools_for_nodes(
     plan_identity: Any = None,
     session_id: str | None = None,
     set_handles: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]], dict[str, Any]]:
+) -> tuple[
+    list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress], dict[str, Any]
+]:
     """Pre-create local subprocess actors for already-collected UDF nodes."""
-    created: list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]] = []
+    created: list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress] = []
     actor_options_map: dict[str, Any] = {}
+    udf_nodes = list(udf_nodes)
+    task_resources = {
+        str(node["node_id"]): udf_process_resources(node["payload"])
+        for node in udf_nodes
+        if isinstance(node.get("payload"), dict)
+        and str(node["payload"].get("execution_backend") or "").strip().lower() == "subprocess_task"
+    }
+    if task_resources:
+        runtime = _global_task_runtime()
+        # Actor pools stay resident while the query runs. Validate the query's
+        # complete minimum before any constructor can consume node capacity.
+        actors: dict[Any, ResourceVector] = {}
+        for node in udf_nodes:
+            payload = node.get("payload") or {}
+            if (
+                not isinstance(payload, dict)
+                or str(payload.get("execution_backend") or "").strip().lower() != "subprocess_actor"
+            ):
+                continue
+            options = node.get("executor_options") or {}
+            model = options.get("local_model_pool")
+            existing = options.get("local_actor_pool")
+            if model is not None:
+                from vane.execution.udf_local_model import RegisteredLocalModel
+
+                if not isinstance(model, RegisteredLocalModel):
+                    raise TypeError("local_model_pool must be an explicitly registered local model")
+            identity = (
+                (id(model._registry), model.identity)
+                if model is not None
+                else id(existing)
+                if existing is not None
+                else str(node["node_id"])
+            )
+            declared = udf_process_resources(payload).scale(_local_actor_pool_size_from_node(node, payload))
+            actors[identity] = ResourceVector(cpu=declared.cpu, heap_bytes=declared.heap_bytes)
+        minimum = sum(actors.values(), ResourceVector()) + ResourceVector(
+            cpu=max(resources.cpu for resources in task_resources.values()),
+            heap_bytes=sum(resources.heap_bytes for resources in task_resources.values()),
+        )
+        if not minimum.fits_within(runtime.resource_limit):
+            raise ValueError("local query actor residency and task progress exceed the node CPU/heap resource capacity")
+        for resources in task_resources.values():
+            local_task_capacity(resources, runtime.resource_limit)
+        for node in udf_nodes:
+            if str(node["node_id"]) in task_resources and "local_task_progress" in (node.get("executor_options") or {}):
+                raise ValueError("UDF node already has a task progress binding")
 
     try:
         identity = id(udf_nodes) if plan_identity is None else plan_identity
@@ -3379,6 +3434,15 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             executor_options["local_actor_pool"] = pool
             actor_options_map[node_id] = executor_options
 
+        if task_resources:
+            progress = runtime.execution_capacity.reserve_task_progress(task_resources)
+            created.append(progress)
+            for node in udf_nodes:
+                node_id = str(node["node_id"])
+                if node_id in task_resources:
+                    options = dict(node.get("executor_options") or {})
+                    options["local_task_progress"] = progress.bind(node_id)
+                    actor_options_map[node_id] = options
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
     except BaseException as creation_error:
@@ -3504,7 +3568,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     self._pool_size,
                     session_config=session_config,
                 )
-                self._initialize_local_admission(self._task_pool.create_admission_authority(), options)
+                progress = options.get("local_task_progress")
+                if progress is not None and not isinstance(progress, LocalTaskProgressBinding):
+                    raise TypeError("local_task_progress must be LocalTaskProgressBinding")
+                self._initialize_local_admission(self._task_pool.create_admission_authority(progress), options)
                 with self._task_runtime.cond:
                     task_pool_ref_count = self._task_pool.ref_count
                     task_pool_capacity = self._task_pool.pool_size

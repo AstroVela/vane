@@ -374,7 +374,11 @@ def test_plan_publication_failure_releases_borrow_without_closing_resident_model
 @pytest.mark.parametrize("fail_publication", [False, True])
 def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch, fail_publication):
     import vane.execution.udf_subprocess as local
+    from vane.execution.udf_admission import LocalTaskProgress
 
+    local._shutdown_global_task_runtime()
+    tasks = local._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=4, heap_bytes=1024**3))
+    monkeypatch.setattr(local, "_GLOBAL_TASK_RUNTIME", tasks)
     pools = []
     config = {"AWS_VANE_MODEL_SESSION_TEST": "captured"}
 
@@ -420,11 +424,16 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
                 runtime.prepare(plan, {"1": "model"})
         else:
             resources = runtime.prepare(plan, {"1": "model"})
-            assert len(resources) == 2
-            assert isinstance(resources[0], ModelPoolBorrow)
-            assert resources[1] is pools[1]
-            for resource in resources:
-                resource.shutdown()
+            try:
+                assert len(resources) == 3
+                assert isinstance(resources[0], ModelPoolBorrow)
+                assert resources[1] is pools[1]
+                assert isinstance(resources[2], LocalTaskProgress)
+                assert published[0]["3"]["local_task_progress"].query is resources[2]
+            finally:
+                for resource in reversed(resources):
+                    resource.shutdown()
+        assert tasks.execution_capacity.resource_snapshot()["task_progress"]["queries"] == 0
         assert len(published) == 1
         assert set(published[0]) == {"1", "2", "3"}
         for index, options in enumerate(published[0].values()):
@@ -444,6 +453,7 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
         with model.acquire() as borrow:
             assert borrow.pool is pools[0]
     assert all(pool.closed for pool in pools)
+    tasks.close(kill=True)
 
 
 def test_partial_constructor_ownership_is_not_transferred_to_query_rollback(monkeypatch):
@@ -832,7 +842,9 @@ def test_mixed_native_plan_uses_captured_session_for_every_udf(monkeypatch, back
                 resources = runtime.prepare(plan, {str(model_node["node_id"]): "model"}, conn=connection)
                 try:
                     assert sum(isinstance(resource, ModelPoolBorrow) for resource in resources) == 1
-                    query_pools = [resource for resource in resources if not isinstance(resource, ModelPoolBorrow)]
+                    from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+                    query_pools = [resource for resource in resources if isinstance(resource, LocalSubprocessActorPool)]
                     assert len(query_pools) == (1 if backend == "subprocess_actor" else 0)
                     result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan)
                     values = [
@@ -1260,7 +1272,7 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
             track_data=tracking != "tasks",
         )
         resources = runtime.prepare(plan, {}, conn=connection)
-        assert len(resources) == (2 if tracking == "both" else 1)
+        assert len(resources) == (3 if tracking == "both" else 2)
         assert isinstance(resources[0], QueryDataScope if tracking == "data" else QueryTaskAdmission)
         try:
             with pytest.raises(TimeoutError, match="active queries"):

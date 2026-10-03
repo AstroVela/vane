@@ -2066,7 +2066,9 @@ def test_subprocess_actor_local_actor_pool_requires_full_runtime_contract():
 
 def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_admission import LocalTaskProgress
 
+    _set_task_resource_limit(monkeypatch, 8)
     created_args = []
 
     class FakeLocalActorPool:
@@ -2112,16 +2114,29 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
 
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_plan(plan, conn="conn")
 
-    assert len(created) == 1
-    assert created_args[0][1] == 3
-    assert set(handles_map) == {"7"}
-    assert handles_map["7"] == {"local_actor_pool": created[0]}
-    assert plan.set_calls == [(handles_map, "conn")]
+    try:
+        assert len(created) == 2
+        assert created_args[0][1] == 3
+        assert isinstance(created[1], LocalTaskProgress)
+        assert set(handles_map) == {"7", "8"}
+        assert handles_map["7"] == {"local_actor_pool": created[0]}
+        binding = handles_map["8"]["local_task_progress"]
+        assert binding.query is created[1]
+        assert binding.node_id == "8"
+        assert plan.set_calls == [(handles_map, "conn")]
+    finally:
+        for resource in reversed(created):
+            resource.shutdown(kill=True)
+    assert (
+        subprocess_exec._global_task_runtime().execution_capacity.resource_snapshot()["task_progress"]["queries"] == 0
+    )
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_admission import LocalTaskProgress
 
+    _set_task_resource_limit(monkeypatch, 8)
     created_args = []
     injected = []
 
@@ -2170,17 +2185,27 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
         set_handles=inject,
     )
 
-    assert len(created) == 1
-    assert created_args[0][1] == 2
-    assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
-    assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
-    assert handles_map == {
-        "4": {
+    try:
+        assert len(created) == 2
+        assert created_args[0][1] == 2
+        assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
+        assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
+        assert isinstance(created[1], LocalTaskProgress)
+        assert set(handles_map) == {"4", "5"}
+        assert handles_map["4"] == {
             "local_actor_pool": created[0],
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
         }
-    }
-    assert injected == [handles_map]
+        binding = handles_map["5"]["local_task_progress"]
+        assert binding.query is created[1]
+        assert binding.node_id == "5"
+        assert injected == [handles_map]
+    finally:
+        for resource in reversed(created):
+            resource.shutdown(kill=True)
+    assert (
+        subprocess_exec._global_task_runtime().execution_capacity.resource_snapshot()["task_progress"]["queries"] == 0
+    )
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monkeypatch):

@@ -1216,6 +1216,21 @@ that reservation through idle periods, replacements and cleanup retries. Actor
 calls do not charge those resources a second time. Registered GPU pools retain
 their existing device inventory and exclusive assignment rules.
 
+Preparation protects one declared heap reservation per task stage for the whole
+query, including task-only plans. Producers can use additional capacity only
+after leaving every idle stage's minimum available. This deliberately uses a
+conservative minimum across all task stages, including stages on separate
+branches or separated by native materialization. A query whose resident actors
+plus this heap minimum and the largest task CPU request exceed node capacity
+is rejected before workers start. Later actor startup must also preserve the
+CPU minimum for prepared tasks. These progress reservations are separate from
+actual resource usage and are returned during query cleanup.
+
+Temporary node-capacity refusal raises `LocalProcessCapacityError` and does not
+cache a model initialization failure. After the other owner closes, the same
+registered model can retry `prewarm()`. Actual constructor failures remain
+cached, and failed physical cleanup retains its original ownership.
+
 `batch_size` controls each Python call; a physical task can combine multiple
 compute batches. For UDFs that expand small inputs into large outputs,
 `task_input_max_bytes` bounds input accumulation per task. Declare `memory_bytes`
