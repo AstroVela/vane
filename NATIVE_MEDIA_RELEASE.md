@@ -9,7 +9,10 @@ manifest binds the bundled libraries and their corresponding source SDK. Other i
 platforms need their own build and acceptance profiles before publication
 support is expanded.
 
-Versions still come from the Git identity and shared provider version encoder.
+The public provider version appends the positive `release_number` in
+`native-media-release.toml` to the matching Vane version (for example,
+`0.2.0.1`). Increment that number for each new delivery on the same Vane base.
+The bundled runtime and source SDK retain their Git-derived content identities.
 The base wheel must already be available on PyPI for the exact Vane version
 tag being released. A locally compiled base wheel is a build byproduct; the
 delivery uses the original published base bytes.

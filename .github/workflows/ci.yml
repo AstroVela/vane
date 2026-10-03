@@ -255,7 +255,7 @@ jobs:
             build/duckdb/extension/gravitino/gravitino.duckdb_extension \
             "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension"
           platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
-          python -I scripts/build_extension_wheel.py \
+          python -I scripts/build_extension_wheel.py --release-number 1 \
             --artifact "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension" \
             --extension-name gravitino --test-only \
             --output-directory "$RUNNER_TEMP/gravitino/wheels" \
@@ -289,7 +289,7 @@ jobs:
             "${base_wheels[0]}"
           base_wheels=("$RUNNER_TEMP"/test-base-wheels/vane_ai-*.whl)
           test "${#base_wheels[@]}" -eq 1
-          python -I scripts/build_extension_wheel.py \
+          python -I scripts/build_extension_wheel.py --release-number 1 \
             --artifact "$RUNNER_TEMP/test-dynamic-extension/loadable_extension_demo.duckdb_extension" \
             --extension-name loadable_extension_demo \
             --output-directory dist/extension-wheels \
@@ -343,7 +343,7 @@ jobs:
             --private-key external/duckdb/test/mbedtls/private.pem \
             build/vane_extensions/native_media.duckdb_extension \
             "$RUNNER_TEMP/native-media/native_media.duckdb_extension"
-          python -I scripts/build_extension_wheel.py \
+          python -I scripts/build_extension_wheel.py --release-number 1 \
             --artifact "$RUNNER_TEMP/native-media/native_media.duckdb_extension" \
             --extension-name native_media \
             --output-directory "$RUNNER_TEMP/native-media/wheels" \
