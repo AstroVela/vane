@@ -213,3 +213,12 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：
 - 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:54c4fb92b4c4f973c224d5db2a262242d4dc742b6edf5846d35912696e69bb60`，与 DuckDB 源码及编译器/加载器摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3676 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3752 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
 - root 与 DuckDB 格式、ruff、适用的 pre-commit 检查、源码版权清单、文档链接和实际源码包发布校验通过。本地构建与测试运行于 Linux；macOS/Windows 由对应 CI 验证。
+
+### P0 回调重入审查修复（PR #935）
+
+- 删除自行获取锁的 `LockPlanningConnection`，八个需要连接的 native fragment 入口统一调用 `DuckDBPyConnection::LockConnection()`，复用已有的 Python 输入回调检查与 GIL 释放规则；回调内重入在等待连接或 context 锁前被拒绝。
+- 新增 18 项独立进程回归，覆盖编译、提交准备、能力查询、worker 准备、直接计划加载、HASH 校验及有限测试执行，对同一连接和空闲 sibling cursor 均验证立即报错；捕获异常后外层 Parquet 查询和后续规划、执行继续成功。
+- 旧版本的首批 16 项回归全部失败（同一连接死锁或允许回调进入）；修复后新增 18 项全部通过，P0 四个模块合计 299 passed。审查方的 3 项临时用例由 2 failed、1 passed 变为 3 passed。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:f2b6f432831e448fb5fa5de40bec1c01c463cb11361a60aed2acbf8dac6422d1`，与源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3694 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3770 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
+- root 格式、ruff、适用的 pre-commit 检查、源码版权清单和文档链接检查通过。

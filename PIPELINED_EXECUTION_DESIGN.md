@@ -250,6 +250,8 @@ range 的扫描 split 由 table function 的 native 回调规划；Parquet 从�
 
 prepare_ray_query 只接受 RayExecution。在连接锁内先读取语义设置，再完成 native 绑定和构图，捕获固定 source 状态，最后确认设置没有变化。该入口不启动执行器、旧 PlanRunner 或旧 FTE manager。local 原生查询既不序列化这份描述，也不读取分布式执行选项。
 
+需要连接的 native fragment 入口统一使用 `DuckDBPyConnection::LockConnection()`，在等待连接锁或 context 锁前执行已有的 `CheckCallbackEntry()`。Python 输入回调内调用编译、提交准备、能力查询、计划加载或 HASH 校验时立即抛出 `InvalidInputException`；这一限制也适用于空闲 sibling cursor，避免嵌套工作再次依赖当前回调。回调处理该异常后，外层查询和后续正常规划仍可继续。
+
 首版连接 profile 为 vane.builtin-session:1，限定于当前受支持的内置 SQL 子集：
 
 - 捕获整数除法、IEEE 浮点语义、隐式转换、默认 collation、默认排序与 NULL 顺序、标识符大小写、表达式深度、optimizer 配置、TimeZone 和 Calendar。

@@ -19,11 +19,6 @@ namespace {
 
 using namespace vane_execution;
 
-std::unique_lock<std::recursive_mutex> LockPlanningConnection(DuckDBPyConnection &connection) {
-	py::gil_scoped_release release;
-	return std::unique_lock<std::recursive_mutex>(*connection.py_connection_lock);
-}
-
 py::dict Port(const string &id, const vector<LogicalType> &types) {
 	py::dict result;
 	result["port_id"] = id;
@@ -111,7 +106,7 @@ py::dict DescribeGraph(const FragmentGraph &graph) {
 
 py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
 	{
@@ -123,7 +118,7 @@ py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const s
 
 py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
                            const vector<idx_t> &hash_columns, bool require_replay) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
 	string snapshot;
@@ -152,7 +147,7 @@ py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, co
 }
 
 py::dict CompilerCapabilities(DuckDBPyConnection &connection) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	vector<std::pair<string, string>> scans;
 	{
 		py::gil_scoped_release release;
@@ -187,7 +182,7 @@ public:
 };
 
 py::dict InspectFragment(DuckDBPyConnection &connection, const string &payload) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentSpec fragment;
 	{
@@ -209,7 +204,7 @@ py::dict InspectFragment(DuckDBPyConnection &connection, const string &payload) 
 
 py::dict InspectSubmittedFragment(DuckDBPyConnection &connection, const string &payload, const string &snapshot,
                                   const string &sources, bool require_replay) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	{
 		py::gil_scoped_release release;
@@ -255,7 +250,7 @@ unique_ptr<ColumnDataCollection> RowsToCollection(ClientContext &context, const 
 // local queries and the future TaskRuntime do not call this function.
 py::list ExecuteFragmentForTest(DuckDBPyConnection &connection, const string &payload, const py::dict &input_rows,
                                 const py::dict &source_assignments) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	auto fragment = FragmentSpec::Deserialize(payload);
 	SourceAssignments assignments;
@@ -301,7 +296,7 @@ py::list ExecuteFragmentForTest(DuckDBPyConnection &connection, const string &pa
 
 vector<idx_t> HashRowsForTest(DuckDBPyConnection &connection, const string &schema, const string &partitioning,
                               const py::list &rows, idx_t partitions) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	auto collection = RowsToCollection(context, DeserializeSchema(schema), rows);
 	ColumnDataScanState state;
@@ -317,7 +312,7 @@ vector<idx_t> HashRowsForTest(DuckDBPyConnection &connection, const string &sche
 }
 
 void ValidateHash(DuckDBPyConnection &connection, const string &schema, const string &partitioning) {
-	auto lock = LockPlanningConnection(connection);
+	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), DeserializeSchema(schema));

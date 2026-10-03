@@ -6,6 +6,7 @@
 import json
 import subprocess
 import sys
+import textwrap
 from collections import Counter
 from dataclasses import replace
 
@@ -74,6 +75,124 @@ def execute_graph(connection, graph):
                 native._execute_fragment_for_test(connection, fragment.native_plan, inputs[partition], assignments)
             )
     return outputs[graph.result.fragment_id][0]
+
+
+@pytest.mark.parametrize("target", ["same", "sibling"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "compile_fragment_graph",
+        "prepare_ray_query",
+        "native_plan_capabilities",
+        "prepare_worker_plan",
+        "inspect_submitted_fragment",
+        "inspect_fragment",
+        "validate_hash",
+        "execute_fragment",
+        "hash_rows",
+    ],
+)
+def test_fragment_connection_entries_reject_python_input_callback_reentry(entry, target):
+    pytest.importorskip("fsspec")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import os
+        import sys
+        from datetime import datetime, timezone
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import vane
+        from vane._native import execution_plan as native
+        from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
+        from vane.execution.plan import Distribution
+        from vane.execution.query_options import QueryExecutionOptions, RayExecution
+        from vane.execution.resource_demand import MemoryDemand, ResourceDemand
+        from vane.execution.submission import native_plan_capabilities, prepare_ray_query, prepare_worker_plan
+
+        os.environ["VANE_RUNNER"] = "local-fast"
+        entry, target = sys.argv[1:]
+        output = pa.BufferOutputStream()
+        pq.write_table(pa.table({"x": [1, 2, 3]}), output)
+        payload = output.getvalue().to_pybytes()
+        armed, attempts = False, []
+
+        def prepare(connection):
+            return prepare_ray_query(
+                connection, "SELECT 7", query_id="callback-entry",
+                options=QueryExecutionOptions(RayExecution(), 10, 60, 30),
+                resources=ResourceDemand(1, 2, MemoryDemand(4096, 4096, 4096, 4096), 1),
+            )
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "fragmentcallback"
+
+            def _open(self, path, mode="rb", **kwargs):
+                if armed and not attempts:
+                    attempts.append(entry)
+                    try:
+                        invoke()
+                    except vane.InvalidInputException as error:
+                        assert "Python input callback" in str(error), str(error)
+                    else:
+                        raise AssertionError("input callback entered " + entry)
+                return io.BytesIO(payload)
+
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+
+            def modified(self, path):
+                return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        with vane.connect(config={"threads": 1}) as connection, connection.cursor() as sibling:
+            selected = connection if target == "same" else sibling
+            spec = prepare(connection)
+            fragment = spec.graph.fragments[0]
+            hashed = compile_fragment_graph(
+                connection, "SELECT range FROM range(3)", query_id="callback-hash",
+                options=FragmentCompileOptions(2, (0,)),
+            )
+            edge = next(edge for edge in hashed.exchanges if edge.distribution is Distribution.HASH)
+            schema = hashed.fragments[0].outputs[0].schema
+            operations = {
+                "compile_fragment_graph": lambda: compile_fragment_graph(selected, "SELECT 7", query_id="nested"),
+                "prepare_ray_query": lambda: prepare(selected),
+                "native_plan_capabilities": lambda: native_plan_capabilities(selected),
+                "prepare_worker_plan": lambda: prepare_worker_plan(selected, spec),
+                "inspect_submitted_fragment": lambda: native.inspect_submitted_fragment(
+                    selected, fragment.native_plan, spec.connection_snapshot,
+                    spec.source_snapshots[0].payload, spec.requires_replay,
+                ),
+                "inspect_fragment": lambda: native.inspect_fragment(selected, fragment.native_plan),
+                "validate_hash": lambda: native.validate_hash(selected, schema, edge.partitioning),
+                "execute_fragment": lambda: native._execute_fragment_for_test(selected, fragment.native_plan, {}, {}),
+                "hash_rows": lambda: native._hash_rows_for_test(selected, schema, edge.partitioning, [(1,), (2,)], 2),
+            }
+            invoke = operations[entry]
+            connection.register_filesystem(Filesystem(skip_instance_cache=True))
+            armed = True
+            # Isolate a regression so a lock wait cannot hang the pytest process.
+            faulthandler.dump_traceback_later(8, exit=True)
+            assert connection.execute(
+                "SELECT x FROM read_parquet('fragmentcallback://data.parquet')"
+            ).fetchall() == [(1,), (2,), (3,)]
+            assert attempts == [entry]
+            # The guard must leave both the outer query and later planning usable.
+            invoke()
+            assert connection.execute("SELECT 42").fetchall() == [(42,)]
+            assert sibling.execute("SELECT 43").fetchall() == [(43,)]
+            faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, entry, target],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize(
