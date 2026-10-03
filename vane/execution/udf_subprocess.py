@@ -2053,6 +2053,7 @@ class _TaskWorkerPool:
         try:
             while wrapper is None and spawn_idx is None:
                 evicted: tuple[_TaskWorkerPool, _PooledTaskWorker] | None = None
+                retry_retirement = False
                 with self.runtime.cond:
                     scope.raise_if_cancelled("subprocess task worker acquisition")
                     if self.closing or self.runtime.closed:
@@ -2071,6 +2072,13 @@ class _TaskWorkerPool:
                         break
                     if evicted is not None:
                         pass
+                    elif self._retiring_workers:
+                        # A failed close still owns inventory but cannot wake
+                        # an acquisition waiting for a free slot. Retry it
+                        # outside the ledger lock; another failure must finish
+                        # this task with an error rather than retain its grant.
+                        evicted = (self, next(iter(self._retiring_workers)))
+                        retry_retirement = True
                     elif self.total < self.pool_size:
                         # Reclaim idle cache entries before growing inventory.
                         # Transport waiters retain their processes, so their
@@ -2090,7 +2098,7 @@ class _TaskWorkerPool:
                         continue
                 if evicted is not None:
                     evicted_pool, evicted_wrapper = evicted
-                    evicted_pool._close_retiring_worker(evicted_wrapper, kill=False)
+                    evicted_pool._close_retiring_worker(evicted_wrapper, kill=retry_retirement)
 
             try:
                 assert spawn_idx is not None

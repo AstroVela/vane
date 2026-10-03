@@ -675,6 +675,136 @@ def test_overflow_retirement_keeps_cleanup_owner_until_process_exits(
     assert manager.snapshot()["usage_bytes"] == 0
 
 
+@pytest.mark.timeout(40)
+@pytest.mark.parametrize("cleanup_failures", [0, 1, 2])
+def test_shared_task_pool_retries_failed_retirement_without_stranding_grants(monkeypatch, cleanup_failures):
+    import pyarrow as pa
+
+    from vane import pickle as vane_pickle
+    from vane.execution import udf_subprocess
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            assert time.monotonic() < deadline, "shared-pool peer did not finish"
+            time.sleep(0.01)
+
+    def submit(executor):
+        table = pa.table({"x": [1]})
+        assert executor.request_task_admission(table.nbytes)
+        assert executor.task_admission_state()["available"]
+        executor.submit(table)
+
+    def take(executor):
+        results = []
+
+        def poll():
+            result = executor.take_ready_result()
+            if result is not None:
+                results.append(result)
+            return bool(results)
+
+        wait_until(poll)
+        wait_until(lambda: tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict())
+        return results[0]
+
+    def identity(table):
+        return table
+
+    def increment(table):
+        return pa.table({"x": [value + 1 for value in table.column("x").to_pylist()]})
+
+    def payload(function):
+        return {
+            "function_pickle": vane_pickle.dumps(function),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "cpus": 1,
+            "memory_bytes": 20,
+        }
+
+    udf_subprocess._shutdown_global_task_runtime()
+    tasks = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=100))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    shared_payload = payload(identity)
+    first = udf_subprocess.UDFExecutor(shared_payload)
+    peer = udf_subprocess.UDFExecutor(shared_payload)
+    other = udf_subprocess.UDFExecutor(payload(increment))
+    pool = first._task_pool
+    assert peer._task_pool is pool
+    assert pool.pool_size == 1
+    original_close = udf_subprocess._SingleSubprocessExecutor.close
+    failures_remaining = cleanup_failures
+    failed_workers = []
+    close_kills = []
+
+    def fail_close(worker, *args, **kwargs):
+        nonlocal failures_remaining
+        if any(wrapper.worker is worker for wrapper in pool._retiring_workers):
+            close_kills.append(kwargs.get("kill", False))
+            if failures_remaining:
+                failures_remaining -= 1
+                if worker not in failed_workers:
+                    failed_workers.append(worker)
+                raise RuntimeError("injected retirement retry failure")
+        return original_close(worker, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(udf_subprocess._SingleSubprocessExecutor, "close", fail_close)
+            with monkeypatch.context() as retirement_patch:
+                retirement_patch.setattr(udf_subprocess, "_worker_is_reusable", lambda worker: False)
+                submit(first)
+                first_result = take(first)
+            if cleanup_failures:
+                assert isinstance(first_result, RuntimeError)
+                assert "injected retirement retry failure" in str(first_result)
+                assert len(failed_workers) == 1
+                retired_proc = failed_workers[0]._proc
+                assert retired_proc.poll() is None
+                assert pool.total == 1 and pool.active == 0 and pool.idle == []
+            else:
+                assert first_result.to_pydict() == {"x": [1]}
+            first.close(kill=True)
+            assert pool.ref_count == 1
+            submit(peer)
+            peer_result = take(peer)
+            assert close_kills == ([False, True] if cleanup_failures else [False])
+            if cleanup_failures == 2:
+                assert isinstance(peer_result, RuntimeError)
+                assert "injected retirement retry failure" in str(peer_result)
+                assert retired_proc.poll() is None
+                assert pool.total == 1 and pool.active == 0
+                assert tasks.stats()["retiring_workers"] == 1
+            else:
+                assert peer_result.to_pydict() == {"x": [1]}
+                assert tasks.stats()["retiring_workers"] == 0
+                if cleanup_failures:
+                    assert retired_proc.poll() is not None
+                    assert pool.idle[0].worker._proc.pid != retired_proc.pid
+            submit(other)
+            assert take(other).to_pydict() == {"x": [2]}
+            if cleanup_failures == 2:
+                assert retired_proc.poll() is None
+                assert pool.total == 1
+                assert tasks.stats()["retiring_workers"] == 1
+        if cleanup_failures == 2:
+            submit(peer)
+            assert take(peer).to_pydict() == {"x": [1]}
+            assert retired_proc.poll() is not None
+            assert tasks.stats()["retiring_workers"] == 0
+    finally:
+        first.close(kill=True)
+        peer.close(kill=True)
+        other.close(kill=True)
+        tasks.close(kill=True)
+        for worker in failed_workers:
+            original_close(worker, kill=True)
+    assert tasks.stats()["total_workers"] == 0
+    assert tasks.stats()["retiring_workers"] == 0
+    assert tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
+
 def test_global_shutdown_keeps_a_new_runtime_created_as_old_cleanup_returns(monkeypatch):
     from vane.execution import udf_subprocess
 

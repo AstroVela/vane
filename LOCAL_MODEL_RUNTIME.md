@@ -1276,6 +1276,9 @@ that worker reusable or releases its inventory count. Executor cleanup retries
 the pool's retired workers; the task runtime retains them even after the final
 pool reference is released, and a failed runtime close can be retried explicitly.
 A closed runtime with pending worker cleanup cannot be replaced by a fresh one.
+Worker acquisition retries retained retirements before spawning or waiting for
+a free slot. A failed retry returns a task error and its execution resources;
+shared-pool peers do not wait indefinitely behind an unclosed retired worker.
 
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
