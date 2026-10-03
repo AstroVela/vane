@@ -27,6 +27,7 @@ _ALLOWED_OPTIONS = frozenset(
         "local_actor_pool",
         "local_model_pool",
         "local_task_admission",
+        "local_task_progress",
         "local_data_scope",
         "local_input_cleanup",
         "local_executor_cleanup",
@@ -98,6 +99,8 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
     options = normalize_options(_options)
     if options.get("local_model_pool") is not None and backend != "subprocess_actor":
         raise ValueError("registered local models require the subprocess_actor backend")
+    if options.get("local_task_progress") is not None and backend != "subprocess_task":
+        raise ValueError("local task progress requires the subprocess_task backend")
     if options.get("local_task_admission") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("runtime task admission requires local subprocess UDFs")
     if options.get("local_data_scope") is not None and backend not in {"subprocess_actor", "subprocess_task"}:

@@ -15,7 +15,7 @@ from vane import pickle as vane_pickle
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataAdmissionWaitLimits
-from vane.execution.udf_data_lease import RuntimeDataLedger
+from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
@@ -119,7 +119,6 @@ def test_input_cleanup_retry_preserves_another_subprocess_borrow(
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -185,7 +184,6 @@ def test_metadata_input_owner_dispatches_and_is_accounted_once(strict_transport,
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -252,7 +250,6 @@ def test_oversized_metadata_input_is_rejected_before_lease_or_dispatch(strict_tr
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -298,7 +295,6 @@ def test_removed_byte_wakeup_preserves_stats_and_subprocess_results(strict_trans
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -356,7 +352,6 @@ def test_retained_view_refuses_new_work_then_retries_with_shared_model_or_pool(s
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -432,7 +427,6 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -444,6 +438,7 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
     )
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     send = local._send_message
 
@@ -469,7 +464,7 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
             assert data["reservations"] == 1
             assert data["usage_bytes"] >= grant_bytes
             with pytest.raises(RuntimeError, match="planned grant cleanup failure"):
-                resources[-1].shutdown()
+                data_scope.shutdown()
             with pytest.raises(TimeoutError, match="active queries or tasks"):
                 runtime.close()
     finally:
@@ -497,7 +492,6 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
         function_pickle=vane_pickle.dumps(lambda table: table),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -557,7 +551,6 @@ def test_failed_input_cleanup_keeps_runtime_owned(
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -569,8 +562,11 @@ def test_failed_input_cleanup_keeps_runtime_owned(
     )
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     refs = []
+    later = None
+    later_resources = []
 
     def fail_cleanup(*args, **kwargs):
         raise RuntimeError("planned input transport cleanup failure")
@@ -604,21 +600,34 @@ def test_failed_input_cleanup_keeps_runtime_owned(
                     with pytest.raises(DataAdmissionCapacityError, match="runtime"):
                         later.request_task_admission(8)
                 finally:
-                    later.close(kill=True)
+                    if backend == "subprocess_task":
+                        with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
+                            later.close(kill=True)
+                        assert later.cleanup_pending()
+                    else:
+                        later.close(kill=True)
                     for resource in later_resources:
-                        resource.shutdown(kill=True)
+                        try:
+                            resource.shutdown(kill=True)
+                        except RuntimeError as exc:
+                            assert backend == "subprocess_task" and "planned input transport cleanup failure" in str(
+                                exc
+                            )
+                            assert resource.cleanup_pending()
             with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
-                resources[-1].shutdown()
-            assert resources[-1].cleanup_pending()
+                data_scope.shutdown()
+            assert data_scope.cleanup_pending()
             with pytest.raises(TimeoutError, match="active queries or tasks"):
                 runtime.close()
         # Query cleanup must own the retry even if the failed worker is gone.
-        resources[-1].shutdown()
+        data_scope.shutdown()
         assert strict_transport.snapshot()["input_lease_bytes"] == 0
         assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
     finally:
         executor.close(kill=True)
-        for resource in resources:
+        if later is not None:
+            later.close(kill=True)
+        for resource in [*resources, *later_resources]:
             try:
                 resource.shutdown(kill=True)
             except RuntimeError as exc:
@@ -644,13 +653,13 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
         function_pickle=vane_pickle.dumps(identity),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
     runtime = LocalModelRuntime(session_id="test", session_config={}, data_limit=DataAdmissionLimits(4096, 2048, 2048))
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
     inputs = [_MetadataInputOwner(result[1][0])] if metadata_owner else result[1]
@@ -670,7 +679,7 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
             if failure == "descriptor":
                 patch.setattr(local, "make_local_ref_bundle_worker_payload", fail_descriptor)
             elif failure == "schedule":
-                patch.setattr(local._global_task_runtime().executor, "submit", fail)
+                patch.setattr(executor._task_pool.executor, "submit", fail)
             else:
                 patch.setattr(executor._task_pool, "_spawn_worker", fail)
             assert executor.request_task_admission(8)
@@ -684,10 +693,10 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
             assert input_bytes > 0
             assert runtime.resource_snapshot()["data"]["input_bytes"] == input_bytes
             with pytest.raises(RuntimeError, match="planned input setup or cleanup failure"):
-                resources[-1].shutdown()
+                data_scope.shutdown()
             with pytest.raises(TimeoutError):
                 runtime.close()
-        resources[-1].shutdown()
+        data_scope.shutdown()
         assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
         assert strict_transport.snapshot()["input_lease_bytes"] == 0
     finally:
@@ -700,12 +709,19 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
 
 
 @pytest.mark.parametrize("limited", [False, True])
-def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited):
+def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited, monkeypatch, request):
+    from vane.execution import udf_subprocess as local
+    from vane.execution.resources import ResourceVector
+
+    # Force the byte refusal to arrive via the queued pool wakeup, rather than
+    # an immediate grant from a second physical slot.
+    tasks = local._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    monkeypatch.setattr(local, "_GLOBAL_TASK_RUNTIME", tasks)
+    request.addfinalizer(lambda: tasks.close(kill=True))
     payload = dict(
         function_pickle=vane_pickle.dumps(lambda table: table),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -872,7 +888,6 @@ def test_subprocess_failure_returns_input_output_and_execution_reservations(
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -923,7 +938,6 @@ def test_failed_task_submission_returns_all_byte_reservations(strict_transport, 
         function_pickle=vane_pickle.dumps(identity),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -940,7 +954,7 @@ def test_failed_task_submission_returns_all_byte_reservations(strict_transport, 
         with monkeypatch.context() as patch:
             executor.request_task_admission(8)
             if failure == "schedule":
-                patch.setattr(local._global_task_runtime().executor, "submit", fail)
+                patch.setattr(executor._task_pool.executor, "submit", fail)
                 with pytest.raises(RuntimeError, match="planned scheduler failure"):
                     executor.submit(pa.table({"x": [1]}))
             else:

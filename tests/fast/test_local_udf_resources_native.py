@@ -203,7 +203,6 @@ def test_real_transport_wait_is_attributed_and_cancellation_or_release_retires_i
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=1,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -271,7 +270,6 @@ def test_completion_callback_remains_visible_after_executor_shutdown_timeout(mon
             "function_pickle": vane_pickle.dumps(lambda table: table),
             "call_mode": "map_batches",
             "execution_backend": "subprocess_task",
-            "udf_worker_slots": 1,
         },
         {"local_resource_unit": identity, "local_resource_activity": activity, "local_executor_cleanup": cleanup},
     )

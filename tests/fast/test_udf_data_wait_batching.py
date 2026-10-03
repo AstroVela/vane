@@ -27,7 +27,7 @@ def _run_chain(
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: budget)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     with monkeypatch.context() as cpus:
-        cpus.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        cpus.setattr(udf_subprocess.os, "cpu_count", lambda: 1 + int(actor))
         task_runtime = udf_subprocess._GlobalSubprocessTaskRuntime()
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", task_runtime)
     submitted_rows = []

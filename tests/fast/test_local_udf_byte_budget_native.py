@@ -12,6 +12,7 @@ import pytest
 from vane import pickle as vane_pickle
 from vane.execution import ref_bundle, udf_subprocess
 from vane.execution.local_resource_graph import LocalResourceUnitContext
+from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits
 from vane.execution.udf_data_lease import RuntimeDataLedger
@@ -59,18 +60,15 @@ def test_real_shared_pool_preserves_other_units_share_and_retries_after_completi
         call_mode="map_batches",
         execution_backend=backend,
         actor_number=4,
-        udf_worker_slots=4,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
-    # The test needs four physical threads even on a smaller developer machine.
+    # The test needs four process slots even on a smaller developer machine.
     # Keep this runtime separate from cached pools used by other tests.
-    task_pool_runtime = None
-    if backend == "subprocess_task":
-        with monkeypatch.context() as cpu_count:
-            cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 4)
-            task_pool_runtime = udf_subprocess._GlobalSubprocessTaskRuntime()
-        monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", task_pool_runtime)
+    task_pool_runtime = udf_subprocess._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=4, heap_bytes=1024**3)
+    )
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", task_pool_runtime)
     actor_pool = udf_subprocess.LocalSubprocessActorPool(payload, 4) if backend == "subprocess_actor" else None
     ledger = RuntimeDataLedger(DataAdmissionLimits(16_384, 2048, 2048, unit_reservation_ratio=1))
     task_runtime = RuntimeTaskAdmission(TaskAdmissionLimits(4, 8)) if limited else None

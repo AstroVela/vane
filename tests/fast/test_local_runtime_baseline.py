@@ -231,7 +231,7 @@ def test_concurrent_small_budget_requests_reuse_a_model_and_drain_native_views(m
     transport = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", transport)
     with monkeypatch.context() as cpu:
-        cpu.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        cpu.setattr(udf_subprocess.os, "cpu_count", lambda: 2)
         workers = udf_subprocess._GlobalSubprocessTaskRuntime()
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", workers)
     marker = str(tmp_path / "initializations")

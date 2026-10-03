@@ -25,6 +25,7 @@ from vane.execution.udf_actor_pool_lifecycle import (
     rollback_actor_pools,
 )
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
+from vane.execution.udf_local_resources import LocalProcessCapacityError
 
 
 class ModelPool(Protocol):
@@ -367,9 +368,14 @@ class ModelPoolRegistry(Generic[_Pool]):
             # The runtime keeps partial constructor owners. Do not hand those
             # same owners to a query's preparation rollback through the error.
             failure = error.creation_error if isinstance(error, OwnedActorPoolsError) else error
-            cached_failure = _InitializationFailure.capture(failure)
+            owners = tuple(getattr(error, "owned_actor_pools", ()))
+            cached_failure = (
+                None
+                if isinstance(failure, LocalProcessCapacityError) and not owners
+                else _InitializationFailure.capture(failure)
+            )
             with self._condition:
-                entry.owners = tuple(getattr(error, "owned_actor_pools", ()))
+                entry.owners = owners
                 self._owned.extend(entry.owners)
                 if not entry.owners:
                     entry.reserved = False

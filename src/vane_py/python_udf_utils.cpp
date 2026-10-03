@@ -350,9 +350,6 @@ Value BuildPythonUDFPayload(
 	auto gpus_value = ParseOptionalNonNegativeDouble(gpus, "map_batches(gpus=...)");
 	auto memory_bytes_value = ParseOptionalPositiveIdx(memory_bytes, "memory_bytes");
 	const bool is_ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
-	if (memory_bytes_value.first && !is_ray_backend && execution_backend != "subprocess_actor") {
-		throw InvalidInputException("memory_bytes requires a Ray UDF backend or subprocess_actor");
-	}
 	const bool local_gpu_model = registered_local_model && execution_backend == "subprocess_actor" &&
 	                             gpus_value.first && gpus_value.second == 1.0;
 	if (gpus_value.first && gpus_value.second > 0.0 && !is_ray_backend && !local_gpu_model) {

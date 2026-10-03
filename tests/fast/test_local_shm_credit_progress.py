@@ -9,8 +9,9 @@ from vane.execution.ref_bundle import LocalShmBudgetManager
 
 
 @pytest.fixture
-def shared_credits():
+def shared_credits(request):
     manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    reservation = manager.reserve_task_bytes(10, 10) if getattr(request, "param", False) else None
 
     class SharedInput:
         name = "shared-image-batch"
@@ -36,7 +37,7 @@ def shared_credits():
             lease = manager.create_input_lease([source], source.size)
             leases.append(lease)
             manager.consume_input_lease(lease)
-        assert manager.snapshot()["usage_bytes"] == 1700
+        assert manager.snapshot()["usage_bytes"] == 1700 + (20 if reservation is not None else 0)
 
         def request(index, *, size=350, priority="consumer"):
             def run():
@@ -64,6 +65,8 @@ def shared_credits():
             thread.join(timeout=2)
         for grant in grants:
             manager.release_output_grant(grant)
+        if reservation is not None:
+            reservation.release()
         assert all(not thread.is_alive() for thread in threads)
         assert manager.snapshot()["usage_bytes"] == 0
 
@@ -107,3 +110,14 @@ def test_progress_exception_requires_consumer_credit_and_a_bounded_output(shared
     assert thread.is_alive()
     assert grants == [] and errors == []
     assert manager.snapshot()["usage_bytes"] == 1700
+
+
+@pytest.mark.parametrize("shared_credits", [True], indirect=True)
+def test_credit_progress_does_not_overcommit_an_explicit_task_envelope(shared_credits):
+    manager, grants, errors, request = shared_credits
+    thread = request(0)
+    thread.join(timeout=0.1)
+    assert thread.is_alive()
+    assert grants == [] and errors == []
+    assert manager.snapshot()["task_reserved_bytes"] == 20
+    assert manager.snapshot()["usage_bytes"] == 1720

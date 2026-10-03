@@ -60,6 +60,8 @@ release_tests=(
 # use real native plans/subprocesses and small shared-memory budgets, without
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
+  "$project_root/tests/fast/test_local_task_scheduling.py"
+  "$project_root/tests/fast/test_local_shm_credit_progress.py"
   "$project_root/tests/fast/test_local_query_runtime.py"
   "$project_root/tests/fast/test_local_query_streaming.py"
   "$project_root/tests/fast/test_result_delivery_capacity.py"

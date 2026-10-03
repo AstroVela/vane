@@ -58,7 +58,7 @@ def native_environment(monkeypatch):
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     with monkeypatch.context() as cpu_count:
-        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 4)
         tasks = udf_subprocess._GlobalSubprocessTaskRuntime()
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
     yield manager

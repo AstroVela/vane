@@ -514,12 +514,7 @@ def test_video_extra_installs_video_dependencies():
 
 
 def test_base_distribution_keeps_media_dependencies_optional():
-    base_requirements = set()
-    for raw_requirement in requires("vane-ai") or []:
-        requirement = Requirement(raw_requirement)
-        if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
-            base_requirements.add(canonicalize_name(requirement.name))
-
-    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(
-        base_requirements
-    )
+    base_requirements = _base_requirements()
+    # Local process admission requires memory capacity even without media extras.
+    assert base_requirements["psutil"].specifier == SpecifierSet(">=5.9")
+    assert {"av", "pillow", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(base_requirements)
