@@ -48,6 +48,7 @@ _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _EPSILON = 1e-9
 _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
 _SOFT_RESERVATION_WARNING_DELAY_S = 60.0
+_COPY_METADATA_OUTPUT_ESTIMATE_BYTES = 4 * 1024**2
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class TaskRequest:
     attempt_id: str
     node_id: str | None
     retained_input_bytes: int | None = None
+    output_kind: str = "data"
 
 
 @dataclass(frozen=True)
@@ -1361,6 +1363,10 @@ class RayQueryResourceManager:
         unit = self._units.get(str(request.resource_unit_id))
         if unit is None:
             return "unit_not_registered", True, empty_plan
+        if request.output_kind not in {"data", "copy_metadata"} or (
+            request.output_kind == "copy_metadata" and unit.spec.backend != "ray_worker"
+        ):
+            return "invalid_task_output_kind", True, empty_plan
         if unit.completed:
             return "unit_completed", True, empty_plan
         if not self._allocation_admission_open:
@@ -1426,13 +1432,21 @@ class RayQueryResourceManager:
             unit.spec,
             actor_index=actor_index,
         )
+        output_window_bytes = unit.spec.output_window_bytes
+        if request.output_kind == "copy_metadata":
+            # COPY is fused onto the input fragment. Its resource identity can
+            # still name the scan or exchange source, but its result contains
+            # file statistics, not the rows written to disk. Keep an estimate
+            # for that metadata; atomic completion charges its exact size.
+            output_window_bytes = min(output_window_bytes, _COPY_METADATA_OUTPUT_ESTIMATE_BYTES)
+            pending_output_estimate = output_window_bytes
         commitment = _resource_with_object_store(
             resources,
             retained + pending_output_estimate,
         )
         plan = _TaskAdmissionPlan(
             resources=resources,
-            output_window_bytes=unit.spec.output_window_bytes,
+            output_window_bytes=output_window_bytes,
             node_id=node_id,
             actor_index=actor_index,
         )
@@ -1515,6 +1529,8 @@ class RayQueryResourceManager:
 
     def _pending_output_estimate_for_lease_locked(self, lease: TaskLease) -> int:
         spec = self._units[lease.resource_unit_id].spec
+        if spec.backend == "ray_worker":
+            return lease.output_window_bytes
         if spec.backend == "ray_actor" and lease.lease_id not in self._active_actor_slots.values():
             # Prefetched actor calls retain their inputs, but only the active
             # call can currently populate that actor's generator buffer.
@@ -2857,6 +2873,11 @@ class RayQueryResourceManager:
             ready_actor_slots = set(self._actor_node_by_slot)
             active_task_lease_ids_by_unit = dict(self._active_liveness_task_lease_ids_by_unit)
             active_output_lease_ids_by_unit = dict(self._active_liveness_output_lease_ids_by_unit)
+            pending_estimates_by_unit: dict[str, list[int]] = {key: [] for key in self._units}
+            for lease in self._task_leases.values():
+                pending_estimates_by_unit[lease.resource_unit_id].append(
+                    self._pending_output_estimate_for_lease_locked(lease)
+                )
             return {
                 "query_id": self.graph.query_id,
                 "graph": self.graph.to_dict(),
@@ -2982,8 +3003,14 @@ class RayQueryResourceManager:
                             else unit.num_outputs_of_finished_tasks / unit.num_tasks_finished
                         ),
                         "pending_output_estimate_per_active_task_bytes": (
-                            self._pending_output_estimate_per_task_locked(unit.spec)
+                            # Native tasks in one unit can have different fused
+                            # output contracts. Report the largest active
+                            # estimate, with the exact total alongside it.
+                            max(pending_estimates_by_unit[resource_unit_id])
+                            if unit.spec.backend == "ray_worker" and pending_estimates_by_unit[resource_unit_id]
+                            else self._pending_output_estimate_per_task_locked(unit.spec)
                         ),
+                        "pending_output_estimate_bytes": sum(pending_estimates_by_unit[resource_unit_id]),
                         "protocol_output_window_max_bytes": unit.spec.output_window_bytes,
                         "completed": unit.completed,
                         "phase_eligible": resource_unit_id in eligible_unit_ids,

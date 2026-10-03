@@ -111,7 +111,8 @@ def test_fte_partition_attempt_identity_marks_only_retries_as_recovery(
 
 
 @pytest.mark.parametrize("recovery", [False, True])
-def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monkeypatch, recovery):
+@pytest.mark.parametrize("copy_output", [False, True])
+def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monkeypatch, recovery, copy_output):
     lease = object()
     descriptor_requests = []
     submission_events = []
@@ -144,13 +145,16 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
         "resolve_fte_partition_submission",
         lambda *args, **kwargs: submission_events.append(("resolve", args, kwargs)),
     )
-    monkeypatch.setattr(
-        fte_fragment_scheduler,
-        "_fte_fragment_resource_identity",
-        lambda query_id, _fragment_id: (
-            query_id,
-            f"resource:{query_id}:fragment:node:scan",
-        ),
+    context = {
+        "resource_query_id": "query-global-order",
+        "resource_unit_id": "resource:query-global-order:fragment:node:scan",
+    }
+    if copy_output:
+        context["copy_output_remote_base"] = "/copy-output"
+    monkeypatch.setitem(
+        fte_fragment_scheduler._FTE_FRAGMENT_EXECUTIONS,
+        ("query-global-order", "fragment-1"),
+        SimpleNamespace(context=context),
     )
     monkeypatch.setattr(
         "vane.runners.ray.query_resource_runtime.get_query_resource_manager",
@@ -168,6 +172,7 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
     assert result is lease
     assert len(descriptor_requests) == 1
     assert descriptor_requests[0][1] is recovery
+    assert descriptor_requests[0][0].output_kind == ("copy_metadata" if copy_output else "data")
     assert [event[0] for event in submission_events] == ["admit", "resolve"]
     assert submission_events[-1][2]["granted"] is True
 
