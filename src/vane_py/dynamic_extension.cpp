@@ -336,8 +336,10 @@ static bool VerifyNativeRuntimeSignature(const py::bytes &contents, const py::by
 	if (payload.empty() || payload.size() > 64 * 1024 || signature_bytes.size() != 256) {
 		return false;
 	}
-	static constexpr char DOMAIN[] = "VANE_NATIVE_RUNTIME_MANIFEST_V1\0";
-	auto hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(string(DOMAIN, sizeof(DOMAIN) - 1) + payload);
+	// Not named DOMAIN: macOS <math.h> defines that as a legacy SVID macro at __DARWIN_C_FULL.
+	static constexpr char SIGNATURE_DOMAIN[] = "VANE_NATIVE_RUNTIME_MANIFEST_V1\0";
+	auto hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(
+	    string(SIGNATURE_DOMAIN, sizeof(SIGNATURE_DOMAIN) - 1) + payload);
 	for (auto &key : ExtensionHelper::GetPublicKeys(allow_community)) {
 		if (duckdb_mbedtls::MbedTlsWrapper::IsValidSha256Signature(key, signature_bytes, hash)) {
 			return true;
