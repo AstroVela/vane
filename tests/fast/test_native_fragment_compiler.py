@@ -236,6 +236,32 @@ def test_parquet_physical_column_named_file_index_remains_supported(connection, 
         assert execute_graph(worker, graph) == [(1, 11)]
 
 
+@pytest.mark.parametrize("predicate", ["value > 10", "value IS NULL", "false"])
+@pytest.mark.parametrize("hash_columns", [(), (0,)])
+def test_optimized_parquet_dependencies_do_not_create_scan_tasks(connection, tmp_path, predicate, hash_columns):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    graph = compile_sql(
+        connection,
+        f"select value from read_parquet('{path}') where {predicate}",
+        partitions=4,
+        hash_columns=hash_columns,
+    )
+    fragment = graph.fragments[0]
+    assert fragment.partition_count == 1
+    assert not fragment.sources
+    assert len(fragment.source_dependencies) == 1
+    assert fragment.required_capabilities == (fragment.source_dependencies[0].capability,)
+    transported = FragmentGraph.from_dict(
+        json.loads(json.dumps(graph.to_dict())), expected_engine_identity=native.engine_identity()
+    )
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_graph(worker, transported) == []
+
+
 def test_compiling_does_not_enter_old_runner_or_execute_a_query(connection, monkeypatch):
     from vane import _ray_cxx, runners
 

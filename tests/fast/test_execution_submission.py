@@ -221,6 +221,125 @@ def test_parquet_does_not_claim_immutable_fte_replay(connection, tmp_path):
         replace(spec, options=options(DistributedMode.FTE))
 
 
+@pytest.mark.parametrize("predicate", ["value > 10", "value IS NULL"])
+@pytest.mark.parametrize("change", ["rewrite", "mtime", "missing"])
+def test_optimized_parquet_source_changes_are_rejected(connection, tmp_path, predicate, change):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    spec = prepare(connection, f"select value from read_parquet('{path}') where {predicate}")
+    assert all(not fragment.sources for fragment in spec.graph.fragments)
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, spec) == []
+    stat = path.stat()
+    if change == "missing":
+        path.unlink()
+    else:
+        if change == "rewrite":
+            pq.write_table(pa.table({"value": [None, 20, 30, 40]}), path)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    with vane.connect(config={"threads": 1}) as worker:
+        with pytest.raises((vane.InvalidInputException, vane.IOException), match="snapshot changed|Cannot open file"):
+            prepare_worker_plan(worker, spec)
+
+
+@pytest.mark.parametrize("predicate", ["value > 10", "value IS NULL"])
+def test_optimized_parquet_source_still_requires_immutable_fte_replay(connection, tmp_path, predicate):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    sql = f"select value from read_parquet('{path}') where {predicate}"
+    with pytest.raises(vane.NotImplementedException, match="immutable source version"):
+        prepare(connection, sql, options=options(DistributedMode.FTE))
+    spec = prepare(connection, sql)
+    with pytest.raises(ValueError, match="immutable source versions"):
+        replace(spec, options=options(DistributedMode.FTE))
+
+
+def test_pruned_parquet_file_remains_a_submission_dependency(connection, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for part in (1, 2):
+        directory = tmp_path / f"part={part}"
+        directory.mkdir()
+        pq.write_table(pa.table({"value": [part * 10]}), directory / "data.parquet")
+    sql = f"select value from read_parquet('{tmp_path}/part=*/*.parquet', hive_partitioning=true) where part = 2"
+    spec = prepare(connection, sql)
+    assert len(spec.graph.fragments[0].sources[0].splits) == 1
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, spec) == [(20,)]
+    with (tmp_path / "part=1" / "data.parquet").open("ab") as output:
+        output.write(b"changed")
+    with vane.connect(config={"threads": 1}) as worker:
+        with pytest.raises(vane.InvalidInputException, match="snapshot changed"):
+            prepare_worker_plan(worker, spec)
+
+
+def test_optimized_parquet_dependencies_require_absolute_paths(connection, tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"value": [1, 2, 3]}), tmp_path / "data.parquet")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(vane.NotImplementedException, match="absolute local paths"):
+        prepare(connection, "select value from read_parquet('data.parquet') where value > 10")
+
+
+def test_optimized_parquet_dependencies_are_in_worker_capabilities(connection, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    spec = prepare(connection, f"select value from read_parquet('{path}') where value > 10")
+    with pytest.raises(ValueError, match="source capability or split codec"):
+        check_plan_capabilities(spec, replace(native_plan_capabilities(connection), scans=()))
+
+
+def test_optimized_parquet_file_versions_are_in_blueprint_identity(connection, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    sql = f"select value from read_parquet('{path}') where value > 10"
+    first = prepare(connection, sql)
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    second = prepare(connection, sql)
+    assert first.cache_key() != second.cache_key()
+
+
+def test_optimized_parquet_dependencies_survive_submission_transport(connection, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    spec = prepare(connection, f"select value from read_parquet('{path}') where value > 10")
+    transported = RayQuerySpec.from_dict(
+        json.loads(json.dumps(spec.to_dict())), expected_engine_identity=native.engine_identity()
+    )
+    fragment = transported.graph.fragments[0]
+    assert fragment.partition_count == 1
+    assert not fragment.sources
+    assert len(fragment.source_dependencies) == 1
+    assert fragment.source_dependencies[0].requires_snapshot
+    assert len(fragment.source_dependencies[0].splits) == 1
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, transported) == []
+    damaged_fragment = replace(fragment, source_dependencies=())
+    damaged = replace(transported, graph=replace(transported.graph, fragments=(damaged_fragment,)))
+    with vane.connect(config={"threads": 1}) as worker:
+        with pytest.raises(ValueError, match="native fragment disagrees"):
+            prepare_worker_plan(worker, damaged)
+
+
 def test_relative_source_paths_cannot_depend_on_worker_working_directory(connection, tmp_path, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq

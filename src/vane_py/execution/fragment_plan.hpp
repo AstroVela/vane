@@ -40,6 +40,9 @@ struct FragmentSpec {
 	vector<string> names;
 	PlanNode root;
 	vector<SourceSpec> sources;
+	// Bound file dependencies survive scan/statistics pruning and need no task
+	// assignments. Their source codec still describes the original file set.
+	vector<SourceSpec> source_dependencies;
 	string Serialize() const;
 	static FragmentSpec Deserialize(const string &payload);
 };

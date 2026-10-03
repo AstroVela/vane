@@ -134,7 +134,9 @@ class RayQuerySpec:
         if not self.resources.memory.exchange_bytes or not self.resources.memory.staging_bytes:
             raise ValueError("Ray submissions require exchange and staging memory")
         if self.requires_replay and any(
-            source.requires_snapshot for fragment in self.graph.fragments for source in fragment.sources
+            source.requires_snapshot
+            for fragment in self.graph.fragments
+            for source in fragment.sources + fragment.source_dependencies
         ):
             raise ValueError("FTE requires immutable source versions; ordinary Parquet files are not replayable")
 
@@ -260,7 +262,7 @@ def check_plan_capabilities(spec: RayQuerySpec, capabilities: PlanCapabilities) 
     if any(
         (source.capability, source.codec) not in capabilities.scans
         for fragment in spec.graph.fragments
-        for source in fragment.sources
+        for source in fragment.sources + fragment.source_dependencies
     ):
         raise ValueError("worker lacks a source capability or split codec")
 

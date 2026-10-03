@@ -196,7 +196,8 @@ FragmentSpec
   input_ports
   output_ports
   partition_count
-  source_specs
+  sources
+  source_dependencies
   semantic_dependencies
   resource_demand
 
@@ -213,7 +214,7 @@ ExchangeSpec
 
 ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标记。策略绑定阶段生成 DirectBinding 或 MaterializedBinding。第一版一条查询的所有跨 fragment 边使用同一种绑定，不提供混合恢复。
 
-当前 [plan.py](vane/execution/plan.py) 实现端口、native payload、交换边、扫描 source/split 和单根结果的数据契约及校验。schema、native 计划和 HASH 表达式以不可变 bytes 承载；解码时先校验协议和目标 engine identity。[compiler.py](vane/execution/compiler.py) 连接 native 编译器和加载验证。查询级资源声明和当前 SQL 子集的提交快照由 RayQuerySpec 承载；逐 fragment 资源分配、算子语义依赖随 scheduler 和分析算子接入。仅通过 Python 数据契约校验不代表 native payload 已可执行。
+当前 [plan.py](vane/execution/plan.py) 实现端口、native payload、交换边、扫描 source/split、数据源依赖和单根结果的数据契约及校验。`sources` 描述优化后的可执行扫描，`source_dependencies` 保留优化前绑定的 Parquet 文件集合；两者都进入 native envelope 和严格的 Python 传输格式。依赖不需要 task 的 split 分配，不产生额外扫描或分区。schema、native 计划和 HASH 表达式以不可变 bytes 承载；解码时先校验协议和目标 engine identity。[compiler.py](vane/execution/compiler.py) 连接 native 编译器和加载验证。查询级资源声明和当前 SQL 子集的提交快照由 RayQuerySpec 承载；逐 fragment 资源分配、算子语义依赖随 scheduler 和分析算子接入。仅通过 Python 数据契约校验不代表 native payload 已可执行。
 
 构图是无执行副作用的过程。远程 exchange 边界切分 fragment，扫描器产生可执行 source 描述。资源需求附着在同一图上，诊断图从它派生，不另行维护可能失真的可执行 ResourceGraph。
 
@@ -231,9 +232,11 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
 
-engine identity 同时包含 DuckDB SourceID 与 Vane 编译器/加载器源码摘要。schema、fragment 和 HASH 表达式分别带版本及身份，加载器在解释 native 算子之前检查身份与完整载荷边界。Python 图里的端口和 source 是原生描述的视图；validate_native_graph 对照 native 解码结果校验，拒绝两者不一致。
+engine identity 同时包含 DuckDB SourceID 与 Vane 编译器/加载器源码摘要。schema、fragment 和 HASH 表达式分别带版本及身份，加载器在解释 native 算子之前检查身份与完整载荷边界。Python 图里的端口、source 和 source dependency 是原生描述的视图；validate_native_graph 对照 native 解码结果校验，拒绝两者不一致。
 
 range 的扫描 split 由 table function 的 native 回调规划；Parquet 从绑定后的 MultiFileList 枚举文件，使用独立的文件 split codec，不依赖旧 FTE 的 split 管理器。载荷带稳定 split_id、能力和 codec 身份。worker bind 独立持有可移植状态，加载时必须显式提供所分配的 split；空列表代表空任务，未知或重复 split_id 被拒绝。无扫描的常量查询只执行一次，不因请求多个分区而复制结果。Parquet 的 requires_snapshot 标记为真：固定文件列表只封闭了枚举，提交层还必须检查访问条件与回放保证。
+
+编译器在优化前的 logical validation 中捕获每个 Parquet bind 的完整文件集合，作为 source fragment 的 `source_dependencies`。统计信息可把扫描优化成空结果，hive/file pruning 也可移除部分文件，但这些优化仍依赖原始文件。依赖使用同一 native 文件 codec，随扫描节点的移除继续保留；实际 split 分配与并行度仍由优化后的 `sources` 决定。纯空结果的 source fragment 只执行一次，HASH/GATHER 下游不携带源文件分配。
 
 当前 Parquet split 未携带原始文件序号，因此明确拒绝虚拟列 `file_index`。编译器在优化前检查 native 虚拟列 ID，覆盖投影和仅用于过滤的引用，物理计划导出与加载也检查同一限制；普通数据列使用相同名称仍可执行。未来开放该虚拟列时，split 和 scan bind 必须保留绑定时的原始文件索引，不能使用 task 内重新编号的文件列表代替。
 
@@ -260,11 +263,13 @@ prepare_ray_query 只接受 RayExecution。在连接锁内先读取语义设置�
 | 普通 Parquet 文件 | 固定文件集合；要求绝对路径、worker 可见的本地普通文件；准备时核对路径、大小和修改时间 | 拒绝，尚无不可变版本保证 |
 | 远程文件、其他 scan 或自定义文件系统 | 当前提交 profile 不支持 | 当前提交 profile 不支持 |
 
+source 快照同时覆盖实际扫描和 `source_dependencies`，同一路径的文件元数据只捕获一次。扫描完全被优化掉时仍校验原始文件；部分文件被裁剪时也保留被裁剪文件的校验。普通 Parquet 的绝对路径、访问条件和 FTE 限制应用于全部依赖，不能因优化后的结果为空而绕过。依赖的 capability/codec 纳入 worker 能力检查，文件版本和依赖身份纳入蓝图缓存键；跨进程传输后不能从 Python 图中删掉 native 计划携带的依赖。
+
 Parquet 元数据检查是访问前置条件，不是内容快照：相同大小和修改时间的替换可能无法检测，检查后再修改也不被阻止。调用方须在执行期间保持文件稳定；每次准备 task/attempt 时重新检查。不可变对象版本、snapshot isolation 或受生命周期保护的 staging 输入应随对应 source 接入，再开放其 FTE 支持。文件内容哈希本身也不能提供重试时的旧版本可读性。
 
 [ResourceDemand](vane/execution/resource_demand.py) 声明查询的 CPU share、task context 数、I/O 并发和 operator/result/exchange/staging 四类内存。当前为 CPU 算子子集，不预先声明尚无执行能力的 GPU/UDF 资源。Ray 必须显式提供 exchange 和 staging 预算。首版 pipelined 按整张图同时活动，context 声明至少覆盖分区数之和；严格阶段 FTE 至少覆盖最大阶段分区数。这只验证声明能描述计划；实际 worker 容量、最小可推进窗口和原子预留由 P2/P3 的准入实现。
 
-prepare_worker_plan 先检查 worker 的 engine、协议、类型/连接 profile、exchange distribution 和 scan capability/codec，再恢复连接、检查 source、加载原生 fragment，并对照 Python 图中的端口、source、结果列名和 HASH 规则。能力清单由 native catalog 与当前编译器产生，表示加载能力；它不证明 TaskRuntime、网络端点或 exchange store 已就绪。未来 scheduler 必须在每个 task/attempt 启动前使用这些检查，并完成自身的准入与存储检查。
+prepare_worker_plan 先检查 worker 的 engine、协议、类型/连接 profile、exchange distribution 和 scan/dependency capability/codec，再恢复连接、检查 source 与原始数据源依赖、加载原生 fragment，并对照 Python 图中的端口、source、source dependency、结果列名和 HASH 规则。能力清单由 native catalog 与当前编译器产生，表示加载能力；它不证明 TaskRuntime、网络端点或 exchange store 已就绪。未来 scheduler 必须在每个 task/attempt 启动前使用这些检查，并完成自身的准入与存储检查。
 
 RayQuerySpec.cache_key 对规范序列化计算 SHA-256，包含 engine、完整图、schema、分区规则、执行/超时选项、资源声明、连接与 source 快照，只排除 query_id。它标识可复用的计划蓝图；不缓存结果、连接、attempt、端点或 reservation，命中后仍必须重新检查 source 与 worker。
 

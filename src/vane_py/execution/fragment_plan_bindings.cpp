@@ -40,20 +40,9 @@ void InputPorts(const PlanNode &node, py::list &result) {
 	}
 }
 
-py::dict DescribeFragment(const FragmentSpec &fragment) {
-	py::dict result;
-	result["fragment_id"] = fragment.fragment_id;
-	result["native_plan"] = py::bytes(fragment.Serialize());
-	result["partition_count"] = fragment.partition_count;
-	result["names"] = fragment.names;
-	py::list inputs;
-	InputPorts(fragment.root, inputs);
-	result["inputs"] = inputs;
-	py::list outputs;
-	outputs.append(Port("out", fragment.root.types));
-	result["outputs"] = outputs;
+py::list DescribeSources(const vector<SourceSpec> &specifications) {
 	py::list sources;
-	for (auto &source : fragment.sources) {
+	for (auto &source : specifications) {
 		py::dict spec;
 		spec["source_id"] = source.source_id;
 		spec["function_name"] = source.function_name;
@@ -70,7 +59,23 @@ py::dict DescribeFragment(const FragmentSpec &fragment) {
 		spec["splits"] = splits;
 		sources.append(spec);
 	}
-	result["sources"] = sources;
+	return sources;
+}
+
+py::dict DescribeFragment(const FragmentSpec &fragment) {
+	py::dict result;
+	result["fragment_id"] = fragment.fragment_id;
+	result["native_plan"] = py::bytes(fragment.Serialize());
+	result["partition_count"] = fragment.partition_count;
+	result["names"] = fragment.names;
+	py::list inputs;
+	InputPorts(fragment.root, inputs);
+	result["inputs"] = inputs;
+	py::list outputs;
+	outputs.append(Port("out", fragment.root.types));
+	result["outputs"] = outputs;
+	result["sources"] = DescribeSources(fragment.sources);
+	result["source_dependencies"] = DescribeSources(fragment.source_dependencies);
 	return result;
 }
 

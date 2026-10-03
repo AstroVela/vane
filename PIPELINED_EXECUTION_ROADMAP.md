@@ -194,3 +194,12 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：
 - 源码包清单补齐 P0 的四个 release 测试文件与设计/roadmap 文档，修复 CI 的缺失文件校验失败。
 - 本次 native 已重新构建并非 editable 安装；engine identity 为 `fbbdb1efe0:fragment:ec00dd1647150041b52e0ce2d2dd7dcfcca038403c10a766e7352137fcdf46c7`，与 DuckDB 源码及编译器/加载器摘要一致。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3633 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3709 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。root/DuckDB 格式、ruff、pre-commit、源码版权清单与实际源码包发布校验通过。
+
+### P0 优化依赖审查修复（PR #935）
+
+- 在优化前保存绑定的 Parquet 文件集合到 `FragmentSpec.source_dependencies`，覆盖扫描整体移除及 hive/file pruning。优化后的 `sources` 只负责实际扫描与 split 分配，依赖不创建额外扫描任务；空结果 source fragment 保持单分区。
+- native 文件快照、普通 Parquet 的 FTE 拒绝、绝对路径条件、worker capability/codec、图一致性和缓存身份同时检查执行 source 与原始数据源依赖；重复文件路径只捕获一次元数据。依赖随 native envelope 和严格 JSON 描述传输，不支持旧格式转换。
+- 新增 19 项回归，覆盖统计信息生成空结果、常量 false、文件重写/mtime/删除、部分文件裁剪、FTE、能力、缓存、描述损坏以及 HASH/GATHER。连同 P0 原有用例共 257 项通过；审查方的 4 项临时复现用例从全部失败变为全部通过。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `fbbdb1efe0:fragment:e87a3f9db06b0ca9b67034b39ac8b47cf673af5043cb9fc477dd9bb2073afac4`，与编译器/加载器源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3652 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3728 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
+- root 格式、ruff、全仓库 mypy、pre-commit、源码版权清单、文档链接和实际源码包发布校验通过。

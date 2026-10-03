@@ -156,6 +156,7 @@ class FragmentSpec:
     inputs: tuple[PortSpec, ...]
     outputs: tuple[PortSpec, ...]
     sources: tuple[SourceSpec, ...] = ()
+    source_dependencies: tuple[SourceSpec, ...] = ()
 
     def __post_init__(self) -> None:
         _name(self.fragment_id, "fragment_id")
@@ -172,16 +173,17 @@ class FragmentSpec:
             object.__setattr__(self, label, tuple(sorted(ports, key=lambda port: port.port_id)))
         if not self.outputs:
             raise ValueError("a read-only fragment must have an output port")
-        sources = _items(self.sources, "sources")
-        if any(not isinstance(source, SourceSpec) for source in sources):
-            raise ValueError("sources must contain SourceSpec objects")
-        if len({source.source_id for source in sources}) != len(sources):
-            raise ValueError("duplicate source_id")
-        object.__setattr__(self, "sources", tuple(sorted(sources, key=lambda source: source.source_id)))
+        for label in ("sources", "source_dependencies"):
+            sources = _items(getattr(self, label), label)
+            if any(not isinstance(source, SourceSpec) for source in sources):
+                raise ValueError(f"{label} must contain SourceSpec objects")
+            if len({source.source_id for source in sources}) != len(sources):
+                raise ValueError(f"duplicate source_id in {label}")
+            object.__setattr__(self, label, tuple(sorted(sources, key=lambda source: source.source_id)))
 
     @property
     def required_capabilities(self) -> tuple[str, ...]:
-        return tuple(sorted({source.capability for source in self.sources}))
+        return tuple(sorted({source.capability for source in self.sources + self.source_dependencies}))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -191,11 +193,16 @@ class FragmentSpec:
             "inputs": [port.to_dict() for port in self.inputs],
             "outputs": [port.to_dict() for port in self.outputs],
             "sources": [source.to_dict() for source in self.sources],
+            "source_dependencies": [source.to_dict() for source in self.source_dependencies],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> FragmentSpec:
-        _fields(value, {"fragment_id", "native_plan", "partition_count", "inputs", "outputs", "sources"}, cls.__name__)
+        _fields(
+            value,
+            {"fragment_id", "native_plan", "partition_count", "inputs", "outputs", "sources", "source_dependencies"},
+            cls.__name__,
+        )
         return cls(
             fragment_id=value["fragment_id"],
             native_plan=_decode(value["native_plan"], "native_plan"),
@@ -203,6 +210,9 @@ class FragmentSpec:
             inputs=tuple(PortSpec.from_dict(port) for port in _items(value["inputs"], "inputs")),
             outputs=tuple(PortSpec.from_dict(port) for port in _items(value["outputs"], "outputs")),
             sources=tuple(SourceSpec.from_dict(source) for source in _items(value["sources"], "sources")),
+            source_dependencies=tuple(
+                SourceSpec.from_dict(source) for source in _items(value["source_dependencies"], "source_dependencies")
+            ),
         )
 
 

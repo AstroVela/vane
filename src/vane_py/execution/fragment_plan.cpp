@@ -201,6 +201,7 @@ string FragmentSpec::Serialize() const {
 		serializer.WriteProperty(12, "names", names);
 		serializer.WriteProperty(13, "root", root);
 		serializer.WriteProperty(14, "sources", sources);
+		serializer.WriteProperty(15, "source_dependencies", source_dependencies);
 	});
 }
 
@@ -213,6 +214,7 @@ FragmentSpec FragmentSpec::Deserialize(const string &payload) {
 		result.names = deserializer.ReadProperty<vector<string>>(12, "names");
 		result.root = deserializer.ReadProperty<PlanNode>(13, "root");
 		result.sources = deserializer.ReadProperty<vector<SourceSpec>>(14, "sources");
+		result.source_dependencies = deserializer.ReadProperty<vector<SourceSpec>>(15, "source_dependencies");
 	});
 	CheckPartitions(result.partition_count);
 	if (result.fragment_id.empty() || result.names.size() != result.root.types.size()) {
@@ -271,8 +273,12 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 	    expression, [&](ParsedExpression &child) { CheckParsedExpression(context, child); });
 }
 
+SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data);
+
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
+	vector<SourceSpec> source_dependencies;
+
 	void VisitOperator(LogicalOperator &op) override {
 		switch (op.type) {
 		case LogicalOperatorType::LOGICAL_GET: {
@@ -282,6 +288,12 @@ public:
 			}
 			// Validate before filter pushdown can remove a filter-only virtual column.
 			CheckScanColumns(get.function.name, get.GetColumnIds());
+			if (IsParquetScan(get.function.name)) {
+				// Statistics and file pruning depend on the bound file set even if
+				// optimization later removes every executable scan.
+				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
+				                                            get.function.name, get.bind_data.get()));
+			}
 			break;
 		}
 		case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -345,8 +357,8 @@ TableFunctionDistributedScanInput ScanInput(PhysicalTableScan &scan) {
 	                                         scan.projection_ids, scan.table_filters.get(), scan.estimated_cardinality);
 }
 
-MultiFileBindData &ParquetBind(PhysicalTableScan &scan) {
-	auto bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
+MultiFileBindData &ParquetBind(FunctionData *bind_data) {
+	auto bind = dynamic_cast<MultiFileBindData *>(bind_data);
 	if (!bind || !bind->file_list) {
 		throw SerializationException("Parquet fragment requires a native multi-file bind");
 	}
@@ -362,6 +374,22 @@ string EncodeFile(const OpenFileInfo &file) {
 		}
 		serializer.WriteProperty(2, "options", options);
 	});
+}
+
+SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data) {
+	SourceSpec source;
+	source.source_id = id;
+	source.function_name = name;
+	source.capability = PARQUET_CAPABILITY;
+	source.codec = PARQUET_CODEC;
+	source.requires_snapshot = true;
+	for (auto &file : ParquetBind(bind_data).file_list->GetAllFiles()) {
+		DistributedScanSplit split;
+		split.split_id = "file" + std::to_string(source.splits.size());
+		split.payload = EncodeFile(file);
+		source.splits.push_back(std::move(split));
+	}
+	return source;
 }
 
 OpenFileInfo DecodeFile(const string &payload) {
@@ -390,19 +418,12 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 			throw NotImplementedException("scan %s has no portable split contract", scan.function.name);
 		}
 		SourceSpec source;
-		source.source_id = "source" + std::to_string(fragment.sources.size());
+		const auto source_id = "source" + std::to_string(fragment.sources.size());
+		source.source_id = source_id;
 		source.function_name = scan.function.name;
 		if (IsParquetScan(scan.function.name)) {
-			source.capability = PARQUET_CAPABILITY;
-			source.codec = PARQUET_CODEC;
-			source.requires_snapshot = true;
-			auto &bind = ParquetBind(scan);
-			for (auto &file : bind.file_list->GetAllFiles()) {
-				DistributedScanSplit split;
-				split.split_id = "file" + std::to_string(source.splits.size());
-				split.payload = EncodeFile(file);
-				source.splits.push_back(std::move(split));
-			}
+			source = ParquetSource(source_id, scan.function.name, scan.bind_data.get());
+			auto &bind = ParquetBind(scan.bind_data.get());
 			// Copy drops cached coordinator readers; workers receive files only
 			// through their explicit assignments, never by re-expanding a glob.
 			auto worker_bind = bind.Copy();
@@ -512,6 +533,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		FragmentSpec source;
 		source.fragment_id = "fragment0";
 		source.names = planner.names;
+		source.source_dependencies = std::move(validator.source_dependencies);
 		source.root = EncodeNode(context, physical->Root(), source, partitions);
 		// Constants execute once. Parallelism comes only from independently
 		// assignable scan splits, not from duplicating a complete local query.
@@ -614,7 +636,7 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 			}
 			scan.extra_info.total_files = files.size();
 			scan.extra_info.filtered_files = files.size();
-			ParquetBind(scan).file_list = make_shared_ptr<SimpleMultiFileList>(std::move(files));
+			ParquetBind(scan.bind_data.get()).file_list = make_shared_ptr<SimpleMultiFileList>(std::move(files));
 		} else {
 			scan.function.GetDistributedScanCallbacks().apply_splits(scan.bind_data.get(), selected);
 		}
@@ -826,24 +848,41 @@ void ApplyConnection(ClientContext &context, const string &snapshot) {
 
 string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool require_replay) {
 	vector<string> identities;
+	vector<string> dependencies;
 	vector<string> versions;
-	for (auto &source : fragment.sources) {
-		identities.push_back(Encode([&](Serializer &serializer) { source.Serialize(serializer); }));
+	std::set<string> stamped_files;
+	auto capture_versions = [&](const SourceSpec &source) {
 		if (source.requires_snapshot) {
 			if (!IsParquetScan(source.function_name) || require_replay) {
 				throw NotImplementedException(
 				    "FTE requires an immutable source version; ordinary Parquet files are not replayable");
 			}
 			for (auto &split : source.splits) {
-				versions.push_back(FileStamp(context, DecodeFile(split.payload)));
+				auto file = DecodeFile(split.payload);
+				if (stamped_files.insert(file.path).second) {
+					versions.push_back(FileStamp(context, file));
+				}
 			}
 		}
+	};
+	for (auto &source : fragment.sources) {
+		identities.push_back(Encode([&](Serializer &serializer) { source.Serialize(serializer); }));
+		capture_versions(source);
+	}
+	for (auto &source : fragment.source_dependencies) {
+		if (!source.requires_snapshot || !IsParquetScan(source.function_name) ||
+		    source.capability != PARQUET_CAPABILITY || source.codec != PARQUET_CODEC) {
+			throw SerializationException("unsupported fragment source dependency");
+		}
+		dependencies.push_back(Encode([&](Serializer &serializer) { source.Serialize(serializer); }));
+		capture_versions(source);
 	}
 	return Encode([&](Serializer &serializer) {
 		WriteIdentity(serializer, "sources");
 		serializer.WriteProperty(10, "fragment", fragment.fragment_id);
 		serializer.WriteProperty(11, "sources", identities);
 		serializer.WriteProperty(12, "file_versions", versions);
+		serializer.WriteProperty(13, "source_dependencies", dependencies);
 	});
 }
 
@@ -855,6 +894,7 @@ void ValidateSources(ClientContext &context, const FragmentSpec &fragment, const
 		deserializer.ReadProperty<string>(10, "fragment");
 		deserializer.ReadProperty<vector<string>>(11, "sources");
 		deserializer.ReadProperty<vector<string>>(12, "file_versions");
+		deserializer.ReadProperty<vector<string>>(13, "source_dependencies");
 	});
 	if (CaptureSources(context, fragment, require_replay) != snapshot) {
 		throw InvalidInputException("submission source snapshot changed or does not match fragment");

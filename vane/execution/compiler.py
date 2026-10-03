@@ -41,6 +41,17 @@ class FragmentCompileOptions:
         object.__setattr__(self, "hash_columns", columns)
 
 
+def _native_source(source: dict[str, Any]) -> SourceSpec:
+    return SourceSpec(
+        source_id=source["source_id"],
+        function_name=source["function_name"],
+        capability=source["capability"],
+        codec=source["codec"],
+        requires_snapshot=source["requires_snapshot"],
+        splits=tuple(ScanSplitSpec(**split) for split in source["splits"]),
+    )
+
+
 def _native_fragment(value: dict[str, Any]) -> FragmentSpec:
     return FragmentSpec(
         fragment_id=value["fragment_id"],
@@ -48,17 +59,8 @@ def _native_fragment(value: dict[str, Any]) -> FragmentSpec:
         partition_count=value["partition_count"],
         inputs=tuple(PortSpec(**port) for port in value["inputs"]),
         outputs=tuple(PortSpec(**port) for port in value["outputs"]),
-        sources=tuple(
-            SourceSpec(
-                source_id=source["source_id"],
-                function_name=source["function_name"],
-                capability=source["capability"],
-                codec=source["codec"],
-                requires_snapshot=source["requires_snapshot"],
-                splits=tuple(ScanSplitSpec(**split) for split in source["splits"]),
-            )
-            for source in value["sources"]
-        ),
+        sources=tuple(_native_source(source) for source in value["sources"]),
+        source_dependencies=tuple(_native_source(source) for source in value["source_dependencies"]),
     )
 
 
