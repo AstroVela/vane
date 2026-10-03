@@ -88,6 +88,29 @@ def test_submission_transport_restores_session_and_executes_real_sql(connection,
         )
 
 
+@pytest.mark.parametrize("mode", list(DistributedMode))
+@pytest.mark.parametrize("disabled_optimizers", ["", "expression_rewriter"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select current_timestamp::varchar from range(3)",
+        "select current_date::varchar from range(3)",
+        "select current_time::varchar from range(3)",
+        "select localtimestamp::varchar from range(3)",
+        "select localtime::varchar from range(3)",
+        "select range from range(3) where current_timestamp::varchar <> ''",
+        "select case when range = 0 then current_timestamp::varchar else 'later' end from range(3)",
+    ],
+)
+def test_submission_rejects_query_stable_expressions_before_constant_folding(
+    connection, mode, disabled_optimizers, sql
+):
+    connection.execute(f"SET disabled_optimizers='{disabled_optimizers}'")
+    assert len(connection.execute(sql).fetchall()) == 3
+    with pytest.raises(vane.NotImplementedException, match="consistent across tasks and attempts"):
+        prepare(connection, sql, options=options(mode), compile_options=FragmentCompileOptions(3))
+
+
 def test_worker_preparation_is_session_scoped_on_shared_database(connection):
     with vane.connect(config={"threads": 1}) as planning:
         planning.execute("SET ieee_floating_point_ops=false")

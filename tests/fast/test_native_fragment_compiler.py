@@ -204,6 +204,38 @@ def test_parquet_worker_preserves_union_schema_without_coordinator_readers(conne
         assert Counter(execute_graph(worker, graph)) == Counter(expected)
 
 
+@pytest.mark.parametrize("scan", ["read_parquet", "parquet_scan"])
+@pytest.mark.parametrize("partitions", [1, 3])
+@pytest.mark.parametrize(
+    "projection,predicate,expected", [("file_index", "", [(0,), (1,), (2,)]), ("value", "where file_index = 1", [(1,)])]
+)
+def test_parquet_virtual_file_index_is_rejected_before_splitting(
+    connection, tmp_path, scan, partitions, projection, predicate, expected
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for index in range(3):
+        pq.write_table(pa.table({"value": [index]}), tmp_path / f"part{index}.parquet")
+    sql = f"select {projection} from {scan}('{tmp_path}/*.parquet') {predicate}"
+    assert Counter(connection.execute(sql).fetchall()) == Counter(expected)
+    with pytest.raises(vane.NotImplementedException, match="virtual file_index"):
+        compile_sql(connection, sql, partitions=partitions)
+
+
+def test_parquet_physical_column_named_file_index_remains_supported(connection, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for index in range(3):
+        pq.write_table(pa.table({"file_index": [index], "value": [index + 10]}), tmp_path / f"part{index}.parquet")
+    sql = f"select file_index, value from read_parquet('{tmp_path}/*.parquet') where file_index = 1"
+    assert connection.execute(sql).fetchall() == [(1, 11)]
+    graph = compile_sql(connection, sql, partitions=3)
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_graph(worker, graph) == [(1, 11)]
+
+
 def test_compiling_does_not_enter_old_runner_or_execute_a_query(connection, monkeypatch):
     from vane import _ray_cxx, runners
 

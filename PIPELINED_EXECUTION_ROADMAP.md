@@ -185,3 +185,12 @@ P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3596 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3672 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。这次完整验收使用上述从当前 C++ 源码重建的 native。
 
 P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；P1.2 在进程内验证分布式直接通道，不新增 local+pipelined 模式。TaskRuntime、Ray 调度器及网络数据面仍待后续阶段接线。
+
+### P0 审查修复（PR #935）
+
+- Parquet 的虚拟 `file_index` 在分配文件后会从零重新编号；当前编译器按原生列 ID 显式拒绝，覆盖投影、过滤及物理计划加载，同名普通数据列仍可执行。完整支持需在 split/scan 中保留原始文件索引。
+- 表达式在优化前按 `IsConsistent()` 校验，拒绝 volatile 与仅单次查询内稳定的函数。ICU 的 `LOCALTIME`/`LOCALTIMESTAMP` 补齐 `CONSISTENT_WITHIN_QUERY` 声明；两种 Ray 模式都拒绝尚未冻结的查询时间，未来支持需把查询上下文纳入提交快照。
+- 新增 37 项回归验收，覆盖多个文件/分区、Parquet 两个入口、同名普通列、五类时间表达式、过滤与 CASE，以及优化器开启/关闭。旧实现中 36 项拒绝用例失败，修复后连同 P0 原有用例共 238 项通过。
+- 源码包清单补齐 P0 的四个 release 测试文件与设计/roadmap 文档，修复 CI 的缺失文件校验失败。
+- 本次 native 已重新构建并非 editable 安装；engine identity 为 `fbbdb1efe0:fragment:ec00dd1647150041b52e0ce2d2dd7dcfcca038403c10a766e7352137fcdf46c7`，与 DuckDB 源码及编译器/加载器摘要一致。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3633 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3709 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。root/DuckDB 格式、ruff、pre-commit、源码版权清单与实际源码包发布校验通过。

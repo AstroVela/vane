@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -230,6 +231,19 @@ bool SupportedScan(const string &name) {
 	return name == "range" || name == "generate_series" || IsParquetScan(name);
 }
 
+void CheckScanColumns(const string &name, const vector<ColumnIndex> &column_ids) {
+	if (!IsParquetScan(name)) {
+		return;
+	}
+	for (auto &column : column_ids) {
+		if (column.GetPrimaryIndex() == MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+			// A task's file list has different indices from the bound query's list.
+			// Match the virtual column ID so physical columns named file_index work.
+			throw NotImplementedException("fragment compiler does not support Parquet virtual file_index");
+		}
+	}
+}
+
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
@@ -266,6 +280,8 @@ public:
 			if (!SupportedScan(get.function.name) || !get.children.empty()) {
 				throw NotImplementedException("fragment compiler does not support scan %s", get.function.name);
 			}
+			// Validate before filter pushdown can remove a filter-only virtual column.
+			CheckScanColumns(get.function.name, get.GetColumnIds());
 			break;
 		}
 		case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -282,8 +298,11 @@ public:
 	}
 
 	void VisitExpression(unique_ptr<Expression> *expression) override {
-		if ((*expression)->IsVolatile()) {
-			throw NotImplementedException("fragment compiler requires deterministic expressions");
+		// Query-stable functions (e.g. CURRENT_TIMESTAMP) also change across tasks
+		// and retries. Reject them before optional constant folding can hide them.
+		if (!(*expression)->IsConsistent()) {
+			throw NotImplementedException(
+			    "fragment compiler requires expressions consistent across tasks and attempts");
 		}
 		LogicalOperatorVisitor::VisitExpression(expression);
 	}
@@ -306,11 +325,14 @@ void CheckOperator(PhysicalOperator &op, idx_t children) {
 			return;
 		}
 		break;
-	case PhysicalOperatorType::TABLE_SCAN:
-		if (children == 0 && SupportedScan(op.Cast<PhysicalTableScan>().function.name)) {
+	case PhysicalOperatorType::TABLE_SCAN: {
+		auto &scan = op.Cast<PhysicalTableScan>();
+		if (children == 0 && SupportedScan(scan.function.name)) {
+			CheckScanColumns(scan.function.name, scan.column_ids);
 			return;
 		}
 		break;
+	}
 	default:
 		break;
 	}

@@ -225,6 +225,8 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 [native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 的首个子集为单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter 和 projection。标量函数先按已验收的内置函数集合检查，用户函数在常量折叠前拒绝；聚合、连接、排序、LIMIT、相关子查询及扩展类型按后续阶段实现。普通本地查询继续由原生查询入口处理，不调用该编译器。
 
+绑定后的表达式在优化前按 native `IsConsistent()` 检查：同时拒绝 volatile 和 `CONSISTENT_WITHIN_QUERY` 函数，包括 `CURRENT_TIMESTAMP`、`CURRENT_DATE`、`CURRENT_TIME`、`LOCALTIMESTAMP` 和 `LOCALTIME`。当前提交描述尚未冻结查询时间，不能把单次查询内稳定误当成跨 task/attempt 稳定，也不能依赖可关闭的常量折叠。该限制统一应用于 pipelined 和 FTE；未来支持这类表达式时，需要在提交时冻结查询上下文，并让所有 task 与重试复用。
+
 扫描、过滤和投影先合并到一个 source fragment。并行输出通过 GATHER 进入单分区根结果；显式指定 hash_columns 时，native 按结果列类型绑定 BoundReferenceExpression，生成 HASH 边，再按需要 GATHER。hash_columns 是内部物理分区请求，尚不表示已实现 aggregate/join 的自动分布式规划。HASH 求值和 NULL、多列键合并均使用 DuckDB 原生表达式执行与 DataChunk.Hash。
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
@@ -232,6 +234,8 @@ fragment 使用自己的原生 envelope。普通节点保存不含子节点的 n
 engine identity 同时包含 DuckDB SourceID 与 Vane 编译器/加载器源码摘要。schema、fragment 和 HASH 表达式分别带版本及身份，加载器在解释 native 算子之前检查身份与完整载荷边界。Python 图里的端口和 source 是原生描述的视图；validate_native_graph 对照 native 解码结果校验，拒绝两者不一致。
 
 range 的扫描 split 由 table function 的 native 回调规划；Parquet 从绑定后的 MultiFileList 枚举文件，使用独立的文件 split codec，不依赖旧 FTE 的 split 管理器。载荷带稳定 split_id、能力和 codec 身份。worker bind 独立持有可移植状态，加载时必须显式提供所分配的 split；空列表代表空任务，未知或重复 split_id 被拒绝。无扫描的常量查询只执行一次，不因请求多个分区而复制结果。Parquet 的 requires_snapshot 标记为真：固定文件列表只封闭了枚举，提交层还必须检查访问条件与回放保证。
+
+当前 Parquet split 未携带原始文件序号，因此明确拒绝虚拟列 `file_index`。编译器在优化前检查 native 虚拟列 ID，覆盖投影和仅用于过滤的引用，物理计划导出与加载也检查同一限制；普通数据列使用相同名称仍可执行。未来开放该虚拟列时，split 和 scan bind 必须保留绑定时的原始文件索引，不能使用 task 内重新编号的文件列表代替。
 
 [native 编译测试](tests/fast/test_native_fragment_compiler.py) 使用有限数据的物化测试设施执行反序列化后的 fragment，并对照原生 SQL；它不接入公开 local 查询，也不作为 Ray 流水调度器。TaskRuntime、异步 exchange 和根结果服务仍按 P1/P2 实现。
 
