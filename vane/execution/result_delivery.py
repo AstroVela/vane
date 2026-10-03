@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.request_admission import _timeout
@@ -18,6 +18,11 @@ from vane.execution.request_deadline import MonotonicDeadline
 from vane.execution.udf_actor_pool_lifecycle import rollback_actor_pools
 from vane.execution.udf_admission import AdmissionLease
 from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+    from vane.execution.query_runtime import QueryContext
 
 
 @dataclass(frozen=True)
@@ -97,7 +102,7 @@ class ResultPayload(Protocol):
 class ResultStream(Protocol):
     """Pull one payload at a time; retain execution until EOF or cleanup."""
 
-    def read(self, result: ManagedResult) -> bool: ...
+    def read(self, result: QueryResult) -> bool: ...
 
     def check(self) -> None: ...
 
@@ -138,7 +143,7 @@ class RuntimeResultDelivery:
             raise TypeError("result_limit must be ResultDeliveryLimits")
         self.limits = limits
         self._condition = threading.Condition()
-        self._results: dict[str, ManagedResult] = {}
+        self._results: dict[str, QueryResult] = {}
         self._buffers: dict[str, _BufferLease] = {}
         self._usage_bytes = 0
         self._closed = False
@@ -148,7 +153,7 @@ class RuntimeResultDelivery:
         self._delivery_seconds = 0.0
         self._delivery_samples = 0
 
-    def begin(self) -> ManagedResult:
+    def begin(self) -> QueryResult:
         with self._condition:
             if self._closed:
                 raise ResultDeliveryClosed("result delivery runtime is closed")
@@ -161,11 +166,11 @@ class RuntimeResultDelivery:
                     used=len(self._results),
                     limit=self.limits.max_results,
                 )
-            result = ManagedResult(self, uuid.uuid4().hex)
+            result = QueryResult(self, uuid.uuid4().hex)
             self._results[result.result_id] = result
             return result
 
-    def _release_result(self, result: ManagedResult) -> None:
+    def _release_result(self, result: QueryResult) -> None:
         with self._condition:
             if self._results.pop(result.result_id, None) is not None:
                 assert result._outcome is not None
@@ -262,7 +267,7 @@ class RuntimeResultDelivery:
             raise RuntimeError("stream cleanup failed; retry result.close() or runtime.close()") from errors[0]
 
 
-class ManagedResult:
+class QueryResult:
     """A single-consumer iterator whose remaining output has a separate lifetime.
 
     ``take()`` transfers one payload to the caller. Its underlying buffers remain
@@ -272,6 +277,9 @@ class ManagedResult:
     def __init__(self, runtime: RuntimeResultDelivery, result_id: str) -> None:
         self._runtime = runtime
         self.result_id = result_id
+        self.query_id: str | None = None
+        self.context: QueryContext | None = None
+        self.schema: pa.Schema | None = None
         self._payloads: deque[ResultPayload] = deque()
         self._stream: ResultStream | None = None
         self._stream_error: Callable[[], BaseException] | None = None
@@ -617,6 +625,51 @@ class ManagedResult:
         self._cleanup()
         return True
 
+    @property
+    def execution_state(self) -> str | None:
+        """Execution outcome, independent of the delivery handle's state."""
+        return None if self.context is None else self.context.state
+
+    def read_batch(self) -> Any:
+        """Read the next batch; EOF raises StopIteration and errors propagate."""
+        return self.take()
+
+    def collect(self) -> pa.Table:
+        """Collect remaining rows into caller-owned memory outside the stream budget.
+
+        Copy each batch before requesting another: retaining every stream lease
+        would exhaust its window and prevent the collection from making progress.
+        """
+        import pyarrow as pa
+
+        tables: list[pa.Table] = []
+        value = None
+        table = None
+        try:
+            while True:
+                try:
+                    value = self.take()
+                except StopIteration:
+                    break
+                table = pa.Table.from_batches([value]) if isinstance(value, pa.RecordBatch) else value
+                if not isinstance(table, pa.Table):
+                    raise TypeError("collect() requires Arrow result batches")
+                with pa.BufferOutputStream() as output:
+                    with pa.ipc.new_stream(output, table.schema) as writer:
+                        writer.write_table(table)
+                    copied = output.getvalue()
+                with pa.ipc.open_stream(copied) as reader:
+                    tables.append(reader.read_all())
+                value = table = None
+            return pa.concat_tables(tables) if tables else pa.Table.from_batches([], schema=self.schema)
+        except BaseException as error:
+            value = table = None
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+
     def close(self) -> None:
         self._guard_stream()
         with self._runtime._condition:
@@ -646,13 +699,13 @@ class ManagedResult:
                     if self._preparing or self._taking or self._cleaning or not self._cancel_finished.is_set():
                         self._runtime._condition.wait(remaining)
 
-    def __iter__(self) -> ManagedResult:
+    def __iter__(self) -> QueryResult:
         return self
 
     def __next__(self) -> Any:
         return self.take()
 
-    def __enter__(self) -> ManagedResult:
+    def __enter__(self) -> QueryResult:
         return self
 
     def __exit__(self, _type: object, error: BaseException | None, _traceback: object) -> None:

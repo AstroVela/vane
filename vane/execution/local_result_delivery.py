@@ -11,14 +11,14 @@ from typing import Any
 import pyarrow as pa
 
 from vane.execution.data_lifecycle import OutputBlockLeaseOwner
-from vane.execution.result_delivery import ManagedResult
+from vane.execution.result_delivery import QueryResult
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 
 class _NativeResultStream:
     """Own the reader, native cancellation fence and request through cleanup."""
 
-    def __init__(self, result: ManagedResult, reader: Any, query: Any, close_native: Any) -> None:
+    def __init__(self, result: QueryResult, reader: Any, query: Any, close_native: Any) -> None:
         self._reader = reader
         self._read_native: Any = None
         self._guard_native: Any = None
@@ -61,10 +61,11 @@ class _NativeResultStream:
                 if request._deadline is None or not request._deadline.expired():
                     return
 
-    def read(self, result: ManagedResult) -> bool:
+    def read(self, result: QueryResult) -> bool:
         batch = None
         try:
             self.check()
+            result.schema = self._reader.schema
             batch = self._read_native()
             self.check()
             self._had_rows = self._had_rows or bool(batch.num_rows)
@@ -126,9 +127,10 @@ class _NativeResultStream:
 
 
 def prepare_native_query_stream(
-    result: ManagedResult, reader: Any, schema: dict[str, Any], query: Any, close_native: Any
+    result: QueryResult, reader: Any, schema: dict[str, Any], query: Any, close_native: Any
 ) -> _NativeResultStream:
     result.result_schema = schema
+    result.schema = reader.schema if reader is not None else None
     result.completion_status = "streaming"
     source = _NativeResultStream(result, reader, query, close_native)
     result.start_stream(source)
@@ -172,7 +174,7 @@ class _ArrowResultPayload:
         return self._buffer is not None or self._owner is not None
 
 
-def prepare_local_result(result: ManagedResult, native: Any) -> None:
+def prepare_local_result(result: QueryResult, native: Any) -> None:
     """Build exact-size delivery buffers from an already materialized result.
 
     Native collection and its peak memory precede this budget. Encoding creates
@@ -186,19 +188,21 @@ def prepare_local_result(result: ManagedResult, native: Any) -> None:
         _prepare_table(result, table)
 
 
-def prepare_native_query_result(result: ManagedResult, table: pa.Table, schema: dict[str, Any]) -> None:
+def prepare_native_query_result(result: QueryResult, table: pa.Table, schema: dict[str, Any]) -> None:
     """Adapt an ordinary, fully materialized native query without another request."""
     result.result_schema = schema
+    result.schema = table.schema
     result.completion_status = "ok" if table.num_rows else "empty"
     if table.num_rows:
         _prepare_table(result, table)
 
 
-def _prepare_table(result: ManagedResult, table: pa.Table) -> None:
+def _prepare_table(result: QueryResult, table: pa.Table) -> None:
     try:
         result.check_preparation()
         if not isinstance(table, pa.Table):
             raise TypeError("managed local results require Arrow table partitions")
+        result.schema = table.schema
         with pa.MockOutputStream() as sizing:
             with pa.ipc.new_stream(sizing, table.schema) as writer:
                 writer.write_table(table)

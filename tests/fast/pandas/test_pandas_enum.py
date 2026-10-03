@@ -21,7 +21,7 @@ class TestPandasEnum:
         );
         """
         )
-        df = duckdb_cursor.query("SELECT * FROM tab LIMIT 0;").to_df()
+        df = duckdb_cursor.sql("SELECT * FROM tab LIMIT 0;").to_df()
         assert df["cat"].cat.categories.equals(pd.Index(["marie", "duchess", "toulouse"]))
         duckdb_cursor.execute("DROP TABLE tab")
         duckdb_cursor.execute("DROP TYPE cat")

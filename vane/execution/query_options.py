@@ -3,8 +3,8 @@
 
 """Immutable query configuration for native local and distributed Ray execution.
 
-These contracts do not start queries or change the existing public connection
-API. Local execution deliberately has no distributed execution mode.
+Local query() and the Ray fragment compiler consume these contracts. Local
+execution deliberately has no distributed execution mode.
 """
 
 from __future__ import annotations

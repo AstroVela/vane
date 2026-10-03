@@ -724,18 +724,17 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    py::arg("connection") = py::none());
 	m.def(
 	    "query",
-	    [](const py::object &query, string alias = "", py::object params = py::list(),
-	       shared_ptr<DuckDBPyConnection> conn = nullptr) {
+	    [](const py::object &query, const py::object &parameters, const py::object &options,
+	       const py::object &rows_per_batch, shared_ptr<DuckDBPyConnection> conn, const py::kwargs &overrides) {
+		    DuckDBPyConnection::CheckCallbackEntry();
 		    if (!conn) {
 			    conn = DuckDBPyConnection::DefaultConnection();
 		    }
-		    return conn->RunQuery(query, alias, params);
+		    return conn->Query(query, parameters, options, rows_per_batch, overrides);
 	    },
-	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	    "connection and catalog operations execute on the client.",
-	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
-	    py::arg("connection") = py::none());
+	    "Execute a native local query and return an incremental QueryResult", py::arg("query"),
+	    py::arg("parameters") = py::none(), py::kw_only(), py::arg("options") = py::none(),
+	    py::arg("rows_per_batch") = 2048, py::arg("connection") = py::none());
 	m.def(
 	    "from_query",
 	    [](const py::object &query, string alias = "", py::object params = py::list(),
@@ -1209,7 +1208,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 
 	RegisterExceptions(m);
 
-	m.def("connect", &DuckDBPyConnection::Connect,
+	m.def("connect", &DuckDBPyConnection::ConnectQuery,
 	      "Create a DuckDB database instance. Can take a database file name to read/write persistent data and a "
 	      "read_only flag if no changes are desired",
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));

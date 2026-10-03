@@ -29,6 +29,7 @@ add_library(
   dynamic_extension.cpp
   execution/fragment_plan.cpp
   execution/fragment_plan_bindings.cpp
+  execution/local_query.cpp
   vane_python.cpp
   importer.cpp
   merge_relation.cpp

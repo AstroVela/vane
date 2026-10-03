@@ -75,7 +75,7 @@ class TestRuntimeError:
             }
         )
         conn.execute("create view x as select * from df_in")
-        rel = conn.query("select * from x")
+        rel = conn.sql("select * from x")
         del df_in
         with pytest.raises(vane.ProgrammingError, match="Table with name df_in does not exist"):
             # Even when we preserve ExternalDependency objects correctly, this is not supported
@@ -91,7 +91,7 @@ class TestRuntimeError:
             }
         )
         conn.execute("create view x as select * from df_in")
-        rel = conn.query("select * from x")
+        rel = conn.sql("select * from x")
         del df_in
         with pytest.raises(vane.ProgrammingError, match="Table with name df_in does not exist"):
             rel.execute()
@@ -104,7 +104,7 @@ class TestRuntimeError:
             }
         )
         conn.execute("create view x as select * from df_in")
-        rel = conn.query("select * from x")
+        rel = conn.sql("select * from x")
         del df_in
         with pytest.raises(vane.CatalogException, match="Table with name df_in does not exist"):
             rel.query("bla", "select * from bla")

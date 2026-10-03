@@ -28,7 +28,7 @@ def import_database(import_location):
     con.execute(f"import database '{import_location}'")
     print(f"Imported database from {import_location}")
 
-    res = con.query("select * from tbl").fetchall()
+    res = con.sql("select * from tbl").fetchall()
     assert res == [
         (5, 1),
     ]

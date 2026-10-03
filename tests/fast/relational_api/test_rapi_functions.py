@@ -11,7 +11,7 @@ import vane
 
 class TestRAPIFunctions:
     def test_rapi_str_print(self, duckdb_cursor):
-        res = duckdb_cursor.query("select 42::INT AS a, 84::BIGINT AS b")
+        res = duckdb_cursor.sql("select 42::INT AS a, 84::BIGINT AS b")
         assert str(res) is not None
         res.show()
 

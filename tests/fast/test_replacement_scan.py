@@ -161,15 +161,15 @@ class TestReplacementScan:
 
     def test_replacement_scan_relapi(self):
         con = vane.connect()
-        pyrel1 = con.query("from (values (42), (84), (120)) t(i)")
+        pyrel1 = con.sql("from (values (42), (84), (120)) t(i)")
         assert isinstance(pyrel1, vane.DuckDBPyRelation)
         assert pyrel1.fetchall() == [(42,), (84,), (120,)]
 
-        pyrel2 = con.query("from pyrel1 limit 2")
+        pyrel2 = con.sql("from pyrel1 limit 2")
         assert isinstance(pyrel2, vane.DuckDBPyRelation)
         assert pyrel2.fetchall() == [(42,), (84,)]
 
-        pyrel3 = con.query("select i + 100 from pyrel2")
+        pyrel3 = con.sql("select i + 100 from pyrel2")
         assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(142,), (184,)]
 
@@ -181,17 +181,17 @@ class TestReplacementScan:
 
     def test_replacement_scan_alias(self):
         con = vane.connect()
-        pyrel1 = con.query("from (values (1, 2)) t(i, j)")
-        pyrel2 = con.query("from (values (1, 10)) t(i, k)")
-        pyrel3 = con.query("from pyrel1 join pyrel2 using(i)")
+        pyrel1 = con.sql("from (values (1, 2)) t(i, j)")
+        pyrel2 = con.sql("from (values (1, 10)) t(i, k)")
+        pyrel3 = con.sql("from pyrel1 join pyrel2 using(i)")
         assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(1, 2, 10)]
 
     def test_replacement_scan_pandas_alias(self):
         con = vane.connect()
-        df1 = con.query("from (values (1, 2)) t(i, j)").df()
-        df2 = con.query("from (values (1, 10)) t(i, k)").df()
-        df3 = con.query("from df1 join df2 using(i)")
+        df1 = con.sql("from (values (1, 2)) t(i, j)").df()
+        df2 = con.sql("from (values (1, 10)) t(i, k)").df()
+        df3 = con.sql("from df1 join df2 using(i)")
         assert df3.fetchall() == [(1, 2, 10)]
 
     def test_replacement_scan_after_creation(self, duckdb_cursor):
@@ -495,16 +495,16 @@ class TestReplacementScan:
     def test_replacement_of_cross_connection_relation(self):
         con1 = vane.connect(":memory:")
         con2 = vane.connect(":memory:")
-        con1.query("create table integers(i int)")
-        con2.query("create table integers(v varchar)")
-        con1.query("insert into integers values (42)")
-        con2.query("insert into integers values ('xxx')")
-        rel1 = con1.query("select * from integers")
+        con1.sql("create table integers(i int)")
+        con2.sql("create table integers(v varchar)")
+        con1.sql("insert into integers values (42)")
+        con2.sql("insert into integers values ('xxx')")
+        rel1 = con1.sql("select * from integers")
         with pytest.raises(
             vane.InvalidInputException,
             match=r"The object was created by another Connection and can therefore not be used by this Connection.",
         ):
-            con2.query("from rel1")
+            con2.sql("from rel1")
 
         del con1
 
@@ -512,4 +512,4 @@ class TestReplacementScan:
             vane.InvalidInputException,
             match=r"The object was created by another Connection and can therefore not be used by this Connection.",
         ):
-            con2.query("from rel1")
+            con2.sql("from rel1")

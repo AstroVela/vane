@@ -823,12 +823,9 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
 	      "local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
+	m.def("query", &DuckDBPyConnection::Query, "Execute a native local query and return an incremental QueryResult",
+	      py::arg("query"), py::arg("parameters") = py::none(), py::kw_only(), py::arg("options") = py::none(),
+	      py::arg("rows_per_batch") = 2048);
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
@@ -1354,6 +1351,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	InitializeConnectionMethods(connection_module);
 	connection_module.def("configure_local_runtime", &DuckDBPyConnection::ConfigureLocalRuntime,
 	                      "Configure shared admission for local-fast read-only queries before creating cursors");
+	connection_module.def_property_readonly("query_runtime", &DuckDBPyConnection::GetQueryRuntime);
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");
@@ -2823,13 +2821,15 @@ void DuckDBPyConnection::Close() {
 			result.attr("_close_stream")();
 		}
 	}
-	if (vane_session && !vane_session->local_query_runtime.is_none()) {
+	if (vane_session && (!vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none())) {
 		if (vane_session_owner) {
 			{
 				lock_guard<mutex> guard(vane_session->lock);
 				vane_session->local_runtime_closing = true;
 			}
-			vane_session->local_query_runtime.attr("drain")();
+			auto runtime =
+			    vane_session->query_runtime.is_none() ? vane_session->local_query_runtime : vane_session->query_runtime;
+			runtime.attr("drain")();
 		}
 		// A queued request must be cancelled before waiting for its execution
 		// lock. Running requests keep their owners until native cleanup ends.
@@ -3278,7 +3278,7 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 		if (vane_session->connection_count == 0 || vane_session->local_runtime_closing) {
 			throw InternalException("Cannot inherit closed Vane connection session");
 		}
-		if (!vane_session->local_query_runtime.is_none()) {
+		if (!vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none()) {
 			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
 		}
 		vane_session->connection_count++;
@@ -3305,7 +3305,7 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 		lock_guard<mutex> guard(vane_session->lock);
 		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
 		    !vane_session_owner || vane_session->connection_count != 1 ||
-		    !vane_session->local_query_runtime.is_none()) {
+		    !vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none()) {
 			throw InvalidInputException(
 			    "configure_local_runtime must run once on the session owner before creating cursors");
 		}
@@ -3485,6 +3485,14 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		runtime.attr("close")();
 		guard.lock();
 		vane_session->local_query_runtime = py::none();
+	}
+	if (!vane_session->query_runtime.is_none() && !PythonIsFinalizing()) {
+		vane_session->local_runtime_closing = true;
+		auto runtime = vane_session->query_runtime;
+		guard.unlock();
+		runtime.attr("close")();
+		guard.lock();
+		vane_session->query_runtime = py::none();
 	}
 	if (vane_session->ray_session_opened && !vane_session->id.empty() && !PythonIsFinalizing()) {
 		py::module_::import("vane.runners.ray.runner").attr("notify_connection_closed")(py::str(vane_session->id));

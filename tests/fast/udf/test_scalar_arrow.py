@@ -147,7 +147,7 @@ class TestPyArrowUDF:
             side_effects=True,
             type="arrow",
         )
-        res = duckdb_cursor.query("SELECT random_arrow('') FROM range(10)").fetchall()
+        res = duckdb_cursor.sql("SELECT random_arrow('') FROM range(10)").fetchall()
         assert res == [(0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
 
     def test_return_struct(self):

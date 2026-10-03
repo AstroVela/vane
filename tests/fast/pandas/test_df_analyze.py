@@ -22,7 +22,7 @@ class TestResolveObjectColumns:
         data = [1000008, 6, 9, 4, 1, 6]
         df = create_generic_dataframe(data)
         roundtripped_df = vane.query_df(df, "x", "select * from x", connection=duckdb_conn).df()
-        duckdb_df = duckdb_conn.query("select * FROM (VALUES (1000008), (6), (9), (4), (1), (6)) as '0'").df()
+        duckdb_df = duckdb_conn.sql("select * FROM (VALUES (1000008), (6), (9), (4), (1), (6)) as '0'").df()
         pd.testing.assert_frame_equal(duckdb_df, roundtripped_df, check_dtype=False)
 
     def test_sample_low_incorrect_detected(self, duckdb_cursor):
@@ -70,6 +70,6 @@ class TestResolveObjectColumns:
 
         pdf = pd.DataFrame(data=data)
         duckdb_cursor.register("content", pdf)
-        res = duckdb_cursor.query("select id from content").fetchall()
+        res = duckdb_cursor.sql("select id from content").fetchall()
         expected = [(i,) for i in range(2001)]
         assert res == expected

@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 在该合入提交 b161c07fc3 上的独立分支 feat/query-result-runtime 实现。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -11,14 +11,14 @@
 - 先实现有界的正确执行与取消，再测量性能并优化。
 - 新模块只有完成实际入口接线后才成为公开能力；数据结构测试通过不代表查询已经可运行。
 - 旧源码在接管对应职责后删除；调用方与测试按新契约修改，不增加 legacy 别名或 fallback。
-- 受影响测试通过后运行仓库 release gate。测试环境必须使用非 editable 安装，并记录运行的代码和 native 基线。
+- 优先运行受影响测试；本轮按要求只验收相关测试，不运行完整 release gate。测试环境必须使用非 editable 安装，并记录运行的代码和 native 基线。
 
 ## 里程碑概览
 
 | 阶段 | 可交付能力 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
-| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | 未开始 |
+| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1 已完成，P1.2 未开始 |
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | 未开始 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
@@ -73,12 +73,14 @@ P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划�
 
 ### P1.1 本地原生查询入口
 
-- [ ] QueryContext 管理查询身份、准入、取消和期限，不继承 LocalModelRequest。
-- [ ] local 直接推进原生查询，QueryResult 提供逐批读取、collect 和 close。
-- [ ] BatchLease 覆盖 Arrow 与 NumPy 导出视图，close 后仍借用的内存持续计费。
-- [ ] 接通 local 公开入口，拒绝任何 execution override。
+- [x] QueryContext 管理查询身份、准入、取消和期限，不继承 LocalModelRequest。
+- [x] local 直接推进原生查询，QueryResult 提供逐批读取、collect 和 close。
+- [x] BatchLease 覆盖 Arrow 与 NumPy 导出视图，close 后仍借用的内存持续计费。
+- [x] 接通 local 公开入口，拒绝任何 execution override。
 
 验收：真实 SQL、参数、空结果、增量结果、取消、保留视图及清理失败重试；通过调用边界测试确认不创建分布式计划或任务。
+
+实现位于 [query_runtime.py](vane/execution/query_runtime.py)、[result_delivery.py](vane/execution/result_delivery.py)、[batch_lease.py](vane/execution/batch_lease.py) 与 [local_query.cpp](src/vane_py/execution/local_query.cpp)。独立 QueryContext 复用准入和结果容量原语；查询入口直接调用 native PendingQuery 并交付 RecordBatch。ManagedResult 已重命名为 QueryResult，所有调用方使用新名字，无别名；原来的惰性 connection.query 调用方迁移到 sql。新入口暂限自动提交下的只读 SELECT，模型 UDF 后续接入。
 
 ### P1.2 DirectExchange 的进程内契约
 
@@ -184,7 +186,7 @@ P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端
 - root/DuckDB 格式、ruff、全仓库 mypy、源码版权清单和仓库文档链接检查通过。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3596 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3672 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。这次完整验收使用上述从当前 C++ 源码重建的 native。
 
-P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；P1.2 在进程内验证分布式直接通道，不新增 local+pipelined 模式。TaskRuntime、Ray 调度器及网络数据面仍待后续阶段接线。
+P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；下一增量 P1.2 在进程内验证分布式直接通道，不新增 local+pipelined 模式。TaskRuntime、Ray 调度器及网络数据面仍待后续阶段接线。
 
 ### P0 审查修复（PR #935）
 
@@ -230,3 +232,15 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：
 - 修复后新增 72 项全部通过，P0 四个模块合计 371 passed；审查方的 4 项临时用例由 2 failed、2 passed 变为 4 passed。
 - 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:18497cb82d5466056628bb30c840bc924f5137d61255a71861e002fa76da51cf`，与源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
 - 本次按要求只验收相关测试，完整 release gate 已在完成前停止；本次修复未宣称通过完整套件。root 格式、ruff、适用的 pre-commit 检查、源码版权清单和文档链接检查通过。
+
+### P1.1 原生查询结果入口（2026 年 10 月 4 日）
+
+- `vane.connect(backend="local", resources=QueryResources(...))` 接通独立 QueryRuntime；`connection.query()` 与 `vane.query(..., connection=connection)` 共用 native 入口，返回 QueryResult。配置不依赖 VANE_RUNNER，拒绝 local 的任何 execution override。
+- QueryContext 管理不可变选项、查询身份、共享准入、执行期限及中断隔离；准备失败和取消都保留清理责任，确认回收后才归还准入与结果名额。新路径不构建 FragmentGraph，不创建 LocalModelRequest。
+- 结果逐批交付 RecordBatch；执行与交付各自记录状态。BatchLease 在导出 Arrow/NumPy 视图期间持续计费，关闭查询不会使视图失效；collect 逐批复制，避免完整收集占满有限窗口。结果预算范围和当前只读 SELECT 支持边界见[公开 API](PIPELINED_EXECUTION_DESIGN.md#公开-api-与后续目标)。
+- [新入口验收](tests/fast/test_query_result_runtime.py) 最终 **46 passed**：真实 SQL、位置/具名参数、嵌套类型、空结果、上游未完成时首批可读、部分结果后的错误、容量拒绝、保留视图、取消/期限、排队关闭、清理失败重试、回调重入以及环境变量隔离。
+- 共享结果、local 查询、取消/期限及 model-serving 相关回归 **840 passed**（含当时 44 项新入口用例）；惰性 API 调用方迁移回归 **189 passed、4 skipped**。模块级 query 入口补齐后重跑新入口模块，得到上述 46 passed；按用例去重合计 **1031 passed、4 skipped**。跳过项为已有 Arrow BIT/UUID 两项及已禁用的 DuckDB create_function 两项。按要求未运行完整 release gate。
+- 当前 C++ 已使用 build/python-release 增量 Release 构建并非 editable 安装。270 个 Python 源码/类型声明文件与 checkout 字节一致；安装的 native 与构建产物 SHA-256 相同。DuckDB SourceID 仍为 `263045b861`，本增量未修改 DuckDB 子树。
+- root 格式、ruff、全包 mypy、适用的 pre-commit 检查、源码版权清单、文档相对链接和实际源码包校验通过。新模块已加入 release launcher 与 sdist 清单，供后续 CI 执行。
+
+下一增量为 P1.2：先落实有界 DirectExchange channel 的所有权、FINISH 与取消契约，再接 native BLOCKED/唤醒和部分发送恢复，最后用两个 fragment 的进程内 TaskService 验证并发推进。该设施用于分布式执行契约验证；local 公开路径继续直接原生执行。

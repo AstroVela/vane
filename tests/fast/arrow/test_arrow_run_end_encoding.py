@@ -130,8 +130,8 @@ class TestArrowREE:
         query = query.format(val1, dbtype, val2, dbtype, 10000)
         duckdb_cursor.execute(query)
 
-        rel = duckdb_cursor.query("select * from ree_tbl")
-        expected = duckdb_cursor.query(f"select {projection} from ree_tbl where {filter}").fetchall()
+        rel = duckdb_cursor.sql("select * from ree_tbl")
+        expected = duckdb_cursor.sql(f"select {projection} from ree_tbl where {filter}").fetchall()
 
         # Create an Arrow Table from the table
         arrow_conversion = rel.to_arrow_table()
@@ -161,7 +161,7 @@ class TestArrowREE:
         assert res == expected
 
     def test_arrow_ree_empty_table(self, duckdb_cursor):
-        duckdb_cursor.query("create table tbl (ree integer)")
+        duckdb_cursor.sql("create table tbl (ree integer)")
         rel = duckdb_cursor.table("tbl")
         array = rel.to_arrow_table()["ree"]
         expected = rel.fetchall()
@@ -176,7 +176,7 @@ class TestArrowREE:
     @pytest.mark.parametrize("projection", ["*", "a, c, b", "ree, a, b, c", "c, b, a, ree", "c", "b, ree, c, a"])
     def test_arrow_ree_projections(self, duckdb_cursor, projection):
         # Create the schema
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             """
             create table tbl (
                 ree integer,
@@ -188,7 +188,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             """
             insert into tbl select
                 i // 4,
@@ -227,21 +227,21 @@ class TestArrowREE:
         # Scan the arrow table, making projections that don't cover the entire table
         # This should be pushed down into arrow to only provide us with the necessary columns
 
-        res = duckdb_cursor.query(  # noqa: F841
+        res = duckdb_cursor.sql(  # noqa: F841
             f"""
             select {projection} from arrow_tbl
         """
         ).to_arrow_table()
 
         # Verify correctness by fetching from the original table and the constructed result
-        expected = duckdb_cursor.query(f"select {projection} from tbl").fetchall()
-        actual = duckdb_cursor.query(f"select {projection} from res").fetchall()
+        expected = duckdb_cursor.sql(f"select {projection} from tbl").fetchall()
+        actual = duckdb_cursor.sql(f"select {projection} from res").fetchall()
         assert expected == actual
 
     @pytest.mark.parametrize("create_list", list_constructors())
     def test_arrow_ree_list(self, duckdb_cursor, create_list):
         size = 1000
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             f"""
             create table tbl
             as select
@@ -251,7 +251,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        unstructured = duckdb_cursor.query(
+        unstructured = duckdb_cursor.sql(
             """
             select * from tbl
         """
@@ -279,11 +279,11 @@ class TestArrowREE:
         structured = pa.chunked_array(structured_chunks)
 
         arrow_tbl = pa.Table.from_arrays([structured], names=["ree"])
-        result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()
+        result = duckdb_cursor.sql("select * from arrow_tbl").to_arrow_table()
         assert arrow_tbl.to_pylist() == result.to_pylist()
 
     def test_arrow_ree_struct(self, duckdb_cursor):
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             """
             create table tbl
             as select
@@ -296,7 +296,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        unstructured = duckdb_cursor.query(
+        unstructured = duckdb_cursor.sql(
             """
             select * from tbl
         """
@@ -315,10 +315,10 @@ class TestArrowREE:
         structured = pa.chunked_array(structured_chunks)
 
         arrow_tbl = pa.Table.from_arrays([structured], names=["ree"])  # noqa: F841
-        result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()  # noqa: F841
+        result = duckdb_cursor.sql("select * from arrow_tbl").to_arrow_table()  # noqa: F841
 
-        expected = duckdb_cursor.query("select {'ree': ree, 'a': a, 'b': b, 'c': c} as s from tbl").fetchall()
-        actual = duckdb_cursor.query("select * from result").fetchall()
+        expected = duckdb_cursor.sql("select {'ree': ree, 'a': a, 'b': b, 'c': c} as s from tbl").fetchall()
+        actual = duckdb_cursor.sql("select * from result").fetchall()
 
         assert expected == actual
 
@@ -363,7 +363,7 @@ class TestArrowREE:
     def test_arrow_ree_union(self, duckdb_cursor):
         size = 1000
 
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             f"""
             create table tbl
             as select
@@ -376,7 +376,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        unstructured = duckdb_cursor.query(
+        unstructured = duckdb_cursor.sql(
             """
             select * from tbl
         """
@@ -402,7 +402,7 @@ class TestArrowREE:
 
         structured = pa.chunked_array(structured_chunks)
         arrow_tbl = pa.Table.from_arrays([structured], names=["ree"])  # noqa: F841
-        result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()  # noqa: F841
+        result = duckdb_cursor.sql("select * from arrow_tbl").to_arrow_table()  # noqa: F841
 
         # Recreate the same result set
         expected = []
@@ -415,13 +415,13 @@ class TestArrowREE:
                 expected.append((i % 2 == 0,))
             elif i % 4 == 3:
                 expected.append((str(i),))
-        actual = duckdb_cursor.query("select * from result").fetchall()
+        actual = duckdb_cursor.sql("select * from result").fetchall()
         assert expected == actual
 
     def test_arrow_ree_map(self, duckdb_cursor):
         size = 1000
 
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             f"""
             create table tbl
             as select
@@ -432,7 +432,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        unstructured = duckdb_cursor.query(
+        unstructured = duckdb_cursor.sql(
             """
             select * from tbl
         """
@@ -462,7 +462,7 @@ class TestArrowREE:
 
         structured = pa.chunked_array(structured_chunks)
         arrow_tbl = pa.Table.from_arrays([structured], names=["ree"])
-        result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()
+        result = duckdb_cursor.sql("select * from arrow_tbl").to_arrow_table()
 
         # Verify that the resulting scan is the same as the input
         assert result.to_pylist() == arrow_tbl.to_pylist()
@@ -470,7 +470,7 @@ class TestArrowREE:
     def test_arrow_ree_dictionary(self, duckdb_cursor):
         size = 1000
 
-        duckdb_cursor.query(
+        duckdb_cursor.sql(
             f"""
             create table tbl
             as select
@@ -480,7 +480,7 @@ class TestArrowREE:
         )
 
         # Populate the table with data
-        unstructured = duckdb_cursor.query(
+        unstructured = duckdb_cursor.sql(
             """
             select * from tbl
         """
@@ -502,7 +502,7 @@ class TestArrowREE:
 
         structured = pa.chunked_array(structured_chunks)
         arrow_tbl = pa.Table.from_arrays([structured], names=["ree"])
-        result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()
+        result = duckdb_cursor.sql("select * from arrow_tbl").to_arrow_table()
 
         # Verify that the resulting scan is the same as the input
         assert result.to_pylist() == arrow_tbl.to_pylist()

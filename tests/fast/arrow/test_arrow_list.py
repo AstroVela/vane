@@ -142,6 +142,6 @@ class TestArrowListType:
         list_view_tbl = pa.Table.from_arrays([res.list_view], ["x"])  # noqa: F841
 
         assert res.list_view.to_pylist() == res.list.to_pylist()
-        original = duckdb_cursor.query("select * from list_tbl").fetchall()
-        view = duckdb_cursor.query("select * from list_view_tbl").fetchall()
+        original = duckdb_cursor.sql("select * from list_tbl").fetchall()
+        view = duckdb_cursor.sql("select * from list_view_tbl").fetchall()
         assert original == view

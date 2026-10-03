@@ -15,9 +15,9 @@ pd = pytest.importorskip("pandas")
 def compare_results(con, query, expected):
     expected = pd.DataFrame.from_dict(expected)
 
-    unsorted_res = con.query(query).df()
+    unsorted_res = con.sql(query).df()
     print(unsorted_res, unsorted_res["a"][0].__class__)
-    df_duck = con.query("select * from unsorted_res order by all").df()
+    df_duck = con.sql("select * from unsorted_res order by all").df()
     print(df_duck, df_duck["a"][0].__class__)
     print(expected, expected["a"][0].__class__)
     pd.testing.assert_frame_equal(df_duck, expected)

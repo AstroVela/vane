@@ -290,6 +290,10 @@ from vane.datasink import (
 from vane.datasink.doris import DorisStreamLoadSink
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
+from vane.execution.batch_lease import BatchLease
+from vane.execution.query_options import LocalExecution, QueryExecutionOptions
+from vane.execution.query_runtime import QueryResources
+from vane.execution.result_delivery import QueryResult
 from vane.extensions import (
     DEFAULT_EXTENSION_CATALOG_URL,
     DynamicExtensionDependency,
@@ -424,6 +428,11 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "BatchLease",
+    "LocalExecution",
+    "QueryExecutionOptions",
+    "QueryResources",
+    "QueryResult",
     "read_video_frames",
     "DEFAULT_EXTENSION_CATALOG_URL",
     "AudioFile",
