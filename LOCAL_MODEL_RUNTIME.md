@@ -1909,6 +1909,18 @@ the fast-test shards.
 | Final UDF counters survive native cleanup | `test_execute_native_subprocess_udf_reports_admission_task_stats`, with waiting enabled and disabled, reusing the same plan |
 | Shared Local/Ray contracts remain compatible | Reentrant wakeups, callback removal, late grants after close, exact input handoff, idempotent lease release, retained-output accounting and retry |
 
+Local table-producing `map_batches` and `flat_map` subprocess calls publish
+bounded output blocks as the callable produces them. Each block is serialized
+once into an Arrow IPC buffer; its exact size, including the transport header,
+is admitted before shared memory is allocated. The parent adopts each block
+independently so downstream work can start before the physical task finishes.
+An explicit terminal result retains task completion and slot ownership until
+worker execution and cleanup finish. An error after earlier blocks still fails
+the query, and cancellation releases queued blocks and outstanding grants.
+Row-preserving calls keep their row-count validation and fused output contract.
+Local IPC transport and Ray's object store remain different implementations;
+this change does not imply equal throughput or equal memory budgets.
+
 Common byte-accounting tests also verify the intentional backend differences:
 Local preserves a complete task envelope even at a zero reservation ratio;
 Ray's object-store reservation baseline stays zero. Both charge retained output

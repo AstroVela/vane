@@ -101,6 +101,7 @@ from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
 
 _active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
+_active_local_output: ContextVar[Callable[[Any], None] | None] = ContextVar("vane_local_output", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -118,6 +119,7 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+_MSG_REF_BUNDLE_CHUNK = 0x11
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -444,6 +446,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise ValueError("UDF payload is required")
 
         self._queue: deque[Any] = deque()
+        self._stream_result_lock = threading.Lock()
         self._finished_submitting = False
         self._closed = False
         self._cleanup_finished = False
@@ -1229,6 +1232,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 (
                     _MSG_OK,
                     _MSG_REF_BUNDLE_RESULT,
+                    _MSG_REF_BUNDLE_CHUNK,
                     _MSG_ERROR,
                     _MSG_INPUT_CONSUMED,
                     _MSG_INPUT_CONSUME_FAILED,
@@ -1266,7 +1270,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     raise ExecutionCancelledError(f"UDF subprocess task cancelled: {scope.cancel_reason or error}")
                 self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
                 raise RuntimeError(self._broken_error)
-            if msg_type == _MSG_REF_BUNDLE_RESULT:
+            if msg_type in (_MSG_REF_BUNDLE_RESULT, _MSG_REF_BUNDLE_CHUNK):
                 descriptor = self._decode_ref_bundle_result(payload)
                 grant_id = descriptor["grant_id"]
                 scope = self._current_execution_scope()
@@ -1314,6 +1318,20 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except BaseException:
                     _release_local_ref_bundle_result(result)
                     raise
+                if msg_type == _MSG_REF_BUNDLE_CHUNK:
+                    receiver = _active_local_output.get()
+                    if receiver is None:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream has no receiver", actor_lost=True)
+                        raise RuntimeError(self._broken_error)
+                    try:
+                        receiver(result)
+                    except BaseException:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream receiver failed", actor_lost=True)
+                        raise
+                    msg_type = None
+                    continue
                 return result
             if len(payload) != 8:
                 self._mark_broken("UDF subprocess returned malformed OK response", actor_lost=True)
@@ -1423,18 +1441,22 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def submit(self, args: pa.Table) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
         try:
             result = self._submit_table(args)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
         self._notify_wakeup()
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
         try:
             result = self._submit_table(args)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
@@ -1448,20 +1470,34 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         names: Any,
     ) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
     def submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
+        self._notify_wakeup()
+
+    def _queue_stream_result(self, submit_id: int | None, result: Any) -> None:
+        with self._stream_result_lock:
+            if self._closed:
+                _release_local_ref_bundle_result(result)
+                raise ExecutionCancelledError("UDF output stream worker closed")
+            self._queue.append(
+                (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+            )
         self._notify_wakeup()
 
     def take_ready_result(self) -> Any | None:
@@ -1583,6 +1619,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 pass
         self._record_worker_outcome(outcome)
         self._closed = True
+        stream_lock = getattr(self, "_stream_result_lock", None)
+        if stream_lock is not None:
+            with stream_lock:
+                while self._queue:
+                    _release_local_ref_bundle_result(self._queue.popleft())
         cleanup_errors: list[BaseException] = []
         try:
             self.cancel_output_grants()
@@ -1804,6 +1845,8 @@ def _record_worker_cancellation(worker: Any) -> None:
 def _release_local_ref_bundle_result(value: Any) -> None:
     if isinstance(value, tuple) and len(value) >= 3 and value[0] == SUBMIT_RESULT_MARKER:
         value = value[2]
+    elif isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], bool):
+        value = value[0]
     if not (isinstance(value, tuple) and len(value) >= 2 and value[0] == REF_BUNDLE_RESULT_MARKER):
         return
     for ref in list(value[1] or []):
@@ -3742,6 +3785,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return (SUBMIT_RESULT_MARKER, int(submit_id), result)
         return result if result is not None else (None, True)
 
+    def _publish_stream_result(self, submit_id: int | None, result: Any) -> None:
+        transition_local_shm_output(result, "unit_queue")
+        self._record_output_budget_result(result)
+        item = (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+        with self._queue_lock:
+            if self._closed:
+                _release_local_ref_bundle_result(result)
+                raise ExecutionCancelledError("UDF output stream executor closed")
+            self._queue.append(item)
+            # A block transfers data ownership only. The terminal result retains
+            # the physical task slot until backend cleanup has completed.
+            self._result_admissions.append(None)
+        self._notify_wakeup()
+
     def _output_budget_estimate(self, num_rows: int | None) -> int:
         if not self._ref_bundle_output:
             return 0
@@ -4148,6 +4205,17 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         _active_local_admission.reset(token)
 
                 fn = run_admitted
+
+            output_fn = fn
+
+            def run_streaming(worker: _SingleSubprocessExecutor) -> Any | None:
+                token = _active_local_output.set(lambda result: self._publish_stream_result(submit_id, result))
+                try:
+                    return output_fn(worker)
+                finally:
+                    _active_local_output.reset(token)
+
+            fn = run_streaming
 
             if unit_task is not None:
                 unit_task.transition("submitted")

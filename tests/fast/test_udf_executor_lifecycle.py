@@ -146,8 +146,11 @@ def _subprocess_map_payload(fn, **extra):
 
 
 def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, SUBMIT_RESULT_MARKER
+
     deadline = time.monotonic() + timeout_s
     results = []
+    stream_blocks = {}
     wakeup_event = threading.Event()
     previous_wakeup = getattr(executor, "_wakeup", None)
 
@@ -162,6 +165,31 @@ def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
         while len(results) < count:
             item = executor.take_ready_result()
             if item is not None:
+                # These lifecycle tests count completed submissions. Dedicated
+                # streaming tests consume individual blocks before completion.
+                tagged = isinstance(item, tuple) and len(item) in (3, 4) and item[0] == SUBMIT_RESULT_MARKER
+                untagged = isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool)
+                submit_id = item[1] if tagged else None
+                partial = (tagged and len(item) == 4 and not item[3]) or (untagged and not item[1])
+                if partial:
+                    stream_blocks.setdefault(submit_id, []).append(item[2] if tagged else item[0])
+                    continue
+                blocks = stream_blocks.pop(submit_id, [])
+                if blocks:
+                    terminal = item[2] if tagged else item[0] if untagged else item
+                    if isinstance(terminal, BaseException):
+                        for block in blocks:
+                            for ref in block[1]:
+                                ref.release()
+                    else:
+                        assert terminal is None
+                        result = (
+                            REF_BUNDLE_RESULT_MARKER,
+                            [ref for block in blocks for ref in block[1]],
+                            [meta for block in blocks for meta in block[2]],
+                            blocks[0][3],
+                        )
+                        item = (SUBMIT_RESULT_MARKER, submit_id, result) if tagged else result
                 results.append(item)
                 continue
             remaining = deadline - time.monotonic()
@@ -170,6 +198,10 @@ def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
             wakeup_event.wait(timeout=remaining)
             wakeup_event.clear()
     finally:
+        for blocks in stream_blocks.values():
+            for block in blocks:
+                for ref in block[1]:
+                    ref.release()
         if hasattr(executor, "register_wakeup"):
             executor.register_wakeup(previous_wakeup)
     return results
@@ -9251,7 +9283,7 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
     grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
-    monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", fail_descriptor)
+    monkeypatch.setattr(worker, "make_local_shm_descriptor_from_ipc", fail_descriptor)
 
     with pytest.raises(RuntimeError, match="descriptor failed"):
         worker._execute_submit(
@@ -9351,7 +9383,8 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
 
     captured: list[pa.Table] = []
 
-    def make_descriptor(tables, *, grant_id=None):
+    def make_descriptor(blocks, *, grant_id=None):
+        tables = [pa.ipc.open_stream(block.ipc).read_all() for block in blocks]
         captured.extend(tables)
         return {
             "block_refs": [],
@@ -9412,7 +9445,8 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
                 raise RuntimeError("compute tail was not flushed")
             return [pa.table({"rows": [self.input_rows]})]
 
-    def make_descriptor(table, *, grant_id=None):
+    def make_descriptor(block, *, grant_id=None):
+        table = pa.ipc.open_stream(block.ipc).read_all()
         assert grant_id is None
         return {
             "block_refs": [{"provider": "local_shm", "shm_name": "fake-shm", "ipc_size_bytes": 1}],
@@ -9424,7 +9458,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
-    monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", make_descriptor)
+    monkeypatch.setattr(worker, "make_local_shm_descriptor_from_ipc", make_descriptor)
     monkeypatch.setattr(worker, "configure_loaded_torch_threads", lambda: None)
 
     _data_shm, msg_type, payload = worker._execute_task_submit(
