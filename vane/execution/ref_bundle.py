@@ -1183,13 +1183,13 @@ def _require_shm_buffer(shm: shared_memory.SharedMemory) -> memoryview[int]:
     return buffer
 
 
-def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
+def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes | pa.Buffer) -> int:
     buffer = _require_shm_buffer(shm)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
     if required > len(buffer):
         raise BufferError("shared memory segment is too small for Arrow IPC payload")
     buffer[:_IPC_HEADER_SIZE] = len(ipc_bytes).to_bytes(_IPC_HEADER_SIZE, "little")
-    buffer[_IPC_HEADER_SIZE:required] = ipc_bytes
+    buffer[_IPC_HEADER_SIZE:required] = memoryview(ipc_bytes).cast("B")
     return required
 
 
@@ -1609,18 +1609,44 @@ def make_local_shm_ref_bundle_result(
     )
 
 
+@dataclass(frozen=True)
+class PreparedLocalShmBlock:
+    ipc: pa.Buffer
+    names: list[str]
+    num_rows: int
+    size_bytes: int
+
+    @property
+    def ipc_size_bytes(self) -> int:
+        return _IPC_HEADER_SIZE + len(self.ipc)
+
+
+def prepare_local_shm_block(table: pa.Table) -> PreparedLocalShmBlock:
+    """Serialize once, before admission, retaining the Arrow buffer without a bytes copy."""
+    table = _ensure_table(table)
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return PreparedLocalShmBlock(
+        sink.getvalue(), list(table.schema.names), table.num_rows, int(estimate_table_bytes(table))
+    )
+
+
 def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | None = None) -> dict[str, Any]:
     """Create a worker-safe local shm descriptor for a single Arrow table block."""
-    table = _ensure_table(table)
-    ipc_bytes = _arrow_table_to_ipc_bytes(table)
-    required = _IPC_HEADER_SIZE + len(ipc_bytes)
+    return make_local_shm_descriptor_from_ipc(prepare_local_shm_block(table), grant_id=grant_id)
+
+
+def make_local_shm_descriptor_from_ipc(block: PreparedLocalShmBlock, *, grant_id: int | None = None) -> dict[str, Any]:
+    """Publish exactly the IPC buffer whose size was admitted by the caller."""
+    required = block.ipc_size_bytes
     shm = _create_shm(required, track=False)
     try:
-        _write_ipc_to_shm(shm, ipc_bytes)
+        _write_ipc_to_shm(shm, block.ipc)
         metadata = {
             "provider": LOCAL_SHM_PROVIDER,
-            "num_rows": int(table.num_rows),
-            "size_bytes": int(estimate_table_bytes(table)),
+            "num_rows": block.num_rows,
+            "size_bytes": block.size_bytes,
             "ipc_size_bytes": int(required),
             "shm_name": shm.name,
         }
@@ -1633,11 +1659,11 @@ def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | Non
                 }
             ],
             "metadata": [metadata],
-            "names": list(table.schema.names),
+            "names": block.names,
         }
         if grant_id is not None:
             descriptor["grant_id"] = int(grant_id)
-        _shm_debug_log("create_descriptor", name=shm.name, size=required, rows=table.num_rows, nbytes=table.nbytes)
+        _shm_debug_log("create_descriptor", name=shm.name, size=required, rows=block.num_rows, nbytes=block.size_bytes)
         return descriptor
     except Exception:
         try:
@@ -1885,8 +1911,10 @@ def track_local_shm_output(task: TaskDataScope, result: Any) -> None:
 
 
 def transition_local_shm_output(result: Any, state: str) -> None:
-    if isinstance(result, tuple) and len(result) == 3 and result[0] == SUBMIT_RESULT_MARKER:
+    if isinstance(result, tuple) and len(result) in (3, 4) and result[0] == SUBMIT_RESULT_MARKER:
         result = result[2]
+    elif isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool):
+        result = result[0]
     if isinstance(result, tuple) and len(result) == 4 and result[0] == REF_BUNDLE_RESULT_MARKER:
         for ref in result[1]:
             if isinstance(ref, LocalShmBlockRef):

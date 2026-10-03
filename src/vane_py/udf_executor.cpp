@@ -468,11 +468,17 @@ static PythonReadyResult DecodePythonReadyResult(const py::handle &value) {
 		return result;
 	}
 	auto tuple = py::reinterpret_borrow<py::tuple>(value);
-	if (py::len(tuple) == 3 && py::isinstance<py::str>(tuple[0])) {
+	if ((py::len(tuple) == 3 || py::len(tuple) == 4) && py::isinstance<py::str>(tuple[0])) {
 		auto marker = tuple[0].cast<string>();
 		if (marker == "__vane_submit_result__") {
 			result.submit_id = tuple[1].cast<idx_t>();
 			result.output = py::reinterpret_borrow<py::object>(tuple[2]);
+			if (py::len(tuple) == 4) {
+				if (!py::isinstance<py::bool_>(tuple[3])) {
+					throw InvalidInputException("udf async: submit completion flag must be a bool");
+				}
+				result.submit_complete = tuple[3].cast<bool>();
+			}
 			return result;
 		}
 	}
@@ -2688,7 +2694,8 @@ private:
 		}
 
 		UDFOutputEvent event;
-		event.kind = UDFOutputEventKind::DATA;
+		event.kind = none_result && ready_result.submit_complete && slot.is_table_udf ? UDFOutputEventKind::COMPLETE
+		                                                                              : UDFOutputEventKind::DATA;
 		event.outputs = std::move(outputs_chunk);
 		event.ref_outputs = std::move(ref_outputs);
 		event.rows = std::move(rows_chunk);
@@ -2950,7 +2957,8 @@ private:
 				}
 				auto empty_outputs = MakeEmptyDataChunk();
 				UDFOutputEvent event;
-				event.kind = UDFOutputEventKind::DATA;
+				event.kind = ready_result.submit_complete && slot.is_table_udf ? UDFOutputEventKind::COMPLETE
+				                                                               : UDFOutputEventKind::DATA;
 				event.outputs = std::move(empty_outputs);
 				event.rows = std::move(rows_chunk);
 				event.submit_complete = ready_result.submit_complete;
