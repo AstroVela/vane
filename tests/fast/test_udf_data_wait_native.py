@@ -37,7 +37,7 @@ def native_environment(monkeypatch):
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 280_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     with monkeypatch.context() as cpu_count:
-        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 2)
         task_runtime = udf_subprocess._GlobalSubprocessTaskRuntime()
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", task_runtime)
     yield manager, task_runtime
@@ -93,7 +93,7 @@ def _runtime(plan, *, limited=False, budget=280_000, timeout=10):
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("limited", [False, True])
 @pytest.mark.parametrize("budget", [280_000, 420_000])
-def test_native_chain_drains_repeated_large_outputs_with_one_worker(native_environment, actor, limited, budget):
+def test_native_chain_drains_repeated_large_outputs_with_bounded_cpu(native_environment, actor, limited, budget):
     manager, _ = native_environment
     with vane.connect() as connection:
         plan = _plan(connection, actor=actor, rows=8)

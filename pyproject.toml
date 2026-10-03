@@ -32,6 +32,7 @@ dependencies = [
     "numpy",
     "pyarrow>=25.0.0",
     "pyelftools>=0.33,<1",
+    "psutil>=5.9",
     "ray>=2.58.0,<3",
     "typing-extensions",
 ]
@@ -305,6 +306,8 @@ include = [
     "/tests/fast/test_vane_config.py",
     "/tests/fast/test_expression_udf_contracts.py",
     "/tests/fast/test_local_e2e.py",
+    "/tests/fast/test_local_task_scheduling.py",
+    "/tests/fast/test_local_shm_credit_progress.py",
     "/tests/fast/test_local_runtime_baseline.py",
     "/tests/fast/test_local_query_runtime.py",
     "/tests/fast/test_local_query_results.py",
@@ -596,6 +599,7 @@ build = [
 dev = [ # tooling like uv will install this automatically when syncing the environment
     "pre-commit",
     "mypy",
+    "types-psutil",
     "ruff>=0.13.0",
     {include-group = "stubdeps"},
     {include-group = "build"},

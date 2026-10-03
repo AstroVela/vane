@@ -830,15 +830,16 @@ class LocalShmBudgetManager:
                     limit, input_credit, _, required_usage, oversized_allowed = _grant_state_locked()
                     if limit <= 0 or required_usage <= limit or oversized_allowed:
                         return True
-                    # Different slices can borrow the same allocation, then
-                    # each retain an output credit after ACK. Permit consumers
-                    # to convert their own credit without increasing total
-                    # usage, so these credits cannot deadlock the pipeline.
-                    # Materialized memory may exceed the limit by one bounded
-                    # output block; further grants wait until it drains.
-                    materialized = self._allocated_bytes + self._output_grant_bytes
+                    # Overlapping input slices can retain duplicate credits
+                    # after the allocation is released. Convert existing
+                    # consumer credit without increasing total usage. At most
+                    # one bounded block may exceed materialized capacity;
+                    # explicit task reservations retain their hard boundary.
                     return (
-                        priority == "consumer" and 0 < requested <= min(input_credit, limit) and materialized <= limit
+                        priority == "consumer"
+                        and 0 < requested <= min(input_credit, limit)
+                        and self._task_reservation_bytes == 0
+                        and self._allocated_bytes + self._output_grant_bytes <= limit
                     )
 
                 while not _can_grant_locked():
@@ -2114,6 +2115,10 @@ def _apply_ref_bundle_slices(
             if start < 0 or end < start or end > table.num_rows:
                 raise ValueError(f"invalid ref bundle slice [{start}, {end}) for block rows={table.num_rows}")
             table = table.slice(start, end - start)
+        if output_names:
+            # Source projections can repeat columns. Unify schemas by position
+            # before restoring the logical names, which can also be duplicated.
+            table = table.rename_columns([f"__vane_ref_column_{index}" for index in range(table.num_columns)])
         tables.append(table)
 
     if not tables:
