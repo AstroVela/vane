@@ -176,7 +176,7 @@ class RuntimeTaskAdmission:
                         driver=base.driver,
                         _release_callback=base.release,
                         _execution_finished_callback=partial(self._complete_execution, token, base),
-                        _capacity_wait_context=partial(self._suspend_for_wait, token),
+                        _capacity_wait_context=partial(self._suspend_for_wait, token, base),
                     )
                     authority._ready_token = token
                     authority._state = "ready"
@@ -204,7 +204,12 @@ class RuntimeTaskAdmission:
             self._condition.notify_all()
 
     @contextmanager
-    def _suspend_for_wait(self, token: str, scope: ExecutionCancellationScope) -> Iterator[None]:
+    def _suspend_for_wait(self, token: str, base: AdmissionLease, scope: ExecutionCancellationScope) -> Iterator[None]:
+        with base.suspend_for_wait(scope), self._suspend_runtime_for_wait(token, scope):
+            yield
+
+    @contextmanager
+    def _suspend_runtime_for_wait(self, token: str, scope: ExecutionCancellationScope) -> Iterator[None]:
         scope.raise_if_cancelled("runtime capacity wait")
         with self._condition:
             if token not in self._running:

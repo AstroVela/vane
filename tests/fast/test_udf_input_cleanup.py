@@ -136,7 +136,6 @@ def test_submission_error_survives_cleanup(monkeypatch, track_data, stage, task_
             function_pickle=vane_pickle.dumps(lambda table: table),
             call_mode="map_batches",
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
         ),
         options,
     )
@@ -342,7 +341,6 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
         function_pickle=vane_pickle.dumps(lambda table: table),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -398,7 +396,6 @@ def test_ref_input_cleanup_survives_failure_before_worker_submission(monkeypatch
         function_pickle=vane_pickle.dumps(lambda table: table),
         call_mode="map_batches",
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -421,7 +418,7 @@ def test_ref_input_cleanup_survives_failure_before_worker_submission(monkeypatch
         with monkeypatch.context() as fault:
             fault.setattr(manager, "_release_input_ack_ref", fail)
             if failure == "schedule":
-                fault.setattr(executor._task_runtime.executor, "submit", fail)
+                fault.setattr(executor._task_pool.executor, "submit", fail)
             else:
                 fault.setattr(executor._task_pool, "_spawn_worker", fail)
             assert executor.request_task_admission(8)

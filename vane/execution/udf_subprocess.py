@@ -65,6 +65,7 @@ from vane.execution.ref_bundle import (
     transition_local_shm_output,
     wake_local_shm_ref_budget_waiters,
 )
+from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
     actor_pool_cleanup_pending,
@@ -87,6 +88,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancelledError,
 )
 from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
+from vane.execution.udf_local_resources import local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_threading import (
@@ -1742,12 +1744,6 @@ def _payload_subprocess_mode(payload: dict[str, Any]) -> str:
     raise ValueError("payload.execution_backend must be one of: subprocess_task, subprocess_actor")
 
 
-def _payload_subprocess_pool_size(payload: dict[str, Any], mode: str) -> int:
-    if mode == "actor":
-        return _payload_positive_int(payload, "actor_number")
-    return _payload_positive_int(payload, "udf_worker_slots")
-
-
 def _worker_env_for_pool_index(payload: dict[str, Any], worker_idx: int, pool_size: int) -> dict[str, str]:
     _payload_subprocess_mode(payload)
     env = {
@@ -1839,6 +1835,8 @@ class _TaskWorkerPool:
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
         self.pool_size = max(1, int(pool_size))
+        self.resources = udf_process_resources(payload)
+        self.executor = ThreadPoolExecutor(max_workers=self.pool_size, thread_name_prefix="vane-udf-subprocess-task")
         self.ref_count = 0
         self.closing = False
         self.idle: list[_PooledTaskWorker] = []
@@ -1854,6 +1852,7 @@ class _TaskWorkerPool:
             max_slots=self.pool_size,
             execution_slot_prefix=f"subprocess_task:{self.key}",
             execution_capacity=runtime.execution_capacity,
+            resources=self.resources,
         )
 
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
@@ -1891,6 +1890,10 @@ class _TaskWorkerPool:
         cleanup_errors: list[BaseException] = []
         try:
             self.admission_slots.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
         except BaseException as exc:
             cleanup_errors.append(exc)
         for worker in to_close:
@@ -2047,19 +2050,23 @@ class _TaskWorkerPool:
                         break
                     if evicted is not None:
                         pass
-                    elif self.total < self.pool_size and self.runtime.total_workers < self.runtime.max_workers:
-                        spawn_idx = self.next_worker_idx
-                        self.next_worker_idx += 1
-                        self._spawning_workers.add(spawn_idx)
-                        self.total += 1
-                        self.active += 1
-                        self.runtime.total_workers += 1
-                        break
-                    else:
-                        evicted = self.runtime._take_idle_worker_locked()
+                    elif self.total < self.pool_size:
+                        # Reclaim idle cache entries before growing inventory.
+                        # Transport waiters retain their processes, so their
+                        # count must not prevent an admitted consumer starting.
+                        if self.runtime.total_workers >= self.runtime.max_workers:
+                            evicted = self.runtime._take_idle_worker_locked()
                         if evicted is None:
-                            self.runtime.cond.wait()
-                            continue
+                            spawn_idx = self.next_worker_idx
+                            self.next_worker_idx += 1
+                            self._spawning_workers.add(spawn_idx)
+                            self.total += 1
+                            self.active += 1
+                            self.runtime.total_workers += 1
+                            break
+                    else:
+                        self.runtime.cond.wait()
+                        continue
                 if evicted is not None:
                     evicted.close(kill=False)
 
@@ -2115,7 +2122,13 @@ class _TaskWorkerPool:
             self._active_wrappers.discard(wrapper)
             self.active = max(0, self.active - 1)
             wrapper.active_scope = None
-            if self.closing or wrapper.abort_requested or not reusable or not _worker_is_reusable(wrapper.worker):
+            if (
+                self.closing
+                or wrapper.abort_requested
+                or not reusable
+                or not _worker_is_reusable(wrapper.worker)
+                or self.runtime.total_workers > self.runtime.max_workers
+            ):
                 self.total = max(0, self.total - 1)
                 self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
                 to_close = wrapper.worker
@@ -2151,18 +2164,22 @@ class _TaskWorkerPool:
 
 
 class _GlobalSubprocessTaskRuntime:
-    def __init__(self) -> None:
-        self.max_workers = max(1, os.cpu_count() or 1)
-        self.execution_capacity = LocalExecutionCapacity(max_slots=self.max_workers)
-        self.executor = ThreadPoolExecutor(
-            max_workers=self.max_workers,
-            thread_name_prefix="vane-udf-subprocess-task",
-        )
+    def __init__(self, *, resource_limit: ResourceVector | None = None) -> None:
+        self.resource_limit = local_process_capacity() if resource_limit is None else resource_limit
+        self.execution_capacity = LocalExecutionCapacity(max_slots=None, resource_limit=self.resource_limit)
         self.cond = threading.Condition()
         self.pools: dict[str, _TaskWorkerPool] = {}
         self.total_workers = 0
         self.closed = False
         self._close_finished = True
+
+    @property
+    def max_workers(self) -> int:
+        # Waiting transport owners keep their workers while yielding CPU.
+        # This bounds runnable processes; each pool separately bounds owners.
+        with self.cond:
+            minimum_cpu = min((pool.resources.cpu for pool in self.pools.values()), default=1.0)
+            return max(1, int(self.resource_limit.cpu / minimum_cpu))
 
     def acquire_pool(
         self,
@@ -2194,8 +2211,8 @@ class _GlobalSubprocessTaskRuntime:
         if self.closed:
             raise RuntimeError("global subprocess task runtime is closed")
         if worker_metrics is None:
-            return self.executor.submit(self._run_task, pool, fn, scope, debug_seq)
-        return self.executor.submit(self._run_task, pool, fn, scope, debug_seq, worker_metrics=worker_metrics)
+            return pool.executor.submit(self._run_task, pool, fn, scope, debug_seq)
+        return pool.executor.submit(self._run_task, pool, fn, scope, debug_seq, worker_metrics=worker_metrics)
 
     def _run_task(
         self,
@@ -2274,7 +2291,7 @@ class _GlobalSubprocessTaskRuntime:
         self.total_workers = max(0, self.total_workers - 1)
         return wrapper.worker
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         with self.cond:
             return {
                 "max_workers": self.max_workers,
@@ -2282,6 +2299,7 @@ class _GlobalSubprocessTaskRuntime:
                 "pool_count": len(self.pools),
                 "idle_workers": sum(len(pool.idle) for pool in self.pools.values()),
                 "active_workers": sum(pool.active for pool in self.pools.values()),
+                "process_resources": self.execution_capacity.resource_snapshot(),
             }
 
     def close(self, *, kill: bool = False) -> None:
@@ -2321,10 +2339,11 @@ class _GlobalSubprocessTaskRuntime:
                     pool.cancel_output_grants()
                 except BaseException as exc:
                     cleanup_errors.append(exc)
-            try:
-                self.executor.shutdown(wait=False, cancel_futures=True)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+            for pool in pools_to_cancel:
+                try:
+                    pool.executor.shutdown(wait=False, cancel_futures=True)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
             for worker in to_close:
                 try:
                     worker.close(kill=kill)
@@ -2428,6 +2447,7 @@ class LocalSubprocessActorPool:
         self._cleanup_pending_workers: list[_SingleSubprocessExecutor] = []
         self._executor: ThreadPoolExecutor | None = None
         self._cleanup_pending_executor: ThreadPoolExecutor | None = None
+        self._resident_release: Callable[[], None] | None = None
         initializing_workers: dict[int, _SingleSubprocessExecutor] = {}
         startup_lock = threading.Lock()
         starting_worker: _SingleSubprocessExecutor | None = None
@@ -2457,6 +2477,10 @@ class LocalSubprocessActorPool:
             return observe_startup
 
         try:
+            declared = udf_process_resources(payload).scale(self.pool_size)
+            self._resident_release = _global_task_runtime().execution_capacity.reserve_resident(
+                ResourceVector(cpu=declared.cpu, heap_bytes=declared.heap_bytes), startup_cancellation
+            )
             for worker_idx in range(self.pool_size):
                 worker = _SingleSubprocessExecutor(
                     self.payload,
@@ -2496,6 +2520,8 @@ class LocalSubprocessActorPool:
                 _append_subprocess_cleanup_error(cleanup_errors, close_error)
             self._cleanup_pending_workers = pending_workers
             self._workers = []
+            if not self.cleanup_pending():
+                self._release_resident_resources()
             if cleanup_errors:
                 details = _subprocess_cleanup_error_details(cleanup_errors)
                 raise _OwnedLocalSubprocessActorPoolsError(
@@ -3199,9 +3225,19 @@ class LocalSubprocessActorPool:
                 details = _subprocess_cleanup_error_details(cleanup_errors)
                 raise RuntimeError(f"local subprocess actor pool shutdown failed: {details}") from cleanup_errors[0]
         finally:
-            with self._cond:
-                self._shutdown_finished = True
-                self._cond.notify_all()
+            try:
+                if not self.cleanup_pending():
+                    self._release_resident_resources()
+            finally:
+                with self._cond:
+                    self._shutdown_finished = True
+                    self._cond.notify_all()
+
+    def _release_resident_resources(self) -> None:
+        with self._cond:
+            release, self._resident_release = self._resident_release, None
+        if release is not None:
+            release()
 
     def __del__(self) -> None:
         try:
@@ -3211,18 +3247,7 @@ class LocalSubprocessActorPool:
 
 
 def _local_actor_pool_size_from_node(node: dict[str, Any], payload: dict[str, Any]) -> int:
-    for container, key in (
-        (payload, "actor_number"),
-        (payload, "udf_worker_slots"),
-        (node, "actor_pool_size"),
-    ):
-        value = container.get(key)
-        if value is None:
-            continue
-        parsed = int(value)
-        if parsed > 0:
-            return parsed
-    raise ValueError("subprocess_actor payload is missing actor_number/udf_worker_slots")
+    return _payload_positive_int(payload, "actor_number")
 
 
 def _local_actor_pool_size_from_pool(actor_pool: Any) -> int:
@@ -3416,11 +3441,15 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             raise TypeError("local_request_cancellation must be ExecutionCancellationScope")
         self._request_cancel_unregister: Callable[[], None] | None = None
         self._subprocess_mode = _payload_subprocess_mode(payload)
-        self._pool_size = _payload_subprocess_pool_size(payload, self._subprocess_mode)
+        self._pool_size = (
+            _payload_positive_int(payload, "actor_number")
+            if self._subprocess_mode == "actor"
+            else local_task_capacity(udf_process_resources(payload), _global_task_runtime().resource_limit)
+        )
         _subprocess_debug_log(
             "executor_init "
             f"mode={self._subprocess_mode} backend={payload.get('execution_backend')!r} "
-            f"pool_size={self._pool_size} payload_udf_worker_slots={payload.get('udf_worker_slots')!r} "
+            f"pool_size={self._pool_size} "
             f"actor_number={payload.get('actor_number')!r}"
         )
         self._closed = False

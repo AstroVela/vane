@@ -107,13 +107,7 @@ class RegisteredLocalModel:
             or not self._registry.owns_pool(self.identity, pool)
         ):
             raise ValueError("GPU resources require the registered model's resident device pool")
-        # The physical operator adds its dispatch parallelism after native
-        # preparation. Validate the original model contract without that
-        # generated field; the resident pool still owns its fixed device slots.
-        prepared_payload = dict(payload)
-        if "udf_worker_slots" not in pool.payload:
-            prepared_payload.pop("udf_worker_slots", None)
-        self.validate(prepared_payload, pool.pool_size, session_config, session_id=self.identity.session_id)
+        self.validate(payload, pool.pool_size, session_config, session_id=self.identity.session_id)
 
     def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
         self._require_admission()

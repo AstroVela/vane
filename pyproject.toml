@@ -32,6 +32,7 @@ dependencies = [
     "numpy",
     "pyarrow>=25.0.0",
     "pyelftools>=0.33,<1",
+    "psutil>=5.9",
     "ray>=2.53.0,<3",
     "typing-extensions",
 ]
@@ -593,6 +594,7 @@ build = [
 dev = [ # tooling like uv will install this automatically when syncing the environment
     "pre-commit",
     "mypy",
+    "types-psutil",
     "ruff>=0.13.0",
     {include-group = "stubdeps"},
     {include-group = "build"},

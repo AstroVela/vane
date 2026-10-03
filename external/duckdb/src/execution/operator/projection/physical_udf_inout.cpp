@@ -342,24 +342,6 @@ idx_t SaturatingAdd(idx_t left, idx_t right) {
 	return left + right;
 }
 
-idx_t ResolveUDFRuntimeWorkerSlots(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "subprocess_task") {
-		return MaxValue<idx_t>(idx_t(1), task_operator_width);
-	}
-	if (backend.second == "subprocess_actor") {
-		auto actor_number = GetStructIntField(payload, "actor_number");
-		if (!actor_number.first || actor_number.second == 0) {
-			throw InvalidInputException("actor_number is required for execution_backend='%s'", backend.second);
-		}
-		return actor_number.second;
-	}
-	throw InvalidInputException("unsupported udf execution_backend '%s'", backend.second);
-}
-
 Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements) {
 	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
 		return payload;
@@ -385,20 +367,6 @@ Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements
 		children.emplace_back(replacement.first, std::move(replacement.second));
 	}
 	return Value::STRUCT(std::move(children));
-}
-
-Value ResolveUDFRuntimePayload(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "ray_task" || backend.second == "ray_actor") {
-		return payload;
-	}
-	auto worker_slots = ResolveUDFRuntimeWorkerSlots(payload, task_operator_width);
-	child_list_t<Value> replacements;
-	replacements.emplace_back("udf_worker_slots", Value::BIGINT(static_cast<int64_t>(worker_slots)));
-	return ReplaceStructFields(payload, std::move(replacements));
 }
 
 string UDFDebugNameFromPayload(const Value &payload) {
@@ -756,7 +724,7 @@ private:
 		UDFWorkerSlotDebugLog(StringUtil::Format("resolve_runtime_commit udf_name=%s reason=%s width=%llu",
 		                                         DebugUDFName().c_str(), reason ? reason : "<missing>",
 		                                         static_cast<unsigned long long>(task_operator_width)));
-		resolved_payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		resolved_payload = original_payload;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 	}
@@ -826,10 +794,6 @@ static void AppendUDFExecutionConfigParams(InsertionOrderPreservingMap<string> &
 	auto ray_actor_thread_policy = GetStructStringField(payload, "ray_actor_thread_policy");
 	if (ray_actor_thread_policy.first && !ray_actor_thread_policy.second.empty()) {
 		result["ray_actor_thread_policy"] = ray_actor_thread_policy.second;
-	}
-	auto worker_slots = GetStructIntField(payload, "udf_worker_slots");
-	if (worker_slots.first && worker_slots.second > 0) {
-		result["udf_worker_slots"] = std::to_string(worker_slots.second);
 	}
 	auto min_task_batch_size = GetStructIntField(payload, "min_task_batch_size");
 	if (min_task_batch_size.first && min_task_batch_size.second > 0) {
@@ -1169,7 +1133,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		    "streaming_resolve_commit udf_name=%s width=%llu operator_width_resolved=%s previous_width=%llu",
 		    UDFDebugNameFromPayload(original_payload).c_str(), static_cast<unsigned long long>(task_operator_width),
 		    operator_width_resolved ? "true" : "false", static_cast<unsigned long long>(resolved_task_operator_width)));
-		payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		payload = original_payload;
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;

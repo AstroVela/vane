@@ -13,11 +13,12 @@ from __future__ import annotations
 import threading
 import uuid
 from collections import deque
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from vane.execution.resources import ResourceVector
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 
@@ -143,19 +144,28 @@ def _notify_slot_wakeups(wakeups: list[Callable[[], None]]) -> None:
 
 
 class LocalExecutionCapacity:
-    """Execution-only capacity shared by pools using the same worker executor.
+    """Process resources shared by local task pools and resident actors.
 
-    Ready grants reserve capacity before submission. Suspended tasks retain it
-    until backend completion, whereas buffered results only retain a pool slot.
-    All pools use this ledger's lock to acquire both resources atomically.
+    Ready grants reserve resources before submission. Tasks waiting on transport
+    yield CPU but retain declared heap and their physical owner. Completion
+    returns process resources; buffered results retain only their pool slot.
+    All pools use this ledger's lock to acquire slots and resources atomically.
     """
 
-    def __init__(self, *, max_slots: int) -> None:
-        if int(max_slots) <= 0:
+    def __init__(self, *, max_slots: int | None, resource_limit: ResourceVector | None = None) -> None:
+        if max_slots is not None and int(max_slots) <= 0:
             raise ValueError("max_slots must be positive")
-        self._max_slots = int(max_slots)
+        if resource_limit is None and max_slots is None:
+            raise ValueError("execution capacity requires a slot or resource limit")
+        self._max_slots = None if max_slots is None else int(max_slots)
+        self.resource_limit = resource_limit
+        self._resources = ResourceVector()
+        self._task_resources = ResourceVector()
+        self._residents: dict[str, ResourceVector] = {}
+        self._resuming: deque[_LocalExecutionReservation] = deque()
         self._reserved = 0
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         # Move a pool to the back after every grant, including direct grants.
         self._pools: dict[LocalExecutionSlotPool, None] = {}
         self._dispatching = False
@@ -169,7 +179,78 @@ class LocalExecutionCapacity:
         with self._lock:
             return self._reserved
 
+    def _slots_full_locked(self) -> bool:
+        return self._max_slots is not None and self._reserved >= self._max_slots
+
+    def _fits_locked(self, resources: ResourceVector) -> bool:
+        return self.resource_limit is None or (self._resources + resources).fits_within(self.resource_limit)
+
+    def _can_acquire_locked(self, resources: ResourceVector) -> bool:
+        return not self._resuming and not self._slots_full_locked() and self._fits_locked(resources)
+
+    def _return_ready_locked(self, resources: ResourceVector) -> None:
+        self._reserved -= 1
+        self._resources -= resources
+        self._task_resources -= resources
+        self._condition.notify_all()
+
+    def reserve_resident(
+        self, resources: ResourceVector, cancellation: ExecutionCancellationScope | None = None
+    ) -> Callable[[], None]:
+        """Reserve actor processes once, until their physical owner closes."""
+        with self._condition:
+            while True:
+                resident = sum(self._residents.values(), ResourceVector())
+                if self.resource_limit is None:
+                    break
+                if not (resident + resources).fits_within(self.resource_limit):
+                    raise ValueError("local actor processes exceed the node CPU/heap resource capacity")
+                # A new resident must not claim CPU temporarily yielded by a
+                # task which still needs that CPU to finish and release input.
+                if (resident + self._task_resources + resources).fits_within(self.resource_limit):
+                    break
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("local actor process resources")
+                self._condition.wait(timeout=0.1)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("local actor process resources")
+            token = uuid.uuid4().hex
+            self._residents[token] = resources
+            self._resources += resources
+
+        def release() -> None:
+            with self._condition:
+                owned = self._residents.pop(token, None)
+                if owned is None:
+                    return
+                self._resources -= owned
+                self._condition.notify_all()
+                wakeups = self._dispatch_locked()
+            _notify_slot_wakeups(wakeups)
+
+        return release
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "limit": None if self.resource_limit is None else self.resource_limit.to_dict(),
+                "usage": self._resources.to_dict(),
+                "resident": sum(self._residents.values(), ResourceVector()).to_dict(),
+                "resuming_tasks": len(self._resuming),
+            }
+
+    def _resume_locked(self) -> None:
+        while self._resuming:
+            reservation = self._resuming[0]
+            if not self._fits_locked(reservation.cpu):
+                break
+            self._resuming.popleft()
+            self._resources += reservation.cpu
+            reservation.suspended = False
+        self._condition.notify_all()
+
     def _dispatch_locked(self) -> list[Callable[[], None]]:
+        self._resume_locked()
         self._dispatch_requested = True
         self._deferred_guards.clear()
         return [self._dispatch]
@@ -206,7 +287,7 @@ class LocalExecutionCapacity:
                 with self._lock:
                     self._turn_pool = None
                     self._turn_remaining = 0
-                    if self._reserved >= self._max_slots or (not granted and not self._dispatch_requested):
+                    if self._slots_full_locked() or (not granted and not self._dispatch_requested):
                         self._dispatching = False
                         self._deferred_guards.clear()
                         finished = True
@@ -222,11 +303,67 @@ class LocalExecutionCapacity:
         if error is not None:
             raise error
 
-    def _complete_execution(self) -> None:
+    def _complete_execution(self, reservation: _LocalExecutionReservation) -> None:
         with self._lock:
+            if reservation.finished:
+                return
+            reservation.finished = True
+            if reservation in self._resuming:
+                self._resuming.remove(reservation)
             self._reserved -= 1
+            self._task_resources -= reservation.resources
+            self._resources -= (
+                reservation.resources - reservation.cpu if reservation.suspended else reservation.resources
+            )
+            self._condition.notify_all()
             wakeups = self._dispatch_locked()
         _notify_slot_wakeups(wakeups)
+
+
+class _LocalExecutionReservation:
+    def __init__(self, capacity: LocalExecutionCapacity, resources: ResourceVector) -> None:
+        self.capacity = capacity
+        self.resources = resources
+        self.cpu = ResourceVector(cpu=resources.cpu)
+        self.suspended = False
+        self.finished = False
+
+    def complete(self) -> None:
+        self.capacity._complete_execution(self)
+
+    @contextmanager
+    def suspend(self, scope: ExecutionCancellationScope) -> Iterator[None]:
+        capacity = self.capacity
+        with capacity._condition:
+            if self.finished or self.suspended:
+                raise RuntimeError("cannot suspend inactive local execution resources")
+            self.suspended = True
+            capacity._resources -= self.cpu
+            capacity._condition.notify_all()
+            wakeups = capacity._dispatch_locked()
+        _notify_slot_wakeups(wakeups)
+        yield
+        # Failed transport goes directly to cleanup without reclaiming CPU.
+        try:
+            with capacity._condition:
+                if not self.finished and not scope.is_set():
+                    capacity._resuming.append(self)
+                    capacity._resume_locked()
+                try:
+                    while not self.finished and self.suspended and not scope.is_set():
+                        capacity._condition.wait(timeout=0.1)
+                finally:
+                    if self in capacity._resuming:
+                        capacity._resuming.remove(self)
+                    wakeups = capacity._dispatch_locked()
+            _notify_slot_wakeups(wakeups)
+            scope.raise_if_cancelled("local execution resource resumption")
+            if self.finished:
+                raise RuntimeError("cannot resume completed local execution resources")
+        finally:
+            with capacity._condition:
+                if self in capacity._resuming:
+                    capacity._resuming.remove(self)
 
 
 class LocalExecutionSlotPool:
@@ -238,6 +375,7 @@ class LocalExecutionSlotPool:
         max_slots: int,
         execution_slot_prefix: str,
         execution_capacity: LocalExecutionCapacity | None = None,
+        resources: ResourceVector = ResourceVector(),
     ) -> None:
         slot_count = int(max_slots)
         if slot_count <= 0:
@@ -247,6 +385,10 @@ class LocalExecutionSlotPool:
             raise ValueError("execution_slot_prefix must be non-empty")
         self._prefix = prefix
         self._execution_capacity = execution_capacity
+        self._resources = resources
+        if execution_capacity is not None and execution_capacity.resource_limit is not None:
+            if not resources.fits_within(execution_capacity.resource_limit):
+                raise ValueError("local task exceeds the node CPU/heap resource capacity")
         self._lock = execution_capacity._lock if execution_capacity is not None else threading.Lock()
         self._available_slots = deque(range(slot_count))
         self._active_slots: dict[str, tuple[int, LocalSlotAdmissionAuthority]] = {}
@@ -275,7 +417,7 @@ class LocalExecutionSlotPool:
 
     def _try_take_slot_locked(self, source: int = 0, guard: Callable[[], bool] | None = None) -> int | None:
         capacity = self._execution_capacity
-        if not self._available_slots or (capacity is not None and capacity._reserved >= capacity._max_slots):
+        if not self._available_slots or (capacity is not None and not capacity._can_acquire_locked(self._resources)):
             return None
         if capacity is not None:
             if capacity._dispatch_requested and not capacity._dispatching:
@@ -313,6 +455,8 @@ class LocalExecutionSlotPool:
         if capacity is not None:
             capacity._deferred_guards.clear()
             capacity._reserved += 1
+            capacity._resources += self._resources
+            capacity._task_resources += self._resources
             if capacity._dispatching:
                 capacity._turn_remaining -= 1
             capacity._pools.pop(self)
@@ -373,7 +517,7 @@ class LocalExecutionSlotPool:
                     self._turn_remaining = 0
                     capacity = self._execution_capacity
                     global_turn_finished = capacity is not None and (
-                        capacity._reserved >= capacity._max_slots or capacity._turn_remaining == 0
+                        not capacity._can_acquire_locked(self._resources) or capacity._turn_remaining == 0
                     )
                     if (
                         self._closed
@@ -424,7 +568,7 @@ class LocalExecutionSlotPool:
             elif authority._state == "ready" and authority._ready_slot is not None:
                 self._available_slots.append(authority._ready_slot)
                 if self._execution_capacity is not None:
-                    self._execution_capacity._reserved -= 1
+                    self._execution_capacity._return_ready_locked(self._resources)
             authority._state = "closed"
             authority._request_id = ""
             authority._retained_input_bytes = 0
@@ -450,7 +594,7 @@ class LocalExecutionSlotPool:
             self._waiters.clear()
             for authority in authorities:
                 if authority._ready_slot is not None and self._execution_capacity is not None:
-                    self._execution_capacity._reserved -= 1
+                    self._execution_capacity._return_ready_locked(self._resources)
                 authority._state = "closed"
                 authority._request_id = ""
                 authority._retained_input_bytes = 0
@@ -605,6 +749,8 @@ class LocalSlotAdmissionAuthority:
         execution_slot_id = f"{self._pool._prefix}:{slot}"
         self._pool._active_slots[lease_id] = (slot, self)
         self._active_lease_ids.add(lease_id)
+        capacity = self._pool._execution_capacity
+        reservation = None if capacity is None else _LocalExecutionReservation(capacity, self._pool._resources)
         return AdmissionLease(
             request_id=request_id,
             retained_input_bytes=retained,
@@ -614,11 +760,8 @@ class LocalSlotAdmissionAuthority:
                 "slot_index": slot,
             },
             _release_callback=lambda: self._pool._release(lease_id),
-            _execution_finished_callback=(
-                self._pool._execution_capacity._complete_execution
-                if self._pool._execution_capacity is not None
-                else None
-            ),
+            _execution_finished_callback=None if reservation is None else reservation.complete,
+            _capacity_wait_context=None if reservation is None else reservation.suspend,
         )
 
     def close(self) -> None:

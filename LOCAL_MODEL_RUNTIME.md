@@ -869,8 +869,8 @@ relation = source.map_batches(
 
 `flat_map` also accepts this declaration for `subprocess_actor`. The collected
 native payload carries `memory_bytes` through registration, compatibility
-validation, and execution; use that payload directly. Heap declarations remain
-unsupported for `subprocess_task`, whose task-memory admission is separate work.
+validation, and execution; use that payload directly. Heap declarations also
+apply to `subprocess_task` as a per-task process-memory reservation.
 
 `ResourceVector` and UDF process-resource parsing are shared with Ray's query
 resource graph. CPU may be fractional; heap uses integer bytes from the UDF's
@@ -1195,20 +1195,51 @@ another UDF in the same query can progress. A grant acquires both the runtime
 allowance and a pool slot without waiting while holding just one of them.
 Capacity changes wake pending dispatchers; they do not poll for capacity.
 
-Subprocess task pools also share the global task executor's thread capacity.
-Admission reserves a thread together with the pool slot, before reporting a
-ready grant. This applies to tasks with and without a runtime task limit, so
-another query cannot enqueue work ahead of an already reserved thread. When
-all threads are occupied, a pending task receives no runtime allowance.
-Suspended tasks retain their thread reservations; they can reacquire their
-runtime allowance when memory becomes available. Backend completion returns
-the thread reservation even while the result still holds its pool slot.
+Subprocess tasks and resident actors share one process-wide CPU/heap admission
+ledger. Its capacity is captured when the local subprocess runtime starts, using
+the process CPU affinity where supported (bounded by the host CPU count) and
+available system memory. `cpus` can be fractional; `memory_bytes` is an optional
+per-process heap reservation. These declarations govern admission, not OS CPU or
+RSS enforcement.
+Shared-memory flow remains governed by its separate transport and data budgets.
+The host-memory estimate does not detect container memory limits.
 
-Global thread grants rotate between eligible pools, with one grant per pool
-per round. A continuously busy pool cannot starve another pool, including
-when pools use different runtimes or omit `task_limit`. Both pending grants
-and new requests respect that arbitration; returning multiple threads does
-not let the first pool consume them all.
+Native scan width controls native pipeline work only. It does not set the number
+of UDF workers: a single Parquet row group and one native thread can submit
+multiple batches. Batches can complete out of input order; add a downstream
+`ORDER BY` when ordered rows are required. A task pool sizes its physical slots
+from the node capacity and its per-task declarations; workers and coordinator
+threads start lazily. All pools reserve CPU and declared heap together with a
+slot before reporting ready.
+Resident actor pools reserve their total CPU and heap before startup and retain
+that reservation through idle periods, replacements and cleanup retries. Actor
+calls do not charge those resources a second time. Registered GPU pools retain
+their existing device inventory and exclusive assignment rules.
+
+`batch_size` controls each Python call; a physical task can combine multiple
+compute batches. For UDFs that expand small inputs into large outputs,
+`task_input_max_bytes` bounds input accumulation per task. Declare `memory_bytes`
+to account for each task's working heap. The shared-memory transport budget does
+not account for arbitrary allocations made by the UDF itself.
+
+Tasks waiting for shared-memory input or output yield CPU, while retaining their
+heap reservation, process and pool slot. They reacquire CPU before user execution
+continues. Separate task pools can start a consumer even when all existing task
+processes are waiting; there is no shared thread count blocking that consumer.
+Ready-to-resume tasks take priority over fresh grants. A new resident actor must
+also leave CPU for suspended tasks to resume. Completion returns CPU and heap
+even while the result still holds its pool slot. Cancellation and failed
+transport skip reacquisition and return retained resources at completion.
+
+Process-resource grants rotate between eligible pools, with one grant per pool
+per round. A continuously busy pool cannot starve another eligible pool, including
+when pools use different runtimes or omit `task_limit`. Pending grants and new
+requests both respect that arbitration.
+
+This matches Ray's separation of batch tasks, process resources and resident
+actors from native pipeline width. Local still uses subprocess IPC and bounded
+shared memory; Ray owns cluster placement, its object store and distributed
+recovery. Their transport budgets and default capacity detection are distinct.
 
 Within each shared pool, its ordinary FIFO queue and each runtime policy also
 rotate, with one grant per source per round. Queries with and without
@@ -1236,11 +1267,11 @@ Retain and shut down **all** returned resources after executors finish, as in
 the registration workflow. Query shutdown removes its pending requests and
 unused ready grants. Running tasks retain ownership until their backend futures
 finish, including cancellation/failure cleanup. A task waiting for shared-memory
-capacity retains its worker slot and query owner while yielding only its
-execution allowance. Cancellation wakes both memory and allowance waits without
-releasing another query's capacity. Cancelling one query does not close its
-shared model or release another query's allowances. A
-runtime close waits for these query owners, including task-only queries;
+capacity retains its worker slot, heap reservation and query owner while yielding
+its CPU and runtime execution allowance. Cancellation wakes both memory and
+allowance waits without releasing another query's capacity. Cancelling one query
+does not close its shared model or release another query's allowances. A runtime
+close waits for these query owners, including task-only queries;
 `kill=True` does not revoke running work. Drain prevents new preparation while
 allowing already prepared queries to finish.
 The shared query admission gate closes before model draining starts, so
@@ -1260,7 +1291,7 @@ counts are not additive. Both remain tracked until backend completion and
 are bounded by their physical pools, separately from the pending admission
 queue. The running and ready counts sum to the currently reserved runtime task
 capacity. Omitting `task_limit` skips the runtime-wide allowance and bounded
-query queue. Pool slots and global subprocess task threads still constrain
+query queue. Pool slots and process-wide CPU/heap resources still constrain
 admission.
 
 This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
@@ -1272,8 +1303,8 @@ waiting is available through the [bounded byte waiting](#bounded-byte-waiting)
 configuration delivered under [#841](https://github.com/AstroVela/vane/issues/841);
 this task limit alone does not establish a whole-process memory bound. Yielding during
 transport waits lets consumers with available workers use the execution
-allowance. It does not pre-reserve worst-case UDF output expansion, provide
-extra workers, or account worker heap buffers as shared-memory allocations.
+allowance. It does not pre-reserve worst-case UDF output expansion or account
+worker heap buffers as shared-memory allocations.
 
 ## Retained shared-memory data
 
@@ -1756,7 +1787,7 @@ transport users still compete for the process-wide shared-memory hard capacity.
 That external pressure can cause a bounded wait to time out.
 
 Byte checks run inside the existing physical-slot arbitration, after both a
-pool slot and a global task-executor thread are available. A successful check
+pool slot and the declared process resources are available. A successful check
 commits the complete runtime and transport envelope together with those slots,
 before the task policy publishes an allowance. A byte waiter owns none of those
 resources. The native caller can still retain its pending input; this queue is

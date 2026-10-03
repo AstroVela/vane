@@ -110,7 +110,6 @@ def test_runtime_tracks_queued_outputs_and_views_after_query_and_model_close(bac
     payload = _payload(
         _Identity if backend == "subprocess_actor" else identity,
         execution_backend=backend,
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -229,7 +228,7 @@ def test_data_accounting_completion_failure_still_returns_task_worker_capacity(m
     resources, executors = [], []
     try:
         for function in (identity, other_identity):
-            payload = _payload(function, execution_backend="subprocess_task", udf_worker_slots=1)
+            payload = _payload(function, execution_backend="subprocess_task")
             plan = _Plan(payload)
             resources.extend(runtime.prepare(plan, {}))
             executors.append(build_executor(payload, plan.published[-1]["1"]))
@@ -1341,7 +1340,7 @@ def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch
 @pytest.mark.parametrize("workers", [1, 2])
 @pytest.mark.parametrize("neighbor_limited", [False, True])
 @pytest.mark.parametrize("cancel", [False, True])
-def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another_pool(
+def test_transport_waiters_yield_node_cpu_to_another_pool_before_resuming_or_cancelling(
     monkeypatch, workers, neighbor_limited, cancel
 ):
     from vane.execution import ref_bundle
@@ -1364,7 +1363,7 @@ def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another
     resources, executors = [], []
     try:
         for index in range(workers + 1):
-            payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=1)
+            payload = _payload(make_task(index), execution_backend="subprocess_task")
             options = {"session_config": {}}
             if index < workers or neighbor_limited:
                 plan = _Plan(payload)
@@ -1381,10 +1380,12 @@ def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another
             )
         assert global_runtime.execution_capacity.reserved_slots == workers
         assert global_runtime.stats()["active_workers"] == workers
+        assert global_runtime.stats()["process_resources"]["usage"]["cpu"] == 0
         assert neighbor.request_task_admission(small.nbytes)
-        assert neighbor.task_admission_state()["state"] == "requested"
-        assert runtime.resource_snapshot()["task_admission"]["ready_tasks"] == 0
-        assert not neighbor._task_futures
+        assert neighbor.task_admission_state()["available"]
+        neighbor.submit(small)
+        assert _wait_result(neighbor).to_pydict() == {"x": [1 + workers]}
+        assert runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == workers
 
         if cancel:
             for executor in first:
@@ -1392,9 +1393,6 @@ def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another
         else:
             for ref in held[1]:
                 ref.release()
-        _wait_until(lambda: neighbor.task_admission_state()["available"], "global worker capacity was not returned")
-        neighbor.submit(small)
-        assert _wait_result(neighbor).to_pydict() == {"x": [1 + workers]}
         if not cancel:
             for index, executor in enumerate(first):
                 assert _wait_result(executor).to_pydict() == {"x": [8192 + index]}
@@ -1417,7 +1415,7 @@ def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another
 
 @pytest.mark.parametrize("workers", [1, 2])
 @pytest.mark.parametrize("track_data", [False, True])
-def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(monkeypatch, workers, track_data):
+def test_native_task_queries_progress_while_other_pools_wait_for_output_memory(monkeypatch, workers, track_data):
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -1470,12 +1468,15 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
                             "native task did not wait for output memory",
                         )
                     futures.append(threads.submit(runner.execute_native, cursors[-1], plans[-1]))
-                    _wait_until(
-                        lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1,
-                        "native task did not queue behind global worker capacity",
-                    )
+                    # The small result fits even while every producer owns a
+                    # process waiting for enough space for its large output.
+                    neighbor_result = futures[-1].result(timeout=20)
+                    assert [v for table in neighbor_result.partition_payloads for v in table.column(0).to_pylist()] == [
+                        workers
+                    ]
                     snapshot = runtime.resource_snapshot()["task_admission"]
                     assert snapshot["ready_tasks"] == snapshot["running_tasks"] == 0
+                    assert snapshot["waiting_tasks"] == workers
                     if track_data:
                         data = runtime.resource_snapshot()["data"]
                         assert data["tasks"] == workers
@@ -1536,7 +1537,7 @@ def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, 
     runtimes, resources, executors = [], [], []
     try:
         for index in range(2):
-            payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=2)
+            payload = _payload(make_task(index), execution_backend="subprocess_task")
             options = {"session_config": {}}
             limited = limits in {"shared", "separate"} or limits == ("first" if index == 0 else "second")
             if limited or track_data:
@@ -1609,7 +1610,7 @@ def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tm
                 time.sleep(0.01)
         return table
 
-    payload = _payload(task, execution_backend="subprocess_task", udf_worker_slots=2)
+    payload = _payload(task, execution_backend="subprocess_task")
     runtime = LocalModelRuntime(
         session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8), track_data=track_data
     )
@@ -1686,14 +1687,14 @@ def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatc
     resources, executors = [], []
     try:
         for function in (fail, identity):
-            payload = _payload(function, execution_backend="subprocess_task", udf_worker_slots=1)
+            payload = _payload(function, execution_backend="subprocess_task")
             plan = _Plan(payload)
             resources.extend(runtime.prepare(plan, {}))
             executors.append(build_executor(payload, plan.published[-1]["1"]))
         broken, healthy = executors
         with monkeypatch.context() as patch:
             if failure == "submit":
-                patch.setattr(local._global_task_runtime().executor, "submit", fail)
+                patch.setattr(broken._task_pool.executor, "submit", fail)
                 with pytest.raises(RuntimeError, match="planned task failure"):
                     _submit(broken, pa.table({"x": [1]}))
             else:
@@ -1753,7 +1754,7 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
     source = pa.table({"x": list(range(8192))})
     held = ref_bundle.make_local_shm_ref_bundle_result(source)
     producer_payload = _payload(Producer, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
-    consumer_payload = _payload(consumer, execution_backend="subprocess_task", udf_worker_slots=1)
+    consumer_payload = _payload(consumer, execution_backend="subprocess_task")
     runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
     resources, executors, outputs = [], [], []
     try:
@@ -1930,10 +1931,17 @@ def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure
                 cursor.close()
 
 
-def test_mixed_native_queries_share_four_task_slots_across_two_four_worker_models(monkeypatch, tmp_path):
+def test_mixed_native_queries_share_four_task_slots_across_two_four_worker_models(monkeypatch, tmp_path, request):
     import sqlite3
     from contextlib import closing
 
+    from vane.execution import udf_subprocess
+
+    # Sixteen resident actors plus four task CPUs. The runtime task limit,
+    # rather than the CI machine's CPU count, is the subject of this test.
+    tasks = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=20, heap_bytes=1024**3))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    request.addfinalizer(lambda: tasks.close(kill=True))
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     database = str(tmp_path / "activity.sqlite")
     gates = [str(tmp_path / f"release-{stage}") for stage in range(3)]

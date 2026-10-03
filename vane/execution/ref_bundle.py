@@ -827,8 +827,20 @@ class LocalShmBudgetManager:
                 def _can_grant_locked() -> bool:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError(f"local_shm output grant cancelled: {name or '-'}")
-                    limit, _, _, required_usage, oversized_allowed = _grant_state_locked()
-                    return limit <= 0 or required_usage <= limit or oversized_allowed
+                    limit, input_credit, _, required_usage, oversized_allowed = _grant_state_locked()
+                    if limit <= 0 or required_usage <= limit or oversized_allowed:
+                        return True
+                    # Overlapping input slices can retain duplicate credits
+                    # after the allocation is released. Convert existing
+                    # consumer credit without increasing total usage. At most
+                    # one bounded block may exceed materialized capacity;
+                    # explicit task reservations retain their hard boundary.
+                    return (
+                        priority == "consumer"
+                        and 0 < requested <= min(input_credit, limit)
+                        and self._task_reservation_bytes == 0
+                        and self._allocated_bytes + self._output_grant_bytes <= limit
+                    )
 
                 while not _can_grant_locked():
                     limit, input_credit, _, _, _ = _grant_state_locked()
@@ -2103,6 +2115,10 @@ def _apply_ref_bundle_slices(
             if start < 0 or end < start or end > table.num_rows:
                 raise ValueError(f"invalid ref bundle slice [{start}, {end}) for block rows={table.num_rows}")
             table = table.slice(start, end - start)
+        if output_names:
+            # Source projections can repeat columns. Unify schemas by position
+            # before restoring the logical names, which can also be duplicated.
+            table = table.rename_columns([f"__vane_ref_column_{index}" for index in range(table.num_columns)])
         tables.append(table)
 
     if not tables:

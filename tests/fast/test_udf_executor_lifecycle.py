@@ -22,6 +22,19 @@ pytest.importorskip("pyarrow")
 
 import pyarrow as pa
 
+from vane.execution.resources import ResourceVector
+
+
+def _set_task_resource_limit(monkeypatch, cpus):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    subprocess_exec._shutdown_global_task_runtime()
+    monkeypatch.setattr(
+        subprocess_exec,
+        "_GLOBAL_TASK_RUNTIME",
+        subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=cpus, heap_bytes=64 * 1024**3)),
+    )
+
 
 def _packed_native_vllm_options(options):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -127,7 +140,6 @@ def _subprocess_map_payload(fn, **extra):
         "function_pickle": _pickle_function(fn),
         "call_mode": "map_batches",
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
     }
     payload.update(extra)
     return payload
@@ -248,7 +260,6 @@ def _subprocess_scalar_payload(fn, **extra):
         "function_pickle": _pickle_function(fn),
         "call_mode": "map",
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
     }
     payload.update(extra)
     return payload
@@ -261,7 +272,7 @@ def _make_subprocess_actor_executor(
     pool_size=None,
     name="test-local-subprocess-actor",
 ):
-    size = int(pool_size or payload.get("actor_number") or payload.get("udf_worker_slots") or 1)
+    size = int(pool_size or payload.get("actor_number") or 1)
     pool = subprocess_exec.LocalSubprocessActorPool(payload, size, name=name)
     try:
         executor = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
@@ -2087,7 +2098,6 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
                     "node_id": 8,
                     "payload": {
                         "execution_backend": "subprocess_task",
-                        "udf_worker_slots": 3,
                         "function_pickle": b"unused",
                         "call_mode": "map_batches",
                     },
@@ -4316,7 +4326,6 @@ def test_subprocess_task_rejects_callable_instance():
             _subprocess_map_payload(
                 StatefulBatchUDF(),
                 execution_backend="subprocess_task",
-                udf_worker_slots=1,
             )
         )
 
@@ -4365,7 +4374,7 @@ def test_subprocess_actor_reuses_callable_class_state():
         pool.shutdown(kill=True)
 
 
-def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
+def test_subprocess_tasks_reuse_an_idle_worker(monkeypatch):
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from vane.execution.udf_subprocess import UDFExecutor
 
@@ -4380,7 +4389,6 @@ def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
         _subprocess_map_payload(
             worker_pid,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -4402,10 +4410,10 @@ def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
         executor.close()
 
 
-def test_subprocess_task_stats_report_worker_slot_admission():
+def test_subprocess_task_stats_report_worker_slot_admission(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
-    subprocess_exec._shutdown_global_task_runtime()
+    _set_task_resource_limit(monkeypatch, 3)
 
     def sleeper(table):
         import time
@@ -4417,7 +4425,6 @@ def test_subprocess_task_stats_report_worker_slot_admission():
         _subprocess_map_payload(
             sleeper,
             execution_backend="subprocess_task",
-            udf_worker_slots=3,
         )
     )
     try:
@@ -4460,7 +4467,6 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
     payload = _subprocess_map_payload(
         make_output,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
         output_schema=[
@@ -4525,7 +4531,6 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
         _subprocess_map_payload(
             make_output,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
             output_schema=[
@@ -4561,7 +4566,6 @@ def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
         _subprocess_map_payload(
             make_output,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
             output_schema=[
@@ -4701,6 +4705,7 @@ def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_w
             events.append("admission-close")
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.name = "pool"
     pool._closed = False
     pool._lock = threading.RLock()
@@ -4767,6 +4772,7 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     failed_worker = FakeWorker("failed")
     replacement = FakeWorker("replacement")
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "replacement-shutdown-race"
@@ -4888,6 +4894,7 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     failed_worker = FailedWorker()
     provisional_worker = ProvisionalWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "provisional-replacement-shutdown"
@@ -4960,6 +4967,7 @@ def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(mon
             pass
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "unpublished-replacement-shutdown"
@@ -5022,6 +5030,7 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
     pool.name = "abort-cleanup-failure"
@@ -5080,6 +5089,7 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_scope_cancel_failu
 
     scope = FailingScope()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "scope-cancel-failure"
@@ -5134,6 +5144,7 @@ def test_local_subprocess_actor_pool_reports_graceful_quiescence_timeout(monkeyp
             return None
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "graceful-quiescence-timeout"
@@ -5169,6 +5180,7 @@ def test_local_subprocess_actor_pool_bounds_replacement_cleanup_errors():
     import vane.execution.udf_subprocess as subprocess_exec
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool._closed = True
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
@@ -5205,6 +5217,7 @@ def test_local_subprocess_actor_pool_closes_idle_workers_concurrently():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
     pool.name = "concurrent-graceful-close"
@@ -5254,6 +5267,11 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    from vane.execution.udf_admission import LocalExecutionCapacity
+
+    capacity = LocalExecutionCapacity(max_slots=None, resource_limit=ResourceVector(cpu=1, heap_bytes=100))
+    reserved = ResourceVector(cpu=1, heap_bytes=80)
+    pool._resident_release = capacity.reserve_resident(reserved)
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "retry-retained-cleanup"
@@ -5279,6 +5297,7 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
     with pytest.raises(RuntimeError, match="planned first close failure"):
         pool.shutdown(kill=False)
 
+    assert capacity.resource_snapshot()["usage"] == reserved.to_dict()
     assert pool.cleanup_pending()
     assert pool._workers == []
     assert pool._cleanup_pending_workers == [worker]
@@ -5287,6 +5306,7 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
 
     assert close_calls == [False, True]
     assert not pool.cleanup_pending()
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
     assert pool._cleanup_pending_workers == []
 
 
@@ -5319,6 +5339,7 @@ def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_unti
     provisional_worker = FakeWorker("provisional")
     admission_slots = FakeAdmissionSlots()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "failed-provisional-replacement"
@@ -5379,6 +5400,7 @@ def test_local_subprocess_actor_pool_retries_retained_executor_cleanup():
 
     executor = FakeExecutor()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "retry-retained-executor"
@@ -5431,6 +5453,7 @@ def test_local_subprocess_actor_pool_aborts_active_workers_concurrently():
             close_barrier.wait(timeout=1.0)
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
     pool._active_scopes = {0: scopes[0], 1: scopes[1]}
@@ -5466,6 +5489,7 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     lost_worker = FakeWorker("lost", reusable=True)
     replacement = FakeWorker("replacement", reusable=True)
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {"udf_name": "reconstructible_local_actor"}
     pool.pool_size = 1
     pool.name = "reconstructible-local-actor"
@@ -5508,6 +5532,9 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_failure(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
+
     class Identity:
         def __call__(self, table):
             return table
@@ -5547,9 +5574,14 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_f
 
     assert events == ["close:w0:True"]
 
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_init_failure(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
 
     class Identity:
         def __call__(self, table):
@@ -5589,9 +5621,14 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
 
     assert events == ["close:w1:True", "close:w0:True"]
 
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
 
 def test_local_subprocess_actor_pool_init_cleanup_failure_carries_retry_owner(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
 
     workers = []
 
@@ -5636,12 +5673,15 @@ def test_local_subprocess_actor_pool_init_cleanup_failure_carries_retry_owner(mo
     assert len(exc_info.value.owned_actor_pools) == 1
     pool = exc_info.value.owned_actor_pools[0]
     assert pool.cleanup_pending()
+    assert capacity.resource_snapshot()["usage"]["cpu"] == 2
     assert [worker.close_calls for worker in workers] == [1, 1]
 
     pool.shutdown(kill=True)
 
     assert not pool.cleanup_pending()
     assert [worker.close_calls for worker in workers] == [2, 1]
+
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
 
 
 def test_local_subprocess_actor_pool_rollback_preserves_owned_constructor_failure(monkeypatch):
@@ -5715,13 +5755,16 @@ def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_exe
 
     idle_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("idle"))
     active_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("active"))
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
     runtime.closed = False
     runtime.total_workers = 2
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = FakeExecutor()
     pool.runtime = runtime
     pool.key = "pool"
     pool.closing = False
@@ -5777,13 +5820,16 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
 
     idle_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("idle", fail=True))
     active_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("active"))
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
     runtime.closed = False
     runtime.total_workers = 2
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = FakeExecutor()
     pool.runtime = runtime
     pool.key = "pool"
     pool.closing = False
@@ -5825,10 +5871,14 @@ def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
             shutdown_started.set()
             assert allow_shutdown.wait(timeout=5.0)
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
-    runtime.pools = {}
+    pool = subprocess_exec._TaskWorkerPool(runtime, "close-test", {"execution_backend": "subprocess_task"}, 1)
+    pool.executor.shutdown(wait=False)
+    pool.executor = FakeExecutor()
+    runtime.pools = {"close-test": pool}
     runtime.total_workers = 0
     runtime.closed = False
     runtime._close_finished = True
@@ -5886,9 +5936,10 @@ def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails
             assert released is wrapper
             events.append(f"release:{reusable}")
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.total_workers = 1
-    runtime.max_workers = 1
     monkeypatch.setattr(subprocess_exec, "_should_debug_submit", lambda _seq: True)
 
     def fail_debug_log(_message):
@@ -6150,7 +6201,6 @@ def test_subprocess_ref_bundle_output_stats_include_pending_projected_bytes(monk
         _subprocess_map_payload(
             make_output,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
             output_schema=[
@@ -6191,7 +6241,6 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
     payload = _subprocess_map_payload(
         sleeper,
         execution_backend="subprocess_task",
-        udf_worker_slots=2,
     )
     executor_a = subprocess_exec.UDFExecutor(payload)
     executor_b = subprocess_exec.UDFExecutor(payload)
@@ -6199,7 +6248,7 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
         assert len(executor_a._workers) == 0
         assert len(executor_b._workers) == 0
         assert executor_a._task_pool is not None
-        assert executor_a._task_pool.pool_size == 2
+        assert executor_a._task_pool.pool_size == 1
         assert subprocess_exec._global_task_runtime().stats()["max_workers"] == 1
 
         _submit_with_admission(executor_a, pa.table({"x": [1]}), submit_id=171)
@@ -6212,12 +6261,13 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
         executor_b.register_wakeup(ready.set)
         second_table = pa.table({"x": [2]})
         assert executor_b.request_task_admission(second_table.nbytes)
+        results = _wait_for_results(executor_a, 1, timeout_s=10.0)
         if not executor_b.task_admission_state()["available"]:
             assert ready.wait(10)
         assert executor_b.task_admission_state()["available"]
         executor_b.submit_with_id(172, second_table)
 
-        results = _wait_for_results(executor_a, 1, timeout_s=10.0) + _wait_for_results(
+        results += _wait_for_results(
             executor_b,
             1,
             timeout_s=10.0,
@@ -6398,6 +6448,8 @@ def test_subprocess_task_pool_abort_attempts_every_matching_worker_after_failure
     wrapper_b.active_scope = scope_b
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = types.SimpleNamespace(shutdown=lambda **_kwargs: None)
     pool.runtime = types.SimpleNamespace(cond=threading.Condition())
     pool._active_wrappers = {wrapper_a, wrapper_b}
 
@@ -6418,6 +6470,8 @@ def test_subprocess_task_pool_nonfinal_release_does_not_join_shared_worker_spawn
         total_workers=1,
     )
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = types.SimpleNamespace(shutdown=lambda **_kwargs: None)
     pool.runtime = runtime
     pool.key = "shared-spawn"
     pool.ref_count = 2
@@ -6706,9 +6760,10 @@ def test_subprocess_task_releases_result_cancelled_after_worker_call():
             assert released_wrapper is wrapper
             events.append(f"release:{reusable}")
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.total_workers = 1
-    runtime.max_workers = 1
 
     with pytest.raises(ExecutionCancelledError, match="subprocess task result cancelled"):
         runtime._run_task(FakePool(), lambda _worker: result, scope)
@@ -6747,6 +6802,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "post-call-cancel"
@@ -6776,7 +6832,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
-    subprocess_exec._shutdown_global_task_runtime()
+    _set_task_resource_limit(monkeypatch, 1)
 
     def sleeper(table):
         import os
@@ -6788,7 +6844,6 @@ def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypat
     payload = _subprocess_map_payload(
         sleeper,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
     )
     executor_a = subprocess_exec.UDFExecutor(payload)
     executor_b = subprocess_exec.UDFExecutor(payload)
@@ -6835,7 +6890,6 @@ def test_subprocess_task_pool_identity_includes_session_config():
 
     payload = {
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
         "function_pickle": b"same-function",
     }
 
@@ -7010,7 +7064,6 @@ def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materializ
         _subprocess_map_payload(
             add_one,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
         )
     )
     try:
@@ -7057,7 +7110,6 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         _subprocess_map_payload(
             maybe_sleep_add_one,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
         )
     )
     try:
@@ -7102,7 +7154,6 @@ def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
         _subprocess_map_payload(
             identity,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
         )
     )
 
@@ -7281,9 +7332,11 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     assert snapshot["output_credit_bytes"] == 0
 
 
-def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed():
+def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed(monkeypatch):
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from vane.execution.udf_subprocess import UDFExecutor
+
+    _set_task_resource_limit(monkeypatch, 1)
 
     def identity(table):
         return table
@@ -7292,7 +7345,6 @@ def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consum
         _subprocess_map_payload(
             identity,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -7583,7 +7635,8 @@ def test_subprocess_worker_receives_worker_env_without_cuda_assignment(monkeypat
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
-    executor = UDFExecutor(_subprocess_map_payload(worker_env, udf_worker_slots=1, gpus=1.0))
+    _set_task_resource_limit(monkeypatch, 1)
+    executor = UDFExecutor(_subprocess_map_payload(worker_env))
     try:
         _submit_with_admission(executor, pa.table({"x": [1]}))
         output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
@@ -8300,7 +8353,6 @@ def test_subprocess_ref_bundle_input_ack_releases_upstream_before_result(monkeyp
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -8341,7 +8393,6 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
             output_schema=[{"name": "y", "kind": "tensor", "dtype": "UINT8", "shape": [tensor_width]}],
         )
     )
@@ -9639,7 +9690,6 @@ def test_close_during_input_ack_keeps_executor_cleanup_retryable(monkeypatch, ow
             dict(
                 function_pickle=vane_pickle.dumps(lambda table: table),
                 execution_backend="subprocess_task",
-                udf_worker_slots=1,
             ),
             {},
         )
@@ -10103,7 +10153,6 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -10219,7 +10268,6 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
     payload = _subprocess_map_payload(
         add_one,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )

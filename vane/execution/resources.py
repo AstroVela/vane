@@ -46,7 +46,7 @@ class ResourceVector:
     path may escape a soft block. Object-store bytes additionally describe
     spillable flow rather than process memory. A vector is never allowed to
     carry negative capacity; subtraction that would underflow is a
-    control-plane bug. Local resident model limits use the same arithmetic,
+    control-plane bug. Local task and resident model limits use the same arithmetic,
     but represent admission limits rather than OS memory or CPU enforcement.
     """
 
