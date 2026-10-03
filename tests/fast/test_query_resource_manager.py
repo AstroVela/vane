@@ -150,7 +150,7 @@ def _ready(manager, *unit_ids, consumer_waiting=False):
     manager.set_external_consumer_waiting(consumer_waiting)
 
 
-def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None):
+def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None, output_kind="data"):
     return TaskRequest(
         query_id="q",
         resource_unit_id=resource_unit_id,
@@ -158,7 +158,91 @@ def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None)
         attempt_id=str(attempt),
         node_id=node_id,
         retained_input_bytes=retained,
+        output_kind=output_kind,
     )
+
+
+def test_native_copy_estimate_is_per_task_and_completion_charges_exact_metadata():
+    mib = 1024**2
+    native = _unit("resource:f:scan", backend="ray_worker", target=128 * mib)
+    manager = _manager(native, resources=_r(store=1024 * mib))
+    _ready(manager, native.resource_unit_id)
+    data = manager.try_acquire_task(_task(native.resource_unit_id, 0, node_id="node-a"))
+    copy_request = _task(native.resource_unit_id, 1, node_id="node-a", output_kind="copy_metadata")
+    copy = manager.try_acquire_task_descriptor(copy_request)
+    assert data.granted and copy.granted
+    assert data.lease.output_window_bytes == 256 * mib
+    assert copy.lease.output_window_bytes == 4 * mib
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 260 * mib
+    assert snapshot["units"][native.resource_unit_id]["pending_output_estimate_bytes"] == 260 * mib
+
+    # A failed placement relinquishes its estimate without making the attempt
+    # terminal. Re-admission must preserve the COPY contract.
+    assert manager.abandon_task_lease(copy.lease.lease_id, attempt_id="0")
+    copy = manager.try_acquire_task_descriptor(copy_request, recovery=True)
+    assert copy.granted and copy.lease.output_window_bytes == 4 * mib
+    outputs = manager.finish_task_with_outputs(
+        copy.lease.lease_id,
+        attempt_id="0",
+        outputs=[
+            OutputBlockRequest(
+                query_id="q",
+                producer_unit_id=native.resource_unit_id,
+                task_lease_id=copy.lease.lease_id,
+                attempt_id="0",
+                block_id="copy-file-statistics",
+                size_bytes=6 * mib,
+            )
+        ],
+    )
+    # The seed is an estimate, not a cap or an exemption from output accounting.
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 262 * mib
+    assert manager.release_task_lease(data.lease.lease_id, attempt_id="0")
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 6 * mib
+    assert manager.release_output_block(outputs[0].lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_eight_copy_fragments_leave_budget_for_seven_decoder_tasks_and_resident_actor():
+    mib = 1024**2
+    native = _unit("resource:f:scan", backend="ray_worker", target=128 * mib)
+    decode = _unit("resource:u:decode", inputs=(native.resource_unit_id,), resources=_r(cpu=1), target=128 * mib)
+    model = _unit(
+        "resource:u:model",
+        inputs=(decode.resource_unit_id,),
+        backend="ray_actor",
+        actor_pool_size=1,
+        resident=_r(cpu=1, gpu=1),
+        target=128 * mib,
+    )
+    manager = _manager(native, decode, model, resources=_r(cpu=8, gpu=1, store=4 * 1024 * mib))
+    _ready(manager, native.resource_unit_id, decode.resource_unit_id, model.resource_unit_id)
+    for index in range(8):
+        grant = manager.try_acquire_task_descriptor(
+            _task(native.resource_unit_id, index, node_id="node-a", output_kind="copy_metadata")
+        )
+        assert grant.granted and not grant.liveness
+    native_snapshot = manager.snapshot()["units"][native.resource_unit_id]
+    assert native_snapshot["pending_output_estimate_per_active_task_bytes"] == 4 * mib
+    assert native_snapshot["pending_output_estimate_bytes"] == 32 * mib
+    for index in range(7):
+        grant = manager.try_acquire_task(_task(decode.resource_unit_id, index, retained=128))
+        assert grant.granted and not grant.liveness
+    assert not manager.try_acquire_task(_task(decode.resource_unit_id, 7, retained=128)).granted
+    assert manager.snapshot()["usage"]["object_store_bytes"] == (8 * 4 + 7 * 256) * mib + 7 * 128
+
+
+@pytest.mark.parametrize("backend,kind", [("ray_task", "copy_metadata"), ("ray_worker", "unknown")])
+def test_task_output_contract_cannot_exempt_udfs_or_unknown_outputs(backend, kind):
+    unit = _unit("resource:f:unit", backend=backend)
+    manager = _manager(unit)
+    _ready(manager, unit.resource_unit_id)
+    result = manager.try_acquire_task(
+        _task(unit.resource_unit_id, 0, node_id="node-a" if backend == "ray_worker" else None, output_kind=kind)
+    )
+    assert not result.granted and result.fatal
+    assert result.blocked_reason == "invalid_task_output_kind"
 
 
 def _assert_object_store_budget_invariants(snapshot):
