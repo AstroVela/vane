@@ -736,6 +736,14 @@ OperatorFinalizeResultType CachingPhysicalOperator::FinalExecute(ExecutionContex
 }
 
 void PhysicalOperator::Serialize(Serializer &serializer) const {
+	SerializeInternal(serializer, true);
+}
+
+void PhysicalOperator::SerializeNode(Serializer &serializer) const {
+	SerializeInternal(serializer, false);
+}
+
+void PhysicalOperator::SerializeInternal(Serializer &serializer, bool include_children) const {
 	auto &data = serializer.GetSerializationData();
 	DynamicFilterSerializationGuard guard(data);
 
@@ -748,7 +756,7 @@ void PhysicalOperator::Serialize(Serializer &serializer) const {
 	SerializeOperatorData(serializer);
 
 	// Write children as a list
-	serializer.WriteList(198, "children", children.size(), [&](Serializer::List &list, idx_t i) {
+	serializer.WriteList(198, "children", include_children ? children.size() : 0, [&](Serializer::List &list, idx_t i) {
 		list.WriteObject([&](Serializer &child_serializer) { children[i].get().Serialize(child_serializer); });
 	});
 }

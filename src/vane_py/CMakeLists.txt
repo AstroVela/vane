@@ -27,6 +27,8 @@ add_library(
   bound_plan.cpp
   query_parameters.cpp
   dynamic_extension.cpp
+  execution/fragment_plan.cpp
+  execution/fragment_plan_bindings.cpp
   vane_python.cpp
   importer.cpp
   merge_relation.cpp
@@ -60,5 +62,25 @@ add_library(
   vllm_executor.cpp)
 
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
+
+# The fragment wire identity includes the compiler/loader implementation as well
+# as DuckDB's SourceID. Vane-only native edits must invalidate old plan bytes
+# too.
+set(_fragment_identity "")
+foreach(_fragment_file execution/fragment_plan.hpp execution/fragment_plan.cpp
+                       execution/fragment_plan_bindings.cpp)
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${_fragment_file}")
+  file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${_fragment_file}" _fragment_hash)
+  string(APPEND _fragment_identity "${_fragment_hash}")
+endforeach()
+string(SHA256 _fragment_identity "${_fragment_identity}")
+set_property(
+  SOURCE execution/fragment_plan.cpp
+  APPEND
+  PROPERTY COMPILE_DEFINITIONS
+           "VANE_FRAGMENT_BUILD_ID=\"${_fragment_identity}\"")
 target_include_directories(
   python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include")

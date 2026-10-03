@@ -350,6 +350,7 @@ struct ICULocalTimestampFunc : public ICUDateFunc {
 	static void AddFunction(const string &name, ExtensionLoader &loader) {
 		ScalarFunctionSet set(name);
 		auto function = ScalarFunction({}, LogicalType::TIMESTAMP, Execute, BindNow);
+		function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 		function.SetRequiresClientContext();
 		set.AddFunction(function);
 		loader.RegisterFunction(set);
@@ -368,6 +369,7 @@ struct ICULocalTimeFunc : public ICUDateFunc {
 	static void AddFunction(const string &name, ExtensionLoader &loader) {
 		ScalarFunctionSet set(name);
 		auto function = ScalarFunction({}, LogicalType::TIME, Execute, ICULocalTimestampFunc::BindNow);
+		function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 		function.SetRequiresClientContext();
 		set.AddFunction(function);
 		loader.RegisterFunction(set);

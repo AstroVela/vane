@@ -76,6 +76,7 @@ _ExpressionLike: typing.TypeAlias = (
 
 from . import _func as _func
 from . import _sqltypes as _sqltypes
+from . import execution_plan as execution_plan
 from . import ray_cxx as ray_cxx
 
 class BinderException(ProgrammingError): ...

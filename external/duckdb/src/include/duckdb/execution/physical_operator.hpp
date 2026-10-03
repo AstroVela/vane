@@ -279,10 +279,14 @@ public:
 	// Serialization interface
 	//! Serialize this operator and all its children recursively
 	void Serialize(Serializer &serializer) const;
+	//! Serialize a single operator with an empty child list. Fragment codecs bind
+	//! child operators and input ports separately without mutating the plan tree.
+	void SerializeNode(Serializer &serializer) const;
 	//! Deserialize an operator tree from a deserializer
 	static unique_ptr<PhysicalOperator> Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan);
 
 protected:
+	void SerializeInternal(Serializer &serializer, bool include_children) const;
 	//! Serialize operator-specific data (virtual, must be implemented by each operator)
 	virtual void SerializeOperatorData(Serializer &serializer) const;
 	//! Deserialize operator-specific data and create the operator
