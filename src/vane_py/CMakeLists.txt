@@ -30,6 +30,9 @@ add_library(
   execution/fragment_plan.cpp
   execution/fragment_plan_bindings.cpp
   execution/local_query.cpp
+  execution/direct_exchange.cpp
+  execution/direct_task.cpp
+  execution/direct_runtime_bindings.cpp
   vane_python.cpp
   importer.cpp
   merge_relation.cpp

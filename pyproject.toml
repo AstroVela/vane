@@ -309,6 +309,7 @@ include = [
     "/tests/fast/test_native_fragment_compiler.py",
     "/tests/fast/test_query_execution_options.py",
     "/tests/fast/test_query_result_runtime.py",
+    "/tests/fast/test_direct_exchange.py",
     "/tests/fast/test_local_e2e.py",
     "/tests/fast/test_local_runtime_baseline.py",
     "/tests/fast/test_local_query_runtime.py",
