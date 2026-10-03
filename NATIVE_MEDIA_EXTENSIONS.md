@@ -274,8 +274,9 @@ wheel before running:
 : "${VANE_MEDIA_RUNTIME_SOURCE:?Set the matching runtime source archive path}"
 : "${VANE_BASE_WHEEL:?Set the matching Vane base wheel path}"
 : "${media_wheel_license_expression:?Set the reviewed binary SPDX expression}"
+: "${VANE_MEDIA_RELEASE_NUMBER:?Set providers.native_media.release_number from native-media-release.toml}"
 python -I scripts/build_extension_wheel.py \
-  --release-number 1 \
+  --release-number "$VANE_MEDIA_RELEASE_NUMBER" \
   --artifact "$VANE_MEDIA_SIGNED_EXTENSION" \
   --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \
@@ -398,6 +399,7 @@ the directory to the ordinary wheel builder:
 ```bash
 # Set this to the reviewed expression covering the binary and all materials.
 : "${media_wheel_license_expression:?Set the complete wheel SPDX expression}"
+: "${VANE_MEDIA_RELEASE_NUMBER:?Set providers.native_media.release_number from native-media-release.toml}"
 python -I scripts/prepare_extension_materials.py \
   --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
   --extension-name native_media \
@@ -406,7 +408,7 @@ python -I scripts/prepare_extension_materials.py \
   --inventory build/media-release-materials/inventory.json
 
 python -I scripts/build_extension_wheel.py \
-  --release-number 1 \
+  --release-number "$VANE_MEDIA_RELEASE_NUMBER" \
   --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
   --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \

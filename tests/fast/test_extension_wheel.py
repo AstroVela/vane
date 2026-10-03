@@ -1526,6 +1526,22 @@ def test_numbered_release_sorts_after_legacy_and_increments_independently(tmp_pa
     assert Version(legacy) < Version(first) < Version(second) < Version(upgraded)
 
 
+def test_numbered_releases_keep_the_counter_across_vane_stage_changes():
+    releases = [
+        ("0.2.0.dev663", 1),
+        ("0.2.0.dev663", 2),
+        ("0.2.0.dev664", 3),
+        ("0.2.0rc1", 4),
+        ("0.2.0rc1", 5),
+        ("0.2.0", 6),
+        ("0.2.0.post1", 7),
+        ("0.3.0", 1),
+    ]
+    versions = [Version(extension_wheel_module._extension_release_version(base, number)) for base, number in releases]
+    assert all(previous < candidate for previous, candidate in zip(versions, versions[1:]))
+    assert str(versions[-1]) == "0.3.0.1"
+
+
 def test_numbered_release_accepts_a_legacy_dependency(tmp_path, synthetic_descriptor_factory, monkeypatch):
     artifact = _write_artifact(tmp_path / "sample.duckdb_extension")
     descriptor = _descriptor(artifact)

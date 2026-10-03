@@ -138,7 +138,6 @@ python -I scripts/verify_extension_wheel.py \
   --base-wheel dist/vane_ai-*.whl \
   --extension-wheel dist/extensions/vane_extension_<extension>-*.whl \
   --extension-name <extension> \
-  --release-number 1 \
   --trust-identity astrovela/vane
 ```
 

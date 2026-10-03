@@ -11,7 +11,10 @@ support is expanded.
 
 The public provider version appends the positive `release_number` in
 `native-media-release.toml` to the matching Vane version (for example,
-`0.2.0.1`). Increment that number for each new delivery on the same Vane base.
+`0.2.0.1`). Increment that number for each new delivery in the same numeric
+Vane `X.Y.Z` series, including dev, rc, final and post stages. Reset to one
+only when `X.Y.Z` changes; the first provider for a new `0.3.0` series is
+`0.3.0.1` unless an earlier `0.3.0` stage already consumed a release number.
 The bundled runtime and source SDK retain their Git-derived content identities.
 The base wheel must already be available on PyPI for the exact Vane version
 tag being released. A locally compiled base wheel is a build byproduct; the

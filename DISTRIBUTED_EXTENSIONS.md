@@ -134,6 +134,9 @@ separately packaged dependency-extension wheels. Each extension-wheel package
 version appends an independent positive release number to the matching Vane
 release tuple: Vane `0.2.0` uses providers `0.2.0.1`, `0.2.0.2`, and so on.
 Vane prerelease/development suffixes are preserved after the fourth component.
+The counter continues across dev, rc, final and post stages of the same numeric
+Vane `X.Y.Z`: `0.2.0.2rc1` advances to `0.2.0.3`. Reset to one only for a new
+numeric base, such as the first `0.3.0.1` provider for Vane `0.3.0`.
 Dependencies pin the actual supplied wheel versions, while descriptors retain
 the exact artifact SHA-256 and dependency identities. Historical versions
 encoded from descriptor digests remain readable. Published files for a given

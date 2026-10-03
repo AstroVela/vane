@@ -3288,7 +3288,7 @@ def _descriptor_digest(descriptor: DynamicExtensionDescriptor) -> str:
 
 
 def _extension_release_version(vane_version: str, release_number: int) -> str:
-    """Append an independent provider release number to the Vane release tuple."""
+    """Append a provider counter that continues across stages of the same X.Y.Z."""
     if type(release_number) is not int or release_number < 1:
         raise ValueError("extension release_number must be a positive integer")
     base = Version(_validate_vane_version(vane_version))
