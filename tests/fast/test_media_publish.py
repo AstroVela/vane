@@ -36,6 +36,7 @@ def delivery(release_inputs, tmp_path, monkeypatch):
     digest = prepare_release(**inputs, output=path)
     _, manifest = read_manifest(path / "media-release.json", trust_identity=TRUST_IDENTITY)
     monkeypatch.setattr(publishing, "TRUST", TRUST_IDENTITY)
+    monkeypatch.setattr(publishing, "_json", lambda *args, **kwargs: None)
     return path, digest, manifest
 
 
@@ -61,6 +62,9 @@ def test_resume_downloads_existing_wheel_and_avoids_duplicate_publication(delive
     path, digest, manifest = delivery
     record = manifest["artifacts"]["provider"]
     monkeypatch.setattr(publishing, "index_files", lambda *args: {record["filename"]: indexed(record)})
+    monkeypatch.setattr(
+        publishing, "_json", lambda *args, **kwargs: pytest.fail("identical retries keep their version")
+    )
     downloads = []
 
     def download(url, output, expected):
@@ -72,6 +76,40 @@ def test_resume_downloads_existing_wheel_and_avoids_duplicate_publication(delive
     assert not publishing.stage_index(path, digest, channel="testpypi", output=output)
     assert downloads == [record]
     assert not list(output.iterdir())
+
+
+@pytest.mark.parametrize(
+    "previous,candidate,accepted",
+    [
+        ("0.2.0.2.dev663", "0.2.0.1.dev664", False),
+        ("0.2.0.2rc1", "0.2.0.1", False),
+        ("0.2.0.2", "0.2.0.1.post1", False),
+        ("0.2.0.2.dev663", "0.2.0.2.dev664", False),
+        ("0.2.0.2.dev663", "0.2.0.3.dev664", True),
+        ("0.2.0.2rc1", "0.2.0.3", True),
+        ("0.2.0.2", "0.2.0.3.post1", True),
+        ("0.2.0.99.post1", "0.3.0.1", True),
+    ],
+)
+def test_media_release_counter_continues_across_vane_stages(monkeypatch, previous, candidate, accepted):
+    monkeypatch.setattr(publishing, "_json", lambda *args, **kwargs: {"releases": {previous: []}})
+    if accepted:
+        publishing._require_increasing_release("pypi", "vane-extension-native-media", candidate)
+    else:
+        with pytest.raises(ValueError, match="including stage changes"):
+            publishing._require_increasing_release("pypi", "vane-extension-native-media", candidate)
+
+
+def test_media_staging_rejects_a_reset_counter_before_copying(delivery, tmp_path, monkeypatch):
+    path, digest, manifest = delivery
+    version = publishing._provider_files(manifest)[1]
+    components = version.split(".")[:3]
+    previous = ".".join((*components, "2rc1"))
+    monkeypatch.setattr(publishing, "index_files", lambda *args: None)
+    monkeypatch.setattr(publishing, "_json", lambda *args, **kwargs: {"releases": {previous: []}})
+    with pytest.raises(ValueError, match="including stage changes"):
+        publishing.stage_index(path, digest, channel="pypi", output=tmp_path / "dist")
+    assert not (tmp_path / "dist").exists()
 
 
 def test_staging_rejects_a_file_changed_after_initial_verification(delivery, tmp_path, monkeypatch):
