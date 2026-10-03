@@ -15,7 +15,7 @@ from vane import pickle as vane_pickle
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataAdmissionWaitLimits
-from vane.execution.udf_data_lease import RuntimeDataLedger
+from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
@@ -438,6 +438,7 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
     )
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     send = local._send_message
 
@@ -463,7 +464,7 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
             assert data["reservations"] == 1
             assert data["usage_bytes"] >= grant_bytes
             with pytest.raises(RuntimeError, match="planned grant cleanup failure"):
-                resources[-1].shutdown()
+                data_scope.shutdown()
             with pytest.raises(TimeoutError, match="active queries or tasks"):
                 runtime.close()
     finally:
@@ -561,6 +562,7 @@ def test_failed_input_cleanup_keeps_runtime_owned(
     )
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     refs = []
 
@@ -600,12 +602,12 @@ def test_failed_input_cleanup_keeps_runtime_owned(
                     for resource in later_resources:
                         resource.shutdown(kill=True)
             with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
-                resources[-1].shutdown()
-            assert resources[-1].cleanup_pending()
+                data_scope.shutdown()
+            assert data_scope.cleanup_pending()
             with pytest.raises(TimeoutError, match="active queries or tasks"):
                 runtime.close()
         # Query cleanup must own the retry even if the failed worker is gone.
-        resources[-1].shutdown()
+        data_scope.shutdown()
         assert strict_transport.snapshot()["input_lease_bytes"] == 0
         assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
     finally:
@@ -642,6 +644,7 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
     runtime = LocalModelRuntime(session_id="test", session_config={}, data_limit=DataAdmissionLimits(4096, 2048, 2048))
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {})
+    data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
     inputs = [_MetadataInputOwner(result[1][0])] if metadata_owner else result[1]
@@ -675,10 +678,10 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(
             assert input_bytes > 0
             assert runtime.resource_snapshot()["data"]["input_bytes"] == input_bytes
             with pytest.raises(RuntimeError, match="planned input setup or cleanup failure"):
-                resources[-1].shutdown()
+                data_scope.shutdown()
             with pytest.raises(TimeoutError):
                 runtime.close()
-        resources[-1].shutdown()
+        data_scope.shutdown()
         assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
         assert strict_transport.snapshot()["input_lease_bytes"] == 0
     finally:
