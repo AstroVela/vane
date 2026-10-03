@@ -97,7 +97,6 @@ def _task_payload():
         "function_pickle": vane_pickle.dumps(_task),
         "call_mode": "map_batches",
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
     }
 
 
