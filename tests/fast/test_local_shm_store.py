@@ -361,47 +361,161 @@ def test_exit_cleanup_preserves_views_and_attempts_every_arena_after_failure(mon
             store.close()
 
 
-_FORK_EXIT = """
-import os, signal, threading
+_FORK_FINALIZERS = """
+import atexit, gc, json, os, signal, sys, threading
+from pathlib import Path
+fork_child = False
+original_refs = []
+
+def finish_child_exit():
+    if fork_child:
+        # Registered before Vane imports, so all Python exit callbacks,
+        # including block-ref weakref finalizers, must have run first. Avoid
+        # unrelated native-library teardown in a fork of a multithreaded host.
+        pending = any(ref._finalizer.alive for ref in original_refs)
+        os._exit(7 if pending else 0)
+
+atexit.register(finish_child_exit)
+import pyarrow as pa
 from vane.execution import udf_shm_store as storage
 from vane.execution import ref_bundle as refs
-store = storage.LocalShmStore(4096)
-lease = store.allocate(64)
-print(store._shm.name, flush=True)
+
+scenario, held_lock = sys.argv[1:]
+store = storage.LocalShmStore(32768)
+store.add_client('old-runtime')
+
+def make_ref(values):
+    block = refs.prepare_local_shm_block(pa.table({'x': values}))
+    lease = store.allocate(block.ipc_size_bytes)
+    allocation = lease.allocation
+    region = store.buffer(allocation)
+    region[:8] = len(block.ipc).to_bytes(8, 'little')
+    region[8:] = memoryview(block.ipc).cast('B')
+    region.release()
+    return refs.LocalShmBlockRef(f'{allocation.identity}:0', allocation.size,
+                                budget_bytes=0, allocation_lease=lease)
+
+original_refs = [make_ref([11, 22, 33])]
+reuse = scenario in ('reuse', 'arrow', 'numpy')
+if reuse:
+    original_refs.append(make_ref([44]))
+lease = original_refs[0]._allocation_lease
+name = lease.allocation.shm_name
+print(json.dumps({'name': name}), flush=True)
+kept = None
+if scenario in ('arrow', 'numpy'):
+    kept = original_refs[0].to_table().column(0)
+    if scenario == 'numpy':
+        kept = kept.chunk(0).to_numpy(zero_copy_only=True)
+    original_refs[0].release()
+store.remove_client('old-runtime')
+
+def drop_child_view():
+    global kept
+    kept = None
+    gc.collect()
+
+def explicit_child_cleanup():
+    store.release(lease.allocation)
+    store.drain_if_idle()
+    store.remove_client('old-runtime')
+    store.close()
+
 locked, proceed = threading.Event(), threading.Event()
-def hold_locks():
-    with storage._registry_lock, store._lock:
+locks = {'lease': lease._lock, 'store': store._lock, 'registry': storage._registry_lock}
+def hold_lock():
+    with locks[held_lock]:
         locked.set()
         assert proceed.wait(10)
-thread = threading.Thread(target=hold_locks)
-thread.start()
-assert locked.wait(5)
+
+thread = None
+if held_lock != 'none':
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert locked.wait(5)
+read_fd, write_fd = os.pipe()
 pid = os.fork()
 if pid == 0:
+    fork_child = True
     signal.alarm(5)
-    storage._unlink_owned_stores_at_exit()
-    os._exit(0)
+    os.close(write_fd)
+    assert os.read(read_fd, 1) == b'1'
+    os.close(read_fd)
+    if scenario in ('arrow', 'numpy'):
+        atexit.register(drop_child_view)
+    if scenario == 'explicit':
+        atexit.register(explicit_child_cleanup)
+    # Exercise normal Python exit, not a direct os._exit that skips finalizers.
+    sys.exit(0)
+
+os.close(read_fd)
 proceed.set()
-thread.join(5)
+if thread is not None:
+    thread.join(5)
+later = None
+if reuse:
+    store.add_client('new-runtime')
+    later = make_ref([17] * 2048)
+    assert later.to_table().column(0).to_pylist() == [17] * 2048
+os.write(write_fd, b'1')
+os.close(write_fd)
 try:
     _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0, status
-    opened = refs._open_existing_shm(store._shm.name, track=False)
-    opened.close()
+    target = later if later is not None else original_refs[0]
+    expected = [17] * 2048 if reuse else [11, 22, 33]
+    actual = target.to_table().column(0).to_pylist()
+    print(json.dumps({'child_exit': os.waitstatus_to_exitcode(status),
+                      'parent_arena_exists': (Path('/dev/shm') / name).exists(),
+                      'values_intact': actual == expected,
+                      'zeroed_live_rows': actual.count(0)}), flush=True)
 finally:
-    lease.release()
+    kept = None
+    gc.collect()
+    if later is not None:
+        later.release()
+    for ref in original_refs:
+        ref.release()
+    if reuse:
+        store.remove_client('new-runtime')
+    store.close()
 """
 
 
-def test_forked_child_exit_does_not_lock_or_unlink_inherited_parent_arena():
-    child = subprocess.run([sys.executable, "-I", "-c", _FORK_EXIT], text=True, capture_output=True, timeout=15)
-    name = child.stdout.strip()
+@pytest.mark.parametrize(
+    "scenario,held_lock",
+    [
+        ("arena", "none"),
+        ("arena", "lease"),
+        ("arena", "store"),
+        ("arena", "registry"),
+        ("reuse", "none"),
+        ("arrow", "none"),
+        ("numpy", "none"),
+        ("explicit", "store"),
+    ],
+)
+def test_fork_exit_finalizers_preserve_parent_data_and_skip_inherited_locks(scenario, held_lock):
+    child = subprocess.run(
+        [sys.executable, "-I", "-c", _FORK_FINALIZERS, scenario, held_lock],
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    records = [json.loads(line) for line in child.stdout.splitlines()]
+    name = records[0]["name"] if records else None
     try:
         assert child.returncode == 0, child.stderr
-        assert name
+        assert name is not None
+        assert records[-1] == {
+            "child_exit": 0,
+            "parent_arena_exists": True,
+            "values_intact": True,
+            "zeroed_live_rows": 0,
+        }, child.stderr
+        assert "Exception ignored" not in child.stderr
         assert not (Path("/dev/shm") / name).exists()
     finally:
-        if name:
+        if name is not None:
             refs._unlink_shared_memory_name(name)
 
 

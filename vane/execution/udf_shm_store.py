@@ -88,6 +88,10 @@ class StoreLease:
             return self.store.acquire(self.allocation)
 
     def release(self) -> None:
+        # A fork inherits both locks and a stale allocation table. Its
+        # finalizers must not reclaim pages or names owned by the parent.
+        if self.store._owner_pid != os.getpid():
+            return
         with self._lock:
             if not self._released:
                 self.store.release(self.allocation)
@@ -128,6 +132,8 @@ class LocalShmStore:
             return True
 
     def remove_client(self, client_id: str) -> None:
+        if self._owner_pid != os.getpid():
+            return
         with self._lock:
             self._clients.discard(client_id)
             if not self._clients:
@@ -185,6 +191,8 @@ class LocalShmStore:
             return StoreLease(self, allocation)
 
     def release(self, allocation: ShmAllocation) -> None:
+        if self._owner_pid != os.getpid():
+            return
         with self._lock:
             entry = self._require_locked(allocation)
             if entry.refs > 1:
@@ -202,6 +210,8 @@ class LocalShmStore:
             self._free = merged
 
     def drain_if_idle(self) -> None:
+        if self._owner_pid != os.getpid():
+            return
         with self._lock:
             if not self._clients:
                 self._drain_locked()
@@ -251,6 +261,8 @@ class LocalShmStore:
             self._unlink_locked()
 
     def close(self) -> None:
+        if self._owner_pid != os.getpid():
+            return
         with self._lock:
             if self._clients:
                 raise RuntimeError("shared-memory store still has live worker clients")
