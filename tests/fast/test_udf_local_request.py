@@ -237,7 +237,7 @@ def test_native_binding_replays_early_cancel_and_fences_late_callbacks(cancel_be
     scope = ExecutionCancellationScope("request", 1)
     calls = []
     conn = SimpleNamespace(interrupt=lambda: calls.append("interrupt"))
-    binding = local._NativeRequestCancellation(scope)
+    binding = local.NativeQueryCancellation(scope)
     if cancel_before_start:
         scope.cancel()
         assert not calls
@@ -258,7 +258,7 @@ def test_native_binding_close_waits_for_interrupt_before_cursor_reuse():
         assert proceed.wait(5)
 
     scope = ExecutionCancellationScope("request", 1)
-    binding = local._NativeRequestCancellation(scope)
+    binding = local.NativeQueryCancellation(scope)
     binding.started(SimpleNamespace(interrupt=interrupt))
     with ThreadPoolExecutor(max_workers=2) as threads:
         cancelling = threads.submit(scope.cancel)

@@ -115,8 +115,8 @@ class TestPolars:
 
     def test_polars_from_json_error_2(self, duckdb_cursor):
         conn = vane.connect()
-        my_table = conn.query("select 'x' my_str").pl()  # noqa: F841
-        my_res = vane.query("select my_str from my_table where my_str != 'y'")
+        my_table = conn.sql("select 'x' my_str").pl()  # noqa: F841
+        my_res = vane.sql("select my_str from my_table where my_str != 'y'")
         assert my_res.fetchall() == [("x",)]
 
     def test_polars_lazy_from_conn(self, duckdb_cursor):

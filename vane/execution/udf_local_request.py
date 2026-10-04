@@ -11,9 +11,10 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.local_resource_graph import PreparedLocalResourceGraph
+from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.request_admission import RequestCancellationReason, RequestTicket, _timeout
 from vane.execution.request_deadline import RequestExecutionDeadline
-from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull
+from vane.execution.result_delivery import QueryResult, ResultDeliveryFull
 from vane.execution.udf_actor_pool_lifecycle import actor_pool_cleanup_pending, rollback_actor_pools
 from vane.execution.udf_admission import AdmissionLease
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
@@ -22,46 +23,10 @@ if TYPE_CHECKING:
     from vane.execution.udf_local_model import LocalModelRuntime
 
 
-class _NativeRequestCancellation:
-    """Bind interruption after query startup, and fence callbacks before reuse."""
-
-    def __init__(self, cancellation: ExecutionCancellationScope) -> None:
-        self._cancellation = cancellation
-        self._lock = threading.Lock()
-        self._interrupt_native: Callable[[], None] | None = None
-        self._active = True
-        self._unregister = cancellation.register_cancel_wakeup(self._interrupt)
-
-    def _interrupt(self) -> None:
-        with self._lock:
-            if self._active and self._interrupt_native is not None:
-                self._interrupt_native()
-
-    def started(self, conn: Any) -> None:
-        self.started_callback(conn.interrupt)
-
-    def started_callback(self, interrupt: Callable[[], None]) -> None:
-        with self._lock:
-            if not self._active:
-                return
-            self._interrupt_native = interrupt
-            # DuckDB resets the interrupt flag during startup. Replay an
-            # earlier cancellation only after that reset, on the actual cursor.
-            if self._cancellation.is_set():
-                interrupt()
-
-    def close(self) -> None:
-        with self._lock:
-            # Unregister alone cannot fence a callback already copied by cancel.
-            self._active = False
-            self._interrupt_native = None
-        self._unregister()
-
-
 def _execute_native(conn: Any, plan: Any, *, cancellation: ExecutionCancellationScope) -> Any:
     from vane._ray_cxx import require_ray_cxx_attr
 
-    binding = _NativeRequestCancellation(cancellation)
+    binding = NativeQueryCancellation(cancellation)
     try:
         return require_ray_cxx_attr("DistributedPhysicalPlanRunner")().execute_native(
             conn, plan, native_execution_started=binding.started
@@ -304,7 +269,7 @@ class LocalModelRequest:
         conn: Any,
         execution_timeout: float | None = None,
         delivery_timeout: float | None = None,
-    ) -> ManagedResult:
+    ) -> QueryResult:
         """Execute once and return a separately bounded, explicitly owned result."""
         from vane.execution.local_result_delivery import prepare_local_result
 
@@ -322,12 +287,12 @@ class LocalModelRequest:
     def _run_managed_result(
         self,
         operation: Callable[[], Any],
-        prepare_result: Callable[[ManagedResult, Any], None],
+        prepare_result: Callable[[QueryResult, Any], None],
         *,
         execution_timeout: float | None = None,
         delivery_timeout: float | None = None,
         streaming: bool = False,
-    ) -> ManagedResult:
+    ) -> QueryResult:
         """Share coupled admission and delivery with native SQL/Relation execution."""
         timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
         if execution_timeout is not None:
@@ -335,7 +300,7 @@ class LocalModelRequest:
         runtime = self._runtime._result_delivery
         if runtime is None:
             raise RuntimeError("managed results require a configured result_limit")
-        result: ManagedResult | None = None
+        result: QueryResult | None = None
 
         def reserve_result() -> None:
             nonlocal result

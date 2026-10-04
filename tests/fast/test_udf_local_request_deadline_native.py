@@ -130,13 +130,13 @@ def test_recorded_cancellation_prevents_native_start_before_signal_dispatch(monk
 def test_deadline_interrupts_native_sql_and_fences_cursor_reuse(monkeypatch, drain):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     started = threading.Event()
-    original = udf_local_request._NativeRequestCancellation.started
+    original = udf_local_request.NativeQueryCancellation.started
 
     def native_started(self, conn):
         original(self, conn)
         started.set()
 
-    monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", native_started)
+    monkeypatch.setattr(udf_local_request.NativeQueryCancellation, "started", native_started)
     with vane.connect() as conn:
         plan = _plan(conn, value="SELECT sum(i) AS x FROM range(1000000000000) t(i)")
         with (

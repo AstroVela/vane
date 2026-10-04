@@ -176,6 +176,7 @@ struct VaneSessionContext {
 	idx_t connection_count = 1;
 	bool ray_session_opened = false;
 	py::object local_query_runtime = py::none();
+	py::object query_runtime = py::none();
 	bool local_runtime_closing = false;
 };
 
@@ -309,6 +310,8 @@ public:
 	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
+	py::object Query(const py::object &query, const py::object &parameters, const py::object &options,
+	                 const py::object &rows_per_batch, const py::kwargs &overrides);
 	py::object ExecuteResult(const py::object &query, const py::object &params, const py::object &delivery_timeout,
 	                         bool stream, idx_t rows_per_batch);
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);
@@ -401,6 +404,8 @@ public:
 	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(const idx_t rows_per_batch);
 
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
+	static shared_ptr<DuckDBPyConnection> ConnectQuery(const py::object &database, bool read_only,
+	                                                   const py::dict &config, const py::kwargs &options);
 	static shared_ptr<DuckDBPyConnection> ConnectWithRunner(const py::object &database, bool read_only,
 	                                                        const py::dict &config, const string &runner_type,
 	                                                        bool use_instance_cache = true);
@@ -419,6 +424,7 @@ public:
 	void ReleaseVaneSession();
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
+	py::object GetQueryRuntime() const;
 	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
 	//! Reject all connection entry from input callbacks before acquiring locks.
 	//! This includes idle cursors and callbacks before a file handle exists.

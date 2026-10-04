@@ -95,7 +95,7 @@ class TestRAPIQuery:
         amount = 1000000
         rel = None
         for _ in range(steps):
-            rel = con.query(f"select i from range({amount}::BIGINT) tbl(i)")
+            rel = con.sql(f"select i from range({amount}::BIGINT) tbl(i)")
             amount = amount / 10
             rel = rel.query("rel", f"select * from rel limit {amount}")
         result = rel.execute()
@@ -130,20 +130,20 @@ class TestRAPIQuery:
 
     def test_query_insert_into_relation(self, tbl_table):
         con = vane.default_connection()
-        rel = con.query("select i from range(1000) tbl(i)")
+        rel = con.sql("select i from range(1000) tbl(i)")
         # Can't insert into this, not a table relation
         with pytest.raises(vane.InvalidInputException):
             rel.insert([5])
 
     def test_query_non_select(self, duckdb_cursor):
-        rel = duckdb_cursor.query("select [1,2,3,4]")
+        rel = duckdb_cursor.sql("select [1,2,3,4]")
         rel.query("relation", "create table tbl as select * from relation")
 
         result = duckdb_cursor.execute("select * from tbl").fetchall()
         assert result == [([1, 2, 3, 4],)]
 
     def test_query_non_select_fail(self, duckdb_cursor):
-        rel = duckdb_cursor.query("select [1,2,3,4]")
+        rel = duckdb_cursor.sql("select [1,2,3,4]")
         duckdb_cursor.execute("create table tbl as select range(10)")
         # Table already exists
         with pytest.raises(vane.CatalogException):
@@ -163,33 +163,33 @@ class TestRAPIQuery:
 
     def test_query_non_select_result(self, duckdb_cursor):
         with pytest.raises(vane.ParserException, match="syntax error"):
-            duckdb_cursor.query("selec 42")
+            duckdb_cursor.sql("selec 42")
 
-        res = duckdb_cursor.query("explain select 42").fetchall()
+        res = duckdb_cursor.sql("explain select 42").fetchall()
         assert len(res) > 0
 
-        res = duckdb_cursor.query("describe select 42::INT AS column_name").fetchall()
+        res = duckdb_cursor.sql("describe select 42::INT AS column_name").fetchall()
         assert res[0][0] == "column_name"
 
-        res = duckdb_cursor.query("create or replace table tbl_non_select_result(i integer)")
+        res = duckdb_cursor.sql("create or replace table tbl_non_select_result(i integer)")
         assert res is None
 
-        res = duckdb_cursor.query("insert into tbl_non_select_result values (42)")
+        res = duckdb_cursor.sql("insert into tbl_non_select_result values (42)")
         assert res is None
 
-        res = duckdb_cursor.query("insert into tbl_non_select_result values (84) returning *").fetchall()
+        res = duckdb_cursor.sql("insert into tbl_non_select_result values (84) returning *").fetchall()
         assert res == [(84,)]
 
-        res = duckdb_cursor.query("select * from tbl_non_select_result").fetchall()
+        res = duckdb_cursor.sql("select * from tbl_non_select_result").fetchall()
         assert res == [(42,), (84,)]
 
-        res = duckdb_cursor.query("insert into tbl_non_select_result select * from range(10000) returning *").fetchall()
+        res = duckdb_cursor.sql("insert into tbl_non_select_result select * from range(10000) returning *").fetchall()
         assert len(res) == 10000
 
-        res = duckdb_cursor.query("show tables").fetchall()
+        res = duckdb_cursor.sql("show tables").fetchall()
         assert len(res) > 0
 
-        res = duckdb_cursor.query("drop table tbl_non_select_result")
+        res = duckdb_cursor.sql("drop table tbl_non_select_result")
         assert res is None
 
     def test_replacement_scan_recursion(self, duckdb_cursor):

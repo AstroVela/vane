@@ -14,7 +14,7 @@ import pytest
 
 from vane.execution.request_admission import RequestExecutionTimeout
 from vane.execution.request_deadline import MonotonicDeadline
-from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull, RuntimeResultDelivery
+from vane.execution.result_delivery import QueryResult, ResultDeliveryFull, RuntimeResultDelivery
 
 
 def acceptance():
@@ -128,7 +128,7 @@ def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
         return invoke
 
     monkeypatch.setattr(RuntimeResultDelivery, "begin", opaque_message(RuntimeResultDelivery.begin))
-    monkeypatch.setattr(ManagedResult, "own_buffer", opaque_message(ManagedResult.own_buffer))
+    monkeypatch.setattr(QueryResult, "own_buffer", opaque_message(QueryResult.own_buffer))
     if expire_before_publication:
         start = MonotonicDeadline.start
 

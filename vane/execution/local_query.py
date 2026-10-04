@@ -9,12 +9,13 @@ import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.request_admission import RequestAdmissionLimits, _timeout
 from vane.execution.resources import ResourceVector
-from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
+from vane.execution.result_delivery import QueryResult, ResultDeliveryLimits
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_local_model import LocalModelRuntime
-from vane.execution.udf_local_request import LocalModelRequest, _NativeRequestCancellation
+from vane.execution.udf_local_request import LocalModelRequest
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
 if TYPE_CHECKING:
@@ -51,7 +52,7 @@ class _NativeQuery:
     def __init__(self, request: LocalModelRequest) -> None:
         self.request = request
         self.track_graph = request._runtime._track_graph
-        self._binding = _NativeRequestCancellation(request._cancellation)
+        self._binding = NativeQueryCancellation(request._cancellation)
         self._prepared = False
 
     def prepare(self, nodes: list[dict[str, Any]], graph: dict[str, Any] | None) -> dict[str, Any]:
@@ -171,10 +172,10 @@ class LocalQueryRuntime:
         self,
         execute: Callable[[_NativeQuery], None],
         publish: Callable[[LocalModelRequest | None], None],
-        prepare_result: Callable[[ManagedResult, Any], None] | None = None,
+        prepare_result: Callable[[QueryResult, Any], None] | None = None,
         delivery_timeout: float | None = None,
         streaming: bool = False,
-    ) -> ManagedResult | None:
+    ) -> QueryResult | None:
         request = self._runtime.request()
         publish(request)
         try:
@@ -193,7 +194,7 @@ class LocalQueryRuntime:
 
             if prepare_result is not None:
 
-                def prepare(managed: ManagedResult, query: _NativeQuery | None) -> None:
+                def prepare(managed: QueryResult, query: _NativeQuery | None) -> None:
                     try:
                         prepare_result(managed, query)
                     except BaseException:

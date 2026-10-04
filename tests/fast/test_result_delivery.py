@@ -78,7 +78,11 @@ def test_stream_cancellation_captures_request_outcome_outside_the_result_lock():
 
 
 def native(*tables):
-    return SimpleNamespace(result_schema={"names": ["x"], "types": ["BIGINT"]}, partition_payloads=list(tables))
+    return SimpleNamespace(
+        result_schema={"names": ["x"], "types": ["BIGINT"]},
+        arrow_schema=pa.schema([("x", pa.int64())]),
+        partition_payloads=list(tables),
+    )
 
 
 def clock(monkeypatch):
@@ -646,7 +650,21 @@ def test_native_completion_metadata_is_preserved():
     prepare_local_result(result, source)
     result.ready(delivery_timeout=None)
     assert result.completion_status == source.completion_status
+    assert result.schema == source.arrow_schema
     assert result.stats == source.stats and result.task_stats == source.task_stats
+    runtime.close()
+
+
+def test_empty_native_result_collect_keeps_schema_without_charging_data():
+    runtime = registry()
+    result = runtime.begin()
+    source = native()
+    prepare_local_result(result, source)
+    result.ready(delivery_timeout=None)
+    assert result.schema == source.arrow_schema
+    assert result.collect() == pa.Table.from_batches([], schema=source.arrow_schema)
+    assert result.state == "delivered"
+    assert runtime.snapshot()["active_results"] == runtime.snapshot()["usage_bytes"] == 0
     runtime.close()
 
 

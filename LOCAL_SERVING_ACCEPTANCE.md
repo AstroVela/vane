@@ -16,7 +16,7 @@ The [runnable example](scripts/validate_local_serving.py) uses
 `model.prewarm()`, and `vane.attach_function()` for setup. Clients execute
 parameterized SQL through `cursor.execute_result()` or build projections with
 the registered model and call `relation.execute_result()`. They consume and
-close `ManagedResult` handles. Independent control threads cancel queries with
+close `QueryResult` handles. Independent control threads cancel queries with
 `cursor.interrupt()`. The driver never constructs physical plans, model payloads,
 node bindings, or internal request tickets. See the
 [public API example](LOCAL_MODEL_RUNTIME.md#managed-results-from-sql-and-relation-queries)

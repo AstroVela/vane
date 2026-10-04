@@ -39,14 +39,14 @@ def test_streaming_failure_waits_for_consumer_cleanup(monkeypatch, tmp_path, api
     from concurrent.futures import ThreadPoolExecutor
 
     from vane.execution.request_admission import RequestCancelled
-    from vane.execution.result_delivery import ManagedResult
+    from vane.execution.result_delivery import QueryResult
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     acceptance = runpy.run_path(str(SCRIPT.with_name("validate_local_serving.py")))
     checks_type = runpy.run_path(str(SCRIPT.with_name("local_serving_streaming.py")))["StreamingChecks"]
     release_read = threading.Event()
     controller = threading.get_ident()
-    own_buffer = ManagedResult.own_buffer
+    own_buffer = QueryResult.own_buffer
 
     def delayed_buffer(result, size):
         try:
@@ -64,7 +64,7 @@ def test_streaming_failure_waits_for_consumer_cleanup(monkeypatch, tmp_path, api
             release_read.set()
             return super().__exit__(*args)
 
-    monkeypatch.setattr(ManagedResult, "own_buffer", delayed_buffer)
+    monkeypatch.setattr(QueryResult, "own_buffer", delayed_buffer)
     monkeypatch.setitem(checks_type.blocked_stream.__wrapped__.__globals__, "ThreadPoolExecutor", Reader)
     scenario = acceptance["Scenario"](tmp_path)
     checks = checks_type(scenario, acceptance)

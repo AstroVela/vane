@@ -823,12 +823,9 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
 	      "local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
+	m.def("query", &DuckDBPyConnection::Query, "Execute a native local query and return an incremental QueryResult",
+	      py::arg("query"), py::arg("parameters") = py::none(), py::kw_only(), py::arg("options") = py::none(),
+	      py::arg("rows_per_batch") = 2048);
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
@@ -1354,6 +1351,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	InitializeConnectionMethods(connection_module);
 	connection_module.def("configure_local_runtime", &DuckDBPyConnection::ConfigureLocalRuntime,
 	                      "Configure shared admission for local-fast read-only queries before creating cursors");
+	connection_module.def_property_readonly("query_runtime", &DuckDBPyConnection::GetQueryRuntime);
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");
@@ -2823,13 +2821,15 @@ void DuckDBPyConnection::Close() {
 			result.attr("_close_stream")();
 		}
 	}
-	if (vane_session && !vane_session->local_query_runtime.is_none()) {
+	if (vane_session && (!vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none())) {
 		if (vane_session_owner) {
 			{
 				lock_guard<mutex> guard(vane_session->lock);
 				vane_session->local_runtime_closing = true;
 			}
-			vane_session->local_query_runtime.attr("drain")();
+			auto runtime =
+			    vane_session->query_runtime.is_none() ? vane_session->local_query_runtime : vane_session->query_runtime;
+			runtime.attr("drain")();
 		}
 		// A queued request must be cancelled before waiting for its execution
 		// lock. Running requests keep their owners until native cleanup ends.
@@ -3278,7 +3278,7 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 		if (vane_session->connection_count == 0 || vane_session->local_runtime_closing) {
 			throw InternalException("Cannot inherit closed Vane connection session");
 		}
-		if (!vane_session->local_query_runtime.is_none()) {
+		if (!vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none()) {
 			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
 		}
 		vane_session->connection_count++;
@@ -3305,7 +3305,7 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 		lock_guard<mutex> guard(vane_session->lock);
 		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
 		    !vane_session_owner || vane_session->connection_count != 1 ||
-		    !vane_session->local_query_runtime.is_none()) {
+		    !vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none()) {
 			throw InvalidInputException(
 			    "configure_local_runtime must run once on the session owner before creating cursors");
 		}
@@ -3361,6 +3361,11 @@ unique_lock<std::recursive_mutex> DuckDBPyConnection::LockForQuery() const {
 	// Preserve cancellation accepted during that wait.
 	if (interrupting || InterruptInProgress() || InterruptGeneration() != generation) {
 		throw InterruptException();
+	}
+	// Another caller may have published a result while this caller waited for
+	// the lock. Never replace that caller's still-active native result stream.
+	if (!local_query_request.is_none()) {
+		throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
 	}
 	return lock;
 }
@@ -3485,6 +3490,14 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		runtime.attr("close")();
 		guard.lock();
 		vane_session->local_query_runtime = py::none();
+	}
+	if (!vane_session->query_runtime.is_none() && !PythonIsFinalizing()) {
+		vane_session->local_runtime_closing = true;
+		auto runtime = vane_session->query_runtime;
+		guard.unlock();
+		runtime.attr("close")();
+		guard.lock();
+		vane_session->query_runtime = py::none();
 	}
 	if (vane_session->ray_session_opened && !vane_session->id.empty() && !PythonIsFinalizing()) {
 		py::module_::import("vane.runners.ray.runner").attr("notify_connection_closed")(py::str(vane_session->id));
@@ -3658,13 +3671,15 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 	return res;
 }
 
-bool IsDefaultConnectionString(const string &database, bool read_only, case_insensitive_map_t<Value> &config) {
+bool IsDefaultConnectionString(const string &database, bool read_only, case_insensitive_map_t<Value> &config,
+                               const string &runner_type) {
 	bool is_default = StringUtil::CIEquals(database, ":default:");
 	if (!is_default) {
 		return false;
 	}
-	// Only allow fetching the default connection when no options are passed
-	if (read_only == true || !config.empty()) {
+	// An explicit runner creates a new session. Fetching the default connection
+	// must never replace an existing session's runtime or resource accounting.
+	if (read_only || !config.empty() || !runner_type.empty()) {
 		throw InvalidInputException("Default connection fetching is only allowed without additional options");
 	}
 	return true;
@@ -3686,7 +3701,7 @@ static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database
 	DuckDBPyConnection::CheckCallbackEntry();
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
-	if (IsDefaultConnectionString(database, read_only, config_dict)) {
+	if (IsDefaultConnectionString(database, read_only, config_dict, runner_type)) {
 		return DuckDBPyConnection::DefaultConnection();
 	}
 	const auto selected_runner =

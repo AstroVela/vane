@@ -18,7 +18,7 @@ class TestIssue1767:
         B = pd.DataFrame({"key": ["a", "п"]})
         con = vane.connect(":memory:")
         arrow = con.register("A", A).register("B", B)
-        q = arrow.query("""SELECT key FROM "A" FULL JOIN "B" USING ("key") ORDER BY key""")
+        q = arrow.sql("""SELECT key FROM "A" FULL JOIN "B" USING ("key") ORDER BY key""")
         result = q.df()
 
         d = {"key": ["a", "п"]}

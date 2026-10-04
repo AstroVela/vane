@@ -7,8 +7,8 @@ class TestPivot:
         duckdb_cursor.sql(
             "create table input_data as select unnest(['u','v','w']) as a, unnest(['x','y','z']) as b, unnest([1,2,3]) as c;"  # noqa: E501
         )
-        pivot_1 = duckdb_cursor.query("pivot input_data on a using max(c) group by b;")
-        pivot_2 = duckdb_cursor.query("pivot input_data on b using max(c) group by a;")
+        pivot_1 = duckdb_cursor.sql("pivot input_data on a using max(c) group by b;")
+        pivot_2 = duckdb_cursor.sql("pivot input_data on b using max(c) group by a;")
         pivot_1.create("pivot_1")
         pivot_2.create("pivot_2")
         pivot_1_tbl = duckdb_cursor.table("pivot_1")
@@ -20,8 +20,8 @@ class TestPivot:
         duckdb_cursor.sql(
             "create table input_data as select unnest(['u','v','w']) as a, unnest(['x','y','z']) as b, unnest([1,2,3]) as c;"  # noqa: E501
         )
-        pivot_1 = duckdb_cursor.query("pivot input_data on a using max(c) group by b;")
+        pivot_1 = duckdb_cursor.sql("pivot input_data on a using max(c) group by b;")
         pivot_1.create("pivot_1")
         export_dir = tempfile.mkdtemp()
-        duckdb_cursor.query(f"EXPORT DATABASE '{export_dir}'")
+        duckdb_cursor.sql(f"EXPORT DATABASE '{export_dir}'")
         assert "CREATE TYPE" not in (Path(export_dir) / "schema.sql").read_text()

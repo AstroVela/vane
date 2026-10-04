@@ -637,9 +637,12 @@ those are scenario evidence, separate from these runtime observations.
 
 ## Managed results from SQL and Relation queries
 
+This section covers model-serving queries. The native local `query()` API is
+documented in the [execution design](PIPELINED_EXECUTION_DESIGN.md#公开-api-与后续目标).
+
 Configure `result_limit` on the owning connection to enable explicit managed
 delivery for ordinary local-fast queries. Both `connection.execute_result()`
-and `relation.execute_result()` return the existing `ManagedResult` handle:
+and `relation.execute_result()` return the existing `QueryResult` handle:
 
 ```python
 import vane

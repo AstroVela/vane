@@ -17,23 +17,23 @@ class TestArrowBufferSize:
         con = vane.connect()
 
         # All small string
-        res = con.query("select 'bla'").to_arrow_table()
+        res = con.sql("select 'bla'").to_arrow_table()
         assert res[0][0].type == pa.string()
-        res = con.query("select 'bla'").to_arrow_reader()
+        res = con.sql("select 'bla'").to_arrow_reader()
         assert res.schema[0].type == pa.string()
 
         # All Large String
         con.execute("SET arrow_large_buffer_size=True")
-        res = con.query("select 'bla'").to_arrow_table()
+        res = con.sql("select 'bla'").to_arrow_table()
         assert res[0][0].type == pa.large_string()
-        res = con.query("select 'bla'").to_arrow_reader()
+        res = con.sql("select 'bla'").to_arrow_reader()
         assert res.schema[0].type == pa.large_string()
 
         # All small string again
         con.execute("SET arrow_large_buffer_size=False")
-        res = con.query("select 'bla'").to_arrow_table()
+        res = con.sql("select 'bla'").to_arrow_table()
         assert res[0][0].type == pa.string()
-        res = con.query("select 'bla'").to_arrow_reader()
+        res = con.sql("select 'bla'").to_arrow_reader()
         assert res.schema[0].type == pa.string()
 
     @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
@@ -44,12 +44,12 @@ class TestArrowBufferSize:
         con = vane.connect()
         con.create_function("just_return", just_return, [VARCHAR], VARCHAR, type="arrow")
 
-        res = con.query("select just_return('bla')").to_arrow_table()
+        res = con.sql("select just_return('bla')").to_arrow_table()
 
         assert res[0][0].type == pa.string()
 
         # All Large String
         con.execute("SET arrow_large_buffer_size=True")
 
-        res = con.query("select just_return('bla')").to_arrow_table()
+        res = con.sql("select just_return('bla')").to_arrow_table()
         assert res[0][0].type == pa.large_string()

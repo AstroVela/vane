@@ -43,9 +43,11 @@ if typing.TYPE_CHECKING:
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
     from vane.execution.local_query import LocalQueryRuntime
+    from vane.execution.query_options import QueryExecutionOptions
+    from vane.execution.query_runtime import QueryResources, QueryRuntime
     from vane.execution.request_admission import RequestAdmissionLimits
     from vane.execution.resources import ResourceVector
-    from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
+    from vane.execution.result_delivery import QueryResult, ResultDeliveryLimits
     from vane.execution.udf_data_admission import DataAdmissionLimits
     from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
@@ -183,7 +185,7 @@ class DuckDBPyConnection:
         delivery_timeout: float | None = None,
         stream: bool = False,
         rows_per_batch: int = 2048,
-    ) -> ManagedResult: ...
+    ) -> QueryResult: ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...
     def extract_statements(self, query: str) -> lst[Statement]: ...
     def fetch_arrow_table(self, rows_per_batch: typing.SupportsInt = 1000000) -> pyarrow.lib.Table:
@@ -305,7 +307,16 @@ class DuckDBPyConnection:
     def pl(
         self, rows_per_batch: typing.SupportsInt = 1000000, *, lazy: bool = False
     ) -> polars.DataFrame | polars.LazyFrame: ...
-    def query(self, query: str, *, alias: str = "", params: object = None) -> DuckDBPyRelation: ...
+    @property
+    def query_runtime(self) -> QueryRuntime | None: ...
+    def query(
+        self,
+        query: str,
+        parameters: object = None,
+        *,
+        options: QueryExecutionOptions | None = None,
+        rows_per_batch: int = 2048,
+    ) -> QueryResult: ...
     def query_progress(self) -> float: ...
     def read_csv(
         self,
@@ -583,7 +594,7 @@ class DuckDBPyRelation:
     def execute(self) -> DuckDBPyRelation: ...
     def execute_result(
         self, *, delivery_timeout: float | None = None, stream: bool = False, rows_per_batch: int = 2048
-    ) -> ManagedResult: ...
+    ) -> QueryResult: ...
     def explain(self, type: ExplainType | str | int = ...) -> str: ...
     def explode(self, column: str) -> DuckDBPyRelation: ...
     def favg(
@@ -1564,6 +1575,9 @@ def connect(
     database: str | pathlib.Path = ":memory:",
     read_only: bool = False,
     config: dict[str, str | bool | int | float | lst[str]] | None = None,
+    *,
+    backend: typing.Literal["local"] = ...,
+    resources: QueryResources | None = None,
 ) -> DuckDBPyConnection: ...
 def _connect_with_runner(runner_type: str) -> DuckDBPyConnection: ...
 def cursor(*, connection: DuckDBPyConnection | None = None) -> DuckDBPyConnection: ...
@@ -1786,12 +1800,13 @@ def project(
     df: pandas.DataFrame, *args: _ExpressionLike, groups: str = "", connection: DuckDBPyConnection | None = None
 ) -> DuckDBPyRelation: ...
 def query(
-    query: Statement | str,
+    query: str,
+    parameters: object = None,
     *,
-    alias: str = "",
-    params: object = None,
+    options: QueryExecutionOptions | None = None,
+    rows_per_batch: int = 2048,
     connection: DuckDBPyConnection | None = None,
-) -> DuckDBPyRelation: ...
+) -> QueryResult: ...
 def query_df(
     df: pandas.DataFrame,
     virtual_table_name: str,

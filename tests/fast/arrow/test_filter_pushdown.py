@@ -972,7 +972,7 @@ class TestArrowFilterPushdown:
             }
         )
 
-        result = vane.query(
+        result = vane.sql(
             """
             SELECT *
             FROM cardinality_table

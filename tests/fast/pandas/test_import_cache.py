@@ -29,7 +29,7 @@ def test_import_cache_explicit_dtype(string_dtype):
         }
     )
     con = vane.connect()
-    result_df = con.query("select id, value from df").df()
+    result_df = con.sql("select id, value from df").df()
 
     assert pd.isna(result_df["value"][1])
     assert pd.isna(result_df["value"][2])
@@ -38,7 +38,7 @@ def test_import_cache_explicit_dtype(string_dtype):
 def test_import_cache_implicit_dtype():
     df = pd.DataFrame({"id": [1, 2, 3], "value": pd.Series(["123.123", pd.NaT, pd.NA])})  # noqa: F841
     con = vane.connect()
-    result_df = con.query("select id, value from df").df()
+    result_df = con.sql("select id, value from df").df()
 
     assert pd.isna(result_df["value"][1])
     assert pd.isna(result_df["value"][2])

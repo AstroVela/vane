@@ -38,12 +38,12 @@ def from_arrow(duckdb_cursor):
 def arrow_replacement(duckdb_cursor):
     data = pa.array(np.random.rand(1_000_000), type=pa.float32())
     arrow_table = pa.Table.from_arrays([data], ["a"])  # noqa: F841
-    duckdb_cursor.query("select sum(a) from arrow_table").fetchall()
+    duckdb_cursor.sql("select sum(a) from arrow_table").fetchall()
 
 
 def pandas_replacement(duckdb_cursor):
     df = pd.DataFrame({"x": np.random.rand(1_000_000)})  # noqa: F841
-    duckdb_cursor.query("select sum(x) from df").fetchall()
+    duckdb_cursor.sql("select sum(x) from df").fetchall()
 
 
 class TestRelationDependencyMemoryLeak:

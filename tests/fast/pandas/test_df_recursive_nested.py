@@ -15,7 +15,7 @@ NULL = None
 def check_equal(conn, df, reference_query, data):
     duckdb_conn = vane.connect()
     duckdb_conn.execute(reference_query, parameters=[data])
-    res = duckdb_conn.query("SELECT * FROM tbl").fetchall()
+    res = duckdb_conn.sql("SELECT * FROM tbl").fetchall()
     out = conn.sql("SELECT * FROM df").fetchall()
     assert res == out
 

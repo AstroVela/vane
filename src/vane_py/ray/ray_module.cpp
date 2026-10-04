@@ -454,13 +454,15 @@ void register_ray_bindings(py::module_ &mod) {
 	    });
 
 	py::class_<NativeDistributedTaskResult>(m, "NativeDistributedTaskResult")
-	    .def(py::init<py::iterable, py::iterable, py::object, py::object, std::string, int, py::object, py::object>(),
+	    .def(py::init<py::iterable, py::iterable, py::object, py::object, std::string, int, py::object, py::object,
+	                  py::object>(),
 	         py::arg("partition_payloads"), py::arg("partition_metadatas"), py::arg("result_schema"), py::arg("stats"),
 	         py::arg("completion_status"), py::arg("flight_port") = 0, py::arg("exchange_sink_instance") = py::none(),
-	         py::arg("task_stats") = py::none())
+	         py::arg("task_stats") = py::none(), py::arg("arrow_schema") = py::none())
 	    .def_property_readonly("partition_payloads", &NativeDistributedTaskResult::PartitionPayloads)
 	    .def_property_readonly("partition_metadatas", &NativeDistributedTaskResult::PartitionMetadatas)
 	    .def_property_readonly("result_schema", &NativeDistributedTaskResult::ResultSchema)
+	    .def_property_readonly("arrow_schema", &NativeDistributedTaskResult::ArrowSchema)
 	    .def_property_readonly("stats", &NativeDistributedTaskResult::Stats)
 	    .def_property_readonly("task_stats", &NativeDistributedTaskResult::TaskStats)
 	    .def_readonly("completion_status", &NativeDistributedTaskResult::completion_status)

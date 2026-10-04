@@ -44,7 +44,7 @@ class TestVaneQuery:
     def test_vane_query_empty_result(self):
         con = vane.connect()
         # show tables on empty connection does not produce any tuples
-        res = con.query("show tables").fetchall()
+        res = con.sql("show tables").fetchall()
         assert res == []
 
     def test_parametrized_explain(self, duckdb_cursor):

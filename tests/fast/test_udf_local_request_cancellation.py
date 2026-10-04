@@ -273,7 +273,7 @@ def test_cancel_running_native_udf_preserves_other_query_and_pool(
 def test_cancel_native_sql_at_start_and_reuse_cursor(monkeypatch, before_start):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     entered, proceed = threading.Event(), threading.Event()
-    original = udf_local_request._NativeRequestCancellation.started
+    original = udf_local_request.NativeQueryCancellation.started
 
     def started(self, conn):
         if not before_start:
@@ -283,7 +283,7 @@ def test_cancel_native_sql_at_start_and_reuse_cursor(monkeypatch, before_start):
         if before_start:
             original(self, conn)
 
-    monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", started)
+    monkeypatch.setattr(udf_local_request.NativeQueryCancellation, "started", started)
     with vane.connect() as connection:
         relation = connection.sql("SELECT sum(i) AS x FROM range(1000000000000) t(i)")
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
@@ -564,7 +564,7 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(
     def progress():
         return {name: (progress_directory / name).exists() for name in milestones}
 
-    native_started = udf_local_request._NativeRequestCancellation.started
+    native_started = udf_local_request.NativeQueryCancellation.started
     continue_native_start = threading.Event()
 
     def record_native_start(self, conn):
@@ -574,7 +574,7 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(
             assert continue_native_start.wait(30), "native-start callback was not released"
         mark("native_started")
 
-    monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", record_native_start)
+    monkeypatch.setattr(udf_local_request.NativeQueryCancellation, "started", record_native_start)
 
     def produce(table):
         mark("producer_entered")
@@ -694,7 +694,7 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(
     original_snapshot = local_runtime_helpers.local_runtime_snapshot
     original_start = udf_subprocess._SingleSubprocessExecutor._start_worker
     original_control = udf_subprocess._SingleSubprocessExecutor._handle_submit_control_message
-    original_native_start = udf_local_request._NativeRequestCancellation.started
+    original_native_start = udf_local_request.NativeQueryCancellation.started
     primary = AssertionError("controlled model-entry timeout")
 
     def pause():
@@ -729,7 +729,7 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(
     monkeypatch.setenv("VANE_TEST_DIAGNOSTICS_DIR", str(output))
     monkeypatch.setattr(local_runtime_helpers, "local_runtime_snapshot", snapshot_then_release)
     if delay_native_start:
-        monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", delayed_native_start)
+        monkeypatch.setattr(udf_local_request.NativeQueryCancellation, "started", delayed_native_start)
     monkeypatch.setattr(
         udf_subprocess._SingleSubprocessExecutor,
         "_start_worker" if stage == "preparation" else "_handle_submit_control_message",

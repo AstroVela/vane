@@ -22,7 +22,7 @@ class TestNonDefaultConn:
     def test_query(self, duckdb_cursor):
         duckdb_cursor.execute("create table t (a integer)")
         duckdb_cursor.execute("insert into t values (1)")
-        assert duckdb_cursor.query("select count(*) from t").execute().fetchall()[0] == (1,)
+        assert duckdb_cursor.sql("select count(*) from t").execute().fetchall()[0] == (1,)
         assert duckdb_cursor.from_query("select count(*) from t").execute().fetchall()[0] == (1,)
 
     def test_from_csv(self, duckdb_cursor):

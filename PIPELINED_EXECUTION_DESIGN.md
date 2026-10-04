@@ -7,15 +7,15 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 3 日 |
-| 开发分支 | feat/pipelined-execution |
-| 基础分支 | feature/local-runtime |
-| Vane 参考提交 | 36bdc721fa6f060bcd59d2e1df61e45359a9f292 |
+| 日期 | 2026 年 10 月 4 日（P1.1 更新） |
+| 开发分支 | feat/query-result-runtime |
+| 基础分支 | integration/pipelined-execution（P0 已合入） |
+| Vane 参考提交 | b161c07fc3ae8758026def0c69064e89f16ddd4c |
 | Trino 参考提交 | [6ead7e6c2f04c0bcfe5caf8e938dc1f5d3344f31][trino-revision]，调研时的 master，提交时间为 2026 年 10 月 2 日 02:30:56 UTC |
 | 兼容策略 | 不保留旧 API、旧协议、旧默认行为或旧执行入口 |
 | 实施记录 | [PIPELINED_EXECUTION_ROADMAP.md](PIPELINED_EXECUTION_ROADMAP.md) |
 
-全文的接口、目录和实施阶段描述目标状态。当前源码只作为算法、实现经验和问题证据；它的类名、继承关系、序列化格式及模块位置均不约束新设计。构建和测试流程遵循 [DEVELOPMENT.md](DEVELOPMENT.md)。
+未注明已实现的接口、目录和实施阶段描述目标状态。既有源码提供算法、实现经验和问题证据；它的类名、继承关系、序列化格式及模块位置均不约束新设计。构建和测试流程遵循 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## 设计决策
 
@@ -136,16 +136,43 @@ PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创�
 
 当前 [query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。exchange_store 目前只是注册存储的名字，P3 必须在实际准入前解析并验证其可用性与故障域。RayQuerySpec 覆盖计划准备所需的配置、快照和资源声明，尚不代表已预留资源或提交任务。公开连接入口继续按 roadmap 接线；local 不使用 RayQuerySpec。
 
-### API 草案
+### 公开 API 与后续目标
 
-以下是新 API 的目标形态，当前基线不能运行。limits 和 store 是预先构造的资源配置与存储配置；其具体类型随公共配置实现一并定义。
+P1.1 接通以下 local 入口。QueryResources 是会话共享的容量，独立 cursor 共用准入和结果预算；QueryExecutionOptions 是本次查询的不可变期限快照。
+
+`connect(":default:")` 只获取已有连接，不接受 `backend` 或 `resources` 等配置选项。需要 local 默认连接时，先通过 `connect(backend="local", resources=...)` 创建，再调用 `set_default_connection`；后续获取默认连接继续共用该会话的 runtime 和资源计费。
 
 ~~~python
-# 本地没有 execution 参数，也不启动分布式任务。
-local = vane.connect(backend="local", resources=limits)
-with local.query("SELECT 1 AS x") as result:
-    table = result.collect()
+import vane
 
+limits = vane.QueryResources(
+    max_active_queries=4,
+    max_queued_queries=64,
+    max_results=4,
+    result_buffer_bytes=64 * 1024 * 1024,
+)
+options = vane.QueryExecutionOptions(
+    target=vane.LocalExecution(),
+    admission_timeout=30,
+    execution_timeout=300,
+    delivery_timeout=300,
+)
+with vane.connect(backend="local", resources=limits) as local:
+    with local.query("SELECT ?::BIGINT AS x", [42], options=options) as result:
+        table = result.collect()
+        assert table.to_pylist() == [{"x": 42}]
+        assert result.execution_state == "SUCCEEDED"
+~~~
+
+local.query 只接受自动提交下的单条只读 SELECT；命令使用 execute。支持位置/具名参数、原生算子与批次输出，模型 UDF 尚未接入。query 不读取 VANE_RUNNER，不构建 FragmentGraph，也不创建 LocalModelRequest。local 的 connect/query 拒绝任何 execution override，包括显式 None。未指定 backend 的既有连接尚未切换；它们调用 query 会报错，惰性 Relation 使用 sql 或 from_query，不保留旧 query 别名。新 Ray 连接入口留待 P2。
+
+QueryResult 暴露 schema（Arrow schema）、query_id、context、read_batch/迭代、collect、cancel、close、execution_state 和交付 state。read_batch 返回 RecordBatch，正常 EOF 抛出 StopIteration，部分交付后的 native 错误继续抛出。collect 只收集剩余行，逐批复制到调用方内存并释放传输 lease。关闭结果或连接后，已经导出的 Arrow 切片、NumPy 零拷贝视图仍可读取并持续占用预算，直到最后一个视图释放。
+
+当前默认 rows_per_batch=2048，资源与期限默认值如上例；这些是初始功能配置，性能验收后再调整。result_buffer_bytes 只限制结果交付持有的 IPC 缓冲，不包含 DuckDB 算子、native 预取缓冲或 collect 的完整副本。超过窗口的单批立即报容量错误；能够放入窗口的下一批等待旧 lease 释放，可由取消或期限唤醒。需要控制 native 预取时使用连接的 streaming_buffer_size 设置。查询与交付期限分别从准入及结果句柄就绪开始计算，慢消费期间二者都可能到期。
+
+以下 Ray API 仍为后续目标，尚不能运行；limits/store 的分布式配置类型随 P2/P3 接线。
+
+~~~python
 connection = vane.connect(
     backend="ray",
     execution="pipelined",
@@ -585,7 +612,7 @@ FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。�
 
 ### ResultService 与 QueryResult
 
-QueryResult 提供 schema、批次迭代、collect、execution_completion、close 和状态查询。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
+QueryResult 提供 schema、批次迭代、collect、close 和状态查询。P1.1 通过 execution_state 与 state 分别观察执行和交付；分布式 execution_completion 通知随 P2/P3 接入。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
 
 分布式结果使用原生 ResultService，部署在客户端可访问的查询服务端点：
 
@@ -682,6 +709,7 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 ~~~text
 vane/execution/
   query_options.py          执行目标与不可变查询配置
+  query_runtime.py          local QueryContext、会话容量与取消生命周期（已实现）
   api.py                    QuerySpec 与查询入口
   coordinator.py            查询状态与服务生命周期
   plan.py                   FragmentGraph 的 Python 视图
@@ -689,7 +717,9 @@ vane/execution/
   submission.py             RayQuerySpec、快照及 worker 计划准备
   resource_demand.py         不可变资源声明
   resources.py              资源准入与 reservation
-  result.py                 QueryResult 的 Python API
+  result_delivery.py        QueryResult 的 Python API 与有界交付（已实现）
+  batch_lease.py            Arrow 批次及导出视图的计费所有权（已实现）
+  native_cancellation.py    原生中断与 cursor 复用的生命周期隔离（已实现）
   schedulers/
     pipelined.py            活动组与直接执行
     recovery.py             阶段提交与任务恢复
@@ -698,6 +728,7 @@ vane/execution/
     ray.py                  Ray worker 放置与控制
 
 src/vane_py/execution/
+  local_query.cpp           原生 local query 入口与增量 reader（已实现）
   fragment_plan.cpp         native fragment、连接/source 快照及能力
   fragment_plan_bindings.cpp 编译与准备的 Python 绑定
   task_service.cpp          native 任务服务绑定

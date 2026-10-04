@@ -84,7 +84,7 @@ def construct_map(pair):
 def check_struct_upgrade(expected_type: str, creation_method, pair: ObjectPair, cursor):
     column_data = creation_method(pair)
     df = pd.DataFrame(data={"col": column_data})
-    rel = cursor.query("select col from df")
+    rel = cursor.sql("select col from df")
     res = rel.fetchall()
     print("COLUMN_DATA", column_data)
     print("RESULT", res)
@@ -391,7 +391,7 @@ class TestResolveObjectColumns:
                 ]
             }
         )
-        res = duckdb_cursor.query("select typeof(col) from df").fetchall()
+        res = duckdb_cursor.sql("select typeof(col) from df").fetchall()
         # So we fall back to converting them as VARCHAR instead
         assert res == [("MAP(VARCHAR, VARCHAR)[]",), ("MAP(VARCHAR, VARCHAR)[]",)]
 

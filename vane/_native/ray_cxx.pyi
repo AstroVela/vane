@@ -4,6 +4,7 @@
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, SupportsFloat, SupportsIndex, SupportsInt, overload
 
+import pyarrow
 from typing_extensions import Never
 
 from vane._native import DuckDBPyRelation
@@ -133,6 +134,7 @@ class NativeDistributedTaskResult:
         flight_port: SupportsInt | SupportsIndex = ...,
         exchange_sink_instance: object | None = ...,
         task_stats: object | None = ...,
+        arrow_schema: pyarrow.Schema | None = ...,
     ) -> None: ...
     @property
     def partition_payloads(self) -> list[object]: ...
@@ -140,6 +142,8 @@ class NativeDistributedTaskResult:
     def partition_metadatas(self) -> list[NativePartitionMetadata]: ...
     @property
     def result_schema(self) -> Mapping[str, Any] | None: ...
+    @property
+    def arrow_schema(self) -> pyarrow.Schema | None: ...
     @property
     def stats(self) -> Iterable[int]: ...
     @property

@@ -103,7 +103,7 @@ class TestVaneConnection:
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
         res_df = vane.fetch_df()  # noqa: F841
-        res = vane.query("select * from res_df").fetchall()
+        res = vane.sql("select * from res_df").fetchall()
         assert res == ref
 
     def test_duplicate(self):
@@ -153,13 +153,13 @@ class TestVaneConnection:
             vane.InvalidInputException,
             match="Please provide either a Vane DuckDBPyStatement or a string representing the query",
         ):
-            vane.query(statements)
+            vane.sql(statements)
 
         with pytest.raises(vane.InvalidInputException, match="Values were not provided.*parameters: 1"):
-            vane.query(statements[0])
-        assert vane.query(statements[0], params=[42]).fetchall() == [(42,)]
+            vane.sql(statements[0])
+        assert vane.sql(statements[0], params=[42]).fetchall() == [(42,)]
 
-        assert vane.query(statements[1]).fetchall() == [(21,)]
+        assert vane.sql(statements[1]).fetchall() == [(21,)]
         assert vane.execute(statements[1]).fetchall() == [(21,)]
 
         with pytest.raises(
@@ -212,7 +212,7 @@ class TestVaneConnection:
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
         res_df = vane.fetch_df()  # noqa: F841
-        res = vane.query("select * from res_df").fetchall()
+        res = vane.sql("select * from res_df").fetchall()
         assert res == ref
 
     def test_fetch_df_chunk(self):
@@ -243,7 +243,7 @@ class TestVaneConnection:
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
         res_df = vane.fetchdf()  # noqa: F841
-        res = vane.query("select * from res_df").fetchall()
+        res = vane.sql("select * from res_df").fetchall()
         assert res == ref
 
     def test_fetchmany(self):
@@ -287,7 +287,7 @@ class TestVaneConnection:
         assert vane.load_extension is not None
 
     def test_query(self):
-        assert vane.query("select 3").fetchall() == [(3,)]
+        assert vane.sql("select 3").fetchall() == [(3,)]
 
     def test_register(self):
         assert vane.register is not None

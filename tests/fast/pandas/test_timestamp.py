@@ -80,7 +80,7 @@ class TestPandasTimestamps:
         reason="time zones other than UTC don't seem to work on Pyodide",
     )
     def test_timestamp_timezone(self, duckdb_cursor):
-        rel = duckdb_cursor.query(
+        rel = duckdb_cursor.sql(
             """
             SELECT
                 '2019-01-01 00:00:00+00'::TIMESTAMPTZ AS dateTime,
