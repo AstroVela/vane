@@ -220,11 +220,19 @@ def _close_subprocess_workers_concurrently(
     workers: list[_SingleSubprocessExecutor],
     *,
     kill: bool,
+    close_worker: Callable[[_SingleSubprocessExecutor], None] | None = None,
 ) -> tuple[list[BaseException], list[_SingleSubprocessExecutor]]:
-    """Close distinct actors and retain owners whose cleanup is incomplete."""
+    """Close distinct workers and retain owners whose cleanup is incomplete."""
 
     if not workers:
         return [], []
+
+    def close(worker: _SingleSubprocessExecutor) -> None:
+        if close_worker is None:
+            worker.close(kill=kill)
+        else:
+            close_worker(worker)
+
     cleanup_errors: list[BaseException] = []
     pending_workers: list[_SingleSubprocessExecutor] = []
     close_executor: ThreadPoolExecutor | None = None
@@ -239,11 +247,11 @@ def _close_subprocess_workers_concurrently(
     try:
         close_executor = ThreadPoolExecutor(
             max_workers=min(len(workers), _SUBPROCESS_CLEANUP_MAX_WORKERS),
-            thread_name_prefix="vane-udf-subprocess-actor-close",
+            thread_name_prefix="vane-udf-subprocess-close",
         )
         for worker in workers:
             try:
-                futures.append((worker, close_executor.submit(worker.close, kill=kill)))
+                futures.append((worker, close_executor.submit(close, worker)))
                 submitted += 1
             except BaseException as error:
                 _append_subprocess_cleanup_error(cleanup_errors, error)
@@ -269,7 +277,7 @@ def _close_subprocess_workers_concurrently(
     # remaining workers still need a best-effort owner-side close.
     for worker in workers[submitted:]:
         try:
-            worker.close(kill=kill)
+            close(worker)
         except BaseException as error:
             _append_subprocess_cleanup_error(cleanup_errors, error)
             retain_if_incomplete(worker, close_failed=True)
@@ -1901,11 +1909,17 @@ class _TaskWorkerPool:
             self.executor.shutdown(wait=False, cancel_futures=True)
         except BaseException as exc:
             cleanup_errors.append(exc)
-        for wrapper in to_close:
-            try:
-                self._close_retiring_worker(wrapper, kill=close_kill)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+        retiring_by_worker = {wrapper.worker: wrapper for wrapper in to_close}
+
+        def close_retiring_worker(worker: _SingleSubprocessExecutor) -> None:
+            self._close_retiring_worker(retiring_by_worker[worker], kill=close_kill)
+
+        # Keep the retirement ledger authoritative: the callback drops ownership
+        # and capacity only after that worker's close succeeds.
+        close_errors, _ = _close_subprocess_workers_concurrently(
+            list(retiring_by_worker), kill=close_kill, close_worker=close_retiring_worker
+        )
+        cleanup_errors.extend(close_errors)
         for worker in active_to_kill:
             try:
                 worker.close(kill=True)
