@@ -1454,7 +1454,10 @@ views remain valid after runtime shutdown; the arena closes after the last view
 is released. Cleanup failures retain the store for retry. Normal interpreter
 exit unlinks arenas owned by that process even when views remain alive, without
 invalidating their mappings for later exit callbacks. Forked children do not
-unlink inherited parent arenas during exit cleanup.
+reclaim inherited parent allocations or arenas. Allocation-lease release and
+arena cleanup check the owning PID before acquiring locks, including releases
+from block-ref finalizers and retained-view destructors. This prevents a child's
+stale free list from decommitting pages subsequently allocated by the parent.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
