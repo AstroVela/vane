@@ -6352,6 +6352,117 @@ def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
         runtime.close(kill=True)
 
 
+@pytest.mark.parametrize("kill", [False, True])
+def test_subprocess_task_pool_final_release_closes_workers_concurrently_and_waits(kill):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
+    close_barrier = threading.Barrier(3)
+    allow_close = [threading.Event(), threading.Event()]
+    close_calls = []
+    close_errors = []
+
+    class FakeWorker:
+        def __init__(self, index):
+            self.index = index
+
+        def close(self, *, kill):
+            close_calls.append((self.index, kill))
+            close_barrier.wait(timeout=5.0)
+            assert allow_close[self.index].wait(timeout=5.0)
+
+    pool = subprocess_exec._TaskWorkerPool(runtime, "concurrent-task-close", {}, 2)
+    runtime.pools[pool.key] = pool
+    runtime.total_workers = pool.total = 2
+    wrappers = [subprocess_exec._PooledTaskWorker(FakeWorker(index)) for index in range(2)]
+    pool.idle = list(wrappers)
+    pool.acquire_ref()
+    pool.acquire_ref()
+
+    def release_last_ref():
+        try:
+            pool.release_ref(kill=kill)
+        except BaseException as error:
+            close_errors.append(error)
+
+    close_thread = threading.Thread(target=release_last_ref, daemon=True)
+    try:
+        pool.release_ref(kill=kill)
+        assert close_calls == []
+        assert not pool.closing
+
+        close_thread.start()
+        close_barrier.wait(timeout=5.0)
+        assert sorted(close_calls) == [(0, kill), (1, kill)]
+        with runtime.cond:
+            assert runtime.total_workers == pool.total == 2
+            assert set(pool._retiring_workers) == set(wrappers)
+            assert set(runtime._retiring_workers) == set(wrappers)
+
+        allow_close[0].set()
+        with runtime.cond:
+            assert runtime.cond.wait_for(lambda: pool.total == 1, timeout=5.0)
+            assert runtime.total_workers == 1
+            assert list(pool._retiring_workers) == [wrappers[1]]
+            assert list(runtime._retiring_workers) == [wrappers[1]]
+        assert close_thread.is_alive()
+    finally:
+        for event in allow_close:
+            event.set()
+        if close_thread.ident is not None:
+            close_thread.join(timeout=10.0)
+        runtime.close(kill=True)
+
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert runtime.total_workers == pool.total == 0
+    assert pool._retiring_workers == runtime._retiring_workers == {}
+
+
+@pytest.mark.parametrize("failure", ["init", "submit"])
+def test_subprocess_task_pool_close_thread_failure_preserves_retirement_cleanup(monkeypatch, failure):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
+    close_calls = []
+
+    class FakeWorker:
+        def __init__(self, index):
+            self.index = index
+
+        def close(self, *, kill):
+            close_calls.append((self.index, kill))
+
+    class FailingCloseExecutor(subprocess_exec.ThreadPoolExecutor):
+        def __init__(self, **kwargs):
+            if failure == "init":
+                raise RuntimeError("planned close thread init failure")
+            super().__init__(**kwargs)
+            self.submit_count = 0
+
+        def submit(self, fn, *args, **kwargs):
+            self.submit_count += 1
+            if self.submit_count == 2:
+                raise RuntimeError("planned close thread submit failure")
+            return super().submit(fn, *args, **kwargs)
+
+    pool = subprocess_exec._TaskWorkerPool(runtime, "close-thread-failure", {}, 2)
+    runtime.pools[pool.key] = pool
+    runtime.total_workers = pool.total = 2
+    pool.idle = [subprocess_exec._PooledTaskWorker(FakeWorker(index)) for index in range(2)]
+    pool.acquire_ref()
+    monkeypatch.setattr(subprocess_exec, "ThreadPoolExecutor", FailingCloseExecutor)
+    try:
+        with pytest.raises(RuntimeError, match=f"planned close thread {failure} failure"):
+            pool.release_ref(kill=False)
+
+        assert sorted(close_calls) == [(0, False), (1, False)]
+        assert runtime.total_workers == pool.total == 0
+        assert pool._retiring_workers == runtime._retiring_workers == {}
+    finally:
+        runtime.close(kill=True)
+
+
 def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_failure():
     import vane.execution.udf_subprocess as subprocess_exec
 
@@ -6387,10 +6498,13 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
         with pytest.raises(RuntimeError, match="admission cleanup failed.*second cleanup failed"):
             pool.release_ref(kill=False)
 
-        assert calls == ["admission", "second", "first"]
+        assert calls[0] == "admission"
+        assert sorted(calls[1:]) == ["first", "second"]
         assert runtime.total_workers == 1
         assert runtime.stats()["retiring_workers"] == 1
         assert pool.total == 1
+        assert [wrapper.worker.name for wrapper in pool._retiring_workers] == ["second"]
+        assert list(runtime._retiring_workers) == list(pool._retiring_workers)
     finally:
         runtime.close(kill=True)
     assert runtime.total_workers == 0
