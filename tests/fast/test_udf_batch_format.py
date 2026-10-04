@@ -111,6 +111,27 @@ def test_batch_format_runtime_builds_declared_empty_output(batch_format, stream_
     )
 
 
+@pytest.mark.parametrize("layout", ["middle", "row"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_numpy_batch_format_preserves_declared_layout_for_singleton_views(layout, masked):
+    base = np.arange(6, dtype=np.float32).reshape(2, 3)
+    values = base[:, None, :] if layout == "middle" else base[None, :, :]
+    tensor_type = pa.fixed_shape_tensor(pa.float32(), values.shape[1:])
+    batch = {"tensor": np.ma.MaskedArray(values, mask=False) if masked else values}
+    (output,) = iter_udf_output_tables(
+        batch,
+        batch_format="numpy",
+        output_schema=[_tensor_field("tensor", "FLOAT", values.shape[1:])],
+    )
+
+    tensor = output.column("tensor").chunk(0)
+    assert tensor.type == tensor_type
+    assert tensor.type.permutation is None
+    actual = tensor.to_numpy_ndarray()
+    np.testing.assert_array_equal(actual, values)
+    assert np.shares_memory(actual, values)
+
+
 def test_numpy_batch_format_preserves_nullable_tensor_rows_as_object_array():
     batch = format_udf_input(_tensor_input_table(nullable=True), "numpy")
 

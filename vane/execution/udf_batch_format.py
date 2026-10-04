@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 from vane.execution._udf_validation import ensure_synchronous_udf_result
 from vane.execution.udf_output_schema import (
     _arrow_type_from_output_schema_entry,
+    _fixed_shape_tensor_array,
     normalize_output_schema_entries,
 )
 
@@ -402,7 +403,7 @@ def _dense_tensor_values_to_arrow(
     except pa.ArrowNotImplementedError:
         source_value_type = None
     if contiguous.dtype.isnative and source_value_type == tensor_type.value_type:
-        return pa.FixedShapeTensorArray.from_numpy_ndarray(contiguous)
+        return _fixed_shape_tensor_array(contiguous, tensor_type)
 
     flattened = pa.array(contiguous.reshape(-1).tolist(), type=tensor_type.value_type, safe=True)
     storage = pa.FixedSizeListArray.from_arrays(flattened, tensor_type.storage_type.list_size)
