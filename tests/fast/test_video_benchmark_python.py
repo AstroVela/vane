@@ -43,10 +43,16 @@ def _frames(kind, pixels):
 def test_python_video_frame_conversion_preserves_pixels(benchmark, kind):
     pixels = np.arange(3 * 640 * 640 * 3, dtype=np.uint8).reshape(3, 640, 640, 3)
     frames = _frames(kind, pixels)
-    for column in (frames.slice(1, 2), pa.chunked_array([frames.slice(1, 1), frames.slice(2, 1)])):
+    for column in (
+        frames.slice(1, 2),
+        pa.chunked_array([frames.slice(1, 2)]),
+        pa.chunked_array([frames.slice(1, 1), frames.slice(2, 1)]),
+    ):
         result = benchmark._frame_batch(column)
         np.testing.assert_array_equal(result, pixels[1:])
         assert result.dtype == np.uint8 and result.flags.c_contiguous
+        if kind == "tensor" and isinstance(column, pa.ChunkedArray) and column.num_chunks == 1:
+            assert np.shares_memory(result, column.chunk(0).to_numpy_ndarray())
     assert benchmark._frame_batch(frames.slice(0, 0)).shape == (0, 640, 640, 3)
     with pytest.raises(ValueError, match="NULL"):
         benchmark._frame_batch(frames.take(pa.array([None], type=pa.int64())))
@@ -100,3 +106,27 @@ def test_python_video_source_exposes_fixed_tensor_frames(benchmark, tmp_path, mo
     pixels = benchmark._frame_batch(table["frame"])
     for frame, level in zip(pixels, (17, 91, 203), strict=True):
         np.testing.assert_array_equal(frame, np.full((640, 640, 3), level, dtype=np.uint8))
+
+
+@pytest.mark.parametrize("kind", ["tensor", "generic", "fixed"])
+def test_batch_video_preparation_preserves_slices_and_reuses_single_tensor_chunk(benchmark, kind):
+    directory = Path(benchmark.__file__).parent
+    spec = importlib.util.spec_from_file_location("video_batch_benchmark_python", directory / "vane_batch_main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    detector = object.__new__(module.YOLODetector)
+    pixels = np.arange(3 * 640 * 640 * 3, dtype=np.uint8).reshape(3, 640, 640, 3)
+    frames = _frames(kind, pixels)
+    for column in (pa.chunked_array([frames.slice(1, 2)]), pa.chunked_array([frames.slice(1, 1), frames.slice(2, 1)])):
+        prepared = detector.prepare_batch(pa.table({"frame_index": [7, 8], "frame": column}))
+        assert prepared["frame_index"] == [7, 8]
+        np.testing.assert_array_equal(prepared["frame"], pixels[1:])
+        assert prepared["frame"].dtype == np.uint8 and prepared["frame"].flags.c_contiguous
+        if kind == "tensor" and column.num_chunks == 1:
+            assert np.shares_memory(prepared["frame"], column.chunk(0).to_numpy_ndarray())
+    empty = detector.prepare_batch(
+        pa.table({"frame_index": pa.array([], type=pa.int64()), "frame": frames.slice(0, 0)})
+    )
+    assert empty["frame"].shape == (0, 640, 640, 3)
+    with pytest.raises(ValueError, match="NULL"):
+        detector.prepare_batch(pa.table({"frame_index": [9], "frame": frames.take(pa.array([None], type=pa.int64()))}))

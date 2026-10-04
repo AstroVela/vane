@@ -84,3 +84,21 @@ comparison adapter, not a complete product VideoFile backend replacement.
 output, nested NULLs, storage conversion, ownership after close, backpressure,
 errors, hooks, instance isolation and the public Ray Actor API. The combined
 frozen candidate passed the 1,835-test base release gate with 38 optional skips.
+
+## Single-chunk frame input
+
+The benchmark frame adapter reuses `chunk(0)` for a single chunk and combines
+multiple chunks. This applies to the optional BatchUDF detector, the original
+detector and crop adaptation. NULL, dtype, shape and contiguity validation
+remain unchanged. A nonzero slice offset still identifies the correct pixels.
+
+On 32 frames of 640x640 RGB uint8, the old combine operation copied 37.5 MiB.
+A same-Actor interleaved comparison over 24,576 measured frames reduced input
+adaptation from 0.3998 to 0.0082 ms/frame and detector calls from 23.3440 to
+22.9432 ms/frame. Crop-only replay reduced 35.228 to 34.960 ms/frame; separate
+cached-pipeline paired windows had a +0.36% median throughput gain. These are
+different scopes and cannot be added into an end-to-end speedup.
+
+The focused test verifies pixel values and storage sharing for single-chunk
+tensors, slices, multi-chunk input, empty input and NULL rejection. Numerical
+helpers, model configuration and the default detector selection are unchanged.

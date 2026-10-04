@@ -84,7 +84,7 @@ class PythonVideoFrameSource(DataSource):
 
 def _frame_batch(column) -> np.ndarray:
     if isinstance(column, pa.ChunkedArray):
-        column = column.combine_chunks()
+        column = column.chunk(0) if column.num_chunks == 1 else column.combine_chunks()
     if column.null_count:
         raise ValueError("Video frames cannot contain NULL values")
     if isinstance(column, pa.FixedShapeTensorArray):
