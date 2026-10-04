@@ -67,7 +67,7 @@ def test_numpy_tensor_offsets_preserve_values_and_storage(
     np.testing.assert_array_equal(result, pixels[parent_offset : parent_offset + 2])
     assert result.dtype == np.float32 and result.flags.c_contiguous
     assert result.flags.writeable != zero_copy_batch
-    assert np.shares_memory(result, flat) == (zero_copy_batch and not multiple_chunks and not child_offset)
+    assert np.shares_memory(result, flat) == (zero_copy_batch and not multiple_chunks)
     if not zero_copy_batch:
         result[:] = 99
         np.testing.assert_array_equal(values.to_numpy(), pixels.reshape(-1))
@@ -143,7 +143,9 @@ def test_numpy_image_modes_and_copy_policy(form, mode, zero_copy_batch):
     dtype = (
         vane.image_type(mode, 2, 3)
         if form == "fixed"
-        else vane.image_type(mode) if form == "variable" else vane.image_type()
+        else vane.image_type(mode)
+        if form == "variable"
+        else vane.image_type()
     )
     channels = _MODE_CHANNELS[mode]
     pixels = np.arange(3 * 2 * 3 * channels, dtype=_MODE_DTYPES[mode]).reshape(3, 2, 3, channels)
@@ -196,7 +198,9 @@ def test_numpy_image_null_rows_round_trip(form, zero_copy_batch):
     dtype = (
         vane.image_type("RGB", 2, 3)
         if form == "fixed"
-        else vane.image_type("RGB") if form == "variable" else vane.image_type()
+        else vane.image_type("RGB")
+        if form == "variable"
+        else vane.image_type()
     )
     pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
     array = _image_array(dtype, [pixels, None, pixels + 1])
