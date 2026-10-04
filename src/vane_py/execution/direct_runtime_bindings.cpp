@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "direct_task.hpp"
+#include "direct_flight.hpp"
 
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_conversion.hpp"
@@ -36,6 +38,33 @@ struct DirectBatchView {
 	DataChunk chunk;
 	idx_t sequence = 0;
 	string producer;
+
+	py::object Arrow(const vector<string> &names) {
+		if (names.size() != chunk.ColumnCount()) {
+			throw InvalidInputException("result column names do not match native schema");
+		}
+		ArrowArray array;
+		array.Init();
+		ClientProperties properties;
+		ArrowSchema schema;
+		schema.Init();
+		try {
+			DirectFlight::ExportSchema(chunk.GetTypes(), names, &schema);
+			unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
+			ArrowConverter::ToArrowArray(chunk, &array, properties, extensions);
+			return py::module_::import("pyarrow")
+			    .attr("RecordBatch")
+			    .attr("_import_from_c")(reinterpret_cast<uintptr_t>(&array), reinterpret_cast<uintptr_t>(&schema));
+		} catch (...) {
+			if (array.release) {
+				array.release(&array);
+			}
+			if (schema.release) {
+				schema.release(&schema);
+			}
+			throw;
+		}
+	}
 
 	py::list Rows() {
 		py::list rows;
@@ -188,6 +217,7 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 	    .def_property_readonly("count", [](DirectTestSignal &signal) { return signal.count.load(); });
 	py::class_<DirectBatchView>(runtime, "DirectBatch")
 	    .def("to_rows", &DirectBatchView::Rows)
+	    .def("to_arrow", &DirectBatchView::Arrow)
 	    .def("slice", &DirectBatchView::Slice)
 	    .def("close", [](DirectBatchView &view) { view.chunk.Destroy(); })
 	    .def_property_readonly("num_rows", [](DirectBatchView &view) { return view.chunk.size(); })
@@ -207,6 +237,65 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 	         py::arg("signal") = nullptr)
 	    .def("snapshot", &Snapshot)
 	    .def("producer_drained", &DirectChannel::ProducerDrained);
+	runtime.def("arrow_schema", [](const string &encoded, const vector<string> &names) {
+		ClientProperties properties;
+		ArrowSchema schema;
+		schema.Init();
+		auto types = DeserializeSchema(encoded);
+		if (types.size() != names.size()) {
+			throw InvalidInputException("result column names do not match native schema");
+		}
+		DirectFlight::ExportSchema(types, names, &schema);
+		try {
+			return py::module_::import("pyarrow").attr("Schema").attr("_import_from_c")(
+			    reinterpret_cast<uintptr_t>(&schema));
+		} catch (...) {
+			if (schema.release) {
+				schema.release(&schema);
+			}
+			throw;
+		}
+	});
+	py::class_<DirectFlight, shared_ptr<DirectFlight>>(runtime, "DirectFlight")
+	    .def(py::init([](const string &host, const string &advertise, idx_t links, idx_t staging, idx_t frame) {
+		    TaskEntry entry;
+		    py::gil_scoped_release release;
+		    return shared_ptr<DirectFlight>(new DirectFlight(host, advertise, links, staging, frame),
+		                                    [](DirectFlight *service) {
+			                                    py::gil_scoped_release release;
+			                                    delete service;
+		                                    });
+	    }))
+	    .def_property_readonly("location", &DirectFlight::Location)
+	    .def_property_readonly("error", &DirectFlight::Error)
+	    .def_property_readonly("active_links", &DirectFlight::ActiveLinks)
+	    .def_property_readonly("ready", &DirectFlight::Ready)
+	    .def_static("staging_per_link", &DirectFlight::StagingPerLink)
+	    .def(
+	        "publish",
+	        [](DirectFlight &service, const string &ticket, shared_ptr<DirectChannel> channel, const string &consumer) {
+		        TaskEntry entry;
+		        py::gil_scoped_release release;
+		        service.Publish(ticket, std::move(channel), consumer);
+	        })
+	    .def("subscribe",
+	         [](DirectFlight &service, const string &location, const string &ticket, shared_ptr<DirectChannel> channel,
+	            const string &producer, double timeout) {
+		         TaskEntry entry;
+		         py::gil_scoped_release release;
+		         service.Subscribe(location, ticket, std::move(channel), producer, timeout);
+	         })
+	    .def("cancel",
+	         [](DirectFlight &service, const string &reason) {
+		         TaskEntry entry;
+		         py::gil_scoped_release release;
+		         service.Cancel(reason);
+	         })
+	    .def("close", [](DirectFlight &service) {
+		    TaskEntry entry;
+		    py::gil_scoped_release release;
+		    service.Close();
+	    });
 	py::class_<DirectTaskService, shared_ptr<DirectTaskService>>(runtime, "TaskService")
 	    .def(py::init([](DuckDBPyConnection &connection) {
 		    auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
@@ -248,22 +337,35 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 		         py::gil_scoped_release release;
 		         service.Release();
 	         })
-	    .def("status", [](DirectTaskService &service) {
+	    .def("status",
+	         [](DirectTaskService &service) {
+		         TaskEntry entry;
+		         vector<DirectTaskStatus> values;
+		         {
+			         py::gil_scoped_release release;
+			         values = service.Status();
+		         }
+		         py::list result;
+		         for (auto &value : values) {
+			         py::dict item;
+			         item["task_id"] = value.task_id;
+			         item["state"] = value.state;
+			         item["error"] = value.error;
+			         item["released"] = value.released;
+			         result.append(std::move(item));
+		         }
+		         return result;
+	         })
+	    .def("production_status", [](DirectTaskService &service) {
 		    TaskEntry entry;
-		    vector<DirectTaskStatus> values;
+		    DirectProducerStatus status;
 		    {
 			    py::gil_scoped_release release;
-			    values = service.Status();
+			    status = service.ProductionStatus();
 		    }
-		    py::list result;
-		    for (auto &value : values) {
-			    py::dict item;
-			    item["task_id"] = value.task_id;
-			    item["state"] = value.state;
-			    item["error"] = value.error;
-			    item["released"] = value.released;
-			    result.append(std::move(item));
-		    }
+		    py::dict result;
+		    result["finished"] = status.finished;
+		    result["error"] = status.error;
 		    return result;
 	    });
 }

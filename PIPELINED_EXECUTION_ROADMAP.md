@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 的 feat/direct-exchange 已迁到该合入提交之上，PR #944 直接面向 integration/pipelined-execution，仅包含 P1.2 增量。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 从此提交切出 feat/native-flight-exchange，完成 native Flight、Ray 调度与公开结果入口。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -18,8 +18,8 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | 阶段 | 可交付能力 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
-| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1 已合入；P1.2 已实现，PR #944 待审查 |
-| P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | 未开始 |
+| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1、P1.2 均已合入 |
+| P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已完成相关验收 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
 | P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
@@ -100,24 +100,26 @@ P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；�
 
 ### P2.1 Native Flight 数据面
 
-- [ ] Direct ticket、QueryId/AttemptId/WorkerEpoch 校验与访问 capability。
-- [ ] DoGet 数据帧、累计 ACK、关闭与有界 I/O。
-- [ ] 独立控制通道保证窗口耗尽时仍可取消。
-- [ ] 两进程故障注入验证断连不伪造 EOF。
+- [x] Direct ticket、QueryId/AttemptId/WorkerEpoch 校验与访问 capability。
+- [x] DoGet 数据帧、累计 ACK、关闭与有界 I/O。
+- [x] 独立控制通道保证窗口耗尽时仍可取消。
+- [x] 两进程故障注入验证断连不伪造 EOF。
 
 ### P2.2 调度与 worker 控制
 
-- [ ] Ray backend 放置 worker，提供 prepare/start、split、状态和取消控制。
-- [ ] 活动组获得可兑现的上下文与最小推进容量；预留全部成功或撤销。
-- [ ] PipelinedScheduler 先准备消费者再启动生产者。
-- [ ] worker epoch 变化使查询失败，不通过 Ray 方法重试重放任务。
+- [x] Ray backend 放置固定 epoch 的 worker；prepare 绑定并封闭全部 split，提供 start、状态、生产结局和取消控制。
+- [x] 活动组获得可兑现的上下文与最小推进容量；预留全部成功或撤销。
+- [x] PipelinedScheduler 先准备消费者再启动生产者。
+- [x] worker epoch 变化使查询失败，不通过 Ray 方法重试重放任务。
 
 ### P2.3 根结果与公开入口
 
-- [ ] 原生 ResultService 从 root worker 拉取数据，为客户端提供可达的 Flight 端点。
-- [ ] 上游和客户端两个方向的窗口都有界，批次不经 Python/Ray ObjectRef 中转。
-- [ ] 接通 ray/pipelined 查询及 QueryResult。
-- [ ] 区分执行结局和交付结局，部分结果之后的失败可观察。
+- [x] 原生 ResultService 从 root worker 拉取数据，为客户端提供可达的 Flight 端点。
+- [x] 上游和客户端两个方向的窗口都有界，批次不经 Python/Ray ObjectRef 中转。
+- [x] 接通 ray/pipelined 查询及 QueryResult。
+- [x] 区分执行结局和交付结局，部分结果之后的失败可观察。
+
+实现位于 [native Flight](src/vane_py/execution/direct_flight.cpp)、[固定放置与容量](vane/execution/pipelined_plan.py)、[worker/ResultService](vane/execution/pipelined_worker.py) 及 [scheduler/QueryContext](vane/execution/pipelined_runtime.py)。公开 `connect(backend="ray")` 使用 RayResources；Ray 须先初始化，当前 SQL/type 范围延续 P0，SQL 参数、分析算子和 FTE 明确拒绝。
 
 P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端产生背压；取消和 worker/结果服务失效有明确结局；数据面没有 shuffle 物化文件。
 
@@ -327,4 +329,21 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 9 项回归在旧版本为 **8 failed、1 passed**；审查者的复现和对照为 **2 failed、6 passed**。修复后相关验证共 **198 passed**：DirectExchange 123、QueryResult runtime 67、审查者用例 8。覆盖单线程/四线程、后台 native 完成前的通道观察、sink 提前结束、持有批次、status/pump/release 及无错误对照。只运行相关测试，未运行完整 release/fast 套件。
 - C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致，DuckDB 子树及 engine identity 未变。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
 
-下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。
+### P2 Native Flight、Ray 调度与结果服务（2026 年 10 月 4 日）
+
+- [DirectFlight](src/vane_py/execution/direct_flight.cpp) 接通 native 通道与 Arrow Flight。完整 ticket 固定查询、attempt、双方 epoch、schema、路由和访问 capability；每条流最多一个未确认帧，累计 ACK 归还发送端所有权。独立控制检查覆盖窗口耗尽、提前关闭、断连及 FINISH 后的持久错误。
+- [PipelinedWorker/ResultService](vane/execution/pipelined_worker.py) 与 [PipelinedScheduler](vane/execution/pipelined_runtime.py) 实现会话共享 worker 池、整图准备和资源预留、固定 split、消费者握手及逆拓扑启动。准备或清理失败保留资源所有者，成功释放后才退还额度；worker 不自动重启或重放任务。
+- 公开 `connect(backend="ray").query()` 返回相同的 QueryResult。数据通过 root worker → native ResultService → 客户端传输，Ray 只负责控制；慢客户端背压一直传回扫描端。最终 EOF 重新检查全图结局，已完成生产不再被执行期限取消，后台失败会唤醒结果容量等待者。
+- 最终相关测试共 **283 passed**：DirectFlight 24、配置/放置 13、DirectExchange 123、QueryResult runtime 67、执行选项 45、真实 Ray 11。覆盖两个独立 native 进程、两个真实 Ray worker、Parquet/HASH、空 schema、小窗口、部分交付后杀 worker/结果服务、预留回滚、清理失败重试、共享会话准入、取消与执行/交付期限。按要求未运行完整 release/fast 套件。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装。275 个 Python 源码/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致；engine identity 为 `346ef5b69e:fragment:18497cb82d5466056628bb30c840bc924f5137d61255a71861e002fa76da51cf`。DuckDB 子树与 fragment codec 没有修改。
+- 新增测试已加入 release launcher 和源码包清单。当前 SQL/type 范围延续 P0，原生传输支持 basic types；SQL 参数、聚合/join、模型 UDF 和 FTE 尚未接线。Parquet 使用 worker 共同可访问的绝对路径；客户端须能访问 ResultService 公布的节点地址和动态端口。
+- root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。本地构建与测试平台为 Linux；其余平台交由 CI 验证。
+
+P2 退出条件已满足。下一步为 P3：在同一 FragmentGraph、worker 身份与 QueryResult 契约上实现物化 exchange、原子提交和失败重试。
+
+### P2 状态监控审查修复（PR #962）
+
+- 周期监控复用独立的 native production/error 探测，与执行期限和最终 EOF 检查保持一致。详细 task status 会等待 pump 的执行锁，退出存活监控路径；保留监控的 5 秒 RPC 期限及实际执行期限，不通过延长超时掩盖长时间 native 执行。
+- 新增真实 Ray 回归：60 秒执行期限下的长过滤查询正常完成，2 秒期限仍抛出 RequestExecutionTimeout，结束后资源账本清空。新增用例在旧版本为 **1 failed、1 passed**；审查者的监控/无监控对照在旧版本也为 **1 failed、1 passed**。修复后监控开启和关闭均约 14.3 秒成功完成。
+- 本次相关验证共 **107 passed**：Ray pipelined 13、DirectFlight 24、QueryResult runtime 67、审查者补充用例 3。覆盖故障传播、已完成生产、取消、执行/交付期限、背压与多查询共享 worker。按要求未运行完整 release/fast 套件。
+- 修复仅修改 Python 调度和测试，已重新进行非 editable 安装；275 个 Python 源码/类型文件与 checkout 一致，native 二进制及 engine identity 没有变化。root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接及 diff 检查通过。

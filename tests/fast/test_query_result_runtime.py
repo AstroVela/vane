@@ -669,7 +669,7 @@ def test_local_options_snapshot_and_mode_validation():
             connection.query("SELECT 1", options=vane.QueryExecutionOptions(RayExecution(), 1, 1, 1))
         idle(connection.query_runtime)
     with pytest.raises(ValueError, match="backend"):
-        vane.connect(backend="ray")
+        vane.connect(backend="unknown")
     with pytest.raises(TypeError, match="QueryResources"):
         vane.connect(backend="local", resources={})
 

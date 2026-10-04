@@ -257,6 +257,9 @@ class QueryContext:
 class QueryRuntime:
     """Session-owned capacities shared by its independent native cursors."""
 
+    backend = "local"
+    context_type: type[QueryContext] = QueryContext
+
     def __init__(self, resources: QueryResources | None = None) -> None:
         if resources is None:
             resources = QueryResources()
@@ -294,7 +297,7 @@ class QueryRuntime:
             if self._draining:
                 raise RuntimeError("query runtime is draining")
             ticket = self._admission.request(queue_timeout=options.admission_timeout)
-            context = QueryContext(self, ticket, options)
+            context = self.context_type(self, ticket, options)
             self._contexts[context.query_id] = context
         try:
             publish(context)

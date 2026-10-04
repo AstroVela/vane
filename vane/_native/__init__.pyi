@@ -45,6 +45,7 @@ if typing.TYPE_CHECKING:
     from vane.execution.local_query import LocalQueryRuntime
     from vane.execution.query_options import QueryExecutionOptions
     from vane.execution.query_runtime import QueryResources, QueryRuntime
+    from vane.execution.pipelined_plan import RayResources
     from vane.execution.request_admission import RequestAdmissionLimits
     from vane.execution.resources import ResourceVector
     from vane.execution.result_delivery import QueryResult, ResultDeliveryLimits
@@ -316,6 +317,7 @@ class DuckDBPyConnection:
         *,
         options: QueryExecutionOptions | None = None,
         rows_per_batch: int = 2048,
+        **overrides: typing.Any,
     ) -> QueryResult: ...
     def query_progress(self) -> float: ...
     def read_csv(
@@ -1576,8 +1578,9 @@ def connect(
     read_only: bool = False,
     config: dict[str, str | bool | int | float | lst[str]] | None = None,
     *,
-    backend: typing.Literal["local"] = ...,
-    resources: QueryResources | None = None,
+    backend: typing.Literal["local", "ray"] = ...,
+    resources: QueryResources | RayResources | None = None,
+    **options: typing.Any,
 ) -> DuckDBPyConnection: ...
 def _connect_with_runner(runner_type: str) -> DuckDBPyConnection: ...
 def cursor(*, connection: DuckDBPyConnection | None = None) -> DuckDBPyConnection: ...

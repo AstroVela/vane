@@ -536,6 +536,38 @@ bool DirectTaskService::Expire() {
 	return Stop("execution deadline exceeded", true);
 }
 
+DirectProducerStatus DirectTaskService::ProductionStatus() {
+	// Deadline/control probes must not wait behind a running ExecuteTask.
+	lock_guard<mutex> registry(registry_lock);
+	DirectProducerStatus result;
+	result.finished = !tasks.empty();
+	for (auto &task : tasks) {
+		string error = task->failure_reason;
+		if (error.empty() && task->execution_errors && task->execution_errors->HasError()) {
+			error = task->execution_errors->GetError().Message();
+		}
+		if (error.empty()) {
+			error = InputError(task->inputs);
+		}
+		for (auto &output : task->outputs) {
+			for (auto &channel : output.channels) {
+				auto state = channel->ProducerStatus(output.producer);
+				result.finished = result.finished && state.finished;
+				if (error.empty()) {
+					error = state.error;
+				}
+			}
+		}
+		if (result.error.empty()) {
+			result.error = std::move(error);
+		}
+	}
+	if (result.error.empty() && canceled.load()) {
+		result.error = cancel_reason;
+	}
+	return result;
+}
+
 bool DirectTaskService::Stop(const string &reason, bool only_running, optional_ptr<Task> failure) {
 	vector<shared_ptr<ClientContext>> interrupt;
 	vector<shared_ptr<DirectChannel>> abort;

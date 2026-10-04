@@ -67,6 +67,20 @@ add_library(
 
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
 
+# Arrow's C++ API is isolated from the C++11 engine/binding translation units.
+add_library(python_direct_flight OBJECT execution/direct_flight.cpp)
+set_target_properties(python_direct_flight PROPERTIES CXX_STANDARD 17)
+target_link_libraries(
+  python_direct_flight
+  PRIVATE
+    vane_python_dependencies
+    $<TARGET_PROPERTY:duckdb_execution_distributed_exchange,LINK_LIBRARIES>)
+target_include_directories(
+  python_direct_flight
+  PRIVATE
+    $<TARGET_PROPERTY:duckdb_execution_distributed_exchange,INCLUDE_DIRECTORIES>
+)
+
 # The fragment wire identity includes the compiler/loader implementation as well
 # as DuckDB's SourceID. Vane-only native edits must invalidate old plan bytes
 # too.
