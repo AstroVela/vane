@@ -175,7 +175,7 @@ def _crop_objects(table):
     )
 
 
-def main() -> None:
+def main(*, detector_cls=YOLODetector) -> None:
     start = time.time()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     con = vane.connect()
@@ -193,7 +193,7 @@ def main() -> None:
             con=con,
         )
         rel = rel.map_batches(
-            YOLODetector,
+            detector_cls,
             schema={
                 "frame_index": vane.sqltypes.BIGINT,
                 "frame": FRAME_TYPE,

@@ -20,9 +20,14 @@ __all__: list[str] = [
     "DEFAULT",
     "NATIVE",
     "SPECIAL",
+    "BatchUDF",
     "FunctionNullHandling",
     "PythonUDFType",
     "vectorized",
 ]
+
+class BatchUDF:
+    def prepare_batch(self, table: typing.Any) -> typing.Any: ...
+    def __call__(self, prepared: typing.Any) -> dict[str, typing.Any]: ...
 
 def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., typing.Any]: ...

@@ -2799,6 +2799,7 @@ def test_udf_runtime_retries_callable_and_async_runtime_close_failures():
     runtime = TransientRuntime()
     executor._map_fn = actor
     executor._async_runtime = runtime
+    executor._batch_callable = None
 
     with pytest.raises(RuntimeError, match="planned callable close failure") as exc_info:
         executor.close()
@@ -2843,6 +2844,7 @@ def test_udf_runtime_close_does_not_transport_raw_oversized_provider_failure():
     executor._finished_submitting = True
     executor._map_fn = FailingActor()
     executor._async_runtime = None
+    executor._batch_callable = None
 
     with pytest.raises(RuntimeError, match="error text exceeds") as exc_info:
         executor.close()
@@ -2870,6 +2872,7 @@ def test_udf_runtime_close_handles_unprintable_cleanup_failure():
     executor._finished_submitting = True
     executor._map_fn = FailingActor()
     executor._async_runtime = None
+    executor._batch_callable = None
 
     with pytest.raises(RuntimeError, match="error text unavailable"):
         executor.close()

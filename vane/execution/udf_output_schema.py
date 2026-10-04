@@ -216,6 +216,99 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     return _arrow_type_from_name(str(entry.get("type") or ""))
 
 
+def _batch_udf_type_supported(dtype: pa.DataType, *, top_level: bool = True) -> bool:
+    if isinstance(dtype, pa.FixedShapeTensorType):
+        return top_level and (pa.types.is_integer(dtype.value_type) or pa.types.is_floating(dtype.value_type))
+    if pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        return _batch_udf_type_supported(dtype.value_type, top_level=False)
+    if pa.types.is_struct(dtype):
+        return all(_batch_udf_type_supported(field.type, top_level=False) for field in dtype)
+    return any(
+        check(dtype)
+        for check in (
+            pa.types.is_null,
+            pa.types.is_boolean,
+            pa.types.is_integer,
+            pa.types.is_floating,
+            pa.types.is_string,
+            pa.types.is_binary,
+        )
+    )
+
+
+def batch_udf_output_schema(payload: dict[str, Any]) -> pa.Schema:
+    """Resolve the deliberately limited, declared BatchUDF output contract."""
+    import vane
+
+    entries = payload.get("output_schema")
+    if not entries:
+        raise ValueError("BatchUDF requires output_schema")
+    fields = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+            raise ValueError("BatchUDF output_schema entries require a non-empty column name")
+        name = entry["name"]
+        if str(entry.get("kind") or "").lower() != "tensor":
+            logical_type = vane.type(str(entry.get("type") or ""))
+            if _duckdb_pytype_contains_governed(logical_type):
+                raise TypeError(f"BatchUDF output column {name!r} does not support FILE or IMAGE")
+        dtype = _arrow_type_from_output_schema_entry(entry)
+        if not _batch_udf_type_supported(dtype):
+            raise TypeError(f"BatchUDF output column {name!r} has unsupported type {dtype}")
+        fields.append(pa.field(name, dtype))
+    names = [field.name for field in fields]
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("BatchUDF output column names must be unambiguous")
+    return pa.schema(fields)
+
+
+def columns_to_output_table(result: Any, schema: pa.Schema, *, udf_name: str) -> pa.Table:
+    """Encode materialized columns on the actor thread without inferring types."""
+    import numpy as np
+
+    boundary = f"BatchUDF {udf_name!r} output"
+    if not isinstance(result, dict):
+        raise TypeError(f"{boundary} must be a materialized dict, got {type(result).__name__}")
+    if set(result) != set(schema.names):
+        raise ValueError(f"{boundary} must contain exactly the declared columns {schema.names}")
+    arrays = []
+    row_count = None
+    for field in schema:
+        values = result[field.name]
+        column_boundary = f"{boundary} column {field.name!r} (expected {field.type})"
+        if not isinstance(values, (list, tuple, np.ndarray)):
+            raise TypeError(f"{column_boundary} requires a materialized list, tuple or ndarray")
+        if isinstance(field.type, pa.FixedShapeTensorType):
+            if not isinstance(values, np.ndarray):
+                raise TypeError(f"{column_boundary} requires a NumPy ndarray")
+            if (
+                values.ndim != len(field.type.shape) + 1
+                or tuple(values.shape[1:]) != tuple(field.type.shape)
+                or values.dtype != np.dtype(field.type.value_type.to_pandas_dtype())
+                or not values.flags.c_contiguous
+            ):
+                raise ValueError(
+                    f"{column_boundary} requires matching dtype, shape and C-contiguous storage; "
+                    f"got dtype={values.dtype}, shape={values.shape}"
+                )
+        elif isinstance(values, np.ndarray) and values.ndim != 1:
+            raise ValueError(f"{column_boundary} requires a one-dimensional ndarray, got shape={values.shape}")
+        length = len(values)
+        if row_count is not None and length != row_count:
+            raise ValueError(f"{column_boundary} has {length} rows, expected {row_count}")
+        row_count = length
+        try:
+            if isinstance(field.type, pa.FixedShapeTensorType) and length:
+                array = pa.FixedShapeTensorArray.from_numpy_ndarray(values)
+            else:
+                array = pa.array(values if length else [], type=field.type)
+        except (TypeError, ValueError, OverflowError, pa.ArrowException):
+            # Arrow error messages may include complete input values.
+            raise ValueError(f"{column_boundary} could not encode {type(values).__name__}") from None
+        arrays.append(array)
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def empty_output_table_from_schema(output_schema: Any, *, output_contract_types: Any = None) -> pa.Table:
     if not output_schema:
         raise ValueError("empty UDF output requires payload.output_schema")
