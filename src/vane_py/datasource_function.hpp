@@ -21,10 +21,9 @@ struct DataSourceStreamFactory {
 	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
 
-	//! C callback: unpickle task → context-aware execute → RecordBatchReader → _export_to_c
-	//! Called from pipeline threads — each call creates an independent stream.
-	static void ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
-	                          ClientContext *context);
+	//! Unpickle a task and create its cancellable, scheduler-aware batch stream.
+	static unique_ptr<DataSourceStream> ProduceStream(const char *pickled_task, idx_t pickled_len,
+	                                                  ClientContext *context);
 
 	//! C callback: export the serialized or cached Arrow schema to ArrowSchema
 	static void GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
