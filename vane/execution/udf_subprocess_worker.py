@@ -23,13 +23,13 @@ from vane.execution._common import callable_cache_enabled as _callable_cache_ena
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
-    PreparedLocalShmBlock,
+    PreparedPooledShmBlock,
     _open_existing_shm,
     _require_shm_buffer,
     make_pooled_shm_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
-    prepare_local_shm_block,
+    prepare_pooled_shm_block,
     release_local_shm_ref_bundle_descriptor,
 )
 from vane.execution.udf_row_preserving import (
@@ -468,7 +468,7 @@ def _concat_executor_outputs(result_tables: list[pa.Table]) -> pa.Table:
 
 
 def _make_local_shm_ref_bundle_descriptor_for_tables(
-    blocks: list[PreparedLocalShmBlock],
+    blocks: list[PreparedPooledShmBlock],
     *,
     grant_id: int,
     allocation: dict[str, Any],
@@ -489,7 +489,7 @@ def _streaming_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _publish_output_block(
     table: pa.Table, sock: socket.socket, *, submit_count: int, input_lease_id: int | None
 ) -> None:
-    block = prepare_local_shm_block(table)
+    block = prepare_pooled_shm_block(table)
     grant = _request_output_grant(
         sock, submit_count=submit_count, size=block.ipc_size_bytes, input_lease_id=input_lease_id
     )
@@ -552,7 +552,7 @@ def _execute_submit(
             mode=f"{call_mode} subprocess",
         )
     if produce_ref_bundle_output:
-        blocks = [prepare_local_shm_block(table) for table in output_tables]
+        blocks = [prepare_pooled_shm_block(table) for table in output_tables]
         required = sum(block.ipc_size_bytes for block in blocks)
         grant = _request_output_grant(
             sock,

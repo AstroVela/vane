@@ -219,7 +219,7 @@ def test_close_with_retained_view_preserves_live_pages_and_finishes_on_last_view
 
 def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_shm_worker):
     peer = pooled_shm_worker
-    blocks = [refs.prepare_local_shm_block(pa.table({"x": [value]})) for value in (11, 22)]
+    blocks = [refs.prepare_pooled_shm_block(pa.table({"x": [value]})) for value in (11, 22)]
     size = sum(block.ipc_size_bytes for block in blocks)
     grant = refs.request_local_shm_output_grant(size)
     allocation = peer.reserve_write(grant, size)
@@ -240,7 +240,7 @@ def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_s
 @pytest.mark.parametrize("field,value", [("allocation_offset", 1), ("ipc_size_bytes", 1), ("shm_name", "foreign")])
 def test_descriptor_cannot_alias_other_regions(pooled_shm_worker, field, value):
     peer = pooled_shm_worker
-    block = refs.prepare_local_shm_block(pa.table({"x": [1]}))
+    block = refs.prepare_pooled_shm_block(pa.table({"x": [1]}))
     descriptor = refs.make_pooled_shm_descriptor(
         [block], allocation=peer.reserve_write(17, block.ipc_size_bytes), grant_id=17
     )

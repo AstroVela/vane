@@ -1429,6 +1429,13 @@ Large allocations use size classes with at most 6.25% rounding overhead, so
 small IPC metadata changes between batches do not strand a nearly usable slot.
 Physical capacity includes this rounding.
 
+Before requesting an output grant, the worker counts the Arrow IPC stream size
+with `MockOutputStream`. It then writes the table directly into the granted
+region with `FixedSizeBufferWriter`, checking that the written size matches the
+reservation. There is no intermediate serialized payload buffer. Arrow still
+copies the table's buffers into shared memory, and the count pass traverses IPC
+metadata; this is not zero-copy serialization.
+
 Storage ownership is independent of transport admission. Input acknowledgments
 may return transport credit, but do not release physical buffers. Before sending
 an input, the parent registers a read lease for the receiving worker. Arrow and
@@ -1947,9 +1954,9 @@ the fast-test shards.
 | Shared Local/Ray contracts remain compatible | Reentrant wakeups, callback removal, late grants after close, exact input handoff, idempotent lease release, retained-output accounting and retry |
 
 Local table-producing `map_batches` and `flat_map` subprocess calls publish
-bounded output blocks as the callable produces them. Each block is serialized
-once into an Arrow IPC buffer; its exact size, including the transport header,
-is admitted before shared memory is allocated. The parent adopts each block
+bounded output blocks as the callable produces them. Each block's exact IPC size,
+including the transport header, is counted and admitted before shared memory is
+allocated. Serialization writes directly into that region. The parent adopts each block
 independently so downstream work can start before the physical task finishes.
 An explicit terminal result retains task completion and slot ownership until
 worker execution and cleanup finish. An error after earlier blocks still fails

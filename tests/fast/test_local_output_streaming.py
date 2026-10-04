@@ -126,7 +126,7 @@ def test_block_arrives_before_producer_finishes_and_retains_task_ownership(runti
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_worker_serializes_each_output_once_and_admits_exact_published_size(monkeypatch, streaming, pooled_shm_worker):
+def test_worker_counts_then_writes_directly_into_exact_admitted_size(monkeypatch, streaming, pooled_shm_worker):
     from vane.execution import udf_subprocess_worker as worker
 
     table = pa.table({"blob": [b"x" * 4096]})
@@ -134,8 +134,11 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
     new_stream = pa.ipc.new_stream
 
     def serialize(*args, **kwargs):
-        serialized.append(True)
+        serialized.append(type(args[0]))
         return new_stream(*args, **kwargs)
+
+    def forbid_staging(*args, **kwargs):
+        raise AssertionError("pooled output must not allocate a staging IPC buffer")
 
     class Executor:
         _payload = {"call_mode": "map_batches"} if streaming else {}
@@ -154,12 +157,13 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
         return {"grant_id": 9, "allocation": pooled_shm_worker.reserve_write(9, size)}
 
     monkeypatch.setattr(pa.ipc, "new_stream", serialize)
+    monkeypatch.setattr(pa, "BufferOutputStream", forbid_staging)
     monkeypatch.setattr(worker, "_request_output_grant", grant)
     monkeypatch.setattr(worker, "_send_message", lambda _sock, kind, payload: sent.append((kind, payload)))
     _, kind, payload = worker._execute_submit(Executor(), table, None, True, sock=None, submit_count=1)
     descriptor = vane_pickle.loads(sent[0][1] if streaming else payload)
     try:
-        assert serialized == [True]
+        assert serialized == [pa.MockOutputStream, pa.FixedSizeBufferWriter]
         assert grants == [descriptor["metadata"][0]["ipc_size_bytes"]]
         assert descriptor["grant_id"] == 9
         if streaming:
