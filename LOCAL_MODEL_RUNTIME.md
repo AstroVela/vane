@@ -1425,6 +1425,9 @@ by the parent process. Workers share the arena and cache its mapping across
 tasks. Allocations carry a generation so a stale descriptor cannot refer to a
 later output that reuses the same offset. Multiple output blocks can share one
 allocation; its space becomes reusable only after every block is released.
+Large allocations use size classes with at most 6.25% rounding overhead, so
+small IPC metadata changes between batches do not strand a nearly usable slot.
+Physical capacity includes this rounding.
 
 Storage ownership is independent of transport admission. Input acknowledgments
 may return transport credit, but do not release physical buffers. Before sending

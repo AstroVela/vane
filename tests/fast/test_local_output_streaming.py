@@ -302,3 +302,21 @@ def test_native_pipeline_consumes_blocks_before_a_physical_task_completes(runtim
         assert rel.fetchall() == [(32768,)] * 10
     finally:
         con.close()
+
+
+def test_physical_store_exhaustion_reports_capacity_failure_and_cleans_grants(runtime, monkeypatch):
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64k")
+
+    def produce(_table):
+        return pa.table({"blob": [b"x" * 75000]})
+
+    executor = udf_subprocess.UDFExecutor(_payload(produce))
+    try:
+        assert executor.request_task_admission(0)
+        executor.submit_with_id(1, pa.table({"x": [1]}))
+        result = _next(executor)[2]
+        assert isinstance(result, RuntimeError)
+        assert "shared-memory store cannot allocate" in str(result)
+        assert "cancelled" not in str(result)
+    finally:
+        executor.close(kill=True)

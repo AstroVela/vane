@@ -95,6 +95,27 @@ def test_retained_arrow_slice_pins_data_after_ref_and_transport_budget_release(s
     assert store.snapshot()["live_allocations"] == 0
 
 
+def test_batch_size_jitter_reuses_a_free_slot_with_other_batches_live():
+    store = storage.LocalShmStore(3 * 64 * 1024)
+    store.add_client("test")
+    slots = [store.allocate(60000) for _ in range(3)]
+    offset = slots[0].allocation.offset
+    slots[0].release()
+    try:
+        for size in (60128, 59900, 60200, 60064):
+            next_batch = store.allocate(size)
+            try:
+                assert next_batch.allocation.offset == offset
+                assert store.snapshot()["live_allocations"] == 3
+            finally:
+                next_batch.release()
+    finally:
+        for slot in slots:
+            slot.release()
+        store.remove_client("test")
+    assert store.snapshot()["mapped_capacity_bytes"] == 0
+
+
 def test_full_store_refuses_overwrite_and_recovers_after_release(store):
     lease = store.allocate(store.capacity)
     pin = lease.fork()

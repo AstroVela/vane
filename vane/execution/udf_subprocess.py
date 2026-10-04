@@ -121,6 +121,7 @@ _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
 _MSG_REF_BUNDLE_CHUNK = 0x11
+_MSG_OUTPUT_GRANT_FAILED = 0x12
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -1222,7 +1223,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     self._release_output_grant(grant_id, name=f"udf-output-{request_id}-cancelled")
                 self._send_worker_message(
                     self._require_socket(),
-                    _MSG_OUTPUT_GRANT_CANCELLED,
+                    _MSG_OUTPUT_GRANT_CANCELLED if scope.is_set() else _MSG_OUTPUT_GRANT_FAILED,
                     str(exc).encode("utf-8", errors="replace"),
                 )
                 return True

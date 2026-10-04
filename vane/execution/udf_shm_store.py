@@ -132,7 +132,12 @@ class LocalShmStore:
     def allocate(self, size: int) -> StoreLease:
         if type(size) is not int or size <= 0:
             raise ValueError("shared-memory allocation size must be positive")
-        required = (size + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
+        # Sixteen size classes per power-of-two range keep large-block slack
+        # below 6.25%, while absorbing small IPC metadata changes between
+        # batches. Exact-size free holes otherwise strand almost an entire
+        # image batch when its successor grows by only a few bytes.
+        alignment = 1 << max(6, (size - 1).bit_length() - 5)
+        required = (size + alignment - 1) // alignment * alignment
         with self._lock:
             if self._closed:
                 raise RuntimeError("shared-memory store is closed")
@@ -143,7 +148,9 @@ class LocalShmStore:
                 live = sum(entry.capacity for entry in self._live.values())
                 raise LocalShmStoreCapacityError(
                     f"shared-memory store cannot allocate {size} bytes: "
-                    f"live={live}, capacity={self.capacity}; live buffers must be released before retry"
+                    f"live={live}, capacity={self.capacity}, "
+                    f"largest_free={max((length for _, length in self._free), default=0)}; "
+                    "live buffers must be released before retry"
                 )
             if self._shm is None:
                 from vane.execution.ref_bundle import _create_shm
