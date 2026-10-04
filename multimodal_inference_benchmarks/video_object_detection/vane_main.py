@@ -88,6 +88,10 @@ def _frame_batch(column) -> np.ndarray:
     if column.null_count:
         raise ValueError("Video frames cannot contain NULL values")
     if isinstance(column, pa.FixedShapeTensorArray):
+        # Arrow's tensor view ignores offsets on the primitive child array.
+        # Compact only those inputs; ordinary tensor slices remain zero-copy.
+        if column.storage.values.offset:
+            column = pa.concat_arrays([column])
         batch = column.to_numpy_ndarray()
     elif isinstance(column, pa.ExtensionArray) and column.type.extension_name == "vane.image":
         # Current VideoFrameSource exposes IMAGE. Read its Arrow pixel buffers

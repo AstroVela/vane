@@ -30,6 +30,12 @@ def benchmark(monkeypatch):
 def _frames(kind, pixels):
     if kind == "tensor":
         return pa.FixedShapeTensorArray.from_numpy_ndarray(pixels)
+    if kind == "tensor_child_offset":
+        values = pa.array(np.concatenate([np.zeros(1, dtype=np.uint8), pixels.reshape(-1)])).slice(1)
+        storage = pa.FixedSizeListArray.from_arrays(values, 640 * 640 * 3)
+        frames = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(pa.uint8(), (640, 640, 3)), storage)
+        frames.validate(full=True)
+        return frames
     dtype = vane.image_type() if kind == "generic" else vane.image_type("RGB", 640, 640)
     arrow_type = image_arrow_type(dtype)
     if kind == "generic":
@@ -39,17 +45,20 @@ def _frames(kind, pixels):
     return pa.ExtensionArray.from_storage(arrow_type, pa.array(values, type=arrow_type.storage_type))
 
 
-@pytest.mark.parametrize("kind", ["tensor", "generic", "fixed"])
-def test_python_video_frame_conversion_preserves_pixels(benchmark, kind):
+@pytest.mark.parametrize("kind", ["tensor", "tensor_child_offset", "generic", "fixed"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_python_video_frame_conversion_preserves_pixels(benchmark, kind, offset):
     pixels = np.arange(3 * 640 * 640 * 3, dtype=np.uint8).reshape(3, 640, 640, 3)
+    # Each frame must differ so an incorrect slice offset changes the expected pixels.
+    pixels += np.arange(3, dtype=np.uint8)[:, None, None, None]
     frames = _frames(kind, pixels)
     for column in (
-        frames.slice(1, 2),
-        pa.chunked_array([frames.slice(1, 2)]),
-        pa.chunked_array([frames.slice(1, 1), frames.slice(2, 1)]),
+        frames.slice(offset, 2),
+        pa.chunked_array([frames.slice(offset, 2)]),
+        pa.chunked_array([frames.slice(offset, 1), frames.slice(offset + 1, 1)]),
     ):
         result = benchmark._frame_batch(column)
-        np.testing.assert_array_equal(result, pixels[1:])
+        np.testing.assert_array_equal(result, pixels[offset : offset + 2])
         assert result.dtype == np.uint8 and result.flags.c_contiguous
         if kind == "tensor" and isinstance(column, pa.ChunkedArray) and column.num_chunks == 1:
             assert np.shares_memory(result, column.chunk(0).to_numpy_ndarray())
@@ -108,19 +117,25 @@ def test_python_video_source_exposes_fixed_tensor_frames(benchmark, tmp_path, mo
         np.testing.assert_array_equal(frame, np.full((640, 640, 3), level, dtype=np.uint8))
 
 
-@pytest.mark.parametrize("kind", ["tensor", "generic", "fixed"])
-def test_batch_video_preparation_preserves_slices_and_reuses_single_tensor_chunk(benchmark, kind):
+@pytest.mark.parametrize("kind", ["tensor", "tensor_child_offset", "generic", "fixed"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_batch_video_preparation_preserves_slices_and_reuses_single_tensor_chunk(benchmark, kind, offset):
     directory = Path(benchmark.__file__).parent
     spec = importlib.util.spec_from_file_location("video_batch_benchmark_python", directory / "vane_batch_main.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     detector = object.__new__(module.YOLODetector)
     pixels = np.arange(3 * 640 * 640 * 3, dtype=np.uint8).reshape(3, 640, 640, 3)
+    # Each frame must differ so an incorrect slice offset changes the expected pixels.
+    pixels += np.arange(3, dtype=np.uint8)[:, None, None, None]
     frames = _frames(kind, pixels)
-    for column in (pa.chunked_array([frames.slice(1, 2)]), pa.chunked_array([frames.slice(1, 1), frames.slice(2, 1)])):
+    for column in (
+        pa.chunked_array([frames.slice(offset, 2)]),
+        pa.chunked_array([frames.slice(offset, 1), frames.slice(offset + 1, 1)]),
+    ):
         prepared = detector.prepare_batch(pa.table({"frame_index": [7, 8], "frame": column}))
         assert prepared["frame_index"] == [7, 8]
-        np.testing.assert_array_equal(prepared["frame"], pixels[1:])
+        np.testing.assert_array_equal(prepared["frame"], pixels[offset : offset + 2])
         assert prepared["frame"].dtype == np.uint8 and prepared["frame"].flags.c_contiguous
         if kind == "tensor" and column.num_chunks == 1:
             assert np.shares_memory(prepared["frame"], column.chunk(0).to_numpy_ndarray())

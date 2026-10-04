@@ -91,6 +91,9 @@ The benchmark frame adapter reuses `chunk(0)` for a single chunk and combines
 multiple chunks. This applies to the optional BatchUDF detector, the original
 detector and crop adaptation. NULL, dtype, shape and contiguity validation
 remain unchanged. A nonzero slice offset still identifies the correct pixels.
+If the tensor's child pixel array also has a nonzero offset, the adapter copies
+it into compact storage before NumPy conversion; ordinary tensor slices retain
+the shared buffer.
 
 On 32 frames of 640x640 RGB uint8, the old combine operation copied 37.5 MiB.
 A same-Actor interleaved comparison over 24,576 measured frames reduced input
@@ -100,5 +103,7 @@ cached-pipeline paired windows had a +0.36% median throughput gain. These are
 different scopes and cannot be added into an end-to-end speedup.
 
 The focused test verifies pixel values and storage sharing for single-chunk
-tensors, slices, multi-chunk input, empty input and NULL rejection. Numerical
-helpers, model configuration and the default detector selection are unchanged.
+tensors, slices, multi-chunk input, empty input and NULL rejection. Distinct
+pixels per frame expose incorrect slice offsets, including offsets on the
+tensor's child pixel array. Numerical helpers, model configuration and the
+default detector selection are unchanged.
