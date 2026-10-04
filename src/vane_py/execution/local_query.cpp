@@ -53,6 +53,10 @@ py::object DuckDBPyConnection::GetQueryRuntime() const {
 py::object DuckDBPyConnection::Query(const py::object &sql, const py::object &parameters, const py::object &options,
                                      const py::object &rows_per_batch, const py::kwargs &overrides) {
 	auto lock = LockForQuery();
+	// Options and parameter conversion can call Python and release the GIL.
+	// Preserve any interruption accepted before the query is published.
+	auto interrupt_check = CreateQueryInterruptCheck();
+	const auto generation = InterruptGeneration();
 	auto runtime = GetQueryRuntime();
 	if (runtime.is_none()) {
 		throw InvalidInputException("query() requires a connection created with backend='local'");
@@ -77,9 +81,8 @@ py::object DuckDBPyConnection::Query(const py::object &sql, const py::object &pa
 	auto native_parameters =
 	    TransformPreparedParameters(parameters.is_none() ? py::object(py::list()) : parameters, nullptr);
 	PreparedStatement::VerifyParameters(native_parameters, statements[0]->named_param_map);
+	interrupt_check();
 	con.SetResult(nullptr);
-	auto interrupt_check = CreateQueryInterruptCheck();
-	const auto generation = InterruptGeneration();
 	auto weak_source = weak_ptr<DuckDBPyConnection>(shared_from_this());
 	auto publish = py::cpp_function([weak_source, generation](py::object query) {
 		if (auto source = weak_source.lock()) {

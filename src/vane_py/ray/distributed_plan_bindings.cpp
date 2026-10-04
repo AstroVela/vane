@@ -3735,17 +3735,18 @@ struct PyPhysicalPlanWrapperRunner {
 		auto build_table_result = [&](const py::object &table, idx_t row_count, const duckdb::vector<string> &names,
 		                              const duckdb::vector<duckdb::LogicalType> &result_types,
 		                              py::object task_stats) -> py::object {
-			if (row_count == 0) {
-				return build_empty_result(names, result_types, "empty", std::move(task_stats));
-			}
 			py::list payloads;
-			payloads.append(table);
 			py::list metadatas;
-			metadatas.append(
-			    py::cast(NativePartitionMetadata(static_cast<size_t>(row_count), GetPyPayloadSizeBytes(table))));
+			if (row_count != 0) {
+				payloads.append(table);
+				metadatas.append(
+				    py::cast(NativePartitionMetadata(static_cast<size_t>(row_count), GetPyPayloadSizeBytes(table))));
+			}
+			// Retain the actual Arrow schema even when there are no data partitions.
+			// It includes the execution context's Arrow types and timezone settings.
 			return BuildNativeTaskResult(payloads, metadatas, build_result_schema(names, result_types), py::list(),
-			                             std::move(task_stats), "ok", task_flight_port(),
-			                             task_exchange_sink_instance_obj());
+			                             std::move(task_stats), row_count ? "ok" : "empty", task_flight_port(),
+			                             task_exchange_sink_instance_obj(), table.attr("schema"));
 		};
 		auto build_executed_result = [&](py::object task_stats) -> py::object {
 			duckdb::vector<string> names;

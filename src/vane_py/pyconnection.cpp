@@ -3362,6 +3362,11 @@ unique_lock<std::recursive_mutex> DuckDBPyConnection::LockForQuery() const {
 	if (interrupting || InterruptInProgress() || InterruptGeneration() != generation) {
 		throw InterruptException();
 	}
+	// Another caller may have published a result while this caller waited for
+	// the lock. Never replace that caller's still-active native result stream.
+	if (!local_query_request.is_none()) {
+		throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
+	}
 	return lock;
 }
 

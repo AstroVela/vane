@@ -59,6 +59,7 @@ struct NativeDistributedTaskResult {
 	duckdb::distributed::python::ray::SafePyObject partition_payloads;
 	duckdb::distributed::python::ray::SafePyObject partition_metadatas;
 	duckdb::distributed::python::ray::SafePyObject result_schema;
+	duckdb::distributed::python::ray::SafePyObject arrow_schema;
 	duckdb::distributed::python::ray::SafePyObject stats;
 	duckdb::distributed::python::ray::SafePyObject task_stats;
 	std::string completion_status;
@@ -69,10 +70,12 @@ struct NativeDistributedTaskResult {
 	                            pybind11::object result_schema_p, pybind11::object stats_p,
 	                            std::string completion_status_p, int flight_port_p = 0,
 	                            pybind11::object exchange_sink_instance_p = pybind11::none(),
-	                            pybind11::object task_stats_p = pybind11::none())
+	                            pybind11::object task_stats_p = pybind11::none(),
+	                            pybind11::object arrow_schema_p = pybind11::none())
 	    : partition_payloads(duckdb::distributed::python::ray::SafePyObject(pybind11::list(payloads))),
 	      partition_metadatas(duckdb::distributed::python::ray::SafePyObject(pybind11::list(metadatas))),
 	      result_schema(duckdb::distributed::python::ray::SafePyObject(std::move(result_schema_p))),
+	      arrow_schema(duckdb::distributed::python::ray::SafePyObject(std::move(arrow_schema_p))),
 	      stats(duckdb::distributed::python::ray::SafePyObject(std::move(stats_p))),
 	      task_stats(duckdb::distributed::python::ray::SafePyObject(std::move(task_stats_p))),
 	      completion_status(std::move(completion_status_p)), flight_port(flight_port_p),
@@ -89,6 +92,10 @@ struct NativeDistributedTaskResult {
 
 	pybind11::object ResultSchema() const {
 		return result_schema.get();
+	}
+
+	pybind11::object ArrowSchema() const {
+		return arrow_schema.get();
 	}
 
 	pybind11::object Stats() const {
@@ -134,10 +141,11 @@ static pybind11::object BuildNativeTaskResult(pybind11::iterable payloads, pybin
                                               pybind11::object result_schema, pybind11::object stats,
                                               pybind11::object task_stats, const std::string &completion_status,
                                               int flight_port = 0,
-                                              pybind11::object exchange_sink_instance = pybind11::none()) {
+                                              pybind11::object exchange_sink_instance = pybind11::none(),
+                                              pybind11::object arrow_schema = pybind11::none()) {
 	return pybind11::cast(NativeDistributedTaskResult(payloads, metadatas, std::move(result_schema), std::move(stats),
 	                                                  completion_status, flight_port, std::move(exchange_sink_instance),
-	                                                  std::move(task_stats)));
+	                                                  std::move(task_stats), std::move(arrow_schema)));
 }
 
 static idx_t SaturatingAddIdx(idx_t lhs, idx_t rhs) {

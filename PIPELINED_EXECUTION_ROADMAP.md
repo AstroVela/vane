@@ -243,4 +243,12 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 当前 C++ 已使用 build/python-release 增量 Release 构建并非 editable 安装。270 个 Python 源码/类型声明文件与 checkout 字节一致；安装的 native 与构建产物 SHA-256 相同。DuckDB SourceID 仍为 `263045b861`，本增量未修改 DuckDB 子树。
 - root 格式、ruff、全包 mypy、适用的 pre-commit 检查、源码版权清单、文档相对链接和实际源码包校验通过。新模块已加入 release launcher 与 sdist 清单，供后续 CI 执行。
 
+### P1.1 审查修复（PR #943）
+
+- `LockForQuery` 在持有连接锁后再次检查活动查询，覆盖两个调用同时通过入口检查的竞争窗口；后来的调用立即报错，已有结果流可以完整收集。
+- `query()` 在选项、SQL 和参数转换之前保存中断 generation，并在进入准入前检查中断；转换期间接受的 `interrupt()` 抛出原生 `InterruptException`，后续查询仍可正常执行。
+- 原生物化结果单独保存 Arrow schema，空结果保持零数据分区；`LocalModelRequest.execute_result().collect()` 因而可以返回保留类型的空表，包含嵌套类型、Decimal 和执行连接的时区。
+- 新增 11 项回归，覆盖查询竞争、转换期间中断、空/非空物化结果及结果名额和字节预算释放。
+- 6 个相关测试模块 **346 passed**，原生物化结果契约定向检查 **2 passed**；审查者提供的独立复现 **6 passed**。使用增量 Release 非 editable 安装，270 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。仅运行相关测试，未运行完整 release/fast 套件。
+
 下一增量为 P1.2：先落实有界 DirectExchange channel 的所有权、FINISH 与取消契约，再接 native BLOCKED/唤醒和部分发送恢复，最后用两个 fragment 的进程内 TaskService 验证并发推进。该设施用于分布式执行契约验证；local 公开路径继续直接原生执行。

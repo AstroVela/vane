@@ -8,6 +8,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import pyarrow as pa
 import pytest
 
 import vane
@@ -90,6 +91,36 @@ def test_native_nested_embedding_and_binary_results_roundtrip(monkeypatch):
                     [{"text": "caption"}],
                 ]
                 assert result.result_schema["types"] == ["DOUBLE[]", "BLOB", 'STRUCT("text" VARCHAR)']
+
+
+@pytest.mark.parametrize("has_rows", [False, True])
+@pytest.mark.parametrize(
+    "projection",
+    [
+        "1::BIGINT AS x",
+        "[1.0::DOUBLE, 2.0] AS embedding, 'image bytes'::BLOB AS image, {'text': 'caption'} AS context",
+        "'2026-10-04 12:34:56+00'::TIMESTAMPTZ AS time, 1.25::DECIMAL(10, 2) AS amount",
+    ],
+)
+def test_native_materialized_collect_preserves_schema_without_partitions(monkeypatch, has_rows, projection):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"TimeZone": "Asia/Shanghai"}) as conn:
+        expected = conn.execute(f"SELECT {projection} WHERE {has_rows}").to_arrow_table()
+        bound = plan(conn, f"SELECT {projection} WHERE {has_rows}")
+        with runtime(bound) as models:
+            with models.request().execute_result(bound, {}, conn=conn) as result:
+                assert isinstance(result.schema, pa.Schema)
+                assert result.schema.types == expected.schema.types
+                actual = result.collect()
+                assert actual.schema == result.schema
+                # Native physical plans use generated column names. Compare
+                # types and values to the ordinary query independently of names.
+                assert actual.rename_columns(expected.column_names) == expected
+                assert result.completion_status == ("ok" if has_rows else "empty")
+            snapshot = models.resource_snapshot()
+            assert snapshot["request_admission"]["active_requests"] == 0
+            assert snapshot["result_delivery"]["active_results"] == 0
+            assert snapshot["result_delivery"]["usage_bytes"] == 0
 
 
 def test_full_result_slots_refuse_before_native_udf_side_effects(monkeypatch, tmp_path):

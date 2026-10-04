@@ -329,6 +329,78 @@ def test_active_result_rejects_same_cursor_reentry():
         idle(connection.query_runtime)
 
 
+@pytest.mark.parametrize("entry", ["query", "execute"])
+def test_waiting_query_cannot_replace_another_callers_result(entry):
+    entered, proceed, second_entered = (threading.Event() for _ in range(3))
+
+    class Parameters(list):
+        def __len__(self):
+            entered.set()
+            assert proceed.wait(5)
+            return super().__len__()
+
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("SET streaming_buffer_size = '8KB'")
+        results = []
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            first = threads.submit(connection.query, "SELECT i FROM range(?) t(i)", Parameters([100_000]))
+            try:
+                assert entered.wait(5)
+
+                def submit_second():
+                    second_entered.set()
+                    return getattr(connection, entry)("SELECT 42 AS x")
+
+                second = threads.submit(submit_second)
+                assert second_entered.wait(5)
+                # Let the second caller reach the native lock while the first
+                # holds it in parameter conversion, before publishing a result.
+                time.sleep(0.1)
+                proceed.set()
+                result = first.result(timeout=5)
+                results.append(result)
+                with pytest.raises(vane.InvalidInputException, match="reentrant"):
+                    unexpected = second.result(timeout=5)
+                    if entry == "query":
+                        results.append(unexpected)
+                table = result.collect()
+                assert table.column(0).to_pylist() == list(range(100_000))
+            finally:
+                proceed.set()
+                for result in results:
+                    result.close()
+        assert connection.query("SELECT 7 AS x").collect().to_pylist() == [{"x": 7}]
+        idle(connection.query_runtime)
+
+
+@pytest.mark.parametrize("entry", ["query", "execute"])
+def test_interrupt_during_parameter_conversion_is_preserved(entry):
+    entered, proceed = threading.Event(), threading.Event()
+
+    class Parameters(list):
+        def __len__(self):
+            entered.set()
+            assert proceed.wait(5)
+            return super().__len__()
+
+    with vane.connect(backend="local") as connection:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(getattr(connection, entry), "SELECT ? AS x", Parameters([7]))
+            try:
+                assert entered.wait(5)
+                connection.interrupt()
+                proceed.set()
+                with pytest.raises(vane.InterruptException):
+                    unexpected = future.result(timeout=5)
+                    if entry == "query":
+                        unexpected.close()
+            finally:
+                proceed.set()
+        idle(connection.query_runtime)
+        assert connection.query("SELECT 8 AS x").collect().to_pylist() == [{"x": 8}]
+        idle(connection.query_runtime)
+
+
 def test_parquet_query_supports_native_aggregate_and_join(tmp_path):
     import pyarrow.parquet as pq
 

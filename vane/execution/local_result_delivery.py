@@ -181,6 +181,7 @@ def prepare_local_result(result: QueryResult, native: Any) -> None:
     one IPC copy per native partition; consumers then receive zero-copy views.
     """
     result.result_schema = native.result_schema
+    result.schema = native.arrow_schema
     result.completion_status = getattr(native, "completion_status", None)
     result.stats = getattr(native, "stats", None)
     result.task_stats = getattr(native, "task_stats", None)
