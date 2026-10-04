@@ -389,6 +389,7 @@ class ParentShmPeer:
     """Own a worker's write grants and remote read pins until release or death."""
 
     def __init__(self) -> None:
+        self._owner_pid = os.getpid()
         self.client_id = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._ids = count(1)
@@ -479,6 +480,10 @@ class ParentShmPeer:
                 del self._writes[grant_id]
 
     def close_after_exit(self) -> None:
+        # Forked executor finalizers inherit this peer. They must neither wait
+        # on an inherited lock nor shut down the parent's shared socket.
+        if os.getpid() != self._owner_pid:
+            return
         # The caller must confirm process death. A socket disconnect alone
         # cannot prove that the process stopped reading or writing the arena.
         with self._lock:

@@ -1470,7 +1470,9 @@ new registry lock. New workers allocate from child-owned arenas. Inherited
 stores and allocation leases reject new allocations, borrows, and buffer access
 before taking any inherited lock; they cannot reuse the parent's copied free
 list. Parent-owned results and already materialized views keep their existing
-ownership and cleanup rules.
+ownership and cleanup rules. Worker-peer cleanup also checks its creator PID
+before taking locks or shutting down the release channel, so inherited executor
+finalizers cannot close the parent's live channel when a fork child exits.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
