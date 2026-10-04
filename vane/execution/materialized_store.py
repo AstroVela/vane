@@ -5,8 +5,8 @@
 
 The directory must be shared by all participating processes and survive the
 compute worker. This provider verifies store identity/visibility, not the
-physical durability of a deployment's mount. Coordinator recovery and automatic
-orphan collection belong to the recovery scheduler, not this storage primitive.
+physical durability of a deployment's mount. StorePool owns automatic orphan
+collection; coordinator recovery is outside the supported execution contract.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from vane.execution.materialized_exchange import (
     ObjectMeta,
     OutputObject,
     PartitionSpec,
+    ResultManifest,
     StageManifest,
     _hex,
     _label,
@@ -37,6 +38,10 @@ from vane.execution.materialized_exchange import (
 )
 from vane.execution.plan import _fields, _items
 from vane.execution.resource_demand import _capacity
+
+
+class StorageCleanupPending(RuntimeError):
+    """A native owner still holds storage; its reservation cannot be returned."""
 
 
 def _sync_directory(path: Path) -> None:
@@ -234,13 +239,14 @@ class CommitCoordinator:
         tasks: tuple[MaterializedTask, ...],
         *,
         max_bytes: int,
+        namespace: str | None = None,
     ) -> None:
         _label(query_id, "query_id")
         _label(engine_identity, "engine_identity")
         _capacity(max_bytes, "store capacity")
         task_list = _items(tasks, "tasks")
-        if not 1 <= len(task_list) <= 4096 or any(not isinstance(t, MaterializedTask) for t in task_list):
-            raise ValueError("materialized query requires between 1 and 4096 tasks")
+        if len(task_list) > 4096 or any(not isinstance(t, MaterializedTask) for t in task_list):
+            raise ValueError("materialized query supports at most 4096 tasks")
         if len({t.task_id for t in task_list}) != len(task_list):
             raise ValueError("duplicate logical task")
         if sum(len(t.outputs) for t in task_list) > 4096:
@@ -250,7 +256,8 @@ class CommitCoordinator:
         self.query_id = query_id
         self.engine_identity = engine_identity
         self.max_bytes = max_bytes
-        self.namespace = uuid.uuid4().hex
+        self.namespace = namespace or uuid.uuid4().hex
+        _hex(self.namespace, 32, "query namespace")
         self._directory = Path(self.store.root) / "queries" / self.namespace
         self._tasks = {t.task_id: t for t in task_list}
         self._lock = threading.RLock()
@@ -263,8 +270,36 @@ class CommitCoordinator:
         self._error = ""
         self._closing = False
         self._closed = False
+        self._source_bytes = 0
+        self.result: ResultManifest | None = None
         self._check_directory()
-        self._directory.mkdir(mode=0o700)
+        self._directory.mkdir(mode=0o700, exist_ok=namespace is not None)
+
+    def source_bytes(self, amount: int) -> None:
+        _capacity(amount, "source bytes", minimum=0)
+        with self._lock:
+            self._active()
+            if self._reservations or amount > self.max_bytes:
+                raise ValueError("source storage must be admitted before attempts")
+            self._source_bytes = amount
+
+    def declare_stage(self, tasks: tuple[MaterializedTask, ...]) -> None:
+        """Bind a stage to the now-committed upstream manifests exactly once."""
+        tasks = _items(tasks, "stage tasks")
+        if not tasks or any(not isinstance(t, MaterializedTask) for t in tasks):
+            raise ValueError("stage requires logical tasks")
+        if len({t.stage_id for t in tasks}) != 1 or len({t.task_id for t in tasks}) != len(tasks):
+            raise ValueError("invalid stage task identities")
+        with self._lock:
+            self._active()
+            if any(t.stage_id == tasks[0].stage_id for t in self._tasks.values()):
+                raise ValueError("stage input identities are already fixed")
+            if any(t.task_id in self._tasks for t in tasks):
+                raise ValueError("logical task already declared")
+            combined = tuple(self._tasks.values()) + tasks
+            if len(combined) > 4096 or sum(len(t.outputs) for t in combined) > 4096:
+                raise ValueError("materialized graph exceeds the partition metadata limit")
+            self._tasks.update((t.task_id, t) for t in tasks)
 
     def _check_directory(self) -> None:
         self.store.check()
@@ -276,9 +311,17 @@ class CommitCoordinator:
             raise RuntimeError(self._error or "materialized query is closing")
 
     def _usage(self) -> int:
-        return sum(o.max_bytes for r in self._reservations.values() for o in r.objects)
+        return self._source_bytes + sum(o.max_bytes for r in self._reservations.values() for o in r.objects)
+
+    def _publish_fence(self, task_id: str, fence: str | None) -> None:
+        from vane.execution.fte_store import replace_metadata
+
+        name = hashlib.sha256(task_id.encode()).hexdigest()
+        replace_metadata(self._directory / f"task-{name}.json", {"fence": fence})
 
     def begin(self, task_id: str, worker_epoch: str, *, object_bytes: int) -> AttemptReservation:
+        from vane._native import execution_runtime as native
+
         _capacity(object_bytes, "object reservation", minimum=40)
         with self._lock:
             self._active()
@@ -309,6 +352,10 @@ class CommitCoordinator:
             self._reservations[token.fence] = reservation
             self._counts[task_id] = token.attempt
             self._current[task_id] = token
+            guard = native.StoreGuard.acquire(str(self._directory / token.fence / "io.lock"), True, True)
+            assert guard is not None
+            guard.close()
+            self._publish_fence(task_id, token.fence)
             return reservation
 
     def _validate(self, manifest: AttemptManifest) -> AttemptManifest | None:
@@ -375,11 +422,29 @@ class CommitCoordinator:
             self._readers.add(identity)
             return ReadLease(self, identity)
 
+    def publish_result(self, stage: StageManifest, names: tuple[str, ...]) -> ResultManifest:
+        with self._lock:
+            self._active()
+            if self._stages.get(stage.stage_id) != stage:
+                raise ValueError("result requires this query's sealed root stage")
+            result = ResultManifest(stage, names)
+            if self.result is not None:
+                if self.result != result:
+                    raise ValueError("conflicting root result publication")
+                return self.result
+        _publish(self._directory / "result.json", result.to_dict())
+        with self._lock:
+            self._active()
+            self.result = result
+            return result
+
     def cancel(self, reason: str = "materialized query canceled") -> None:
         with self._lock:
             self._error = self._error or reason or "materialized query canceled"
 
     def discard(self, token: AttemptToken) -> None:
+        from vane._native import execution_runtime as native
+
         with self._lock:
             reserved = self._reservations.get(token.fence)
             if reserved is None:
@@ -390,10 +455,17 @@ class CommitCoordinator:
                 raise ValueError("committed output belongs to the query, not the attempt")
             if self._current.get(token.task_id) == token:
                 del self._current[token.task_id]
+                self._publish_fence(token.task_id, None)
             self._check_directory()
             directory = self._directory / token.fence
             if directory.is_symlink() or directory.exists():
-                shutil.rmtree(directory)
+                guard = native.StoreGuard.acquire(str(directory / "io.lock"), True, True)
+                if guard is None:
+                    raise StorageCleanupPending("attempt still owns native storage I/O")
+                try:
+                    shutil.rmtree(directory)
+                finally:
+                    guard.close()
             del self._reservations[token.fence]
 
     def close(self) -> None:
@@ -410,6 +482,7 @@ class CommitCoordinator:
             if self._directory.exists():
                 shutil.rmtree(self._directory)
             self._reservations.clear()
+            self._source_bytes = 0
             self._closed = True
 
     def snapshot(self) -> dict[str, Any]:

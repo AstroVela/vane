@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vane.execution.direct_exchange import DirectExchangeLimits
+from vane.execution.fte_store import ExchangeStore
 from vane.execution.query_runtime import QueryResources
 from vane.execution.resource_demand import _capacity
 from vane.execution.submission import RayQuerySpec
@@ -23,7 +24,8 @@ class RayResources(QueryResources):
 
     Ray reserves each worker's CPU and operator memory. Native exchange and
     encoding windows are additionally reserved on that worker before start.
-    The first scheduler activates the entire graph as one admission group.
+    Pipelined scheduling admits the whole graph; FTE admits bounded stage
+    attempts. Both charge the same worker ledger.
     """
 
     worker_count: int = 2
@@ -35,6 +37,7 @@ class RayResources(QueryResources):
     io_concurrency: int = 32
     partitions: int = 2
     exchange: DirectExchangeLimits = field(default_factory=DirectExchangeLimits)
+    exchange_stores: tuple[ExchangeStore, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -51,6 +54,13 @@ class RayResources(QueryResources):
             _capacity(getattr(self, name), name)
         if not isinstance(self.exchange, DirectExchangeLimits):
             raise TypeError("exchange must be DirectExchangeLimits")
+        if not isinstance(self.exchange_stores, (tuple, list)) or any(
+            not isinstance(s, ExchangeStore) for s in self.exchange_stores
+        ):
+            raise TypeError("exchange_stores must contain ExchangeStore registrations")
+        if len({s.name for s in self.exchange_stores}) != len(self.exchange_stores):
+            raise ValueError("exchange store names must be unique")
+        object.__setattr__(self, "exchange_stores", tuple(self.exchange_stores))
         if self.io_concurrency > 4096 or self.worker_count > 256:
             raise ValueError("Ray capacities exceed the supported worker/link limits")
         if self.operator_memory_bytes < self.max_active_queries:

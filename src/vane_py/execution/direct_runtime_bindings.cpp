@@ -4,6 +4,7 @@
 #include "direct_task.hpp"
 #include "direct_flight.hpp"
 #include "materialized_exchange.hpp"
+#include "file_snapshot.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -232,6 +233,18 @@ void Prepare(DirectTaskService &service, const string &id, const string &payload
 void RegisterDirectRuntimeBindings(py::module_ &module) {
 	auto runtime = module.def_submodule("execution_runtime", "Internal native DirectExchange and TaskService");
 	runtime.def("check_entry", &DuckDBPyConnection::CheckCallbackEntry);
+	py::class_<StoreGuard, shared_ptr<StoreGuard>>(runtime, "StoreGuard")
+	    .def_static("acquire",
+	                [](const string &path, bool exclusive, bool create) {
+		                TaskEntry entry;
+		                py::gil_scoped_release release;
+		                return StoreGuard::Acquire(path, exclusive, create);
+	                })
+	    .def("close", [](StoreGuard &guard) {
+		    TaskEntry entry;
+		    py::gil_scoped_release release;
+		    guard.Close();
+	    });
 	py::class_<MaterializedIO, shared_ptr<MaterializedIO>>(runtime, "MaterializedIO")
 	    .def_static("staging_bytes", &MaterializedIO::StagingBytes)
 	    .def_static("write",

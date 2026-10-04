@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Whole-graph Ray pipelined scheduling and native Flight result delivery."""
+"""Shared Ray query runtime, pipelined scheduling and native result delivery."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 
 from vane.execution.compiler import FragmentCompileOptions
 from vane.execution.pipelined_plan import DirectTicket, RayResources, placement, task_id
-from vane.execution.query_options import DistributedMode, QueryExecutionOptions, RayExecution
+from vane.execution.query_options import DistributedMode, FteOptions, QueryExecutionOptions, RayExecution
 from vane.execution.query_runtime import QueryContext, QueryRuntime
 from vane.execution.resource_demand import MemoryDemand, ResourceDemand
 from vane.execution.submission import prepare_ray_query
@@ -151,6 +151,35 @@ class WorkerPool:
                     ray.kill(worker, no_restart=True)
             self.workers.clear()
             self.epochs.clear()
+
+    def replace(self, index: int, epoch: str, context: QueryContext, engine: str) -> None:
+        import ray
+
+        from vane.execution.pipelined_worker import PipelinedWorker
+
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("worker pool is closed")
+            if self.epochs[index] != epoch:
+                return
+            ray.kill(self.workers[index], no_restart=True)
+            resources = self.resources
+            actor = ray.remote(max_restarts=0, max_task_retries=0, max_concurrency=16)(PipelinedWorker)
+            replacement = actor.options(
+                num_cpus=resources.cpus_per_worker,
+                memory=resources.operator_memory_bytes
+                + resources.exchange_buffer_bytes
+                + resources.staging_buffer_bytes,
+            ).remote(resources)
+            try:
+                value = _get(replacement.describe.remote(), context)
+                if value["engine"] != engine or value["epoch"] == epoch:
+                    raise RuntimeError("replacement worker has an incompatible native engine or epoch")
+            except BaseException:
+                ray.kill(replacement, no_restart=True)
+                raise
+            self.workers[index] = replacement
+            self.epochs[index] = value["epoch"]
 
 
 class PipelinedScheduler:
@@ -408,11 +437,28 @@ class RayQueryRuntime(QueryRuntime):
             resources = RayResources()
         if not isinstance(resources, RayResources):
             raise TypeError("Ray connections require RayResources")
-        if execution != "pipelined":
-            raise NotImplementedError("Ray FTE execution is scheduled for P3")
+        try:
+            self.execution = DistributedMode(execution)
+        except (ValueError, TypeError) as error:
+            raise ValueError("Ray execution must be 'pipelined' or 'fte'") from error
+        if self.execution is DistributedMode.FTE and not resources.exchange_stores:
+            raise ValueError("Ray FTE requires a registered ExchangeStore")
         super().__init__(resources)
         self.ray_resources = resources
         self.pool = WorkerPool(resources)
+        self.store_lock = threading.Lock()
+        self.stores: dict[str, Any] = {}
+
+    def exchange_store(self, name: str) -> Any:
+        from vane.execution.fte_store import StorePool
+
+        config = next((s for s in self.ray_resources.exchange_stores if s.name == name), None)
+        if config is None:
+            raise ValueError(f"unknown registered exchange store: {name}")
+        with self.store_lock:
+            if name not in self.stores:
+                self.stores[name] = StorePool(config)
+            return self.stores[name]
 
     def submit(
         self,
@@ -431,24 +477,33 @@ class RayQueryRuntime(QueryRuntime):
             raise ValueError("Ray query() requires SQL text")
         if set(overrides) - {"execution"}:
             raise ValueError("unknown Ray query options")
-        execution = overrides.get("execution", "pipelined")
-        if execution != "pipelined":
-            raise NotImplementedError("Ray FTE execution is scheduled for P3")
         if type(rows_per_batch) is not int or not 0 < rows_per_batch <= 2048:
             raise ValueError("Ray rows_per_batch must be between 1 and 2048")
-        if options is None:
-            options = QueryExecutionOptions(RayExecution(), 30, 300, 300)
-        if (
-            not isinstance(options, QueryExecutionOptions)
-            or not isinstance(options.target, RayExecution)
-            or options.target.mode is not DistributedMode.PIPELINED
+        if options is not None and (
+            not isinstance(options, QueryExecutionOptions) or not isinstance(options.target, RayExecution)
         ):
-            raise ValueError("Ray pipelined queries require pipelined RayExecution options")
+            raise ValueError("Ray queries require RayExecution options")
+        default_mode = self.execution
+        if options is not None:
+            assert isinstance(options.target, RayExecution)
+            default_mode = options.target.mode
+        mode = DistributedMode(overrides.get("execution", default_mode))
+        if options is None:
+            policy = None
+            if mode is DistributedMode.FTE:
+                if len(self.ray_resources.exchange_stores) != 1:
+                    raise ValueError("FTE requires explicit options naming a registered ExchangeStore")
+                policy = FteOptions(self.ray_resources.exchange_stores[0].name, 3, 0.1)
+            options = QueryExecutionOptions(RayExecution(mode, policy), 30, 300, 300)
+        if not isinstance(options.target, RayExecution) or options.target.mode is not mode:
+            raise ValueError("execution override disagrees with the immutable query options")
 
         def execute(context: QueryContext) -> None:
             assert isinstance(context, PipelinedContext)
             resources = self.ray_resources
-            scheduler: PipelinedScheduler | None = None
+            from vane.execution.recovery_runtime import RecoveryScheduler
+
+            scheduler: PipelinedScheduler | RecoveryScheduler | None = None
 
             def close(retired: bool) -> None:
                 if retired:
@@ -470,17 +525,25 @@ class RayQueryRuntime(QueryRuntime):
                 ),
                 resources.worker_count * resources.io_concurrency,
             )
-            spec = prepare_ray_query(
-                connection,
-                sql,
-                query_id=context.query_id,
-                options=options,
-                resources=demand,
-                compile_options=FragmentCompileOptions(resources.partitions),
-            )
-            scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch)
-            context.started(scheduler.cancel)
-            scheduler.prepare()
+            if mode is DistributedMode.FTE:
+                assert isinstance(options.target, RayExecution) and options.target.fte_options is not None
+                store = self.exchange_store(options.target.fte_options.exchange_store)
+                scheduler = RecoveryScheduler(self.pool, store, context, rows_per_batch)
+                context.started(scheduler.cancel)
+                scheduler.prepare(connection, sql, options, demand, FragmentCompileOptions(resources.partitions))
+                spec = scheduler.spec
+            else:
+                spec = prepare_ray_query(
+                    connection,
+                    sql,
+                    query_id=context.query_id,
+                    options=options,
+                    resources=demand,
+                    compile_options=FragmentCompileOptions(resources.partitions),
+                )
+                scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch)
+                context.started(scheduler.cancel)
+                scheduler.prepare()
             context.install_reader(
                 scheduler,
                 scheduler.read_next_batch,

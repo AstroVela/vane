@@ -238,6 +238,48 @@ def prepare_ray_query(
         compile_options.hash_columns,
         options.target.mode is DistributedMode.FTE,
     )
+    return _submission(value, options, resources)
+
+
+def stage_ray_query(
+    connection: Any,
+    sql: str,
+    *,
+    query_id: str,
+    options: QueryExecutionOptions,
+    resources: ResourceDemand,
+    source_directory: str,
+    source_budget: int,
+    compile_options: FragmentCompileOptions = FragmentCompileOptions(),
+) -> tuple[RayQuerySpec, int]:
+    """Copy file inputs before binding; the admitted query owns partial copies.
+
+    The pure planning entry above never creates these files. The execution
+    service must hold the store reservation and lease before entering here.
+    """
+    from vane._native import execution_plan
+
+    if not isinstance(options, QueryExecutionOptions) or not isinstance(options.target, RayExecution):
+        raise ValueError("FTE staging requires RayExecution")
+    if options.target.mode is not DistributedMode.FTE:
+        raise ValueError("file staging requires FTE execution")
+    if not isinstance(resources, ResourceDemand) or not isinstance(compile_options, FragmentCompileOptions):
+        raise ValueError("invalid FTE resources or compile options")
+    _name(sql, "sql")
+    _name(query_id, "query_id")
+    value = execution_plan.stage_submission(
+        connection,
+        sql,
+        query_id,
+        compile_options.partition_count,
+        compile_options.hash_columns,
+        source_directory,
+        source_budget,
+    )
+    return _submission(value, options, resources), value["source_bytes"]
+
+
+def _submission(value: dict[str, Any], options: QueryExecutionOptions, resources: ResourceDemand) -> RayQuerySpec:
     return RayQuerySpec(
         graph=_native_graph(value["graph"]),
         options=options,

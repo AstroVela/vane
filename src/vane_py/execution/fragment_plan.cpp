@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "fragment_plan.hpp"
+#include "file_snapshot.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -23,10 +24,12 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -42,6 +45,7 @@ constexpr idx_t FORMAT_VERSION = 1;
 constexpr idx_t MAX_PARTITIONS = 2147483647;
 constexpr const char *PARQUET_CAPABILITY = "vane.parquet-scan:1";
 constexpr const char *PARQUET_CODEC = "vane.parquet-file:1";
+constexpr const char *FROZEN_PARQUET_CODEC = "vane.parquet-snapshot:1";
 
 void CheckPartitions(idx_t partitions) {
 	if (partitions == 0 || partitions > MAX_PARTITIONS) {
@@ -265,8 +269,9 @@ void CheckFunctionOrigin(CatalogEntry &entry) {
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
-		static const std::set<string> scalar_functions = {
-		    "+", "-", "*", "/", "//", "%", "||", "abs", "lower", "upper", "length", "hash", "starts_with", "contains"};
+		static const std::set<string> scalar_functions = {"+",      "-",    "*",           "/",        "//",
+		                                                  "%",      "||",   "abs",         "lower",    "upper",
+		                                                  "length", "hash", "starts_with", "contains", "list_value"};
 		const auto name = StringUtil::Lower(function.function_name);
 		const bool scan = SupportedScan(name);
 		if (!scan && !scalar_functions.count(name)) {
@@ -292,6 +297,7 @@ SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bin
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
 	vector<SourceSpec> source_dependencies;
+	bool frozen_files = false;
 
 	void VisitOperator(LogicalOperator &op) override {
 		switch (op.type) {
@@ -302,6 +308,13 @@ public:
 			}
 			// Validate before filter pushdown can remove a filter-only virtual column.
 			CheckScanColumns(get.function.name, get.GetColumnIds());
+			if (frozen_files && IsParquetScan(get.function.name)) {
+				for (auto &column : get.GetColumnIds()) {
+					if (column.GetPrimaryIndex() == MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+						throw NotImplementedException("FTE snapshots do not support the virtual filename column");
+					}
+				}
+			}
 			if (IsParquetScan(get.function.name)) {
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
@@ -506,8 +519,105 @@ string HashExpression(const vector<LogicalType> &types, const vector<idx_t> &col
 
 } // namespace
 
+namespace {
+void FilePatterns(ParsedExpression &expression, vector<string> &patterns, bool allow_list = true) {
+	if (expression.GetExpressionClass() == ExpressionClass::CONSTANT) {
+		auto &value = expression.Cast<ConstantExpression>().value;
+		if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
+			patterns.push_back(value.GetValue<string>());
+			return;
+		}
+	} else if (allow_list && expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression.Cast<FunctionExpression>();
+		if (StringUtil::Lower(function.function_name) == "list_value") {
+			for (auto &child : function.children) {
+				FilePatterns(*child, patterns, false);
+			}
+			return;
+		}
+	}
+	throw NotImplementedException("FTE file inputs require literal absolute paths or lists of literal paths");
+}
+
+void StageFileArguments(ClientContext &context, SelectStatement &select, const string &directory, idx_t budget,
+                        unordered_map<string, FrozenFile> &frozen, idx_t &used) {
+	unordered_map<string, FrozenFile> originals;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    *select.node, [](unique_ptr<ParsedExpression> &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type != TableReferenceType::TABLE_FUNCTION) {
+			    return;
+		    }
+		    auto &expression = *ref.Cast<TableFunctionRef>().function;
+		    if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+			    return;
+		    }
+		    auto &function = expression.Cast<FunctionExpression>();
+		    if (!IsParquetScan(StringUtil::Lower(function.function_name))) {
+			    return;
+		    }
+		    if (function.children.empty()) {
+			    throw InvalidInputException("Parquet scan requires file paths");
+		    }
+		    vector<string> patterns;
+		    FilePatterns(*function.children[0], patterns);
+		    if (patterns.empty() || patterns.size() > 4096) {
+			    throw InvalidInputException("FTE source pattern count exceeds limit");
+		    }
+		    vector<Value> paths;
+		    auto &fs = FileSystem::GetFileSystem(context);
+		    for (auto &pattern : patterns) {
+			    if (!fs.IsPathAbsolute(pattern)) {
+				    throw NotImplementedException("FTE snapshots require absolute local paths");
+			    }
+			    for (auto &file : fs.GlobFiles(pattern)) {
+				    if (paths.size() >= 4096) {
+					    throw InvalidInputException("FTE source file reference count exceeds limit");
+				    }
+				    auto existing = originals.find(file.path);
+				    if (existing == originals.end()) {
+					    if (originals.size() >= 4096) {
+						    throw InvalidInputException("FTE source file count exceeds limit");
+					    }
+					    auto snapshot = FreezeFile(context, file.path, directory, budget - used);
+					    used += snapshot.bytes;
+					    frozen.emplace(snapshot.path, snapshot);
+					    existing = originals.emplace(file.path, std::move(snapshot)).first;
+				    }
+				    paths.push_back(Value(existing->second.path));
+			    }
+		    }
+		    function.children[0] = make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths)));
+	    });
+}
+
+void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, FrozenFile> &frozen) {
+	for (auto &source : sources) {
+		if (!IsParquetScan(source.function_name)) {
+			continue;
+		}
+		for (auto &split : source.splits) {
+			auto file = DecodeFile(split.payload);
+			auto found = frozen.find(file.path);
+			if (found == frozen.end()) {
+				throw InternalException("bound file was not frozen before compilation");
+			}
+			if (!file.extended_info) {
+				file.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			}
+			file.extended_info->options["vane_snapshot_sha256"] = Value(found->second.sha256);
+			file.extended_info->options["vane_snapshot_bytes"] = Value::UBIGINT(found->second.bytes);
+			split.payload = EncodeFile(file);
+		}
+		source.codec = FROZEN_PARQUET_CODEC;
+		source.requires_snapshot = false;
+	}
+}
+} // namespace
+
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
-                      const vector<idx_t> &hash_columns) {
+                      const vector<idx_t> &hash_columns, const string &snapshot_directory, idx_t source_budget,
+                      idx_t *source_bytes) {
 	CheckPartitions(partitions);
 	auto trimmed_id = query_id;
 	StringUtil::Trim(trimmed_id);
@@ -521,6 +631,8 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 	}
 	FragmentGraph graph;
 	graph.query_id = query_id;
+	unordered_map<string, FrozenFile> frozen;
+	idx_t used = 0;
 	context.RunFunctionInTransaction([&]() {
 		auto &select = parser.statements[0]->Cast<SelectStatement>();
 		ParsedExpressionIterator::EnumerateQueryNodeChildren(
@@ -532,6 +644,9 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 				    throw NotImplementedException("fragment compiler requires explicit range or Parquet sources");
 			    }
 		    });
+		if (!snapshot_directory.empty()) {
+			StageFileArguments(context, select, snapshot_directory, source_budget, frozen, used);
+		}
 		Planner planner(context);
 		// Column references can become SQL value functions during binding. Check
 		// the resolved entry before macro expansion or table-argument evaluation;
@@ -542,6 +657,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");
 		}
 		LogicalValidator validator;
+		validator.frozen_files = !snapshot_directory.empty();
 		validator.VisitOperator(*planner.plan);
 		CheckTypes(planner.types);
 		if (ClientConfig::GetConfig(context).enable_optimizer && planner.plan->RequireOptimizer()) {
@@ -579,6 +695,15 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 			graph.exchanges.push_back(std::move(gather));
 		}
 	});
+	if (!snapshot_directory.empty()) {
+		for (auto &fragment : graph.fragments) {
+			MarkFrozenSources(fragment.sources, frozen);
+			MarkFrozenSources(fragment.source_dependencies, frozen);
+		}
+	}
+	if (source_bytes) {
+		*source_bytes = used;
+	}
 	return graph;
 }
 
@@ -623,7 +748,7 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		string codec;
 		if (parquet) {
 			capability = PARQUET_CAPABILITY;
-			codec = PARQUET_CODEC;
+			codec = spec.codec == FROZEN_PARQUET_CODEC ? FROZEN_PARQUET_CODEC : PARQUET_CODEC;
 		} else {
 			auto &callbacks = scan.function.GetDistributedScanCallbacks();
 			callbacks.Validate(scan.function);
@@ -633,7 +758,7 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		if (scan.function.name != spec.function_name || capability != spec.capability || codec != spec.codec) {
 			throw SerializationException("fragment source capability or codec mismatch");
 		}
-		if (spec.requires_snapshot != parquet) {
+		if (spec.requires_snapshot != (parquet && codec == PARQUET_CODEC)) {
 			throw SerializationException("fragment source snapshot requirement mismatch");
 		}
 		unordered_map<string, const DistributedScanSplit *> known;
@@ -886,6 +1011,31 @@ string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool
 	vector<string> versions;
 	std::set<string> stamped_files;
 	auto capture_versions = [&](const SourceSpec &source) {
+		if (source.codec == FROZEN_PARQUET_CODEC) {
+			if (source.requires_snapshot || !IsParquetScan(source.function_name) ||
+			    source.capability != PARQUET_CAPABILITY) {
+				throw SerializationException("invalid frozen source capability");
+			}
+			for (auto &split : source.splits) {
+				auto file = DecodeFile(split.payload);
+				if (!file.extended_info || !file.extended_info->options.count("vane_snapshot_sha256") ||
+				    !file.extended_info->options.count("vane_snapshot_bytes")) {
+					throw SerializationException("frozen source has no content identity");
+				}
+				auto &options = file.extended_info->options;
+				auto stamp = FileStamp(context, file);
+				auto hash = FileFingerprint(context, file);
+				auto handle = FileSystem::GetFileSystem(context).OpenFile(file, FileFlags::FILE_FLAGS_READ);
+				if (hash != options.at("vane_snapshot_sha256").GetValue<string>() ||
+				    idx_t(handle->GetFileSize()) != options.at("vane_snapshot_bytes").GetValue<idx_t>()) {
+					throw InvalidInputException("immutable FTE source snapshot changed");
+				}
+				if (stamped_files.insert(file.path).second) {
+					versions.push_back(stamp + hash);
+				}
+			}
+			return;
+		}
 		if (source.requires_snapshot) {
 			if (!IsParquetScan(source.function_name) || require_replay) {
 				throw NotImplementedException(
@@ -904,8 +1054,9 @@ string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool
 		capture_versions(source);
 	}
 	for (auto &source : fragment.source_dependencies) {
-		if (!source.requires_snapshot || !IsParquetScan(source.function_name) ||
-		    source.capability != PARQUET_CAPABILITY || source.codec != PARQUET_CODEC) {
+		if (!IsParquetScan(source.function_name) || source.capability != PARQUET_CAPABILITY ||
+		    (source.codec != PARQUET_CODEC && source.codec != FROZEN_PARQUET_CODEC) ||
+		    source.requires_snapshot != (source.codec == PARQUET_CODEC)) {
 			throw SerializationException("unsupported fragment source dependency");
 		}
 		dependencies.push_back(Encode([&](Serializer &serializer) { source.Serialize(serializer); }));
@@ -949,6 +1100,7 @@ vector<std::pair<string, string>> ScanCapabilities(ClientContext &context) {
 				}
 				if (IsParquetScan(name)) {
 					capabilities.emplace(PARQUET_CAPABILITY, PARQUET_CODEC);
+					capabilities.emplace(PARQUET_CAPABILITY, FROZEN_PARQUET_CODEC);
 				} else if (function.HasDistributedScanCallbacks()) {
 					auto &callbacks = function.GetDistributedScanCallbacks();
 					callbacks.Validate(function);

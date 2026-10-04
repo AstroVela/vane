@@ -24,6 +24,15 @@ def compile_submission(
     require_replay: bool,
 ) -> dict[str, Any]: ...
 def compiler_capabilities(connection: DuckDBPyConnection) -> dict[str, Any]: ...
+def stage_submission(
+    connection: DuckDBPyConnection,
+    sql: str,
+    query_id: str,
+    partition_count: int,
+    hash_columns: Sequence[int],
+    directory: str,
+    source_budget: int,
+) -> dict[str, Any]: ...
 def inspect_submitted_fragment(
     connection: DuckDBPyConnection,
     payload: bytes,

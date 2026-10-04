@@ -76,7 +76,8 @@ vector<std::pair<string, string>> ScanCapabilities(ClientContext &context);
 // hash_columns is an explicit physical output-distribution request, expressed
 // as result-column positions. Native code binds and serializes the expressions.
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
-                      const vector<idx_t> &hash_columns);
+                      const vector<idx_t> &hash_columns, const string &snapshot_directory = "", idx_t source_budget = 0,
+                      idx_t *source_bytes = nullptr);
 
 using InputFactory = std::function<PhysicalOperator &(PhysicalPlan &, const string &, const vector<LogicalType> &)>;
 using SourceAssignments = unordered_map<string, vector<string>>;

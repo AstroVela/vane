@@ -71,7 +71,7 @@ target_link_libraries(python_src PRIVATE vane_python_dependencies)
 add_library(
   python_direct_flight OBJECT
   execution/direct_flight.cpp execution/arrow_frame.cpp
-  execution/materialized_exchange.cpp)
+  execution/materialized_exchange.cpp execution/file_snapshot.cpp)
 set_target_properties(python_direct_flight PROPERTIES CXX_STANDARD 17)
 target_link_libraries(
   python_direct_flight

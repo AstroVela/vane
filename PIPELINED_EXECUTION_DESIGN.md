@@ -7,7 +7,7 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 5 日（P3.1 更新） |
+| 日期 | 2026 年 10 月 5 日（P3 完整实现更新） |
 | 开发分支 | feat/materialized-exchange |
 | 基础分支 | integration/pipelined-execution |
 | Vane 参考提交 | 68b5407a4ca4（PR #962 合入） |
@@ -134,9 +134,9 @@ FteOptions
 
 PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创建后续 attempt。FteOptions 仅进入 FTE 查询快照，向 pipelined 查询传入重试参数时直接报配置错误。连接可以预先登记 exchange_store，供后续 FTE 查询使用；pipelined 查询不使用该存储。
 
-当前 [query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。exchange_store 目前只是注册存储的名字，P3 必须在实际准入前解析并验证其可用性与故障域。RayQuerySpec 覆盖计划准备所需的配置、快照和资源声明，尚不代表已预留资源或提交任务。公开连接入口继续按 roadmap 接线；local 不使用 RayQuerySpec。
+[query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。P3 已接通 RayResources.exchange_stores、文件冻结、RecoveryScheduler 与公开 FTE QueryResult。exchange_store 解析为会话注册的 ExchangeStore，所有 worker 检查相同 root/store_id；独立故障域仍由部署方保证，不能用路径或 marker 自动证明。local 不使用 RayQuerySpec。
 
-P3.1 提供内部 SharedDirectoryStore、native 物化读写与提交账本，供后续恢复调度器组合使用。它尚未接入 RayResources 或公开的 FTE 查询入口；普通 Parquet 的 FTE 准备仍被拒绝。文件输入冻结属于 P3.2，RecoveryScheduler 和 FTE 结果交付属于 P3.3。
+纯 `prepare_ray_query` 只编译和验证，不复制文件；普通 Parquet 不能经此入口声明为可重放。公开 FTE 查询在获得存储预留后调用明确具有文件写入效果的 `stage_ray_query`，先冻结输入，再绑定及优化。失败产生的部分副本由查询存储 lease 清理，不改变数据库状态。
 
 ### 公开 API 与后续目标
 
@@ -187,7 +187,30 @@ with vane.connect(backend="ray", execution="pipelined", resources=resources) as 
             del batch
 ~~~
 
-当前入口支持 P0 已验证的只读 SQL 子集：常量、range、普通本地 Parquet、filter、projection 与 GATHER；HASH 图可通过 FragmentCompileOptions 验收。文件必须使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。整数、浮点、布尔、字符串及 NULL 在 native Flight 中传输，空结果保留 schema。单次 query 可显式传入 execution="pipelined"；FTE、SQL 参数、聚合/join、模型 UDF 等尚未接线的能力明确报错。FTE 的公开执行由 P3 接入。
+当前入口支持 P0 已验证的只读 SQL 子集：常量、range、普通本地 Parquet、filter、projection 与 GATHER；HASH 图可通过 FragmentCompileOptions 验收。文件必须使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。整数、浮点、布尔、字符串及 NULL 在 native Flight 中传输，空结果保留 schema。单次 query 可显式选择 execution="pipelined" 或 execution="fte"；SQL 参数、聚合/join、模型 UDF 等尚未接线的能力明确报错。P3 的 FTE 入口如下。
+
+P3 在同一 Ray 会话中注册共享存储并选择 FTE。部署前将下例路径替换为所有参与者挂载的同一目录；输入文件只需要在提交端可读，worker 读取冻结副本。
+
+~~~python
+store = vane.ExchangeStore(
+    "shared", "/mnt/vane-exchange",
+    capacity_bytes=16 << 30, query_bytes=1 << 30,
+    object_bytes=64 << 20, source_bytes=256 << 20,
+    lease_seconds=60,
+)
+resources = vane.RayResources(exchange_stores=(store,))
+options = vane.QueryExecutionOptions(
+    vane.RayExecution("fte", vane.FteOptions("shared", 3, 0.1)),
+    admission_timeout=30, execution_timeout=300, delivery_timeout=300,
+)
+with vane.connect(backend="ray", resources=resources) as connection:
+    with connection.query("SELECT range AS value FROM range(10000)", options=options) as result:
+        for batch in result:
+            print(batch)
+            del batch
+~~~
+
+`connect(backend="ray", execution="fte", resources=resources)` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
 
 客户端必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。当前使用 Ray 节点地址和动态端口；网关、TLS 和固定端口部署属于后续部署能力。
 
@@ -294,14 +317,15 @@ prepare_ray_query 只接受 RayExecution。在连接锁内先读取语义设置�
 | 数据源 | pipelined 准备 | FTE 准备 |
 | --- | --- | --- |
 | 无扫描常量、整数 range/generate_series | 固定 native 计划和 split | 可按同一输入回放 |
-| 普通 Parquet 文件 | 固定文件集合；要求绝对路径、worker 可见的本地普通文件；准备时核对路径、大小和包含原生亚秒精度的修改时间 | 拒绝，尚无不可变版本保证 |
+| 普通 Parquet 文件 | 固定文件集合；要求绝对路径、worker 可见的本地普通文件；准备时核对路径、大小和包含原生亚秒精度的修改时间 | 纯准备入口拒绝；公开 FTE 查询先冻结为下述 snapshot codec |
+| P3 冻结的 Parquet 副本 | codec 可验证同一内容 | 查询存储 lease 保护的副本；按 SHA-256、长度和 stat 验证，可重放 |
 | 远程文件、其他 scan 或自定义文件系统 | 当前提交 profile 不支持 | 当前提交 profile 不支持 |
 
 source 快照同时覆盖实际扫描和 `source_dependencies`，同一路径的文件元数据只捕获一次。扫描完全被优化掉时仍校验原始文件；部分文件被裁剪时也保留被裁剪文件的校验。普通 Parquet 的绝对路径、访问条件和 FTE 限制应用于全部依赖，不能因优化后的结果为空而绕过。依赖的 capability/codec 纳入 worker 能力检查，文件版本和依赖身份纳入蓝图缓存键；跨进程传输后不能从 Python 图中删掉 native 计划携带的依赖。
 
 本地文件类型、大小和 mtime 来自同一次已打开句柄的 stat。快照同时保存标准微秒时间戳和 `mtime_nsec` 原生小数部分：Linux/macOS 保留纳秒，Windows 保留 FILETIME 的 100 纳秒精度；精度受底层文件系统限制。缺少原生小数部分时拒绝提交。同一秒内的等大小改写以及低于一微秒的 mtime 变化也参与 worker 校验和缓存身份。Parquet 元数据缓存使用的本地文件版本标识同步保留完整时间精度，重新规划可发现更新后的文件统计信息。
 
-Parquet 元数据检查是访问前置条件，不是内容快照：相同大小和修改时间的替换可能无法检测，检查后再修改也不被阻止。调用方须在执行期间保持文件稳定；每次准备 task/attempt 时重新检查。不可变对象版本、snapshot isolation 或受生命周期保护的 staging 输入应随对应 source 接入，再开放其 FTE 支持。文件内容哈希本身也不能提供重试时的旧版本可读性。
+Parquet 元数据检查是访问前置条件，不是内容快照：相同大小和修改时间的替换可能无法检测，检查后再修改也不被阻止。调用方须在执行期间保持文件稳定；每次准备 task/attempt 时重新检查。P3 的公开 FTE 先复制到受查询存储 lease 保护的 staging，再绑定和优化；worker 重放该副本。未来其他 source 也须提供不可变版本或同等保证。文件内容哈希本身不能提供重试时的旧版本可读性。
 
 [ResourceDemand](vane/execution/resource_demand.py) 声明查询的 CPU share、task context 数、I/O 并发和 operator/result/exchange/staging 四类内存。当前为 CPU 算子子集，不预先声明尚无执行能力的 GPU/UDF 资源。Ray 必须显式提供 exchange 和 staging 预算。首版 pipelined 按整张图同时活动，context 声明至少覆盖分区数之和；严格阶段 FTE 至少覆盖最大阶段分区数。这只验证声明能描述计划；实际 worker 容量、最小可推进窗口和原子预留由 P2/P3 的准入实现。
 
@@ -436,7 +460,7 @@ AttemptManifest 包含分区对象、长度、校验值、schema、输入身份�
 
 如果提交已接受但确认丢失，重复 RPC 查询并返回既有决定，不创建新 attempt。coordinator 的提交表在本次查询内有效；第一版不提供 coordinator 故障恢复，因此无需为此增加跨 coordinator 选主协议。
 
-### P3.1 物化 I/O 与提交基础的实现边界
+### P3.1 物化 I/O 与提交基础
 
 实现位于 [native MaterializedIO](src/vane_py/execution/materialized_exchange.cpp)、[不可变 manifest](vane/execution/materialized_exchange.py) 与 [共享目录和提交账本](vane/execution/materialized_store.py)。native 读写与 Flight 共用 [Arrow frame codec](src/vane_py/execution/arrow_frame.cpp)，类型范围保持 basic types。没有新增执行器或调用旧 FTE manager。
 
@@ -453,17 +477,35 @@ MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel
 
 整数使用 64 位小端编码。空分区也必须写入带 schema 和文件尾的对象。写端排空已封闭生产者后写入文件尾，sync 并关闭文件，才报告封存完成；关闭 writer 不删除文件。读端先以固定 64 KiB 缓冲核对整个文件的大小、SHA-256、schema 和文件尾，再逐帧校验、解码和交付；缺失、截断、变更或元数据不匹配均以错误结束。EOF 与 reader 完成状态在同一取消锁内发布，读到 EOF 后立即 close 不会把成功交付改为取消。
 
-每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 256 KiB` 的 staging，另外持有 channel 的窗口预算。native I/O 同时只处理一个帧，等待容量时保留所有权。P3.1 校验声明并限制文件/帧大小；跨 worker 的实际内存和 I/O 准入由 P3.3 接线，不将此设施描述为完整的进程内存硬限。
+每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 256 KiB` 的 staging，另外持有 channel 的窗口预算。native I/O 同时只处理一个帧，等待容量时保留所有权。每个 attempt 启动前在同一个 worker 账本中预留 context、operator share、channel window、native staging 和 I/O 槽；两个策略同时运行也不能突破各项容量。这些约束不等价于完整的进程 RSS 硬限。
 
 SharedDirectoryStore 要求所有参与者访问同一个绝对路径和 `store_id`，支持独占创建、原子 hard link 发布和文件 sync。目录必须由部署方放在独立于计算 worker 的共享存储上；路径名称与 marker 只能校验身份和可见性，无法证明挂载的物理故障域。当前测试验证独立生产进程退出后数据保留，不宣称本地临时目录可承受整台存储节点失效。
 
-CommitCoordinator 在开始查询时接受固定的逻辑 task、输入指纹和全部输出分区声明。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。存储配额按对象最大预留长度计费，成功清理后才释放。
+CommitCoordinator 按阶段接收固定的逻辑 task、输入指纹和全部输出分区声明；下游指纹包含实际已提交的上游 manifest，不能在上游选定之前伪造。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。存储配额按对象最大预留长度计费，成功清理后才释放。
 
 commit 先核对 engine、查询、task、输入、epoch、fence、分区、schema 和对象预算，在决策锁外读取对象并发布不可变 `attempt.json`，最后再次验证 fence 并选择唯一成功输出。取消或新 attempt 可以在慢存储验证期间抢先生效。相同提交重复到达返回既有决定，冲突提交报错。`attempt.json` 是封存记录；即使文件存在，也不代表已被接受。只有本次 coordinator 的提交表选中的 attempt 可以进入 StageManifest。
 
 stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必须持有该 stage 的 ReadLease，不能用目录 listing 补全对象或从失败 attempt 取数据。成功对象归 query 所有，仍有 ReadLease 时 close 会保留对象及配额。调用方必须先停止 native I/O 或确认 worker 已退出，才能 discard 未提交 attempt；删除失败保持原有资源责任，可再次清理。已记录的输入错误优先于后续取消原因。
 
-这一步不实现自动重试、文件 source staging、ResultManifest、存储注册、失联查询的 TTL/orphan 回收或 coordinator 恢复。close 会等待 native I/O 线程退出；此文件提供者不能中断内核阻塞的文件 I/O，调度器还须管理清理期限和故障 worker 的退出。后续 P3.2/P3.3 完成这些接线与故障验收前，公开 FTE 查询继续拒绝执行。
+### P3.2 不可变文件输入
+
+[file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制、核对源文件两次 SHA-256 与元数据，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
+
+冻结路径保留原路径中的 Hive 分区目录。虚拟 filename 与 file_index 列明确拒绝，物理同名列正常保留。冻结发生在统计信息剪枝之前，被优化成 EMPTY_RESULT 的 scan 仍保留 source dependency。`vane.parquet-snapshot:1` split 携带冻结文件 SHA-256/长度，worker prepare/start 校验内容与精确文件状态。原文件覆盖、删除或 glob 新增成员不改变重试输入；冻结副本缺失/损坏则失败。
+
+[fte_plan.py](vane/execution/fte_plan.py) 将不可变 QuerySpec、固定 split assignment、partition 与实际上游 StageManifest 指纹组成输入身份。每次 attempt 使用相同身份；不重新编译 SQL，不重新展开 glob，也不替换已提交对象。
+
+### P3.3 恢复调度、配额与租约
+
+[RecoveryScheduler](vane/execution/recovery_runtime.py) 使用 P2 的 worker 池与 native TaskService，每个阶段按 worker 数量分批运行，每个查询在一个 worker 上至多运行一个 attempt。所有 stage task 提交后才声明下一阶段的输入。worker actor 禁用自动重启和 RPC 自动重放；未提交 attempt 遇到 RayActorError 时，scheduler 创建新 epoch 的 worker，按固定输入生成新 fence。Ray 状态探测读取独立 native production/error 快照，不等待 pump 执行锁；准备和源文件校验受查询执行期限约束。
+
+[StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量，exchange 按各对象最大长度预留。失败 attempt 未清理完成时继续占用配额。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
+
+每个查询具有随机 namespace、lease_id 和有限到期时间。coordinator 独立线程续租；worker 与 ResultService 独立线程检查 lease/fence，过期即取消 native 执行并清理。所有 native 参与者持有查询共享锁，attempt 另有 I/O 锁。删除必须取得独占锁；Unix 使用 open-description flock，Windows 使用 LockFileEx，不能用会被同进程其他 close 释放的进程级锁替代。
+
+query 配额记录位于对象目录外，部分删除失败不会丢失计费记录。actor 死亡通知可能先于进程释放锁，清理对此提供有限宽限；仍不能取得锁时保留 CleanupPending，调用方可以重试 close。文件提供者不能中断内核阻塞的文件 I/O，因此不承诺任意存储故障下的物理清理时限。RPC/线程等待有期限，不能因此先释放仍在使用的对象。
+
+每次准入、活跃查询心跳和 worker orphan 清理都会扫描过期租约；没有活跃参与者时，可由服务调用 `StorePool.collect_expired()` 或等下一次准入回收。租约使用墙钟，部署要求节点时钟同步；存储要求共享可见性、跨进程 advisory lock、原子创建/替换和 sync。coordinator 丢失会终止查询并回收 orphan，不恢复查询或接管旧提交账本。
 
 ### 重试与存储故障
 
@@ -471,8 +513,9 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 | --- | --- |
 | attempt 提交前计算 worker 丢失 | 废弃未提交输出，在可用 worker 重放相同逻辑输入 |
 | 已提交输出的生产 worker 丢失 | 从独立存储继续读取，不重跑已经提交的 task |
-| 下游 attempt 失败 | 重试该下游，输入仍指向同一批已提交对象 |
-| 短暂存储或控制传输错误 | 对幂等操作有限重试；超出上限按错误分类终止或重试 attempt |
+| 未提交下游 attempt 的 worker 丢失 | 重试该下游，输入仍指向同一批已提交对象 |
+| 幂等 manifest 发布遇到 EAGAIN/EINTR/ETIMEDOUT/ECONNRESET | 原操作最多尝试 3 次，重复确认沿用既有提交；耗尽后失败 |
+| 其他控制超时或 native 存储 I/O 错误 | 明确失败，不把所有异常当作可恢复 worker 丢失 |
 | SQL、类型、权限错误或内存硬限不足 | 查询失败；不重复执行确定失败的任务 |
 | 已提交对象永久丢失或损坏 | 查询失败；第一版不重建已被下游消费的恢复区域 |
 | coordinator 丢失 | 查询失败，存活资源依据 lease 清理 |
@@ -682,7 +725,7 @@ FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。�
 
 ### ResultService 与 QueryResult
 
-QueryResult 提供 schema、批次迭代、collect、close 和状态查询。P1.1 通过 execution_state 与 state 分别观察执行和交付；P2 根据全图生产状态停止执行期限，并在最终 EOF 前核实分布式结局。FTE 的提交完成通知随 P3 接入。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
+QueryResult 提供 schema、批次迭代、collect、close 和状态查询。P1.1 通过 execution_state 与 state 分别观察执行和交付；P2 根据全图生产状态停止执行期限，并在最终 EOF 前核实分布式结局。P3 的 FTE 在 ResultManifest 提交后停止执行期限，交付期限继续有效。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
 
 分布式结果使用原生 ResultService，部署在客户端可访问的查询服务端点：
 
@@ -854,7 +897,7 @@ local 直接连接原生查询与 QueryResult，验证结果、资源与取消�
 
 实现 MaterializedExchange、存储提供者、AttemptManifest、StageManifest、RecoveryScheduler 和 ResultManifest。Ray FTE 与 Ray pipelined 使用同一 TaskRuntime 和 QueryResult；不实现 local FTE。
 
-按可独立审查的增量交付：P3.1 原生对象 I/O 与提交基础，P3.2 不可变文件输入与重放准备，P3.3 恢复调度、结果提交和失联资源回收。P3.1 的内部设施通过验收不等于整个 FTE 路径已经完成。
+按可独立审查的增量交付：P3.1 原生对象 I/O 与提交基础，P3.2 不可变文件输入与重放准备，P3.3 恢复调度、结果提交和失联资源回收。P3.1—P3.3 均已接通并按 roadmap 验收；后续 SQL/type 扩展属于 P4。
 
 退出条件：提交前后 worker 丢失、下游失败、重复提交、迟到 attempt、对象缺失和重试耗尽均有可控验证；恢复不会重复暴露行；生产 worker 退出后可从独立存储读到已提交输出。
 

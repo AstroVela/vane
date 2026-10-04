@@ -250,3 +250,46 @@ class MaterializedTask:
         if len({o.identity for o in outputs}) != len(outputs):
             raise ValueError("duplicate task output partition")
         object.__setattr__(self, "outputs", tuple(sorted(outputs, key=lambda o: o.identity)))
+
+
+@dataclass(frozen=True)
+class ResultManifest:
+    stage: StageManifest
+    names: tuple[str, ...]
+    ordering: str = "unordered"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, StageManifest) or len(self.stage.attempts) != 1:
+            raise ValueError("result requires one committed root task")
+        outputs = self.stage.attempts[0].objects
+        if len(outputs) != 1 or outputs[0].output.identity != ("result", 0):
+            raise ValueError("result requires the committed root output")
+        names = _items(self.names, "result names")
+        if not 1 <= len(names) <= 256 or any(not isinstance(n, str) or len(n) > 65536 for n in names):
+            raise ValueError("invalid result names")
+        object.__setattr__(self, "names", names)
+        if self.ordering != "unordered":
+            raise ValueError("ordered FTE results are not supported by this plan profile")
+
+    @property
+    def output(self) -> OutputObject:
+        return self.stage.attempts[0].objects[0]
+
+    @property
+    def identity(self) -> str:
+        return fingerprint(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "protocol": MATERIALIZED_PROTOCOL,
+            "stage": self.stage.to_dict(),
+            "names": list(self.names),
+            "ordering": self.ordering,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ResultManifest:
+        _fields(value, {"protocol", "stage", "names", "ordering"}, cls.__name__)
+        if type(value["protocol"]) is not int or value["protocol"] != MATERIALIZED_PROTOCOL:
+            raise ValueError("unsupported result manifest protocol")
+        return cls(StageManifest.from_dict(value["stage"]), value["names"], value["ordering"])

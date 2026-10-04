@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3.1 从此提交切出 feat/materialized-exchange，先交付 native 物化 I/O 与提交基础。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -20,7 +20,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
 | P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1、P1.2 均已合入 |
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
-| P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1 实现与相关验收；P3.2、P3.3 待实现 |
+| P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
 | P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
 
@@ -65,7 +65,7 @@ P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新�
 - [x] 新图拒绝不支持能力，不借旧 PlanRunner 完成计划。
 - [x] 缓存键同时涵盖 engine、图与执行选项；本地提交不承担网络协议开销。
 
-实现见 [submission.py](vane/execution/submission.py) 与 [resource_demand.py](vane/execution/resource_demand.py)。内部 RayQuerySpec 冻结当前内置 SQL 子集的 session、source、资源和结果描述；worker 先检查能力，再恢复查询独占连接并对照 native 载荷。不可变计划蓝图不代表已经准入或拥有可恢复的 exchange store。普通 Parquet 只提供固定成员与大小/修改时间检查，允许 pipelined 准备，明确拒绝 FTE；真正不可变的 source 版本另行接入。[详细保证](PIPELINED_EXECUTION_DESIGN.md#ray-提交描述与-worker-准备)见设计文档。
+实现见 [submission.py](vane/execution/submission.py) 与 [resource_demand.py](vane/execution/resource_demand.py)。内部 RayQuerySpec 冻结当前内置 SQL 子集的 session、source、资源和结果描述；worker 先检查能力，再恢复查询独占连接并对照 native 载荷。不可变计划蓝图不代表已经准入或拥有可恢复的 exchange store。普通 Parquet 的纯准备入口只提供固定成员与大小/修改时间检查，允许 pipelined，拒绝直接声明为 FTE；P3 已通过文件 staging 和独立 snapshot codec 接通公开 FTE。[详细保证](PIPELINED_EXECUTION_DESIGN.md#ray-提交描述与-worker-准备)见设计文档。
 
 P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划描述，完整往返与能力校验通过，构图无执行副作用。仅完成 P0.1/P0.2 不标记整个 P0 完成。
 
@@ -134,28 +134,44 @@ P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端
 - [x] 校验对象长度、SHA-256、schema 和封存记录；缺失或损坏明确失败。
 - [x] 显式 attempt 清理、query 对象所有权和 ReadLease；失败清理保留存储配额。
 
-实现见 [native I/O](src/vane_py/execution/materialized_exchange.cpp)、[manifest](vane/execution/materialized_exchange.py) 与 [store/commit](vane/execution/materialized_store.py)。共享目录必须由部署方提供独立于计算 worker 的故障域；身份 marker 无法自动验证底层挂载的物理可靠性。这些是内部设施，尚未注册到公开 FTE 入口，也不代表已具备自动重试或全路径资源准入。
+实现见 [native I/O](src/vane_py/execution/materialized_exchange.cpp)、[manifest](vane/execution/materialized_exchange.py) 与 [store/commit](vane/execution/materialized_store.py)。共享目录必须由部署方提供独立于计算 worker 的故障域；身份 marker 无法自动验证底层挂载的物理可靠性。P3.2/P3.3 已将这些设施接入公开 FTE、重试和共享资源准入。
 
 验收：原生 fragment 写入后杀死生产进程，封存输出仍可提交和读取；封存前退出只留下不可提交的私有输出，丢弃后可用同一输入身份重放。单线程和四线程的共同 TaskRuntime 能消费物化输入。并发重复提交、迟到 attempt、校验期间取消/重试、空分区、对象损坏及清理失败均有定向测试。
 
-P3.1 本地相关验证为 **283 passed**：物化 I/O/提交 56、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray pipelined 13。非 editable 安装中的 277 个 Python/类型文件与 checkout 一致，native 与增量 Release 构建产物一致；格式、Ruff、全仓库 mypy 和源码版权清单通过。未运行完整 release/fast 套件。随后继续在本分支实现 P3.2/P3.3。
+P3.1 本地相关验证为 **283 passed**：物化 I/O/提交 56、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray pipelined 13。非 editable 安装中的 277 个 Python/类型文件与 checkout 一致，native 与增量 Release 构建产物一致；格式、Ruff、全仓库 mypy 和源码版权清单通过。未运行完整 release/fast 套件。这是 P3.1 阶段记录；P3 完整验收记录见下文。
 
 ### P3.2 不可变数据源与重放准备
 
-- [ ] 为文件 scan 接入不可变数据源版本或受查询生命周期保护的 staging；重试仍可读到同一份输入。
-- [ ] 冻结优化阶段依赖的数据源，在 worker 准备与重试时恢复同一连接/source 快照。
-- [ ] 将逻辑 task 的固定 split 与已提交上游 StageManifest 组成可验证的输入身份。
+- [x] 为文件 scan 接入不可变数据源版本或受查询生命周期保护的 staging；重试仍可读到同一份输入。
+- [x] 冻结优化阶段依赖的数据源，在 worker 准备与重试时恢复同一连接/source 快照。
+- [x] 将逻辑 task 的固定 split 与已提交上游 StageManifest 组成可验证的输入身份。
 
 ### P3.3 恢复调度与公开结果
 
-- [ ] 注册并验证 exchange store，接通 worker、native 物化 binding、存储和 staging/I/O 准入。
-- [ ] StageManifest 封闭后才调度下游；重试时复用固定输入与 split。
-- [ ] RecoveryScheduler 的失败分类、重试上限、退避与共享 deadline。
-- [ ] ResultManifest 发布后才交付 FTE 结果。
-- [ ] 取消和清理期限、失联查询的有限 lease 与 orphan 回收。
-- [ ] 接通公开 ray/fte QueryResult，在真实 Ray worker 故障下验收。
+- [x] 注册并验证 exchange store，接通 worker、native 物化 binding、存储和 staging/I/O 准入。
+- [x] StageManifest 封闭后才调度下游；重试时复用固定输入与 split。
+- [x] RecoveryScheduler 的失败分类、重试上限、退避与共享 deadline。
+- [x] ResultManifest 发布后才交付 FTE 结果。
+- [x] 取消和清理期限、失联查询的有限 lease 与 orphan 回收。
+- [x] 接通公开 ray/fte QueryResult，在真实 Ray worker 故障下验收。
+
+实现见 [文件冻结](src/vane_py/execution/file_snapshot.cpp)、[固定输入绑定](vane/execution/fte_plan.py)、[共享存储准入](vane/execution/fte_store.py)、[native attempt owner](vane/execution/fte_worker.py) 和 [RecoveryScheduler](vane/execution/recovery_runtime.py)。公开 `vane.ExchangeStore` 注册到 `RayResources.exchange_stores`；`FteOptions` 指定 store、attempt 上限与退避。同一会话可并发运行 pipelined/FTE，共用 worker 和资源计费。
+
+文件冻结发生在优化前，保留被剪枝的数据源；重试只读取 SHA-256 验证的副本，Hive 路径语义保留。动态路径、虚拟 filename/file_index、未支持的 scan/算子/type 明确拒绝。共享存储须由部署方提供独立故障域、原子文件操作、锁、sync 与同步时钟；marker 只校验身份和可见性。
+
+查询租约与 native I/O 锁共同保护对象，过期 lease 不会使仍有 native 读写者的目录被删除。全局存储计费记录独立于对象目录，失败清理保留配额；actor 死亡到实际进程退出之间有有限清理宽限。orphan 在活跃服务心跳、worker 清理或下次准入回收，也可显式运行 StorePool.collect_expired。coordinator 恢复和内核阻塞文件 I/O 的强制中止不在本阶段承诺内。
 
 验收：提交前 worker 丢失可重试；提交后 worker 丢失仍可读；迟到或重复提交不会重复输出；下游重试读取同一 manifest；对象永久丢失明确失败；全路径不调用旧 FTE 引擎。不实现 local FTE。
+
+### P3 完整验收
+
+本地分组运行受影响测试，共 **685 passed**：物化交换/提交 56、文件冻结 17、存储租约/配额 8、配置与放置 13、native 编译/提交描述 295、查询配置 45、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray FTE 24、真实 Ray pipelined 13。仅运行相关测试，未运行完整 release/fast 套件。
+
+真实 Ray 验收覆盖上游/下游 worker 丢失、提交后计算节点退出、重试耗尽、退避与原执行期限、原文件变更、HASH 阶段、空结果、取消和交付期限、已提交输入损坏/丢失、ResultService 丢失、两种策略并发与共享准入、独立于 native pump 的状态探测、三种 manifest 发布的确认丢失，以及真实 native worker 的租约过期和 orphan 清理。测试同时核对无重复行、固定输入身份、新 epoch/fence 及结束后的资源账本。
+
+C++ 已增量 Release 构建并非 editable 安装；281 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `346ef5b69e:fragment:39b1018536dc95747a225e38632714a553a2a550a6cfddb6a026a911a708b244`。root 格式、适用 pre-commit（含全仓库 mypy）、源码版权清单、文档本地链接及源码包检查通过。新增物化交换、文件冻结、存储和真实 Ray 恢复测试已加入 release launcher 与 sdist 清单；原有旧 FTE 测试保留到 P5 迁移阶段。
+
+P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、调度公平性和诊断扩展。本地验证平台为 Linux；macOS/Windows 构建与运行仍由 CI 验证。
 
 ## P4 分析与混跑
 
@@ -361,7 +377,7 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增测试已加入 release launcher 和源码包清单。当前 SQL/type 范围延续 P0，原生传输支持 basic types；SQL 参数、聚合/join、模型 UDF 和 FTE 尚未接线。Parquet 使用 worker 共同可访问的绝对路径；客户端须能访问 ResultService 公布的节点地址和动态端口。
 - root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。本地构建与测试平台为 Linux；其余平台交由 CI 验证。
 
-P2 退出条件已满足。下一步为 P3：在同一 FragmentGraph、worker 身份与 QueryResult 契约上实现物化 exchange、原子提交和失败重试。
+P2 退出条件已满足；后续 P3 已在同一 FragmentGraph、worker 身份与 QueryResult 契约上实现物化 exchange、原子提交和失败重试。
 
 ### P2 状态监控审查修复（PR #962）
 

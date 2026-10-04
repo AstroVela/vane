@@ -70,13 +70,13 @@ def test_ticket_capability_is_not_in_repr():
 def test_ray_api_explicit_configuration():
     with vane.connect(backend="ray") as connection:
         assert connection.query_runtime.backend == "ray"
-        with pytest.raises(NotImplementedError, match="P3"):
+        with pytest.raises(ValueError, match="ExchangeStore"):
             connection.query("select 1", execution="fte")
         with pytest.raises(NotImplementedError, match="parameters"):
             connection.query("select ?", [1])
     with pytest.raises(TypeError, match="RayResources"):
         vane.connect(backend="ray", resources=vane.QueryResources())
-    with pytest.raises(NotImplementedError, match="P3"):
+    with pytest.raises(ValueError, match="ExchangeStore"):
         vane.connect(backend="ray", execution="fte")
     with pytest.raises(vane.InvalidInputException):
         vane.connect(":default:", backend="ray")
