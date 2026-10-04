@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +14,9 @@ import numpy as np
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 from numpy.typing import NDArray
 
+from vane._image import _MODE_CHANNELS, _MODE_DTYPES, _image_arrow_scalar_to_numpy, _ImageArrowType
 from vane.execution._udf_validation import ensure_synchronous_udf_result
+from vane.execution.udf_file_contract import _native_outputs_to_arrow_array, validate_file_arrow_array
 from vane.execution.udf_output_schema import (
     _arrow_type_from_output_schema_entry,
     _fixed_shape_tensor_array,
@@ -27,6 +30,7 @@ VALID_BATCH_FORMATS = frozenset({"pyarrow", "numpy", "pandas", "cudf"})
 class _OutputColumnSchema:
     name: str
     tensor_type: pa.DataType | None
+    image_dtype: Any = None
 
 
 _OutputSchema = tuple[_OutputColumnSchema, ...]
@@ -39,15 +43,22 @@ def normalize_batch_format(value: Any) -> str:
     return value
 
 
-def format_udf_input(table: pa.Table, batch_format: str) -> Any:
+def format_udf_input(table: pa.Table, batch_format: str, *, zero_copy_batch: bool = True) -> Any:
     """Convert an internal Arrow table to the exact format requested by a UDF."""
     batch_format = normalize_batch_format(batch_format)
+    if type(zero_copy_batch) is not bool:
+        raise TypeError("zero_copy_batch must be a bool")
+    if not zero_copy_batch and batch_format != "numpy":
+        raise ValueError("zero_copy_batch=False requires batch_format='numpy'")
     if batch_format == "pyarrow":
         return table
 
     _require_unique_column_names(table.schema.names, batch_format)
     if batch_format == "numpy":
-        return {name: _arrow_column_to_numpy(table.column(index)) for index, name in enumerate(table.schema.names)}
+        return {
+            name: _numpy_input_buffers(_arrow_column_to_numpy(table.column(index)), zero_copy_batch)
+            for index, name in enumerate(table.schema.names)
+        }
     if batch_format == "pandas":
         return _arrow_table_to_pandas(table)
     return _arrow_table_to_cudf(table)
@@ -80,7 +91,14 @@ def resolve_udf_output_schema(batch_format: str, output_schema: Any) -> _OutputS
         tensor_type = _arrow_type_from_output_schema_entry(entry) if kind == "tensor" else None
         if tensor_type is not None and not isinstance(tensor_type, pa.FixedShapeTensorType):
             raise TypeError(f"batch_format={batch_format!r} supports only fixed-shape tensor outputs")
-        columns.append(_OutputColumnSchema(name=name, tensor_type=tensor_type))
+        image_dtype = None
+        if kind == "duckdb_type":
+            import vane
+
+            dtype = vane.type(str(entry["type"]))
+            if dtype.is_image():
+                image_dtype = dtype
+        columns.append(_OutputColumnSchema(name=name, tensor_type=tensor_type, image_dtype=image_dtype))
     return tuple(columns)
 
 
@@ -174,11 +192,51 @@ def _is_fixed_shape_tensor(data_type: pa.DataType) -> bool:
     return getattr(data_type, "extension_name", None) == "arrow.fixed_shape_tensor"
 
 
+def _numpy_input_buffers(values: np.ndarray, zero_copy_batch: bool) -> np.ndarray:
+    """Expose read-only buffers, or detach all buffers for in-place UDF mutation."""
+    if not zero_copy_batch:
+        # Object columns can contain array views (lists, nullable tensors, images).
+        # A shallow ndarray.copy() would retain those shared, read-only buffers.
+        return copy.deepcopy(values) if values.dtype.hasobject else values.copy()
+    _freeze_numpy_buffers(values)
+    return values
+
+
+def _freeze_numpy_buffers(value: Any) -> None:
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            for item in value.flat:
+                _freeze_numpy_buffers(item)
+        if isinstance(value, np.ma.MaskedArray):
+            np.ma.getmaskarray(value).setflags(write=False)  # type: ignore[no-untyped-call]
+        value.setflags(write=False)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _freeze_numpy_buffers(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _freeze_numpy_buffers(item)
+
+
+def _single_arrow_array(column: pa.ChunkedArray) -> pa.Array:
+    return column.chunk(0) if column.num_chunks == 1 else column.combine_chunks()
+
+
+def _tensor_numpy_view(array: pa.FixedShapeTensorArray) -> np.ndarray:
+    # Arrow's tensor conversion ignores an offset on the primitive child array.
+    # Compact that layout before converting; ordinary parent slices stay views.
+    if array.storage.values.offset:
+        array = pa.concat_arrays([array])
+    return array.to_numpy_ndarray()
+
+
 def _arrow_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
-    array = column.combine_chunks()
+    if isinstance(column.type, _ImageArrowType):
+        return _image_column_to_numpy(column)
+    array = _single_arrow_array(column)
     if not _is_fixed_shape_tensor(array.type):
         if array.null_count == 0:
-            return np.array(array.to_numpy(zero_copy_only=False), copy=True)
+            return array.to_numpy(zero_copy_only=False)
         valid = array.is_valid().to_numpy(zero_copy_only=False)
         valid_array = array.filter(pa.array(valid))
         valid_values = valid_array.to_numpy(zero_copy_only=False)
@@ -190,20 +248,51 @@ def _arrow_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
             copy=False,
         )
 
-    dense = array.to_numpy_ndarray()
+    dense = _tensor_numpy_view(array)
     if array.null_count == 0:
-        return np.array(dense, copy=True)
+        return dense
 
     valid = array.is_valid().to_numpy(zero_copy_only=False)
     nullable: NDArray[np.object_] = np.empty(len(array), dtype=object)
     for index, is_valid in enumerate(valid):
-        nullable[index] = np.array(dense[index], copy=True) if is_valid else None
+        nullable[index] = dense[index] if is_valid else None
     return nullable
+
+
+def _image_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
+    import vane
+
+    image_type = column.type
+    dtype = vane.image_type(image_type.mode, image_type.height, image_type.width)
+    for chunk in column.chunks:
+        validate_file_arrow_array(chunk, dtype, boundary="map_batches IMAGE input")
+    if image_type.height is not None and column.null_count == 0:
+        shape = (len(column), image_type.height, image_type.width, _MODE_CHANNELS[image_type.mode])
+        if len(column) == 0:
+            return np.empty(shape, dtype=_MODE_DTYPES[image_type.mode])
+        storage = _single_arrow_array(column).storage
+        size = storage.type.list_size
+        pixels = storage.values.slice(storage.offset * size, len(storage) * size)
+        return pixels.to_numpy().reshape(shape)
+
+    # Variable-size images cannot share one dense batch shape. Keep each row's
+    # HWC shape and mode-specific dtype, including mixed modes in generic IMAGE.
+    rows: NDArray[np.object_] = np.empty(len(column), dtype=object)
+    index = 0
+    for chunk in column.chunks:
+        for scalar in chunk:
+            rows[index] = _image_arrow_scalar_to_numpy(scalar, dtype, copy=False) if scalar.is_valid else None
+            index += 1
+    return rows
 
 
 def _arrow_table_to_pandas(table: pa.Table) -> Any:
     pandas = _import_pandas()
-    tensor_indices = [index for index, field in enumerate(table.schema) if _is_fixed_shape_tensor(field.type)]
+    tensor_indices = [
+        index
+        for index, field in enumerate(table.schema)
+        if _is_fixed_shape_tensor(field.type) or isinstance(field.type, _ImageArrowType)
+    ]
     if not tensor_indices:
         return _arrow_regular_table_to_pandas(table, pandas)
 
@@ -214,9 +303,15 @@ def _arrow_table_to_pandas(table: pa.Table) -> Any:
     else:
         frame = pandas.DataFrame(index=pandas.RangeIndex(table.num_rows))
     for index, field in enumerate(table.schema):
-        if not _is_fixed_shape_tensor(field.type):
+        if index not in tensor_index_set:
             continue
-        tensor_values = _tensor_column_to_object_array(table.column(index))
+        if isinstance(field.type, _ImageArrowType):
+            values = _image_column_to_numpy(table.column(index))
+            tensor_values: NDArray[np.object_] = np.empty(len(values), dtype=object)
+            for row, value in enumerate(values):
+                tensor_values[row] = None if value is None else value.copy()
+        else:
+            tensor_values = _tensor_column_to_object_array(table.column(index))
         frame.insert(index, field.name, pandas.Series(tensor_values, index=frame.index, dtype=object))
     return frame
 
@@ -231,8 +326,8 @@ def _arrow_regular_table_to_pandas(table: pa.Table, pandas: Any) -> Any:
 
 
 def _tensor_column_to_object_array(column: pa.ChunkedArray) -> np.ndarray:
-    array = column.combine_chunks()
-    dense = array.to_numpy_ndarray()
+    array = _single_arrow_array(column)
+    dense = _tensor_numpy_view(array)
     valid = array.is_valid().to_numpy(zero_copy_only=False) if array.null_count else None
     values: NDArray[np.object_] = np.empty(len(array), dtype=object)
     for index in range(len(array)):
@@ -267,6 +362,8 @@ def _numpy_batch_to_arrow(batch: dict[Any, Any], schema: _OutputSchema) -> pa.Ta
 
 
 def _numpy_column_to_arrow(value: np.ndarray, column_schema: _OutputColumnSchema) -> pa.Array:
+    if column_schema.image_dtype is not None:
+        return _image_values_to_arrow(value, column_schema)
     if column_schema.tensor_type is not None:
         return _tensor_values_to_arrow(value, column_schema)
     if value.ndim != 1:
@@ -279,11 +376,21 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
     arrays = []
     for column_schema in schema:
         series = frame[column_schema.name]
-        if column_schema.tensor_type is not None:
+        if column_schema.image_dtype is not None:
+            arrays.append(_image_values_to_arrow(series.tolist(), column_schema))
+        elif column_schema.tensor_type is not None:
             arrays.append(_tensor_values_to_arrow(series.tolist(), column_schema))
         else:
             arrays.append(pa.array(series, from_pandas=True))
     return pa.Table.from_arrays(arrays, names=[column.name for column in schema])
+
+
+def _image_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> pa.Array:
+    if isinstance(values, np.ma.MaskedArray):
+        raise TypeError("IMAGE output must use HWC ndarrays or None, not MaskedArray")
+    return _native_outputs_to_arrow_array(
+        list(values), column_schema.image_dtype, boundary=f"map_batches IMAGE output column {column_schema.name!r}"
+    )
 
 
 def _cudf_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:

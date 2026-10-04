@@ -55,7 +55,7 @@ def test_numpy_batch_format_runtime_round_trip_preserves_tensor_shape():
     def transform(batch):
         assert set(batch) == {"x", "embedding"}
         assert all(isinstance(column, np.ndarray) for column in batch.values())
-        assert all(column.flags.writeable for column in batch.values())
+        assert all(not column.flags.writeable for column in batch.values())
         assert batch["embedding"].shape == (3, 2, 2)
         return {"x": batch["x"] + 10, "embedding": batch["embedding"] * np.float32(2)}
 
@@ -401,6 +401,7 @@ def test_actor_formats_convert_on_owner_and_reuse_serial_worker(monkeypatch, bac
     payload.update(
         execution_backend=backend, batch_size=2, stream_output=stream_output, preserve_compute_batch_boundaries=True
     )
+    payload["zero_copy_batch"] = batch_format != "numpy"
     runtime = UDFExecutor(payload)
     model = runtime._map_fn
     table = _tensor_input_table()
@@ -465,6 +466,7 @@ def test_actor_formats_public_map_batches(request, monkeypatch, backend, batch_f
                 Model,
                 schema={"x": vane.sqltypes.BIGINT},
                 batch_format=batch_format,
+                zero_copy_batch=batch_format != "numpy",
                 batch_size=2,
                 execution_backend=backend,
                 actor_number=1,

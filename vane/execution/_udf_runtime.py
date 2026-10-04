@@ -531,6 +531,11 @@ class UDFExecutor:
             if self._call_mode == "map_batches"
             else "pyarrow"
         )
+        self._zero_copy_batch = payload.get("zero_copy_batch", True)
+        if type(self._zero_copy_batch) is not bool:
+            raise TypeError("zero_copy_batch must be a bool")
+        if not self._zero_copy_batch and self._batch_format != "numpy":
+            raise ValueError("zero_copy_batch=False requires batch_format='numpy'")
         self._batch_output_schema = (
             _resolve_udf_output_schema(self._batch_format, output_schema) if self._batch_format != "pyarrow" else None
         )
@@ -726,7 +731,11 @@ class UDFExecutor:
     def _invoke_map_batch(self, batch: pa.Table) -> Any:
         # Adapt each compute batch on the actor owner before handing it to the
         # serial worker. Both runners use this same conversion boundary.
-        udf_batch = _format_udf_input(batch, self._batch_format) if self._is_map_batches else batch
+        udf_batch = (
+            _format_udf_input(batch, self._batch_format, zero_copy_batch=self._zero_copy_batch)
+            if self._is_map_batches
+            else batch
+        )
         if self._actor_callable is not None:
             return self._actor_callable(self._map_fn, udf_batch)
         return ensure_synchronous_udf_result(self._map_fn(udf_batch))

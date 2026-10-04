@@ -334,8 +334,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	relation_module.def(
 	    "map_batches",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema, const string &batch_format,
-	       const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
-	       const Optional<py::object> &min_task_batch_size,
+	       const py::object &zero_copy_batch, const Optional<py::object> &batch_size,
+	       const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
 	       const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
 	       const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
 	       const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
@@ -343,16 +343,22 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	       const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes,
 	       py::kwargs kwargs) {
 		    RejectMapBatchesUnsupportedKwargs(kwargs);
-		    return self.MapBatches(fun, schema, batch_format, batch_size, output_batch_size, min_task_batch_size,
-		                           preserve_compute_batch_boundaries, cpus, gpus, memory_bytes, execution_backend,
-		                           actor_number, ray_actor_thread_policy, target_max_batch_bytes, task_input_max_bytes,
-		                           output_target_max_bytes);
+		    return self.MapBatches(fun, schema, batch_format, zero_copy_batch, batch_size, output_batch_size,
+		                           min_task_batch_size, preserve_compute_batch_boundaries, cpus, gpus, memory_bytes,
+		                           execution_backend, actor_number, ray_actor_thread_policy, target_max_batch_bytes,
+		                           task_input_max_bytes, output_target_max_bytes);
 	    },
 	    "Apply a Python function or callable class to batches of rows. batch_format selects pyarrow.Table, "
 	    "dict[str, numpy.ndarray], pandas.DataFrame, or cudf.DataFrame input and output. Non-null fixed-shape tensor "
-	    "columns are N-D arrays in NumPy batches; nullable tensor columns are object arrays containing per-row "
-	    "ndarrays or None. pandas tensor columns use per-row ndarrays. Nullable ordinary NumPy columns use "
-	    "numpy.ma.MaskedArray. NumPy, pandas and cuDF outputs must use the selected format. The default pyarrow "
+	    "columns are N-D arrays in NumPy batches; non-null fixed-size IMAGE columns are NHWC arrays. Nullable "
+	    "tensor/IMAGE columns and variable-size IMAGE columns are object arrays of per-row ndarrays or None. "
+	    "IMAGE pixels retain their mode-specific dtype without resizing or color conversion. pandas tensor/IMAGE "
+	    "columns use per-row ndarrays. Nullable ordinary NumPy columns use numpy.ma.MaskedArray. "
+	    "zero_copy_batch=True (default) exposes read-only NumPy input buffers, sharing Arrow storage where "
+	    "possible; merging chunks, converting dtypes and normalizing tensor child offsets can allocate. "
+	    "Set zero_copy_batch=False with batch_format='numpy' for detached writable input arrays. "
+	    "NumPy and pandas IMAGE outputs must contain HWC ndarrays or None. "
+	    "NumPy, pandas and cuDF outputs must use the selected format. The default pyarrow "
 	    "format also accepts existing dict outputs. Retrying Task and Actor "
 	    "backends may replay "
 	    "a call after failure; exactly-once execution is not provided, so external effects must be idempotent. "
@@ -360,12 +366,13 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
 	    "failures may reconstruct an Actor and reset its local state.",
 	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_format") = "pyarrow",
-	    py::arg("batch_size") = py::none(), py::arg("output_batch_size") = py::none(),
-	    py::arg("min_task_batch_size") = py::none(), py::arg("preserve_compute_batch_boundaries") = py::none(),
-	    py::arg("cpus") = py::none(), py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(),
-	    py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
-	    py::arg("ray_actor_thread_policy") = py::none(), py::arg("target_max_batch_bytes") = py::none(),
-	    py::arg("task_input_max_bytes") = py::none(), py::arg("output_target_max_bytes") = py::none());
+	    py::arg("zero_copy_batch") = py::bool_(true), py::arg("batch_size") = py::none(),
+	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
+	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),
+	    py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(), py::arg("execution_backend") = py::none(),
+	    py::arg("actor_number") = py::none(), py::arg("ray_actor_thread_policy") = py::none(),
+	    py::arg("target_max_batch_bytes") = py::none(), py::arg("task_input_max_bytes") = py::none(),
+	    py::arg("output_target_max_bytes") = py::none());
 	relation_module.def(
 	    "flat_map",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
