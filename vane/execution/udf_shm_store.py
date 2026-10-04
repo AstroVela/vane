@@ -15,11 +15,13 @@ import atexit
 import mmap
 import os
 import queue
+import select
 import socket
 import struct
 import threading
 import uuid
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from itertools import count
 from typing import Any
 
@@ -30,10 +32,114 @@ _registry_lock = threading.RLock()
 _stores: dict[str, LocalShmStore] = {}
 _current_store: LocalShmStore | None = None
 _worker_client: WorkerShmClient | None = None
+# Always acquire this after registry/store locks. Fork preparation takes only
+# this lock, so a different thread holding a public store lock cannot block it.
+_fork_lock = threading.RLock()
+_fork_holds: set[_ForkHold] = set()
+_pending_fork: _ForkHold | None = None
+_inherited_fork_writers: set[int] = set()
+
+
+class _ForkHold:
+    def __init__(self) -> None:
+        self.stores: list[LocalShmStore] = []
+        self.read_fd: int | None = None
+        self.write_fd: int | None = None
+        self.alive = True
+        self.watching = False
+
+    def is_alive(self) -> bool:
+        # Called under _fork_lock. An incomplete fork notification setup must
+        # retain its pins: at-fork callback errors do not cancel os.fork().
+        if not self.alive or self.read_fd is None:
+            return self.alive
+        poller = select.poll()
+        poller.register(self.read_fd, select.POLLIN | select.POLLHUP)
+        if poller.poll(0):
+            if os.read(self.read_fd, 1) != b"":
+                raise RuntimeError("unexpected fork lifetime notification")
+            self.alive = False
+            if not self.watching:
+                self.close_reader()
+        return self.alive
+
+    def close_reader(self) -> None:
+        if self.read_fd is not None:
+            os.close(self.read_fd)
+            self.read_fd = None
+        _fork_holds.discard(self)
+
+
+def _pin_stores_before_fork() -> None:
+    global _pending_fork
+    _fork_lock.acquire()
+    hold = _ForkHold()
+    _pending_fork = hold
+    for store in _stores.values():
+        pinned = False
+        for generation, entry in store._live.items():
+            if entry.refs:
+                entry.forks.append(hold)
+                store._forked[generation] = entry
+                pinned = True
+        if pinned:
+            hold.stores.append(store)
+    if hold.stores:
+        _fork_holds.add(hold)
+        # Pins are installed before allocating descriptors. If pipe creation
+        # fails, they remain owned until process exit instead of risking reuse.
+        hold.read_fd, hold.write_fd = os.pipe()
+
+
+def _watch_fork_exit(hold: _ForkHold) -> None:
+    assert hold.read_fd is not None
+    if os.read(hold.read_fd, 1) != b"":
+        raise RuntimeError("unexpected fork lifetime notification")
+    with _fork_lock:
+        hold.alive = False
+        hold.close_reader()
+    error: Exception | None = None
+    for store in hold.stores:
+        try:
+            store.drain_if_idle()
+        except Exception as exc:
+            # Stores retain failed cleanup for retry; try every owned store.
+            if error is None:
+                error = exc
+    if error is not None:
+        raise error
+
+
+def _resume_parent_after_fork() -> None:
+    global _pending_fork
+    try:
+        hold, _pending_fork = _pending_fork, None
+        if hold is not None and hold.write_fd is not None:
+            os.close(hold.write_fd)
+            hold.write_fd = None
+            hold.watching = True
+            try:
+                threading.Thread(target=_watch_fork_exit, args=(hold,), name="vane-shm-fork-exit", daemon=True).start()
+            except BaseException:
+                # Allocation/drain paths can still observe EOF synchronously.
+                hold.watching = False
+                raise
+    finally:
+        _fork_lock.release()
 
 
 def _reset_registry_after_fork() -> None:
-    global _registry_pid, _registry_lock, _stores, _current_store
+    global _registry_pid, _registry_lock, _stores, _current_store, _fork_lock, _fork_holds, _pending_fork
+    if _pending_fork is not None and _pending_fork.write_fd is not None:
+        # Keep the writer through normal exit, _exit, signals and further
+        # forks. CLOEXEC releases it when exec discards inherited mappings.
+        _inherited_fork_writers.add(_pending_fork.write_fd)
+    for hold in _fork_holds:
+        if hold.read_fd is not None:
+            os.close(hold.read_fd)
+    _fork_holds = set()
+    _pending_fork = None
+    _fork_lock = threading.RLock()
     # Free lists and locks are process-local even though their backing mmap is
     # shared. Discard inherited registry state without closing parent arenas.
     _registry_lock = threading.RLock()
@@ -49,7 +155,11 @@ def _require_registry_owner() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_registry_after_fork)
+    os.register_at_fork(
+        before=_pin_stores_before_fork,
+        after_in_parent=_resume_parent_after_fork,
+        after_in_child=_reset_registry_after_fork,
+    )
 
 
 class LocalShmStoreCapacityError(RuntimeError):
@@ -93,6 +203,7 @@ class _LiveAllocation:
     allocation: ShmAllocation
     capacity: int
     refs: int = 1
+    forks: list[_ForkHold] = dataclass_field(default_factory=list)
 
 
 class StoreLease:
@@ -136,6 +247,7 @@ class LocalShmStore:
         self._shm: Any = None
         self._free = [(0, capacity)]
         self._live: dict[int, _LiveAllocation] = {}
+        self._forked: dict[int, _LiveAllocation] = {}
         self._generations = count(1)
         self._clients: set[str] = set()
         self._closed = False
@@ -143,7 +255,7 @@ class LocalShmStore:
         self._allocations = 0
         self._reused_allocations = 0
         self._high_water = 0
-        with _registry_lock:
+        with _registry_lock, _fork_lock:
             _stores[self.store_id] = self
 
     def _require_owner(self) -> None:
@@ -162,7 +274,8 @@ class LocalShmStore:
     def remove_client(self, client_id: str) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock:
+        with self._lock, _fork_lock:
+            self._collect_fork_pins_locked()
             self._clients.discard(client_id)
             if not self._clients:
                 self._drain_locked()
@@ -177,7 +290,8 @@ class LocalShmStore:
         # image batch when its successor grows by only a few bytes.
         alignment = 1 << max(6, (size - 1).bit_length() - 5)
         required = (size + alignment - 1) // alignment * alignment
-        with self._lock:
+        with self._lock, _fork_lock:
+            self._collect_fork_pins_locked()
             if self._closed:
                 raise RuntimeError("shared-memory store is closed")
             index = next((i for i, (_, length) in enumerate(self._free) if length >= required), None)
@@ -214,7 +328,7 @@ class LocalShmStore:
 
     def acquire(self, allocation: ShmAllocation) -> StoreLease:
         self._require_owner()
-        with self._lock:
+        with self._lock, _fork_lock:
             entry = self._require_locked(allocation)
             entry.refs += 1
             return StoreLease(self, allocation)
@@ -222,26 +336,45 @@ class LocalShmStore:
     def release(self, allocation: ShmAllocation) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock:
+        with self._lock, _fork_lock:
+            self._collect_fork_pins_locked()
             entry = self._require_locked(allocation)
-            if entry.refs > 1:
-                entry.refs -= 1
-                return
-            del self._live[allocation.generation]
-            self._free.append((allocation.offset, entry.capacity))
-            merged: list[tuple[int, int]] = []
-            for start, length in sorted(self._free):
-                if merged and sum(merged[-1]) == start:
-                    previous, capacity = merged.pop()
-                    merged.append((previous, capacity + length))
-                else:
-                    merged.append((start, length))
-            self._free = merged
+            if not entry.refs:
+                raise ValueError("shared-memory allocation lease already released")
+            entry.refs -= 1
+            if not entry.refs and not entry.forks:
+                self._free_allocation_locked(entry)
+
+    def _free_allocation_locked(self, entry: _LiveAllocation) -> None:
+        del self._live[entry.allocation.generation]
+        self._free.append((entry.allocation.offset, entry.capacity))
+        merged: list[tuple[int, int]] = []
+        for start, length in sorted(self._free):
+            if merged and sum(merged[-1]) == start:
+                previous, capacity = merged.pop()
+                merged.append((previous, capacity + length))
+            else:
+                merged.append((start, length))
+        self._free = merged
+
+    def _collect_fork_pins_locked(self) -> bool:
+        if not self._forked:
+            return False
+        freed = False
+        for generation, entry in list(self._forked.items()):
+            entry.forks = [hold for hold in entry.forks if hold.is_alive()]
+            if not entry.forks:
+                del self._forked[generation]
+                if not entry.refs:
+                    self._free_allocation_locked(entry)
+                    freed = True
+        return freed
 
     def drain_if_idle(self) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock:
+        with self._lock, _fork_lock:
+            self._collect_fork_pins_locked()
             if not self._clients:
                 self._drain_locked()
 
@@ -293,14 +426,17 @@ class LocalShmStore:
     def close(self) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock:
+        with self._lock, _fork_lock:
+            self._collect_fork_pins_locked()
             if self._clients:
                 raise RuntimeError("shared-memory store still has live worker clients")
             self._drain_locked()
 
     def snapshot(self) -> dict[str, int]:
         self._require_owner()
-        with self._lock:
+        with self._lock, _fork_lock:
+            if self._collect_fork_pins_locked() and not self._clients:
+                self._drain_locked()
             live = sum(entry.capacity for entry in self._live.values())
             return {
                 "capacity_bytes": self.capacity,
@@ -323,9 +459,10 @@ def current_store(client_id: str) -> LocalShmStore:
             with _current_store._lock:
                 if not _current_store._clients and not _current_store._live:
                     _current_store.close()
-        for key, store in list(_stores.items()):
-            if store._closed:
-                del _stores[key]
+        with _fork_lock:
+            for key, store in list(_stores.items()):
+                if store._closed:
+                    del _stores[key]
         # Retirement can race with this lookup. add_client() checks and pins
         # under the store lock, so failure means we must create a new arena.
         if _current_store is not None and _current_store.add_client(client_id):

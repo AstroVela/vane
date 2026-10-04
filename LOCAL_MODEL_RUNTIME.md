@@ -1466,6 +1466,18 @@ list. Parent-owned results and already materialized views keep their existing
 ownership and cleanup rules. Worker-peer cleanup also checks its creator PID
 before taking locks or shutting down the release channel, so inherited executor
 finalizers cannot close the parent's live channel when a fork child exits.
+Before a driver forks, its live allocations gain process-lifetime pins. The
+parent cannot reuse these regions or decommit their pages after releasing its
+own Arrow or NumPy views. An inherited pipe writer keeps the pins alive until
+the child and any inheriting descendants exit or replace their address space
+with `exec`; this includes normal exit, `os._exit()`, and signal termination.
+These pins conservatively last for the inheriting processes' lifetimes even if
+they drop the views earlier, and count against the physical arena capacity.
+Allocation and cleanup paths collect completed pins synchronously; a background
+watcher also drains idle stores. Fork preparation uses a separate allocation
+mutation lock without acquiring registry, store, or lease locks. If notification
+setup fails, the affected regions remain pinned until owner-process exit, rather
+than being reused without proof that inherited views are gone.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
