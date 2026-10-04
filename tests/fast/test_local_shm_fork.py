@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Forked drivers must not allocate from a parent's copied arena free list."""
+"""Forked drivers must preserve the parent's arenas and worker channels."""
 
 import json
 import os
@@ -227,3 +227,114 @@ def test_forked_child_rejects_inherited_handles_before_taking_locks(held_lock):
     )
     assert child.returncode == 0, child.stdout + child.stderr
     assert json.loads(child.stdout) == {"rejected": 6, "parent_intact": True}
+
+
+_WORKER_EXIT_FINALIZER = """
+import atexit, json, os, select, signal, sys, threading
+from pathlib import Path
+fork_child = False
+
+def finish_child_exit():
+    if fork_child:
+        # Register before Vane imports so the inherited executor finalizer
+        # must run before this callback. Skip only native-library teardown,
+        # which is unrelated to Python cleanup in a multithreaded fork.
+        os._exit(7 if worker._finalizer.alive else 0)
+
+atexit.register(finish_child_exit)
+import pyarrow as pa
+from vane import pickle as vane_pickle
+from vane.execution import udf_shm_store as storage
+from vane.execution.udf_subprocess import _SingleSubprocessExecutor
+
+def identity(table):
+    return table
+
+payload = {
+    'function_pickle': vane_pickle.dumps(identity),
+    'call_mode': 'map_batches',
+    'execution_backend': 'subprocess_task',
+    'produce_ref_bundle_output': True,
+    'streaming_output_mode': 'local_shm_ref_bundle',
+}
+worker = _SingleSubprocessExecutor(payload)
+peer = worker._shm_peer
+proc = worker._proc
+
+def submit(value):
+    worker.submit(pa.table({'x': [value]}))
+    result, finished = worker.take_ready_result()
+    assert finished is False
+    assert worker.take_ready_result() == (None, True)
+    try:
+        slot = result[1][0]._allocation_lease.allocation
+        return result[1][0].to_table().column(0).to_pylist(), slot.shm_name
+    finally:
+        for ref in result[1]:
+            ref.release()
+
+locked, unlock = threading.Event(), threading.Event()
+def hold_lock():
+    with peer._lock:
+        locked.set()
+        assert unlock.wait(15)
+
+thread = None
+try:
+    before, name = submit(11)
+    assert before == [11]
+    if sys.argv[1] == 'peer':
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        assert locked.wait(5)
+    pid = os.fork()
+    if pid == 0:
+        fork_child = True
+        signal.alarm(8)
+        # sys.exit runs weakref/atexit finalizers; os._exit here would miss
+        # the inherited peer's shutdown and the inherited-lock deadlock.
+        sys.exit(0)
+    unlock.set()
+    if thread is not None:
+        thread.join(5)
+        assert not thread.is_alive()
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, status
+    assert proc.poll() is None
+    # There are no borrowed inputs in this probe. EOF from shutdown would
+    # make this socket readable even if its reader has already consumed EOF.
+    assert not select.select([peer.sock], [], [], 0.1)[0], 'parent release channel closed'
+    peer.check()
+    after, next_name = submit(22)
+    assert after == [22]
+    assert next_name == name
+    assert worker._proc is proc
+    print(json.dumps({'after_fork': after, 'same_worker': True}), flush=True)
+finally:
+    if not fork_child:
+        unlock.set()
+        if thread is not None:
+            thread.join(5)
+        worker.close(kill=True)
+assert proc.poll() is not None
+assert peer._closed
+assert peer.sock.fileno() == -1
+assert not (Path('/dev/shm') / name).exists()
+snapshot = storage.local_shm_store_snapshot()
+assert snapshot['live_allocations'] == snapshot['mapped_capacity_bytes'] == 0
+"""
+
+
+@pytest.mark.parametrize("held_lock", ["none", "peer"])
+def test_fork_exit_finalizer_preserves_parent_worker_release_channel(held_lock):
+    child = subprocess.run(
+        [sys.executable, "-I", "-c", _WORKER_EXIT_FINALIZER, held_lock],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env={**os.environ, "VANE_LOCAL_SHM_STORE_BYTES": "1m"},
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert "Exception ignored" not in child.stderr
+    assert "Traceback" not in child.stderr
+    assert json.loads(child.stdout) == {"after_fork": [22], "same_worker": True}
