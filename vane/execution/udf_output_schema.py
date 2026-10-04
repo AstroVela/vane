@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -288,13 +288,15 @@ def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary
                 for field in dtype
             }
         if isinstance(value, tuple) and len(value) == len(dtype):
-            return tuple(
-                _canonicalize_struct_field_names(item, field.type, boundary=boundary)
+            # Inference recognizes mappings as STRUCTs; tuples infer as LISTs.
+            return {
+                field.name: _canonicalize_struct_field_names(item, field.type, boundary=boundary)
                 for item, field in zip(value, dtype, strict=True)
-            )
-    elif (pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype)) and isinstance(
-        value, (list, tuple, np.ndarray)
-    ):
+            }
+        raise TypeError("STRUCT values require a mapping or a matching positional tuple")
+    elif pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        if not isinstance(value, (Sequence, np.ndarray)) or isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("nested LIST/ARRAY values require a materialized sequence or ndarray")
         return [_canonicalize_struct_field_names(item, dtype.value_type, boundary=boundary) for item in value]
     return value
 
@@ -307,7 +309,7 @@ def _fixed_shape_tensor_array(values: NDArray[Any], dtype: pa.FixedShapeTensorTy
 
 
 def columns_to_output_table(result: Any, schema: pa.Schema, *, udf_name: str) -> pa.Table:
-    """Encode materialized columns on the actor thread without inferring types."""
+    """Encode tensors by declaration and preserve ordinary source types for DuckDB casts."""
 
     from vane._tensor import _NUMPY_DTYPES
 
@@ -355,12 +357,16 @@ def columns_to_output_table(result: Any, schema: pa.Schema, *, udf_name: str) ->
                         _canonicalize_struct_field_names(value, field.type, boundary=column_boundary)
                         for value in values
                     ]
-                array = pa.array(values if length else [], type=field.type)
+                # Typed Python-to-Arrow conversion can silently truncate floats
+                # or decode BLOBs with semantics different from DuckDB casts.
+                # Keep source types; the existing output contract normalizes
+                # lossless storage changes and leaves other casts to DuckDB.
+                array = pa.array(values) if length else pa.array([], type=field.type)
         except (TypeError, ValueError, OverflowError, pa.ArrowException):
             # Arrow error messages may include complete input values.
             raise ValueError(f"{column_boundary} could not encode {type(values).__name__}") from None
         arrays.append(array)
-    return pa.Table.from_arrays(arrays, schema=schema)
+    return pa.Table.from_arrays(arrays, names=schema.names)
 
 
 def empty_output_table_from_schema(output_schema: Any, *, output_contract_types: Any = None) -> pa.Table:
