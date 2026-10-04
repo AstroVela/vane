@@ -351,7 +351,10 @@ def empty_output_table_from_schema(output_schema: Any, *, output_contract_types:
     arrays = {}
     for index, entry in enumerate(entries):
         name = str(entry.get("name") or "")
-        if logical_table is not None and file_contract.output_types[index] is not None:
+        # FILE/IMAGE leaves need their logical storage. Ordinary columns and
+        # numeric tensors must use declared types, not inference from no rows.
+        dtype = file_contract.output_types[index] if logical_table is not None else None
+        if dtype is not None and _duckdb_pytype_contains_governed(dtype):
             arrays[name] = logical_table.column(index)
             continue
         try:

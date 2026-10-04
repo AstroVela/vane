@@ -16,8 +16,9 @@ There is no additional public UDF base class or user-owned executor.
   schema for top-level fixed-shape numeric tensors with primitive/list/struct
   siblings. This path requires exactly the declared columns and list, tuple
   or NumPy column values. Empty detections and zero rows preserve their types.
-- Tensors must match dtype and shape and use C-contiguous storage. There is no
-  implicit dtype conversion or pixel expansion through `tolist()`.
+- The default-format dict encoder requires tensors to match dtype and shape
+  and use C-contiguous storage. This encoder performs no implicit dtype
+  conversion or pixel expansion through `tolist()`.
 - Returned arrays transfer ownership to the output; do not overwrite them
   while downstream consumers may still use them. Arrow retains their owners
   after the worker closes. Raw results/Futures are not cached across batches.
@@ -84,8 +85,8 @@ ndarray or `None` per row; nullable ordinary columns use `numpy.ma.MaskedArray`
 so SQL NULL stays distinct from floating NaN. Pandas uses per-row ndarray
 tensor cells. NumPy inputs and pandas tensor cells own their mutable array
 storage; user mutation must not change the source Arrow buffers. Returned
-buffers must still remain unchanged while
-downstream consumes them. Tensor output shape is checked and existing safe
+buffers must still remain unchanged while downstream consumes them. Tensor
+output shape is checked and existing safe
 casts to the declared element type are retained. Variable-shape tensor output
 requires the Arrow format. Pandas/cuDF remain optional dependencies, and cuDF
 requires a compatible CUDA environment and Arrow conversion support.

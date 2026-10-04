@@ -79,19 +79,27 @@ def test_numpy_batch_format_runtime_round_trip_preserves_tensor_shape():
     )
 
 
-def test_numpy_batch_format_runtime_builds_declared_empty_output():
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+@pytest.mark.parametrize("stream_output", [False, True])
+def test_batch_format_runtime_builds_declared_empty_output(batch_format, stream_output):
     def drop_batch(_batch):
         return None
 
-    executor = UDFExecutor(
-        _runtime_payload(
-            drop_batch,
-            batch_format="numpy",
-            output_schema=[_duckdb_field("x", "BIGINT"), _tensor_field("embedding", "FLOAT", (2, 2))],
-        )
+    payload = _runtime_payload(
+        drop_batch,
+        batch_format=batch_format,
+        output_schema=[_duckdb_field("x", "BIGINT"), _tensor_field("embedding", "FLOAT", (2, 2))],
     )
-    executor.submit(_tensor_input_table())
-    result = executor.take_ready_result()
+    payload["stream_output"] = stream_output
+    executor = UDFExecutor(payload)
+    try:
+        if stream_output:
+            (result,) = executor.iter_submit(_tensor_input_table())
+        else:
+            executor.submit(_tensor_input_table())
+            result = executor.take_ready_result()
+    finally:
+        executor.close()
 
     assert result is not None
     assert result.num_rows == 0
