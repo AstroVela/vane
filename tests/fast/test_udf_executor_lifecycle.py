@@ -4183,15 +4183,19 @@ def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
-def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch, error_type):
+def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch, error_type, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
+    allocation = pooled_shm_worker.reserve_write(77, 128)
+    slot = pooled_shm_worker._writes[77].allocation
     descriptor = {
         "block_refs": [
             {
                 "provider": "local_shm",
-                "shm_name": "failed-result-shm",
+                "shm_name": f"{slot.identity}:0",
+                "allocation": allocation,
+                "allocation_offset": 0,
                 "ipc_size_bytes": 128,
             }
         ],
@@ -4201,6 +4205,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     }
     scope = ExecutionCancellationScope("test-executor", 1)
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._closed = False
     executor._broken_error = None
     executor._execution_scope_lock = threading.Lock()
@@ -4642,12 +4647,13 @@ def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
         executor.close(kill=True)
 
 
-def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch):
+def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     parent_sock, child_sock = subprocess_exec.socket.socketpair()
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._closed = False
     executor._broken_error = None
     executor._sock = parent_sock
@@ -4705,6 +4711,7 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
 
     events: list[object] = []
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._proc = None
     executor._sock = None
@@ -7459,6 +7466,7 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", synchronized_cancel)
 
     worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._shm_peer = None
     outer = object.__new__(subprocess_exec.UDFExecutor)
     outer._active_input_leases = {lease_id}
     outer._active_input_leases_lock = threading.Lock()
@@ -8601,6 +8609,7 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
 
 def _timeout_test_executor(subprocess_exec, sock):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._broken_error = None
     executor._sock = sock
@@ -8737,6 +8746,7 @@ def _decode_control_messages(data: bytes, header) -> list[tuple[int, bytes]]:
 
 def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._broken_error = None
     executor._actor_lost = False
@@ -8849,6 +8859,7 @@ def test_single_subprocess_reported_error_survives_unprintable_cleanup_failure(m
             raise RuntimeError("planned repr failure")
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
 
     def fail_cleanup(*_args, **_kwargs):
         raise _UnprintableCleanupError()
@@ -9047,7 +9058,7 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
     assert sock.closed
 
 
-def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds():
+def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds(pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
 
     class RetryableShutdownProcess:
@@ -9071,6 +9082,8 @@ def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds
 
     proc = RetryableShutdownProcess()
     executor = _bare_shutdown_executor(subprocess_exec, _FakeControlSocket(), proc)
+    executor._shm_peer = pooled_shm_worker
+    pooled_shm_worker.reserve_write(1, 64)
 
     with pytest.raises(RuntimeError, match="planned first kill failure"):
         executor.close(kill=True)
@@ -9078,15 +9091,19 @@ def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds
     assert executor._closed
     assert not executor._cleanup_finished
     assert executor._proc is proc
+    assert executor._shm_peer is pooled_shm_worker
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 1
 
     executor.close(kill=True)
 
     assert proc.kill_calls == 2
     assert executor._cleanup_finished
     assert executor._proc is None
+    assert executor._shm_peer is None
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 0
 
 
-def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
+def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane import pickle as vane_pickle
     from vane.execution import ref_bundle
@@ -9095,6 +9112,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     before = ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"]
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._queue = deque()
     executor._finished_submitting = False
     executor._closed = False
@@ -9202,6 +9220,7 @@ def test_single_subprocess_execution_scope_is_cleared_after_cleanup_failure():
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -9235,6 +9254,7 @@ def test_single_subprocess_execution_scope_releases_post_call_cancelled_result()
             released += 1
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     executor._cancel_scope_resources = lambda _scope, *, cancel_scope: None
@@ -9256,6 +9276,7 @@ def test_single_subprocess_execution_scope_is_cleared_when_wakeup_registration_f
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -9281,6 +9302,7 @@ def test_single_subprocess_cancel_wakeup_cleanup_failure_breaks_worker():
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -9390,14 +9412,14 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
         def drain_outputs(self):
             return [pa.table({"y": [1]})]
 
-    def fail_descriptor(_table, *, grant_id=None):
-        assert grant_id is None
+    def fail_descriptor(_blocks, *, allocation, grant_id):
+        assert grant_id == 99
         raise RuntimeError("descriptor failed")
 
-    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99})
+    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
-    monkeypatch.setattr(worker, "make_local_shm_descriptor_from_ipc", fail_descriptor)
+    monkeypatch.setattr(worker, "make_pooled_shm_descriptor", fail_descriptor)
 
     with pytest.raises(RuntimeError, match="descriptor failed"):
         worker._execute_submit(
@@ -9429,7 +9451,7 @@ def test_subprocess_worker_formats_fully_unprintable_exception():
     assert worker._format_exception(_UnprintableError()) == "<unprintable _UnprintableError>"
 
 
-def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):
+def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9443,7 +9465,9 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
                 pa.table({"payload": [b"b" * 64]}),
             ]
 
-    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101})
+    required = sum(worker.prepare_local_shm_block(t).ipc_size_bytes for t in FakeExecutor().drain_outputs())
+    allocation = pooled_shm_worker.reserve_write(101, required)
+    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101, "allocation": allocation})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
 
@@ -9497,7 +9521,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
 
     captured: list[pa.Table] = []
 
-    def make_descriptor(blocks, *, grant_id=None):
+    def make_descriptor(blocks, *, allocation, grant_id):
         tables = [pa.ipc.open_stream(block.ipc).read_all() for block in blocks]
         captured.extend(tables)
         return {
@@ -9507,7 +9531,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
             "grant_id": grant_id,
         }
 
-    grant_payload = vane_pickle.dumps({"request_id": 12, "grant_id": 102})
+    grant_payload = vane_pickle.dumps({"request_id": 12, "grant_id": 102, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "_make_local_shm_ref_bundle_descriptor_for_tables", make_descriptor)
@@ -9559,20 +9583,21 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
                 raise RuntimeError("compute tail was not flushed")
             return [pa.table({"rows": [self.input_rows]})]
 
-    def make_descriptor(block, *, grant_id=None):
-        table = pa.ipc.open_stream(block.ipc).read_all()
-        assert grant_id is None
+    def make_descriptor(blocks, *, allocation, grant_id):
+        table = pa.ipc.open_stream(blocks[0].ipc).read_all()
+        assert grant_id == 88
         return {
+            "grant_id": grant_id,
             "block_refs": [{"provider": "local_shm", "shm_name": "fake-shm", "ipc_size_bytes": 1}],
             "metadata": [{"rows": table.column("rows").to_pylist(), "num_rows": table.num_rows, "ipc_size_bytes": 1}],
             "names": list(table.schema.names),
         }
 
-    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88})
+    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
-    monkeypatch.setattr(worker, "make_local_shm_descriptor_from_ipc", make_descriptor)
+    monkeypatch.setattr(worker, "make_pooled_shm_descriptor", make_descriptor)
     monkeypatch.setattr(worker, "configure_loaded_torch_threads", lambda: None)
 
     _data_shm, msg_type, payload = worker._execute_task_submit(

@@ -21,6 +21,7 @@ def runtime(monkeypatch):
     runtime = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=2, heap_bytes=64 * 1024**2))
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", runtime)
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", str(128 * 1024))
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(256 * 1024))
     yield runtime
     runtime.close(kill=True)
     assert runtime.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
@@ -125,7 +126,7 @@ def test_block_arrives_before_producer_finishes_and_retains_task_ownership(runti
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_worker_serializes_each_output_once_and_admits_exact_published_size(monkeypatch, streaming):
+def test_worker_serializes_each_output_once_and_admits_exact_published_size(monkeypatch, streaming, pooled_shm_worker):
     from vane.execution import udf_subprocess_worker as worker
 
     table = pa.table({"blob": [b"x" * 4096]})
@@ -150,7 +151,7 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
 
     def grant(_sock, *, size, **kwargs):
         grants.append(size)
-        return 9
+        return {"grant_id": 9, "allocation": pooled_shm_worker.reserve_write(9, size)}
 
     monkeypatch.setattr(pa.ipc, "new_stream", serialize)
     monkeypatch.setattr(worker, "_request_output_grant", grant)
@@ -168,11 +169,11 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
         ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
 
 
-def test_failed_chunk_send_releases_descriptor_and_grant(monkeypatch):
+def test_failed_chunk_send_releases_descriptor_and_grant(monkeypatch, pooled_shm_worker):
     from vane.execution import udf_subprocess_worker as worker
 
     descriptors, released = [], []
-    create = worker.make_local_shm_descriptor_from_ipc
+    create = worker.make_pooled_shm_descriptor
 
     def record(*args, **kwargs):
         descriptor = create(*args, **kwargs)
@@ -182,15 +183,26 @@ def test_failed_chunk_send_releases_descriptor_and_grant(monkeypatch):
     def fail(*args):
         raise BrokenPipeError("send failed")
 
-    monkeypatch.setattr(worker, "make_local_shm_descriptor_from_ipc", record)
-    monkeypatch.setattr(worker, "_request_output_grant", lambda *args, **kwargs: 9)
-    monkeypatch.setattr(worker, "_release_output_grant", lambda _sock, grant: released.append(grant))
+    monkeypatch.setattr(worker, "make_pooled_shm_descriptor", record)
+    monkeypatch.setattr(
+        worker,
+        "_request_output_grant",
+        lambda *args, **kwargs: {"grant_id": 9, "allocation": pooled_shm_worker.reserve_write(9, kwargs["size"])},
+    )
+    monkeypatch.setattr(
+        worker,
+        "_release_output_grant",
+        lambda _sock, grant: (released.append(grant), pooled_shm_worker.finish_write(grant)),
+    )
     monkeypatch.setattr(worker, "_send_message", fail)
     with pytest.raises(BrokenPipeError, match="send failed"):
         worker._publish_output_block(pa.table({"x": [1]}), None, submit_count=1, input_lease_id=None)
     assert released == [9]
-    with pytest.raises(FileNotFoundError):
-        ref_bundle._open_existing_shm(descriptors[0]["block_refs"][0]["shm_name"], track=False)
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 0
+    allocation = descriptors[0]["block_refs"][0]["allocation"]
+    reused = pooled_shm_worker.reserve_write(10, allocation["size"])
+    assert reused["offset"] == allocation["offset"]
+    assert reused["generation"] != allocation["generation"]
 
 
 @pytest.mark.parametrize("call_mode", ["map_batches", "flat_map"])

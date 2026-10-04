@@ -26,7 +26,7 @@ from vane.execution.ref_bundle import (
     PreparedLocalShmBlock,
     _open_existing_shm,
     _require_shm_buffer,
-    make_local_shm_descriptor_from_ipc,
+    make_pooled_shm_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
     prepare_local_shm_block,
@@ -36,6 +36,7 @@ from vane.execution.udf_row_preserving import (
     fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
+from vane.execution.udf_shm_store import initialize_worker_shm_client
 from vane.execution.udf_threading import configure_loaded_torch_threads
 
 _MSG_READY = 0x01
@@ -415,7 +416,7 @@ def _request_output_grant(
     submit_count: int,
     size: int,
     input_lease_id: int | None = None,
-) -> int:
+) -> dict[str, Any]:
     payload = {
         "request_id": int(submit_count),
         "worker_pid": os.getpid(),
@@ -432,7 +433,7 @@ def _request_output_grant(
     if msg_type != _MSG_OUTPUT_GRANT_GRANTED:
         raise RuntimeError(f"unexpected output grant response: {msg_type:#x}")
     response = vane_pickle.loads(payload_data)
-    return int(response["grant_id"])
+    return {"grant_id": int(response["grant_id"]), "allocation": response["allocation"]}
 
 
 def _release_output_grant(sock: socket.socket, grant_id: int) -> None:
@@ -466,37 +467,14 @@ def _concat_executor_outputs(result_tables: list[pa.Table]) -> pa.Table:
 def _make_local_shm_ref_bundle_descriptor_for_tables(
     blocks: list[PreparedLocalShmBlock],
     *,
-    grant_id: int | None = None,
+    grant_id: int,
+    allocation: dict[str, Any],
 ) -> dict[str, Any]:
     if not blocks:
         raise RuntimeError("UDF returned no result")
-
-    descriptor: dict[str, Any] = {
-        "block_refs": [],
-        "metadata": [],
-        "names": blocks[0].names,
-    }
-    try:
-        for block in blocks:
-            block_descriptor = make_local_shm_descriptor_from_ipc(block)
-            try:
-                block_names = list(block_descriptor.get("names") or [])
-                if block_names != descriptor["names"]:
-                    raise ValueError(
-                        "UDF output block schemas have different column names: "
-                        f"expected={descriptor['names']!r} got={block_names!r}"
-                    )
-                descriptor["block_refs"].extend(block_descriptor.get("block_refs") or [])
-                descriptor["metadata"].extend(block_descriptor.get("metadata") or [])
-            except Exception:
-                release_local_shm_ref_bundle_descriptor(block_descriptor)
-                raise
-        if grant_id is not None:
-            descriptor["grant_id"] = int(grant_id)
-        return descriptor
-    except Exception:
-        release_local_shm_ref_bundle_descriptor(descriptor)
-        raise
+    if any(block.names != blocks[0].names for block in blocks):
+        raise ValueError("UDF output block schemas have different column names")
+    return make_pooled_shm_descriptor(blocks, allocation=allocation, grant_id=grant_id)
 
 
 def _streaming_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -509,12 +487,13 @@ def _publish_output_block(
     table: pa.Table, sock: socket.socket, *, submit_count: int, input_lease_id: int | None
 ) -> None:
     block = prepare_local_shm_block(table)
-    grant_id = _request_output_grant(
+    grant = _request_output_grant(
         sock, submit_count=submit_count, size=block.ipc_size_bytes, input_lease_id=input_lease_id
     )
+    grant_id = grant["grant_id"]
     descriptor = None
     try:
-        descriptor = make_local_shm_descriptor_from_ipc(block, grant_id=grant_id)
+        descriptor = make_pooled_shm_descriptor([block], allocation=grant["allocation"], grant_id=grant_id)
         _send_message(sock, _MSG_REF_BUNDLE_CHUNK, vane_pickle.dumps(descriptor))
     except BaseException:
         try:
@@ -572,15 +551,18 @@ def _execute_submit(
     if produce_ref_bundle_output:
         blocks = [prepare_local_shm_block(table) for table in output_tables]
         required = sum(block.ipc_size_bytes for block in blocks)
-        grant_id = _request_output_grant(
+        grant = _request_output_grant(
             sock,
             submit_count=submit_count,
             size=required,
             input_lease_id=input_lease_id,
         )
+        grant_id = grant["grant_id"]
         descriptor = None
         try:
-            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(blocks, grant_id=grant_id)
+            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(
+                blocks, grant_id=grant_id, allocation=grant["allocation"]
+            )
             result_payload = vane_pickle.dumps(descriptor)
         except Exception:
             if descriptor is not None:
@@ -640,8 +622,9 @@ def _execute_task_submit(
         executor.close()
 
 
-def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str) -> None:
+def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str, shm_fd: int) -> None:
     sock = socket.socket(fileno=sock_fd)
+    shm_client = initialize_worker_shm_client(shm_fd)
     payload_shm = _open_existing_shm(payload_shm_name, track=False)
     data_shm = _open_existing_shm(data_shm_name, track=False)
 
@@ -720,6 +703,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                             invalid_ipc_block = block_index
 
                     try:
+                        shm_client.begin_input(ref_bundle)
                         input_table = materialize_ref_bundle(
                             ref_bundle["block_refs"],
                             ref_bundle.get("slices"),
@@ -730,6 +714,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     except Exception as exc:
                         _send_input_consume_failed(sock, ref_bundle, exc, invalid_ipc_block=invalid_ipc_block)
                         raise
+                    finally:
+                        shm_client.end_input()
                     _send_input_consumed(sock, ref_bundle, input_table)
                 submit_count += 1
                 log_submit = _should_log_submit(submit_count)
@@ -779,6 +765,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
                 _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+            finally:
+                input_table = None
     except Exception as exc:
         try:
             _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
@@ -789,6 +777,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             _close_executor_with_retry(executor)
             executor = None
             gc.collect()
+        shm_client.close()
         try:
             payload_shm.close()
         except Exception:
@@ -804,9 +793,9 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
 
 
 def _main(argv: list[str]) -> int:
-    if len(argv) != 5:
+    if len(argv) != 6:
         return 2
-    worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4])
+    worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4], int(argv[5]))
     return 0
 
 

@@ -1418,6 +1418,40 @@ path. Common tests exercise that owner against both local and Ray managers.
 Strict retained-byte admission and output-completion reservations are described
 below. Data accounting alone preserves the observational behavior above.
 
+## Reusable local output storage
+
+Local subprocess workers write output into a bounded shared-memory arena owned
+by the parent process. Workers share the arena and cache its mapping across
+tasks. Allocations carry a generation so a stale descriptor cannot refer to a
+later output that reuses the same offset. Multiple output blocks can share one
+allocation; its space becomes reusable only after every block is released.
+
+Storage ownership is independent of transport admission. Input acknowledgments
+may return transport credit, but do not release physical buffers. Before sending
+an input, the parent registers a read lease for the receiving worker. Arrow and
+NumPy views retain this lease through the underlying buffer owner, including
+views saved in actor state after a task returns. Last-buffer notifications use a
+separate channel so they can arrive while the task channel waits for an output
+grant. A disconnected channel does not release a worker's buffers: cleanup must
+first confirm that the process exited. Failed process cleanup retains ownership
+for retry.
+
+`VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
+`auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
+available `/dev/shm` space when the store is created. Pages are populated on use;
+the arena's virtual size is not its resident memory. This limit is separate from
+`VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
+outputs, not model heap or the existing input/control allocations. When live
+buffers or fragmentation prevent an allocation, the task receives an explicit
+capacity error instead of waiting while holding input buffers. Release retained
+views or increase the store capacity before retrying.
+
+On Linux, closing the last worker decommits wholly free pages. Returned Arrow
+views remain valid after runtime shutdown; the arena closes after the last view
+is released. Cleanup failures retain the store for retry.
+`vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
+live allocation bytes, allocation counts, and reuse counts for diagnostics.
+
 ## Strict shared-memory byte admission
 
 Pass `data_limit` to reserve a complete input/output envelope before each UDF
