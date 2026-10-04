@@ -215,3 +215,26 @@ def test_failure_wakes_client_waiting_for_result_capacity():
         del first
         gc.collect()
         assert connection.query_runtime.resource_snapshot()["result_delivery"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("execution_timeout", [60, 2])
+def test_long_native_filter_uses_execution_deadline(execution_timeout):
+    from vane.execution.request_admission import RequestExecutionTimeout
+
+    # A supported filter with no output can hold the pump execution lock for
+    # longer than a status RPC's five-second deadline. Keep the real monitor
+    # enabled: its liveness checks must not become an extra execution deadline.
+    limits = vane.RayResources(worker_count=1, partitions=1, max_active_queries=1)
+    options = vane.QueryExecutionOptions(vane.RayExecution(), 30, execution_timeout, 60)
+    sql = "select range from range(30000) where hash(upper('" + "ß" * 16000 + "' || range::varchar)) = 0"
+    with vane.connect(backend="ray", resources=limits) as connection:
+        connection.query("select 1").collect()  # Exclude actor startup from the execution deadline.
+        if execution_timeout == 60:
+            with connection.query(sql, options=options) as result:
+                assert result.collect().num_rows == 0
+                assert result.execution_state == "SUCCEEDED"
+        else:
+            with pytest.raises(RequestExecutionTimeout):
+                with connection.query(sql, options=options) as result:
+                    result.collect()
+        assert_idle(connection)

@@ -549,7 +549,7 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 basic-types 的 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
 
-数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器在执行期限到期时使用该入口重新判断生产是否完成，在向用户返回最终 EOF 前再次检查全部 worker 和结果服务；查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
+数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 
 [pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。会话 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
 

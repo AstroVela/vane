@@ -340,3 +340,10 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。本地构建与测试平台为 Linux；其余平台交由 CI 验证。
 
 P2 退出条件已满足。下一步为 P3：在同一 FragmentGraph、worker 身份与 QueryResult 契约上实现物化 exchange、原子提交和失败重试。
+
+### P2 状态监控审查修复（PR #962）
+
+- 周期监控复用独立的 native production/error 探测，与执行期限和最终 EOF 检查保持一致。详细 task status 会等待 pump 的执行锁，退出存活监控路径；保留监控的 5 秒 RPC 期限及实际执行期限，不通过延长超时掩盖长时间 native 执行。
+- 新增真实 Ray 回归：60 秒执行期限下的长过滤查询正常完成，2 秒期限仍抛出 RequestExecutionTimeout，结束后资源账本清空。新增用例在旧版本为 **1 failed、1 passed**；审查者的监控/无监控对照在旧版本也为 **1 failed、1 passed**。修复后监控开启和关闭均约 14.3 秒成功完成。
+- 本次相关验证共 **107 passed**：Ray pipelined 13、DirectFlight 24、QueryResult runtime 67、审查者补充用例 3。覆盖故障传播、已完成生产、取消、执行/交付期限、背压与多查询共享 worker。按要求未运行完整 release/fast 套件。
+- 修复仅修改 Python 调度和测试，已重新进行非 editable 安装；275 个 Python 源码/类型文件与 checkout 一致，native 二进制及 engine identity 没有变化。root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接及 diff 检查通过。

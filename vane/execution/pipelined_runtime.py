@@ -287,14 +287,14 @@ class PipelinedScheduler:
         self.monitor = threading.Thread(target=self._monitor, name="vane-pipelined-query", daemon=True)
         self.monitor.start()
 
-    def production_status(self) -> bool:
+    def production_status(self, *, timeout: float = 2) -> bool:
         calls = [
             self.pool.workers[index].production.remote(self.pool.epochs[index], self.spec.query_id)
             for index in sorted(self.prepared)
         ]
-        values = [_get(reference, timeout=2) for reference in calls]
+        values = [_get(reference, timeout=timeout) for reference in calls]
         error = next((value["error"] for value in values if value["error"]), "")
-        relay = _get(self.relay.status.remote(), timeout=2)
+        relay = _get(self.relay.status.remote(), timeout=timeout)
         if relay["epoch"] != self.relay_epoch:
             raise RuntimeError("result service epoch changed")
         error = error or relay["error"] or relay["channel"]["error"] or self.client.error
@@ -305,19 +305,10 @@ class PipelinedScheduler:
     def _monitor(self) -> None:
         try:
             while not self.stop.is_set():
-                calls = [
-                    self.pool.workers[index].status.remote(self.pool.epochs[index], self.spec.query_id)
-                    for index in sorted(self.prepared)
-                ]
-                values = [_get(reference, timeout=5) for reference in calls]
-                relay = _get(self.relay.status.remote(), timeout=5)
-                if relay["epoch"] != self.relay_epoch:
-                    raise RuntimeError("result service epoch changed")
-                error = next((value["error"] for value in values if value["error"]), "")
-                error = error or relay["error"] or relay["channel"]["error"] or self.client.error
-                if error:
-                    raise RuntimeError(error)
-                if all(value["production_done"] for value in values):
+                # Detailed task status waits for the execution lock held by
+                # pump(). Monitor the independent native production/error
+                # probe so a long ExecuteTask is not mistaken for worker loss.
+                if self.production_status(timeout=5):
                     self.context.produced()
                 self.stop.wait(0.02)
         except BaseException as error:
