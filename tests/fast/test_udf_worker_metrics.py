@@ -107,24 +107,35 @@ def _corrupt_shm_result(descriptor, failure):
     if failure in {"short_descriptor", "oversized_descriptor"}:
         size = 8 if failure == "short_descriptor" else ref["ipc_size_bytes"] + 1
         return dict(descriptor, block_refs=[dict(ref, ipc_size_bytes=size)])
-    shm = ref_bundle._open_existing_shm(ref["shm_name"], track=False)
+    allocation = ref.get("allocation")
+    name = allocation["shm_name"] if allocation is not None else ref["shm_name"]
+    shm = ref_bundle._open_existing_shm(name, track=False)
     try:
         if failure in {"empty_mapping", "short_mapping"}:
+            # Truncation is only valid for a standalone, test-owned mapping.
+            assert allocation is None, "cannot truncate a shared arena"
             os.ftruncate(shm._fd, 0 if failure == "empty_mapping" else 4)
-        elif failure == "oversized_header":
-            shm.buf[:8] = (shm.size + 1).to_bytes(8, "little")
-        elif failure == "empty_payload":
-            shm.buf[:8] = bytes(8)
-        elif failure == "invalid_ipc":
-            # Keep the descriptor, mapping and outer length header valid.
-            # Arrow rejects the schema only when the native consumer decodes it.
-            shm.buf[8:16] = bytes(8)
-        elif failure == "truncated_ipc_body":
-            # A readable schema with a truncated record body exercises read_all
-            # (ArrowIOError/OSError), rather than the initial schema decoder.
-            shm.buf[:8] = (int.from_bytes(shm.buf[:8], "little") - 12).to_bytes(8, "little")
         else:
-            raise AssertionError(f"unexpected mapping corruption: {failure}")
+            start = allocation["offset"] + ref["allocation_offset"] if allocation is not None else 0
+            size = ref["ipc_size_bytes"] if allocation is not None else shm.size
+            region = shm.buf[start : start + size]
+            try:
+                if failure == "oversized_header":
+                    region[:8] = (size + 1).to_bytes(8, "little")
+                elif failure == "empty_payload":
+                    region[:8] = bytes(8)
+                elif failure == "invalid_ipc":
+                    # Keep the descriptor, mapping and outer length header valid.
+                    # Arrow rejects the schema only when the native consumer decodes it.
+                    region[8:16] = bytes(8)
+                elif failure == "truncated_ipc_body":
+                    # A readable schema with a truncated record body exercises read_all
+                    # (ArrowIOError/OSError), rather than the initial schema decoder.
+                    region[:8] = (int.from_bytes(region[:8], "little") - 12).to_bytes(8, "little")
+                else:
+                    raise AssertionError(f"unexpected mapping corruption: {failure}")
+            finally:
+                region.release()
     finally:
         shm.close()
     return descriptor
@@ -134,9 +145,11 @@ def _release_corrupted_descriptors(descriptors):
     from vane.execution import ref_bundle
 
     for descriptor in descriptors:
-        # A broken mapping may not be openable even for cleanup on the old
-        # revision. Unlink the test-owned names directly to leave no fixtures.
+        # Broken standalone mappings may not be openable for cleanup. Pooled
+        # allocations stay owned by the peer/store; never unlink their arena.
         for ref in descriptor["block_refs"]:
+            if "allocation" in ref:
+                continue
             try:
                 ref_bundle.shared_memory._posixshmem.shm_unlink("/" + ref["shm_name"])
             except FileNotFoundError:
@@ -1112,6 +1125,65 @@ def test_deferred_decode_failure_precedes_cleanup_and_preserves_category(monkeyp
             if cleanup_failure:
                 assert isinstance(raised.value.__cause__, RuntimeError)
                 assert cleanup_calls == [cleanup_failure]
+        field = "runtime_errors" if issubclass(failure, MemoryError) else "worker_losses"
+        assert nonzero(metrics) == {field: 1}
+        assert not worker.is_reusable()
+    finally:
+        worker.close(kill=True)
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+    assert worker._cleanup_finished
+    assert nonzero(metrics) == {field: 1}
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
+@pytest.mark.parametrize("failure", [pa.ArrowInvalid, pa.ArrowMemoryError, OSError])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_pooled_decode_failure_precedes_worker_cleanup_and_preserves_category(monkeypatch, failure, cleanup_failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+    )
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    result = None
+    decode_error = failure("injected pooled decoding failure")
+    cleanup_error = RuntimeError("injected worker cleanup failure")
+    cleanup_calls = []
+
+    def fail_decode(*_args, **_kwargs):
+        raise decode_error
+
+    def fail_cleanup():
+        cleanup_calls.append("worker")
+        raise cleanup_error
+
+    try:
+        worker.submit(pa.table({"x": [1]}))
+        result, finished = worker.take_ready_result()
+        assert not finished
+        assert worker.take_ready_result() == (None, True)
+        assert result[1][0]._allocation_lease is not None
+        with monkeypatch.context() as patch:
+            patch.setattr(pa.ipc, "open_stream", fail_decode)
+            if cleanup_failure:
+                patch.setattr(worker, "_close_data_shm", fail_cleanup)
+            with pytest.raises(failure, match="injected pooled decoding failure") as raised:
+                result[1][0].to_table()
+            assert raised.value is decode_error
+            if cleanup_failure:
+                cause = raised.value.__cause__
+                assert isinstance(cause, RuntimeError)
+                assert "UDF subprocess close failed" in str(cause)
+                assert cause.__cause__ is cleanup_error
+                assert cleanup_calls == ["worker"]
+            else:
+                assert raised.value.__cause__ is None
+                assert cleanup_calls == []
         field = "runtime_errors" if issubclass(failure, MemoryError) else "worker_losses"
         assert nonzero(metrics) == {field: 1}
         assert not worker.is_reusable()

@@ -1326,7 +1326,10 @@ def _arrow_table_from_pooled_shm(
         return pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
     except (pa.ArrowException, OSError, MemoryError, BufferError) as error:
         if on_decode_error is not None:
-            on_decode_error(error)
+            try:
+                on_decode_error(error)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
         raise
     finally:
         if region is not None:
