@@ -175,6 +175,7 @@ add_subdirectory(src/vane_py)
 pybind11_add_module(
   _native
   $<TARGET_OBJECTS:python_src>
+  $<TARGET_OBJECTS:python_direct_flight>
   $<TARGET_OBJECTS:python_arrow>
   $<TARGET_OBJECTS:python_common>
   $<TARGET_OBJECTS:python_functional>

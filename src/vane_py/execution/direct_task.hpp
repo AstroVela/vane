@@ -48,6 +48,7 @@ public:
 	bool Expire();
 	void Release();
 	vector<DirectTaskStatus> Status();
+	DirectProducerStatus ProductionStatus();
 
 private:
 	struct Task {

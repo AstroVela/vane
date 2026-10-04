@@ -7,10 +7,10 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 4 日（P1.2 更新） |
-| 开发分支 | feat/direct-exchange |
-| 基础分支 | feat/query-result-runtime；P0 已合入 integration/pipelined-execution |
-| Vane 参考提交 | 277ac325d1（P1.1） |
+| 日期 | 2026 年 10 月 4 日（P2 更新） |
+| 开发分支 | feat/native-flight-exchange |
+| 基础分支 | integration/pipelined-execution |
+| Vane 参考提交 | 31191cae217d（PR #944 合入） |
 | Trino 参考提交 | [6ead7e6c2f04c0bcfe5caf8e938dc1f5d3344f31][trino-revision]，调研时的 master，提交时间为 2026 年 10 月 2 日 02:30:56 UTC |
 | 兼容策略 | 不保留旧 API、旧协议、旧默认行为或旧执行入口 |
 | 实施记录 | [PIPELINED_EXECUTION_ROADMAP.md](PIPELINED_EXECUTION_ROADMAP.md) |
@@ -164,31 +164,30 @@ with vane.connect(backend="local", resources=limits) as local:
         assert result.execution_state == "SUCCEEDED"
 ~~~
 
-local.query 只接受自动提交下的单条只读 SELECT；命令使用 execute。支持位置/具名参数、原生算子与批次输出，模型 UDF 尚未接入。query 不读取 VANE_RUNNER，不构建 FragmentGraph，也不创建 LocalModelRequest。local 的 connect/query 拒绝任何 execution override，包括显式 None。未指定 backend 的既有连接尚未切换；它们调用 query 会报错，惰性 Relation 使用 sql 或 from_query，不保留旧 query 别名。新 Ray 连接入口留待 P2。
+local.query 只接受自动提交下的单条只读 SELECT；命令使用 execute。支持位置/具名参数、原生算子与批次输出，模型 UDF 尚未接入。query 不读取 VANE_RUNNER，不构建 FragmentGraph，也不创建 LocalModelRequest。local 的 connect/query 拒绝任何 execution override，包括显式 None。未指定 backend 的既有连接尚未切换；它们调用 query 会报错，惰性 Relation 使用 sql 或 from_query，不保留旧 query 别名。P2 接通下述 Ray pipelined 入口。
 
 QueryResult 暴露 schema（Arrow schema）、query_id、context、read_batch/迭代、collect、cancel、close、execution_state 和交付 state。read_batch 返回 RecordBatch，正常 EOF 抛出 StopIteration，部分交付后的 native 错误继续抛出。collect 只收集剩余行，逐批复制到调用方内存并释放传输 lease。关闭结果或连接后，已经导出的 Arrow 切片、NumPy 零拷贝视图仍可读取并持续占用预算，直到最后一个视图释放。
 
 当前默认 rows_per_batch=2048，资源与期限默认值如上例；这些是初始功能配置，性能验收后再调整。result_buffer_bytes 只限制结果交付持有的 IPC 缓冲，不包含 DuckDB 算子、native 预取缓冲或 collect 的完整副本。超过窗口的单批立即报容量错误；能够放入窗口的下一批等待旧 lease 释放，可由取消或期限唤醒。需要控制 native 预取时使用连接的 streaming_buffer_size 设置。查询与交付期限分别从准入及结果句柄就绪开始计算，慢消费期间二者都可能到期。
 
-以下 Ray API 仍为后续目标，尚不能运行；limits/store 的分布式配置类型随 P2/P3 接线。
+P2 接通以下 Ray pipelined 入口。先连接 Ray 集群，RayResources 定义会话共享的 worker 池及结果容量；相同连接的 cursors 共用这个池和准入账本。
 
 ~~~python
-connection = vane.connect(
-    backend="ray",
-    execution="pipelined",
-    resources=limits,
-    exchange_store=store,
-)
+import ray
+import vane
 
-with connection.query("SELECT x FROM inputs WHERE x > 10") as result:
-    for batch in result:
-        consume(batch)
-        del batch
-
-# 单次调用可以覆盖连接默认值；每次提交形成独立的 QuerySpec。
-with connection.query("SELECT k, sum(v) FROM inputs GROUP BY k", execution="fte") as result:
-    table = result.collect()
+ray.init()  # 也可以连接已经运行的 Ray 集群。
+resources = vane.RayResources(worker_count=2, partitions=2)
+with vane.connect(backend="ray", execution="pipelined", resources=resources) as connection:
+    with connection.query("SELECT range AS value FROM range(10000) WHERE range > 10") as result:
+        for batch in result:
+            print(batch)
+            del batch
 ~~~
+
+当前入口支持 P0 已验证的只读 SQL 子集：常量、range、普通本地 Parquet、filter、projection 与 GATHER；HASH 图可通过 FragmentCompileOptions 验收。文件必须使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。整数、浮点、布尔、字符串及 NULL 在 native Flight 中传输，空结果保留 schema。单次 query 可显式传入 execution="pipelined"；FTE、SQL 参数、聚合/join、模型 UDF 等尚未接线的能力明确报错。FTE 的公开执行由 P3 接入。
+
+客户端必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。当前使用 Ray 节点地址和动态端口；网关、TLS 和固定端口部署属于后续部署能力。
 
 连接提供默认值，query 提交时冻结快照。同一 Ray 连接的并发查询可以选择不同分布式策略，不修改进程环境；local 连接拒绝分布式策略 override。已经提交的查询不能原地切换目标。Relation 等上层表达入口如继续提供，也必须提交到同一个 QuerySpec 入口。
 
@@ -542,6 +541,22 @@ DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢
 
 P1.2 的预算保证限定为通道拥有的实际值缓冲；operator 输入/状态属于独立内存域。进程内传递无需 Arrow 编解码 staging。此设施不实现跨查询的分布式资源池、Flight、动态 split/routing 更新、worker epoch 或公开 Ray QueryResult；这些分别在 P2/P3 接线。原生 operator 的完整预算与能力扩展继续按后续阶段实现。local 公开入口仍直接执行原生查询。
 
+### P2 已实现的跨进程数据面与 Ray 调度
+
+[direct_flight.cpp](src/vane_py/execution/direct_flight.cpp) 实现独立的 native Flight 服务，与旧 shuffle server 没有 ticket 或执行路径适配。传输对象先获得有限的 link 数量和 staging 预留，publish/subscribe 消耗这些额度。每条路由绑定完整的 query、attempt、双方 worker epoch、exchange、分区、schema 指纹、routing version 和随机 capability；服务按已注册 ticket 的完整字节匹配，日志与错误不回显凭据。
+
+DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流第一版只允许一个未确认帧；服务端保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，并 ACK 上游，所有权由发送窗口转入接收窗口。
+
+每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 basic-types 的 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
+
+数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器在执行期限到期时使用该入口重新判断生产是否完成，在向用户返回最终 EOF 前再次检查全部 worker 和结果服务；查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
+
+[pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。会话 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
+
+[pipelined_runtime.py](vane/execution/pipelined_runtime.py) 的 PipelinedScheduler 将整张图作为活动组，按任务固定分配到 worker。先准备全部任务和独立 ResultService，再绑定输入、验证客户端及 worker 的 Flight 握手，最后逆拓扑启动消费者和生产者。任一准备失败都会等待已发出的 prepare 结算并撤销整组预留；release 失败保留重试所有者。独立 native pump 推进已经启动的任务，Ray RPC 不搬运 RecordBatch。
+
+结果服务是另一个 Ray actor 内的 native relay，数据路径为 root worker → ResultService → 客户端 native channel → QueryResult。两跳各自拥有窗口和 staging，结果服务在启动生产前占有资源。会话 max_results 同时限制这些结果服务及客户端通道的数量；交付 IPC 缓冲另外受 result_buffer_bytes 约束，导出的 Arrow/NumPy 视图继续由 BatchLease 计费。用户看到 QueryResult，与 local 相同；local 入口继续直接执行原生查询。
+
 ## Native 算子的异步推进
 
 ### Source 的等待与唤醒
@@ -636,7 +651,7 @@ FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。�
 
 ### ResultService 与 QueryResult
 
-QueryResult 提供 schema、批次迭代、collect、close 和状态查询。P1.1 通过 execution_state 与 state 分别观察执行和交付；分布式 execution_completion 通知随 P2/P3 接入。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
+QueryResult 提供 schema、批次迭代、collect、close 和状态查询。P1.1 通过 execution_state 与 state 分别观察执行和交付；P2 根据全图生产状态停止执行期限，并在最终 EOF 前核实分布式结局。FTE 的提交完成通知随 P3 接入。提交请求返回结果句柄，不等待所有任务完成；FTE 的首批读取等待 ResultManifest 发布，pipelined 可以读取运行中任务的结果。
 
 分布式结果使用原生 ResultService，部署在客户端可访问的查询服务端点：
 

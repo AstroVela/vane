@@ -1,0 +1,396 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Ray control actors; all fragment and relay data movement stays in native."""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from dataclasses import replace
+from typing import Any
+
+from vane.execution.pipelined_plan import RayResources, task_id
+from vane.execution.submission import RayQuerySpec, native_plan_capabilities, prepare_worker_plan
+
+
+def _host() -> str:
+    import ray
+
+    return str(ray.util.get_node_ip_address())
+
+
+def _channel(schema: bytes, resources: RayResources, producer: str, consumer: str) -> Any:
+    from vane._native import execution_runtime as native
+
+    limits = resources.exchange
+    channel = native.DirectChannel(
+        schema,
+        native.DirectLimits(limits.window_bytes, limits.frame_bytes, limits.frame_rows, limits.frame_slots),
+        1,
+        [consumer],
+    )
+    channel.add_producer(producer)
+    channel.seal_producers()
+    return channel
+
+
+class _Query:
+    def __init__(
+        self,
+        spec: RayQuerySpec,
+        resources: RayResources,
+        index: int,
+        routes: list[dict[str, Any]],
+    ) -> None:
+        self.spec = spec
+        self.resources = resources
+        self.index = index
+        self.routes = routes
+        self.channels: dict[str, Any] = {}
+        self.connection: Any = None
+        self.service: Any = None
+        self.flight: Any = None
+        self.thread: threading.Thread | None = None
+        self.stop = threading.Event()
+        self.started = False
+        self.started_at = 0.0
+        self.error = ""
+        self.order: list[str] = []
+        self.lifecycle = threading.RLock()
+        self.closed = False
+        self.control = threading.Lock()
+
+    def prepare(self, tasks: list[str], operator_bytes: int) -> None:
+        import vane
+        from vane._native import execution_runtime as native
+
+        spec, resources, index, routes = self.spec, self.resources, self.index, self.routes
+        relevant = [r for r in routes if index in (r["source_worker"], r["target_worker"])]
+        links = sum((r["source_worker"] == index) + (r["target_worker"] == index) for r in relevant)
+        with self.lifecycle:
+            if self.stop.is_set():
+                raise RuntimeError("query preparation was canceled")
+            self.connection = vane.connect(
+                backend="local",
+                config={
+                    "threads": resources.cpus_per_worker,
+                    "memory_limit": f"{operator_bytes}B",
+                },
+            )
+            prepare_worker_plan(self.connection, spec)
+            if self.stop.is_set():
+                raise RuntimeError("query preparation was canceled")
+            self.service = native.TaskService(self.connection)
+            self.flight = native.DirectFlight(
+                "0.0.0.0",
+                _host(),
+                links,
+                links * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
+                resources.exchange.frame_bytes,
+            )
+            incoming: dict[str, dict[str, list[Any]]] = {}
+            outgoing: dict[str, dict[str, list[Any]]] = {}
+            for route in relevant:
+                if route["source_worker"] == index:
+                    channel = _channel(route["schema"], resources, route["source"], route["target"])
+                    self.channels[f"out/{route['id']}"] = channel
+                    self.flight.publish(route["ticket"], channel, route["target"])
+                    outgoing.setdefault(route["source"], {}).setdefault(route["edge"], []).append(channel)
+                if route["target_worker"] == index:
+                    channel = _channel(route["schema"], resources, route["source"], route["target"])
+                    self.channels[f"in/{route['id']}"] = channel
+                    incoming.setdefault(route["target"], {}).setdefault(route["port"], []).append(
+                        (channel, route["target"])
+                    )
+            fragments = {f.fragment_id: f for f in spec.graph.fragments}
+            snapshots = {s.fragment_id: s.payload for s in spec.source_snapshots}
+            edges = {e.exchange_id: e for e in spec.graph.exchanges}
+            for identity in reversed(spec.graph.topological_fragment_ids()):
+                fragment = fragments[identity]
+                for part in range(fragment.partition_count):
+                    task = task_id(identity, part)
+                    if task not in tasks:
+                        continue
+                    assignments = {
+                        source.source_id: [split.split_id for split in source.splits[part :: fragment.partition_count]]
+                        for source in fragment.sources
+                    }
+                    outputs = [
+                        {
+                            "channels": channels,
+                            "producer": task,
+                            "partitioning": edges[edge].partitioning if edge in edges else None,
+                        }
+                        for edge, channels in outgoing[task].items()
+                    ]
+                    self.service.prepare(
+                        task,
+                        fragment.native_plan,
+                        spec.connection_snapshot,
+                        snapshots[identity],
+                        assignments,
+                        incoming.get(task, {}),
+                        outputs,
+                    )
+                    self.order.append(task)
+            if self.stop.is_set():
+                raise RuntimeError("query preparation was canceled")
+
+    def connect(self, locations: dict[int, str]) -> None:
+        with self.lifecycle:
+            if self.stop.is_set() or self.started:
+                raise RuntimeError("query no longer accepts input bindings")
+            for route in self.routes:
+                if route["target_worker"] == self.index:
+                    self.flight.subscribe(
+                        locations[route["source_worker"]],
+                        route["ticket"],
+                        self.channels[f"in/{route['id']}"],
+                        route["source"],
+                        self.spec.options.execution_timeout + self.spec.options.delivery_timeout,
+                    )
+
+    def start(self, tasks: list[str]) -> None:
+        with self.lifecycle:
+            if self.stop.is_set():
+                raise RuntimeError("query is canceled")
+            for task in tasks:
+                if task not in self.order:
+                    raise ValueError("task does not belong to this worker")
+                self.service.start(task, "initial")
+            if not self.started:
+                self.started = True
+                self.started_at = time.monotonic()
+                self.thread = threading.Thread(target=self._run, name="vane-pipelined-worker", daemon=True)
+                self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self.stop.is_set():
+                self.service.pump(max(1, len(self.order)))
+                status = self.service.status()
+                error = next((task["error"] for task in status if task["state"] in {"FAILED", "CANCELED"}), "")
+                error = error or self.flight.error
+                if error:
+                    self.cancel(error)
+                    return
+                if time.monotonic() - self.started_at >= self.spec.options.execution_timeout:
+                    self.service.expire()
+                self.stop.wait(0.002)
+        except BaseException as error:
+            self.cancel(str(error))
+
+    def snapshot(self) -> dict[str, Any]:
+        tasks = self.service.status()
+        production = self.service.production_status()
+        channels = [channel.snapshot() for channel in self.channels.values()]
+        error = self.error or self.flight.error or next((c["error"] for c in channels if c["error"]), "")
+        return {
+            "tasks": tasks,
+            "error": error,
+            "production_done": production["finished"] and not production["error"],
+            "active_contexts": sum(not t["released"] for t in tasks),
+            "owned_bytes": sum(c["bytes"] for c in channels),
+        }
+
+    def cancel(self, reason: str) -> None:
+        # Interrupt outside lifecycle/pump locks. Failure remains sticky in native.
+        if self.closed:
+            return
+        self.error = self.error or reason
+        self.stop.set()
+        with self.control:
+            if self.service is None and self.connection is not None:
+                self.connection.interrupt()
+        if self.service is not None:
+            self.service.cancel(reason)
+        if self.flight is not None:
+            self.flight.cancel(reason)
+
+    def close(self) -> None:
+        self.cancel("worker query released")
+        with self.lifecycle:
+            if self.closed:
+                return
+            if self.thread is not None and self.thread is not threading.current_thread():
+                self.thread.join(timeout=5)
+                if self.thread.is_alive():
+                    raise RuntimeError("native task cleanup is still pending")
+            if self.service is not None:
+                self.service.release()
+            if self.flight is not None:
+                self.flight.close()
+            with self.control:
+                if self.connection is not None:
+                    self.connection.close()
+                    self.connection = None
+            self.closed = True
+
+
+class PipelinedWorker:
+    """One fixed worker epoch and an atomically accounted query registry."""
+
+    def __init__(self, resources: RayResources) -> None:
+        import vane
+
+        self.resources = resources
+        self.epoch = uuid.uuid4().hex
+        self.lock = threading.RLock()
+        self.queries: dict[str, _Query] = {}
+        self.reservations: dict[str, dict[str, int]] = {}
+        with vane.connect(backend="local") as connection:
+            self.engine = native_plan_capabilities(connection).engine_identity
+
+    def describe(self) -> dict[str, Any]:
+        return {"epoch": self.epoch, "engine": self.engine}
+
+    def _check(self, epoch: str) -> None:
+        if epoch != self.epoch:
+            raise RuntimeError("worker epoch changed; pipelined attempts cannot be replayed")
+
+    def prepare(
+        self,
+        epoch: str,
+        encoded: dict[str, Any],
+        index: int,
+        tasks: list[str],
+        routes: list[dict[str, Any]],
+        frame_rows: int,
+    ) -> str:
+        from vane._native import execution_runtime as native
+
+        self._check(epoch)
+        spec = RayQuerySpec.from_dict(encoded, expected_engine_identity=self.engine)
+        if spec.requires_replay:
+            raise ValueError("pipelined worker does not accept FTE submissions")
+        links = sum((r["source_worker"] == index) + (r["target_worker"] == index) for r in routes)
+        reservation = {
+            "contexts": len(tasks),
+            "exchange": links * self.resources.exchange.window_bytes,
+            "staging": links * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
+            "io": links,
+            "operator": self.resources.operator_memory_bytes // self.resources.max_active_queries,
+        }
+        capacity = {
+            "contexts": self.resources.task_contexts_per_worker,
+            "exchange": self.resources.exchange_buffer_bytes,
+            "staging": self.resources.staging_buffer_bytes,
+            "io": self.resources.io_concurrency,
+            "operator": self.resources.operator_memory_bytes,
+        }
+        with self.lock:
+            if spec.query_id in self.reservations:
+                raise ValueError("query already prepared")
+            for name, amount in reservation.items():
+                if amount + sum(r[name] for r in self.reservations.values()) > capacity[name]:
+                    raise RuntimeError(f"worker has insufficient {name} capacity")
+            resources = replace(self.resources, exchange=replace(self.resources.exchange, frame_rows=frame_rows))
+            query = _Query(spec, resources, index, routes)
+            self.reservations[spec.query_id] = reservation
+            self.queries[spec.query_id] = query
+        try:
+            query.prepare(tasks, reservation["operator"])
+            return str(query.flight.location)
+        except BaseException as primary:
+            try:
+                self.release(epoch, spec.query_id)
+            except BaseException as cleanup:
+                # Retain the registered owner and its reservation for release retry.
+                raise primary from cleanup
+            raise
+
+    def connect(self, epoch: str, query: str, locations: dict[int, str]) -> None:
+        self._check(epoch)
+        self.queries[query].connect(locations)
+
+    def start(self, epoch: str, query: str, tasks: list[str]) -> None:
+        self._check(epoch)
+        self.queries[query].start(tasks)
+
+    def status(self, epoch: str, query: str) -> dict[str, Any]:
+        self._check(epoch)
+        return {"epoch": self.epoch, **self.queries[query].snapshot()}
+
+    def production(self, epoch: str, query: str) -> dict[str, Any]:
+        self._check(epoch)
+        value: dict[str, Any] = self.queries[query].service.production_status()
+        return value
+
+    def ready(self, epoch: str, query: str) -> bool:
+        self._check(epoch)
+        owner = self.queries[query]
+        if owner.flight.error:
+            raise RuntimeError(owner.flight.error)
+        return bool(owner.flight.ready)
+
+    def cancel(self, epoch: str, query: str, reason: str) -> None:
+        self._check(epoch)
+        with self.lock:
+            owner = self.queries.get(query)
+        if owner is not None:
+            owner.cancel(reason)
+
+    def release(self, epoch: str, query: str) -> None:
+        self._check(epoch)
+        with self.lock:
+            owner = self.queries.get(query)
+        if owner is not None:
+            owner.close()
+        with self.lock:
+            if self.queries.get(query) is owner:
+                self.queries.pop(query, None)
+                self.reservations.pop(query, None)
+
+    def resources_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {"epoch": self.epoch, "reservations": dict(self.reservations)}
+
+
+class ResultService:
+    """A reachable native relay with independently bounded upstream/client windows."""
+
+    def __init__(self, resources: RayResources) -> None:
+        self.epoch = uuid.uuid4().hex
+        self.resources = resources
+        self.channel: Any = None
+        self.flight: Any = None
+
+    def describe(self) -> str:
+        return self.epoch
+
+    def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
+        from vane._native import execution_runtime as native
+
+        if epoch != self.epoch or self.flight is not None:
+            raise RuntimeError("invalid result service epoch or duplicate preparation")
+        self.channel = _channel(schema, self.resources, "root", "client")
+        self.flight = native.DirectFlight(
+            "0.0.0.0",
+            _host(),
+            2,
+            2 * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
+            self.resources.exchange.frame_bytes,
+        )
+        self.flight.publish(ticket, self.channel, "client")
+        return str(self.flight.location)
+
+    def connect(self, location: str, ticket: str, timeout: float) -> None:
+        self.flight.subscribe(location, ticket, self.channel, "root", timeout)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "epoch": self.epoch,
+            "channel": self.channel.snapshot(),
+            "error": self.flight.error,
+            "ready": self.flight.ready,
+        }
+
+    def cancel(self, reason: str) -> None:
+        if self.flight is not None:
+            self.flight.cancel(reason)
+
+    def release(self) -> None:
+        if self.flight is not None:
+            self.flight.close()

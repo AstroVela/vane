@@ -291,7 +291,8 @@ from vane.datasink.doris import DorisStreamLoadSink
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
 from vane.execution.batch_lease import BatchLease
-from vane.execution.query_options import LocalExecution, QueryExecutionOptions
+from vane.execution.pipelined_plan import RayResources
+from vane.execution.query_options import LocalExecution, QueryExecutionOptions, RayExecution
 from vane.execution.query_runtime import QueryResources
 from vane.execution.result_delivery import QueryResult
 from vane.extensions import (
@@ -432,6 +433,8 @@ __all__: list[str] = [
     "LocalExecution",
     "QueryExecutionOptions",
     "QueryResources",
+    "RayResources",
+    "RayExecution",
     "QueryResult",
     "read_video_frames",
     "DEFAULT_EXTENSION_CATALOG_URL",

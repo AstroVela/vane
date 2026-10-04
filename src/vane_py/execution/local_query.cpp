@@ -24,17 +24,30 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 	}
 	for (auto item : options) {
 		auto name = py::cast<string>(item.first);
-		if (name != "backend" && name != "resources") {
-			throw py::value_error("local connections do not accept execution or unknown options");
+		if (name != "backend" && name != "resources" && name != "execution") {
+			throw py::value_error("connections do not accept unknown query options");
 		}
 	}
-	if (!options.contains("backend") || !py::isinstance<py::str>(options["backend"]) ||
-	    py::cast<string>(options["backend"]) != "local") {
-		throw py::value_error("the query API currently requires backend='local'");
+	if (!options.contains("backend") || !py::isinstance<py::str>(options["backend"])) {
+		throw py::value_error("the query API requires backend='local' or backend='ray'");
+	}
+	auto backend = py::cast<string>(options["backend"]);
+	if (backend != "local" && backend != "ray") {
+		throw py::value_error("backend must be 'local' or 'ray'");
+	}
+	if (backend == "local" && options.contains("execution")) {
+		throw py::value_error("local connections do not accept execution overrides");
 	}
 	auto resources = options.contains("resources") ? py::reinterpret_borrow<py::object>(options["resources"])
 	                                               : py::object(py::none());
-	auto runtime = py::module_::import("vane.execution.query_runtime").attr("QueryRuntime")(resources);
+	py::object runtime;
+	if (backend == "ray") {
+		auto execution = options.contains("execution") ? py::reinterpret_borrow<py::object>(options["execution"])
+		                                               : py::object(py::str("pipelined"));
+		runtime = py::module_::import("vane.execution.pipelined_runtime").attr("RayQueryRuntime")(resources, execution);
+	} else {
+		runtime = py::module_::import("vane.execution.query_runtime").attr("QueryRuntime")(resources);
+	}
 	auto connection = ConnectWithRunner(database, read_only, config, "local-fast");
 	EnableLocalRuntimeInputPolicy(*connection->con.GetConnection().context);
 	connection->vane_session->query_runtime = std::move(runtime);
@@ -59,10 +72,43 @@ py::object DuckDBPyConnection::Query(const py::object &sql, const py::object &pa
 	const auto generation = InterruptGeneration();
 	auto runtime = GetQueryRuntime();
 	if (runtime.is_none()) {
-		throw InvalidInputException("query() requires a connection created with backend='local'");
+		throw InvalidInputException("query() requires a connection created with backend='local' or backend='ray'");
 	}
 	if (local_query_closing) {
 		throw ConnectionException("Connection is closing");
+	}
+	if (runtime.attr("backend").cast<string>() == "ray") {
+		if (!con.GetConnection().context->transaction.IsAutoCommit()) {
+			throw InvalidInputException("query() requires auto-commit mode");
+		}
+		auto weak_source = weak_ptr<DuckDBPyConnection>(shared_from_this());
+		auto publish = py::cpp_function([weak_source, generation](py::object query) {
+			if (auto source = weak_source.lock()) {
+				source->local_query_request = query;
+				source->local_query_thread = query.is_none() ? std::thread::id() : std::this_thread::get_id();
+				if (!query.is_none() && (source->local_query_closing || source->InterruptGeneration() != generation)) {
+					query.attr("cancel")();
+				}
+			}
+		});
+		auto retire = py::cpp_function([weak_source]() {
+			if (auto source = weak_source.lock()) {
+				source->local_query_request = py::none();
+				source->local_query_stream = py::none();
+				source->local_query_thread = std::thread::id();
+			}
+		});
+		interrupt_check();
+		try {
+			auto result = runtime.attr("submit")(shared_from_this(), sql, parameters, options, rows_per_batch,
+			                                     overrides, publish, retire);
+			local_query_stream = py::module_::import("weakref").attr("ref")(result);
+			local_query_thread = std::thread::id();
+			return result;
+		} catch (...) {
+			local_query_thread = std::thread::id();
+			throw;
+		}
 	}
 	py::object snapshot;
 	{
