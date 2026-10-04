@@ -30,6 +30,8 @@ def _generate_chunk(args_tuple):
     """Worker function: generate one chunk and export to Parquet."""
     scale_factor, children, step, output_dir, threads = args_tuple
 
+    # Each spawned worker generates and exports its own connection-local tables.
+    os.environ["VANE_RUNNER"] = "local-fast"
     sys.path.insert(0, "/tmp/duckdb_stock")
     import vane
 

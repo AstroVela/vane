@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception.hpp"
@@ -25,7 +26,8 @@ constexpr const char *TableCatalogEntry::Name;
 
 TableCatalogEntry::TableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
     : StandardEntry(CatalogType::TABLE_ENTRY, schema, catalog, info.table), columns(std::move(info.columns)),
-      constraints(std::move(info.constraints)) {
+      constraints(std::move(info.constraints)),
+      logical_write_target_identity(std::move(info.logical_write_target_identity)) {
 	this->temporary = info.temporary;
 	this->dependencies = info.dependencies;
 	this->comment = info.comment;
@@ -92,6 +94,7 @@ unique_ptr<CreateInfo> TableCatalogEntry::GetInfo() const {
 	result->catalog = catalog.GetName();
 	result->schema = schema.name;
 	result->table = name;
+	result->logical_write_target_identity = logical_write_target_identity;
 	result->columns = columns.Copy();
 	result->constraints.reserve(constraints.size());
 	result->dependencies = dependencies;
@@ -102,6 +105,87 @@ unique_ptr<CreateInfo> TableCatalogEntry::GetInfo() const {
 	result->comment = comment;
 	result->tags = tags;
 	return std::move(result);
+}
+
+string TableCatalogEntry::GetLogicalWriteTargetIdentity() const {
+	return logical_write_target_identity;
+}
+
+static void AppendWriteDefinitionField(duckdb::stringstream &result, const string &field) {
+	result << ":" << field.size() << ":" << field;
+}
+
+string TableCatalogEntry::GetLogicalWriteTargetDefinition(ClientContext &context) {
+	vector<string> index_signatures;
+	auto storage_info = GetStorageInfo(context);
+	index_signatures.reserve(storage_info.index_info.size());
+	for (auto &index : storage_info.index_info) {
+		vector<column_t> columns(index.column_set.begin(), index.column_set.end());
+		std::sort(columns.begin(), columns.end());
+
+		duckdb::stringstream signature;
+		signature << "storage-index:v1:" << index.is_unique << index.is_primary << index.is_foreign << ":"
+		          << columns.size();
+		for (auto column : columns) {
+			signature << ":" << column;
+		}
+		index_signatures.push_back(signature.str());
+
+		// TableStorageInfo captures the columns and constraint flags that affect
+		// DML planning, but intentionally omits standalone index expressions and
+		// types. Resolve the catalog entry by this target index's name instead of
+		// scanning every index in the schema.
+		if (index.name.empty()) {
+			continue;
+		}
+		auto entry = schema.GetEntry(schema.GetCatalogTransaction(context), CatalogType::INDEX_ENTRY, index.name);
+		if (!entry) {
+			continue;
+		}
+		auto &catalog_index = entry->Cast<IndexCatalogEntry>();
+		if (!StringUtil::CIEquals(catalog_index.GetTableName(), name)) {
+			continue;
+		}
+
+		duckdb::stringstream catalog_signature;
+		catalog_signature << "catalog-index:v1";
+		AppendWriteDefinitionField(catalog_signature, catalog_index.index_type);
+		catalog_signature << ":" << static_cast<uint32_t>(catalog_index.index_constraint_type) << ":"
+		                  << catalog_index.column_ids.size();
+		for (auto column : catalog_index.column_ids) {
+			catalog_signature << ":" << column;
+		}
+		catalog_signature << ":" << catalog_index.parsed_expressions.size();
+		for (auto &expression : catalog_index.parsed_expressions) {
+			if (!expression) {
+				throw SerializationException("Index \"%s\" contains a null parsed expression", catalog_index.name);
+			}
+			AppendWriteDefinitionField(catalog_signature, expression->ToString());
+		}
+
+		vector<pair<string, string>> options;
+		options.reserve(catalog_index.options.size());
+		for (auto &option : catalog_index.options) {
+			options.emplace_back(option.first, option.second.ToString());
+		}
+		std::sort(options.begin(), options.end());
+		catalog_signature << ":" << options.size();
+		for (auto &option : options) {
+			AppendWriteDefinitionField(catalog_signature, option.first);
+			AppendWriteDefinitionField(catalog_signature, option.second);
+		}
+		index_signatures.push_back(catalog_signature.str());
+	}
+	std::sort(index_signatures.begin(), index_signatures.end());
+
+	auto table_definition = GetInfo()->ToString();
+	duckdb::stringstream result;
+	result << "duckdb-write-definition:v2:" << table_definition.size() << ":" << table_definition << ":"
+	       << index_signatures.size();
+	for (auto &signature : index_signatures) {
+		result << ":" << signature.size() << ":" << signature;
+	}
+	return result.str();
 }
 
 string TableCatalogEntry::ColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints) {

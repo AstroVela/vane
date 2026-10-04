@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -6,6 +12,7 @@
 #include "json_deserializer.hpp"
 #include "json_functions.hpp"
 #include "json_serializer.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 
 namespace duckdb {
 
@@ -106,8 +113,12 @@ static void JsonSerializeFunction(DataChunk &args, ExpressionState &state, Vecto
 					throw NotImplementedException("Only SELECT statements can be serialized to json!");
 				}
 				auto &select = statement->Cast<SelectStatement>();
-				auto json =
-				    JsonSerializer::Serialize(select, doc, info.skip_if_null, info.skip_if_empty, info.skip_if_default);
+
+				auto options = make_uniq<SerializationOptions>();
+				options->serialization_compatibility =
+				    state.GetContext().db->config.options.serialization_compatibility;
+				auto json = JsonSerializer::Serialize(select, doc, info.skip_if_null, info.skip_if_empty,
+				                                      info.skip_if_default, *options);
 
 				yyjson_mut_arr_append(statements_arr, json);
 			}
@@ -167,6 +178,9 @@ ScalarFunctionSet JSONFunctions::GetSerializeSqlFunction() {
 	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    LogicalType::JSON(), JsonSerializeFunction, JsonSerializeBind, nullptr, nullptr, JSONFunctionLocalState::Init));
 
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+	}
 	return set;
 }
 
@@ -210,6 +224,11 @@ static vector<unique_ptr<SelectStatement>> DeserializeSelectStatement(string_t i
 		if (!stmt->node) {
 			throw ParserException("Error parsing json: no select node found in json");
 		}
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(*stmt->node, [](unique_ptr<ParsedExpression> &child) {
+			if (!child) {
+				throw ParserException("Error parsing json: null expression found in json");
+			}
+		});
 		result.push_back(std::move(stmt));
 	}
 
@@ -317,6 +336,7 @@ struct ExecuteSqlTableFunction {
 TableFunctionSet JSONFunctions::GetExecuteJsonSerializedSqlFunction() {
 	TableFunction func("json_execute_serialized_sql", {LogicalType::VARCHAR}, ExecuteSqlTableFunction::Function,
 	                   ExecuteSqlTableFunction::Bind);
+	func.SetRequiresClientContext();
 	return TableFunctionSet(func);
 }
 

@@ -251,8 +251,27 @@ COPY multi_partitioned_test TO '__TEST_DIR__/multi_partitioned_test' (FORMAT PAR
 statement ok
 COPY (FROM test_all_types()) TO '__TEST_DIR__/test_all_types.parquet' (RETURN_STATS);
 
-# unsupported format (CSV)
-statement error
+# CSV returns row count and file size without column statistics
+query IIIIII
 COPY integers TO '__TEST_DIR__/test_copy_to_file.csv' (RETURN_STATS);
 ----
-not supported
+<REGEX>:.*test_copy_to_file.csv	200000	<REGEX>:\d+	NULL	{}	NULL
+
+# Compressed CSV reports physical bytes produced by the compression stream
+query IIIIII
+COPY integers TO '__TEST_DIR__/test_copy_to_file.csv.zst' (FORMAT CSV, COMPRESSION ZSTD, RETURN_STATS);
+----
+<REGEX>:.*test_copy_to_file.csv.zst	200000	<REGEX>:[1-9]\d*	NULL	{}	NULL
+
+# 128-bit decimal stats are big-endian; unifying row-group bounds must decode
+# before comparing, otherwise the file-level min/max get swapped
+statement ok
+SET preserve_insertion_order=true;
+
+statement ok
+CREATE TABLE decimal128_multi_rg AS SELECT CASE WHEN i < 2048 THEN 126619 ELSE 19308 END::DECIMAL(38,0) AS c FROM range(4096) t(i);
+
+query IIIIII
+COPY decimal128_multi_rg TO '{TEST_DIR}/decimal128_multi_rg.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, RETURN_STATS);
+----
+<REGEX>:.*decimal128_multi_rg.parquet	4096	<REGEX>:\d+	<REGEX>:\d+	<REGEX>:{'"c"'={column_size_bytes=\d+, max=126619, min=19308, null_count=0, num_values=4096}}	NULL

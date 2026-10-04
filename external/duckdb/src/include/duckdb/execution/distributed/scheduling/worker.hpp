@@ -24,8 +24,6 @@ namespace distributed {
 
 // Forward declarations
 class WorkerSnapshot;
-template <typename T>
-class UnboundedChannelState;
 
 //------------------------------------------------------------------------------
 // Worker Snapshot
@@ -108,14 +106,9 @@ public:
 	/// Shutdown all workers
 	virtual DuckDBResult<void> shutdown() = 0;
 
-	/// Optional hook for runners that support streaming task outputs through a
-	/// shared MaterializedOutput channel. Default is a no-op.
-	virtual void set_streaming_results_channel_state(std::shared_ptr<UnboundedChannelState<MaterializedOutput>> state) {
-	}
-
-	/// Optional hook to clear the shared streaming output channel state.
-	virtual void clear_streaming_results_channel_state() {
-	}
+	/// The outer plan has submitted all native task events, including internal
+	/// materialization stages. Existing logical tasks may still run or retry.
+	virtual DuckDBResult<void> task_production_finished(const std::string &query_id) = 0;
 
 	/// Fired when the FTE task event stream for a query has been fully
 	/// consumed. This is the production no-more-input signal for dynamic task
@@ -164,6 +157,21 @@ public:
 		return res;
 	}
 
+	/// Wait for a query while publishing each selected output as it is drained.
+	/// Implementations must stop draining immediately when the callback fails.
+	/// DataSink uses this method to enforce coordinator result bounds before all
+	/// selected outputs are retained, so collecting first is not a safe fallback.
+	/// A successful implementation must return an empty vector: every selected
+	/// output is transferred exactly once through the callback.
+	virtual DuckDBResult<std::vector<MaterializedOutput>>
+	wait_fte_query_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+		(void)query_id;
+		(void)timeout_s;
+		(void)on_output;
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("worker manager does not support streaming FTE result drain"));
+	}
+
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
 	wait_fte_query(const std::string &query_id, double timeout_s,
 	               const std::unordered_set<TaskContext, TaskContextHash> &task_contexts,
@@ -183,6 +191,12 @@ public:
 		}
 		return res;
 	}
+
+	/// Resolve query_id to its resource-query lifecycle, permanently fence task
+	/// ingress, and wait until every owned execution query can no longer produce
+	/// side effects. This is an abort barrier, not final manager teardown:
+	/// adapter-owned lifecycle and result ownership are finalized separately.
+	virtual DuckDBResult<void> abort_and_quiesce_query(const std::string &query_id) = 0;
 };
 
 } // namespace distributed

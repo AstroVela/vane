@@ -100,12 +100,18 @@ static unique_ptr<FunctionData> UnnestDeserialize(Deserializer &deserializer, Ta
 	return make_uniq<UnnestBindData>(std::move(input_type));
 }
 
-void UnnestTableFunction::RegisterFunction(BuiltinFunctions &set) {
+TableFunction UnnestTableFunction::GetFunction() {
 	TableFunction unnest_function("unnest", {LogicalType::ANY}, nullptr, UnnestBind, UnnestInit, UnnestLocalInit);
 	unnest_function.in_out_function = UnnestFunction;
 	unnest_function.serialize = UnnestSerialize;
 	unnest_function.deserialize = UnnestDeserialize;
-	set.AddFunction(unnest_function);
+	unnest_function.SetDistributedScanCallbacks(MakeDistributedSingletonSourceCallbacks());
+	unnest_function.BindDistributedScanCapability("vane_core");
+	return unnest_function;
+}
+
+void UnnestTableFunction::RegisterFunction(BuiltinFunctions &set) {
+	set.AddFunction(GetFunction());
 }
 
 } // namespace duckdb

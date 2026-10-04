@@ -246,10 +246,10 @@ def materialize_task_inputs(
     context: Mapping[str, Any] | None,
     initial_splits: Mapping[str, list[FteSplit]] | None,
     *,
-    merge_scan_task_descriptors: Callable[[list[Any]], Any] | None = None,
+    merge_scan_split_batches: Callable[[list[Any]], Any] | None = None,
 ) -> dict[str, Any]:
     materialized_context = dict(context or {})
-    scan_task_nodes: list[str] = []
+    scan_split_batch_nodes: list[str] = []
     exchange_source_nodes: list[str] = []
 
     for source_node_id, raw_splits in (initial_splits or {}).items():
@@ -257,24 +257,26 @@ def materialize_task_inputs(
             split if isinstance(split, FteSplit) else FteSplit.from_dict(str(source_node_id), split)
             for split in raw_splits
         ]
-        scan_values: list[Any] = []
+        scan_split_batches: list[Any] = []
         exchange_values: list[Any] = []
         for split in splits:
-            if split.kind == "scan_task":
-                scan_values.append(split.data)
+            if split.kind == "scan_split":
+                scan_split_batches.append(split.data)
             elif split.kind == "exchange_source_task":
                 exchange_values.append(split.data)
             else:
                 raise ValueError(f"Unsupported FTE split kind: {split.kind}")
 
-        if scan_values:
-            scan_task_nodes.append(str(source_node_id))
-            if len(scan_values) == 1:
-                materialized_context[f"scan_task:{source_node_id}"] = scan_values[0]
+        if scan_split_batches:
+            scan_split_batch_nodes.append(str(source_node_id))
+            if len(scan_split_batches) == 1:
+                materialized_context[f"scan_split_batch:{source_node_id}"] = scan_split_batches[0]
             else:
-                if merge_scan_task_descriptors is None:
-                    raise ValueError("multiple scan_task splits require a merge function")
-                materialized_context[f"scan_task:{source_node_id}"] = merge_scan_task_descriptors(scan_values)
+                if merge_scan_split_batches is None:
+                    raise ValueError("multiple scan splits require a scan split batch merge function")
+                materialized_context[f"scan_split_batch:{source_node_id}"] = merge_scan_split_batches(
+                    scan_split_batches
+                )
 
         if exchange_values:
             if len(exchange_values) != 1:
@@ -282,8 +284,8 @@ def materialize_task_inputs(
             exchange_source_nodes.append(str(source_node_id))
             materialized_context[f"exchange_source_task:{source_node_id}"] = exchange_values[0]
 
-    if scan_task_nodes:
-        materialized_context["scan_task_nodes"] = ",".join(scan_task_nodes)
+    if scan_split_batch_nodes:
+        materialized_context["scan_split_batch_nodes"] = ",".join(scan_split_batch_nodes)
     if exchange_source_nodes:
         materialized_context["exchange_source_task_nodes"] = ",".join(exchange_source_nodes)
     return materialized_context
@@ -329,7 +331,7 @@ class FteTaskExecution:
                 self.request.get("dynamic_scan_source_node_ids") or self.request.get("scan_source_node_ids") or []
             )
         }
-        self.dynamic_scan_source_queues = self._create_dynamic_source_queues("scan_task", self.dynamic_scan_source_ids)
+        self.dynamic_scan_source_queues = self._create_dynamic_source_queues("scan_split", self.dynamic_scan_source_ids)
         self.dynamic_exchange_source_queues = self._create_dynamic_source_queues(
             "exchange_source_task",
             self.dynamic_exchange_source_ids,
@@ -385,7 +387,7 @@ class FteTaskExecution:
         data = split.data
         if isinstance(data, str):
             data = data.encode()
-        if expected_kind == "scan_task":
+        if expected_kind == "scan_split":
             queue.add_scan_split(data)
         elif expected_kind == "exchange_source_task":
             queue.add_exchange_source_split(data)
@@ -399,7 +401,7 @@ class FteTaskExecution:
             self.initial_splits.setdefault(source_node_id, []).append(split)
             return
         if scan_queue is not None:
-            self._add_split_to_dynamic_queue(scan_queue, split, "scan_task")
+            self._add_split_to_dynamic_queue(scan_queue, split, "scan_split")
         if exchange_queue is not None:
             self._add_split_to_dynamic_queue(exchange_queue, split, "exchange_source_task")
 
@@ -892,7 +894,7 @@ class FteTaskExecution:
         )
 
     def _add_dynamic_source_queues(self, expected_kind: str, source_ids: set[str]) -> None:
-        if expected_kind == "scan_task":
+        if expected_kind == "scan_split":
             missing = set(source_ids) - set(self.dynamic_scan_source_queues)
             self.dynamic_scan_source_queues.update(self._create_dynamic_source_queues(expected_kind, missing))
             return
@@ -954,7 +956,7 @@ class FteTaskExecution:
             merged_scan_source_ids = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
             if merged_scan_source_ids != self.dynamic_scan_source_ids:
                 self.dynamic_scan_source_ids = merged_scan_source_ids
-                self._add_dynamic_source_queues("scan_task", merged_scan_source_ids)
+                self._add_dynamic_source_queues("scan_split", merged_scan_source_ids)
                 self.request["dynamic_scan_source_node_ids"] = sorted(merged_scan_source_ids)
                 dynamic_sources_changed = True
                 changed = True

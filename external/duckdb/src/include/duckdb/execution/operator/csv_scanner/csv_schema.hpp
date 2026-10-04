@@ -33,6 +33,9 @@ struct CSVSchema {
 
 	//! If the schema is empty
 	bool Empty() const;
+	//! Whether schema discovery identified the source as an empty file. This is
+	//! distinct from having no bound columns and affects later schema matching.
+	bool IsEmptyFile() const;
 
 	//! If the columns of the schema match
 	bool MatchColumns(const CSVSchema &other) const;

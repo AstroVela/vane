@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/function/function_binder.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
@@ -706,7 +707,12 @@ InsertionOrderPreservingMap<string> PhysicalUngroupedAggregate::ParamsToString()
 }
 
 void PhysicalUngroupedAggregate::SerializeOperatorData(Serializer &serializer) const {
-	serializer.WriteProperty(103, "aggregates", aggregates);
+	vector<unique_ptr<Expression>> portable_aggregates;
+	for (const auto &aggregate : aggregates) {
+		portable_aggregates.push_back(
+		    FunctionBinder::UnbindSortedAggregate(aggregate->Cast<BoundAggregateExpression>()));
+	}
+	serializer.WriteProperty(103, "aggregates", portable_aggregates);
 	serializer.WriteProperty(104, "distinct_validity", distinct_validity);
 }
 

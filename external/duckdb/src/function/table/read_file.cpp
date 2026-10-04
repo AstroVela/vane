@@ -1,6 +1,9 @@
 #include "duckdb/function/table/read_file.hpp"
 #include "duckdb/function/table/direct_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/common/multi_file/multi_file_list.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -9,6 +12,15 @@
 #include "duckdb/storage/caching_file_system.hpp"
 
 namespace duckdb {
+
+unique_ptr<FunctionData> ReadFileBindData::Copy() const {
+	auto result = make_uniq<ReadFileBindData>();
+	result->column_ids = column_ids;
+	if (options) {
+		result->options = make_uniq<BaseFileReaderOptions>(*options);
+	}
+	return std::move(result);
+}
 
 namespace {
 
@@ -44,6 +56,7 @@ struct DirectMultiFileInfo : MultiFileReaderInterface {
 	                                        BaseFileReaderOptions &options,
 	                                        const MultiFileOptions &file_options) override;
 	unique_ptr<NodeStatistics> GetCardinality(const MultiFileBindData &bind_data, idx_t file_count) override;
+	unique_ptr<MultiFileReaderInterface> Copy() override;
 	FileGlobInput GetGlobInput() override;
 };
 
@@ -160,6 +173,11 @@ unique_ptr<NodeStatistics> DirectMultiFileInfo<OP>::GetCardinality(const MultiFi
 }
 
 template <class OP>
+unique_ptr<MultiFileReaderInterface> DirectMultiFileInfo<OP>::Copy() {
+	return make_uniq<DirectMultiFileInfo>();
+}
+
+template <class OP>
 FileGlobInput DirectMultiFileInfo<OP>::GetGlobInput() {
 	return FileGlobOptions::ALLOW_EMPTY;
 }
@@ -184,9 +202,95 @@ struct ReadTextOperation {
 	}
 };
 
+static void ReadFileSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
+                              const TableFunction &function) {
+	if (!bind_data_p) {
+		throw SerializationException("Cannot serialize %s without bind data", function.name);
+	}
+	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
+	if (!bind_data.file_list) {
+		throw SerializationException("Cannot serialize %s without a file list", function.name);
+	}
+
+	auto files = bind_data.file_list->GetAllFiles();
+	serializer.WriteList(100, "files", files.size(), [&](Serializer::List &list, idx_t index) {
+		list.WriteObject([&](Serializer &object) {
+			object.WriteProperty(100, "path", files[index].path);
+			unordered_map<string, Value> options;
+			if (files[index].extended_info) {
+				options = files[index].extended_info->options;
+			}
+			object.WriteProperty(101, "options", options);
+		});
+	});
+	serializer.WriteProperty(101, "types", bind_data.types);
+	serializer.WriteProperty(102, "names", bind_data.names);
+	serializer.WriteProperty(103, "file_options", bind_data.file_options);
+	serializer.WriteProperty(104, "reader_bind", bind_data.reader_bind);
+	serializer.WriteProperty(105, "table_columns", bind_data.table_columns);
+	serializer.WriteProperty(106, "column_ids", bind_data.column_ids);
+}
+
+template <class OP>
+static unique_ptr<FunctionData> ReadFileDeserialize(Deserializer &deserializer, TableFunction &function) {
+	auto &context = deserializer.Get<ClientContext &>();
+	vector<OpenFileInfo> files;
+	deserializer.ReadList(100, "files", [&](Deserializer::List &list, idx_t) {
+		list.ReadObject([&](Deserializer &object) {
+			OpenFileInfo file;
+			file.path = object.ReadProperty<string>(100, "path");
+			auto options = object.ReadProperty<unordered_map<string, Value>>(101, "options");
+			if (!options.empty()) {
+				auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+				extended_info->options = std::move(options);
+				file.extended_info = std::move(extended_info);
+			}
+			files.push_back(std::move(file));
+		});
+	});
+	auto types = deserializer.ReadProperty<vector<LogicalType>>(101, "types");
+	auto names = deserializer.ReadProperty<vector<string>>(102, "names");
+	auto file_options = deserializer.ReadProperty<MultiFileOptions>(103, "file_options");
+	auto reader_bind = deserializer.ReadProperty<MultiFileReaderBindData>(104, "reader_bind");
+	auto table_columns = deserializer.ReadProperty<vector<string>>(105, "table_columns");
+	auto column_ids = deserializer.ReadProperty<vector<idx_t>>(106, "column_ids");
+
+	if (types.size() != names.size()) {
+		throw SerializationException("Cannot deserialize %s with mismatched names and types", function.name);
+	}
+
+	auto multi_file_reader = MultiFileReader::Create(function);
+	auto file_list = make_shared_ptr<SimpleMultiFileList>(std::move(files));
+	auto interface = DirectMultiFileInfo<OP>::CreateInterface(context);
+	interface->InitializeInterface(context, *multi_file_reader, *file_list);
+	auto options = interface->InitializeOptions(context, nullptr);
+
+	auto result = make_uniq<MultiFileBindData>();
+	result->file_list = std::move(file_list);
+	result->multi_file_reader = std::move(multi_file_reader);
+	result->interface = std::move(interface);
+	result->file_options = std::move(file_options);
+	result->reader_bind = std::move(reader_bind);
+	result->types = std::move(types);
+	result->names = std::move(names);
+	result->table_columns = std::move(table_columns);
+	result->column_ids = std::move(column_ids);
+	result->bind_data = result->interface->InitializeBindData(*result, std::move(options));
+	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
+
+	virtual_column_map_t virtual_columns;
+	MultiFileReader::GetVirtualColumns(context, result->reader_bind, virtual_columns);
+	result->interface->GetVirtualColumns(context, *result, virtual_columns);
+	result->virtual_columns = std::move(virtual_columns);
+	result->interface->FinalizeBindData(*result);
+	return std::move(result);
+}
+
 template <class OP>
 static TableFunction GetFunction() {
 	MultiFileFunction<DirectMultiFileInfo<OP>> table_function(OP::NAME);
+	table_function.serialize = ReadFileSerialize;
+	table_function.deserialize = ReadFileDeserialize<OP>;
 	// Erase extra multi file reader options
 	table_function.named_parameters.erase("filename");
 	table_function.named_parameters.erase("hive_partitioning");

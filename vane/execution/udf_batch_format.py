@@ -14,7 +14,10 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 from numpy.typing import NDArray
 
 from vane.execution._udf_validation import ensure_synchronous_udf_result
-from vane.execution.udf_output_schema import arrow_type_from_output_schema_entry, normalize_output_schema_entries
+from vane.execution.udf_output_schema import (
+    _arrow_type_from_output_schema_entry,
+    normalize_output_schema_entries,
+)
 
 VALID_BATCH_FORMATS = frozenset({"pyarrow", "numpy", "pandas", "cudf"})
 
@@ -56,7 +59,7 @@ def iter_udf_output_tables(
     output_schema: Any = None,
     resolved_output_schema: _OutputSchema | None = None,
 ) -> Iterable[pa.Table]:
-    """Normalize UDF output batches back to Arrow without cross-format fallback."""
+    """Normalize selected-format output; Arrow keeps its existing dict support."""
     batch_format = normalize_batch_format(batch_format)
     if output_schema is not None and resolved_output_schema is not None:
         raise ValueError("provide output_schema or resolved_output_schema, not both")
@@ -73,7 +76,9 @@ def resolve_udf_output_schema(batch_format: str, output_schema: Any) -> _OutputS
     columns: list[_OutputColumnSchema] = []
     for name, entry in normalize_output_schema_entries(output_schema):
         kind = str(entry.get("kind") or "").strip().lower()
-        tensor_type = arrow_type_from_output_schema_entry(entry) if kind == "tensor" else None
+        tensor_type = _arrow_type_from_output_schema_entry(entry) if kind == "tensor" else None
+        if tensor_type is not None and not isinstance(tensor_type, pa.FixedShapeTensorType):
+            raise TypeError(f"batch_format={batch_format!r} supports only fixed-shape tensor outputs")
         columns.append(_OutputColumnSchema(name=name, tensor_type=tensor_type))
     return tuple(columns)
 
@@ -96,6 +101,9 @@ def _iter_udf_output_tables(
             return
         if isinstance(result, pa.RecordBatch):
             yield pa.Table.from_batches([result])
+            return
+        if isinstance(result, dict):
+            yield pa.table(result)
             return
     elif batch_format == "numpy":
         if type(result) is dict:
@@ -142,7 +150,7 @@ def _is_batch_like(value: Any) -> bool:
 
 def _output_type_name(batch_format: str) -> str:
     return {
-        "pyarrow": "pyarrow.Table or pyarrow.RecordBatch",
+        "pyarrow": "pyarrow.Table, pyarrow.RecordBatch or dict",
         "numpy": "dict[str, numpy.ndarray]",
         "pandas": "pandas.DataFrame",
         "cudf": "cudf.DataFrame",

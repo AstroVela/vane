@@ -68,6 +68,44 @@ public:
 	}
 
 	template <class FUNC, class CATALOG_ENTRY>
+	static FUNC DeserializeBaseFunction(ClientContext &context, CatalogType catalog_type, const string &catalog_name,
+	                                    const string &schema_name, const string &name,
+	                                    const vector<LogicalType> &arguments,
+	                                    const vector<LogicalType> &original_arguments, bool, std::false_type) {
+		return DeserializeFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
+		                                                arguments, original_arguments);
+	}
+
+	template <class FUNC, class CATALOG_ENTRY>
+	static FUNC
+	DeserializeBaseFunction(ClientContext &context, CatalogType catalog_type, const string &catalog_name,
+	                        const string &schema_name, const string &name, const vector<LogicalType> &arguments,
+	                        const vector<LogicalType> &original_arguments, bool has_serialize, std::true_type) {
+		if (has_serialize && StringUtil::StartsWith(name, "aggregate_state_export_")) {
+			auto placeholder = AggregateFunction(
+			    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
+			    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
+			    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
+			    FunctionNullHandling::DEFAULT_NULL_HANDLING);
+			placeholder.serialize = ExportStateAggregateSerialize;
+			placeholder.deserialize = ExportStateAggregateDeserialize;
+			return placeholder;
+		}
+		if (has_serialize && StringUtil::StartsWith(name, "merge_")) {
+			auto placeholder = AggregateFunction(
+			    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
+			    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
+			    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
+			    FunctionNullHandling::DEFAULT_NULL_HANDLING);
+			placeholder.serialize = distributed::MergeAggregateSerialize;
+			placeholder.deserialize = distributed::MergeAggregateDeserialize;
+			return placeholder;
+		}
+		return DeserializeFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
+		                                                arguments, original_arguments);
+	}
+
+	template <class FUNC, class CATALOG_ENTRY>
 	static pair<FUNC, bool> DeserializeBase(Deserializer &deserializer, CatalogType catalog_type,
 	                                        optional_ptr<vector<unique_ptr<Expression>>> children = nullptr) {
 		auto &context = deserializer.Get<ClientContext &>();
@@ -94,39 +132,10 @@ public:
 			}
 		}
 
-		bool is_export_state = false;
-		bool is_merge_state = false;
-		if constexpr (std::is_same<FUNC, AggregateFunction>::value) {
-			is_export_state = has_serialize && StringUtil::StartsWith(name, "aggregate_state_export_");
-			is_merge_state = has_serialize && StringUtil::StartsWith(name, "merge_");
-		}
-
-		auto function = [&]() -> FUNC {
-			if constexpr (std::is_same<FUNC, AggregateFunction>::value) {
-				if (is_export_state) {
-					auto placeholder = AggregateFunction(
-					    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
-					    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
-					    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
-					    FunctionNullHandling::DEFAULT_NULL_HANDLING);
-					placeholder.serialize = ExportStateAggregateSerialize;
-					placeholder.deserialize = ExportStateAggregateDeserialize;
-					return placeholder;
-				}
-				if (is_merge_state) {
-					auto placeholder = AggregateFunction(
-					    name, arguments, LogicalType(LogicalTypeId::INVALID), static_cast<aggregate_size_t>(nullptr),
-					    static_cast<aggregate_initialize_t>(nullptr), static_cast<aggregate_update_t>(nullptr),
-					    static_cast<aggregate_combine_t>(nullptr), static_cast<aggregate_finalize_t>(nullptr),
-					    FunctionNullHandling::DEFAULT_NULL_HANDLING);
-					placeholder.serialize = distributed::MergeAggregateSerialize;
-					placeholder.deserialize = distributed::MergeAggregateDeserialize;
-					return placeholder;
-				}
-			}
-			return DeserializeFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
-			                                                arguments, original_arguments);
-		}();
+		typename std::is_same<FUNC, AggregateFunction>::type is_aggregate;
+		auto function =
+		    DeserializeBaseFunction<FUNC, CATALOG_ENTRY>(context, catalog_type, catalog_name, schema_name, name,
+		                                                 arguments, original_arguments, has_serialize, is_aggregate);
 		if (has_serialize) {
 			function.arguments = std::move(arguments);
 			function.original_arguments = std::move(original_arguments);

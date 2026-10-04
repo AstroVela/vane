@@ -13,18 +13,21 @@
 namespace duckdb {
 
 CreateTableRelation::CreateTableRelation(shared_ptr<Relation> child_p, string schema_name, string table_name,
-                                         bool temporary_p, OnCreateConflict on_conflict)
-    : Relation(child_p->context, RelationType::CREATE_TABLE_RELATION), child(std::move(child_p)),
-      schema_name(std::move(schema_name)), table_name(std::move(table_name)), temporary(temporary_p),
-      on_conflict(on_conflict) {
-	TryBindRelation(columns);
+                                         bool temporary_p, OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options_p,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys_p)
+    : CreateTableRelation(std::move(child_p), INVALID_CATALOG, std::move(schema_name), std::move(table_name),
+                          temporary_p, on_conflict, std::move(table_options_p), std::move(partition_keys_p)) {
 }
 
 CreateTableRelation::CreateTableRelation(shared_ptr<Relation> child_p, string catalog_name, string schema_name,
-                                         string table_name, bool temporary_p, OnCreateConflict on_conflict)
+                                         string table_name, bool temporary_p, OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options_p,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys_p)
     : Relation(child_p->context, RelationType::CREATE_TABLE_RELATION), child(std::move(child_p)),
       catalog_name(std::move(catalog_name)), schema_name(std::move(schema_name)), table_name(std::move(table_name)),
-      temporary(temporary_p), on_conflict(on_conflict) {
+      temporary(temporary_p), on_conflict(on_conflict), table_options(std::move(table_options_p)),
+      partition_keys(std::move(partition_keys_p)) {
 	TryBindRelation(columns);
 }
 
@@ -46,6 +49,12 @@ BoundStatement CreateTableRelation::Bind(Binder &binder) {
 	info->query = std::move(select);
 	info->on_conflict = on_conflict;
 	info->temporary = temporary;
+	for (auto &entry : table_options) {
+		info->options.emplace(entry.first, entry.second->Copy());
+	}
+	for (auto &partition_key : partition_keys) {
+		info->partition_keys.push_back(partition_key->Copy());
+	}
 	stmt.info = std::move(info);
 	return binder.Bind(stmt.Cast<SQLStatement>());
 }

@@ -212,6 +212,7 @@ static bool UnionToUnionCast(Vector &source, Vector &result, idx_t count, CastPa
 	auto target_member_count = UnionType::GetMemberCount(result.GetType());
 
 	auto target_member_is_mapped = vector<bool>(target_member_count);
+	bool all_converted = true;
 
 	// Perform the casts from source to target members
 	for (idx_t member_idx = 0; member_idx < source_member_count; member_idx++) {
@@ -223,13 +224,13 @@ static bool UnionToUnionCast(Vector &source, Vector &result, idx_t count, CastPa
 
 		CastParameters child_parameters(parameters, member_cast.cast_data, lstate.local_states[member_idx]);
 		if (!member_cast.function(source_member_vector, target_member_vector, count, child_parameters)) {
-			return false;
+			all_converted = false;
 		}
 
 		target_member_is_mapped[target_member_idx] = true;
 	}
 
-	// All member casts succeeded!
+	// Even a TRY_CAST failure must retain the selected tag and valid UNION layout.
 
 	// Set the unmapped target members to constant NULL.
 	// If we cast UNION(A, B) -> UNION(A, B, C) we need to invalidate C so that
@@ -290,7 +291,7 @@ static bool UnionToUnionCast(Vector &source, Vector &result, idx_t count, CastPa
 
 	result.Verify(count);
 
-	return true;
+	return all_converted;
 }
 
 static bool UnionToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {

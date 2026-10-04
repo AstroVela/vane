@@ -1,1 +1,2 @@
 *.test linguist-language=sql
+test/sql/file/list_files/** text eol=lf

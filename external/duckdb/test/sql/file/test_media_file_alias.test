@@ -1,0 +1,679 @@
+# name: test/sql/file/test_media_file_alias.test
+# description: Test media-specialized FILE aliases, pure conversion, and family functions
+# group: [file]
+
+require file
+
+load __TEST_DIR__/media_file.db readwrite v1.4.0
+
+statement ok
+PRAGMA enable_verification
+
+query TTTTTT
+SELECT
+	typeof(image_file('missing.png')),
+	typeof(audio_file('missing.mp3')),
+	typeof(video_file('missing.mp4')),
+	typeof(NULL::IMAGEFILE[]),
+	typeof(NULL::AUDIOFILE[]),
+	typeof(NULL::VIDEOFILE[])
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE	IMAGEFILE[]	AUDIOFILE[]	VIDEOFILE[]
+
+# Unverified construction and specialization are pure and preserve all fields.
+query TTTIIT
+SELECT typeof(value), value.url, value.content_type, value.position, value.size, value.checksum
+FROM (
+	SELECT image_file(file('memory://image', 'image/png', 2, 4, 'sha256:image')) AS value
+)
+----
+IMAGEFILE	memory://image	image/png	2	4	sha256:image
+
+query TTT
+SELECT
+	typeof(image_file(image_file('memory://image'))),
+	typeof(audio_file(file('memory://audio', NULL, NULL, NULL, NULL))),
+	typeof(video_file(file('memory://video', NULL, NULL, NULL, NULL)))
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE
+
+# VARCHAR aliases retain ordinary VARCHAR function compatibility.
+statement ok
+CREATE TYPE media_url_alias AS VARCHAR
+
+query TTTTTT
+SELECT
+	typeof(image_file('image.png'::media_url_alias)), image_file('image.png'::media_url_alias).url,
+	typeof(audio_file('audio.mp3'::media_url_alias)), audio_file('audio.mp3'::media_url_alias).url,
+	typeof(video_file('video.mp4'::media_url_alias)), video_file('video.mp4'::media_url_alias).url
+----
+IMAGEFILE	image.png	AUDIOFILE	audio.mp3	VIDEOFILE	video.mp4
+
+# Unresolved constructor parameters retain the unambiguous URL interpretation.
+statement ok
+PREPARE prepared_media_files AS SELECT
+	typeof(image_file($1)), image_file($1).url,
+	typeof(audio_file($2)), audio_file($2).url,
+	typeof(video_file($3)), video_file($3).url
+
+query TTTTTT
+EXECUTE prepared_media_files('prepared.png', 'prepared.mp3', 'prepared.mp4')
+----
+IMAGEFILE	prepared.png	AUDIOFILE	prepared.mp3	VIDEOFILE	prepared.mp4
+
+statement ok
+PREPARE prepared_verified_image AS SELECT typeof(image_file($1, $2)), image_file($1, $2).url
+
+query TT
+EXECUTE prepared_verified_image('prepared-verified.png', FALSE)
+----
+IMAGEFILE	prepared-verified.png
+
+# Typed macro overloads infer the generic FILE family member only when an
+# argument is unresolved or entirely untyped. Known media values remain exact.
+statement ok
+CREATE MACRO infer_file_family
+	(value FILE) AS 'FILE',
+	(value IMAGEFILE) AS 'IMAGEFILE',
+	(value AUDIOFILE) AS 'AUDIOFILE',
+	(value VIDEOFILE) AS 'VIDEOFILE'
+
+statement ok
+CREATE MACRO infer_file_list_family
+	(value FILE[]) AS 'FILE[]',
+	(value IMAGEFILE[]) AS 'IMAGEFILE[]',
+	(value AUDIOFILE[]) AS 'AUDIOFILE[]',
+	(value VIDEOFILE[]) AS 'VIDEOFILE[]'
+
+query TTTT
+SELECT
+	infer_file_family(value := NULL),
+	infer_file_family(image_file('image.png')),
+	infer_file_list_family(value := []),
+	infer_file_list_family([audio_file('audio.mp3')])
+----
+FILE	IMAGEFILE	FILE[]	AUDIOFILE[]
+
+statement ok
+PREPARE prepared_file_macro AS SELECT infer_file_family(value := $1)
+
+statement ok
+PREPARE prepared_file_list_macro AS SELECT infer_file_list_family(value := $1)
+
+# Prepared UNKNOWN parameters select the generic fallback during PREPARE;
+# execution does not rebind the macro overload from each concrete argument.
+query T
+EXECUTE prepared_file_macro(file('prepared.txt', NULL, NULL, NULL, NULL))
+----
+FILE
+
+query T
+EXECUTE prepared_file_macro(image_file('prepared.png'))
+----
+FILE
+
+query T
+EXECUTE prepared_file_list_macro([file('prepared.txt', NULL, NULL, NULL, NULL)])
+----
+FILE[]
+
+query T
+EXECUTE prepared_file_list_macro([video_file('prepared.mp4')])
+----
+FILE[]
+
+# The generic preference must not resolve a second, independent FILE overload
+# dimension according to named-argument order.
+statement ok
+CREATE MACRO preserve_independent_file_ambiguity
+	(left_value FILE, right_value IMAGEFILE) AS 'generic-left',
+	(left_value IMAGEFILE, right_value FILE) AS 'generic-right'
+
+statement error
+SELECT preserve_independent_file_ambiguity(left_value := NULL, right_value := NULL)
+----
+<REGEX>:.*multiple overloads.*
+
+statement error
+SELECT image_file(audio_file('memory://audio'))
+----
+<REGEX>:.*image_file.*requires VARCHAR, FILE, or IMAGEFILE.*AUDIOFILE.*
+
+statement error
+SELECT audio_file(video_file('memory://video'))
+----
+<REGEX>:.*audio_file.*requires VARCHAR, FILE, or AUDIOFILE.*VIDEOFILE.*
+
+# The optional verification path uses bounded content inspection.
+query TT
+SELECT
+	typeof(image_file('logo/DuckDB_Logo-stacked.png', TRUE)),
+	image_file('logo/DuckDB_Logo-stacked.png', TRUE).content_type
+----
+IMAGEFILE	image/png
+
+statement error
+SELECT image_file('test/sql/table_function/files/one.txt', TRUE)
+----
+<REGEX>:.*could not verify IMAGEFILE content.*
+
+statement error
+SELECT video_file('test/sql/table_function/files/does-not-exist', TRUE)
+----
+<REGEX>:.*(Cannot open file|could not open).*
+
+query IIIII
+SELECT
+	image = image,
+	image != image,
+	partial = partial,
+	partial != partial,
+	NULL::IMAGEFILE = image
+FROM (
+	SELECT
+		image_file(file('x', 'image/png', 1, 2, 'sha256:x')) AS image,
+		image_file(file('x', NULL, NULL, NULL, NULL)) AS partial
+)
+----
+true	false	NULL	NULL	NULL
+
+statement error
+SELECT image_file('x') = file('x', NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*Cannot compare values of type IMAGEFILE and type FILE.*
+
+statement error
+SELECT image_file('x') = audio_file('x')
+----
+<REGEX>:.*Cannot compare values of type IMAGEFILE and type AUDIOFILE.*
+
+# FILE-family aliases are exact logical boundaries. DuckDB's ordinary STRUCT
+# casts must not retag a generic FILE, another specialization, or an unaliased
+# canonical STRUCT. Common-type and nested cast paths obey the same rule.
+statement error
+SELECT CAST(image_file('x') AS AUDIOFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(file('x', NULL, NULL, NULL, NULL) AS IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(image_file('x') AS STRUCT(
+	url VARCHAR,
+	content_type VARCHAR,
+	"position" BIGINT,
+	size BIGINT,
+	checksum VARCHAR
+))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(image_file('x') AS VARCHAR)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {
+	'url': 'x',
+	'content_type': NULL::VARCHAR,
+	'position': NULL::BIGINT,
+	'size': NULL::BIGINT,
+	'checksum': NULL::VARCHAR
+}::IMAGEFILE
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CASE WHEN TRUE THEN image_file('x') ELSE audio_file('x') END
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT image_file('x') UNION ALL SELECT audio_file('x')
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT [image_file('x')]::AUDIOFILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT [image_file('x')]::IMAGEFILE[1]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT array_value(image_file('x'))::IMAGEFILE[2]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Sorting stores fixed arrays as lists internally. Compare the gathered array to
+# verify that the private layout roundtrip preserves its governed values.
+query II
+SELECT
+	i,
+	files IS NOT DISTINCT FROM
+		array_value(file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE)
+FROM (
+	SELECT
+		i,
+		array_value(file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE) AS files
+	FROM range(2) AS values(i)
+	ORDER BY i DESC
+)
+----
+1	true
+0	true
+
+# Transparent container casts may still convert non-FILE siblings when every
+# FILE leaf remains at the same path with the exact same specialization.
+query III
+SELECT typeof(value.document) = 'IMAGEFILE', value.document.url = 'x', value.missing IS NULL
+FROM (
+	SELECT CAST(
+		{'document': image_file('x'), 'missing': NULL}
+		AS STRUCT(document IMAGEFILE, missing INTEGER)
+	) AS value
+)
+----
+true	true	true
+
+# Named STRUCT casts retain DuckDB's case-insensitive name mapping around an
+# exact FILE leaf. Field order and unrelated source/target fields remain
+# governed by the ordinary STRUCT caster.
+query TTI
+SELECT typeof(value.document), value.document.url, value.n
+FROM (
+	SELECT CAST(
+		{'document': image_file('reordered.png'), 'n': 7}
+		AS STRUCT(n BIGINT, document IMAGEFILE)
+	) AS value
+)
+----
+IMAGEFILE	reordered.png	7
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.added IS NULL
+FROM (
+	SELECT CAST(
+		{'Document': image_file('case.png'), 'drop_me': 42}
+		AS STRUCT(document IMAGEFILE, added INTEGER)
+	) AS value
+)
+----
+IMAGEFILE	case.png	true
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.n
+FROM (
+	SELECT CAST(
+		ROW(image_file('positional.png'), 9)
+		AS STRUCT(document IMAGEFILE, n BIGINT)
+	) AS value
+)
+----
+IMAGEFILE	positional.png	9
+
+statement ok
+CREATE TYPE image_envelope AS STRUCT(document IMAGEFILE, count BIGINT)
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.count
+FROM (
+	SELECT {'document': image_file('envelope.png'), 'count': 3}::image_envelope AS value
+)
+----
+IMAGEFILE	envelope.png	3
+
+# Adding, dropping, or renaming the FILE-bearing field itself remains
+# forbidden, even when another STRUCT member matches.
+statement error
+SELECT {'document': image_file('x'), 'n': 1}::STRUCT(n BIGINT)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'n': 1}::STRUCT(n BIGINT, document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'old_document': image_file('x'), 'n': 1}::STRUCT(document IMAGEFILE, n BIGINT)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'document': audio_file('x')}::STRUCT(document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# UNION casts use the same case-insensitive member mapping as DuckDB's native
+# UNION binder and may add only unrelated target members.
+query TT
+WITH source(value) AS (
+	SELECT union_value(Document := image_file('union.png'))::UNION(Document IMAGEFILE, old BIGINT)
+), converted(value) AS (
+	SELECT value::UNION(extra VARCHAR, document IMAGEFILE, old BIGINT)
+	FROM source
+)
+SELECT union_tag(value), value.document.url
+FROM converted
+----
+document	union.png
+
+# A scalar value can use DuckDB's native promotion into an exact FILE-family
+# UNION member without retagging the value.
+query TTTT
+SELECT
+	union_tag(generic_value), generic_value.document.url,
+	union_tag(image_value), image_value.image.url
+FROM (
+	SELECT
+		CAST(file('generic.txt', NULL, NULL, NULL, NULL) AS UNION(document FILE, n BIGINT)) AS generic_value,
+		CAST(image_file('image.png') AS UNION(image IMAGEFILE, n BIGINT)) AS image_value
+)
+----
+document	generic.txt	image	image.png
+
+# Non-FILE scalars retain DuckDB's native promotion into an unrelated UNION
+# member even when another member is FILE-specialized.
+query TITT
+SELECT
+	union_tag(integer_value), integer_value.n,
+	union_tag(text_value), text_value.text
+FROM (
+	SELECT
+		CAST(1 AS UNION(n INTEGER, image IMAGEFILE)) AS integer_value,
+		CAST('text' AS UNION(image IMAGEFILE, text VARCHAR)) AS text_value
+)
+----
+n	1	text	text
+
+statement ok
+CREATE TEMP TABLE promoted_file_union(value UNION(n INTEGER, image IMAGEFILE))
+
+statement ok
+INSERT INTO promoted_file_union VALUES (2)
+
+statement ok
+INSERT INTO promoted_file_union VALUES (image_file('inserted.png'))
+
+query TT rowsort
+SELECT union_tag(value), COALESCE(value.n::VARCHAR, value.image.url)
+FROM promoted_file_union
+----
+image	inserted.png
+n	2
+
+statement ok
+SET old_implicit_casting = true
+
+query TT
+SELECT union_tag(generic_value), generic_value.document.url
+FROM (
+	SELECT CAST(
+		file('legacy-casting.txt', NULL, NULL, NULL, NULL)
+		AS UNION(document FILE, text VARCHAR)
+	) AS generic_value
+)
+----
+document	legacy-casting.txt
+
+statement ok
+SET old_implicit_casting = false
+
+statement error
+SELECT CAST(image_file('x') AS UNION(document FILE, n BIGINT))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT (
+	union_value(n := 1)::UNION(n BIGINT, other VARCHAR)
+)::UNION(n BIGINT, other VARCHAR, document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Untyped NULL leaves do not bypass FILE validation and remain valid inputs for
+# empty or NULL-only container literals.
+query II
+SELECT length([]::FILE[]), ([NULL]::IMAGEFILE[])[1] IS NULL
+----
+0	true
+
+statement error
+SELECT [NULL::VARCHAR]::FILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Opaque VARIANT conversion must not bypass a nested FILE leaf in either
+# direction.
+statement error
+SELECT [image_file('x')]::VARIANT
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT ([{
+	'url': 'x',
+	'content_type': NULL::VARCHAR,
+	'position': NULL::BIGINT,
+	'size': NULL::BIGINT,
+	'checksum': NULL::VARCHAR
+}]::VARIANT)::IMAGEFILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT TRY_CAST(video_file('x') AS IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Exact casts and NULL common types remain valid.
+query TTTT
+SELECT
+	typeof(CAST(image_file('x') AS IMAGEFILE)),
+	typeof(NULL::IMAGEFILE),
+	typeof(CASE WHEN TRUE THEN image_file('x') ELSE NULL END),
+	typeof(CASE WHEN TRUE THEN NULL ELSE audio_file('x') END)
+----
+IMAGEFILE	IMAGEFILE	IMAGEFILE	AUDIOFILE
+
+query T
+SELECT typeof(value)
+FROM (
+	SELECT video_file('x') AS value
+	UNION ALL
+	SELECT NULL
+)
+LIMIT 1
+----
+VIDEOFILE
+
+# Internal CSV formatting preserves FILE-family export without admitting a
+# user-visible FILE-to-VARCHAR cast, including for nested values.
+statement ok
+COPY (
+	SELECT
+		file('generic.csv', NULL, NULL, NULL, NULL) AS generic_file,
+		image_file('image.png') AS image_file,
+		[audio_file('audio.mp3')] AS audio_files
+) TO '__TEST_DIR__/media_files.csv' (FORMAT CSV, HEADER)
+
+query III
+SELECT
+	contains(generic_file, 'generic.csv'),
+	contains(image_file, 'image.png'),
+	contains(audio_files, 'audio.mp3')
+FROM read_csv('__TEST_DIR__/media_files.csv', header = TRUE, all_varchar = TRUE)
+----
+true	true	true
+
+# PIVOT's engine-generated VARCHAR conversions retain internal formatting
+# capability through verification and bound plan serialization. Explicit SQL
+# casts remain strict above.
+statement ok
+PRAGMA verify_serializer
+
+query III
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(image_file('one.png'), 1),
+		(image_file('two.png'), 2),
+		(NULL::IMAGEFILE, 3)
+	) AS source(file_value, amount)
+)
+ON file_value IN (
+	CASE WHEN TRUE THEN image_file('one.png') END,
+	CASE WHEN TRUE THEN image_file('two.png') END,
+	NULL::IMAGEFILE
+)
+USING sum(amount)
+----
+1	2	3
+
+# Automatic PIVOT discovery emits an internal CREATE TYPE statement whose
+# bind-only formatting capability has no public SQL representation. Disable
+# query text reparse for those statements while retaining plan serialization.
+statement ok
+PRAGMA disable_verification
+
+statement ok
+PRAGMA verify_serializer
+
+statement ok
+SET pivot_filter_threshold = 1
+
+query II
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(audio_file('one.mp3'), 1),
+		(audio_file('two.mp3'), 2)
+	) AS source(file_value, amount)
+)
+ON file_value
+USING sum(amount)
+----
+1	2
+
+# A PIVOT IN subquery reaches the internal CREATE ENUM binder rather than the
+# automatic-discovery transform above.
+query II
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(video_file('one.mp4'), 1),
+		(video_file('two.mp4'), 2)
+	) AS source(file_value, amount)
+)
+ON file_value IN (
+	SELECT video_file('one.mp4')
+	UNION ALL
+	SELECT video_file('two.mp4')
+)
+USING sum(amount)
+----
+1	2
+
+statement ok
+RESET pivot_filter_threshold
+
+statement ok
+PRAGMA enable_verification
+
+# SUMMARIZE's min/max presentation is another engine-owned formatting
+# boundary; it must not make explicit SQL casts legal.
+statement ok
+SUMMARIZE SELECT image_file('summary.png') AS file_value
+
+statement ok
+PRAGMA disable_verify_serializer
+
+# Partition directory naming and RETURN_STATS both format FILE partition keys
+# internally.
+statement ok
+COPY (
+	SELECT image_file('partition.png') AS partition_file, 42 AS value
+) TO '__TEST_DIR__/media_partitioned' (
+	FORMAT CSV,
+	PARTITION_BY (partition_file),
+	RETURN_STATS
+)
+
+# Generic FILE-family functions accept all specializations. Value-returning
+# enrichment preserves its input alias, while identity functions compare
+# family members explicitly.
+query TTTTII
+SELECT
+	typeof(file_enrich(image_file('image.png'), [])),
+	typeof(file_enrich(audio_file('audio.mp3'), [])),
+	typeof(file_enrich(video_file('video.mp4'), [])),
+	file_path(image_file('image.png')),
+	file_same_location(image_file('same'), audio_file('same')),
+	file_same_content(
+		image_file(file('a', NULL, 0, 3, 'sha256:abc')),
+		video_file(file('b', NULL, 7, 3, 'SHA256:abc'))
+	)
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE	image.png	true	true
+
+statement ok
+CREATE TABLE media_files(
+	image IMAGEFILE,
+	audio AUDIOFILE,
+	video VIDEOFILE
+)
+
+statement ok
+INSERT INTO media_files VALUES (
+	image_file('stored.png'),
+	audio_file('stored.mp3'),
+	video_file('stored.mp4')
+)
+
+statement error
+INSERT INTO media_files(image) SELECT audio_file('wrong.mp3')
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement ok
+PREPARE insert_image AS INSERT INTO media_files(image) VALUES ($1)
+
+statement error
+EXECUTE insert_image(audio_file('wrong.mp3'))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement ok
+EXECUTE insert_image(image_file('prepared.png'))
+
+query TTTTTT
+SELECT
+	typeof(image), image.url,
+	typeof(audio), audio.url,
+	typeof(video), video.url
+FROM media_files
+ORDER BY image.url DESC
+----
+IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4
+IMAGEFILE	prepared.png	AUDIOFILE	NULL	VIDEOFILE	NULL
+
+restart
+
+query TTTTTT
+SELECT
+	typeof(image), image.url,
+	typeof(audio), audio.url,
+	typeof(video), video.url
+FROM media_files
+ORDER BY image.url DESC
+----
+IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4
+IMAGEFILE	prepared.png	AUDIOFILE	NULL	VIDEOFILE	NULL

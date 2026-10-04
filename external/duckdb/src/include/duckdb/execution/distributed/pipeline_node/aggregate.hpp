@@ -141,8 +141,12 @@ private:
 	std::vector<LogicalType> output_types_;
 };
 
-/// Split details used to implement two-stage/grouped aggregation
+enum class AggregateSplitStrategy { SingleStage, PartialFinal };
+
+/// A valid aggregate can require complete input rows instead of exported states.
+/// Invalid expressions and failures while constructing a split remain errors.
 struct GroupByAggSplit {
+	AggregateSplitStrategy strategy = AggregateSplitStrategy::SingleStage;
 	std::vector<BoundAggExpr> first_stage_aggs;
 	SchemaRef first_stage_schema;
 	std::vector<BoundExpr> first_stage_group_by;
@@ -156,8 +160,7 @@ struct GroupByAggSplit {
 	std::vector<BoundExpr> final_exprs;
 };
 
-/// Split aggregations into two-stage plan and final projection. This function
-/// mirrors Rust `split_groupby_aggs` and returns a GroupByAggSplit or an error.
+/// Select complete aggregation or a two-stage plan with a final projection.
 DuckDBResult<GroupByAggSplit> split_groupby_aggs(const std::vector<BoundExpr> &group_by,
                                                  const std::vector<BoundAggExpr> &aggs,
                                                  const std::vector<BoundExpr> &partition_by,

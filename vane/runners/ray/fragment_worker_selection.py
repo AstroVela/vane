@@ -52,6 +52,7 @@ def select_fte_worker(
     current_worker: Any,
     current_worker_id: str | None,
     *,
+    query_id: str,
     exclude: set[str] | None = None,
     allowed_node_ids: set[str] | None = None,
     memory_requirement_bytes: Any = None,
@@ -59,6 +60,9 @@ def select_fte_worker(
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
     node_requirements_wait_started_at: float | None = None,
 ) -> Any | None:
+    query_id = str(query_id or "").strip()
+    if not query_id:
+        raise ValueError("FTE worker selection requires query_id")
     workers = available_fte_workers(current_worker, current_worker_id, exclude=exclude)
     if allowed_node_ids is not None:
         workers = [worker for worker in workers if str(worker.node_id) in allowed_node_ids]
@@ -87,6 +91,7 @@ def select_fte_worker(
         workers,
         key=lambda handle: _fte_worker_selection_key(
             handle,
+            query_id=query_id,
             memory_requirement_bytes=memory_requirement_bytes,
             execution_class=execution_class,
             node_requirements=node_requirements,

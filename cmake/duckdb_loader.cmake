@@ -11,8 +11,7 @@
 # Simple DuckDB Build Configuration Module
 #
 # Sets sensible defaults for DuckDB Python extension builds and provides a clean
-# interface for adding DuckDB as a library target. Adds jemalloc option for
-# debugging but will never allow jemalloc in a release build if not on Linux.
+# interface for adding DuckDB as a library target.
 #
 # Usage: include(cmake/duckdb_loader.cmake) # Optionally load extensions
 # set(BUILD_EXTENSIONS "json;parquet;icu")
@@ -43,7 +42,15 @@ _duckdb_set_default(DUCKDB_SOURCE_PATH
                     "${CMAKE_CURRENT_SOURCE_DIR}/external/duckdb")
 
 # Extension list - commonly used extensions for Python
-_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json;httpfs")
+_duckdb_set_default(BUILD_EXTENSIONS
+                    "core_functions;file;parquet;icu;json;httpfs")
+
+# Optional extensions that are built as self-contained DuckDB loadable
+# artifacts. They are deliberately configured with DONT_LINK so _native keeps
+# its existing symbol-isolated static extension set.
+_duckdb_set_default(VANE_LOADABLE_EXTENSIONS "")
+_duckdb_set_default(VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY
+                    "${CMAKE_BINARY_DIR}/vane_extensions")
 
 # Core build options - disable unnecessary components for Python builds
 _duckdb_set_default(BUILD_SHELL OFF)
@@ -75,6 +82,14 @@ set(DUCKDB_SOURCE_PATH
 set(BUILD_EXTENSIONS
     "${BUILD_EXTENSIONS}"
     CACHE STRING "Semicolon-separated list of extensions to enable")
+set(VANE_LOADABLE_EXTENSIONS
+    "${VANE_LOADABLE_EXTENSIONS}"
+    CACHE
+      STRING
+      "Semicolon-separated list of self-contained loadable extensions to build")
+set(VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY
+    "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
+    CACHE PATH "Directory used to stage Vane loadable extension artifacts")
 set(BUILD_SHELL
     "${BUILD_SHELL}"
     CACHE BOOL "Build the DuckDB shell executable")
@@ -115,37 +130,6 @@ set(DEBUG_STACKTRACE
 # ════════════════════════════════════════════════════════════════════════════════
 # Internal Functions
 # ════════════════════════════════════════════════════════════════════════════════
-
-function(_duckdb_validate_jemalloc_config)
-  # Check if jemalloc is in the extension list
-  if(NOT BUILD_EXTENSIONS MATCHES "jemalloc")
-    return()
-  endif()
-
-  # jemalloc is only enabled on 64bit x86 linux builds
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8
-     AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
-     AND NOT BSD)
-    set(jemalloc_allowed TRUE)
-  else()
-    set(jemalloc_allowed FALSE)
-  endif()
-
-  if(NOT jemalloc_allowed)
-    message(WARNING "jemalloc extension is only supported on Linux.\n"
-                    "Removing jemalloc from extension list.")
-    # Remove jemalloc from the extension list
-    string(REPLACE "jemalloc" "" BUILD_EXTENSIONS_FILTERED
-                   "${BUILD_EXTENSIONS}")
-    string(REGEX REPLACE ";+" ";" BUILD_EXTENSIONS_FILTERED
-                         "${BUILD_EXTENSIONS_FILTERED}")
-    string(REGEX REPLACE "^;|;$" "" BUILD_EXTENSIONS_FILTERED
-                         "${BUILD_EXTENSIONS_FILTERED}")
-    set(BUILD_EXTENSIONS
-        "${BUILD_EXTENSIONS_FILTERED}"
-        PARENT_SCOPE)
-  endif()
-endfunction()
 
 function(_duckdb_validate_source_path)
   if(NOT EXISTS "${DUCKDB_SOURCE_PATH}")
@@ -608,11 +592,8 @@ function(_duckdb_create_interface_target target_name)
                 /utf-8 # treat source files as UTF-8 encoded
     )
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    target_compile_options(
-      ${target_name}
-      INTERFACE -stdlib=libc++ # for libc++ in favor of older libstdc++
-                -mmacosx-version-min=10.7 # minimum osx version compatibility
-    )
+    # Use libc++ on macOS; the deployment target is supplied by the toolchain.
+    target_compile_options(${target_name} INTERFACE -stdlib=libc++)
   endif()
 
   # Link to the DuckDB static library
@@ -621,6 +602,99 @@ function(_duckdb_create_interface_target target_name)
   # Enable position independent code for shared library builds
   set_target_properties(${target_name}
                         PROPERTIES INTERFACE_POSITION_INDEPENDENT_CODE ON)
+endfunction()
+
+function(_duckdb_configure_loadable_extensions)
+  set(_VANE_LOADABLE_EXTENSION_NAMES)
+  foreach(_VANE_REQUESTED_EXTENSION IN LISTS VANE_LOADABLE_EXTENSIONS)
+    string(TOLOWER "${_VANE_REQUESTED_EXTENSION}" _VANE_LOADABLE_EXTENSION_NAME)
+    if(_VANE_LOADABLE_EXTENSION_NAME STREQUAL "")
+      continue()
+    endif()
+    if(NOT _VANE_LOADABLE_EXTENSION_NAME MATCHES "^[a-z][a-z0-9_]*$")
+      message(
+        FATAL_ERROR
+          "Invalid VANE_LOADABLE_EXTENSIONS entry '${_VANE_REQUESTED_EXTENSION}'. "
+          "Extension names must contain lowercase letters, digits, and underscores."
+      )
+    endif()
+    list(APPEND _VANE_LOADABLE_EXTENSION_NAMES
+         "${_VANE_LOADABLE_EXTENSION_NAME}")
+  endforeach()
+  list(REMOVE_DUPLICATES _VANE_LOADABLE_EXTENSION_NAMES)
+
+  # DuckDB processes BUILD_EXTENSIONS before DUCKDB_EXTENSION_CONFIGS. Remove
+  # selected artifacts first so the generated DONT_LINK configuration below owns
+  # their registration even when they are part of Vane's base build list.
+  foreach(_VANE_LOADABLE_EXTENSION_NAME IN LISTS _VANE_LOADABLE_EXTENSION_NAMES)
+    list(REMOVE_ITEM BUILD_EXTENSIONS "${_VANE_LOADABLE_EXTENSION_NAME}")
+  endforeach()
+
+  if(_VANE_LOADABLE_EXTENSION_NAMES AND NOT DEFINED EXTENSION_STATIC_BUILD)
+    # DuckDB defaults this option to ON, but it reads it before declaring the
+    # option. Set it only for a requested Vane artifact so normal Vane builds
+    # retain their existing configuration order.
+    set(EXTENSION_STATIC_BUILD
+        ON
+        CACHE BOOL
+              "Build loadable extensions with a statically linked DuckDB engine"
+    )
+  endif()
+  if(_VANE_LOADABLE_EXTENSION_NAMES AND NOT EXTENSION_STATIC_BUILD)
+    message(
+      FATAL_ERROR
+        "VANE_LOADABLE_EXTENSIONS requires EXTENSION_STATIC_BUILD=ON. Thin "
+        "extensions cannot resolve DuckDB symbols from Vane's private _native module."
+    )
+  endif()
+
+  if(_VANE_LOADABLE_EXTENSION_NAMES)
+    set(_VANE_LOADABLE_EXTENSION_CONFIG_CONTENT
+        "# Generated by cmake/duckdb_loader.cmake.\n")
+    foreach(_VANE_LOADABLE_EXTENSION_NAME IN
+            LISTS _VANE_LOADABLE_EXTENSION_NAMES)
+      # External configs carry pinned source and build settings. Include the
+      # original registration, then change only its final static-link decision.
+      string(TOUPPER "${_VANE_LOADABLE_EXTENSION_NAME}"
+                     _VANE_LOADABLE_EXTENSION_NAME_UPPER)
+      string(
+        APPEND
+        _VANE_LOADABLE_EXTENSION_CONFIG_CONTENT
+        "if(EXISTS \"\${EXTENSION_CONFIG_BASE_DIR}/${_VANE_LOADABLE_EXTENSION_NAME}.cmake\")\n"
+        "  include(\"\${EXTENSION_CONFIG_BASE_DIR}/${_VANE_LOADABLE_EXTENSION_NAME}.cmake\")\n"
+        "  set(DUCKDB_EXTENSION_${_VANE_LOADABLE_EXTENSION_NAME_UPPER}_SHOULD_LINK FALSE)\n"
+        "else()\n"
+        "  duckdb_extension_load(${_VANE_LOADABLE_EXTENSION_NAME} DONT_LINK)\n"
+        "endif()\n")
+    endforeach()
+
+    set(_VANE_LOADABLE_EXTENSION_CONFIG_DIRECTORY
+        "${CMAKE_BINARY_DIR}/generated")
+    set(_VANE_LOADABLE_EXTENSION_CONFIG
+        "${_VANE_LOADABLE_EXTENSION_CONFIG_DIRECTORY}/vane_loadable_extensions.cmake"
+    )
+    file(MAKE_DIRECTORY "${_VANE_LOADABLE_EXTENSION_CONFIG_DIRECTORY}")
+    file(
+      CONFIGURE
+      OUTPUT
+      "${_VANE_LOADABLE_EXTENSION_CONFIG}"
+      CONTENT
+      "${_VANE_LOADABLE_EXTENSION_CONFIG_CONTENT}"
+      @ONLY
+      NEWLINE_STYLE
+      UNIX)
+    list(PREPEND DUCKDB_EXTENSION_CONFIGS "${_VANE_LOADABLE_EXTENSION_CONFIG}")
+  endif()
+
+  set(VANE_LOADABLE_EXTENSION_NAMES
+      "${_VANE_LOADABLE_EXTENSION_NAMES}"
+      PARENT_SCOPE)
+  set(BUILD_EXTENSIONS
+      "${BUILD_EXTENSIONS}"
+      PARENT_SCOPE)
+  set(DUCKDB_EXTENSION_CONFIGS
+      "${DUCKDB_EXTENSION_CONFIGS}"
+      PARENT_SCOPE)
 endfunction()
 
 function(_duckdb_print_summary)
@@ -634,6 +708,14 @@ function(_duckdb_print_summary)
   message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
   message(STATUS "  Native Arch: ${NATIVE_ARCH}")
   message(STATUS "  Unity Build Disabled: ${DISABLE_UNITY}")
+  if(VANE_LOADABLE_EXTENSION_NAMES)
+    message(
+      STATUS "  Vane Loadable Extensions: ${VANE_LOADABLE_EXTENSION_NAMES}")
+    message(
+      STATUS
+        "  Vane Loadable Extension Output: ${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
+    )
+  endif()
 
   set(debug_opts)
   if(FORCE_ASSERT)
@@ -653,14 +735,32 @@ endfunction()
 # ════════════════════════════════════════════════════════════════════════════════
 
 function(duckdb_add_library target_name)
+  _duckdb_configure_loadable_extensions()
   _duckdb_validate_source_path()
-  _duckdb_validate_jemalloc_config()
   _duckdb_resolve_source_id()
   _duckdb_resolve_fork_version()
   _duckdb_print_summary()
 
+  # Keep the embedded engine pinned to its native language mode even if a
+  # downstream embedding project selects a newer default. The Arrow Flight
+  # exchange target declares its own C++20 requirement.
+  set(CMAKE_CXX_STANDARD 11)
+
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
+  if(TARGET clangd_cache)
+    add_custom_target(
+      vane_duckdb_clangd_cache ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+              "${DUCKDB_SOURCE_PATH}/.cache/clangd"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+        "${DUCKDB_SOURCE_PATH}/.cache/clangd/compile_commands.json"
+      COMMENT "Updating DuckDB .cache/clangd"
+      VERBATIM)
+    add_dependencies(vane_duckdb_clangd_cache clangd_cache)
+  endif()
   _duckdb_enable_identity_refresh()
 
   # Create clean interface target
@@ -670,6 +770,19 @@ function(duckdb_add_library target_name)
   set(BUILD_EXTENSIONS
       "${BUILD_EXTENSIONS}"
       PARENT_SCOPE)
+  set(VANE_LOADABLE_EXTENSION_NAMES
+      "${VANE_LOADABLE_EXTENSION_NAMES}"
+      PARENT_SCOPE)
+endfunction()
+
+function(duckdb_require_static_extension extension_name consumer)
+  if(NOT "${extension_name}" IN_LIST BUILD_EXTENSIONS)
+    message(
+      FATAL_ERROR
+        "${consumer} requires DuckDB extension '${extension_name}' to be "
+        "statically linked. Keep '${extension_name}' in BUILD_EXTENSIONS and "
+        "remove it from VANE_LOADABLE_EXTENSIONS.")
+  endif()
 endfunction()
 
 function(duckdb_link_extensions target_name)
@@ -680,15 +793,93 @@ function(duckdb_link_extensions target_name)
   target_link_libraries(
     ${target_name}
     PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,duckdb_generated_extension_loader>")
-  if(BUILD_EXTENSIONS)
+  set(_VANE_STATIC_EXTENSIONS ${BUILD_EXTENSIONS})
+  foreach(_VANE_LOADABLE_EXTENSION_NAME IN LISTS VANE_LOADABLE_EXTENSION_NAMES)
+    list(REMOVE_ITEM _VANE_STATIC_EXTENSIONS "${_VANE_LOADABLE_EXTENSION_NAME}")
+  endforeach()
+  if(_VANE_STATIC_EXTENSIONS)
     message(STATUS "Linking DuckDB extensions:")
-    foreach(ext IN LISTS BUILD_EXTENSIONS)
+    foreach(ext IN LISTS _VANE_STATIC_EXTENSIONS)
       message(STATUS "- ${ext}")
       target_link_libraries(${target_name} PRIVATE ${ext}_extension)
     endforeach()
   else()
     message(STATUS "No DuckDB extensions linked in")
   endif()
+endfunction()
+
+function(duckdb_stage_loadable_extensions)
+  if(NOT VANE_LOADABLE_EXTENSION_NAMES)
+    return()
+  endif()
+
+  add_custom_target(vane_loadable_extensions)
+  foreach(_VANE_LOADABLE_EXTENSION_NAME IN LISTS VANE_LOADABLE_EXTENSION_NAMES)
+    set(_VANE_LOADABLE_EXTENSION_TARGET
+        "${_VANE_LOADABLE_EXTENSION_NAME}_loadable_extension")
+    if(NOT TARGET "${_VANE_LOADABLE_EXTENSION_TARGET}")
+      message(
+        FATAL_ERROR
+          "VANE_LOADABLE_EXTENSIONS requested '${_VANE_LOADABLE_EXTENSION_NAME}', "
+          "but DuckDB did not create target '${_VANE_LOADABLE_EXTENSION_TARGET}'."
+      )
+    endif()
+
+    set(_VANE_STAGED_LOADABLE_EXTENSION
+        "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/${_VANE_LOADABLE_EXTENSION_NAME}.duckdb_extension"
+    )
+    get_target_property(
+      _VANE_RUNTIME_DIRECTORY "${_VANE_LOADABLE_EXTENSION_TARGET}"
+      VANE_LOADABLE_RUNTIME_DIRECTORY)
+    set(_VANE_RUNTIME_COMMANDS)
+    set(_VANE_RUNTIME_INPUTS)
+    set(_VANE_STAGED_RUNTIME_FILES)
+    if(_VANE_RUNTIME_DIRECTORY)
+      file(GLOB _VANE_RUNTIME_INPUTS CONFIGURE_DEPENDS
+           "${_VANE_RUNTIME_DIRECTORY}/*")
+      if(NOT _VANE_RUNTIME_INPUTS)
+        message(
+          FATAL_ERROR
+            "Loadable extension runtime has no shared libraries: ${_VANE_RUNTIME_DIRECTORY}"
+        )
+      endif()
+      foreach(_VANE_RUNTIME_FILE IN LISTS _VANE_RUNTIME_INPUTS)
+        get_filename_component(_VANE_RUNTIME_NAME "${_VANE_RUNTIME_FILE}" NAME)
+        list(
+          APPEND
+          _VANE_STAGED_RUNTIME_FILES
+          "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs/${_VANE_RUNTIME_NAME}"
+        )
+      endforeach()
+      list(
+        APPEND
+        _VANE_RUNTIME_COMMANDS
+        COMMAND
+        ${CMAKE_COMMAND}
+        -E
+        copy_directory
+        "${_VANE_RUNTIME_DIRECTORY}"
+        "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs")
+    endif()
+    add_custom_command(
+      OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_STAGED_RUNTIME_FILES}
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+              "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:${_VANE_LOADABLE_EXTENSION_TARGET}>"
+        "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_RUNTIME_COMMANDS}
+      DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}" ${_VANE_RUNTIME_INPUTS}
+      COMMENT "Staging Vane loadable extension ${_VANE_LOADABLE_EXTENSION_NAME}"
+      VERBATIM)
+
+    add_custom_target(
+      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
+      DEPENDS "${_VANE_STAGED_LOADABLE_EXTENSION}"
+              ${_VANE_STAGED_RUNTIME_FILES})
+    add_dependencies(vane_loadable_extensions
+                     "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}")
+  endforeach()
 endfunction()
 
 # ════════════════════════════════════════════════════════════════════════════════

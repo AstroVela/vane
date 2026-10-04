@@ -6,13 +6,14 @@
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/execution/distributed/exchange/exchange.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_handles.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 // Forward-declare PlanExecutionContext to avoid circular includes
 namespace duckdb {
 namespace distributed {
 class PlanExecutionContext;
-class PlanConfig;
+struct PlanConfig;
 class TaskIDCounter;
 class ExchangeManager;
 } // namespace distributed
@@ -29,6 +30,7 @@ private:
 	size_t num_partitions_;
 	std::shared_ptr<DistributedPipelineNode> child_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
+	bool preserve_order_ = false;
 	bool collect_mark_join_build_summary_ = false;
 	vector<unique_ptr<Expression>> mark_join_build_expressions_;
 
@@ -39,7 +41,8 @@ public:
 	                                               std::shared_ptr<::duckdb::RepartitionSpec> repartition_spec,
 	                                               size_t num_partitions, SchemaRef schema,
 	                                               std::shared_ptr<DistributedPipelineNode> child,
-	                                               std::shared_ptr<ExchangeManager> exchange_mgr = nullptr);
+	                                               std::shared_ptr<ExchangeManager> exchange_mgr = nullptr,
+	                                               bool preserve_order = false);
 
 	std::shared_ptr<DistributedPipelineNode> into_node();
 
@@ -60,8 +63,12 @@ public:
 		return collect_mark_join_build_summary_;
 	}
 
+	bool PreservesOrder() const {
+		return preserve_order_;
+	}
+
 	bool is_materialization_barrier() const override {
-		return collect_mark_join_build_summary_;
+		return collect_mark_join_build_summary_ || preserve_order_;
 	}
 
 	std::vector<NodeID> materialized_input_node_ids() const override {
@@ -78,7 +85,8 @@ public:
 private:
 	RepartitionNode(PipelineNodeConfig config, PipelineNodeContext context,
 	                std::shared_ptr<::duckdb::RepartitionSpec> repartition_spec, size_t num_partitions,
-	                std::shared_ptr<DistributedPipelineNode> child, std::shared_ptr<ExchangeManager> exchange_mgr);
+	                std::shared_ptr<DistributedPipelineNode> child, std::shared_ptr<ExchangeManager> exchange_mgr,
+	                bool preserve_order);
 
 	// No separate execution_loop; production logic implemented in .cpp
 };
@@ -87,16 +95,14 @@ private:
 
 DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan,
                                               const std::shared_ptr<::duckdb::RepartitionSpec> &spec,
-                                              idx_t num_partitions, const std::string &exchange_id,
-                                              const ExchangeSinkInstanceHandle &sink_handle,
-                                              std::shared_ptr<ExchangeManager> exchange_mgr,
+                                              const Exchange &exchange, std::shared_ptr<ExchangeManager> exchange_mgr,
                                               bool collect_mark_join_build_summary = false,
-                                              vector<unique_ptr<Expression>> mark_join_build_expressions = {});
+                                              vector<unique_ptr<Expression>> mark_join_build_expressions = {},
+                                              bool preserve_order = false);
 
 DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan,
                                                    const vector<::duckdb::BoundOrderByNode> &orders,
-                                                   idx_t num_partitions, const std::string &exchange_id,
-                                                   const ExchangeSinkInstanceHandle &sink_handle,
+                                                   const Exchange &exchange,
                                                    std::shared_ptr<ExchangeManager> exchange_mgr,
                                                    vector<string> boundary_keys);
 
@@ -105,7 +111,8 @@ DuckPhysicalPlanRef MakeRemoteExchangeSourcePlan(const vector<LogicalType> &type
                                                  std::vector<ExchangeSourceHandle> source_handles,
                                                  std::shared_ptr<ExchangeManager> exchange_mgr,
                                                  const vector<std::string> &source_nodes,
-                                                 optional_idx runtime_source_node_id = optional_idx());
+                                                 optional_idx runtime_source_node_id = optional_idx(),
+                                                 bool preserve_order = false);
 
 } // namespace distributed
 } // namespace duckdb

@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/appender/fixed_binary.hpp"
 #include "duckdb/common/arrow/arrow_buffer.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/array.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/common/arrow/appender/append_data.hpp"
 #include "duckdb/common/arrow/appender/list.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
@@ -25,14 +27,13 @@ ArrowAppender::ArrowAppender(vector<LogicalType> types_p, const idx_t initial_ca
                              unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_type_cast)
     : types(std::move(types_p)), options(options) {
 	for (idx_t i = 0; i < types.size(); i++) {
-		unique_ptr<ArrowAppendData> entry;
-		bool bitshift_boolean = types[i].id() == LogicalTypeId::BOOLEAN && !options.arrow_lossless_conversion;
-		if (extension_type_cast.find(i) != extension_type_cast.end() && !bitshift_boolean) {
-			entry = InitializeChild(types[i], initial_capacity, options, extension_type_cast[i]);
-		} else {
-			entry = InitializeChild(types[i], initial_capacity, options);
-		}
-		root_data.push_back(std::move(entry));
+		// Pass any explicit per-column extension override through to InitializeChild; when none
+		// is supplied it auto-resolves the extension (and applies the bitshift_boolean gate) so
+		// children of nested types pick up the same extension SetArrowFormat uses for the schema.
+		auto extension_it = extension_type_cast.find(i);
+		shared_ptr<ArrowTypeExtensionData> extension =
+		    extension_it != extension_type_cast.end() ? extension_it->second : nullptr;
+		root_data.push_back(InitializeChild(types[i], initial_capacity, options, extension));
 	}
 }
 
@@ -44,14 +45,7 @@ void ArrowAppender::Append(DataChunk &input, const idx_t from, const idx_t to, c
 	D_ASSERT(types == input.GetTypes());
 	D_ASSERT(to >= from);
 	for (idx_t i = 0; i < input.ColumnCount(); i++) {
-		if (root_data[i]->extension_data && root_data[i]->extension_data->duckdb_to_arrow) {
-			Vector input_data(root_data[i]->extension_data->GetInternalType());
-			root_data[i]->extension_data->duckdb_to_arrow(*options.client_context, input.data[i], input_data,
-			                                              input_size);
-			root_data[i]->append_vector(*root_data[i], input_data, from, to, input_size);
-		} else {
-			root_data[i]->append_vector(*root_data[i], input.data[i], from, to, input_size);
-		}
+		root_data[i]->AppendChild(input.data[i], from, to, input_size);
 	}
 	row_count += to - from;
 }
@@ -149,6 +143,10 @@ static void InitializeAppenderForType(ArrowAppendData &append_data) {
 
 static void InitializeFunctionPointers(ArrowAppendData &append_data, const LogicalType &type) {
 	// handle special logical types
+	if (FixedBinaryType::IsFixedBinary(type)) {
+		InitializeAppenderForType<ArrowFixedBinaryData>(append_data);
+		return;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::SQLNULL:
 		InitializeAppenderForType<ArrowNullData>(append_data);
@@ -322,16 +320,39 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
                                                            ClientProperties &options,
                                                            const shared_ptr<ArrowTypeExtensionData> &extension_type) {
 	auto result = make_uniq<ArrowAppendData>(options);
+	if (TensorType::IsVariableShapeTensor(type) || ImageLogicalType::IsImage(type)) {
+		result->options.arrow_offset_size = ArrowOffsetSize::REGULAR;
+		result->options.arrow_use_list_view = false;
+		result->options.arrow_lossless_conversion = false;
+	}
+
+	// Resolve the effective extension. An explicit override (from the top-level appender) wins.
+	// Otherwise auto-resolve from DBConfig so nested children use the same extension SetArrowFormat
+	// declares in the schema. BOOLEAN stays plain bit-packed when arrow_lossless_conversion is off
+	// (the bitshift_boolean gate), applied here so it holds at every nesting level.
+	shared_ptr<ArrowTypeExtensionData> effective_extension = extension_type;
+	const bool bitshift_boolean = type.id() == LogicalTypeId::BOOLEAN && !options.arrow_lossless_conversion;
+	if (bitshift_boolean) {
+		effective_extension = nullptr;
+	} else if (!effective_extension && options.client_context) {
+		const auto &db_config = DBConfig::GetConfig(*options.client_context);
+		if (db_config.HasArrowExtension(type)) {
+			effective_extension = db_config.GetArrowExtension(type).GetTypeExtension();
+		}
+	}
+
 	LogicalType array_type = type;
-	if (extension_type) {
-		array_type = extension_type->GetInternalType();
+	if (effective_extension) {
+		array_type = effective_extension->GetInternalType();
 	}
 	InitializeFunctionPointers(*result, array_type);
-	result->extension_data = extension_type;
+	result->extension_data = effective_extension;
 
 	const auto byte_count = (capacity + 7) / 8;
 	result->GetValidityBuffer().reserve(byte_count);
-	result->initialize(*result, array_type, capacity);
+	// Arrow batch limits do not imply that every dense Image/Tensor row exists.
+	// Grow its element buffer as rows are appended.
+	result->initialize(*result, array_type, ArrayVector::UsesDeferredStorage(type) ? 0 : capacity);
 	return result;
 }
 

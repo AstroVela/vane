@@ -58,6 +58,8 @@ struct ParsedExtensionMetaData {
 	string extension_version;
 	string signature;
 	string extension_abi_metadata;
+	//! SHA-256 of the runtime manifest, embedded in the signed extension payload.
+	string native_runtime_sha256;
 
 	bool AppearsValid() {
 		return magic_value == EXPECTED_MAGIC_VALUE;

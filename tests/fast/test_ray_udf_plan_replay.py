@@ -47,6 +47,7 @@ def _execute_fresh_physical_plan(target, physical):
 def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
     source = vane.connect()
     target = None
+    physical = None
     try:
         left = source.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
         right = source.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
@@ -60,6 +61,8 @@ def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connect
     finally:
         if target is not None:
             target.close()
+        # The plan must retain the execution cursor context after its parent connection closes.
+        physical = None
         source.close()
 
 
@@ -115,7 +118,10 @@ def test_attached_scalar_alias_survives_logical_plan_pickle_to_fresh_connection(
     ("corruption", "error"),
     [
         ("payload_version", "unsupported payload_version 999"),
-        ("logical_return_type", "payload missing method_return_type or output_schema"),
+        (
+            "logical_return_type",
+            "serialized return type 'INTEGER' does not match payload return type 'VARCHAR'",
+        ),
         ("return_type", "serialized return type 'VARCHAR' does not match payload return type 'INTEGER'"),
     ],
 )
@@ -452,7 +458,7 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
     )
     _runners.set_runner_ray(noop_if_initialized=True)
     runner = _runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
 
     result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
     assert result.column(0).to_pylist() == [0, 2, 4, 6]

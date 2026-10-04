@@ -24,11 +24,13 @@
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/common/enums/metric_type.hpp"
 #include "duckdb/common/table_column.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
+#include "duckdb/function/distributed_table_function.hpp"
 
 namespace duckdb {
 
@@ -342,6 +344,10 @@ typedef unique_ptr<NodeStatistics> (*table_function_cardinality_t)(ClientContext
                                                                    const FunctionData *bind_data);
 typedef idx_t (*table_function_rows_scanned_t)(GlobalTableFunctionState &global_state,
                                                LocalTableFunctionState &local_state);
+typedef void (*table_function_get_metrics_t)(ClientContext &context, const FunctionData *bind_data,
+                                             GlobalTableFunctionState &global_state,
+                                             LocalTableFunctionState &local_state,
+                                             const profiler_settings_t &requested_metrics, profiler_metrics_t &metrics);
 typedef void (*table_function_pushdown_complex_filter_t)(ClientContext &context, LogicalGet &get,
                                                          FunctionData *bind_data,
                                                          vector<unique_ptr<Expression>> &filters);
@@ -397,6 +403,20 @@ public:
 	bool HasBindCallback() const {
 		return bind != nullptr;
 	}
+	bool RequiresClientContext() const {
+		return requires_client_context;
+	}
+	void SetRequiresClientContext() {
+		requires_client_context = true;
+	}
+	//! Reads live client metadata when this function remains in the bound plan.
+	bool IsClientContextRead() const {
+		return client_context_read;
+	}
+	void SetClientContextRead() {
+		requires_client_context = true;
+		client_context_read = true;
+	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
 	}
@@ -415,6 +435,14 @@ public:
 	table_function_deserialize_t GetDeserializeCallback() const {
 		return deserialize;
 	}
+	DUCKDB_API void SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks);
+	//! Bind the loader-derived distributed identity. Extension authors should not
+	//! call this directly; it is also used for Vane's built-in core functions.
+	DUCKDB_API void BindDistributedScanCapability(const string &extension_name);
+	bool HasDistributedScanCallbacks() const {
+		return distributed_scan != nullptr;
+	}
+	DUCKDB_API const TableFunctionDistributedScanCallbacks &GetDistributedScanCallbacks() const;
 
 	//! Bind function
 	//! This function is used for determining the return type of a table producing function and returning bind data
@@ -460,8 +488,10 @@ public:
 	//! (Optional) cardinality function
 	//! Returns the expected cardinality of this scan
 	table_function_cardinality_t cardinality;
-	//! (Optional) returns the number of rows that have benn scanned
+	//! (Optional) deprecated compatibility callback; prefer get_metrics for new table scan metrics
 	table_function_rows_scanned_t rows_scanned;
+	//! (Optional) returns profiling metrics for this table scan operator
+	table_function_get_metrics_t get_metrics;
 	//! (Optional) pushdown a set of arbitrary filter expressions, rather than only simple comparisons with a constant
 	//! Any functions remaining in the expression list will be pushed as a regular filter after the scan
 	table_function_pushdown_complex_filter_t pushdown_complex_filter;
@@ -498,6 +528,10 @@ public:
 
 	table_function_serialize_t serialize;
 	table_function_deserialize_t deserialize;
+	//! Optional extension-owned distributed scan protocol. Bind-state transport
+	//! continues to use serialize/deserialize; these callbacks only detach,
+	//! create, and apply opaque scan splits.
+	shared_ptr<const TableFunctionDistributedScanCallbacks> distributed_scan;
 	bool verify_serialization = true;
 
 	//! Whether or not the table function supports projection pushdown. If not supported a projection will be added
@@ -527,6 +561,10 @@ public:
 	DUCKDB_API bool Equal(const TableFunction &rhs) const;
 	DUCKDB_API bool operator==(const TableFunction &rhs) const;
 	DUCKDB_API bool operator!=(const TableFunction &rhs) const;
+
+private:
+	bool requires_client_context = false;
+	bool client_context_read = false;
 };
 
 } // namespace duckdb

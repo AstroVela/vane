@@ -139,6 +139,13 @@ bool ExtraTypeInfo::Equals(ExtraTypeInfo *other_p) const {
 	if (alias != other_p->alias) {
 		return false;
 	}
+	// IMAGE dimensions are constraints, not optional annotation. Generic IMAGE
+	// and a fixed-shape IMAGE must never compare as the same logical type.
+	if (alias == ImageLogicalType::TYPE_NAME &&
+	    (bool(extension_info) != bool(other_p->extension_info) ||
+	     (extension_info && extension_info->modifiers.size() != other_p->extension_info->modifiers.size()))) {
+		return false;
+	}
 	if (!ExtensionTypeInfo::Equals(extension_info, other_p->extension_info)) {
 		return false;
 	}

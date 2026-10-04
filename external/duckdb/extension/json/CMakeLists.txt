@@ -13,6 +13,7 @@ set(JSON_EXTENSION_FILES
     json_functions.cpp
     json_multi_file_info.cpp
     json_scan.cpp
+    json_distributed.cpp
     json_serializer.cpp
     json_deserializer.cpp
     serialize_json.cpp

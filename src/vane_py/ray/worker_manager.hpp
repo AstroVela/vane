@@ -9,6 +9,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 
@@ -16,6 +17,7 @@
 #include <string>
 
 #include "safe_pyobject.hpp"
+#include "query_lifecycle_coordinator.hpp"
 #include "worker.hpp"
 #include "task.hpp"
 #include "duckdb/execution/distributed/utils/channel.hpp"
@@ -31,7 +33,8 @@ string SubmissionErrorOwnerQueryId(const std::vector<duckdb::distributed::Worker
 class RayWorkerManager : public duckdb::distributed::WorkerManager,
                          public std::enable_shared_from_this<RayWorkerManager> {
 public:
-	RayWorkerManager();
+	using QueryCleanup = std::function<void(const string &)>;
+	explicit RayWorkerManager(QueryCleanup query_cleanup = {});
 
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override;
 
@@ -39,11 +42,15 @@ public:
 	DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> worker_snapshots() const override;
 	DuckDBResult<void> try_autoscale(const std::vector<duckdb::distributed::TaskResourceRequest> &bundles) override;
 	DuckDBResult<void> shutdown() override;
+	DuckDBResult<void> task_production_finished(const string &query_id) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> wait_fte_query(const string &query_id,
 	                                                                                  double timeout_s) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query(const string &query_id, double timeout_s,
 	               duckdb::distributed::MaterializedOutputCallback on_output) override;
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
+	wait_fte_query_streaming(const string &query_id, double timeout_s,
+	                         duckdb::distributed::MaterializedOutputCallback on_output) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> wait_fte_query(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
@@ -52,9 +59,11 @@ public:
 	    const string &query_id, const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids) override;
 	DuckDBResult<void> materialization_barrier_completed(const string &query_id,
 	                                                     duckdb::distributed::NodeID node_id) override;
+	DuckDBResult<void> abort_and_quiesce_query(const string &query_id) override;
 
+	void register_query_owner(const string &query_id, const string &owner_query_id);
 	void drop_query_fragments(const string &query_id);
-	void rethrow_submission_error(const string &query_id);
+	void rethrow_submission_error(const string &query_id, const string &details = string());
 	DuckDBResult<void> close_session(const string &session_id);
 	std::unordered_map<string, std::unordered_map<string, idx_t>> fragment_stats_by_worker() const;
 
@@ -77,6 +86,8 @@ private:
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    retained_fte_result_handles_by_query;
+		std::unordered_map<string, std::unordered_map<string, size_t>> fte_result_handle_counts_by_query;
+		std::unordered_map<string, std::vector<std::shared_ptr<RayWorkerRuntime>>> workers_by_query_owner;
 		idx_t active_operations = 0;
 		bool shutdown_started = false;
 		bool shutdown_finished = false;
@@ -103,14 +114,55 @@ private:
 		bool active_;
 	};
 
+	class QueryOperationGuard {
+	public:
+		QueryOperationGuard(RayWorkerManager &manager, const string &query_id,
+		                    const string &requested_owner_query_id = string())
+		    : manager_(manager), operation_(manager_.BeginQueryOperation(query_id, requested_owner_query_id)) {
+		}
+		QueryOperationGuard(const QueryOperationGuard &) = delete;
+		QueryOperationGuard &operator=(const QueryOperationGuard &) = delete;
+		~QueryOperationGuard() {
+			if (operation_) {
+				manager_.EndQueryOperation(*operation_);
+			}
+		}
+		explicit operator bool() const {
+			return operation_.has_value();
+		}
+		const string &owner_query_id() const {
+			return operation_->lifecycle.owner_query_id;
+		}
+		const QueryLifecycleCoordinator::LifecycleRef &lifecycle() const {
+			return operation_->lifecycle;
+		}
+
+	private:
+		RayWorkerManager &manager_;
+		Optional<QueryLifecycleCoordinator::Operation> operation_;
+	};
+
 	const string manager_instance_id_;
+	const QueryCleanup query_cleanup_;
 	mutable mutex mutex_;
 	mutable std::condition_variable shutdown_cv_;
 	mutable State state_;
+	QueryLifecycleCoordinator query_lifecycles_;
 	PythonExceptionStore submission_errors_;
 
 	bool BeginOperation() const;
 	void EndOperation() const;
+	Optional<QueryLifecycleCoordinator::Operation> BeginQueryOperation(const string &query_id,
+	                                                                   const string &requested_owner_query_id);
+	void EndQueryOperation(const QueryLifecycleCoordinator::Operation &operation);
+	void WaitForQueryOperations(const QueryLifecycleCoordinator::LifecycleRef &lifecycle);
+	void RecordQueryWorkers(const string &owner_query_id,
+	                        const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers);
+	Optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const string &query_id);
+	Optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown);
+	Optional<QueryLifecycleCoordinator::Teardown> BeginQueryTeardown(const string &query_id);
+	std::vector<std::shared_ptr<RayWorkerRuntime>> QueryWorkers(const string &owner_query_id) const;
+	DuckDBResult<void> ExecuteQueryAbort(Optional<QueryLifecycleCoordinator::Abort> active_abort);
 	bool ShutdownStarted() const;
 	bool RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
 	                            const std::shared_ptr<std::atomic<bool>> &retired) const;
@@ -122,11 +174,19 @@ private:
 	                            std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles);
 	void ClearFteResultHandles(const string &query_id);
 	DuckDBResult<void> CollectFteResultHandles(const string &query_id);
+	DuckDBResult<void>
+	ValidateFteResultHandleCoverage(const string &query_id,
+	                                const std::unordered_set<string> &selected_attempt_task_ids) const;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> DrainFteResultHandles(
 	    const string &query_id, double timeout_s, const RayWorkerRuntime::QueryStatus *finished_status = nullptr,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	        *task_context_filter = nullptr,
-	    bool release_payloads = true);
+	    bool release_payloads = true, duckdb::distributed::MaterializedOutputCallback on_output = {},
+	    bool selected_only = false);
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
+	    const string &query_id, double timeout_s,
+	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs);
 	DuckDBResult<RayWorkerRuntime::QueryStatus>
 	FteQueryStatus(const string &query_id,
 	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>

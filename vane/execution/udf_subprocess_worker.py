@@ -10,7 +10,7 @@ import os
 import socket
 import struct
 import sys
-from traceback import TracebackException
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from vane import pickle as vane_pickle
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
+from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
     _open_existing_shm,
@@ -30,7 +31,7 @@ from vane.execution.ref_bundle import (
     release_local_shm_ref_bundle_descriptor,
 )
 from vane.execution.udf_row_preserving import (
-    fuse_row_preserving_output,
+    fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
 from vane.execution.udf_threading import configure_loaded_torch_threads
@@ -55,10 +56,31 @@ _MSG_TASK_CANCELLED = 0x10
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
 _DEFAULT_SHM_SIZE = 1 << 20
+_MAX_FORMATTED_EXCEPTION_BYTES = 4 * 1024
+_MAX_FORMATTED_EXCEPTION_MESSAGE_BYTES = 2 * 1024
+_MAX_FORMATTED_EXCEPTION_CHAIN = 4
+_MAX_FORMATTED_EXCEPTION_FRAMES = 16
+_MAX_FORMATTED_EXCEPTION_TRACEBACK_STEPS = 64
+_MAX_FORMATTED_EXCEPTION_FIELD_BYTES = 256
+_EXECUTOR_CLOSE_ATTEMPTS = 2
 
 
 class _TaskCancelledError(RuntimeError):
     """The parent cancelled this task without invalidating the worker."""
+
+
+def _close_executor_with_retry(executor: Any) -> BaseException | None:
+    """Retry one transient callable cleanup failure before process teardown."""
+
+    last_error: BaseException | None = None
+    for _ in range(_EXECUTOR_CLOSE_ATTEMPTS):
+        try:
+            executor.close()
+        except BaseException as error:
+            last_error = error
+        else:
+            return None
+    return last_error
 
 
 def _debug_enabled() -> bool:
@@ -218,11 +240,133 @@ def _arrow_table_to_ipc_bytes(table: pa.Table) -> bytes:
     return bytes(sink.getvalue().to_pybytes())
 
 
-def _format_exception(exc: BaseException) -> str:
+def _bound_utf8_text(value: str, max_bytes: int) -> str:
+    # Error frames share the control socket with lifecycle messages. Bound the
+    # encoded frame before sending so a provider exception cannot force an
+    # arbitrarily large allocation in the parent process.
+    if len(value) > max_bytes:
+        value = value[:max_bytes] + "\N{HORIZONTAL ELLIPSIS}" + value[-max_bytes:]
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8")
+    omission = "\N{HORIZONTAL ELLIPSIS}".encode()
+    remaining = max_bytes - len(omission)
+    prefix_size = remaining // 2
+    suffix_size = remaining - prefix_size
+    return (
+        encoded[:prefix_size].decode("utf-8", errors="ignore")
+        + omission.decode()
+        + encoded[-suffix_size:].decode("utf-8", errors="ignore")
+    )
+
+
+def _bound_exception_text(value: str) -> str:
+    return _bound_utf8_text(value, _MAX_FORMATTED_EXCEPTION_BYTES)
+
+
+def _safe_exception_type_name(exc: BaseException) -> str:
+    return safe_exception_type_name(exc, _MAX_FORMATTED_EXCEPTION_FIELD_BYTES)
+
+
+def _format_exception_summary(exc: BaseException) -> str:
+    error_type = _safe_exception_type_name(exc)
+    message = exception_message_from_args(exc)
+    if message is None:
+        return f"<unprintable {error_type}>"
+    if not message:
+        return error_type
+    message = _bound_utf8_text(message, _MAX_FORMATTED_EXCEPTION_MESSAGE_BYTES)
+    return _bound_exception_text(f"{error_type}: {message}")
+
+
+def _format_single_exception(exc: BaseException) -> str:
+    summary = _format_exception_summary(exc)
     try:
-        return "".join(TracebackException.from_exception(exc).format())
-    except Exception:
-        return repr(exc)
+        traceback_cursor = BaseException.__getattribute__(exc, "__traceback__")
+    except BaseException:
+        traceback_cursor = None
+    if traceback_cursor is None:
+        return summary
+
+    frames: deque[str] = deque(maxlen=_MAX_FORMATTED_EXCEPTION_FRAMES)
+    frame_count = 0
+    while traceback_cursor is not None and frame_count < _MAX_FORMATTED_EXCEPTION_TRACEBACK_STEPS:
+        frame_count += 1
+        try:
+            code = traceback_cursor.tb_frame.f_code
+            filename = _bound_utf8_text(str(code.co_filename), _MAX_FORMATTED_EXCEPTION_FIELD_BYTES)
+            function = _bound_utf8_text(str(code.co_name), _MAX_FORMATTED_EXCEPTION_FIELD_BYTES)
+            line = int(traceback_cursor.tb_lineno)
+            frames.append(f'  File "{filename}", line {line}, in {function}\n')
+            traceback_cursor = traceback_cursor.tb_next
+        except BaseException:
+            frames.append("  <traceback frame unavailable>\n")
+            break
+
+    parts = ["Traceback (most recent call last):\n"]
+    omitted_frames = frame_count - len(frames)
+    if omitted_frames > 0:
+        parts.append(f"  ... {omitted_frames} earlier frames omitted ...\n")
+    parts.extend(frames)
+    if traceback_cursor is not None:
+        parts.append("  ... additional traceback frames omitted ...\n")
+    parts.append(summary)
+    return _bound_exception_text("".join(parts))
+
+
+def _next_chained_exception(exc: BaseException) -> tuple[BaseException | None, str]:
+    try:
+        cause = BaseException.__getattribute__(exc, "__cause__")
+    except BaseException:
+        cause = None
+    if isinstance(cause, BaseException):
+        return cause, "The above exception was the direct cause of the following exception:"
+
+    try:
+        suppress_context = bool(BaseException.__getattribute__(exc, "__suppress_context__"))
+    except BaseException:
+        suppress_context = True
+    if suppress_context:
+        return None, ""
+    try:
+        context = BaseException.__getattribute__(exc, "__context__")
+    except BaseException:
+        context = None
+    if isinstance(context, BaseException):
+        return context, "During handling of the above exception, another exception occurred:"
+    return None, ""
+
+
+def _format_exception(exc: BaseException) -> str:
+    exceptions = [exc]
+    separators: list[str] = []
+    seen = {id(exc)}
+    chain_omitted = False
+    chain_cycle = False
+    while True:
+        chained, separator = _next_chained_exception(exceptions[-1])
+        if chained is None:
+            break
+        if id(chained) in seen:
+            chain_cycle = True
+            break
+        if len(exceptions) >= _MAX_FORMATTED_EXCEPTION_CHAIN:
+            chain_omitted = True
+            break
+        seen.add(id(chained))
+        exceptions.append(chained)
+        separators.append(separator)
+
+    parts: list[str] = []
+    if chain_omitted:
+        parts.append("... earlier exceptions omitted ...\n\n")
+    elif chain_cycle:
+        parts.append("... cyclic exception chain omitted ...\n\n")
+    parts.append(_format_single_exception(exceptions[-1]))
+    for index in range(len(exceptions) - 2, -1, -1):
+        parts.append(f"\n\n{separators[index]}\n\n")
+        parts.append(_format_single_exception(exceptions[index]))
+    return _bound_exception_text("".join(parts))
 
 
 def _send_input_consumed(
@@ -370,6 +514,7 @@ def _execute_submit(
     row_preserving = call_mode == "map_batches_rows" or (
         call_mode == "map" and payload.get("scalar_arg_count") is not None
     )
+    expected_rows = input_table.num_rows
     passthrough_table = None
     if row_preserving:
         input_table, passthrough_table = split_row_preserving_input(payload, input_table)
@@ -378,11 +523,13 @@ def _execute_submit(
         executor.finished_submitting()
     output_tables = _drain_executor_outputs(executor)
     if row_preserving:
-        if len(output_tables) != 1:
-            raise RuntimeError(
-                "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
-            )
-        output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
+        output_tables = fuse_row_preserving_outputs(
+            payload,
+            passthrough_table,
+            output_tables,
+            expected_rows=expected_rows,
+            mode=f"{call_mode} subprocess",
+        )
     if produce_ref_bundle_output:
         required = sum(_ipc_response_size(output_table) for output_table in output_tables)
         grant_id = _request_output_grant(
@@ -478,24 +625,22 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         while not close_requested:
             msg_type, payload_data = _recv_message(sock)
             if msg_type == _MSG_CLOSE:
-                cleanup_error: BaseException | None = None
-                try:
-                    if executor is not None:
-                        executor.close()
-                except BaseException as exc:
-                    cleanup_error = exc
-                finally:
+                cleanup_error = None if executor is None else _close_executor_with_retry(executor)
+                if cleanup_error is None:
                     executor = None
                     gc.collect()
-                if cleanup_error is None:
                     _send_message(sock, _MSG_ACK)
+                    close_requested = True
                 else:
                     _send_message(
                         sock,
                         _MSG_ERROR,
                         _format_exception(cleanup_error).encode("utf-8", errors="replace"),
                     )
-                close_requested = True
+                    # The parent may decide to force termination after this
+                    # bounded attempt. Retain the executor until then so its
+                    # finalizer still owns every resource that failed to close.
+                    close_requested = True
                 continue
             if msg_type == _MSG_FINISHED:
                 try:
@@ -590,10 +735,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             pass
     finally:
         if executor is not None:
-            try:
-                executor.close()
-            except Exception:
-                pass
+            _close_executor_with_retry(executor)
             executor = None
             gc.collect()
         try:

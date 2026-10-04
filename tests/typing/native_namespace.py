@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import types
 
+import numpy as np
 from typing_extensions import assert_type
 
 import vane
@@ -105,8 +106,67 @@ assert_type(
 )
 assert_type(
     vane.tensor_type(public_sqltypes.FLOAT, [2, 3]).children,
-    list[tuple[str, public_sqltypes.DuckDBPyType | int | list[str] | tuple[int, ...]]],
+    list[tuple[str, public_sqltypes.DuckDBPyType | int | list[str] | tuple[int | None, ...]]],
 )
+file_value = vane.File("memory://typing", content_type="text/plain", position=0, size=1, checksum="sha256:a")
+assert_type(file_value, vane.File)
+assert_type(_native.File("memory://typing"), _native.File)
+assert_type(file_value.url, str)
+assert_type(file_value.content_type, str | None)
+assert_type(file_value.position, int | None)
+assert_type(file_value.size, int | None)
+assert_type(file_value.checksum, str | None)
+assert_type(vane.MediaType.image(), vane.MediaType)
+assert_type(vane.ImageFile("memory://image"), vane.ImageFile)
+assert_type(vane.AudioFile("memory://audio"), vane.AudioFile)
+assert_type(vane.VideoFile("memory://video"), vane.VideoFile)
+assert_type(vane.file_type(), public_sqltypes.DuckDBPyType)
+assert_type(vane.file_type(vane.MediaType.image()), public_sqltypes.DuckDBPyType)
+assert_type(_native.file_type(), _sqltypes.DuckDBPyType)
+assert_type(_native.file_type(_native.MediaType.video()), _sqltypes.DuckDBPyType)
+assert_type(vane.file_type().is_file(), bool)
+image_value: vane.Image = np.zeros((1, 1, 1), dtype=np.uint8)
+assert_type(image_value, vane.Image)
+assert_type(vane.image_type("RGB").image_mode, vane.ImageMode | None)
+assert_type(vane.image_to_tensor(vane.col("image")), vane.Expression)
+assert_type(vane.col("image").image_to_tensor(), vane.Expression)
+assert_type(vane.image_type("RGB", 1, 2).shape, tuple[int, int])
+assert_type(vane.image_type().is_fixed_shape_image(), bool)
+assert_type(vane.col("image").as_image("RGB"), vane.Expression)
+assert_type(vane.image_width(vane.col("image")), vane.Expression)
+assert_type(vane.col("image").image_attribute(vane.ImageProperty.Width), vane.Expression)
+assert_type(vane.col("image").image_height(), vane.Expression)
+assert_type(vane.resize(vane.col("image"), 224, 224, antialias=True), vane.Expression)
+assert_type(vane.col("image").resize(224, 224), vane.Expression)
+assert_type(vane.col("image").resize(224, 224, antialias=True), vane.Expression)
+assert_type(vane.resize(vane.col("image"), 224, 224, antialias=np.bool_(True)), vane.Expression)
+assert_type(vane.col("image").resize(224, 224, antialias=np.bool_(True)), vane.Expression)
+assert_type(vane.col("image").resize(224, 224, antialias=vane.col("antialias")), vane.Expression)
+assert_type(vane.col("image").resize(224, 224, antialias=None), vane.Expression)
+
+assert_type(vane.image_type(), public_sqltypes.DuckDBPyType)
+assert_type(vane.image_type().is_image(), bool)
+assert_type(vane.file("memory://typing"), vane.Expression)
+assert_type(vane.image_file("memory://image"), vane.Expression)
+assert_type(vane.decode_image_file(vane.col("image"), "RGB", "null"), vane.Expression)
+assert_type(vane.col("image").decode_image_file("RGBA", "raise"), vane.Expression)
+assert_type(vane.audio_file(file_value), vane.Expression)
+assert_type(vane.resample(vane.col("audio"), 16000), vane.Expression)
+assert_type(vane.video_file(vane.col("file")), vane.Expression)
+video_expression = vane.col("video")
+seek_index_expression = vane.build_video_index(video_expression)
+assert_type(seek_index_expression, vane.Expression)
+assert_type(video_expression.video_frames(index=seek_index_expression), vane.Expression)
+assert_type(video_expression.video_frames(index=b"opaque index"), vane.Expression)
+assert_type(video_expression.video_frames(index=None), vane.Expression)
+assert_type(video_expression.video_keyframes(index=seek_index_expression), vane.Expression)
+assert_type(video_expression.video_keyframes(index=b"opaque index"), vane.Expression)
+assert_type(video_expression.video_keyframes(index=None), vane.Expression)
+assert_type(vane.video_index_info(seek_index_expression), vane.Expression)
+assert_type(vane.video_scan_stats(video_expression, index=seek_index_expression), vane.Expression)
+assert_type(vane.col("url").as_file(), vane.Expression)
+assert_type(vane.col("url").as_file(vane.MediaType.image()), vane.Expression)
+assert_type(vane.col("file").url, vane.Expression)
 
 assert_type(_native._func, types.ModuleType)
 assert_type(_native._sqltypes, types.ModuleType)
@@ -116,8 +176,10 @@ assert_type(require_ray_cxx_attr("PyLogicalPlan"), type[ray_cxx.PyLogicalPlan])
 assert_type(require_ray_cxx_attr("RayTaskResult"), type[ray_cxx.RayTaskResult])
 cleanup_flight_shuffle = require_ray_cxx_attr("cleanup_flight_shuffle_for_query")
 assert_type(cleanup_flight_shuffle("typing-query"), dict[str, int | str])
-assert_type(ray_cxx.merge_scan_task_descriptors([b"descriptor"]), bytes)
-assert_type(ray_cxx.scan_task_source_partition_id(b"descriptor"), int)
+assert_type(ray_cxx.merge_scan_split_batches([b"batch"]), bytes)
+assert_type(ray_cxx.split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
+split_scan_split_batch = require_ray_cxx_attr("split_scan_split_batch")
+assert_type(split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
 assert_type(
     ray_cxx.split_exchange_source_task_by_partition(b"descriptor"),
     list[tuple[int, bytes, int, int, bool]],

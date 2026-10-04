@@ -10,10 +10,9 @@ cmake_minimum_required(VERSION 3.29)
 
 project(vane_python LANGUAGES CXX)
 
-# Arrow 24 requires C++20. Use the same standard for the complete Vane native
-# build so Python bindings, distributed exchange, and their consumers cannot
-# silently diverge based on transitive CMake requirements.
-set(CMAKE_CXX_STANDARD 20)
+# Match DuckDB's native C++11 mode throughout Vane. The Arrow Flight exchange
+# target opts into C++20 explicitly without changing DuckDB or its consumers.
+set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 # Vane does not use C++ modules. CMake's automatic C++20 module scan emits GCC
@@ -54,47 +53,51 @@ endif()
 # Prefer repo-local vcpkg packages when present. This keeps local PEP 517 builds
 # working after `vcpkg install` without requiring callers to export
 # CMAKE_PREFIX_PATH before running `pip install .`.
-set(_VANE_VCPKG_INSTALLED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed")
+if(DEFINED VCPKG_INSTALLED_DIR AND NOT VCPKG_INSTALLED_DIR STREQUAL "")
+  set(_VANE_VCPKG_INSTALLED_DIR "${VCPKG_INSTALLED_DIR}")
+elseif(DEFINED ENV{VCPKG_INSTALLED_DIR} AND NOT "$ENV{VCPKG_INSTALLED_DIR}"
+                                            STREQUAL "")
+  set(_VANE_VCPKG_INSTALLED_DIR "$ENV{VCPKG_INSTALLED_DIR}")
+else()
+  set(_VANE_VCPKG_INSTALLED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed")
+endif()
+get_filename_component(_VANE_VCPKG_INSTALLED_DIR "${_VANE_VCPKG_INSTALLED_DIR}"
+                       ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 if(EXISTS "${_VANE_VCPKG_INSTALLED_DIR}")
   set(_VANE_VCPKG_PREFIX_CANDIDATES)
 
-  if(DEFINED VCPKG_TARGET_TRIPLET)
+  if(DEFINED VCPKG_TARGET_TRIPLET AND NOT VCPKG_TARGET_TRIPLET STREQUAL "")
     list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
          "${_VANE_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
-  endif()
-
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  elseif(DEFINED ENV{VCPKG_TARGET_TRIPLET} AND NOT "$ENV{VCPKG_TARGET_TRIPLET}"
+                                               STREQUAL "")
+    list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+         "${_VANE_VCPKG_INSTALLED_DIR}/$ENV{VCPKG_TARGET_TRIPLET}")
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/x64-linux")
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-linux-release")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-linux")
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-linux-release")
     endif()
   elseif(APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-osx")
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-osx-release")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/x64-osx")
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-osx-release")
     endif()
   elseif(WIN32)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-windows")
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-windows-static-release")
     else()
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
-           "${_VANE_VCPKG_INSTALLED_DIR}/x64-windows")
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-windows-static-release")
     endif()
   endif()
-
-  file(
-    GLOB _VANE_VCPKG_INSTALLED_PREFIXES
-    LIST_DIRECTORIES true
-    "${_VANE_VCPKG_INSTALLED_DIR}/*")
-  list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES ${_VANE_VCPKG_INSTALLED_PREFIXES})
-  list(REMOVE_DUPLICATES _VANE_VCPKG_PREFIX_CANDIDATES)
 
   foreach(_VANE_VCPKG_PREFIX IN LISTS _VANE_VCPKG_PREFIX_CANDIDATES)
     if(EXISTS "${_VANE_VCPKG_PREFIX}/share/arrow/ArrowConfig.cmake")
@@ -188,7 +191,11 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_vane_runners>)
 # Add Vane's Python and engine dependencies.
 target_link_libraries(_native PRIVATE vane_python_dependencies)
+if(WIN32)
+  target_link_libraries(_native PRIVATE advapi32)
+endif()
 duckdb_link_extensions(_native)
+duckdb_stage_loadable_extensions()
 
 # ────────────────────────────────────────────
 # Controlling symbol export

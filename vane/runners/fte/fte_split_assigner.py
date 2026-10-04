@@ -179,6 +179,7 @@ class ArbitrarySplitAssigner(SplitAssigner):
         self,
         max_splits_per_partition: int | None = None,
         *,
+        preserve_order: bool = False,
         catalog_requirement: str | None = None,
         partitioned_sources: set[str] | list[str] | tuple[str, ...] | None = None,
         replicated_sources: set[str] | list[str] | tuple[str, ...] | None = None,
@@ -208,6 +209,7 @@ class ArbitrarySplitAssigner(SplitAssigner):
         if max_target < min_target:
             raise ValueError("max_target_partition_size_bytes must be >= min_target_partition_size_bytes")
         self._next_partition_id = 0
+        self._preserve_order = bool(preserve_order)
         self._source_sequences: dict[str, int] = {}
         self._catalog_requirement = None if catalog_requirement is None else str(catalog_requirement)
         self._partitioned_sources = _normalize_sources(partitioned_sources)
@@ -290,6 +292,23 @@ class ArbitrarySplitAssigner(SplitAssigner):
         for split in splits:
             node_requirements = self._node_requirements(split)
             assignment = self._open_assignments.get(node_requirements)
+            if self._preserve_order and assignment is None and self._open_assignments:
+                # Locality-aware assignment normally keeps one open partition per
+                # node. Reusing an older partition would turn an A, B, A input
+                # sequence into A, A, B when an ordered exchange reads partitions
+                # by ID, so ordered fragments close the current contiguous run.
+                for open_requirements, open_assignment in list(self._open_assignments.items()):
+                    open_assignment.full = True
+                    for partitioned_source_id in self._partitioned_sources:
+                        _append_update(
+                            result,
+                            open_assignment.partition_id,
+                            partitioned_source_id,
+                            no_more_splits=True,
+                        )
+                    if self._completed_sources.issuperset(self._replicated_sources):
+                        _append_seal(result, open_assignment.partition_id)
+                    self._open_assignments.pop(open_requirements, None)
             split_size = _split_size_bytes(split, self._standard_split_size_bytes)
             if assignment is not None and (
                 assignment.assigned_data_size_bytes + split_size > self._rounded_target_partition_size_bytes

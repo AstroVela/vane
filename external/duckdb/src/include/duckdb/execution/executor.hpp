@@ -73,6 +73,7 @@ public:
 	static Executor &Get(ClientContext &context);
 
 	void Initialize(PhysicalOperator &physical_plan);
+	void Initialize(unique_ptr<PhysicalOperator> physical_plan);
 	//! Build the exact native pipeline graph without scheduling any events or
 	//! executing operator code. Used to publish immutable progress topology.
 	void InitializeProgressTopology(PhysicalOperator &physical_plan);
@@ -173,6 +174,7 @@ private:
 
 private:
 	optional_ptr<PhysicalOperator> physical_plan;
+	unique_ptr<PhysicalOperator> owned_plan;
 
 	mutex executor_lock;
 	//! All pipelines of the query plan

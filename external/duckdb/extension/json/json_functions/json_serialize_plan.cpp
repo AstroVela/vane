@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/connection.hpp"
@@ -217,6 +223,9 @@ ScalarFunctionSet JSONFunctions::GetSerializePlanFunction() {
 	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    LogicalType::JSON(), JsonSerializePlanFunction, JsonSerializePlanBind, nullptr, nullptr,
 	    JSONFunctionLocalState::Init));
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+	}
 	return set;
 }
 

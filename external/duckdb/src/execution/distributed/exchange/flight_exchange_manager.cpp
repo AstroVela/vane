@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "duckdb/common/windows_undefs.hpp"
 #else
 #include <arpa/inet.h>
 #endif
@@ -24,11 +28,14 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -79,6 +86,39 @@ int ParseFlightIpLiteral(int family, const std::string &host, void *address) {
 #endif
 }
 
+bool IsNumericIpv4Like(const std::string &host) {
+	return std::all_of(host.begin(), host.end(),
+	                   [](char character) { return (character >= '0' && character <= '9') || character == '.'; });
+}
+
+bool IsCanonicalIpv4Literal(const std::string &host) {
+	idx_t component_count = 0;
+	idx_t component_start = 0;
+	for (idx_t position = 0; position <= host.size(); position++) {
+		if (position < host.size() && host[position] != '.') {
+			continue;
+		}
+
+		const auto component_length = position - component_start;
+		if (component_length == 0 || component_length > 3 || (component_length > 1 && host[component_start] == '0')) {
+			return false;
+		}
+		idx_t component_value = 0;
+		for (idx_t component_position = component_start; component_position < position; component_position++) {
+			const auto character = host[component_position];
+			if (character < '0' || character > '9') {
+				return false;
+			}
+			component_value = component_value * 10 + NumericCast<idx_t>(character - '0');
+		}
+		if (component_value > 255 || ++component_count > 4) {
+			return false;
+		}
+		component_start = position + 1;
+	}
+	return component_count == 4;
+}
+
 DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 	StringUtil::Trim(host);
 	if (host.empty()) {
@@ -102,6 +142,14 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 	const auto is_zero = [](unsigned char byte) {
 		return byte == 0;
 	};
+	const bool is_numeric_ipv4_like = IsNumericIpv4Like(host);
+	// inet_pton accepts leading-zero IPv4 components on some platforms. Apply
+	// the project's canonical dotted-decimal policy before the system parser so
+	// validation is identical on Linux, macOS, and Windows.
+	if (is_numeric_ipv4_like && !IsCanonicalIpv4Literal(host)) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
+	}
 	if (ParseFlightIpLiteral(AF_INET, host, address.data()) == 1) {
 		const bool is_unspecified = std::all_of(address.begin(), address.begin() + 4, is_zero);
 		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified});
@@ -113,9 +161,6 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 		                                        std::all_of(address.begin() + 12, address.end(), is_zero);
 		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified || is_ipv4_mapped_unspecified});
 	}
-	const bool is_numeric_ipv4_like = std::all_of(host.begin(), host.end(), [](char character) {
-		return (character >= '0' && character <= '9') || character == '.';
-	});
 	if (is_numeric_ipv4_like) {
 		return DuckDBResult<ParsedFlightHost>::err(
 		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
@@ -196,7 +241,8 @@ bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const Lo
 	if (expected_type.id() == LogicalTypeId::AGGREGATE_STATE && arrow_type.id() == LogicalTypeId::BLOB) {
 		return true;
 	}
-	return false;
+	return TypeVisitor::Contains(expected_type, GovernedLogicalType::IsGoverned) &&
+	       GovernedLogicalType::IsCanonicalStorageType(arrow_type, expected_type);
 }
 
 void CastFlightExchangeChunk(ClientContext &context, DataChunk &input, DataChunk &output,
@@ -205,9 +251,185 @@ void CastFlightExchangeChunk(ClientContext &context, DataChunk &input, DataChunk
 	for (idx_t col = 0; col < target_types.size(); col++) {
 		if (input.data[col].GetType() == target_types[col]) {
 			output.data[col].Reference(input.data[col]);
+		} else if (TypeVisitor::Contains(target_types[col], GovernedLogicalType::IsGoverned)) {
+			// Flight carries governed values as their canonical Arrow storage. Schema admission above proves that only
+			// governed aliases were erased, so this internal cast cannot become a public STRUCT-to-governed conversion.
+			auto &cast_functions = CastFunctionSet::Get(context);
+			GetCastFunctionInput cast_input(context);
+			cast_input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;
+			string error_message;
+			if (!VectorOperations::TryCast(cast_functions, cast_input, input.data[col], output.data[col], input.size(),
+			                               &error_message)) {
+				throw InvalidInputException("flight exchange could not restore governed logical type %s: %s",
+				                            target_types[col], error_message);
+			}
 		} else {
 			VectorOperations::Cast(context, input.data[col], output.data[col], input.size());
 		}
+	}
+}
+
+vector<idx_t> FlightExchangeValidRows(const Vector &input, const vector<idx_t> &rows) {
+	vector<idx_t> valid_rows;
+	valid_rows.reserve(rows.size());
+	for (auto row : rows) {
+		if (!FlatVector::IsNull(input, row)) {
+			valid_rows.push_back(row);
+		}
+	}
+	return valid_rows;
+}
+
+void ValidateFlightExchangeFileRows(Vector &input, const vector<idx_t> &rows) {
+	auto valid_rows = FlightExchangeValidRows(input, rows);
+	if (valid_rows.empty()) {
+		return;
+	}
+	auto &fields = StructVector::GetEntries(input);
+	D_ASSERT(fields.size() == FileLogicalType::FIELD_COUNT);
+	auto urls = FlatVector::GetData<string_t>(*fields[FileLogicalType::URL]);
+	auto positions = FlatVector::GetData<int64_t>(*fields[FileLogicalType::POSITION]);
+	auto sizes = FlatVector::GetData<int64_t>(*fields[FileLogicalType::SIZE]);
+	auto checksums = FlatVector::GetData<string_t>(*fields[FileLogicalType::CHECKSUM]);
+	for (auto row : valid_rows) {
+		string url;
+		const string *url_ptr = nullptr;
+		if (!FlatVector::IsNull(*fields[FileLogicalType::URL], row)) {
+			url = urls[row].GetString();
+			url_ptr = &url;
+		}
+		auto has_position = !FlatVector::IsNull(*fields[FileLogicalType::POSITION], row);
+		auto has_size = !FlatVector::IsNull(*fields[FileLogicalType::SIZE], row);
+		string checksum;
+		const string *checksum_ptr = nullptr;
+		if (!FlatVector::IsNull(*fields[FileLogicalType::CHECKSUM], row)) {
+			checksum = checksums[row].GetString();
+			checksum_ptr = &checksum;
+		}
+		FileLogicalType::ValidateFields(url_ptr, has_position, has_position ? positions[row] : 0, has_size,
+		                                has_size ? sizes[row] : 0, checksum_ptr, "flight_exchange");
+	}
+}
+
+void ValidateFlightExchangeImageRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {
+	ImageVector::ValidateRows(input, rows, "flight_exchange");
+}
+
+void ValidateFlightExchangeGovernedRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {
+	if (rows.empty() || !TypeVisitor::Contains(type, GovernedLogicalType::IsGoverned)) {
+		return;
+	}
+	if (FileLogicalType::IsFile(type)) {
+		ValidateFlightExchangeFileRows(input, rows);
+		return;
+	}
+	if (ImageLogicalType::IsImage(type)) {
+		ValidateFlightExchangeImageRows(input, type, rows);
+		return;
+	}
+	if (TensorType::IsVariableShapeTensor(type)) {
+		TensorType::ValidateRows(input, rows, "flight_exchange");
+		return;
+	}
+
+	auto valid_rows = FlightExchangeValidRows(input, rows);
+	if (valid_rows.empty()) {
+		return;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		auto &children = StructVector::GetEntries(input);
+		auto &child_types = StructType::GetChildTypes(type);
+		D_ASSERT(children.size() == child_types.size());
+		for (idx_t child = 0; child < children.size(); child++) {
+			ValidateFlightExchangeGovernedRows(*children[child], child_types[child].second, valid_rows);
+		}
+		return;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto entries = FlatVector::GetData<list_entry_t>(input);
+		auto child_count = ListVector::GetListSize(input);
+		vector<bool> selected_children(child_count, false);
+		idx_t selected_count = 0;
+		for (auto row : valid_rows) {
+			auto &entry = entries[row];
+			if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+				throw InvalidInputException("flight_exchange() received invalid LIST offsets");
+			}
+			for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+				if (!selected_children[child]) {
+					selected_children[child] = true;
+					selected_count++;
+				}
+			}
+		}
+		vector<idx_t> child_rows;
+		child_rows.reserve(selected_count);
+		for (idx_t child = 0; child < child_count; child++) {
+			if (selected_children[child]) {
+				child_rows.push_back(child);
+			}
+		}
+		auto &child = ListVector::GetEntry(input);
+		ValidateFlightExchangeGovernedRows(child, ListType::GetChildType(type), child_rows);
+		return;
+	}
+	case LogicalTypeId::ARRAY: {
+		auto array_size = ArrayType::GetSize(type);
+		auto child_count = ArrayVector::GetTotalSize(input);
+		if (child_count % array_size != 0) {
+			throw InvalidInputException("flight_exchange() received invalid ARRAY storage");
+		}
+		vector<idx_t> child_rows;
+		if (valid_rows.size() <= child_count / array_size) {
+			child_rows.reserve(valid_rows.size() * array_size);
+		}
+		for (auto row : valid_rows) {
+			if (row >= child_count / array_size) {
+				throw InvalidInputException("flight_exchange() received invalid ARRAY storage");
+			}
+			for (idx_t child = row * array_size; child < (row + 1) * array_size; child++) {
+				child_rows.push_back(child);
+			}
+		}
+		auto &child = ArrayVector::GetEntry(input);
+		ValidateFlightExchangeGovernedRows(child, ArrayType::GetChildType(type), child_rows);
+		return;
+	}
+	case LogicalTypeId::UNION: {
+		vector<vector<idx_t>> member_rows(UnionType::GetMemberCount(type));
+		for (auto row : valid_rows) {
+			union_tag_t tag;
+			if (!UnionVector::TryGetTag(input, row, tag) || tag >= member_rows.size()) {
+				throw InvalidInputException("flight_exchange() received an invalid non-NULL UNION value");
+			}
+			member_rows[tag].push_back(row);
+		}
+		for (idx_t member = 0; member < member_rows.size(); member++) {
+			ValidateFlightExchangeGovernedRows(UnionVector::GetMember(input, member),
+			                                   UnionType::GetMemberType(type, member), member_rows[member]);
+		}
+		return;
+	}
+	default:
+		throw InternalException("Flight exchange encountered governed value in unsupported type %s", type);
+	}
+}
+
+void ValidateFlightExchangeGovernedValues(DataChunk &chunk, const vector<LogicalType> &types) {
+	D_ASSERT(chunk.ColumnCount() == types.size());
+	for (idx_t column = 0; column < types.size(); column++) {
+		if (!TypeVisitor::Contains(types[column], GovernedLogicalType::IsGoverned)) {
+			continue;
+		}
+		chunk.data[column].Flatten(chunk.size());
+		vector<idx_t> rows;
+		rows.reserve(chunk.size());
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			rows.push_back(row);
+		}
+		ValidateFlightExchangeGovernedRows(chunk.data[column], types[column], rows);
 	}
 }
 
@@ -281,6 +503,7 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 	output.Initialize(Allocator::DefaultAllocator(), arrow_types, row_count);
 	output.SetCardinality(row_count);
 	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), output, 0);
+	ValidateFlightExchangeGovernedValues(output, output_types);
 
 	if (needs_cast) {
 		DataChunk casted;
@@ -294,7 +517,7 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 }
 
 // FlightClient::DoGet reads the initial schema before returning its FlightStreamReader. Use Arrow's exported
-// transport stream directly so the watchdog can obtain a cancellation handle before the first blocking read.
+// transport stream directly so query interruption can cancel the first blocking read.
 DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>
 ConnectFlightExchangeTransport(const std::string &location_string) {
 	auto location_res = arrow::flight::Location::Parse(location_string);
@@ -368,53 +591,14 @@ private:
 
 } // namespace
 
-enum class FlightWatchdogStopReason : uint8_t { NONE = 0, INTERRUPTED = 1, READ_TIMEOUT = 2 };
-
-class FlightStreamWatchdog {
+class FlightStreamInterrupter {
 public:
-	FlightStreamWatchdog(ClientContext &context, double read_timeout_seconds)
-	    : context_(context), read_timeout_seconds_(read_timeout_seconds), watchdog_thread_([this]() { Run(); }) {
+	explicit FlightStreamInterrupter(ClientContext &context)
+	    : context_(context), interrupt_thread_([this]() { Run(); }) {
 	}
 
-	~FlightStreamWatchdog() {
+	~FlightStreamInterrupter() {
 		Stop();
-	}
-
-	FlightWatchdogStopReason Arm() {
-		arrow::flight::internal::ClientDataStream *stream = nullptr;
-		FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
-		{
-			std::lock_guard<std::mutex> guard(mutex_);
-			if (stop_reason_ != FlightWatchdogStopReason::NONE || stopping_) {
-				return stop_reason_;
-			}
-			operation_active_ = true;
-			operation_generation_++;
-			if (read_timeout_seconds_ > 0.0) {
-				deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-				                               std::chrono::duration<double>(read_timeout_seconds_));
-			}
-			if (context_.IsInterrupted()) {
-				reason = FlightWatchdogStopReason::INTERRUPTED;
-				stop_reason_ = reason;
-				operation_active_ = false;
-				operation_generation_++;
-				stream = stream_;
-			}
-		}
-		condition_.notify_all();
-		if (reason != FlightWatchdogStopReason::NONE) {
-			RequestCancellation(stream);
-		}
-		return reason;
-	}
-
-	FlightWatchdogStopReason Disarm() {
-		std::lock_guard<std::mutex> guard(mutex_);
-		operation_active_ = false;
-		operation_generation_++;
-		condition_.notify_all();
-		return stop_reason_;
 	}
 
 	void SetStream(arrow::flight::internal::ClientDataStream *stream) {
@@ -422,8 +606,12 @@ public:
 		{
 			std::lock_guard<std::mutex> guard(mutex_);
 			stream_ = stream;
-			cancel_stream = stream_ && stop_reason_ != FlightWatchdogStopReason::NONE;
+			if (stream_ && (cancellation_requested_ || context_.IsInterrupted())) {
+				cancellation_requested_ = true;
+				cancel_stream = true;
+			}
 		}
+		condition_.notify_all();
 		if (cancel_stream) {
 			stream->TryCancel();
 		}
@@ -433,84 +621,46 @@ public:
 		{
 			std::lock_guard<std::mutex> guard(mutex_);
 			stopping_ = true;
-			operation_active_ = false;
-			operation_generation_++;
+			stream_ = nullptr;
 		}
 		condition_.notify_all();
-		if (watchdog_thread_.joinable()) {
-			watchdog_thread_.join();
+		if (interrupt_thread_.joinable()) {
+			interrupt_thread_.join();
 		}
 	}
 
 private:
-	using Clock = std::chrono::steady_clock;
 	static constexpr std::chrono::milliseconds INTERRUPT_POLL_INTERVAL {25};
-
-	void RequestCancellation(arrow::flight::internal::ClientDataStream *stream) {
-		if (stream) {
-			stream->TryCancel();
-		}
-	}
 
 	void Run() {
 		std::unique_lock<std::mutex> guard(mutex_);
 		while (!stopping_) {
-			if (!operation_active_) {
-				condition_.wait(guard, [&]() { return stopping_ || operation_active_; });
+			if (cancellation_requested_) {
+				condition_.wait(guard, [&]() { return stopping_; });
 				continue;
 			}
-
-			const auto generation = operation_generation_;
-			auto wake_at = Clock::now() + INTERRUPT_POLL_INTERVAL;
-			if (read_timeout_seconds_ > 0.0 && deadline_ < wake_at) {
-				wake_at = deadline_;
-			}
-			condition_.wait_until(guard, wake_at);
-			if (stopping_ || !operation_active_ || generation != operation_generation_) {
+			condition_.wait_for(guard, INTERRUPT_POLL_INTERVAL);
+			if (stopping_ || !context_.IsInterrupted()) {
 				continue;
 			}
-
-			FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
-			if (context_.IsInterrupted()) {
-				reason = FlightWatchdogStopReason::INTERRUPTED;
-			} else if (read_timeout_seconds_ > 0.0 && Clock::now() >= deadline_) {
-				reason = FlightWatchdogStopReason::READ_TIMEOUT;
-			}
-			if (reason == FlightWatchdogStopReason::NONE) {
-				continue;
-			}
-
-			stop_reason_ = reason;
-			operation_active_ = false;
-			operation_generation_++;
+			cancellation_requested_ = true;
 			auto *stream = stream_;
 			guard.unlock();
-			RequestCancellation(stream);
+			if (stream) {
+				stream->TryCancel();
+			}
 			guard.lock();
 		}
 	}
 
 	ClientContext &context_;
-	double read_timeout_seconds_;
 	std::mutex mutex_;
 	std::condition_variable condition_;
-	Clock::time_point deadline_;
 	arrow::flight::internal::ClientDataStream *stream_ = nullptr;
-	FlightWatchdogStopReason stop_reason_ = FlightWatchdogStopReason::NONE;
-	uint64_t operation_generation_ = 0;
-	bool operation_active_ = false;
+	bool cancellation_requested_ = false;
 	bool stopping_ = false;
-	std::thread watchdog_thread_;
+	std::thread interrupt_thread_;
 };
-
-DuckDBError FlightWatchdogError(FlightWatchdogStopReason reason, const char *operation, double read_timeout_seconds) {
-	if (reason == FlightWatchdogStopReason::INTERRUPTED) {
-		return DuckDBError::external_error(std::string(operation) + " canceled by query interruption");
-	}
-	std::ostringstream message;
-	message << operation << " timed out after " << read_timeout_seconds << " seconds";
-	return DuckDBError::external_error(message.str());
-}
 
 namespace {
 
@@ -826,10 +976,19 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 			SinkAttemptMetadata metadata;
 			metadata.task_partition_id = handle.task_partition_id;
 			metadata.attempt_id = attempt_id;
+			metadata.source_task_order = instance.source_task_order;
 			metadata.output_location = instance.output_location;
 			attempt_entry = sink_entry->second.emplace(attempt_id, std::move(metadata)).first;
 		}
 		auto &attempt_metadata = attempt_entry->second;
+		if (attempt_metadata.source_task_order != DConstants::INVALID_INDEX &&
+		    instance.source_task_order != DConstants::INVALID_INDEX &&
+		    attempt_metadata.source_task_order != instance.source_task_order) {
+			throw InvalidInputException("finished Flight sink source task order changed for one attempt");
+		}
+		if (instance.source_task_order != DConstants::INVALID_INDEX) {
+			attempt_metadata.source_task_order = instance.source_task_order;
+		}
 		if (instance.output_location.empty() || attempt_metadata.output_location != instance.output_location) {
 			throw InvalidInputException("finished Flight sink output location does not match instantiated attempt");
 		}
@@ -999,6 +1158,28 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			attempt_metadata.attempt_id = attempt_id;
 			selected_attempts.emplace_back(sink_partition_id, std::move(attempt_metadata));
 		}
+		const bool has_source_order =
+		    std::any_of(selected_attempts.begin(), selected_attempts.end(),
+		                [](const auto &entry) { return entry.second.source_task_order != DConstants::INVALID_INDEX; });
+		if (has_source_order) {
+			if (std::any_of(selected_attempts.begin(), selected_attempts.end(), [](const auto &entry) {
+				    return entry.second.source_task_order == DConstants::INVALID_INDEX;
+			    })) {
+				throw InvalidInputException("selected Flight sinks have inconsistent source task ordering metadata");
+			}
+			std::sort(selected_attempts.begin(), selected_attempts.end(), [](const auto &left, const auto &right) {
+				if (left.second.source_task_order != right.second.source_task_order) {
+					return left.second.source_task_order < right.second.source_task_order;
+				}
+				return left.first < right.first;
+			});
+			for (idx_t entry_idx = 1; entry_idx < selected_attempts.size(); entry_idx++) {
+				if (selected_attempts[entry_idx - 1].second.source_task_order ==
+				    selected_attempts[entry_idx].second.source_task_order) {
+					throw InvalidInputException("selected Flight sinks have duplicate source task ordering metadata");
+				}
+			}
+		}
 	}
 	if (selected_attempts.empty()) {
 		return handles;
@@ -1068,6 +1249,14 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 
 idx_t FlightExchange::GetNumPartitions() const {
 	return output_partition_count_;
+}
+
+const ExchangeContext &FlightExchange::GetContext() const {
+	return ctx_;
+}
+
+const std::string &FlightExchange::GetSinkOutputLocationPrefix() const {
+	return exchange_instance_id_;
 }
 
 void FlightExchange::Close() {
@@ -1191,8 +1380,8 @@ struct FlightExchangeSource::PartitionStreamState {
 	enum class Kind : uint8_t { LOCAL_FILES = 1, FLIGHT = 2 };
 
 	~PartitionStreamState() {
-		if (flight_watchdog) {
-			flight_watchdog->Stop();
+		if (flight_interrupter) {
+			flight_interrupter->Stop();
 		}
 		if (flight_data_stream) {
 			flight_data_stream->TryCancel();
@@ -1216,7 +1405,7 @@ struct FlightExchangeSource::PartitionStreamState {
 	std::unique_ptr<arrow::flight::internal::ClientTransport> flight_transport;
 	std::shared_ptr<arrow::flight::internal::ClientDataStream> flight_data_stream;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> flight_reader;
-	unique_ptr<FlightStreamWatchdog> flight_watchdog;
+	unique_ptr<FlightStreamInterrupter> flight_interrupter;
 
 	unique_ptr<ArrowTableSchema> arrow_table;
 	vector<LogicalType> arrow_types;
@@ -1379,22 +1568,12 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	if (config_.flight_timeout_seconds > 0.0) {
 		call_options.timeout = arrow::flight::TimeoutDuration(config_.flight_timeout_seconds);
 	}
-	stream->flight_watchdog = make_uniq<FlightStreamWatchdog>(*context_, config_.flight_read_timeout_seconds);
-	auto watchdog_reason = stream->flight_watchdog->Arm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
-	}
+	stream->flight_interrupter = make_uniq<FlightStreamInterrupter>(*context_);
 	std::unique_ptr<arrow::flight::internal::ClientDataStream> data_stream;
 	auto do_get_status = stream->flight_transport->DoGet(call_options, flight_ticket, &data_stream);
 	if (data_stream) {
 		stream->flight_data_stream = std::move(data_stream);
-		stream->flight_watchdog->SetStream(stream->flight_data_stream.get());
-	}
-	watchdog_reason = stream->flight_watchdog->Disarm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
+		stream->flight_interrupter->SetStream(stream->flight_data_stream.get());
 	}
 	if (!do_get_status.ok()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
@@ -1404,22 +1583,12 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::external_error("flight do_get returned no data stream"));
 	}
-	watchdog_reason = stream->flight_watchdog->Arm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
-	}
 	auto memory_manager = call_options.memory_manager;
 	if (!memory_manager) {
 		memory_manager = arrow::CPUDevice::Instance()->default_memory_manager();
 	}
 	auto message_reader = std::make_unique<FlightExchangeIpcMessageReader>(stream->flight_data_stream, memory_manager);
 	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(std::move(message_reader), call_options.read_options);
-	watchdog_reason = stream->flight_watchdog->Disarm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
-	}
 	if (!reader_res.ok()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    FlightExchangeArrowToError(reader_res.status(), "flight get schema"));
@@ -1444,18 +1613,8 @@ DuckDBResult<bool> FlightExchangeSource::ReadStreamChunk(DataChunk &chunk) {
 	}
 	if (stream_state_->kind == PartitionStreamState::Kind::FLIGHT) {
 		while (true) {
-			auto watchdog_reason = stream_state_->flight_watchdog->Arm();
-			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-				return DuckDBResult<bool>::err(
-				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
-			}
 			std::shared_ptr<arrow::RecordBatch> batch;
 			auto next_status = stream_state_->flight_reader->ReadNext(&batch);
-			watchdog_reason = stream_state_->flight_watchdog->Disarm();
-			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-				return DuckDBResult<bool>::err(
-				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
-			}
 			if (!next_status.ok()) {
 				return DuckDBResult<bool>::err(FlightExchangeArrowToError(next_status, "flight read batch"));
 			}

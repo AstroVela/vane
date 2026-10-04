@@ -33,6 +33,9 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
 	}
+	bool has_single_task_output() const override {
+		return child_ && child_->has_single_task_output();
+	}
 
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
 		// Get the input task stream from the child node

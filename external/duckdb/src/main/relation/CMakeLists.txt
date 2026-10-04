@@ -13,6 +13,7 @@ add_library_unity(
   create_table_relation.cpp
   create_view_relation.cpp
   cross_product_relation.cpp
+  data_sink_relation.cpp
   delete_relation.cpp
   delim_get_relation.cpp
   distinct_relation.cpp
@@ -36,6 +37,7 @@ add_library_unity(
   value_relation.cpp
   materialized_relation.cpp
   view_relation.cpp
+  write_file_relation.cpp
   write_parquet_relation.cpp
   write_csv_relation.cpp
   unnest_relation.cpp)

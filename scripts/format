@@ -322,6 +322,8 @@ run_duckdb_format() {
     fi
 
     # Added paths would otherwise be untracked, which git diff does not report.
+    # Force them into the temporary index because committed fixtures can still
+    # match DuckDB's ignore rules.
     while IFS= read -r -d '' file; do
       [[ -f "$file" ]] && added_files+=("$file")
     done < <(git diff --no-renames --name-only --diff-filter=A -z "$index_ref" HEAD -- external/duckdb)
@@ -331,7 +333,7 @@ run_duckdb_format() {
     done < <(git diff --cached --no-renames --name-only --diff-filter=A -z HEAD -- external/duckdb)
 
     if ((${#added_files[@]} > 0)) \
-      && ! GIT_INDEX_FILE="$temp_dir/index" git add --intent-to-add -- "${added_files[@]}"; then
+      && ! GIT_INDEX_FILE="$temp_dir/index" git add --force --intent-to-add -- "${added_files[@]}"; then
       rm -rf "$temp_dir"
       return 1
     fi

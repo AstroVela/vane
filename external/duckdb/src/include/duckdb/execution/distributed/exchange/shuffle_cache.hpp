@@ -26,7 +26,6 @@ class DataChunk;
 class ColumnDataCollection;
 class FileOpener;
 class FileSystem;
-class LogicalType;
 class TemporaryMemoryState;
 
 namespace distributed {

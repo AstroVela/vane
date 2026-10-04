@@ -58,6 +58,7 @@ public:
 	DUCKDB_API ~CachingFileSystemWrapper() override;
 
 	DUCKDB_API std::string GetName() const override;
+	DUCKDB_API bool HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener = nullptr) override;
 
 	DUCKDB_API unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                           optional_ptr<FileOpener> opener = nullptr) override;

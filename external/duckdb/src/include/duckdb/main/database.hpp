@@ -17,6 +17,7 @@
 #include "duckdb/main/extension_manager.hpp"
 
 namespace duckdb {
+class LocalDatabaseFileSystem;
 
 class BufferManager;
 class DatabaseManager;
@@ -25,6 +26,7 @@ class Catalog;
 class TransactionManager;
 class ConnectionManager;
 class ExtensionManager;
+class DistributedExtensionManager;
 class FileSystem;
 class TaskScheduler;
 class ObjectCache;
@@ -52,12 +54,14 @@ public:
 	DUCKDB_API const BufferManager &GetBufferManager() const;
 	DUCKDB_API DatabaseManager &GetDatabaseManager();
 	DUCKDB_API FileSystem &GetFileSystem();
+	DUCKDB_API FileSystem &GetLocalFileSystem();
 	DUCKDB_API ExternalFileCache &GetExternalFileCache();
 	DUCKDB_API ResultSetManager &GetResultSetManager();
 	DUCKDB_API TaskScheduler &GetScheduler();
 	DUCKDB_API ObjectCache &GetObjectCache();
 	DUCKDB_API ConnectionManager &GetConnectionManager();
 	DUCKDB_API ExtensionManager &GetExtensionManager();
+	DUCKDB_API DistributedExtensionManager &GetDistributedExtensionManager();
 	DUCKDB_API ValidChecker &GetValidChecker();
 	DUCKDB_API LogManager &GetLogManager() const;
 
@@ -92,8 +96,10 @@ private:
 	unique_ptr<ObjectCache> object_cache;
 	unique_ptr<ConnectionManager> connection_manager;
 	unique_ptr<ExtensionManager> extension_manager;
+	unique_ptr<DistributedExtensionManager> distributed_extension_manager;
 	ValidChecker db_validity;
 	unique_ptr<DatabaseFileSystem> db_file_system;
+	unique_ptr<LocalDatabaseFileSystem> local_db_file_system;
 	unique_ptr<LogManager> log_manager;
 	unique_ptr<ExternalFileCache> external_file_cache;
 	unique_ptr<ResultSetManager> result_set_manager;

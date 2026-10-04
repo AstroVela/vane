@@ -154,6 +154,9 @@ class _FteControlFaultActor:
         self.statuses.clear()
         return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
+    def prepare_shutdown(self):
+        """Acknowledge the production worker quiescence handshake."""
+
     def created_requests(self):
         return [
             {
@@ -204,9 +207,22 @@ class _RayFteTask:
         return {"query_idx": 0, "last_node_id": 7, "task_id": 0, "node_ids": [7]}
 
     def Inputs(self):
-        return {"3": {"kind": "scan_task", "data": b"payload-before-kill"}}
+        return {
+            "3": {
+                "kind": "scan_split_batch",
+                "data": {
+                    "splits": [
+                        {
+                            "split_id": "fault-before-kill",
+                            "estimated_bytes": len(b"payload-before-kill"),
+                            "data": b"payload-before-kill",
+                        }
+                    ]
+                },
+            }
+        }
 
-    def exchange_sink_instance(self):
+    def exchange_sink_config(self):
         return None
 
     def plan(self):
@@ -214,21 +230,21 @@ class _RayFteTask:
         return {"plan": "unused-by-control-fault-actor"}
 
 
-class _NativeDynamicScanTask:
+class _NativeDynamicScanWorkerTask:
     def __init__(
         self,
         *,
         query_id: str,
         node_id: str,
-        descriptor: bytes,
+        split_batch: bytes,
         plan,
         fragment_node_id: str | None = None,
-        name: str = "native-dynamic-scan-task",
+        name: str = "native-dynamic-scan-worker-task",
     ) -> None:
         self.query_id = query_id
         self.node_id = str(node_id)
         self.fragment_node_id = str(fragment_node_id if fragment_node_id is not None else node_id)
-        self.descriptor = descriptor
+        self.split_batch = split_batch
         self._plan = plan
         self._name = str(name)
 
@@ -252,9 +268,9 @@ class _NativeDynamicScanTask:
         return {"query_idx": 0, "last_node_id": last_node_id, "task_id": 0, "node_ids": [last_node_id]}
 
     def Inputs(self):
-        return {self.node_id: {"kind": "scan_task", "data": self.descriptor}}
+        return {self.node_id: {"kind": "scan_split_batch", "data": self.split_batch}}
 
-    def exchange_sink_instance(self):
+    def exchange_sink_config(self):
         return None
 
     def plan(self):
@@ -416,7 +432,7 @@ def _fault_ray_runtime():
         _shutdown_ray_for_fault_test()
 
 
-def _build_native_scan_task(
+def _build_native_scan_worker_task(
     con,
     tmp_path,
     *,
@@ -425,7 +441,7 @@ def _build_native_scan_task(
     file_name: str,
     start: int,
     stop: int,
-) -> tuple[_NativeDynamicScanTask, str]:
+) -> tuple[_NativeDynamicScanWorkerTask, str]:
     src = tmp_path / file_name
     con.execute(
         f"""
@@ -440,40 +456,21 @@ def _build_native_scan_task(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert len(scan_task_descriptors) == 1
-    source_node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 1
-    descriptor = bytes(descriptors[0])
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert len(scan_split_batches) == 1
+    source_node_id, split_batches = next(iter(scan_split_batches.items()))
+    assert len(split_batches) == 1
+    split_batch = bytes(split_batches[0])
     return (
-        _NativeDynamicScanTask(
+        _NativeDynamicScanWorkerTask(
             query_id=query_id,
             node_id=str(source_node_id),
             fragment_node_id=fragment_node_id,
-            descriptor=descriptor,
+            split_batch=split_batch,
             plan=plan,
             name=f"native-dynamic-scan-{fragment_node_id}",
         ),
         str(source_node_id),
-    )
-
-
-def _wait_for_result_handles(
-    handle: RayWorkerActorHandle,
-    query_id: str,
-    expected_count: int,
-    *,
-    timeout_s: float = 10.0,
-) -> list:
-    deadline = time.monotonic() + timeout_s
-    handles = []
-    while time.monotonic() < deadline:
-        handles.extend(handle.pop_fte_result_handles(query_id))
-        if len(handles) >= expected_count:
-            return handles
-        time.sleep(0.05)
-    raise AssertionError(
-        f"expected {expected_count} result handles for {query_id}, got {[str(h.task_id) for h in handles]}"
     )
 
 
@@ -507,7 +504,10 @@ def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
         ray.kill(actor0, no_restart=True)
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle0, "query-real-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle0.pop_fte_result_handles("query-real-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
         result = asyncio.run(asyncio.wait_for(retry_handle.get_result(), timeout=10.0))
         retry_requests = ray.get(actor1.created_requests.remote())
 
@@ -515,7 +515,9 @@ def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
         assert str(task_handle.task_id) == "query-real-kill.0.0.0"
         assert str(retry_handle.task_id) == "query-real-kill.0.0.1"
         assert retry_requests[0]["task_id"]["attempt_id"] == 1
-        assert retry_requests[0]["initial_splits"]["3"][0]["data"] == b"payload-before-kill"
+        retried_split = retry_requests[0]["initial_splits"]["3"][0]
+        assert retried_split["split_id"] == "fault-before-kill"
+        assert retried_split["data"] == task.Inputs()["3"]["data"]
         assert "worker-a" not in worker_handle_mod._FTE_WORKER_HANDLES
         assert (
             "query-real-kill",
@@ -554,6 +556,7 @@ def test_real_ray_actor_kill_without_replacement_fails_fte_fragment_execution(mo
         ray.kill(actor0, no_restart=True)
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
 
         assert "worker-solo" not in worker_handle_mod._FTE_WORKER_HANDLES
         assert (
@@ -594,11 +597,11 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 1
-    descriptor = bytes(descriptors[0])
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert len(scan_split_batches) == 1
+    node_id, split_batches = next(iter(scan_split_batches.items()))
+    assert len(split_batches) == 1
+    split_batch = bytes(split_batches[0])
 
     actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
     actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
@@ -606,10 +609,10 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-native-b")
 
     try:
-        task = _NativeDynamicScanTask(
+        task = _NativeDynamicScanWorkerTask(
             query_id="query-native-kill",
             node_id=str(node_id),
-            descriptor=descriptor,
+            split_batch=split_batch,
             plan=plan,
         )
         _register_fault_query([task])
@@ -634,7 +637,10 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
 
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle1, "query-native-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles("query-native-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
 
         retry_info = ray.get(actor1.fte_get_task_info.remote(retry_handle.task_id.to_dict()))
         if retry_info["status"].get("state") == "RUNNING":
@@ -692,11 +698,11 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 1
-    descriptor = bytes(descriptors[0])
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert len(scan_split_batches) == 1
+    node_id, split_batches = next(iter(scan_split_batches.items()))
+    assert len(split_batches) == 1
+    split_batch = bytes(split_batches[0])
 
     actor0 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
     actor1 = worker_mod.RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
@@ -704,10 +710,10 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-full-b")
 
     try:
-        task = _NativeDynamicScanTask(
+        task = _NativeDynamicScanWorkerTask(
             query_id="query-full-kill",
             node_id=str(node_id),
-            descriptor=descriptor,
+            split_batch=split_batch,
             plan=plan,
         )
         _register_fault_query([task])
@@ -732,7 +738,10 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
 
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle1, "query-full-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles("query-full-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
 
         retry_info = ray.get(actor1.fte_get_task_info.remote(retry_handle.task_id.to_dict()))
         if retry_info["status"].get("state") == "RUNNING":
@@ -788,7 +797,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
 
     con = vane.connect()
     query_id = "query-host-full-kill"
-    task_a, source_a = _build_native_scan_task(
+    task_a, source_a = _build_native_scan_worker_task(
         con,
         tmp_path,
         query_id=query_id,
@@ -797,7 +806,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
         start=0,
         stop=4,
     )
-    task_b, source_b = _build_native_scan_task(
+    task_b, source_b = _build_native_scan_worker_task(
         con,
         tmp_path,
         query_id=query_id,
@@ -845,7 +854,9 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
         for task_handle in task_handles:
             with pytest.raises(Exception):
                 asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handles = _wait_for_result_handles(handle1, query_id, 2)
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles(query_id)
+        assert len(retry_handles) == 2
 
         handle1.task_input_stream_exhausted([source_a, source_b])
         results = [

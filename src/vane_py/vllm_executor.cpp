@@ -331,8 +331,9 @@ private:
 	vector<LogicalType> expected_types;
 };
 
-static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context, const string &model,
-                                                         const Value &options, VLLMConfig &config) {
+static unique_ptr<VLLMExecutor> CreatePythonEngineExecutor(const string &module_name, ClientContext &context,
+                                                           const string &model, const Value &options,
+                                                           VLLMConfig &config) {
 	PythonGILWrapper gil;
 	py::object options_obj;
 	if (options.IsNull()) {
@@ -343,16 +344,16 @@ static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context,
 
 	py::object module;
 	try {
-		module = py::module_::import("vane.execution.vllm");
+		module = py::module_::import(module_name.c_str());
 	} catch (const py::error_already_set &ex) {
-		throw InvalidInputException("Failed to import vane.execution.vllm: %s", ex.what());
+		throw InvalidInputException("Failed to import %s: %s", module_name.c_str(), ex.what());
 	}
 
 	py::object normalized_obj;
 	try {
 		normalized_obj = module.attr("normalize_options")(options_obj);
 	} catch (const py::error_already_set &ex) {
-		throw InvalidInputException("Failed to normalize vllm options: %s", ex.what());
+		throw InvalidInputException("Failed to normalize %s options: %s", module_name.c_str(), ex.what());
 	}
 	auto normalized = normalized_obj.cast<py::dict>();
 
@@ -386,14 +387,25 @@ static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context,
 		py::object executor_obj = module.attr("build_executor")(py::str(model), normalized_obj);
 		return make_uniq<VLLMPythonExecutor>(std::move(executor_obj));
 	} catch (const py::error_already_set &ex) {
-		throw InvalidInputException("Failed to build vllm executor: %s", ex.what());
+		throw InvalidInputException("Failed to build %s executor: %s", module_name.c_str(), ex.what());
 	}
+}
+
+static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context, const string &model,
+                                                         const Value &options, VLLMConfig &config) {
+	return CreatePythonEngineExecutor("vane.execution.vllm", context, model, options, config);
+}
+
+static unique_ptr<VLLMExecutor> CreatePythonSGLangExecutor(ClientContext &context, const string &model,
+                                                           const Value &options, VLLMConfig &config) {
+	return CreatePythonEngineExecutor("vane.execution.sglang", context, model, options, config);
 }
 
 } // namespace
 
 void RegisterVLLMExecutorFactory() {
-	SetVLLMExecutorFactory(CreatePythonVLLMExecutor);
+	RegisterEngineExecutorFactory("vllm", CreatePythonVLLMExecutor);
+	RegisterEngineExecutorFactory("sglang", CreatePythonSGLangExecutor);
 }
 
 } // namespace duckdb

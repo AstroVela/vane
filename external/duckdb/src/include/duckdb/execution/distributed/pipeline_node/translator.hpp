@@ -3,25 +3,37 @@
 
 #pragma once
 #include <memory>
-#include <vector>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/physical_operator_visitor.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 
 namespace duckdb {
+class Expression;
 class RepartitionSpec;
 class PhysicalBatchCopyToFile;
 class PhysicalCopyToFile;
+class PhysicalCrossProduct;
+class PhysicalAsOfJoin;
+class PhysicalDataSink;
 class PhysicalOperator;
 class PhysicalDelimJoin;
 class PhysicalHashJoin;
+class PhysicalComparisonJoin;
+class PhysicalBlockwiseNLJoin;
 class PhysicalNestedLoopJoin;
+class PhysicalPositionalJoin;
+class PhysicalPositionalScan;
+class PhysicalRangeJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
 class PhysicalDummyScan;
+class PhysicalEmptyResult;
 class PhysicalExpressionScan;
 class PhysicalFilter;
 class PhysicalLimit;
@@ -43,12 +55,14 @@ class PhysicalTableScan;
 class PhysicalTopN;
 class PhysicalUngroupedAggregate;
 class PhysicalUnnest;
+class PhysicalUnion;
 class PhysicalVLLM;
 class PhysicalWindow;
 } // namespace duckdb
 
 namespace duckdb {
 class ClientContext;
+struct DistributedExtensionWriteInfo;
 namespace distributed {
 class ExchangeManager;
 
@@ -58,23 +72,32 @@ private:
 	PlanConfig plan_config_;
 	int pipeline_node_id_counter_ = 0;
 	DuckPhysicalPlanRef plan_;
+	ClientContext *client_context_;
+	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
+	std::unordered_set<const PhysicalUnion *> ordered_unions_;
 
 	int get_next_pipeline_node_id() {
 		return ++pipeline_node_id_counter_;
 	}
 
+	void CollectUnionOrderRequirements(const PhysicalOperator &op, bool output_order_required);
+	bool UnionAllowsOutOfOrder(const PhysicalUnion &op) const;
+
 public:
-	PhysicalPlanToPipelineNodeTranslator(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-	                                     ClientContext *client_context = nullptr);
+	//! resolved_extension_write_info is borrowed only during translation and
+	//! must be resolved for the physical extension root.
+	PhysicalPlanToPipelineNodeTranslator(
+	    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+	    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr);
 
 	// Static helper: convert a DuckDB PhysicalPlan into a DistributedPipelineNode.
 	// This mirrors the Rust helper `physical_plan_to_pipeline_node` but implemented
 	// as a C++ static method on the translator class. Implementation uses the
 	// PhysicalOperatorVisitor to traverse the operator tree in post-order.
-	static DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-	physical_plan_to_pipeline_node(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-	                               ClientContext *client_context = nullptr);
+	static DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline_node(
+	    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+	    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr);
 
 	// Override VisitOperator (post-order): children are visited first by calling
 	// the base traversal helper, then we peek/pop child results from node_stack_
@@ -87,7 +110,8 @@ private:
 	// Generate a shuffle node using the logic from the Rust implementation
 	std::shared_ptr<DistributedPipelineNode> gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
 	                                                          SchemaRef schema,
-	                                                          std::shared_ptr<DistributedPipelineNode> child);
+	                                                          std::shared_ptr<DistributedPipelineNode> child,
+	                                                          bool preserve_order = false);
 
 	// Generate aggregation nodes without pre-aggregation (GroupBy/Shuffle/Gather)
 	std::shared_ptr<DistributedPipelineNode> gen_without_pre_agg(std::shared_ptr<DistributedPipelineNode> input_node,
@@ -116,10 +140,28 @@ private:
 
 	// Generate a gather node using RepartitionNode with num_partitions=1
 	std::shared_ptr<DistributedPipelineNode> gen_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
+	std::shared_ptr<DistributedPipelineNode>
+	gen_ordered_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateHashJoin(const PhysicalHashJoin &op,
 	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateCrossProduct(const PhysicalCrossProduct &op,
+	                      const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateAsOfJoin(const PhysicalAsOfJoin &op,
+	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslatePositionalJoin(const PhysicalPositionalJoin &op,
+	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslatePositionalScan(const PhysicalPositionalScan &op,
+	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateDelimJoin(const PhysicalDelimJoin &op,
@@ -128,6 +170,20 @@ private:
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateNestedLoopJoin(const PhysicalNestedLoopJoin &op,
 	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateRangeJoin(const PhysicalRangeJoin &op,
+	                   const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateBlockwiseNLJoin(const PhysicalBlockwiseNLJoin &op,
+	                         const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateComparisonNestedLoopJoin(const PhysicalComparisonJoin &op, const Expression *predicate,
+	                                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children,
+	                                  duckdb::vector<idx_t> left_projection_map = {},
+	                                  duckdb::vector<idx_t> right_projection_map = {});
 
 	std::shared_ptr<DistributedPipelineNode>
 	TranslateHashGroupBy(const PhysicalHashAggregate &op,
@@ -148,6 +204,8 @@ private:
 	std::shared_ptr<DistributedPipelineNode> TranslateCTESource(PhysicalOperator &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateDummyScanSource(const PhysicalDummyScan &op);
+
+	std::shared_ptr<DistributedPipelineNode> TranslateEmptyResultSource(const PhysicalEmptyResult &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateColumnDataScanSource(const PhysicalColumnDataScan &op);
 
@@ -205,10 +263,17 @@ private:
 	                         const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
+	TranslateDataSink(const PhysicalDataSink &op,
+	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
 	TranslatePivot(const PhysicalPivot &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateUnnest(const PhysicalUnnest &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateUnion(const PhysicalUnion &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateTableInOut(const PhysicalTableInOutFunction &op,
@@ -232,11 +297,11 @@ private:
 
 // Backwards-compatible free function wrapper that delegates to the
 // translator static helper. Keeps existing call sites simple.
-inline DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-physical_plan_to_pipeline_node(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-                               ClientContext *client_context = nullptr) {
-	return PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(std::move(plan_config), std::move(plan),
-	                                                                            client_context);
+inline DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline_node(
+    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr) {
+	return PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
+	    std::move(plan_config), std::move(plan), client_context, resolved_extension_write_info);
 }
 } // namespace distributed
 } // namespace duckdb

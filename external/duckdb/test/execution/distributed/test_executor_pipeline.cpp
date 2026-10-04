@@ -14,6 +14,7 @@
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/physical_plan.hpp"
@@ -34,8 +35,10 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/parser/query_node.hpp"
 
 #include <functional>
+#include <thread>
 
 using namespace duckdb;
 
@@ -67,8 +70,8 @@ static unique_ptr<ColumnDataCollection> MakeIntegerCollection(const vector<Value
 
 class MarkSummaryTestExchangeSink final : public distributed::ExchangeSink {
 public:
-	DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
 	bool IsBlocked() const override {
@@ -78,12 +81,12 @@ public:
 	void WaitUnblocked() override {
 	}
 
-	DuckDBResult<void> Finish() override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> Finish() override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
-	DuckDBResult<void> Abort() override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> Abort() override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
 	size_t GetMemoryUsage() const override {
@@ -119,14 +122,19 @@ static MarkJoinBuildSummary ExecuteMarkJoinSummarySink(Connection &con, const ve
 
 	vector<unique_ptr<Expression>> partition_by;
 	partition_by.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
-	distributed::ExchangeSinkInstanceHandle sink_handle;
-	sink_handle.output_partition_count = 2;
 	auto exchange_manager = std::make_shared<MarkSummaryTestExchangeManager>();
 	auto &sink = physical_plan
 	                 ->Make<PhysicalRemoteExchangeSink>(input_types, right_values.size(), "mark-summary-test", 2,
 	                                                    RepartitionSpec::Type::Hash, std::move(partition_by),
-	                                                    sink_handle, std::move(exchange_manager))
+	                                                    "mark-summary-query", "mark-summary-attempt",
+	                                                    std::move(exchange_manager))
 	                 .Cast<PhysicalRemoteExchangeSink>();
+	distributed::ExchangeSinkInstanceHandle sink_handle;
+	sink_handle.sink_handle.task_partition_id = 0;
+	sink_handle.output_partition_count = 2;
+	sink_handle.query_id = "mark-summary-query";
+	sink_handle.output_location = "mark-summary-attempt__sink_0__attempt_0";
+	sink.ApplyRuntimeSinkHandle(std::move(sink_handle));
 	vector<unique_ptr<Expression>> summary_expressions;
 	summary_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
 	sink.EnableMarkJoinBuildSummary(std::move(summary_expressions));
@@ -903,18 +911,18 @@ TEST_CASE("Executor: Manually built PhysicalPlan with direct Executor API",
 		prepared_data->memory_type = QueryResultMemoryType::IN_MEMORY;
 		prepared_data->physical_plan = std::move(physical_plan);
 
-		auto &sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
-		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink.type) << std::endl;
+		auto sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
+		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink->type) << std::endl;
 
 		// Print complete plan
 		std::cerr << "\n[Plan Structure]" << std::endl;
-		print_plan_recursive(sink, 0);
+		print_plan_recursive(*sink, 0);
 
 		//=============================================================
 		// STEP 4: Initialize Executor and execute via ExecuteTask()
 		//=============================================================
 		Executor executor(client_context);
-		executor.Initialize(sink);
+		executor.Initialize(std::move(sink));
 
 		idx_t total_pipelines = executor.GetTotalPipelines();
 		std::cerr << "\n[4] Executor: " << total_pipelines << " pipeline(s)" << std::endl;
@@ -1001,18 +1009,18 @@ TEST_CASE("Executor: Manually built PhysicalPlan with direct Executor API",
 		prepared_data->memory_type = QueryResultMemoryType::IN_MEMORY;
 		prepared_data->physical_plan = std::move(physical_plan);
 
-		auto &sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
-		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink.type) << std::endl;
+		auto sink = PhysicalResultCollector::GetResultCollector(client_context, *prepared_data);
+		std::cerr << "[3] Added sink: " << PhysicalOperatorToString(sink->type) << std::endl;
 
 		// Print complete plan
 		std::cerr << "\n[Plan Structure]" << std::endl;
-		print_plan_recursive(sink, 0);
+		print_plan_recursive(*sink, 0);
 
 		//=============================================================
 		// STEP 4: Initialize Executor and execute via ExecuteTask()
 		//=============================================================
 		Executor executor(client_context);
-		executor.Initialize(sink);
+		executor.Initialize(std::move(sink));
 
 		idx_t total_pipelines = executor.GetTotalPipelines();
 		std::cerr << "\n[4] Executor: " << total_pipelines << " pipeline(s)" << std::endl;

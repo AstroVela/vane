@@ -44,7 +44,7 @@ void IsFormatExtensionKnown(const string &format) {
 			// It's a match, we must throw
 			throw CatalogException(
 			    "Copy Function with name \"%s\" is not in the catalog, but it exists in the %s extension.", format,
-			    std::string(file_postfixes.extension));
+			    file_postfixes.extension);
 		}
 	}
 }
@@ -95,6 +95,20 @@ case_insensitive_map_t<CopyOption> Binder::GetFullCopyOptionsList(const CopyFunc
 
 BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &function, CopyToType copy_to_type) {
 	if (function.plan) {
+		auto &copy_info = *stmt.info;
+		if (copy_info.select_relation) {
+			// COPY plan rewrites operate on a parsed query tree. Only normalize a
+			// relation-backed source when that representation is faithful: silently
+			// converting a non-SQL relation could discard exchange or binding state.
+			copy_info.select_statement = copy_info.select_relation->TryGetSerializableQueryNode(*this);
+			if (!copy_info.select_statement) {
+				throw NotImplementedException(
+				    "COPY TO FORMAT \"%s\" uses a plan rewrite and cannot consume a relation source that has "
+				    "no faithful SQL query-node representation",
+				    copy_info.format);
+			}
+			copy_info.select_relation.reset();
+		}
 		// plan rewrite COPY TO
 		return function.plan(*this, stmt);
 	}
@@ -577,8 +591,8 @@ BoundStatement Binder::Bind(CopyStatement &stmt, CopyToType copy_to_type) {
 			// check if this matches the mode
 			if (copy_option.mode != CopyOptionMode::READ_WRITE && copy_option.mode != copy_mode) {
 				throw InvalidInputException("Option \"%s\" is not supported for %s - only for %s", provided_option,
-				                            std::string(stmt.info->is_from ? "reading" : "writing"),
-				                            std::string(stmt.info->is_from ? "writing" : "reading"));
+				                            stmt.info->is_from ? "reading" : "writing",
+				                            stmt.info->is_from ? "writing" : "reading");
 			}
 			if (copy_option.type.id() != LogicalTypeId::ANY) {
 				if (provided_entry.second.empty()) {

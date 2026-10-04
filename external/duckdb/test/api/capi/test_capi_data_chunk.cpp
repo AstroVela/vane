@@ -1,7 +1,152 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "capi_tester.hpp"
+#include "duckdb/common/types/image.hpp"
+
+#include <algorithm>
 
 using namespace duckdb;
 using namespace std;
+
+namespace {
+
+void WriteCAPIImagePixels(duckdb_vector image, idx_t count) {
+	auto &vector = *reinterpret_cast<Vector *>(image);
+	auto bytes = count * ArrayType::GetSize(vector.GetType());
+	// Check the backing span before the raw write so the old implementation
+	// fails this regression without corrupting the test process's heap.
+	REQUIRE(ArrayVector::GetTotalSize(vector) >= bytes);
+	auto child = duckdb_array_vector_get_child(image);
+	auto data = reinterpret_cast<uint8_t *>(duckdb_vector_get_data(child));
+	REQUIRE(data);
+	memset(data, 0x7f, bytes);
+}
+
+void CAPIImageScalar(duckdb_function_info, duckdb_data_chunk input, duckdb_vector output) {
+	WriteCAPIImagePixels(output, duckdb_data_chunk_get_size(input));
+}
+
+void CAPIImageTableBind(duckdb_bind_info info) {
+	auto type = ImageLogicalType::Create("RGB", 2, 3);
+	duckdb_bind_add_result_column(info, "image", reinterpret_cast<duckdb_logical_type>(&type));
+}
+
+void CAPIImageTableInit(duckdb_init_info info) {
+	duckdb_init_set_init_data(info, new bool(false), [](void *data) { delete reinterpret_cast<bool *>(data); });
+}
+
+void CAPIImageTable(duckdb_function_info info, duckdb_data_chunk output) {
+	auto &finished = *reinterpret_cast<bool *>(duckdb_function_get_init_data(info));
+	if (finished) {
+		duckdb_data_chunk_set_size(output, 0);
+		return;
+	}
+	WriteCAPIImagePixels(duckdb_data_chunk_get_vector(output, 0), duckdb_vector_size());
+	duckdb_data_chunk_set_size(output, duckdb_vector_size());
+	finished = true;
+}
+
+} // namespace
+
+TEST_CASE("C API fixed Image buffers support raw writes and chunk reset", "[capi][image]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	REQUIRE_NO_FAIL(tester.Query("LOAD file"));
+	auto query = tester.Query("SELECT NULL::IMAGE('RGB', 2, 3)");
+	REQUIRE_NO_FAIL(*query);
+	auto query_chunk = query->FetchChunk(0);
+	auto type = duckdb_vector_get_column_type(query_chunk->GetVector(0));
+	auto chunk = duckdb_create_data_chunk(&type, 1);
+	REQUIRE(chunk);
+	auto image = duckdb_data_chunk_get_vector(chunk, 0);
+	for (idx_t iteration = 0; iteration < 2; iteration++) {
+		REQUIRE(duckdb_data_chunk_get_size(chunk) == 0);
+		// A C client can write before setting cardinality and can retain the
+		// parent vector across reset while obtaining a fresh pixel pointer.
+		WriteCAPIImagePixels(image, duckdb_vector_size());
+		duckdb_data_chunk_set_size(chunk, duckdb_vector_size());
+		auto &vector = *reinterpret_cast<Vector *>(image);
+		for (idx_t row : {idx_t(0), duckdb_vector_size() - 1}) {
+			auto value = vector.GetValue(row);
+			REQUIRE(*ByteSequenceValue::TryGet(value) == string(18, '\x7f'));
+		}
+		duckdb_data_chunk_reset(chunk);
+	}
+	duckdb_destroy_data_chunk(&chunk);
+
+	auto standalone = duckdb_create_vector(type, 7);
+	REQUIRE(standalone);
+	WriteCAPIImagePixels(standalone, 7);
+	REQUIRE(ArrayVector::GetTotalSize(*reinterpret_cast<Vector *>(standalone)) == 7 * 18);
+	duckdb_destroy_vector(&standalone);
+	duckdb_destroy_logical_type(&type);
+}
+
+TEST_CASE("C API nested Image capacity follows list reservation", "[capi][image]") {
+	auto image_type = ImageLogicalType::Create("RGB", 2, 3);
+	auto type = LogicalType::STRUCT({{"images", LogicalType::LIST(LogicalType::ARRAY(image_type, 2))}});
+	auto root = duckdb_create_vector(reinterpret_cast<duckdb_logical_type>(&type), 1);
+	REQUIRE(root);
+	auto list = duckdb_struct_vector_get_child(root, 0);
+	REQUIRE(duckdb_list_vector_reserve(list, 2051) == DuckDBSuccess);
+	auto arrays = duckdb_list_vector_get_child(list);
+	auto images = duckdb_array_vector_get_child(arrays);
+	WriteCAPIImagePixels(images, 2051 * 2);
+	REQUIRE(duckdb_list_vector_set_size(list, 2051) == DuckDBSuccess);
+	auto entries = reinterpret_cast<duckdb_list_entry *>(duckdb_vector_get_data(list));
+	entries[0] = {0, 2051};
+	ImageVector::ValidateRows(*reinterpret_cast<Vector *>(root), {0}, "C API nested Image regression");
+	auto last = reinterpret_cast<Vector *>(images)->GetValue(2051 * 2 - 1);
+	REQUIRE(*ByteSequenceValue::TryGet(last) == string(18, '\x7f'));
+	duckdb_destroy_vector(&root);
+}
+
+TEST_CASE("C API Image callbacks receive writable pixels without expanding query reads", "[capi][image]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	REQUIRE_NO_FAIL(tester.Query("LOAD file"));
+	auto type = ImageLogicalType::Create("RGB", 2, 3);
+	auto argument_type = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+	auto scalar = duckdb_create_scalar_function();
+	duckdb_scalar_function_set_name(scalar, "capi_fixed_image");
+	duckdb_scalar_function_add_parameter(scalar, argument_type);
+	duckdb_scalar_function_set_return_type(scalar, reinterpret_cast<duckdb_logical_type>(&type));
+	duckdb_scalar_function_set_function(scalar, CAPIImageScalar);
+	REQUIRE(duckdb_register_scalar_function(tester.connection, scalar) == DuckDBSuccess);
+	duckdb_destroy_scalar_function(&scalar);
+	duckdb_destroy_logical_type(&argument_type);
+
+	auto table = duckdb_create_table_function();
+	duckdb_table_function_set_name(table, "capi_fixed_images");
+	duckdb_table_function_set_bind(table, CAPIImageTableBind);
+	duckdb_table_function_set_init(table, CAPIImageTableInit);
+	duckdb_table_function_set_function(table, CAPIImageTable);
+	REQUIRE(duckdb_register_table_function(tester.connection, table) == DuckDBSuccess);
+	duckdb_destroy_table_function(&table);
+
+	duckdb::vector<pair<string, idx_t>> queries {{"SELECT capi_fixed_image(i) FROM range(4101) t(i)", 4101},
+	                                             {"SELECT * FROM capi_fixed_images()", duckdb_vector_size()},
+	                                             {"SELECT capi_fixed_image(1)", 1}};
+	for (auto &query : queries) {
+		auto result = tester.Query(query.first);
+		REQUIRE_NO_FAIL(*result);
+		idx_t rows = 0;
+		while (auto chunk = result->NextChunk()) {
+			auto image = chunk->GetVector(0);
+			auto &vector = *reinterpret_cast<Vector *>(image);
+			auto stored = ArrayVector::GetTotalSize(vector);
+			auto data = reinterpret_cast<uint8_t *>(duckdb_vector_get_data(duckdb_array_vector_get_child(image)));
+			REQUIRE(ArrayVector::GetTotalSize(vector) == stored);
+			REQUIRE(std::all_of(data, data + chunk->size() * 18, [](uint8_t byte) { return byte == 0x7f; }));
+			rows += chunk->size();
+		}
+		REQUIRE(rows == query.second);
+	}
+}
 
 TEST_CASE("Test table_info incorrect 'is_valid' value for 'dflt_value' column", "[capi]") {
 	duckdb_database db;

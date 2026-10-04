@@ -34,11 +34,20 @@ def test_json_syntax_error():
         conn.execute("syntax error")
 
 
-def test_json_catalog_error():
+@pytest.mark.parametrize("method", ["execute", "sql", "query", "from_query"])
+def test_json_catalog_error(method):
     conn = vane.connect()
     conn.execute("SET errors_as_json='true'")
     with pytest.raises(vane.CatalogException, match="MISSING_ENTRY", check=_parse_json_func("Catalog Error: ")):
-        conn.execute("SELECT * FROM nonexistent_table")
+        getattr(conn, method)("SELECT * FROM nonexistent_table")
+
+
+@pytest.mark.parametrize("method", ["execute", "sql", "query", "from_query"])
+def test_json_pragma_preprocessing_error(method):
+    with vane.connect() as conn:
+        conn.execute("SET errors_as_json='true'")
+        with pytest.raises(vane.CatalogException, match="MISSING_ENTRY", check=_parse_json_func("Catalog Error: ")):
+            getattr(conn, method)("PRAGMA nonexistent_pragma")
 
 
 def test_json_syntax_error_extract_statements():

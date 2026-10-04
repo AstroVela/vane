@@ -31,6 +31,7 @@ def _persistent_worker_runtime_env(env_vars: dict[str, str]) -> dict[str, Any]:
     """
     runtime_env_vars = dict(env_vars)
     runtime_env_vars.pop("VANE_FLIGHT_ADVERTISE_HOST", None)
+    runtime_env_vars.pop("VANE_NATIVE_MEDIA_RUNTIME", None)
     runtime_env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
     runtime_env_vars["VANE_WORKER"] = "1"
     return {"env_vars": runtime_env_vars}

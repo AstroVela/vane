@@ -307,7 +307,24 @@ ParsedExtensionMetaData ExtensionHelper::ParseExtensionMetaData(FileHandle &hand
 	handle.Read((void *)metadata_segment.data(), metadata_segment.size(),
 	            handle.GetFileSize() - ParsedExtensionMetaData::FOOTER_SIZE);
 
-	return ParseExtensionMetaData(metadata_segment.data());
+	auto result = ParseExtensionMetaData(metadata_segment.data());
+	static constexpr char RUNTIME_MAGIC[] = "VANE_NATIVE_RUNTIME_V1\0";
+	static constexpr idx_t MAGIC_SIZE = sizeof(RUNTIME_MAGIC) - 1;
+	static constexpr idx_t TRAILER_SIZE = MAGIC_SIZE + 64;
+	if (handle.GetFileSize() >= ParsedExtensionMetaData::FOOTER_SIZE + TRAILER_SIZE) {
+		string trailer(TRAILER_SIZE, '\0');
+		handle.Read(&trailer[0], trailer.size(),
+		            handle.GetFileSize() - ParsedExtensionMetaData::FOOTER_SIZE - TRAILER_SIZE);
+		if (trailer.compare(0, MAGIC_SIZE, RUNTIME_MAGIC, MAGIC_SIZE) == 0) {
+			result.native_runtime_sha256 = trailer.substr(MAGIC_SIZE);
+			for (auto c : result.native_runtime_sha256) {
+				if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+					throw InvalidInputException("Invalid native runtime digest in extension '%s'", handle.path);
+				}
+			}
+		}
+	}
+	return result;
 }
 
 static bool CheckKnownSignatures(const string &two_level_hash, const string &signature,

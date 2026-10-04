@@ -69,9 +69,6 @@ from vane.runners.fte.fte_exchange import (
 from vane.runners.fte.fte_exchange import (
     collect_spooling_output_stats as collect_spooling_output_stats,
 )
-from vane.runners.fte.fte_exchange import (
-    derive_exchange_sink_instance_for_attempt as derive_exchange_sink_instance_for_attempt,
-)
 from vane.runners.fte.fte_execution import (
     FteFragmentExecution as FteFragmentExecution,
 )

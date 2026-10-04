@@ -13,12 +13,12 @@
 #include <cstdint>
 #include <unordered_map>
 #include <mutex>
-#include <optional>
 
 #include <duckdb/execution/distributed/common_types.hpp>
 #include <duckdb/execution/distributed/exchange/exchange_handles.hpp>
 #include <duckdb/execution/distributed/scheduling/task.hpp>
 #include <duckdb/execution/distributed/scheduling/worker.hpp>
+#include <duckdb/execution/distributed/utils/optional.hpp>
 #include "safe_pyobject.hpp"
 
 namespace duckdb {
@@ -159,7 +159,7 @@ private:
 	size_t num_rows_;
 	size_t size_bytes_;
 	mutable std::once_flag materialize_once_;
-	mutable std::atomic<std::shared_ptr<duckdb::ColumnDataCollection>> materialized_collection_;
+	mutable std::shared_ptr<duckdb::ColumnDataCollection> materialized_collection_;
 	mutable std::exception_ptr materialize_error_;
 };
 
@@ -195,13 +195,14 @@ public:
 private:
 	struct PollResultCache {
 		std::mutex mutex;
-		std::optional<PollResult> result;
+		Optional<PollResult> result;
 	};
 
 	TaskContext task_context_;
 	std::string fte_task_id_;
 	std::shared_ptr<RayTaskPollState> poll_state_;
 	std::shared_ptr<PollResultCache> poll_result_cache_;
+	bool acked_ = false;
 	bool released_ = false;
 };
 
@@ -231,7 +232,7 @@ public:
 private:
 	struct PollResultCache {
 		std::mutex mutex;
-		std::optional<PollResult> result;
+		Optional<PollResult> result;
 	};
 
 	TaskContext task_context_;
@@ -258,11 +259,11 @@ public:
 	py::object Plan() const;
 
 	// Return task inputs keyed by source node id. Each value contains a
-	// typed payload such as scan-task bytes or exchange-source-task bytes.
+	// typed payload such as scan-split-batch bytes or exchange-source-task bytes.
 	py::dict Inputs() const;
 
-	// Return the task-local remote exchange sink instance, if the plan has one.
-	py::object ExchangeSinkInstance() const;
+	// Return the static remote exchange sink configuration, if present.
+	py::object ExchangeSinkConfig() const;
 
 private:
 	duckdb::distributed::WorkerTask task_;

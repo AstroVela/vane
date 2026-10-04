@@ -25,6 +25,17 @@ def required_positive_int(mapping: dict[str, Any], key: str) -> int:
     return value
 
 
+def payload_max_task_retries(payload: dict[str, Any]) -> int:
+    """Return a payload retry override, defaulting to the ordinary UDF policy."""
+
+    value = payload.get("max_task_retries")
+    if value is None:
+        return MAX_ACTOR_TASK_RETRIES
+    if type(value) is not int or value < 0:
+        raise ValueError("UDF payload field 'max_task_retries' must be a non-negative integer")
+    return value
+
+
 def actor_pool_size(payload: dict[str, Any]) -> int:
     return required_positive_int(payload, "actor_pool_size")
 

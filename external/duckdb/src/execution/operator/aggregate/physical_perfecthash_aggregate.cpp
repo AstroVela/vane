@@ -11,6 +11,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/function/function_binder.hpp"
 
 namespace duckdb {
 
@@ -255,7 +256,20 @@ InsertionOrderPreservingMap<string> PhysicalPerfectHashAggregate::ParamsToString
 
 void PhysicalPerfectHashAggregate::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "groups", groups);
-	serializer.WriteProperty(104, "aggregates", aggregates);
+	vector<unique_ptr<Expression>> portable_aggregates;
+	for (const auto &expression : aggregates) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		auto copy = FunctionBinder::UnbindSortedAggregate(aggregate);
+		if (aggregate.filter) {
+			auto filter_index = filter_indexes.find(aggregate.filter.get());
+			if (filter_index == filter_indexes.end()) {
+				throw InternalException("perfect hash aggregate filter is missing its input index");
+			}
+			copy->filter->Cast<BoundReferenceExpression>().index = filter_index->second;
+		}
+		portable_aggregates.push_back(std::move(copy));
+	}
+	serializer.WriteProperty(104, "aggregates", portable_aggregates);
 	serializer.WriteProperty(105, "group_minima", group_minima);
 	serializer.WriteProperty(106, "required_bits", required_bits);
 }

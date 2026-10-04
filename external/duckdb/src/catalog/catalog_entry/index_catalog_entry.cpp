@@ -29,6 +29,7 @@ unique_ptr<CreateInfo> IndexCatalogEntry::GetInfo() const {
 	result->index_type = index_type;
 	result->constraint_type = index_constraint_type;
 	result->column_ids = column_ids;
+	result->options = options;
 	result->dependencies = dependencies;
 
 	for (auto &expr : expressions) {

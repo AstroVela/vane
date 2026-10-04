@@ -6,6 +6,7 @@
 
 #include "vane_python/pytype.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
@@ -342,6 +343,18 @@ void DuckDBPyType::Initialize(py::handle &m) {
 	type_module.def("__hash__", [](const DuckDBPyType &type) { return py::hash(py::str(type.ToString())); });
 	type_module.def_property_readonly("id", &DuckDBPyType::GetId);
 	type_module.def_property_readonly("children", &DuckDBPyType::Children);
+	type_module.def("is_file", &DuckDBPyType::IsFile, "Return whether this type belongs to the FILE logical family");
+	type_module.def("is_image", &DuckDBPyType::IsImage, "Return whether this is the decoded IMAGE logical type");
+	type_module.def("is_fixed_shape_image",
+	                [](const DuckDBPyType &value) { return ImageLogicalType::IsFixedShape(value.Type()); });
+	type_module.def_property_readonly("image_mode", [](const DuckDBPyType &value) -> py::object {
+		auto mode = ImageLogicalType::GetMode(value.Type());
+		return mode.empty() ? py::object(py::none()) : py::module_::import("vane._image").attr("ImageMode")(mode);
+	});
+	type_module.def_property_readonly("shape", [](const DuckDBPyType &value) {
+		return py::make_tuple(ImageLogicalType::GetHeight(value.Type()), ImageLogicalType::GetWidth(value.Type()));
+	});
+
 	type_module.def(py::init<>([](const string &type_str, shared_ptr<DuckDBPyConnection> connection = nullptr) {
 		auto ltype = FromString(type_str, std::move(connection));
 		return make_shared_ptr<DuckDBPyType>(ltype);
@@ -386,7 +399,8 @@ py::list DuckDBPyType::Children() const {
 		py::tuple shape(TensorType::GetShape(type).size());
 		auto tensor_shape = TensorType::GetShape(type);
 		for (idx_t i = 0; i < tensor_shape.size(); i++) {
-			shape[i] = py::int_(tensor_shape[i]);
+			shape[i] = tensor_shape[i] == TensorType::VARIABLE_DIMENSION ? py::object(py::none())
+			                                                             : py::object(py::int_(tensor_shape[i]));
 		}
 		children.append(py::make_tuple("shape", shape));
 		return children;
@@ -453,6 +467,14 @@ string DuckDBPyType::GetId() const {
 		return "tensor";
 	}
 	return StringUtil::Lower(LogicalTypeIdToString(type.id()));
+}
+
+bool DuckDBPyType::IsFile() const {
+	return FileLogicalType::IsFile(type);
+}
+
+bool DuckDBPyType::IsImage() const {
+	return ImageLogicalType::IsImage(type);
 }
 
 const LogicalType &DuckDBPyType::Type() const {

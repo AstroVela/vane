@@ -137,6 +137,7 @@ class _ThreadPoolSaturatedWaitActor:
     def __init__(self):
         executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
         executor.llm = None
+        executor.on_error = "raise"
         executor.completed_tasks = []
         executor.error_message = None
         executor._shutdown_called = False
@@ -185,6 +186,81 @@ class _ThreadPoolSaturatedWaitActor:
 
     async def release_default_pool(self):
         self.release_pool.set()
+
+
+class SyntheticVLLMRequestError(RuntimeError):
+    status_code = 503
+
+
+class _FailingRequestEngine:
+    async def generate(self, *_args, **_kwargs):
+        if False:
+            yield None
+        raise SyntheticVLLMRequestError("private upstream detail")
+
+    async def abort(self, _request_id):
+        return None
+
+
+class _RequestFailureVLLMActor:
+    """Run the production actor protocol around a deterministic request error."""
+
+    def __init__(self):
+        executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
+        executor.model = "request-failure-model"
+        executor.llm = _FailingRequestEngine()
+        executor.engine_error_message = None
+        executor.sampling_params = object()
+        executor.generate_args = {}
+        executor.counter = 0
+        executor.counter_lock = threading.Lock()
+        executor.running_task_count = 0
+        executor.task_count_lock = threading.Lock()
+        executor.completed_tasks = []
+        executor.error_message = None
+        executor.error_lock = threading.Lock()
+        executor.on_error = "raise"
+        executor._result_cv = threading.Condition(threading.RLock())
+        executor._ensure_wakeup_state()
+        executor._ray_actor_mode = True
+        executor._finished_submitting = False
+        executor._shutdown_called = False
+        executor._per_executor_deques = {}
+        executor._per_executor_running_task_count = {}
+        executor._per_executor_finished = set()
+        executor._per_executor_request_ids = {}
+        executor._per_executor_tasks = {}
+        executor._per_executor_errors = {}
+        executor._per_executor_aborted = set()
+        executor._per_executor_waiters = {}
+        executor._per_executor_wait_tokens_observed = {}
+        executor._per_executor_abort_wait_tokens = {}
+        executor._async_waiter_lock = threading.Lock()
+        executor._async_waiters = {}
+        self.executor = executor
+        self._take_calls = 0
+
+    async def submit_async(self, prompts, rows, executor_id, reservation_id):
+        return await self.executor.submit_async(prompts, rows, executor_id, reservation_id)
+
+    async def wait_for_result(self, executor_id, wait_token):
+        return await self.executor.wait_for_result(executor_id, wait_token)
+
+    def take_ready_result(self, executor_id):
+        self._take_calls += 1
+        return self.executor.take_ready_result(executor_id)
+
+    def finished_executor(self, executor_id):
+        return self.executor.finished_executor(executor_id)
+
+    async def abort_executor(self, executor_id, wait_token):
+        return await self.executor.abort_executor(executor_id, wait_token)
+
+    def release_executor(self, executor_id):
+        return self.executor.release_executor(executor_id)
+
+    def take_calls(self):
+        return self._take_calls
 
 
 class _RayActorOwner:
@@ -238,6 +314,29 @@ def test_remote_executor_waits_for_all_real_ray_submit_acks_before_abort(ray_run
         events = ray_runtime.get(actor.events.remote())
         assert [event[0] for event in events] == ["submit-failed", "submit-settled", "abort"]
         assert len({event[1] for event in events}) == 1
+        assert ray_runtime.get(router.release_executor.remote(executor._executor_id)) == 0
+    finally:
+        executor.shutdown()
+
+
+def test_remote_executor_preserves_real_ray_actor_request_error(ray_runtime):
+    actor = ray_runtime.remote(max_concurrency=32)(_RequestFailureVLLMActor).remote()
+    router = ray_runtime.remote(PrefixRouter).remote([actor], 0)
+    owner = _RayActorOwner(ray_runtime, actor, router)
+    executor = RemoteVLLMExecutor(owner)
+
+    try:
+        executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+        executor.finished_submitting()
+
+        with pytest.raises(RuntimeError, match="SyntheticVLLMRequestError") as exc_info:
+            executor.wait_for_result()
+
+        error_message = str(exc_info.value)
+        assert "status_code=503" in error_message
+        assert "private upstream detail" not in error_message
+        assert "finished without returning all submitted results" not in error_message
+        assert ray_runtime.get(actor.take_calls.remote()) == 0
         assert ray_runtime.get(router.release_executor.remote(executor._executor_id)) == 0
     finally:
         executor.shutdown()

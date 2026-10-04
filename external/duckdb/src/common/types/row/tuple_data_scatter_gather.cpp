@@ -5,6 +5,7 @@
 #include "duckdb/common/types/row/tuple_data_collection.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 
 namespace duckdb {
 
@@ -1771,6 +1772,14 @@ static void TupleDataCollectionWithinCollectionGather(const TupleDataLayout &lay
 //------------------------------------------------------------------------------
 // Special cases for arrays
 //------------------------------------------------------------------------------
+static void TupleDataCastToArray(Vector &source, Vector &target, idx_t count) {
+	D_ASSERT(source.GetType() == ArrayType::ConvertToList(target.GetType()));
+	CastFunctionSet cast_functions;
+	GetCastFunctionInput cast_input;
+	cast_input.file_cast_mode = FileCastMode::INTERNAL_ARRAY_LAYOUT;
+	VectorOperations::TryCast(cast_functions, cast_input, source, target, count, nullptr);
+}
+
 // A gather function that wraps another gather function and casts the result to the target array type
 static void TupleDataCastToArrayListGather(const TupleDataLayout &layout, Vector &row_locations, const idx_t col_idx,
                                            const SelectionVector &scan_sel, const idx_t scan_count, Vector &target,
@@ -1780,13 +1789,13 @@ static void TupleDataCastToArrayListGather(const TupleDataLayout &layout, Vector
 		// Reuse the cached cast vector
 		TupleDataListGather(layout, row_locations, col_idx, scan_sel, scan_count, *cached_cast_vector, target_sel,
 		                    cached_cast_vector, child_functions);
-		VectorOperations::DefaultCast(*cached_cast_vector, target, scan_count);
+		TupleDataCastToArray(*cached_cast_vector, target, scan_count);
 	} else {
 		// Otherwise, create a new temporary cast vector
 		Vector cast_vector(ArrayType::ConvertToList(target.GetType()));
 		TupleDataListGather(layout, row_locations, col_idx, scan_sel, scan_count, cast_vector, target_sel, &cast_vector,
 		                    child_functions);
-		VectorOperations::DefaultCast(cast_vector, target, scan_count);
+		TupleDataCastToArray(cast_vector, target, scan_count);
 	}
 }
 
@@ -1798,13 +1807,13 @@ static void TupleDataCastToArrayStructGather(const TupleDataLayout &layout, Vect
 		// Reuse the cached cast vector
 		TupleDataStructGather(layout, row_locations, col_idx, scan_sel, scan_count, *cached_cast_vector, target_sel,
 		                      cached_cast_vector, child_functions);
-		VectorOperations::DefaultCast(*cached_cast_vector, target, scan_count);
+		TupleDataCastToArray(*cached_cast_vector, target, scan_count);
 	} else {
 		// Otherwise, create a new temporary cast vector
 		Vector cast_vector(ArrayType::ConvertToList(target.GetType()));
 		TupleDataStructGather(layout, row_locations, col_idx, scan_sel, scan_count, cast_vector, target_sel,
 		                      &cast_vector, child_functions);
-		VectorOperations::DefaultCast(cast_vector, target, scan_count);
+		TupleDataCastToArray(cast_vector, target, scan_count);
 	}
 }
 

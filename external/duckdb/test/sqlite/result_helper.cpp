@@ -2,6 +2,7 @@
 
 #include "catch.hpp"
 #include "duckdb/common/crypto/md5.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "re2/re2.h"
 #include "sqllogic_test_logger.hpp"
@@ -427,7 +428,11 @@ string TestResultHelper::SQLLogicTestConvertValue(Value value, LogicalType sql_t
 		case LogicalTypeId::BOOLEAN:
 			return BooleanValue::Get(value) ? "1" : "0";
 		default: {
-			string str = value.CastAs(*runner.con->context, LogicalType::VARCHAR).ToString();
+			// Display governed values without requesting a public cast that would
+			// erase their logical type. Value::ToString uses internal formatting.
+			string str = TypeVisitor::Contains(sql_type, GovernedLogicalType::IsGoverned)
+			                 ? value.ToString()
+			                 : value.CastAs(*runner.con->context, LogicalType::VARCHAR).ToString();
 			if (str.empty()) {
 				return "(empty)";
 			} else {

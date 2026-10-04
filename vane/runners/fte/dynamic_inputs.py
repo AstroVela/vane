@@ -10,6 +10,7 @@ from typing import Any
 from vane.runners.fte.fte_types import FteSplit
 
 SplitExchangeSourceTaskByPartition = Callable[[Any], tuple[list[tuple[int, Any]], int, int, bool]]
+SplitScanSplitBatch = Callable[[Any], list[tuple[str, Any, int | None]]]
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ def strip_fte_dynamic_context(
     sanitized = dict(context or {})
 
     for source_node_id in dynamic_scan_sources:
-        sanitized.pop(f"scan_task:{source_node_id}", None)
+        sanitized.pop(f"scan_split_batch:{source_node_id}", None)
     for source_node_id in dynamic_exchange_sources:
         sanitized.pop(f"exchange_source_task:{source_node_id}", None)
 
@@ -47,7 +48,7 @@ def strip_fte_dynamic_context(
         else:
             sanitized.pop(key, None)
 
-    update_node_list("scan_task_nodes", dynamic_scan_sources)
+    update_node_list("scan_split_batch_nodes", dynamic_scan_sources)
     update_node_list("exchange_source_task_nodes", dynamic_exchange_sources)
     return sanitized
 
@@ -94,12 +95,51 @@ def split_exchange_source_task_by_partition(value: Any) -> tuple[list[tuple[int,
     return native_items, partition_count, source_task_count, replicated
 
 
+def split_scan_split_batch(value: Any) -> list[tuple[str, Any, int | None]]:
+    """Return independently schedulable singleton batches from one transport batch."""
+    if isinstance(value, Mapping):
+        raw_splits = value.get("splits")
+        if not isinstance(raw_splits, (list, tuple)) or not raw_splits:
+            raise ValueError("scan split batch mapping must contain a non-empty splits list")
+        result: list[tuple[str, Any, int | None]] = []
+        seen_ids: set[str] = set()
+        for raw_split in raw_splits:
+            if not isinstance(raw_split, Mapping):
+                raise TypeError("scan split batch entries must be mappings")
+            raw_split_id = raw_split.get("split_id")
+            split_id = "" if raw_split_id is None else str(raw_split_id)
+            if not split_id:
+                raise ValueError("scan split is missing split_id")
+            if split_id in seen_ids:
+                raise ValueError(f"duplicate scan split_id in batch: {split_id}")
+            seen_ids.add(split_id)
+            estimated_bytes = raw_split.get("estimated_bytes")
+            if estimated_bytes is not None:
+                estimated_bytes = int(estimated_bytes)
+                if estimated_bytes < 0:
+                    raise ValueError("scan split estimated_bytes must be non-negative")
+            singleton = dict(value)
+            singleton["splits"] = [dict(raw_split)]
+            result.append((split_id, singleton, estimated_bytes))
+        return result
+
+    import vane
+
+    if isinstance(value, (bytearray, memoryview)):
+        value = bytes(value)
+    return [
+        (str(split_id), singleton_batch, None if estimated_bytes is None else int(estimated_bytes))
+        for split_id, singleton_batch, estimated_bytes in vane.ray_cxx.split_scan_split_batch(value)
+    ]
+
+
 def prepare_fte_dynamic_inputs(
     *,
     context: Mapping[str, Any],
     query_id: str,
     fragment_id: str,
     next_split_sequence: Callable[[str, str, str], int],
+    split_scan_split_batch_fn: SplitScanSplitBatch | None = None,
     split_exchange_source_task_by_partition_fn: SplitExchangeSourceTaskByPartition | None = None,
 ) -> FteDynamicInputPreparation:
     splits: list[FteSplit] = []
@@ -112,19 +152,23 @@ def prepare_fte_dynamic_inputs(
     exchange_source_metadata_by_source: dict[str, tuple[set[int], int, int]] = {}
 
     for key, value in context.items():
-        if key.startswith("scan_task:"):
+        if key.startswith("scan_split_batch:"):
             source_node_id = key.split(":", 1)[1]
             if not source_node_id:
                 continue
             dynamic_scan_sources.add(source_node_id)
-            splits.append(
-                FteSplit(
-                    source_node_id=source_node_id,
-                    sequence_id=next_split_sequence(query_id, fragment_id, source_node_id),
-                    kind="scan_task",
-                    data=value,
+            scan_split_fn = split_scan_split_batch_fn or split_scan_split_batch
+            for split_id, singleton_batch, estimated_bytes in scan_split_fn(value):
+                splits.append(
+                    FteSplit(
+                        source_node_id=source_node_id,
+                        sequence_id=next_split_sequence(query_id, fragment_id, source_node_id),
+                        kind="scan_split",
+                        data=singleton_batch,
+                        split_id=split_id,
+                        size_bytes=estimated_bytes,
+                    )
                 )
-            )
             continue
         if not key.startswith("exchange_source_task:"):
             continue
@@ -132,8 +176,8 @@ def prepare_fte_dynamic_inputs(
         if not source_node_id:
             continue
         dynamic_exchange_sources.add(source_node_id)
-        split_fn = split_exchange_source_task_by_partition_fn or split_exchange_source_task_by_partition
-        split_items, source_partition_count, source_task_count, replicated = split_fn(value)
+        exchange_split_fn = split_exchange_source_task_by_partition_fn or split_exchange_source_task_by_partition
+        split_items, source_partition_count, source_task_count, replicated = exchange_split_fn(value)
         if replicated:
             replicated_exchange_sources.add(source_node_id)
         exchange_source_partition_count = max(exchange_source_partition_count, int(source_partition_count))
@@ -187,6 +231,7 @@ def splits_from_pending_task(
     item: Mapping[str, Any],
     *,
     next_split_sequence: Callable[[str, str, str], int],
+    split_scan_split_batch_fn: SplitScanSplitBatch | None = None,
     split_exchange_source_task_by_partition_fn: SplitExchangeSourceTaskByPartition | None = None,
 ) -> tuple[
     list[FteSplit],
@@ -203,6 +248,7 @@ def splits_from_pending_task(
         query_id=str(item["query_id"]),
         fragment_id=str(item["fragment_id"]),
         next_split_sequence=next_split_sequence,
+        split_scan_split_batch_fn=split_scan_split_batch_fn,
         split_exchange_source_task_by_partition_fn=split_exchange_source_task_by_partition_fn,
     )
     return (

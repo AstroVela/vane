@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 import numpy as np
 
+from vane.ai._client_config import copy_client_options
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
+from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import (
     _is_known_openai_prompt_model,
@@ -35,12 +40,28 @@ from vane.ai.options import (
     validate_embed_options,
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _ProviderResultError,
+    _translate_missing_provider_dependency,
+)
 from vane.ai.providers._mime import ImageMimePolicy
+from vane.ai.providers._openai_client_config import capture_openai_client, create_openai_client
 from vane.ai.typing import UDFOptions
 
+
+def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    normalized = getattr(value, "value", value)
+    if isinstance(normalized, str) and normalized in known:
+        return repr(normalized)
+    return "unsupported"
+
+
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Embedding, Options
@@ -200,7 +221,7 @@ def _validate_openai_prompt_capabilities(
 
 
 def _decode_openai_embedding_base64(value: str) -> np.ndarray:
-    raw = base64.b64decode(value)
+    raw = base64.b64decode(value, validate=True)
     return np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
 
 
@@ -238,12 +259,15 @@ def _build_token_estimator(model: str, *, use_openai_tokenizer: bool) -> _TokenE
     if not use_openai_tokenizer:
         return _TokenEstimator()
 
-    import tiktoken  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    with _translate_missing_provider_dependency("openai", "tiktoken"):
+        import tiktoken  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     return _TokenEstimator(tiktoken.encoding_for_model(model))
 
 
-def _chunk_tokenized_text(text: str, limit: int, estimate_tokens: _TokenEstimator) -> list[str]:
+def _chunk_tokenized_text(
+    text: str, limit: int, estimate_tokens: _TokenEstimator, *, first_only: bool = False
+) -> list[str]:
     """Split with tokenizer guidance while preserving Unicode boundaries."""
     encoding = estimate_tokens.encoding
     assert encoding is not None
@@ -278,14 +302,16 @@ def _chunk_tokenized_text(text: str, limit: int, estimate_tokens: _TokenEstimato
                 "OpenAI embedding token limit is too small for one input character; increase the configured limit"
             )
         chunks.append(candidate)
+        if first_only:
+            break
         remaining = remaining[len(candidate) :]
     return chunks
 
 
-def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any) -> list[str]:
+def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any, *, first_only: bool = False) -> list[str]:
     """Split text on character boundaries without exceeding a token estimate."""
     if isinstance(estimate_tokens, _TokenEstimator) and estimate_tokens.encoding is not None:
-        return _chunk_tokenized_text(text, limit, estimate_tokens)
+        return _chunk_tokenized_text(text, limit, estimate_tokens, first_only=first_only)
 
     chunks: list[str] = []
     start = 0
@@ -303,6 +329,8 @@ def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any) -> l
             else:
                 high = middle - 1
         chunks.append(text[start:low])
+        if first_only:
+            break
         start = low
     return chunks
 
@@ -370,6 +398,14 @@ def _structured_output_name(schema: dict[str, Any]) -> str:
     return "vane_response"
 
 
+def _with_client_endpoint(options: Mapping[str, Any], client_options: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(options)
+    endpoint = client_options["base_url"]
+    if resolved.get("base_url") is None and endpoint != _OPENAI_DEFAULT_BASE_URL:
+        resolved["base_url"] = endpoint
+    return resolved
+
+
 def _wrap_openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """Seal shared sensitive keys plus OpenAI-specific ones (``organization``) at any depth."""
     return wrap_sensitive_options(options, extra_keys=_EXTRA_SENSITIVE_KEYS)
@@ -386,14 +422,35 @@ class OpenAIProvider(Provider):
     DEFAULT_TEXT_EMBEDDER = "text-embedding-3-small"
     DEFAULT_PROMPTER_MODEL = "gpt-4o-mini"
 
-    def __init__(self, name: str | None = None):
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+    ):
         self._name = name or "openai"
+        self._client_options = capture_openai_client(
+            api_key=api_key, base_url=base_url, organization=organization, project=project
+        )
 
     @property
     def name(self) -> str:
         return self._name
 
-    _EMBED_OPTIONS = {"base_url", "timeout", "encoding_format", "batch_token_limit", "input_text_token_limit"}
+    _EMBED_OPTIONS = {
+        "base_url",
+        "timeout",
+        "encoding_format",
+        "batch_token_limit",
+        "input_text_token_limit",
+        "request_batch_size",
+        "max_concurrency_per_actor",
+        "supports_overriding_dimensions",
+        "overlength",
+    }
     _PROMPT_OPTIONS = {
         "base_url",
         "timeout",
@@ -417,6 +474,7 @@ class OpenAIProvider(Provider):
             model_name=model or self.DEFAULT_TEXT_EMBEDDER,
             dimensions=dimensions,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
     def get_prompter(
@@ -436,6 +494,7 @@ class OpenAIProvider(Provider):
             return_format=return_format,
             return_raw_response=return_raw_response,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
 
@@ -452,8 +511,11 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
     model_name: str = "text-embedding-3-small"
     dimensions: int | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_openai_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
+        self.options = _with_client_endpoint(self.options, self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI embedding model must be a non-empty string")
         unknown = sorted(set(self.options) - OpenAIProvider._EMBED_OPTIONS)
@@ -473,6 +535,10 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             and self.dimensions is not None
             and normalized_model in _MODEL_DIMS
             and normalized_model not in _DIMENSION_OVERRIDABLE
+            and not (
+                validated_options.get("supports_overriding_dimensions") is False
+                and self.dimensions == _MODEL_DIMS[normalized_model]
+            )
         ):
             raise ValueError(f"Model {self.model_name!r} does not support custom dimensions")
         if (
@@ -490,7 +556,23 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
                 f"Cannot determine embedding dimensions for OpenAI-compatible model {self.model_name!r} "
                 "from trusted local metadata; pass dimensions=... explicitly"
             )
+        if (
+            official_endpoint
+            and validated_options.get("supports_overriding_dimensions") is False
+            and self.dimensions is not None
+            and normalized_model in _MODEL_DIMS
+            and self.dimensions != _MODEL_DIMS[normalized_model]
+        ):
+            raise ValueError("Declaring dimensions without requesting them requires the model's native dimensions")
+        if "overlength" in validated_options and not (
+            official_endpoint and normalized_model in _MODEL_INPUT_TOKEN_LIMITS
+        ):
+            raise ValueError("Explicit overlength requires a known model tokenizer on the official OpenAI endpoint")
         self.options = _wrap_openai_options(validated_options)
+
+    @property
+    def request_dimensions(self) -> int | None:
+        return None if self.options.get("supports_overriding_dimensions") is False else self.dimensions
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -521,13 +603,14 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
     def instantiate(self) -> TextEmbedder:
         return OpenAITextEmbedder(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
-            dimensions=self.dimensions,
+            dimensions=self.request_dimensions,
         )
 
 
-class OpenAITextEmbedder:
+class OpenAITextEmbedder(ManagedTextEmbedder):
     """Async text embedder using the OpenAI Embeddings API.
 
     Two-level token limiting:
@@ -547,10 +630,13 @@ class OpenAITextEmbedder:
         model: str,
         dimensions: int | None = None,
         provider_name: str = "openai",
+        client_options: dict[str, Any] | None = None,
     ):
-        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        options = unwrap_sensitive_options(options)
+        client_options = capture_openai_client() if client_options is None else client_options
+        options = _with_client_endpoint(unwrap_sensitive_options(options), client_options)
         encoding_format = options.get("encoding_format", "float")
         if encoding_format not in {"float", "base64"}:
             raise ValueError("encoding_format must be 'float' or 'base64'")
@@ -558,90 +644,112 @@ class OpenAITextEmbedder:
         self._model = model
         self._dimensions = dimensions
         self._encoding_format = encoding_format
+        self._request_batch_size = min(options.get("request_batch_size", 2048), 2048)
+        self._request_concurrency = options.get("max_concurrency_per_actor", 1)
+        self._overlength = options.get("overlength")
         self._batch_token_limit = options.get("batch_token_limit", 300_000)
         input_text_token_limit = options.get("input_text_token_limit")
+        tokenizer_model = model.strip().casefold()
         self._input_text_token_limit = (
-            input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(model)
+            input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(tokenizer_model)
         )
         self._estimate_tokens = _build_token_estimator(
-            model,
+            tokenizer_model,
             use_openai_tokenizer=(
-                model in _MODEL_INPUT_TOKEN_LIMITS and _uses_official_openai_endpoint(options.get("base_url"))
+                tokenizer_model in _MODEL_INPUT_TOKEN_LIMITS and _uses_official_openai_endpoint(options.get("base_url"))
             ),
         )
-        client_opts = {
-            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
-            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
-        }
+        if self._overlength is not None and self._estimate_tokens.encoding is None:
+            raise EmbeddingConfigurationError("Explicit overlength requires the model tokenizer")
         # Retries belong to Vane's row-aware wrapper, so the SDK must not
         # stack its own retries underneath the public max_retries contract.
-        client_opts["max_retries"] = 0
-        self._client = AsyncOpenAI(**client_opts)
+        self._client = create_openai_client(AsyncOpenAI, client_options, options)
 
     async def aclose(self) -> None:
         """Release the SDK client's connection pool on the owning loop."""
         await self._client.close()
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
-        embeddings: list[Embedding] = []
-        batch: list[str] = []
-        batch_tokens = 0
-        estimate_tokens = self._estimate_tokens
+        from vane.ai.functions import _log_substituted_failure
 
-        async def flush() -> None:
-            nonlocal batch, batch_tokens
-            if not batch:
-                return
-            result = await self._embed_batch(batch)
-            embeddings.extend(result)
-            batch = []
-            batch_tokens = 0
-
+        estimate = self._estimate_tokens
+        limit = min(self._input_text_token_limit, self._batch_token_limit)
+        policy = getattr(self, "_overlength", None)
+        flat: list[str] = []
+        rows: list[list[int]] = []
+        boundaries: set[int] = set()
+        weights: list[int] = []
         for item in text:
-            est_tokens = estimate_tokens(item)
-            single_input_limit = min(self._input_text_token_limit, self._batch_token_limit)
-
-            if est_tokens > single_input_limit:
-                # Oversized single input — flush pending batch, chunk, embed,
-                # then recombine via weighted average + L2 normalisation.
-                await flush()
-                chunks = _chunk_text_by_token_limit(item, single_input_limit, estimate_tokens)
-                chunk_embeddings: list[Embedding] = []
-                chunk_batch: list[str] = []
-                chunk_batch_tokens = 0
-                for chunk in chunks:
-                    chunk_tokens = estimate_tokens(chunk)
-                    if chunk_batch and chunk_batch_tokens + chunk_tokens > self._batch_token_limit:
-                        chunk_embeddings.extend(await self._embed_batch(chunk_batch))
-                        chunk_batch = []
-                        chunk_batch_tokens = 0
-                    chunk_batch.append(chunk)
-                    chunk_batch_tokens += chunk_tokens
-                if chunk_batch:
-                    chunk_embeddings.extend(await self._embed_batch(chunk_batch))
-                chunk_lens = np.array(
-                    [estimate_tokens(c) for c in chunks],
-                    dtype=np.float64,
-                )
-                avg = np.average(chunk_embeddings, axis=0, weights=chunk_lens)
-                norm = np.linalg.norm(avg)
-                if norm > 0:
-                    avg = avg / norm
-                embeddings.append(avg)
+            try:
+                count = estimate(item)
+                if count > limit:
+                    if policy == "error":
+                        raise ValueError("Embedding input exceeds input_text_token_limit")
+                    if policy == "truncate":
+                        chunks = _chunk_text_by_token_limit(item, limit, estimate, first_only=True)
+                    else:
+                        chunks = _chunk_text_by_token_limit(item, limit, estimate)
+                else:
+                    chunks = [item]
+            except ValueError as exc:
+                if getattr(self, "_request_on_error", "raise") == "raise":
+                    raise
+                _log_substituted_failure(exc, on_error="ignore")
+                self.metrics.failed_inputs += 1
+                rows.append([])
                 continue
+            indices = list(range(len(flat), len(flat) + len(chunks)))
+            if policy is None and len(chunks) > 1:
+                boundaries.update((len(flat), len(flat) + len(chunks)))
+            rows.append(indices)
+            flat.extend(chunks)
+            weights.extend(estimate(chunk) for chunk in chunks)
+        self.metrics.estimated_tokens += sum(weights)
 
-            if batch and est_tokens + batch_tokens > self._batch_token_limit:
-                await flush()
-            batch.append(item)
-            batch_tokens += est_tokens
+        def batches() -> Iterator[tuple[list[int], list[str]]]:
+            indices: list[int] = []
+            tokens = 0
+            maximum = getattr(self, "_request_batch_size", 2048)
+            for index, count in enumerate(weights):
+                if indices and (
+                    index in boundaries or tokens + count > self._batch_token_limit or len(indices) >= maximum
+                ):
+                    yield indices, [flat[i] for i in indices]
+                    indices, tokens = [], 0
+                indices.append(index)
+                tokens += count
+            if indices:
+                yield indices, [flat[i] for i in indices]
 
-        await flush()
-        return embeddings
+        vectors = await self._run_requests(batches(), self._embed_batch, [None] * len(flat))
+        results: list[Any] = []
+        for indices in rows:
+            if not indices or any(vectors[i] is None for i in indices):
+                results.append(None)
+            elif len(indices) == 1:
+                results.append(vectors[indices[0]])
+            else:
+                avg = np.average(
+                    np.asarray([vectors[i] for i in indices], dtype=np.float64),
+                    axis=0,
+                    weights=[weights[i] for i in indices],
+                )
+                # Preserve legacy automatic normalization. Explicit chunk_mean
+                # leaves normalization to the public wrapper's normalize option.
+                if policy is None:
+                    norm = np.linalg.norm(avg)
+                    if norm > 0:
+                        avg /= norm
+                results.append(avg)
+        return results
 
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
-        from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
+        batch_error: _EmbeddingBatchError | None = None
         try:
             encoding_format = getattr(self, "_encoding_format", "float")
             kwargs: dict[str, Any] = {
@@ -652,22 +760,35 @@ class OpenAITextEmbedder:
             if self._dimensions is not None:
                 kwargs["dimensions"] = self._dimensions
             response = await self._client.embeddings.create(**kwargs)
-            response_data = list(response.data)
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "prompt_tokens", None)
+            if type(input_tokens) is int and input_tokens >= 0:
+                self.metrics.input_tokens += input_tokens
+            response_data = getattr(response, "data", None)
+            if not isinstance(response_data, list):
+                raise _EmbeddingBatchError(
+                    "OpenAI Embeddings API returned an invalid data array; "
+                    "embedding calls must preserve row count and order"
+                )
             if len(response_data) != len(texts):
-                raise _ProviderResultError(
+                raise _EmbeddingBatchError(
                     f"OpenAI Embeddings API returned {len(response_data)} embeddings for {len(texts)} inputs; "
                     "embedding calls must preserve row count and order"
                 )
-            raw_indices: list[object] = [getattr(item, "index", None) for item in response_data]
+            # JSON strings/arrays have an unrelated index() method. Malformed
+            # items with no response index belong to the per-row decoder.
+            raw_indices: list[object] = [
+                None if isinstance(item, (str, list)) else getattr(item, "index", None) for item in response_data
+            ]
             if any(index is not None for index in raw_indices):
                 if any(type(index) is not int for index in raw_indices):
-                    raise _ProviderResultError(
+                    raise _EmbeddingBatchError(
                         "OpenAI Embeddings API returned invalid embedding indices; "
                         "embedding calls must preserve row count and order"
                     )
                 indices = cast(list[int], raw_indices)
                 if sorted(indices) != list(range(len(texts))):
-                    raise _ProviderResultError(
+                    raise _EmbeddingBatchError(
                         "OpenAI Embeddings API returned invalid embedding indices; "
                         "embedding calls must preserve row count and order"
                     )
@@ -675,9 +796,20 @@ class OpenAITextEmbedder:
                     item for _, item in sorted(zip(indices, response_data, strict=True), key=lambda pair: pair[0])
                 ]
             if encoding_format == "base64":
-                return [_decode_openai_embedding_base64(cast(str, e.embedding)) for e in response_data]
-            return [np.array(e.embedding, dtype=np.float32) for e in response_data]
+                return self._decode_response_vectors(
+                    response_data, lambda item: _decode_openai_embedding_base64(item.embedding)
+                )
+            return self._decode_response_vectors(response_data, lambda item: np.array(item.embedding, dtype=np.float32))
+        except (JSONDecodeError, UnicodeDecodeError):
+            # SDK response decoding can fail before any vectors are available.
+            # These exceptions retain the raw response, so raise the sanitized
+            # batch error outside the handler without retaining their context.
+            batch_error = _EmbeddingBatchError("OpenAI Embeddings API returned a response that could not be decoded")
         except OpenAIError as ex:
+            # RetryAfterError discards structured SDK fields. Preserve terminal
+            # quota/account classification before converting a 429/503 signal.
+            if _is_request_wide_error(ex):
+                raise
             if _is_embedding_capability_error(ex):
                 capability_error = ProviderCapabilityError(
                     getattr(self, "_provider_name", "openai"),
@@ -686,7 +818,17 @@ class OpenAITextEmbedder:
                     original_error=ex,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(ex)
+                if retry_error is None:
+                    raise
+        if batch_error is not None:
+            raise batch_error from None
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         raise AssertionError("OpenAI embedding request completed without a result")
@@ -727,8 +869,11 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_openai_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
+        self.options = _with_client_endpoint(self.options, self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI prompt model must be a non-empty string")
         validated_options = _validate_openai_prompt_options(self.options)
@@ -763,12 +908,16 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
             and self.model_name.strip().casefold() in _OPENAI_TEXT_ONLY_PROMPT_MODELS
         )
 
+    def supported_media_mime_types(self) -> frozenset[str]:
+        return _IMAGE_MIME_POLICY.supported_mime_types
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)
 
     def instantiate(self) -> Prompter:
         return OpenAIPrompter(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
@@ -789,11 +938,14 @@ class OpenAIPrompter:
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "openai",
+        client_options: dict[str, Any] | None = None,
         strict_structured_outputs: bool | None = None,
     ) -> None:
-        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        options = unwrap_sensitive_options(options)
+        client_options = capture_openai_client() if client_options is None else client_options
+        options = _with_client_endpoint(unwrap_sensitive_options(options), client_options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
@@ -811,12 +963,7 @@ class OpenAIPrompter:
             for key, value in options.items()
             if key in {"temperature", "max_output_tokens", "top_p", "stop_sequences"} and value is not None
         }
-        client_opts = {
-            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
-            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
-        }
-        client_opts["max_retries"] = 0
-        self._client = AsyncOpenAI(**client_opts)
+        self._client = create_openai_client(AsyncOpenAI, client_options, options)
 
     async def aclose(self) -> None:
         """Release the SDK client's connection pool on the owning loop."""
@@ -839,7 +986,7 @@ class OpenAIPrompter:
         """Convert one validated Vane text/image part to the OpenAI shape."""
         if isinstance(msg, str):
             return self._process_str(msg)
-        if isinstance(msg, bytes):
+        if isinstance(msg, (bytes, PromptMedia)):
             return self._process_bytes(msg)
         raise TypeError(f"Unsupported Prompt content type: {type(msg).__name__}")
 
@@ -848,11 +995,11 @@ class OpenAIPrompter:
             return {"type": "text", "text": msg}
         return {"type": "input_text", "text": msg}
 
-    def _process_bytes(self, msg: bytes) -> dict[str, Any]:
+    def _process_bytes(self, msg: bytes | PromptMedia) -> dict[str, Any]:
         import base64
 
         mime_type = _IMAGE_MIME_POLICY.require_supported(msg)
-        b64 = base64.b64encode(msg).decode("utf-8")
+        b64 = base64.b64encode(bytes(msg)).decode("utf-8")
         data_url = f"data:{mime_type};base64,{b64}"
         return self._build_image_part(data_url)
 
@@ -915,6 +1062,7 @@ class OpenAIPrompter:
         """Prompt using the Chat Completions API."""
         options = self._chat_completions_options()
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -930,17 +1078,44 @@ class OpenAIPrompter:
                     original_error=exc,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(exc)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return cast(str | None, response.choices[0].message.content)
+        choices = getattr(response, "choices", None) or []
+        if len(choices) != 1:
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned {len(choices)} choices; expected exactly one"
+            )
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        refusal = getattr(message, "refusal", None)
+        if finish_reason != "stop" or message is None or refusal is not None:
+            received = f"finish_reason {_terminal_state_label(finish_reason, frozenset({'stop', 'length', 'content_filter', 'tool_calls', 'function_call'}))}"
+            if message is None:
+                received += " with no message"
+            if refusal is not None:
+                received += " with a refusal"
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned {received} for Prompt output; expected finish_reason 'stop'"
+            )
+        return cast(str | None, message.content)
 
     async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Responses API."""
         options = self._responses_options()
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             response = await self._client.responses.create(
                 model=self._model,
@@ -956,12 +1131,34 @@ class OpenAIPrompter:
                     original_error=exc,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(exc)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return cast(str | None, response.output_text)
+        status = getattr(response, "status", None)
+        if status != "completed":
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned status "
+                f"{_terminal_state_label(status, frozenset({'completed', 'failed', 'incomplete', 'cancelled', 'in_progress', 'queued'}))} "
+                "for Prompt output; expected 'completed'"
+            )
+        output = getattr(response, "output", None) or []
+        if any(
+            getattr(block, "type", None) == "message"
+            and any(getattr(content, "type", None) == "refusal" for content in (getattr(block, "content", None) or []))
+            for block in output
+        ):
+            raise _ProviderResultError(f"OpenAI response from model {self._model!r} refused the Prompt request")
+        return cast(str | None, getattr(response, "output_text", None))
 
     async def prompt(self, messages: tuple[Any, ...]) -> str | None:
         chat_messages: list[dict[str, Any]] = []

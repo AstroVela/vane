@@ -23,10 +23,11 @@ LimitRelation::LimitRelation(shared_ptr<Relation> child_p, int64_t limit, int64_
 
 unique_ptr<QueryNode> LimitRelation::GetQueryNode() {
 	auto child_node = child->GetQueryNode();
-	if (std::any_of(child_node->modifiers.begin(), child_node->modifiers.end(), [](const auto &modifier) {
-		    return modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-		           modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
-	    })) {
+	if (std::any_of(child_node->modifiers.begin(), child_node->modifiers.end(),
+	                [](const unique_ptr<ResultModifier> &modifier) {
+		                return modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+		                       modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+	                })) {
 		child_node = WrapQueryNode(std::move(child_node), child->GetAlias(), child->Columns());
 	}
 	auto limit_node = make_uniq<LimitModifier>();

@@ -523,6 +523,35 @@ DuckDBResult<GroupByAggSplit> split_groupby_aggs(const std::vector<BoundExpr> &g
                                                  const std::vector<BoundExpr> &partition_by,
                                                  const SchemaRef &input_schema) {
 	GroupByAggSplit res;
+	bool can_split = !aggs.empty();
+	// Validate every expression even if an earlier aggregate requires complete
+	// input rows. Unsupported merge semantics must not hide a malformed plan.
+	for (const auto &group : group_by) {
+		if (!group) {
+			return DuckDBResult<GroupByAggSplit>::err(DuckDBError::invalid_state_error("group expression is null"));
+		}
+	}
+	for (const auto &agg : aggs) {
+		if (!agg) {
+			return DuckDBResult<GroupByAggSplit>::err(DuckDBError::invalid_state_error("aggregate expression is null"));
+		}
+		if (agg->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
+			return DuckDBResult<GroupByAggSplit>::err(
+			    DuckDBError::invalid_state_error("aggregate expression is not a bound aggregate"));
+		}
+		const auto &aggregate = agg->Cast<BoundAggregateExpression>();
+		const auto &function = aggregate.function;
+		// EXPORT_STATE copies a fixed-size state. A combine callback alone does
+		// not make a state with bind data or owned pointers portable.
+		if (aggregate.IsDistinct() || aggregate.filter || aggregate.order_bys || !function.HasStateCombineCallback() ||
+		    function.HasBindCallback() || function.HasStateDestructorCallback()) {
+			can_split = false;
+		}
+	}
+	if (!can_split) {
+		return DuckDBResult<GroupByAggSplit>::ok(std::move(res));
+	}
+	res.strategy = AggregateSplitStrategy::PartialFinal;
 	res.first_stage_group_by = group_by;
 
 	std::vector<BoundExpr> group_by_refs = MakeGroupByReferences(group_by);
@@ -550,26 +579,7 @@ DuckDBResult<GroupByAggSplit> split_groupby_aggs(const std::vector<BoundExpr> &g
 
 	for (idx_t agg_idx = 0; agg_idx < aggs.size(); agg_idx++) {
 		auto &agg_ref = aggs[agg_idx];
-		if (!agg_ref) {
-			return DuckDBResult<GroupByAggSplit>::err(DuckDBError::invalid_state_error("aggregate expression is null"));
-		}
-		if (agg_ref->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
-			return DuckDBResult<GroupByAggSplit>::err(
-			    DuckDBError::invalid_state_error("aggregate expression is not a bound aggregate"));
-		}
 		auto &agg_expr = agg_ref->Cast<BoundAggregateExpression>();
-		if (agg_expr.IsDistinct()) {
-			return DuckDBResult<GroupByAggSplit>::err(
-			    DuckDBError::value_error("distinct aggregates are not supported for distributed merge"));
-		}
-		if (agg_expr.filter) {
-			return DuckDBResult<GroupByAggSplit>::err(
-			    DuckDBError::value_error("filtered aggregates are not supported for distributed merge"));
-		}
-		if (agg_expr.order_bys) {
-			return DuckDBResult<GroupByAggSplit>::err(
-			    DuckDBError::value_error("ordered aggregates are not supported for distributed merge"));
-		}
 
 		unique_ptr<BoundAggregateExpression> agg_copy;
 		try {

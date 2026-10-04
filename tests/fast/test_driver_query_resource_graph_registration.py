@@ -234,6 +234,7 @@ def _runner(events, coordinator):
     runner._detached_client_results = BoundedReplayMap(capacity=65_536)
     runner._session_lock = threading.RLock()
     runner._closed_session_owners = BoundedReplayMap(capacity=65_536)
+    runner._plan_lifecycles = {}
     runner._plan_session_ids = {}
     runner._plan_connections = {}
     runner._plan_teardown_condition = threading.Condition(runner._session_lock)
@@ -253,6 +254,7 @@ def _runner(events, coordinator):
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_udf_actor_by_unit = {}
+    runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_nodes = {}
     runner._query_udf_session_configs = {}
     runner._query_udf_actor_activation_tasks = {}
@@ -260,6 +262,7 @@ def _runner(events, coordinator):
     runner._active_vllm_actors_by_plan = {}
     runner.curr_plans = {}
     runner.curr_streams = {}
+    runner._async_result_streams = {}
     runner._plan_query_ids = {}
     runner._query_terminal_errors = {}
     runner._query_resource_admission_loop = None
@@ -434,21 +437,21 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
     blocker_started = threading.Event()
     blocker_release = threading.Event()
     startup_entered = threading.Event()
-    executor = ThreadPoolExecutor(
+    native_executor = ThreadPoolExecutor(
         max_workers=1,
-        thread_name_prefix="vane-test-saturated",
+        thread_name_prefix="vane-test-native-saturated",
     )
+    runner._driver_native_executor = native_executor
 
     runner._precreate_udf_actors = lambda *_args, **_kwargs: startup_entered.set() or []
 
     async def _exercise() -> None:
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(executor)
         registration_complete = asyncio.Event()
         blocker_future = None
         register_query_resources = runner_cls._register_query_resources
 
-        def _occupy_default_executor() -> None:
+        def _occupy_native_executor() -> None:
             blocker_started.set()
             assert blocker_release.wait(timeout=2.0)
 
@@ -466,8 +469,8 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
                 expected_plan_id=expected_plan_id,
             )
             blocker_future = loop.run_in_executor(
-                None,
-                _occupy_default_executor,
+                native_executor,
+                _occupy_native_executor,
             )
             while not blocker_started.is_set():
                 await asyncio.sleep(0)
@@ -504,7 +507,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         asyncio.run(_exercise())
     finally:
         blocker_release.set()
-        executor.shutdown(wait=True)
+        runner_cls._shutdown_driver_executors(runner)
 
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
@@ -551,18 +554,30 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
         try:
             while not startup_claimed.is_set():
                 await asyncio.sleep(0)
+            lifecycle = runner._plan_lifecycles[physical_plan.idx()]
+
+            async def _wait_for_cancellation_fence() -> None:
+                while not lifecycle.close_requested():
+                    await asyncio.sleep(0)
+
             run_plan.cancel()
+            # Keep startup blocked until the cancellation handler fences execution.
+            await asyncio.wait_for(_wait_for_cancellation_fence(), timeout=1.0)
             startup_release.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(run_plan, timeout=1.0)
         finally:
             startup_release.set()
 
-    asyncio.run(_exercise())
+    try:
+        asyncio.run(_exercise())
+    finally:
+        startup_release.set()
+        runner_cls._shutdown_driver_executors(runner)
 
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
-    assert fragment_drops == [query_id]
+    assert fragment_drops == []
     assert coordinator.released == [(query_id, 7)]
     assert query_id not in runner.curr_plans
     assert query_id not in runner.curr_streams
@@ -617,10 +632,13 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     runner._precreate_vllm_actors = lambda *_args, **_kwargs: []
     runner._get_plan_runner = lambda: SimpleNamespace(
-        run_copy_plan=lambda _plan, _conn: {
-            "rows_copied": 1,
-            "copy_output_committed": True,
-        },
+        run_copy_plan=lambda _plan, _conn, on_execution_started: (
+            on_execution_started()
+            or {
+                "rows_copied": 1,
+                "copy_output_committed": True,
+            }
+        ),
     )
     runner._build_local_progress_snapshot = lambda query_id, _started_at: {
         "query_id": query_id,
@@ -878,6 +896,28 @@ def test_driver_exposes_query_task_and_output_lease_api():
     assert required.issubset(dir(runner_cls))
 
 
+def test_driver_database_disables_persistent_secrets_at_connect(monkeypatch):
+    import vane
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    monkeypatch.delenv("VANE_DUCKDB_THREADS", raising=False)
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._duckdb_conn = None
+    runner._driver_duckdb_memory_bytes = None
+    connect_calls = []
+    connection = object()
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr(vane, "connect", connect)
+
+    assert runner_cls._ensure_duckdb_conn(runner) is connection
+    assert connect_calls == [((), {"config": {"allow_persistent_secrets": False}})]
+
+
 def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomically():
     from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
@@ -1090,6 +1130,137 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
     assert coordinator.snapshot()["queries"][query_id]["state"] == "RUNNING"
     assert runner._query_terminal_errors == {}
     assert dropped == []
+
+
+def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
+    from vane.runners.ray.cluster_resource_coordinator import (
+        ClusterQueryResourceCoordinator,
+    )
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_resource_graph import MaterializationBarrierSpec
+    from vane.runners.ray.query_resource_graph_builder import build_query_demand
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    query_id = "query-phase-fence-rebalance"
+    upstream = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:upstream",
+        physical_node_id="node:upstream:udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(),
+        per_task=ResourceVector(cpu=1, heap_bytes=10),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=None,
+    )
+    materializer = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:materializer",
+        physical_node_id="node:materializer:native-fragment",
+        unit_kind="native_fragment",
+        backend="ray_worker",
+        input_unit_ids=(upstream.resource_unit_id,),
+        per_task=ResourceVector(),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=4,
+    )
+    downstream = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:downstream",
+        physical_node_id="node:downstream:udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(materializer.resource_unit_id,),
+        per_task=ResourceVector(cpu=1, heap_bytes=20),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=None,
+    )
+    graph = QueryResourceGraph(
+        query_id=query_id,
+        plan_digest="sha256:phase-fence-rebalance",
+        units=(upstream, materializer, downstream),
+        terminal_unit_ids=(downstream.resource_unit_id,),
+        materialization_barriers=(
+            MaterializationBarrierSpec(
+                query_id=query_id,
+                barrier_id=f"barrier:{query_id}:node:materializer",
+                physical_node_id="materializer",
+                materializer_unit_id=materializer.resource_unit_id,
+                materialized_input_unit_ids=(upstream.resource_unit_id,),
+            ),
+        ),
+    )
+    node = NodeCapacity(
+        "node-a",
+        ResourceVector(cpu=2, heap_bytes=30, object_store_bytes=100),
+    )
+    coordinator = ClusterQueryResourceCoordinator((node,))
+    allocation = coordinator.register_query(build_query_demand(graph, (node,)), now=0)
+    transitions = []
+    manager = register_query_resource_graph(
+        graph,
+        allocation,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    for unit in graph.units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=True)
+
+    runner._query_resource_coordinator = coordinator
+    runner._query_resource_graphs = {query_id: graph}
+    runner._query_allocations = {query_id: allocation}
+    runner._query_node_capacities = (node,)
+    runner._query_resource_last_capacity_refresh_at = 0.0
+    runner._query_resource_lock = threading.RLock()
+    runner._session_lock = threading.RLock()
+    runner._plan_teardown_condition = threading.Condition(runner._session_lock)
+    runner._plan_teardowns_in_progress = set()
+    runner._plan_session_ids = {query_id: _SESSION_ID}
+    runner._active_udf_actor_by_unit = {}
+    runner._active_udf_actors = []
+    runner._active_udf_actors_by_plan = {}
+    runner._signal_query_resource_change = lambda _query_id: None
+
+    assert manager.mark_materialization_barrier_completed_for_node("materializer")
+    assert len(transitions) == 1
+    eligible, fence_epoch = transitions[0]
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+    runner_cls._maintain_query_resources_once(
+        runner,
+        capacities=(node,),
+        now=5,
+    )
+    unrelated_generation = coordinator.snapshot()["queries"][query_id]["allocation"]["generation"]
+    assert unrelated_generation > allocation.generation
+
+    blocked = manager.try_acquire_task(
+        TaskRequest(query_id, downstream.resource_unit_id, "before-phase-refresh", "0", None)
+    )
+    pending_snapshot = manager.snapshot()
+    assert pending_snapshot["allocation"]["generation"] == unrelated_generation
+    assert pending_snapshot["allocation_admission_open"] is False
+    assert not blocked.granted and blocked.blocked_reason == "allocation_pending"
+
+    runner_cls._transition_query_execution_phase(
+        runner,
+        query_id,
+        eligible,
+        fence_epoch,
+    )
+
+    opened = manager.try_acquire_task(
+        TaskRequest(query_id, downstream.resource_unit_id, "after-phase-refresh", "0", None)
+    )
+    opened_snapshot = manager.snapshot()
+    assert opened_snapshot["allocation"]["generation"] > unrelated_generation
+    assert opened_snapshot["allocation_admission_open"] is True
+    assert opened.granted
 
 
 def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():

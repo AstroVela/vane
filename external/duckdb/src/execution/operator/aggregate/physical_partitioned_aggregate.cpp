@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -234,7 +235,12 @@ InsertionOrderPreservingMap<string> PhysicalPartitionedAggregate::ParamsToString
 
 void PhysicalPartitionedAggregate::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "groups", groups);
-	serializer.WriteProperty(104, "aggregates", aggregates);
+	vector<unique_ptr<Expression>> portable_aggregates;
+	for (const auto &aggregate : aggregates) {
+		portable_aggregates.push_back(
+		    FunctionBinder::UnbindSortedAggregate(aggregate->Cast<BoundAggregateExpression>()));
+	}
+	serializer.WriteProperty(104, "aggregates", portable_aggregates);
 	serializer.WriteProperty(105, "partitions", partitions);
 }
 

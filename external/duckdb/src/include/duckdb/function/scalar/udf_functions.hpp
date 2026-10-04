@@ -68,7 +68,8 @@ inline string NormalizeRunnerType(string runner_type) {
 	std::transform(runner_type.begin(), runner_type.end(), runner_type.begin(),
 	               [](unsigned char c) { return std::tolower(c); });
 	if (!runner_type.empty() && runner_type != "local-fast" && runner_type != "local" && runner_type != "ray") {
-		throw InvalidInputException("Invalid runner type '%s'. Please use 'local' or 'ray'.", runner_type);
+		throw InvalidInputException("Invalid runner type '%s'. Please use 'local-fast', 'local', or 'ray'.",
+		                            runner_type);
 	}
 	return runner_type;
 }
@@ -94,6 +95,11 @@ inline string ExpressionUDFExecutionBackendForRunner(const string &runner_type, 
 }
 
 namespace udf_helpers {
+
+//! Return a catalog-independent logical type descriptor for UDF transport.
+//! Built-in aliases with transport semantics (FILE, JSON, and TENSOR) are
+//! retained; connection-local aliases are expanded recursively.
+LogicalType SerializableContractType(const LogicalType &type);
 
 LogicalType ResolvePayloadReturnType(const Value &payload);
 

@@ -13,6 +13,10 @@
 
 namespace duckdb {
 
+struct CrossProductDeserializeTag {
+	constexpr CrossProductDeserializeTag() = default;
+};
+
 //! PhysicalCrossProduct represents a cross product between two tables
 class PhysicalCrossProduct : public CachingPhysicalOperator {
 public:
@@ -21,6 +25,8 @@ public:
 public:
 	PhysicalCrossProduct(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperator &left,
 	                     PhysicalOperator &right, idx_t estimated_cardinality);
+	PhysicalCrossProduct(PhysicalPlan &physical_plan, CrossProductDeserializeTag, vector<LogicalType> types,
+	                     idx_t estimated_cardinality);
 
 public:
 	// Operator Interface

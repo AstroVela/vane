@@ -25,6 +25,14 @@ public:
 		return false;
 	}
 
+	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		backing_fs.CreateDirectory(directory, opener);
+	}
+
+	void CreateDirectoriesRecursive(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		backing_fs.CreateDirectoriesRecursive(directory, opener);
+	}
+
 	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
 	               FileOpener * = nullptr) override {
 		return ListObjectKeys(directory, directory, callback);
@@ -175,7 +183,8 @@ private:
 
 class MappedRemoteFileSystem : public LocalFileSystem {
 public:
-	explicit MappedRemoteFileSystem(string local_root) : local_root(std::move(local_root)) {
+	explicit MappedRemoteFileSystem(string local_root, string remote_prefix = "s3://bucket")
+	    : local_root(std::move(local_root)), remote_prefix(std::move(remote_prefix)) {
 	}
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
@@ -223,6 +232,14 @@ public:
 		return backing_fs.TryRemoveFile(MapPath(path), opener);
 	}
 
+	bool CanHandleFile(const string &path) override {
+		return StringUtil::StartsWith(path, remote_prefix);
+	}
+
+	bool IsLocalFileSystem() const override {
+		return false;
+	}
+
 	void FailRemovalOf(string path) {
 		failed_removal_path = std::move(path);
 		fail_removal = true;
@@ -236,9 +253,14 @@ public:
 		return "MappedRemoteFileSystem";
 	}
 
+protected:
+	bool ListFilesExtended(const string &path, const std::function<void(OpenFileInfo &info)> &callback,
+	                       optional_ptr<FileOpener> opener) override {
+		return backing_fs.ListFiles(MapPath(path), callback, opener);
+	}
+
 private:
 	string MapPath(const string &path) const {
-		const string remote_prefix = "s3://bucket";
 		if (!StringUtil::StartsWith(path, remote_prefix)) {
 			throw InternalException("unexpected mapped remote path: " + path);
 		}
@@ -247,11 +269,54 @@ private:
 
 	LocalFileSystem backing_fs;
 	string local_root;
+	string remote_prefix;
 	string failed_removal_path;
 	bool fail_removal = false;
 };
 
-class WindowsPathFileSystem : public LocalFileSystem {
+class PhantomRemoteDirectoryFileSystem : public MappedRemoteFileSystem {
+public:
+	PhantomRemoteDirectoryFileSystem(string local_root, string remote_prefix, string phantom_directory)
+	    : MappedRemoteFileSystem(std::move(local_root), std::move(remote_prefix)),
+	      phantom_directory(std::move(phantom_directory)) {
+	}
+
+	bool DirectoryExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return true;
+		}
+		return MappedRemoteFileSystem::DirectoryExists(path, opener);
+	}
+
+	void RemoveDirectory(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return;
+		}
+		MappedRemoteFileSystem::RemoveDirectory(path, opener);
+	}
+
+private:
+	string phantom_directory;
+};
+
+class MissingRemoteMarkerRemovalFileSystem : public MappedRemoteFileSystem {
+public:
+	MissingRemoteMarkerRemovalFileSystem(string local_root, string missing_marker_path)
+	    : MappedRemoteFileSystem(std::move(local_root)), missing_marker_path(std::move(missing_marker_path)) {
+	}
+
+	void RemoveFile(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == missing_marker_path && !MappedRemoteFileSystem::FileExists(path, opener)) {
+			throw IOException({{"errno", "404"}}, "injected missing remote object");
+		}
+		MappedRemoteFileSystem::RemoveFile(path, opener);
+	}
+
+private:
+	string missing_marker_path;
+};
+
+class WindowsPathSemanticsFileSystem : public LocalFileSystem {
 public:
 	string PathSeparator(const string &) override {
 		return "\\";
@@ -442,7 +507,7 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto root_run_dir = BuildCopyDirectWriteRunDirectory(root, "run-root", root);
 	REQUIRE(root_run_dir == root + "_vane_direct_write_run-root");
 	REQUIRE(BuildCopyDirectWriteTaskDirectory(root, "run-root", "w_0", root) == root_run_dir + root + "w_0");
-	auto root_direct_target = BuildCopyDirectTargetFilePath(root, "run-root", "w_0", "part.parquet");
+	auto root_direct_target = BuildCopyDirectTargetFilePath(root, "run-root", "w_0", "part.parquet", root);
 	REQUIRE(root_direct_target == root + "run-root_w_0_part.parquet");
 	REQUIRE(DistributedCopyPathIsInDirectory(root_direct_target, root, root));
 	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, root, "run-root", root_direct_target));
@@ -456,10 +521,15 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto authority_paths =
 	    BuildDistributedCopyFinalizeCommitPaths(fs, authority_root_res.value(), "run-authority-root");
 	REQUIRE(authority_paths.commit_dir == "s3://bucket/.duckdb_commit/run-authority-root");
+	WindowsPathSemanticsFileSystem windows_fs;
+	auto windows_authority_paths =
+	    BuildDistributedCopyFinalizeCommitPaths(windows_fs, authority_root_res.value(), "run-authority-root");
+	REQUIRE(windows_authority_paths.commit_dir == authority_paths.commit_dir);
+	REQUIRE(windows_authority_paths.manifest_path == "s3://bucket/.duckdb_commit/run-authority-root/manifest.txt");
 	REQUIRE(BuildCopyDirectWriteRunDirectory(authority_root_res.value(), "run-authority-root") ==
 	        "s3://bucket/_vane_direct_write_run-authority-root");
 	auto authority_direct_target =
-	    BuildCopyDirectTargetFilePath(authority_root_res.value(), "run-authority-root", "w_0", "part.parquet");
+	    BuildCopyDirectTargetFilePath(fs, authority_root_res.value(), "run-authority-root", "w_0", "part.parquet");
 	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, authority_root_res.value(), "run-authority-root",
 	                                                        authority_direct_target));
 	auto authority_prefix_res = CanonicalDistributedCopyBasePath(fs, "s3://bucket/prefix///");
@@ -471,11 +541,13 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(BuildCopyDirectWriteRunDirectory(empty_authority_root_res.value(), "run-file-root") ==
 	        "file:///_vane_direct_write_run-file-root");
 	auto file_root_direct_target =
-	    BuildCopyDirectTargetFilePath(empty_authority_root_res.value(), "run-file-root", "w_0", "part.parquet");
+	    BuildCopyDirectTargetFilePath(fs, empty_authority_root_res.value(), "run-file-root", "w_0", "part.parquet");
 	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, empty_authority_root_res.value(), "run-file-root",
 	                                                        file_root_direct_target));
 
-	WindowsPathFileSystem windows_fs;
+	auto repeated_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\\)");
+	REQUIRE(repeated_root_res.is_ok());
+	REQUIRE(repeated_root_res.value() == R"(\)");
 	auto unc_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\server\share)");
 	REQUIRE(unc_root_res.is_ok());
 	REQUIRE(unc_root_res.value() == R"(\\server\share\)");
@@ -493,9 +565,16 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	        R"(C:\_vane_direct_write_run-drive-root)");
 	REQUIRE_FALSE(DistributedCopyPathIsInDirectory(R"(C:)", drive_root_res.value(), R"(\)"));
 	REQUIRE(DistributedCopyPathIsInDirectory(R"(C:\run-drive-root_w_0_part.parquet)", drive_root_res.value(), R"(\)"));
+	REQUIRE(DistributedCopyPathIsInDirectory(R"(C:/run-drive-root_w_0_part.parquet)", drive_root_res.value(), R"(\)"));
 	auto forward_slash_drive_root_res = CanonicalDistributedCopyBasePath(windows_fs, "C:////");
 	REQUIRE(forward_slash_drive_root_res.is_ok());
 	REQUIRE(forward_slash_drive_root_res.value() == R"(C:\)");
+	REQUIRE(NormalizeDistributedCopyPathForComparison(windows_fs, R"(C:/out/file.parquet)") ==
+	        R"(C:\out\file.parquet)");
+	REQUIRE(BuildCopyDirectTargetFilePath(windows_fs, R"(C:/out)", "run-mixed", "w_0", "part.parquet") ==
+	        R"(C:\out\run-mixed_w_0_part.parquet)");
+	REQUIRE(NormalizeDistributedCopyPathForComparison(windows_fs, "s3://bucket/out/file.parquet") ==
+	        "s3://bucket/out/file.parquet");
 
 	spec.file_path = root_temporary_output_path;
 	spec.use_tmp_file = true;
@@ -513,7 +592,10 @@ TEST_CASE("Distributed COPY temporary direct output preserves the canonical targ
 	auto output_path = fs.JoinPath(test_dir.path, "copy-output");
 	auto temporary_output_path = fs.JoinPath(test_dir.path, "tmp_copy-output");
 	const string run_id = "run-tmp";
-	auto worker_file = BuildCopyDirectTargetFilePath(temporary_output_path, run_id, "w_0", "part.parquet");
+	// Keep an explicit URI-style separator here: Win32 accepts the resulting
+	// mixed local path, while directory listings return native separators. The
+	// selected output must still compare equal during loser cleanup.
+	auto worker_file = BuildCopyDirectTargetFilePath(temporary_output_path, run_id, "w_0", "part.parquet", "/");
 	const string replacement_contents = "replacement";
 
 	WriteTestFile(fs, output_path, "old");
@@ -564,7 +646,7 @@ TEST_CASE("Distributed COPY temporary direct output preserves the canonical targ
 
 	const string stale_run_id = "run-tmp-stale";
 	auto stale_worker_file =
-	    BuildCopyDirectTargetFilePath(temporary_output_path, stale_run_id, "w_failed", "part.parquet");
+	    BuildCopyDirectTargetFilePath(fs, temporary_output_path, stale_run_id, "w_failed", "part.parquet");
 	WriteTestFile(fs, stale_worker_file, "stale");
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, output_path, stale_run_id, 1, temporary_output_path).is_ok());
 	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, output_path, stale_run_id);
@@ -582,7 +664,7 @@ TEST_CASE("Distributed COPY direct-target empty result removes loser files befor
 	auto &fs = test_dir.fs;
 	auto base_path = fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-empty";
-	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	auto loser_file = BuildCopyDirectTargetFilePath(fs, base_path, run_id, "w_loser", "part.parquet");
 	WriteTestFile(fs, loser_file, "loser");
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id).is_ok());
 
@@ -609,8 +691,8 @@ TEST_CASE("Distributed COPY direct-target cleanup failure prevents commit",
 	auto &local_fs = test_dir.fs;
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-cleanup-failure";
-	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
-	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	auto selected_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
+	auto loser_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_loser", "part.parquet");
 	const string selected_contents = "selected";
 	WriteTestFile(local_fs, selected_file, selected_contents);
 	WriteTestFile(local_fs, loser_file, "loser");
@@ -661,8 +743,8 @@ TEST_CASE("Distributed COPY direct-target cleanup time is excluded from finalize
 	auto &local_fs = test_dir.fs;
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-exclusive-timing";
-	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
-	auto loser_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_loser", "part.parquet");
+	auto selected_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
+	auto loser_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_loser", "part.parquet");
 	const string selected_contents = "selected";
 	WriteTestFile(local_fs, selected_file, selected_contents);
 	WriteTestFile(local_fs, loser_file, "loser");
@@ -703,7 +785,7 @@ TEST_CASE("Distributed COPY accepts a committed marker after its write response 
 	auto &local_fs = test_dir.fs;
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-marker-response-lost";
-	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto selected_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
 	const string selected_contents = "selected";
 	WriteTestFile(local_fs, selected_file, selected_contents);
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id).is_ok());
@@ -755,7 +837,7 @@ TEST_CASE("Distributed COPY reports an unknown outcome when committed marker rea
 		auto &local_fs = test_dir.fs;
 		auto base_path = local_fs.JoinPath(test_dir.path, "out");
 		const string run_id = "run-marker-readback-unknown";
-		auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+		auto selected_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
 		const string selected_contents = "selected";
 		WriteTestFile(local_fs, selected_file, selected_contents);
 		REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id).is_ok());
@@ -798,10 +880,12 @@ TEST_CASE("Distributed COPY reports an unknown outcome when committed marker rea
 TEST_CASE("Distributed COPY resolves relative and qualified list paths",
           "[distributed][copy][lifecycle][object-storage][path]") {
 	LocalFileSystem fs;
+	WindowsPathSemanticsFileSystem windows_fs;
 	const string directory = "memory://bucket/out.duckdb_commit";
 	const string qualified_path = directory + "/run/lifecycle.txt";
 
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "run/lifecycle.txt") == qualified_path);
+	REQUIRE(ResolveDistributedCopyListedPath(windows_fs, directory, "run/lifecycle.txt") == qualified_path);
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, qualified_path) == qualified_path);
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "/bucket/out.duckdb_commit/run/lifecycle.txt") ==
 	        qualified_path);
@@ -845,6 +929,8 @@ TEST_CASE("Distributed COPY treats only not-found list failures as empty",
 
 	std::runtime_error python_missing("FileNotFoundError: /missing");
 	REQUIRE(DistributedCopyExceptionIsNotFound(python_missing));
+	IOException s3_missing({{"errno", "404"}}, "injected missing S3 object");
+	REQUIRE(DistributedCopyExceptionIsNotFound(s3_missing));
 
 	ErrnoListFileSystem partial_missing_fs(ENOENT, true);
 	auto partial_missing_res = ListDistributedCopyFilesUnderPrefix(partial_missing_fs, "/partial");
@@ -1006,7 +1092,7 @@ TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
 	const string run_id = "run-direct-target";
 
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_failed", "part.parquet");
 	WriteTestFile(local_fs, data_file, "stale");
 	auto missing_run_prefix = BuildCopyDirectWriteRunDirectory(base_path, run_id, local_fs.PathSeparator(base_path));
 
@@ -1019,6 +1105,34 @@ TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
 	REQUIRE_FALSE(local_fs.FileExists(data_file));
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
 	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Direct-target cleanup ignores phantom remote directories",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_phantom_remote_directory");
+	const string remote_prefix = "custom-object://bucket";
+	const string base_path = remote_prefix + "/out";
+	const string run_id = "run-direct-target";
+	auto run_prefix = BuildCopyDirectWriteRunDirectory(base_path, run_id, "/");
+	VirtualFileSystem fs;
+	fs.RegisterSubSystem(make_uniq<PhantomRemoteDirectoryFileSystem>(test_dir.fs.JoinPath(test_dir.path, "remote"),
+	                                                                 remote_prefix, run_prefix));
+	REQUIRE_FALSE(FileSystem::IsRemoteFile(base_path));
+	REQUIRE_FALSE(fs.HasDirectorySemantics(run_prefix));
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	auto data_file = BuildCopyDirectTargetFilePath(fs, base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, data_file, "stale");
+	REQUIRE(fs.DirectoryExists(run_prefix, nullptr));
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+
+	auto cleanup_error = cleanup_res.is_err() ? cleanup_res.error().what() : string();
+	INFO(cleanup_error);
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE_FALSE(fs.FileExists(data_file, nullptr));
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path, nullptr));
 }
 
 TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata cleanup finishes",
@@ -1057,7 +1171,7 @@ TEST_CASE("Direct-write cleanup requires lifecycle registration", "[distributed]
 	auto &fs = test_dir.fs;
 	auto base_path = fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-unregistered";
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(fs, base_path, run_id, "w_failed", "part.parquet");
 	WriteTestFile(fs, data_file, "must survive");
 
 	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
@@ -1073,7 +1187,7 @@ TEST_CASE("Direct-write force abort refuses node-local output without mutating t
 	auto &local_fs = test_dir.fs;
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-force-abort-node-local";
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
 	WriteTestFile(local_fs, data_file, "discard me");
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
@@ -1096,7 +1210,7 @@ TEST_CASE("Direct-write force abort cleans shared remote output before reporting
 	MappedRemoteFileSystem fs(test_dir.fs.JoinPath(test_dir.path, "remote"));
 	const string base_path = "s3://bucket/out";
 	const string run_id = "run-force-abort-remote";
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(fs, base_path, run_id, "w_selected", "part.parquet");
 	WriteTestFile(fs, data_file, "discard me");
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
@@ -1123,13 +1237,36 @@ TEST_CASE("Direct-write force abort cleans shared remote output before reporting
 	REQUIRE_FALSE(fs.DirectoryExists(paths.commit_dir));
 }
 
+TEST_CASE("Direct-write force abort tolerates an absent remote committed marker",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_force_abort_missing_remote_marker");
+	const string base_path = "s3://bucket/out";
+	const string run_id = "run-force-abort-missing-remote-marker";
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(test_dir.fs, base_path, run_id);
+	MissingRemoteMarkerRemovalFileSystem fs(test_dir.fs.JoinPath(test_dir.path, "remote"), paths.committed_marker_path);
+	auto data_file = BuildCopyDirectTargetFilePath(fs, base_path, run_id, "w_selected", "part.parquet");
+	WriteTestFile(fs, data_file, "discard me");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	WriteTestFile(fs, paths.manifest_path, "manifest");
+	REQUIRE_FALSE(fs.FileExists(paths.committed_marker_path));
+
+	auto abort_res = ForceAbortDistributedCopyDirectWriteRun(fs, base_path, run_id);
+
+	REQUIRE(abort_res.is_ok());
+	REQUIRE_FALSE(abort_res.value().skipped_committed);
+	REQUIRE_FALSE(fs.FileExists(paths.committed_marker_path));
+	REQUIRE_FALSE(fs.FileExists(data_file));
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path));
+	REQUIRE_FALSE(fs.DirectoryExists(paths.commit_dir));
+}
+
 TEST_CASE("Direct-write force abort preserves node-local lifecycle when the marker is absent",
           "[distributed][copy][lifecycle]") {
 	CopyFinalizeTestDirectory test_dir("copy_finalize_force_abort_missing_marker");
 	auto &local_fs = test_dir.fs;
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-force-abort-missing-marker";
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_selected", "part.parquet");
 	WriteTestFile(local_fs, data_file, "discard me");
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
@@ -1152,7 +1289,7 @@ TEST_CASE("Direct-write cleanup restores lifecycle when directory removal fails"
 	auto base_path = local_fs.JoinPath(test_dir.path, "out");
 	const string run_id = "run-retry-directory";
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, run_id, 1).is_ok());
-	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	auto data_file = BuildCopyDirectTargetFilePath(local_fs, base_path, run_id, "w_failed", "part.parquet");
 	WriteTestFile(local_fs, data_file, "stale");
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
 	WriteTestFile(local_fs, paths.manifest_path, "partial");

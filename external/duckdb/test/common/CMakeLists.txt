@@ -5,16 +5,31 @@ add_library_unity(
   test_checksum.cpp
   test_file_system.cpp
   test_caching_file_system_wrapper.cpp
+  test_external_file_cache.cpp
   test_hyperlog.cpp
+  test_image_operators.cpp
+  test_image_to_tensor.cpp
   test_lru_cache.cpp
   test_numeric_cast.cpp
+  test_parse_expression.cpp
   test_parse_logical_type.cpp
   test_utf.cpp
   test_allocator_debug_info.cpp
   test_storage_fuzz.cpp
   test_strftime.cpp
-  test_string_util.cpp)
+  test_string_util.cpp
+  test_temporary_memory_manager.cpp
+  test_vector_hash.cpp
+  test_value_to_sql_string.cpp)
+
+target_include_directories(test_common PRIVATE ../../extension/file/include
+                                               ../../extension/image/include)
+
+# Exercise ODR-use from extensions compiled with a newer language standard.
+add_library_unity(test_common_cxx17 OBJECT test_logical_type_constants.cpp)
+target_compile_features(test_common_cxx17 PRIVATE cxx_std_17)
 
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_common>
+    $<TARGET_OBJECTS:test_common_cxx17>
     PARENT_SCOPE)

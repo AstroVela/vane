@@ -73,6 +73,8 @@ string RelationTypeToString(RelationType type) {
 		return "QUERY_RELATION";
 	case RelationType::UNNEST_RELATION:
 		return "UNNEST_RELATION";
+	case RelationType::WRITE_FILE_RELATION:
+		return "WRITE_FILE_RELATION";
 	case RelationType::EXTENSION_RELATION:
 		return "EXTENSION_RELATION";
 	case RelationType::INVALID_RELATION:

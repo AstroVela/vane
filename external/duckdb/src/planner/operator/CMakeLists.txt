@@ -20,6 +20,7 @@ add_library_unity(
   logical_create_table.cpp
   logical_cross_product.cpp
   logical_cteref.cpp
+  logical_data_sink.cpp
   logical_delete.cpp
   logical_delim_get.cpp
   logical_dependent_join.cpp

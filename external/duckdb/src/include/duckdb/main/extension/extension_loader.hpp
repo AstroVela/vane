@@ -15,6 +15,8 @@
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/extension_manager.hpp"
+#include "duckdb/main/distributed_extension_manager.hpp"
+#include "duckdb/function/distributed_write.hpp"
 
 namespace duckdb {
 
@@ -28,6 +30,7 @@ struct CreateTableFunctionInfo;
 class ExtensionLoader {
 	friend class DuckDB;
 	friend class ExtensionHelper;
+	friend struct DistributedWriteOperatorExtension;
 
 public:
 	explicit ExtensionLoader(ExtensionActiveLoad &load_info);
@@ -40,7 +43,6 @@ public:
 	//! Set the description of the extension
 	DUCKDB_API void SetDescription(const string &description);
 
-public:
 	//! Register a new scalar function - merge overloads if the function already exists
 	DUCKDB_API void RegisterFunction(ScalarFunction function);
 	DUCKDB_API void RegisterFunction(ScalarFunctionSet function);
@@ -102,12 +104,17 @@ public:
 
 private:
 	void FinalizeLoad();
+	DistributedExtensionManifest &GetOrCreateDistributedManifest();
+	unique_ptr<DistributedExtensionManifest> BindDistributedTableFunctions(TableFunctionSet &functions);
+	void RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension);
 
 private:
 	DatabaseInstance &db;
 	string extension_name;
 	string extension_description;
 	optional_ptr<ExtensionInfo> extension_info;
+	unique_ptr<DistributedExtensionManifest> distributed_manifest;
+	vector<shared_ptr<const DistributedWriteOperatorExtension>> distributed_write_operators;
 };
 
 } // namespace duckdb

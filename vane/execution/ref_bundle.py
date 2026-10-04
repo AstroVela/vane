@@ -680,8 +680,19 @@ class LocalShmBudgetManager:
                 def _can_grant_locked() -> bool:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError(f"local_shm output grant cancelled: {name or '-'}")
-                    limit, _, _, required_usage, oversized_allowed = _grant_state_locked()
-                    return limit <= 0 or required_usage <= limit or oversized_allowed
+                    limit, input_credit, _, required_usage, oversized_allowed = _grant_state_locked()
+                    if limit <= 0 or required_usage <= limit or oversized_allowed:
+                        return True
+                    # Different slices can borrow the same allocation, then
+                    # each retain an output credit after ACK. Permit consumers
+                    # to convert their own credit without increasing total
+                    # usage, so these credits cannot deadlock the pipeline.
+                    # Materialized memory may exceed the limit by one bounded
+                    # output block; further grants wait until it drains.
+                    materialized = self._allocated_bytes + self._output_grant_bytes
+                    return (
+                        priority == "consumer" and 0 < requested <= min(input_credit, limit) and materialized <= limit
+                    )
 
                 if not _can_grant_locked():
                     limit, input_credit, _, _, _ = _grant_state_locked()

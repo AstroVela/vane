@@ -60,7 +60,10 @@ public:
 
 	vector<string> ListSubSystems() override;
 
+	FileSystem &GetDefaultFileSystem();
+
 	std::string GetName() const override;
+	bool HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener = nullptr) override;
 
 	void SetDisabledFileSystems(const vector<string> &names) override;
 	bool SubSystemIsDisabled(const string &name) override;

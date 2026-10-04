@@ -29,6 +29,7 @@ def _native_vllm_envelope(public_options_json):
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": public_options_json,
         "__vane_vllm_secret_payload": b'{"payload_version":1,"values":[]}',
+        "engine": "vllm",
     }
 
 
@@ -291,6 +292,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": json.dumps(public_options),
         "__vane_vllm_secret_payload": secret_payload,
+        "engine": "vllm",
     }
 
     normalized = vllm.normalize_options(envelope)
@@ -370,6 +372,27 @@ def test_native_executor_materializes_structured_outputs_params(monkeypatch):
     assert executor.sampling_params.options == {"max_tokens": 8}
 
 
+def test_local_vllm_executor_explicitly_shuts_down_engine():
+    from vane.execution.vllm import LocalVLLMExecutor
+
+    class Engine:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    engine = Engine()
+    executor = LocalVLLMExecutor.__new__(LocalVLLMExecutor)
+    executor.llm = engine
+
+    executor._shutdown_engine()
+    executor._shutdown_engine()
+
+    assert engine.shutdown_calls == 1
+    assert executor.llm is None
+
+
 def test_ray_actor_releases_only_terminal_per_executor_state():
     from vane.execution.vllm import RayLocalVLLMExecutor
 
@@ -406,6 +429,30 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
     asyncio.run(executor.abort_executor("aborted"))
     assert "aborted" in executor._per_executor_aborted
     assert executor.release_executor("aborted") is True
+
+
+def test_ray_actor_wait_raises_stored_executor_error():
+    from vane.execution.vllm import RayLocalVLLMExecutor
+
+    executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
+    executor.on_error = "raise"
+    executor.task_count_lock = threading.Lock()
+    executor._per_executor_deques = {"executor": deque()}
+    executor._per_executor_running_task_count = {"executor": 0}
+    executor._per_executor_finished = set()
+    executor._per_executor_errors = {"executor": "sentinel request failure"}
+    executor._per_executor_aborted = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_wait_tokens_observed = {}
+    executor._async_waiter_lock = threading.Lock()
+    executor._async_waiters = {}
+    executor._notify_state_change = lambda **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="vllm task failed: sentinel request failure"):
+        asyncio.run(executor.wait_for_result("executor", "error-wait"))
+
+    assert executor._per_executor_waiters == {}
+    assert executor._per_executor_wait_tokens_observed == {"executor": "error-wait"}
 
 
 def test_ray_actor_batches_ready_results_to_standard_vector_size():
@@ -452,6 +499,7 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
+    executor.on_error = "raise"
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
@@ -509,6 +557,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
+    executor.on_error = "raise"
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
@@ -550,6 +599,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
+    import vane.execution._llm_executor as llm_executor
     import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
@@ -579,8 +629,8 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
         sleep_calls.append(delay)
 
     monkeypatch.setenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", "10")
-    monkeypatch.setattr(vllm, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
-    monkeypatch.setattr(vllm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(llm_executor, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(llm_executor.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="abort waiter timeout-wait did not acknowledge termination"):
         asyncio.run(executor.abort_executor("executor", "timeout-wait"))
@@ -612,6 +662,7 @@ def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
+    executor._lifecycle_lock = threading.Lock()
     executor._finished_submitting = False
     executor.running_task_count = 0
     executor.task_count_lock = threading.Lock()
@@ -1584,3 +1635,97 @@ def test_remote_ref_cleanup_does_not_initialize_ray(monkeypatch):
     executor._cancel_refs([object()])
 
     assert calls == ["checked"]
+
+
+def test_native_generate_substitution_logs_bounded_warning(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._ray_actor_mode = True
+    executor.engine_error_message = None
+    executor.llm = None  # generation fails before any engine interaction
+    executor.on_error = "null"  # the lowered form of the public on_error="ignore"
+    executor.completed_tasks = deque()
+    executor.task_count_lock = threading.Lock()
+    executor.running_task_count = 1
+    executor._notify_state_change = lambda **_kwargs: None
+    row = pa.table({"x": [1]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        asyncio.run(executor._generate("prompt text", row))
+
+    assert list(executor.completed_tasks) == [(None, row)]
+    messages = [r.getMessage() for r in caplog.records if "substituted NULL" in r.getMessage()]
+    assert len(messages) == 1
+    assert "vllm engine not initialized" in messages[0]
+    assert "prompt text" not in messages[0]
+
+
+def test_native_generate_raise_mode_logs_no_substitution_warning(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._ray_actor_mode = True
+    executor.engine_error_message = None
+    executor.llm = None
+    executor.on_error = "raise"
+    executor.model = "test-model"
+    executor.completed_tasks = deque()
+    executor.error_message = None
+    executor.error_lock = threading.Lock()
+    executor.task_count_lock = threading.Lock()
+    executor.running_task_count = 1
+    executor._notify_state_change = lambda **_kwargs: None
+    row = pa.table({"x": [1]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        asyncio.run(executor._generate("prompt text", row))
+
+    assert executor.error_message is not None
+    assert list(executor.completed_tasks) == []
+    assert [r for r in caplog.records if "substituted NULL" in r.getMessage()] == []
+
+
+def test_native_append_error_rows_logs_one_warning_per_batch(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.engine_error_message = "engine init exploded"
+    executor.on_error = "null"
+    executor.completed_tasks = deque()
+    executor._notify_state_change = lambda **_kwargs: None
+    rows = pa.table({"x": [1, 2, 3]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        executor._append_error_rows(rows)
+
+    assert [output for output, _row in executor.completed_tasks] == [None, None, None]
+    messages = [r.getMessage() for r in caplog.records if "substituted NULL" in r.getMessage()]
+    assert len(messages) == 1  # bounded: one warning per substituted batch, not per row
+    assert "vllm engine init failed: engine init exploded" in messages[0]
+
+
+def test_native_append_error_rows_raise_mode_logs_no_substitution_warning(caplog):
+    """No caller reaches _append_error_rows under raise mode today, but the
+    policy mapping must guard it so a future caller cannot log a substitution
+    that is not happening."""
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.engine_error_message = "engine init exploded"
+    executor.on_error = "raise"
+    executor.completed_tasks = deque()
+    executor._notify_state_change = lambda **_kwargs: None
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        executor._append_error_rows(pa.table({"x": [1]}))
+
+    assert [r for r in caplog.records if "substituted NULL" in r.getMessage()] == []

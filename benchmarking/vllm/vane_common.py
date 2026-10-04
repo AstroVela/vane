@@ -101,7 +101,7 @@ def _run_relation_benchmark(script_name: str, rel, *, distributed: bool = False)
         from vane.runners import get_or_create_runner
 
         runner = get_or_create_runner()
-        tables = list(runner.run_iter_tables(rel))
+        tables = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)))
         combined = pa.concat_tables(tables)
         rows = combined.to_pydict()
         row_count = combined.num_rows

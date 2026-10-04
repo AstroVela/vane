@@ -196,6 +196,11 @@ inline ClientContext &SerializationData::Get() {
 }
 
 template <>
+inline optional_ptr<ClientContext> SerializationData::TryGet() {
+	return contexts.empty() ? nullptr : &contexts.top().get();
+}
+
+template <>
 inline void SerializationData::Unset<ClientContext>() {
 	AssertNotEmpty(contexts);
 	contexts.pop();

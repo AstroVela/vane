@@ -22,6 +22,8 @@ import pytest
 
 import vane
 import vane._ray_cxx as ray_cxx_helpers
+from tests.ray_diagnostic_helpers import raise_diagnostic_error
+from tests.result_stream_helpers import collect_result_stream
 from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
@@ -252,6 +254,17 @@ def test_physical_plan_submission_preflight_accepts_serializable_root():
     assert plan._validate_serializable_for_submission() is None
 
 
+def test_submission_preflight_skips_coordinator_only_extension_write_root():
+    plan = vane.ray_cxx._make_coordinator_only_extension_write_plan_for_test("query-coordinator-only-extension-write")
+
+    assert plan._validate_serializable_for_submission() is None
+    with pytest.raises(
+        vane.NotImplementedException,
+        match="COORDINATOR_ONLY_EXTENSION_WRITE root cannot be serialized",
+    ):
+        pickle.dumps(plan)
+
+
 def test_logical_to_physical_plan_propagates_submission_preflight_cause(monkeypatch):
     con = vane.connect()
     logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -425,7 +438,7 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
             RuntimeError,
             match=f"distributed worker task submission failed for query_id={query_id}",
         ) as exc_info:
-            list(stream)
+            collect_result_stream(stream)
     finally:
         runner.drop_query_fragments(query_id)
         con.close()
@@ -496,7 +509,9 @@ def test_ray_backed_result_partition_concurrent_materialization(should_fail):
         assert observed["calls"] == 1
         assert [result["rows"] for result in results] == [0] * 8
         assert all("materialization boom" in result["error"] for result in results)
-        assert {result["error_type"] for result in results} == {"InvalidInputException"}
+        assert {result["error_type"] for result in results} == {"RuntimeError"}
+        assert all("RuntimeError: materialization boom" in result["error"] for result in results)
+        assert all(len(result["error"].encode("utf-8")) <= 4096 for result in results)
     else:
         assert observed["calls"] == 1
         assert [result["rows"] for result in results] == [3] * 8
@@ -513,7 +528,7 @@ def test_distributed_physical_plan_inspectors():
     assert isinstance(plan.num_partitions(), int)
     assert isinstance(plan.repr_ascii(False), str)
     assert isinstance(plan.repr_mermaid(False, False), str)
-    assert isinstance(plan.scan_task_descriptor_map(), dict)
+    assert isinstance(plan.scan_split_batch_map(), dict)
 
 
 def test_distributed_physical_plan_runner_run_plan_accepts_none():
@@ -534,7 +549,7 @@ def test_fte_split_queue_basic_states():
 
     first = queue.try_get_next()
     second = queue.try_get_next()
-    assert first == {"state": "SPLIT", "kind": "scan_task", "data": b"scan-a"}
+    assert first == {"state": "SPLIT", "kind": "scan_split_batch", "data": b"scan-a"}
     assert second == {
         "state": "SPLIT",
         "kind": "exchange_source_task",
@@ -543,6 +558,203 @@ def test_fte_split_queue_basic_states():
     assert queue.try_get_next() == {"state": "BLOCKED"}
     queue.no_more_splits()
     assert queue.try_get_next() == {"state": "FINISHED"}
+
+
+def test_merge_scan_split_batches_rejects_empty_payload():
+    with pytest.raises(ValueError, match="requires at least one batch"):
+        vane.ray_cxx.merge_scan_split_batches([])
+    with pytest.raises(Exception, match="empty scan split batch"):
+        vane.ray_cxx.merge_scan_split_batches([b""])
+
+
+@pytest.mark.parametrize("argument", ["scan_split_batch", "exchange_source_task"])
+def test_execute_native_rejects_empty_distributed_input_payload(argument):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="must not be empty"):
+            runner.execute_native(cursor, plan, **{argument: {"1": b""}})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize("argument", ["scan_split_batch", "exchange_source_task"])
+def test_execute_native_rejects_nonbinary_distributed_input_payload(argument):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="values must be raw bytes"):
+            runner.execute_native(cursor, plan, **{argument: {"1": "not-bytes"}})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize("node_id", ["", "-1", "1suffix", "01", 1])
+def test_execute_native_rejects_noncanonical_distributed_task_node_id(node_id):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="node_id"):
+            runner.execute_native(cursor, plan, scan_split_batch={node_id: b"not-reached"})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("runtime_context", "message"),
+    [
+        ("not-a-dict", "runtime_context must be a dict"),
+        ({"task_id": 1}, "runtime_context task_id must be a string"),
+        ({"task_id": ""}, "runtime_context task_id must not be empty"),
+    ],
+)
+def test_execute_native_rejects_invalid_runtime_task_identity(runtime_context, message):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match=message):
+            runner.execute_native(cursor, plan, runtime_context=runtime_context)
+    finally:
+        cursor.close()
+        con.close()
+
+
+def test_execute_native_rejects_static_and_fte_scan_assignment_for_same_node(tmp_path):
+    source = tmp_path / "overlapping_scan.parquet"
+    con = vane.connect()
+    con.execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql(f"SELECT * FROM parquet_scan('{source}')"),
+        "overlapping-scan-assignment",
+    ).to_physical_plan(con)
+    batch_map = plan.scan_split_batch_map()
+    assert len(batch_map) == 1
+    node_id, batches = next(iter(batch_map.items()))
+    assert len(batches) == 1
+
+    try:
+        with pytest.raises(ValueError, match="both a static split batch and an FTE split queue"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+                scan_split_batch={str(node_id): bytes(batches[0])},
+                fte_scan_source_queues={str(node_id): vane.ray_cxx.FteSplitQueue()},
+            )
+    finally:
+        con.close()
+
+
+def test_execute_native_rejects_missing_distributed_scan_assignment(tmp_path):
+    source = tmp_path / "missing_scan_assignment.parquet"
+    con = vane.connect()
+    con.execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql(f"SELECT * FROM parquet_scan('{source}')"),
+        "missing-scan-assignment",
+    ).to_physical_plan(con)
+    assert plan.scan_split_batch_map()
+
+    try:
+        with pytest.raises(ValueError, match="no explicit worker split assignment"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+            )
+    finally:
+        con.close()
+
+
+def test_parquet_bind_serde_preserves_worker_scan_options(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    partition_dir = tmp_path / "region=west"
+    partition_dir.mkdir()
+    source = partition_dir / "bind_state.parquet"
+    con = vane.connect()
+    try:
+        pq.write_table(pa.table({"value": pa.array([42], type=pa.int32())}), source)
+        relation = con.sql(
+            f"""
+            SELECT value, region, filename, file_row_number
+            FROM read_parquet(
+                '{tmp_path}/*/*.parquet',
+                hive_partitioning = true,
+                filename = true,
+                file_row_number = true
+            )
+            """
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "parquet-wrapper-bind-serde",
+        ).to_physical_plan(con)
+        batch_map = plan.scan_split_batch_map()
+        assert len(batch_map) == 1
+        node_id, batches = next(iter(batch_map.items()))
+        assert len(batches) == 1
+
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            con.cursor(),
+            plan,
+            scan_split_batch={str(node_id): bytes(batches[0])},
+        )
+
+        assert result.completion_status == "ok"
+        assert len(result.partition_payloads) == 1
+        table = result.partition_payloads[0]
+        assert isinstance(table, pa.Table)
+        assert table.num_columns == 4
+        assert table.column(0).to_pylist() == [42]
+        assert table.column(1).to_pylist() == ["west"]
+        assert table.column(2).to_pylist() == [str(source)]
+        assert table.column(3).to_pylist() == [0]
+    finally:
+        con.close()
+
+
+def test_execute_native_rejects_static_and_fte_exchange_assignment_for_same_node():
+    con = vane.connect()
+    plan = _make_test_physical_plan(con)
+    descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
+        [
+            {
+                "partition_id": 0,
+                "attempt_id": 0,
+                "node_id": "node-a",
+                "flight_port": 5010,
+                "files": [{"path": "shuffle-a", "rows": 1, "file_size": 1}],
+            }
+        ],
+        [0],
+        1,
+        1,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="both a static task descriptor and an FTE split queue"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+                exchange_source_task={"7": descriptor},
+                fte_exchange_source_queues={"7": vane.ray_cxx.FteSplitQueue()},
+            )
+    finally:
+        con.close()
 
 
 def test_fte_split_queue_tracks_exchange_source_progress_stats():
@@ -602,9 +814,11 @@ def test_fte_split_queue_tracks_exchange_source_width_metadata():
     assert queue.exchange_source_task_count() == 8
 
 
-def test_exchange_source_task_partition_indices_accepts_empty_descriptor():
-    assert vane.ray_cxx.exchange_source_task_partition_indices(b"") == []
-    assert vane.ray_cxx.split_exchange_source_task_by_partition(b"") == []
+def test_exchange_source_task_helpers_reject_empty_descriptor():
+    with pytest.raises(vane.SerializationException, match="empty exchange source task descriptor"):
+        vane.ray_cxx.exchange_source_task_partition_indices(b"")
+    with pytest.raises(vane.SerializationException, match="empty exchange source task descriptor"):
+        vane.ray_cxx.split_exchange_source_task_by_partition(b"")
 
 
 def test_exchange_source_task_descriptor_preserves_attempt_ids():
@@ -720,6 +934,9 @@ def test_ray_task_result_rejects_mark_summary_payload_without_validity(payload_f
                 exchange_sink_instance={payload_field: True},
             )
 
+        def ack(self):
+            return None
+
         def release_result_payload(self):
             return None
 
@@ -812,6 +1029,7 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
             self._error = None
             self._future = None
             self.task = None
+            self.ack_calls = 0
             self.release_calls = 0
 
         def _ensure_started(self):
@@ -835,6 +1053,9 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
                 sink_instance.to_dict(),
             )
 
+        def ack(self):
+            self.ack_calls += 1
+
         def release_result_payload(self):
             self.release_calls += 1
 
@@ -846,6 +1067,7 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
     assert result["flight_port"] == 5010
     assert result["has_exchange_sink_instance"] is True
     assert result["exchange_sink_query_id"] == "query-nested"
+    assert handle.ack_calls == 1
     assert handle.release_calls == 1
 
 
@@ -857,23 +1079,29 @@ class _PollerTestHandle:
         done_error=None,
         result_error=None,
         ready_after=1,
+        long_traceback=False,
     ):
         self.worker_id = f"worker-{name}"
         self.done_error = done_error
         self.result_error = result_error
         self.ready_after = ready_after
+        self.long_traceback = long_traceback
         self.done_calls = 0
+        self.ack_calls = 0
 
     def done(self):
         if self.done_error is not None:
-            raise self.done_error
+            raise_diagnostic_error(self.done_error, long_traceback=self.long_traceback)
         self.done_calls += 1
         return self.done_calls >= self.ready_after
 
     def get_result_sync(self):
         if self.result_error is not None:
-            raise self.result_error
+            raise_diagnostic_error(self.result_error, long_traceback=self.long_traceback)
         return vane.ray_cxx.RayTaskResult.success([], [], None, 5010, None)
+
+    def ack(self):
+        self.ack_calls += 1
 
 
 def _poll_with_shared_ray_task_result_poller(*handles):
@@ -925,10 +1153,11 @@ def _run_ray_task_result_poller_shutdown_race_script(body):
     assert "poller-stopped" in completed.stdout, completed.stdout + completed.stderr
 
 
-def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers(long_traceback):
     healthy = _PollerTestHandle("healthy", ready_after=3)
     outcomes = _poll_with_shared_ray_task_result_poller(
-        _PollerTestHandle("broken", done_error=RuntimeError("injected done failure")),
+        _PollerTestHandle("broken", done_error=RuntimeError("injected done failure"), long_traceback=long_traceback),
         healthy,
     )
 
@@ -937,6 +1166,7 @@ def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
     assert "operation=handle.done" in outcomes[0]["error"]
     assert "task_id=poller-test.0" in outcomes[0]["error"]
     assert "injected done failure" in outcomes[0]["error"]
+    assert len(outcomes[0]["error"].encode("utf-8")) <= 8192
     _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
     assert healthy.done_calls >= 3
 
@@ -1009,9 +1239,12 @@ def test_ray_task_result_poller_falls_back_after_invalid_ready_indices(
     assert error_fragment in stderr
 
 
-def test_ray_task_result_poller_isolates_per_handle_completion_failure():
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_task_result_poller_isolates_per_handle_completion_failure(long_traceback):
     outcomes = _poll_with_shared_ray_task_result_poller(
-        _PollerTestHandle("broken", result_error=RuntimeError("injected completion failure")),
+        _PollerTestHandle(
+            "broken", result_error=RuntimeError("injected completion failure"), long_traceback=long_traceback
+        ),
         _PollerTestHandle("healthy"),
     )
 
@@ -1020,6 +1253,7 @@ def test_ray_task_result_poller_isolates_per_handle_completion_failure():
     assert "operation=handle.get_result_sync" in outcomes[0]["error"]
     assert "task_id=poller-test.0" in outcomes[0]["error"]
     assert "injected completion failure" in outcomes[0]["error"]
+    assert len(outcomes[0]["error"].encode("utf-8")) <= 4096
     _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
 
 
@@ -2049,6 +2283,7 @@ def test_distributed_copy_sink_mode_local_default_uses_visible_direct_target(mon
 
     assert result["construct_error"] is False, result["error"]
     assert result["staging_root_base"] == ""
+    assert result["staging_run_id"]
     assert result["uses_direct_write"] is True
     assert result["uses_visible_direct_target"] is True
 
@@ -2420,6 +2655,62 @@ def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
     assert not filesystem.exists(data_path)
 
 
+def test_copy_direct_write_lifecycle_cleanup_preserves_registered_local_directory_error(tmp_path, monkeypatch):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    filesystem = fsspec.filesystem("file", skip_instance_cache=True)
+    base = tmp_path / "registered_local_cleanup"
+    base_path = f"file://{base.as_posix()}"
+    run_id = "run-local-directory-error"
+    run_dir = base / f"_vane_direct_write_{run_id}"
+    data_file = run_dir / "w_failed" / "part.parquet"
+    lifecycle_file = base.parent / f"{base.name}.duckdb_commit" / run_id / "lifecycle.txt"
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b"stale")
+    lifecycle_file.parent.mkdir(parents=True)
+    lifecycle_file.write_text(
+        textwrap.dedent(
+            f"""\
+            version=2
+            mode=direct_write
+            base_path={base_path}
+            worker_base_path={base_path}
+            run_id={run_id}
+            created_epoch_ms=1000
+            direct_write_run_dir={base_path}/_vane_direct_write_{run_id}
+            """
+        )
+    )
+
+    original_rm = filesystem.rm
+
+    def fail_run_directory_removal(path, recursive=False, **kwargs):
+        stripped_path = filesystem._strip_protocol(path).rstrip("/")
+        if recursive and stripped_path == run_dir.as_posix():
+            raise PermissionError("injected registered-local directory removal failure")
+        return original_rm(path, recursive=recursive, **kwargs)
+
+    monkeypatch.setattr(filesystem, "rm", fail_run_directory_removal)
+    conn = vane.connect()
+    try:
+        conn.register_filesystem(filesystem)
+        result = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(
+            base_path,
+            min_age_ms=5_000,
+            now_epoch_ms=10_000,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+
+    assert result["scanned_runs"] == 1
+    assert result["cleaned_runs"] == 0
+    assert result["errors"] == 1
+    assert "injected registered-local directory removal failure" in result["error_messages"][0]
+    assert not data_file.exists()
+    assert run_dir.exists()
+    assert lifecycle_file.exists()
+
+
 def test_copy_direct_write_lifecycle_cleanup_releases_gil_before_connection_lock():
     pytest.importorskip("fsspec", minversion="2022.11.0")
     script = textwrap.dedent(
@@ -2688,29 +2979,23 @@ def test_execute_native_rejects_invalid_fte_scan_source_queue_map():
 
 
 def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_path, monkeypatch):
-    pytest.importorskip("pyarrow")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     monkeypatch.setenv("VANE_NATIVE_PROGRESS_INTERVAL_MS", "10")
 
     con = vane.connect()
     src = tmp_path / "dynamic_scan_input.parquet"
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(6) tbl(i)
-        ) TO '{src}' (FORMAT PARQUET)
-        """
-    )
+    pq.write_table(pa.table({"i": list(range(6))}), src)
     relation = con.sql(f"SELECT sum(i) AS total FROM read_parquet('{src}')")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = plan.scan_task_descriptor_map()
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 1
-    assert isinstance(descriptors[0], bytes)
+    scan_split_batches = plan.scan_split_batch_map()
+    assert len(scan_split_batches) == 1
+    node_id, batches = next(iter(scan_split_batches.items()))
+    assert len(batches) == 1
+    assert isinstance(batches[0], bytes)
 
     split_queue = vane.ray_cxx.FteSplitQueue()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
@@ -2753,7 +3038,7 @@ def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_
             for item in progress
         )
 
-        split_queue.add_scan_split(bytes(descriptors[0]))
+        split_queue.add_scan_split(bytes(batches[0]))
         split_queue.no_more_splits()
         thread.join(timeout=5)
         assert not thread.is_alive()
@@ -2827,61 +3112,52 @@ def test_execute_native_streaming_udf_emits_determinate_live_progress(tmp_path, 
 
 
 def _make_two_file_dynamic_scan_plan(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     con = vane.connect()
     src_a = tmp_path / "clone_queue_a.parquet"
     src_b = tmp_path / "clone_queue_b.parquet"
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(0, 3) tbl(i)
-        ) TO '{src_a}' (FORMAT PARQUET)
-        """
-    )
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(10, 13) tbl(i)
-        ) TO '{src_b}' (FORMAT PARQUET)
-        """
-    )
+    pq.write_table(pa.table({"i": list(range(3))}), src_a)
+    pq.write_table(pa.table({"i": list(range(10, 13))}), src_b)
     relation = con.sql(f"SELECT sum(i)::BIGINT AS total FROM read_parquet(['{src_a}', '{src_b}'])")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = plan.scan_task_descriptor_map()
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 2
-    return con, plan, str(node_id), descriptors
+    scan_split_batches = plan.scan_split_batch_map()
+    assert len(scan_split_batches) == 1
+    node_id, batches = next(iter(scan_split_batches.items()))
+    assert len(batches) == 2
+    return con, plan, str(node_id), batches
 
 
-def test_scan_task_descriptors_have_stable_distinct_logical_partitions_for_duplicate_files(tmp_path):
-    pytest.importorskip("pyarrow")
+def test_scan_splits_have_stable_distinct_ids_for_duplicate_files(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
 
     con = vane.connect()
     source = tmp_path / "duplicate_scan_source.parquet"
-    con.execute(f"COPY (SELECT * FROM range(3)) TO '{source}' (FORMAT PARQUET)")
+    pq.write_table(pa.table({"range": list(range(3))}), source)
     relation = con.sql(f"SELECT * FROM read_parquet(['{source}', '{source}'])")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    descriptor_map = plan.scan_task_descriptor_map()
-    assert len(descriptor_map) == 1
-    descriptors = next(iter(descriptor_map.values()))
-    assert len(descriptors) == 2
+    batch_map = plan.scan_split_batch_map()
+    assert len(batch_map) == 1
+    batches = next(iter(batch_map.values()))
+    assert len(batches) == 2
 
-    assert [vane.ray_cxx.scan_task_source_partition_id(bytes(item)) for item in descriptors] == [0, 1]
-    assert bytes(descriptors[0]) != bytes(descriptors[1])
+    exploded = vane.ray_cxx.split_scan_split_batch(vane.ray_cxx.merge_scan_split_batches(batches))
+    assert [item[0] for item in exploded] == ["file-0", "file-1"]
+    assert [item[1] for item in exploded] == [bytes(item) for item in batches]
+    assert bytes(batches[0]) != bytes(batches[1])
 
 
 def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_path):
     pytest.importorskip("pyarrow")
 
-    con, plan, node_id, descriptors = _make_two_file_dynamic_scan_plan(tmp_path)
+    con, plan, node_id, batches = _make_two_file_dynamic_scan_plan(tmp_path)
     worker_con_a = vane.connect()
     worker_con_b = vane.connect()
     plan_a = plan.clone(worker_con_a)
@@ -2914,14 +3190,14 @@ def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_pa
         assert thread_b.is_alive()
         assert results.empty()
 
-        queue_b.add_scan_split(bytes(descriptors[1]))
+        queue_b.add_scan_split(bytes(batches[1]))
         queue_b.no_more_splits()
         thread_b.join(timeout=5)
         assert not thread_b.is_alive()
         assert thread_a.is_alive()
         assert results.get_nowait() == ("b", "ok", [33])
 
-        queue_a.add_scan_split(bytes(descriptors[0]))
+        queue_a.add_scan_split(bytes(batches[0]))
         queue_a.no_more_splits()
         thread_a.join(timeout=5)
         assert not thread_a.is_alive()
@@ -2944,7 +3220,7 @@ def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_pa
 def test_distributed_physical_plan_clone_scan_queue_cancel_does_not_cancel_sibling(tmp_path):
     pytest.importorskip("pyarrow")
 
-    con, plan, node_id, descriptors = _make_two_file_dynamic_scan_plan(tmp_path)
+    con, plan, node_id, batches = _make_two_file_dynamic_scan_plan(tmp_path)
     worker_con_cancel = vane.connect()
     worker_con_ok = vane.connect()
     plan_cancel = plan.clone(worker_con_cancel)
@@ -2982,7 +3258,7 @@ def test_distributed_physical_plan_clone_scan_queue_cancel_does_not_cancel_sibli
         assert results.empty()
 
         queue_cancel.cancel()
-        queue_ok.add_scan_split(bytes(descriptors[1]))
+        queue_ok.add_scan_split(bytes(batches[1]))
         queue_ok.no_more_splits()
 
         thread_cancel.join(timeout=5)
@@ -3072,9 +3348,24 @@ def test_ray_worker_manager_integration(monkeypatch):
     assert stats["totals"]["existing_total"] == 2
     assert stats["totals"]["lookup_hits"] == 3
 
+    mgr.register_query_owner("query-lifecycle", "query-lifecycle")
     mgr.drop_query_fragments("query-lifecycle")
     assert dummy_worker_handle.fte_prepare_drop_query_calls == ["query-lifecycle"]
     assert dummy_worker_handle.fte_cleanup_query_calls == ["query-lifecycle"]
+
+
+def test_ray_worker_manager_wait_requires_explicit_resource_owner():
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        with pytest.raises(Exception, match="FTE query is closing"):
+            manager.wait_fte_query("unregistered-query", 0.0)
+
+        manager.register_query_owner("nested-query", "resource-query")
+        with pytest.raises(Exception, match="No Ray workers available"):
+            manager.wait_fte_query("nested-query", 0.0)
+        manager.drop_query_fragments("nested-query")
+    finally:
+        manager.shutdown()
 
 
 def test_ray_worker_manager_instances_use_distinct_worker_scopes(monkeypatch):
@@ -3266,7 +3557,7 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             manager_instance_id=failed_handle.manager_instance_id,
             error=RuntimeError("planned worker failure during query close"),
         )
-        assert worker_failures.mark_fte_worker_failed_for_event(closing_event) == []
+        assert failed_handle._handles_for_worker_failed_event(closing_event) == []
         assert actors[0].killed
         assert ray_worker_handle._FTE_WORKER_HANDLES.get(failed_worker_id) is None
 
@@ -3284,7 +3575,7 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             manager_instance_id=failed_handle.manager_instance_id,
             error=closing_event.error,
         )
-        assert worker_failures.mark_fte_worker_failed_for_event(delayed_event) == []
+        assert failed_handle._handles_for_worker_failed_event(delayed_event) == []
         assert ray_worker_handle._FTE_WORKER_HANDLES[failed_worker_id] is replacement
         assert replacement._fte_healthy is True
         assert actors[1].killed is False
@@ -3889,6 +4180,95 @@ def test_ray_worker_manager_snapshot_refresh_shutdown_has_no_deadlock(monkeypatc
     assert aborted == ["worker-racing-shutdown"]
 
 
+def test_ray_worker_manager_overlapping_drop_joins_failure_and_retry_generation(monkeypatch):
+    query_id = "query-overlapping-drop-failure"
+    thread_count = 6
+    caller_barrier = threading.Barrier(thread_count)
+    drop_condition = threading.Condition()
+    prepare_calls = []
+    cleanup_calls = []
+
+    class DummyRayWorkerHandle:
+        def fte_prepare_drop_query(self, actual_query_id):
+            with drop_condition:
+                prepare_calls.append(str(actual_query_id))
+                call_number = len(prepare_calls)
+                drop_condition.notify_all()
+                if call_number == 1:
+                    # A correct single-flight implementation admits only this
+                    # leader. Keep it open long enough for the other callers to
+                    # join; the predicate only completes early for the broken
+                    # implementation that calls every worker abort.
+                    drop_condition.wait_for(lambda: len(prepare_calls) == thread_count, timeout=0.5)
+            if call_number == 1:
+                raise RuntimeError("planned shared Ray teardown failure")
+            return {
+                "tasks_removed": 0,
+                "tasks_canceled": 0,
+                "fragments_removed": 0,
+            }
+
+        def fte_cleanup_query(self, actual_query_id):
+            cleanup_calls.append(str(actual_query_id))
+            return {}
+
+        def prepare_shutdown(self):
+            pass
+
+        def finish_shutdown(self):
+            pass
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not abort the worker")
+
+    def start_ray_workers(_existing_ids, _manager_instance_id):
+        return [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-overlapping-drop",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ]
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = vane.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 1
+    manager.register_query_owner(query_id, query_id)
+    errors: list[BaseException] = []
+
+    def drop() -> None:
+        try:
+            caller_barrier.wait(timeout=5.0)
+            manager.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=drop) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert len(errors) == thread_count
+    assert len({str(error) for error in errors}) == 1
+    assert "planned shared Ray teardown failure" in str(errors[0])
+    assert prepare_calls == [query_id]
+    assert cleanup_calls == []
+
+    manager.drop_query_fragments(query_id)
+    manager.register_query_owner(query_id, query_id)
+    manager.drop_query_fragments(query_id)
+    assert prepare_calls == [query_id, query_id, query_id]
+    assert cleanup_calls == [query_id, query_id]
+    manager.shutdown()
+
+
 def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypatch):
     calls = []
 
@@ -3938,6 +4318,7 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 2
+    manager.register_query_owner("query-best-effort-drop", "query-best-effort-drop")
 
     with pytest.raises(Exception, match="is dead"):
         manager.drop_query_fragments("query-best-effort-drop")
@@ -3948,7 +4329,8 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
     ]
 
 
-def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(monkeypatch):
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(monkeypatch, long_traceback):
     from types import SimpleNamespace
 
     query_id = "query-result-release-failure"
@@ -3970,7 +4352,7 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
         )
 
         def release_result_payload(self):
-            raise RuntimeError("result payload release failed")
+            raise_diagnostic_error(RuntimeError("result payload release failed"), long_traceback=long_traceback)
 
     class DummyRayWorkerHandle:
         def __init__(self, worker_id, result_handles):
@@ -3978,7 +4360,11 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
             self.result_handles = list(result_handles)
 
         def fte_query_status(self, _query_id):
-            return {"failed": False, "finished": False}
+            return {
+                "failed": False,
+                "finished": False,
+                "selected_attempt_task_ids": [],
+            }
 
         def pop_fte_result_handles(self, _query_id):
             handles = self.result_handles
@@ -4024,6 +4410,7 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 2
+    manager.register_query_owner(query_id, query_id)
 
     with pytest.raises(Exception, match="timed out waiting for FTE query"):
         manager.wait_fte_query(query_id, 1e-9)
@@ -4208,6 +4595,7 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 1
+    manager.register_query_owner("query-entered-before-shutdown", "query-entered-before-shutdown")
 
     wait_outcomes: list[str] = []
 
@@ -4236,7 +4624,9 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     closer.join(timeout=5)
     assert waiter.is_alive() is False
     assert closer.is_alive() is False
-    assert wait_outcomes == ["ok"]
+    assert len(wait_outcomes) == 1
+    assert wait_outcomes[0].startswith("error:")
+    assert "query is closing" in wait_outcomes[0]
     assert shutdown_finished.is_set()
 
 
@@ -4292,6 +4682,7 @@ def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeyp
                 "matched": False,
                 "canceled": False,
                 "registration_pending": False,
+                "selected_attempt_task_ids": [],
             }
         return {
             "failed": False,
@@ -4299,9 +4690,11 @@ def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeyp
             "matched": True,
             "canceled": False,
             "registration_pending": False,
+            "selected_attempt_task_ids": [],
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+    manager.register_query_owner("query-unmatched-scope", "query-unmatched-scope")
 
     try:
         with pytest.raises(Exception, match="scope did not match any registered fragment"):
@@ -4320,8 +4713,10 @@ def test_ray_worker_manager_scoped_wait_allows_pending_registration(monkeypatch)
             "matched": status_calls > 1,
             "canceled": False,
             "registration_pending": status_calls == 1,
+            "selected_attempt_task_ids": [],
         },
     )
+    manager.register_query_owner("query-pending-scope", "query-pending-scope")
 
     try:
         manager._wait_fte_query_scoped_for_test("query-pending-scope")
@@ -4340,12 +4735,40 @@ def test_ray_worker_manager_scoped_wait_stops_when_query_is_canceled(monkeypatch
             "canceled": True,
             "registration_pending": False,
             "message": "query registry is closing",
+            "selected_attempt_task_ids": [],
         },
     )
+    manager.register_query_owner("query-canceled-scope", "query-canceled-scope")
 
     try:
         with pytest.raises(Exception, match="FTE query canceled.*query registry is closing"):
             manager._wait_fte_query_scoped_for_test("query-canceled-scope")
+        assert worker_handle.status_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_ray_worker_manager_status_does_not_stringify_unrelated_fields(monkeypatch):
+    class ExplosiveRepr:
+        def __repr__(self):
+            raise AssertionError("unrelated status fields must not be stringified")
+
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(
+        monkeypatch,
+        lambda _status_calls: {
+            "failed": False,
+            "finished": True,
+            "matched": True,
+            "canceled": False,
+            "registration_pending": False,
+            "unrelated": ExplosiveRepr(),
+            "selected_attempt_task_ids": [],
+        },
+    )
+    manager.register_query_owner("query-bounded-status", "query-bounded-status")
+
+    try:
+        manager._wait_fte_query_scoped_for_test("query-bounded-status")
         assert worker_handle.status_calls == 1
     finally:
         manager.shutdown()
@@ -4362,9 +4785,11 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
             "matched": status_calls >= 50,
             "canceled": False,
             "registration_pending": status_calls < 50,
+            "selected_attempt_task_ids": [],
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+    manager.register_query_owner("query-shutdown-scope", "query-shutdown-scope")
 
     wait_outcomes: list[str] = []
 
@@ -4395,7 +4820,7 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
     assert shutdown_finished.is_set()
     assert len(wait_outcomes) == 1
     assert wait_outcomes[0].startswith("error:")
-    assert "shutting down" in wait_outcomes[0]
+    assert "query is closing" in wait_outcomes[0]
     assert worker_handle.status_calls < 50
 
 

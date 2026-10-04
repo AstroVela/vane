@@ -16,6 +16,7 @@ import pytest
 
 import vane
 import vane.runners.fte.backends.native.backend as native_backend_mod
+from tests.result_stream_helpers import collect_result_stream
 from vane.runners.fte import FteTaskAttemptId, FteTaskId, FteTaskState, TaskResultState
 from vane.runners.fte.backends.native import (
     NativeFteWorkerManagerBackend,
@@ -41,6 +42,18 @@ def _task_id(partition_id: int, *, query_id: str = "q") -> dict[str, int | str]:
     }
 
 
+def _scan_split_batch(split_id: str, data: Any) -> dict[str, Any]:
+    return {
+        "splits": [
+            {
+                "split_id": split_id,
+                "estimated_bytes": len(data) if isinstance(data, bytes) else None,
+                "data": data,
+            }
+        ]
+    }
+
+
 class _FakeNativeWorkerTask:
     def __init__(
         self,
@@ -50,14 +63,14 @@ class _FakeNativeWorkerTask:
         task_context: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         plan: Any = None,
-        exchange_sink_instance: Any = None,
+        exchange_sink_config: Any = None,
     ) -> None:
         self._name = name
         self._context = dict(context or {})
         self._task_context = dict(task_context or {})
         self._inputs = dict(inputs or {})
         self._plan = {"plan": "native"} if plan is None else plan
-        self._exchange_sink_instance = exchange_sink_instance
+        self._exchange_sink_config = exchange_sink_config
 
     def name(self):
         return self._name
@@ -74,14 +87,17 @@ class _FakeNativeWorkerTask:
     def plan(self):
         return self._plan
 
-    def exchange_sink_instance(self):
-        return self._exchange_sink_instance
+    def exchange_sink_config(self):
+        return self._exchange_sink_config
 
 
 class _QueryLifecycleBackend:
     def register_query_owner(self, query_id, owner_query_id):
         assert str(query_id)
         assert str(owner_query_id)
+
+    def task_production_finished(self, query_id):
+        assert str(query_id)
 
 
 def test_native_background_event_loop_concurrent_first_submit_starts_once(monkeypatch):
@@ -351,7 +367,7 @@ def test_native_worker_handle_shutdown_forwards_timeout(monkeypatch):
     assert shutdown_timeouts == [12.5]
 
 
-def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
+def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, aggregate: bool = False):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     if local_staging:
         monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
@@ -363,29 +379,25 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    projection = "sum(x) AS x" if aggregate else "*"
+    con.sql(f"select {projection} from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
 
-    query_id = str(uuid.uuid4())
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        captured[0],
-        query_id,
-    ).to_physical_plan(con)
-    assert plan.scan_task_descriptor_map()
+    query_id = captured[0].idx()
+    plan = captured[0].to_physical_plan(con)
+    assert plan.scan_split_batch_map()
     return con, dst, query_id, plan
 
 
@@ -401,17 +413,15 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_isolation_output.parquet"
@@ -843,8 +853,9 @@ def test_native_worker_terminal_task_stats_merge_completed_split_queue_stats():
                     "scan": [
                         {
                             "sequence_id": 1,
-                            "kind": "scan_task",
-                            "data": b"not-a-real-scan-descriptor",
+                            "kind": "scan_split",
+                            "split_id": "scan-1",
+                            "data": b"not-a-real-scan-split-batch",
                         }
                     ]
                 },
@@ -1353,7 +1364,7 @@ def test_native_worker_manager_task_input_stream_exhausted_seals_fte_runtime_sou
                     "worker_runtime": "fte",
                     "source_node_ids": ["7"],
                     "initial_splits": {
-                        "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                        "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     },
                 }
             ]
@@ -1378,7 +1389,10 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
         context={"query_id": "query-dynamic", "node_id": "3"},
         task_context={"task_id": 9, "last_node_id": "3"},
         inputs={
-            "1": {"kind": "scan_task", "data": b"scan-descriptor"},
+            "1": {
+                "kind": "scan_split_batch",
+                "data": _scan_split_batch("scan-0", b"scan-split-payload"),
+            },
             "3": {
                 "kind": "exchange_source_task",
                 "data": {
@@ -1398,16 +1412,17 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
     assert request["source_node_ids"] == ["1", "3"]
     assert request["dynamic_scan_source_node_ids"] == ["1"]
     assert request["dynamic_exchange_source_node_ids"] == ["3"]
-    assert "scan_task:1" not in request["context"]
+    assert "scan_split_batch:1" not in request["context"]
     assert "exchange_source_task:3" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert "exchange_source_task_nodes" not in request["context"]
 
     scan_splits = request["initial_splits"]["1"]
     assert len(scan_splits) == 1
-    assert scan_splits[0]["kind"] == "scan_task"
+    assert scan_splits[0]["kind"] == "scan_split"
     assert scan_splits[0]["sequence_id"] == 0
-    assert scan_splits[0]["data"] == b"scan-descriptor"
+    assert scan_splits[0]["split_id"] == "scan-0"
+    assert scan_splits[0]["data"] == _scan_split_batch("scan-0", b"scan-split-payload")
 
     exchange_splits = request["initial_splits"]["3"]
     assert [split["sequence_id"] for split in exchange_splits] == [0, 1]
@@ -1451,7 +1466,6 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
                 "node_id": "3",
                 "fragment_execution_id": 4,
                 "attempt_id": attempt_id,
-                "preserve_plan_exchange_sink_instance": "1",
             },
             task_context={
                 "query_idx": 0,
@@ -1465,16 +1479,10 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
                     "data": exchange_source,
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {
-                    "query_id": "query-sink-identity",
-                    "exchange_id": "materialized",
-                    "task_partition_id": 0,
-                    "partition_id": 0,
-                },
-                "attempt_id": 0,
-                "output_location": "materialized__sink_0__attempt_0",
-                "fte_task_identity": True,
+            exchange_sink_config={
+                "query_id": "query-sink-identity",
+                "output_partition_count": 1,
+                "output_location_prefix": "materialized",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1498,19 +1506,18 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
         physical_suffix="second",
     )
 
-    stable_identity = first_order["exchange_sink_instance"]["task_partition_id"]
-    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == stable_identity
-    assert different_source["exchange_sink_instance"]["task_partition_id"] != stable_identity
+    stable_identity = first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
+    assert different_source["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != stable_identity
     assert stable_identity != (4 << 32) | 7
     assert reversed_order["exchange_sink_instance"]["attempt_id"] == 2
     assert reversed_order["exchange_sink_instance"]["output_location"] == (
         f"materialized__sink_{stable_identity}__attempt_2"
     )
     assert first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
-    assert "preserve_plan_exchange_sink_instance" not in first_order["exchange_sink_instance"]
 
 
-def test_native_worker_task_request_derives_stable_plan_sink_identity_from_inputs():
+def test_native_worker_task_request_derives_stable_task_sink_identity_from_inputs():
     def make_request(event_task_id: int, source_task_partition_id: int) -> dict[str, Any]:
         task = _FakeNativeWorkerTask(
             context={"query_id": "query-plan-derived", "node_id": "4"},
@@ -1531,10 +1538,10 @@ def test_native_worker_task_request_derives_stable_plan_sink_identity_from_input
                     },
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "query_id": "query-plan-derived",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1543,45 +1550,47 @@ def test_native_worker_task_request_derives_stable_plan_sink_identity_from_input
     reversed_order = make_request(99, 41)
     different_source = make_request(7, 42)
 
-    first_identity = first_order["exchange_sink_instance"]["task_partition_id"]
-    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == first_identity
-    assert different_source["exchange_sink_instance"]["task_partition_id"] != first_identity
+    first_identity = first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == first_identity
+    assert different_source["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != first_identity
     assert first_order["exchange_sink_instance"]["output_location"] == (f"shuffle__sink_{first_identity}__attempt_0")
 
 
-def test_native_worker_task_request_distinguishes_identical_scan_occurrences():
-    def make_request(source_task_partition_id: int) -> dict[str, Any]:
+def test_native_worker_task_request_distinguishes_scan_splits_by_stable_id():
+    def make_request(split_id: str, event_task_id: int) -> dict[str, Any]:
         task = _FakeNativeWorkerTask(
             context={"query_id": "query-duplicate-scan", "node_id": "4"},
             task_context={
                 "query_idx": 0,
                 "last_node_id": 4,
-                "task_id": 99 - source_task_partition_id,
+                "task_id": event_task_id,
                 "node_ids": [3, 4],
             },
             inputs={
                 "3": {
-                    "kind": "scan_task",
-                    "data": {
-                        "source_task_partition_id": source_task_partition_id,
-                        "files": ["same.parquet"],
-                    },
+                    "kind": "scan_split_batch",
+                    "data": _scan_split_batch(split_id, b"same-file-payload"),
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "query_id": "query-duplicate-scan",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
 
-    first = make_request(0)
-    repeated_occurrence = make_request(1)
+    first = make_request("file-0", 99)
+    same_logical_split = make_request("file-0", 12)
+    repeated_occurrence = make_request("file-1", 98)
 
     assert (
-        first["exchange_sink_instance"]["task_partition_id"]
-        != repeated_occurrence["exchange_sink_instance"]["task_partition_id"]
+        first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        == same_logical_split["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    )
+    assert (
+        first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != repeated_occurrence["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
 
 
@@ -1599,10 +1608,10 @@ def test_native_worker_task_request_uses_explicit_static_source_partition_identi
                 "task_id": event_task_id,
                 "node_ids": [3, 4],
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "query_id": "query-static-source",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1611,49 +1620,43 @@ def test_native_worker_task_request_uses_explicit_static_source_partition_identi
     reversed_order = make_request(99)
 
     assert (
-        reversed_order["exchange_sink_instance"]["task_partition_id"]
-        == (first_order["exchange_sink_instance"]["task_partition_id"])
+        reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        == (first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"])
     )
 
 
-def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
-    task = _FakeNativeWorkerTask(
-        context={
-            "query_id": "query-plan-sink-identity",
-            "node_id": "3",
-            "fragment_execution_id": 4,
-            "attempt_id": 2,
-            "preserve_plan_exchange_sink_instance": "1",
-        },
-        task_context={
-            "query_idx": 0,
-            "last_node_id": 3,
-            "task_id": 7,
-            "node_ids": [3],
-        },
-        exchange_sink_instance={
-            "sink_handle": {
-                "query_id": "query-plan-sink-identity",
-                "exchange_id": "range",
-                "task_partition_id": 5,
-                "partition_id": 5,
+def test_native_worker_task_request_uses_scheduler_identity_for_source_free_sink():
+    def make_request(task_id: int, attempt_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={
+                "query_id": "query-source-free-sink",
+                "node_id": "3",
+                "fragment_execution_id": 4,
+                "attempt_id": attempt_id,
             },
-            "task_partition_id": 5,
-            "partition_id": 5,
-            "attempt_id": 0,
-            "output_location": "range__sink_5__attempt_0",
-        },
-    )
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 3,
+                "task_id": task_id,
+                "node_ids": [3],
+            },
+            exchange_sink_config={
+                "query_id": "query-source-free-sink",
+                "output_partition_count": 1,
+                "output_location_prefix": "range",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
 
-    request = NativeFteWorkerManagerBackend._request_from_task(task)
+    first = make_request(7, 0)
+    retry = make_request(7, 2)
+    other_task = make_request(8, 0)
 
-    assert request["exchange_sink_instance"]["attempt_id"] == 2
-    assert request["exchange_sink_instance"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["partition_id"] == 5
-    assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["sink_handle"]["partition_id"] == 5
-    assert request["exchange_sink_instance"]["output_location"] == "range__sink_5__attempt_2"
-    assert request["exchange_sink_instance"]["preserve_plan_exchange_sink_instance"] is True
+    stable_identity = first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert retry["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
+    assert other_task["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != stable_identity
+    assert retry["exchange_sink_instance"]["attempt_id"] == 2
+    assert retry["exchange_sink_instance"]["output_location"] == f"range__sink_{stable_identity}__attempt_2"
 
 
 def test_native_worker_manager_rejects_stable_task_identity_collisions():
@@ -1662,12 +1665,12 @@ def test_native_worker_manager_rejects_stable_task_identity_collisions():
     requests = [
         {
             "task_id": _task_id(1, query_id="query-collision"),
-            "exchange_sink_instance": {"task_partition_id": 123},
+            "exchange_sink_instance": {"sink_handle": {"task_partition_id": 123}},
             identity_key_field: "logical-task-a",
         },
         {
             "task_id": _task_id(2, query_id="query-collision"),
-            "exchange_sink_instance": {"task_partition_id": 123},
+            "exchange_sink_instance": {"sink_handle": {"task_partition_id": 123}},
             identity_key_field: "logical-task-b",
         },
     ]
@@ -1698,7 +1701,7 @@ def test_native_fte_runtime_starts_dynamic_source_and_removes_initial_splits_bef
                     "source_node_ids": ["7"],
                     "dynamic_scan_source_node_ids": ["7"],
                     "initial_splits": {
-                        "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"scan"}],
+                        "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"scan"}],
                     },
                 }
             ]
@@ -1833,6 +1836,30 @@ def test_cxx_python_task_result_handle_polls_native_handle_without_ray_driver():
     finally:
         worker.fte_drop_query("q")
         worker.shutdown()
+
+
+def test_cxx_python_task_result_handle_requires_ack_contract():
+    class MissingAckHandle:
+        worker_id = "worker-missing-ack"
+        task_id = FteTaskAttemptId.coerce(_task_id(9))
+        task_context_info = {
+            "query_idx": 2,
+            "last_node_id": 4,
+            "task_id": 9,
+            "node_ids": [4],
+        }
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.success([], [], None, 55)
+
+        def release_result_payload(self):
+            return None
+
+    with pytest.raises(Exception, match="ack"):
+        vane.ray_cxx.python_task_result_handle_for_test(MissingAckHandle())
 
 
 def test_cxx_distributed_runner_accepts_python_backend_without_ray_worker_startup():
@@ -2373,7 +2400,8 @@ def test_native_popped_handle_completion_updates_progress_registry_snapshot():
         backend.shutdown()
 
 
-def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
+@pytest.mark.parametrize("empty", [False, True])
+def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend(empty):
     class NoOutputHandle:
         def __init__(self, task, partition_id: int):
             context = task.context()
@@ -2402,6 +2430,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             self.exhausted_calls = []
             self.status_calls = []
             self.handles = []
+            self.production_finished = []
 
         def worker_snapshots(self):
             return [
@@ -2426,7 +2455,13 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             self.exhausted_calls.append((query_id, list(source_node_ids)))
             return []
 
+        def task_production_finished(self, query_id):
+            self.production_finished.append(query_id)
+            assert not self.status_calls
+            assert bool(self.submitted_task_names) is not empty
+
         def fte_query_status(self, query_id):
+            assert self.production_finished == [query_id]
             self.status_calls.append(query_id)
             return {
                 "finished": True,
@@ -2442,7 +2477,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             pass
 
     con = vane.connect()
-    relation = con.sql("SELECT 1 AS i")
+    relation = con.sql("SELECT 1 AS i" + (" WHERE false" if empty else ""))
     query_id = f"native-backend-bridge-{uuid.uuid4()}"
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -2451,15 +2486,453 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
     backend = Backend()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
-    parts = list(iter(runner.run_plan(plan, con)))
+    parts = collect_result_stream(runner.run_plan(plan, con))
 
     assert parts == []
-    assert backend.submitted_task_names
-    assert backend.status_calls
+    assert backend.production_finished == [query_id]
+    assert bool(backend.submitted_task_names) is not empty
+    assert bool(backend.status_calls) is not empty
     assert all(call[0] == query_id for call in backend.exhausted_calls)
-    assert backend.status_calls[-1] == query_id
+    if not empty:
+        assert backend.status_calls[-1] == query_id
     assert all(handle.acked for handle in backend.handles)
     assert all(handle.released for handle in backend.handles)
+
+
+def test_cxx_python_backend_uses_later_nonempty_failed_partition_detail():
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-failed-detail",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": True,
+                "finished": False,
+                "message": "  ",
+                "scheduler_failure": "\t",
+                "selected_attempt_task_ids": [],
+                "failed_partitions": [
+                    {"latest_failure": None},
+                    {
+                        "latest_failure": {
+                            "message": "\n",
+                            "failure_reason": "provider TimeoutError: request timed out",
+                        }
+                    },
+                ],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-failed-detail-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="provider TimeoutError: request timed out"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "middle",
+    ["x" * 16_384, "界" * 2_048],
+    ids=["character-limit", "utf8-byte-limit"],
+)
+def test_cxx_python_backend_bounds_failed_partition_detail_without_losing_edges(middle):
+    prefix = "provider TimeoutError: request timed out"
+    suffix = "terminal provider cause"
+
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-bounded-failed-detail",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": True,
+                "finished": False,
+                "selected_attempt_task_ids": [],
+                "failed_partitions": [
+                    {"latest_failure": f"{prefix}:{middle}:{suffix}"},
+                ],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-bounded-failed-detail-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            collect_result_stream(runner.run_plan(plan, con))
+        detail = str(exc_info.value)
+        assert prefix in detail
+        assert suffix in detail
+        assert len(detail.encode("utf-8")) < 8 * 1024
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_rejects_empty_selected_attempt_task_id():
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-empty-selected-id",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [""],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-empty-selected-id-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="entries must be non-empty"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize("selected_attempt_task_ids", [["selected.0", "selected.0"], ["selected.0"]])
+def test_cxx_python_backend_rejects_invalid_selected_attempt_handle_coverage(selected_attempt_task_ids):
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-invalid-selected-coverage",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": selected_attempt_task_ids,
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-invalid-selected-coverage-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    expected = "entries must be unique" if len(selected_attempt_task_ids) == 2 else "result-handle validation"
+    try:
+        with pytest.raises(RuntimeError, match=expected):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_rejects_duplicate_handles_for_selected_attempt():
+    class DuplicateHandle:
+        def __init__(self, task):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, 0), 0)
+            self.worker_id = "native-worker-duplicate-selected-handle"
+
+        def done(self):
+            raise AssertionError("duplicate selected handles must be rejected before polling")
+
+        def get_result_sync(self):
+            raise AssertionError("duplicate selected handles must not be materialized")
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            pass
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-duplicate-selected-handle",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = []
+            for task in tasks:
+                handle = DuplicateHandle(task)
+                handles.extend((handle, DuplicateHandle(task)))
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(self.handles[0].task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-duplicate-selected-handle-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="multiple result handles for one selected attempt"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_releases_batch_when_later_result_handle_is_malformed():
+    class Handle:
+        def __init__(self, task, *, malformed=False):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            if not malformed:
+                self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, 0), 0)
+            self.worker_id = "native-worker-partial-handle-batch"
+            self.release_calls = 0
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-partial-handle-batch",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handles:
+                return []
+            self.handles = [Handle(tasks[0]), Handle(tasks[0], malformed=True)]
+            return self.handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-partial-handle-batch-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        with pytest.raises(RuntimeError, match="FTE result handle must provide task_id"):
+            collect_result_stream(runner.run_plan(plan, con))
+        assert [handle.release_calls for handle in backend.handles] == [1, 1]
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_drains_but_does_not_publish_handles_when_selection_is_empty():
+    class UnselectedHandle:
+        def __init__(self, task, partition_id):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, partition_id), 0)
+            self.worker_id = "native-worker-unselected-empty"
+            self.get_result_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_calls += 1
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-unselected-empty",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            new_handles = [UnselectedHandle(task, len(self.handles) + index) for index, task in enumerate(tasks)]
+            self.handles.extend(new_handles)
+            return new_handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-unselected-empty-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        assert collect_result_stream(runner.run_plan(plan, con)) == []
+        assert backend.handles
+        assert all(handle.get_result_calls == 1 for handle in backend.handles)
+        assert all(handle.ack_calls == 0 for handle in backend.handles)
+        assert all(handle.release_calls == 1 for handle in backend.handles)
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
 
 
 def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
@@ -2548,14 +3021,16 @@ def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
     drop_thread.start()
     try:
         with pytest.raises(RuntimeError, match="query is closing"):
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
     finally:
         allow_submit_return.set()
         drop_thread.join(timeout=5.0)
 
     assert not drop_thread.is_alive()
     assert drop_errors == []
-    assert backend.drop_calls == [query_id]
+    # The first sweep unblocks the in-flight submit; the second catches work
+    # that crossed the fence before that submit returned.
+    assert backend.drop_calls == [query_id, query_id]
     assert backend.handle is not None
     assert backend.handle.release_calls == 1
     con.close()
@@ -2680,7 +3155,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
     backend = Backend()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
-    parts = list(iter(runner.run_plan(plan, con)))
+    parts = collect_result_stream(runner.run_plan(plan, con))
 
     assert parts
     assert all(handle.acked for handle in backend.handles)
@@ -2704,7 +3179,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
 
 
 @pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
-def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
+def test_cxx_backend_cleanup_cancels_active_output_delivery(cleanup_mode):
     pa = pytest.importorskip("pyarrow")
     status_started = threading.Event()
     allow_status = threading.Event()
@@ -2795,7 +3270,7 @@ def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
 
     def consume() -> None:
         try:
-            consumed.extend(stream)
+            consumed.extend(collect_result_stream(stream))
         except BaseException as exc:
             consume_errors.append(exc)
 
@@ -2810,17 +3285,19 @@ def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
 
     consumer.join(timeout=5.0)
     assert not consumer.is_alive()
-    assert consume_errors == []
-    assert consumed
+    assert len(consume_errors) == 1 and isinstance(consume_errors[0], RuntimeError)
+    assert "query is closing" in str(consume_errors[0])
+    assert consumed == []
     assert backend.cleanup_release_observations[0]
     assert all(release_calls == 0 for release_calls in backend.cleanup_release_observations[0])
-    assert all(handle.acked for handle in backend.handles)
+    assert all(not handle.acked for handle in backend.handles)
     assert all(handle.release_calls == 1 for handle in backend.handles)
 
     if cleanup_mode == "drop":
         runner.shutdown()
     else:
         runner.drop_query_fragments(query_id)
+    con.close()
 
 
 def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
@@ -2852,7 +3329,7 @@ def test_cxx_backend_requires_drop_query_contract():
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
     runner._register_query_owner_for_test(query_id, query_id)
 
-    with pytest.raises(AttributeError, match="drop_query"):
+    with pytest.raises(RuntimeError, match="drop_query"):
         runner.drop_query_fragments(query_id)
 
     runner.shutdown()
@@ -2862,11 +3339,15 @@ def test_cxx_backend_registration_failure_rolls_back_new_replay_state():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.drop_calls = []
+            self.registration_side_effect = False
 
         def register_query_owner(self, _query_id, _owner_query_id):
+            self.registration_side_effect = True
             raise RuntimeError("planned lifecycle registration failure")
 
         def drop_query(self, query_id):
+            assert self.registration_side_effect
+            self.registration_side_effect = False
             self.drop_calls.append(str(query_id))
 
     con = vane.connect()
@@ -2881,8 +3362,43 @@ def test_cxx_backend_registration_failure_rolls_back_new_replay_state():
     with pytest.raises(RuntimeError, match="planned lifecycle registration failure"):
         runner.run_plan(plan, con)
 
-    assert backend.drop_calls == []
+    assert backend.drop_calls == [query_id]
+    assert backend.registration_side_effect is False
     assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+
+
+def test_cxx_backend_registration_failure_fences_owner_until_drop():
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.registration_calls = []
+            self.drop_calls = []
+
+        def register_query_owner(self, query_id, owner_query_id):
+            self.registration_calls.append((str(query_id), str(owner_query_id)))
+            if len(self.registration_calls) == 1:
+                raise RuntimeError("planned lifecycle registration failure")
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    query_id = f"registration-fence-{uuid.uuid4()}"
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(RuntimeError, match="planned lifecycle registration failure"):
+        runner._register_query_owner_for_test(query_id, query_id)
+
+    with pytest.raises(RuntimeError, match="cannot register closing FTE query lifecycle"):
+        runner._register_query_owner_for_test(query_id, query_id)
+    assert backend.registration_calls == [(query_id, query_id)]
+
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id]
+
+    runner._register_query_owner_for_test(query_id, query_id)
+    assert backend.registration_calls == [(query_id, query_id), (query_id, query_id)]
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id, query_id]
 
 
 def test_cxx_backend_serializes_overlapping_drop_and_reuses_query_id():
@@ -2932,6 +3448,60 @@ def test_cxx_backend_serializes_overlapping_drop_and_reuses_query_id():
     assert backend.drop_calls == [query_id, query_id]
 
 
+def test_cxx_backend_overlapping_drop_joins_failure_and_retry_generation():
+    thread_count = 6
+    caller_barrier = threading.Barrier(thread_count)
+    drop_condition = threading.Condition()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def drop_query(self, query_id):
+            with drop_condition:
+                self.drop_calls.append(str(query_id))
+                call_number = len(self.drop_calls)
+                drop_condition.notify_all()
+                if call_number == 1:
+                    # A correct single-flight implementation admits only this
+                    # leader. Keep it open long enough for the other callers to
+                    # join; the predicate only completes early for the broken
+                    # implementation that calls every backend drop.
+                    drop_condition.wait_for(lambda: len(self.drop_calls) == thread_count, timeout=0.5)
+            if call_number == 1:
+                raise RuntimeError("planned shared teardown failure")
+
+    query_id = f"backend-overlapping-drop-failure-{uuid.uuid4()}"
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test(query_id, query_id)
+    errors: list[BaseException] = []
+
+    def drop() -> None:
+        try:
+            caller_barrier.wait(timeout=5.0)
+            runner.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=drop) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert len(errors) == thread_count
+    assert len({str(error) for error in errors}) == 1
+    assert "planned shared teardown failure" in str(errors[0])
+    assert backend.drop_calls == [query_id]
+
+    runner.drop_query_fragments(query_id)
+    runner._register_query_owner_for_test(query_id, query_id)
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id, query_id, query_id]
+
+
 def test_cxx_backend_routes_nested_execution_drop_to_registered_resource_owner():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):
@@ -2965,6 +3535,93 @@ def test_cxx_backend_routes_nested_execution_drop_to_registered_resource_owner()
         assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is None
     finally:
         vane.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+        con.close()
+
+
+@pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
+def test_cxx_ray_manager_cleans_nested_execution_resource_owner_state(cleanup_mode):
+    execution_query_id = f"ray-nested-execution-{uuid.uuid4()}"
+    resource_query_id = f"ray-resource-owner-{uuid.uuid4()}"
+    con = vane.connect()
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        f"source-plan-{uuid.uuid4()}",
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        assert vane.ray_cxx._register_query_python_replay_state(resource_query_id, plan) is True
+        assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is not None
+
+        runner._register_query_owner_for_test(execution_query_id, resource_query_id)
+        if cleanup_mode == "drop":
+            runner.drop_query_fragments(execution_query_id)
+        else:
+            runner.shutdown()
+
+        assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is None
+    finally:
+        vane.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+        con.close()
+
+
+def test_cxx_backend_registers_order_by_internal_queries_under_resource_owner(tmp_path, monkeypatch):
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    con = vane.connect()
+    for partition_id in range(4):
+        source = tmp_path / f"source-{partition_id}.parquet"
+        con.execute(
+            f"COPY (SELECT i + {partition_id * 1000} AS i FROM range(1000) t(i)) TO '{source}' (FORMAT PARQUET)"
+        )
+
+    resource_query_id = f"orderby-resource-owner-{uuid.uuid4()}"
+    relation = con.sql(f"SELECT i FROM read_parquet('{tmp_path}/source-*.parquet') ORDER BY i DESC")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        resource_query_id,
+    ).to_physical_plan(con)
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=_InProcessFragmentExecutor(),
+        max_running_tasks=4,
+        num_workers=2,
+        num_cpus=4,
+    )
+    registrations: list[tuple[str, str]] = []
+    drop_calls: list[str] = []
+    original_register_query_owner = backend.register_query_owner
+    original_drop_query = backend.drop_query
+
+    def register_query_owner(query_id, owner_query_id):
+        registrations.append((str(query_id), str(owner_query_id)))
+        return original_register_query_owner(query_id, owner_query_id)
+
+    def drop_query(query_id):
+        drop_calls.append(str(query_id))
+        return original_drop_query(query_id)
+
+    backend.register_query_owner = register_query_owner
+    backend.drop_query = drop_query
+    try:
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        partitions = collect_result_stream(runner.run_plan(plan, con))
+        runner.drop_query_fragments(resource_query_id)
+
+        assert partitions
+        assert registrations[0] == (resource_query_id, resource_query_id)
+        internal_query_ids = {query_id for query_id, _owner_query_id in registrations[1:]}
+        assert len(internal_query_ids) == 3
+        assert all(owner_query_id == resource_query_id for _query_id, owner_query_id in registrations)
+        assert {query_id.rsplit("_", 2)[-2] for query_id in internal_query_ids} == {
+            "range",
+            "sample",
+            "stage",
+        }
+        assert drop_calls[-1] == resource_query_id
+        assert set(drop_calls[:-1]) == internal_query_ids
+    finally:
+        backend.shutdown()
         con.close()
 
 
@@ -3223,7 +3880,7 @@ def test_cxx_backend_drop_failure_preserves_replay_state_for_active_submit_until
 
     def run() -> None:
         try:
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
         except BaseException as exc:
             run_errors.append(exc)
 
@@ -3279,8 +3936,8 @@ def test_cxx_backend_drop_failure_preserves_replay_state_for_active_submit_until
         con.close()
 
 
-def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
-    """A drop joining shutdown must not report success before shutdown quiesces work."""
+def test_cxx_backend_drop_rejects_running_shutdown_without_waiting():
+    """A teardown must not wait on shutdown while its caller can block shutdown."""
     submit_started = threading.Event()
     allow_submit_return = threading.Event()
     shutdown_started = threading.Event()
@@ -3339,7 +3996,7 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
 
     def run() -> None:
         try:
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
         except BaseException as exc:
             run_errors.append(exc)
 
@@ -3369,9 +4026,11 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
 
         drop_thread.start()
         assert drop_invoked.wait(timeout=5.0)
-        drop_thread.join(timeout=0.05)
-        assert drop_thread.is_alive()
+        drop_thread.join(timeout=5.0)
+        assert not drop_thread.is_alive()
         assert shutdown_thread.is_alive()
+        assert len(drop_errors) == 1
+        assert "cannot tear down FTE query while Python backend is shutting down" in str(drop_errors[0])
         assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
 
         allow_submit_return.set()
@@ -3383,7 +4042,7 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
         assert not shutdown_thread.is_alive()
         assert not drop_thread.is_alive()
         assert shutdown_errors == []
-        assert drop_errors == []
+        assert len(drop_errors) == 1
         assert len(run_errors) == 1
         assert "query is closing" in str(run_errors[0])
         assert backend.drop_calls == []
@@ -3438,6 +4097,62 @@ def test_cxx_backend_preserves_owner_state_until_shutdown_retry():
         assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
     finally:
         vane.ray_cxx._cleanup_query_python_replay_state(query_id)
+        con.close()
+
+
+def test_cxx_backend_successful_shutdown_releases_unobserved_submission_exception():
+    import gc
+    import weakref
+
+    submission_started = threading.Event()
+    release_submission = threading.Event()
+    exception_refs: list[weakref.ReferenceType[RuntimeError]] = []
+
+    class SubmissionSentinelError(RuntimeError):
+        pass
+
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "shutdown-submission-error-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            submission_started.set()
+            assert release_submission.wait(timeout=5)
+            error = SubmissionSentinelError("planned unobserved submission failure")
+            exception_refs.append(weakref.ref(error))
+            raise error
+
+        def shutdown(self):
+            release_submission.set()
+
+    con = vane.connect()
+    query_id = f"shutdown-submission-error-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    stream = runner.run_plan(plan, con)
+    try:
+        assert submission_started.wait(timeout=5)
+        runner.shutdown()
+        assert exception_refs
+        deadline = time.monotonic() + 5
+        while exception_refs[0]() is not None and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.01)
+        assert exception_refs[0]() is None
+    finally:
+        release_submission.set()
+        del stream
         con.close()
 
 
@@ -3554,13 +4269,274 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     with pytest.raises(Exception, match="planned Python backend poll failure"):
-        list(runner.run_plan(plan, con))
+        collect_result_stream(runner.run_plan(plan, con))
 
     assert backend.handle is not None
     assert backend.handle.release_calls == 0
     runner.drop_query_fragments(query_id)
     assert backend.handle.release_calls == 1
     con.close()
+
+
+def test_cxx_python_backend_ack_error_retains_result_handle_until_drop():
+    class ErrorHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-ack-error"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+            raise RuntimeError("planned Python backend ack failure")
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-ack-error",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = ErrorHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-ack-error-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(Exception, match="planned Python backend ack failure"):
+        collect_result_stream(runner.run_plan(plan, con))
+
+    assert backend.handle is not None
+    assert backend.handle.ack_calls == 1
+    assert backend.handle.release_calls == 0
+    runner.drop_query_fragments(query_id)
+    assert backend.handle.release_calls == 1
+    con.close()
+
+
+def test_cxx_python_backend_cleanup_preserves_utf8_when_bounding_query_id():
+    class ErrorHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-unicode-cleanup"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.release_enabled = False
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            raise RuntimeError("planned Unicode cleanup ack failure")
+
+        def release_result_payload(self):
+            if not self.release_enabled:
+                raise RuntimeError("planned Unicode cleanup release failure")
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-unicode-cleanup",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = ErrorHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = "界" * 100
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(Exception, match="planned Unicode cleanup ack failure"):
+        collect_result_stream(runner.run_plan(plan, con))
+
+    with pytest.raises(Exception) as cleanup_error:
+        runner.drop_query_fragments(query_id)
+    assert "planned Unicode cleanup release failure" in str(cleanup_error.value)
+    assert "..." in str(cleanup_error.value)
+
+    assert backend.handle is not None
+    backend.handle.release_enabled = True
+    runner.drop_query_fragments(query_id)
+    con.close()
+
+
+def test_cxx_python_backend_finished_query_respects_exhausted_drain_timeout(monkeypatch):
+    class PendingHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-drain-timeout"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.ready = threading.Event()
+            self.release_calls = 0
+
+        def done(self):
+            return self.ready.is_set()
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-drain-timeout",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = PendingHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setenv("VANE_FTE_QUERY_WAIT_TIMEOUT_S", "0.000001")
+    con = vane.connect()
+    query_id = f"python-backend-drain-timeout-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    outcome = []
+
+    def collect():
+        try:
+            collect_result_stream(runner.run_plan(plan, con))
+        except BaseException as error:  # pragma: no cover - asserted below
+            outcome.append(error)
+
+    thread = threading.Thread(target=collect)
+    thread.start()
+    try:
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            assert backend.handle is not None
+            backend.handle.ready.set()
+            thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert len(outcome) == 1
+        assert "timed out draining Python backend FTE result handles" in str(outcome[0])
+        assert backend.handle is not None
+        assert backend.handle.release_calls == 0
+        runner.drop_query_fragments(query_id)
+        assert backend.handle.release_calls == 1
+    finally:
+        if backend.handle is not None:
+            backend.handle.ready.set()
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        con.close()
 
 
 def test_cxx_run_plan_startup_failure_cleans_query_replay_snapshot():
@@ -3669,6 +4645,8 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
     submission_calls = []
     dropped_queries = []
+    partial_staging_roots: list[Path] = []
+    drop_observed_partial_output: list[bool] = []
 
     class Backend(_QueryLifecycleBackend):
         def worker_snapshots(self):
@@ -3683,11 +4661,18 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
 
         def submit_tasks(self, tasks):
             submission_calls.append(len(tasks))
+            context = tasks[0].context()
+            staging_root = Path(context["copy_output_base"]) / context["copy_output_run_id"]
+            partial_output = staging_root / "partial-submit-worker" / "part.parquet"
+            partial_output.parent.mkdir(parents=True, exist_ok=True)
+            partial_output.write_bytes(b"partial-submit-output")
+            partial_staging_roots.append(staging_root)
             tasks[0].plan()
             return []
 
         def drop_query(self, actual_query_id):
             dropped_queries.append(actual_query_id)
+            drop_observed_partial_output.append(any(root.exists() for root in partial_staging_roots))
 
     def fail_lookup(actual_query_id):
         raise vane.NotImplementedException(f"copy plan lookup sentinel for {actual_query_id}")
@@ -3709,7 +4694,109 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     assert f"copy plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
     assert submission_calls == [1]
     assert dropped_queries == [query_id]
+    assert drop_observed_partial_output == [True]
+    assert partial_staging_roots
+    assert all(not root.exists() for root in partial_staging_roots)
     assert not dst.exists()
+
+
+@pytest.mark.parametrize(
+    ("fail_finalize", "expected_error_name", "expected_write_state"),
+    (
+        (False, "CopyResultUnavailableError", "committed"),
+        (True, "CopyOutcomeUnknownError", None),
+    ),
+    ids=("committed", "outcome-unknown"),
+)
+def test_native_cxx_extension_write_preserves_terminal_state_when_result_marshalling_fails(
+    fail_finalize,
+    expected_error_name,
+    expected_write_state,
+):
+    from vane.runners import copy_outcome
+
+    class NoOutputHandle:
+        def __init__(self, task, partition_id):
+            query_id = task.context()["query_id"]
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0)
+            self.worker_id = "extension-write-worker"
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
+
+        def release_result_payload(self):
+            return None
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+            self.drop_calls = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "extension-write-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [NoOutputHandle(task, len(self.handles) + index) for index, task in enumerate(tasks)]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(handle.task_id) for handle in self.handles],
+            }
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(query_id)
+
+        def shutdown(self):
+            return None
+
+    con = vane.connect()
+    query_id = f"extension-result-marshalling-{uuid.uuid4()}"
+    vane.ray_cxx._register_coordinator_only_extension_write_for_test(con)
+    plan = vane.ray_cxx._make_coordinator_only_extension_write_plan_for_test(
+        query_id,
+        fail_finalize=fail_finalize,
+        conn=con,
+    )
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._fail_next_extension_result_marshalling_for_test()
+    expected_error = getattr(copy_outcome, expected_error_name)
+
+    try:
+        with pytest.raises(expected_error) as error:
+            runner.run_copy_plan(plan, con)
+
+        assert error.value.operation_id == query_id
+        assert error.value.safe_to_retry is False
+        assert "planned extension result marshalling failure" in str(error.value)
+        if expected_write_state is not None:
+            assert error.value.write_state == expected_write_state
+        else:
+            assert "planned coordinator-only extension finalization failure" in str(error.value)
+        assert backend.drop_calls == [query_id]
+    finally:
+        con.close()
 
 
 def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, monkeypatch):
@@ -3721,11 +4808,8 @@ def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, mon
         execute_fn=_InProcessFragmentExecutor(),
         max_running_tasks=2,
     )
-    query_id = f"copy-cleanup-failure-{uuid.uuid4()}"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        relation,
-        query_id,
-    ).to_physical_plan(con)
+    query_id = relation.idx()
+    plan = relation.to_physical_plan(con)
     original_drop_query = backend.drop_query
     drop_calls = []
 
@@ -3761,10 +4845,11 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
     try:
         runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         for _ in range(2):
-            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                relation,
-                str(uuid.uuid4()),
-            ).to_physical_plan(con)
+            state = list(relation.__getstate__())
+            state[0] = str(uuid.uuid4())
+            logical = vane.ray_cxx.PyLogicalPlan.__new__(vane.ray_cxx.PyLogicalPlan)
+            logical.__setstate__(tuple(state))
+            plan = logical.to_physical_plan(con)
             result = runner.run_copy_plan(plan, con)
             results.append(result)
 
@@ -3801,6 +4886,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
 
 
 def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeypatch):
+    import weakref
     from concurrent.futures import ThreadPoolExecutor
 
     from vane.runners.local import runner as local_runner
@@ -3809,8 +4895,11 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def __init__(self, conn_id: int) -> None:
             self.conn_id = conn_id
             self.closed = False
+            self.plan_ref = None
+            self.closed_with_live_plan = False
 
         def close(self) -> None:
+            self.closed_with_live_plan = self.plan_ref is not None and self.plan_ref() is not None
             self.closed = True
 
     class FakeConn:
@@ -3818,12 +4907,15 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             self.conn_id = conn_id
             self.closed = False
             self.executed: list[str] = []
+            self.cursors: list[FakeCursor] = []
 
         def execute(self, sql: str) -> None:
             self.executed.append(sql)
 
         def cursor(self) -> FakeCursor:
-            return FakeCursor(self.conn_id)
+            cursor = FakeCursor(self.conn_id)
+            self.cursors.append(cursor)
+            return cursor
 
         def close(self) -> None:
             self.closed = True
@@ -3831,7 +4923,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     conn_lock = threading.Lock()
     connections: list[FakeConn] = []
 
-    def fake_connect() -> FakeConn:
+    def fake_connect(runner_type: str) -> FakeConn:
+        assert runner_type == "local"
         with conn_lock:
             conn = FakeConn(len(connections))
             connections.append(conn)
@@ -3841,15 +4934,20 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     active_clones = 0
     max_active_clones = 0
 
+    class BoundPlan:
+        def __init__(self, cursor: FakeCursor) -> None:
+            self.cursor = cursor
+            cursor.plan_ref = weakref.ref(self)
+
     class FakePlan:
-        def clone(self, conn: FakeConn) -> tuple[str, int]:
+        def clone(self, cursor: FakeCursor) -> BoundPlan:
             nonlocal active_clones, max_active_clones
             with clone_lock:
                 active_clones += 1
                 max_active_clones = max(max_active_clones, active_clones)
             try:
                 time.sleep(0.05)
-                return ("cloned", conn.conn_id)
+                return BoundPlan(cursor)
             finally:
                 with clone_lock:
                     active_clones -= 1
@@ -3867,31 +4965,34 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def execute_native(
             self,
             cursor: FakeCursor,
-            plan: tuple[str, int],
+            plan: BoundPlan,
             *_args: Any,
         ) -> dict[str, int]:
+            assert plan.cursor is cursor
             execute_barrier.wait(timeout=2.0)
             return {
                 "conn_id": cursor.conn_id,
-                "plan_conn_id": int(plan[1]),
+                "plan_conn_id": plan.cursor.conn_id,
                 "runner_id": self.runner_id,
             }
 
     def fake_require(name: str, *args: Any, **kwargs: Any) -> Any:
         if name == "DistributedPhysicalPlanRunner":
             return FakePlanRunner
-        if name == "merge_scan_task_descriptors":
+        if name == "merge_scan_split_batches":
             return lambda values: values
         raise AssertionError(f"unexpected ray_cxx attr: {name}")
 
-    monkeypatch.setattr(vane, "connect", fake_connect)
+    monkeypatch.setattr(vane._native, "_connect_with_runner", fake_connect)
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()
-    request = {"fragment_plan": FakePlan(), "context": {}}
+    requests = [
+        {"fragment_plan": FakePlan(), "context": {}, "task_id": _task_id(partition_id)} for partition_id in range(2)
+    ]
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(executor, request) for _ in range(2)]
+            futures = [pool.submit(executor, request) for request in requests]
             results = [future.result(timeout=5.0) for future in futures]
 
         assert {result["conn_id"] for result in results} == {0, 1}
@@ -3904,6 +5005,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     assert len(connections) == 2
     assert all(conn.closed for conn in connections)
     for conn in connections:
+        assert conn.cursors and all(cursor.closed for cursor in conn.cursors)
+        assert not any(cursor.closed_with_live_plan for cursor in conn.cursors)
         assert "SET local_exchange_streaming=true" in conn.executed
         assert "SET local_exchange_buffer_bytes = '32MB'" in conn.executed
         assert "SET arrow_large_buffer_size=true" in conn.executed
@@ -3957,7 +5060,10 @@ def test_in_process_fragment_executor_close_does_not_release_live_resources(monk
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert execute_started.wait(timeout=1.0)
         try:
             with pytest.raises(RuntimeError, match="did not drain.*active_executions=1"):
@@ -4023,7 +5129,10 @@ def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatc
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert close_started.wait(timeout=1.0)
         try:
             executor.request_shutdown()
@@ -4208,7 +5317,7 @@ def test_in_process_fragment_executor_registration_failure_releases_execution_ow
     monkeypatch.setattr(executor, "_register_cursor", fail_register)
 
     with pytest.raises(RuntimeError, match="cursor registration failed"):
-        executor({"fragment_plan": object(), "context": {}})
+        executor({"fragment_plan": object(), "context": {}, "task_id": _task_id(0)})
 
     assert executor._in_flight == 0
     assert conn.cursor_instance.closed is True
@@ -4219,6 +5328,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
 
     import pyarrow as pa
+    import pyarrow.parquet as pq
 
     class CopyOutputHandle:
         def __init__(self, task_id, task_context_info, file_path: Path, rows: int):
@@ -4289,16 +5399,8 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
             selected_file.parent.mkdir(parents=True, exist_ok=True)
             duplicate_file.parent.mkdir(parents=True, exist_ok=True)
 
-            selected_conn = vane.connect()
-            selected_conn.execute(
-                f"COPY (select 101::integer as x) TO {_sql_string_literal(str(selected_file))} (FORMAT PARQUET)"
-            )
-            selected_conn.close()
-            duplicate_conn = vane.connect()
-            duplicate_conn.execute(
-                f"COPY (select 999::integer as x) TO {_sql_string_literal(str(duplicate_file))} (FORMAT PARQUET)"
-            )
-            duplicate_conn.close()
+            pq.write_table(pa.table({"x": pa.array([101], type=pa.int32())}), selected_file)
+            pq.write_table(pa.table({"x": pa.array([999], type=pa.int32())}), duplicate_file)
 
             selected_task_id = FteTaskAttemptId.coerce(request["task_id"])
             duplicate_task_id = FteTaskAttemptId(
@@ -4357,7 +5459,8 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
         assert con.sql(f"select list(x order by x) from read_parquet('{dst}')").fetchone()[0] == [101]
         assert backend.handles[0].get_result_calls == 1
         assert backend.handles[1].get_result_calls == 0
-        assert all(handle.acked for handle in backend.handles)
+        assert backend.handles[0].acked is True
+        assert backend.handles[1].acked is False
         assert all(handle.released for handle in backend.handles)
         assert backend.duplicate_file is not None
         assert not backend.duplicate_file.exists()
@@ -4397,6 +5500,116 @@ def test_native_cxx_run_copy_plan_failure_cleans_direct_write_run(tmp_path, monk
         assert backend.pop_fte_result_handles(query_id) == []
     finally:
         backend.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize("cancel_during", ["status", "result"])
+@pytest.mark.parametrize("local_staging", [False, True])
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_native_cxx_copy_drop_during_result_wait_does_not_commit_empty_output(
+    tmp_path, monkeypatch, cancel_during, local_staging, aggregate
+):
+    con, dst, query_id, plan = _captured_native_copy_plan(
+        tmp_path, monkeypatch, local_staging=local_staging, aggregate=aggregate
+    )
+    wait_started = threading.Event()
+    query_dropped = threading.Event()
+
+    class EmptyHandle:
+        def __init__(self, task):
+            request = NativeFteWorkerManagerBackend._request_from_task(task)
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = request["task_context_info"]
+            self.worker_id = "native-worker-0"
+            self.released = False
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            if cancel_during == "result":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            self.released = True
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-0",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [EmptyHandle(task) for task in tasks]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id, _task_context_filter=None):
+            if cancel_during == "status":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return {
+                "finished": True,
+                "failed": False,
+                "matched": True,
+                "selected_attempt_task_ids": []
+                if cancel_during == "status"
+                else [str(handle.task_id) for handle in self.handles],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def drop_query(self, _query_id):
+            query_dropped.set()
+
+        def shutdown(self):
+            pass
+
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    outcomes = []
+
+    def run_copy():
+        try:
+            outcomes.append(runner.run_copy_plan(plan, con))
+        except BaseException as error:
+            outcomes.append(error)
+
+    worker = threading.Thread(target=run_copy)
+    worker.start()
+    try:
+        assert wait_started.wait(timeout=5.0), outcomes
+        runner.drop_query_fragments(query_id)
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert len(outcomes) == 1 and isinstance(outcomes[0], ValueError), outcomes
+        assert "query is closing" in str(outcomes[0])
+        assert backend.handles and all(handle.released for handle in backend.handles)
+        assert not dst.exists()
+        assert not Path(str(dst) + ".duckdb_commit").exists()
+        assert not Path(str(dst) + ".duckdb_staging").exists()
+    finally:
+        query_dropped.set()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        runner.shutdown()
         con.close()
 
 

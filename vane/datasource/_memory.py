@@ -1,0 +1,436 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Internal Arrow snapshot tasks for Python-owned Ray relation sources."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
+
+from vane.datasource import DataSourceTask
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+    from vane._native import _DataSourceExecutionContext
+
+_TARGET_PARTITION_BYTES = 16 * 1024 * 1024
+_MAX_PARTITION_ROWS = 1_000_000
+_MAX_CONCAT_ARRAYS = 1024
+
+
+class _MemoryPartitionTransport:
+    """Serialize owned column buffers with Arrow's native representation."""
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+
+    def __reduce__(self) -> Any:
+        # Vane has already materialized each column chunk. Arrow's own reducer
+        # preserves their boundaries and supports variadic view buffers, which
+        # Ray's custom Table serializer does not handle. Do not split the table
+        # into aligned batches: their slices could serialize whole parent chunks.
+        return self.table.__reduce__()
+
+
+def _put_memory_partition(table: Any) -> Any:
+    import ray
+
+    return ray.put(_MemoryPartitionTransport(table))
+
+
+class _RayMemorySourceTask(DataSourceTask):
+    """Resolve one query-owned Arrow table and expose it as record batches."""
+
+    def __init__(self, source_id: str, partition_index: int, column_indices: tuple[int, ...]) -> None:
+        self.source_id = str(source_id)
+        self.partition_index = partition_index
+        self.column_indices = tuple(column_indices)
+
+    def execute(self) -> Iterator[Any]:
+        import pyarrow as pa
+        import ray
+
+        from vane import ray_cxx
+
+        partition = ray.get(ray_cxx._lookup_memory_source_ref(self.source_id, self.partition_index))
+        if not isinstance(partition, pa.Table):
+            raise TypeError(
+                f"Ray memory source {self.source_id!r} resolved to {type(partition).__name__}, expected pyarrow.Table"
+            )
+        if self.column_indices != tuple(range(partition.num_columns)):
+            partition = partition.select(self.column_indices)
+        yield from partition.to_batches()
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[Any]:
+        execution_context._check_interrupted()
+        for batch in self.execute():
+            execution_context._check_interrupted()
+            yield batch
+
+
+def _append_version_integer(version: bytearray, value: int) -> None:
+    version.extend(int(value).to_bytes(8, byteorder="little", signed=False))
+
+
+def _append_version_bytes(version: bytearray, value: bytes) -> None:
+    _append_version_integer(version, len(value))
+    version.extend(value)
+
+
+def _arrow_array_children(value: Any) -> tuple[Any, ...]:
+    """Return logical child arrays, including storage outside Array.buffers()."""
+
+    import pyarrow as pa
+
+    if isinstance(value, pa.ExtensionArray):
+        return (value.storage,)
+    if pa.types.is_dictionary(value.type):
+        # Dictionary values are stored outside the index buffers returned by
+        # Array.buffers(), so they must be visited explicitly.
+        return (value.dictionary,)
+    is_list_view = getattr(pa.types, "is_list_view", lambda _: False)
+    is_large_list_view = getattr(pa.types, "is_large_list_view", lambda _: False)
+    if (
+        pa.types.is_list(value.type)
+        or pa.types.is_large_list(value.type)
+        or pa.types.is_fixed_size_list(value.type)
+        or is_list_view(value.type)
+        or is_large_list_view(value.type)
+        or pa.types.is_map(value.type)
+    ):
+        return (value.values,)
+    if pa.types.is_struct(value.type) or pa.types.is_union(value.type):
+        return tuple(value.field(index) for index in range(value.type.num_fields))
+    is_run_end_encoded = getattr(pa.types, "is_run_end_encoded", lambda _: False)
+    if is_run_end_encoded(value.type):
+        return (value.run_ends, value.values)
+    return ()
+
+
+def _append_arrow_array_version(version: bytearray, value: Any) -> None:
+    _append_version_bytes(version, str(value.type).encode())
+    _append_version_integer(version, len(value))
+    _append_version_integer(version, value.offset)
+    # Container Array.buffers() flattens descendant buffers. Keep only its own
+    # layout, but retain every leaf buffer: view arrays have variadic data buffers
+    # beyond DataType.num_buffers.
+    children = _arrow_array_children(value)
+    buffers = value.buffers()
+    if children:
+        buffers = buffers[: value.type.num_buffers]
+    _append_version_integer(version, len(buffers))
+    for buffer in buffers:
+        _append_version_integer(version, buffer is not None)
+        if buffer is not None:
+            _append_version_integer(version, buffer.address)
+            _append_version_integer(version, buffer.size)
+    for child in children:
+        _append_arrow_array_version(version, child)
+
+
+def _arrow_source_version(source: Any, column_indices: tuple[int, ...]) -> bytes:
+    """Fingerprint an eager source's schema, row count, and referenced buffers."""
+
+    import pyarrow as pa
+
+    if isinstance(source, pa.RecordBatch):
+        source = pa.Table.from_batches([source])
+    if not isinstance(source, pa.Table):
+        raise TypeError(
+            f"Arrow source version requires pyarrow.Table or pyarrow.RecordBatch, got {type(source).__name__}"
+        )
+
+    version = bytearray()
+    _append_version_bytes(version, source.schema.serialize().to_pybytes())
+    _append_version_integer(version, source.num_rows)
+    _append_version_integer(version, source.num_columns)
+    _append_version_integer(version, len(column_indices))
+    for column_index in column_indices:
+        _append_version_integer(version, column_index)
+        column = source.column(column_index)
+        _append_version_integer(version, column.num_chunks)
+        for chunk in column.chunks:
+            _append_arrow_array_version(version, chunk)
+    return bytes(version)
+
+
+def _prepare_arrow_memory_source(
+    source: Any, column_indices: tuple[int, ...], names: list[str], include_row_count_column: bool
+) -> Any:
+    import pyarrow as pa
+
+    if isinstance(source, pa.RecordBatch):
+        source = pa.Table.from_batches([source])
+    if not isinstance(source, pa.Table):
+        raise TypeError(
+            "Ray supports eager pyarrow.Table and pyarrow.RecordBatch memory sources. "
+            "Materialize lazy or streaming Arrow sources explicitly before calling from_arrow()."
+        )
+    row_count = source.num_rows
+    table = source.select(column_indices)
+    if include_row_count_column:
+        table = pa.Table.from_arrays([*table.columns, pa.nulls(row_count, type=pa.bool_())], names=names)
+    elif table.column_names != names:
+        table = table.rename_columns(names)
+    return table
+
+
+def _materialize_partition_column(column: Any) -> Any:
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    def concatenate_plain_ranges(value: Any, starts: Any, lengths: Any) -> Any:
+        def concatenate_batch(arrays: list[Any]) -> Any:
+            result = pa.concat_arrays(arrays)
+            # Leaf view buffers must be copied before the next level, or its
+            # variadic buffer references would grow with every selected range.
+            if pa.types.is_string_view(result.type) or pa.types.is_binary_view(result.type):
+                result = result.cast(pa.large_binary()).cast(result.type)
+            return result
+
+        chunks = []
+        batch = []
+        for offset, length in zip(starts, lengths, strict=True):
+            batch.append(value.slice(int(offset), int(length)))
+            if len(batch) == _MAX_CONCAT_ARRAYS:
+                chunks.append(concatenate_batch(batch))
+                batch = []
+        if batch:
+            chunks.append(concatenate_batch(batch))
+        if not chunks:
+            return concatenate_batch([value.slice(0, 0)])
+        while len(chunks) > _MAX_CONCAT_ARRAYS:
+            chunks = [
+                concatenate_batch(chunks[index : index + _MAX_CONCAT_ARRAYS])
+                for index in range(0, len(chunks), _MAX_CONCAT_ARRAYS)
+            ]
+        return concatenate_batch(chunks)
+
+    def concatenate_ranges(value: Any, starts: Any, lengths: Any) -> Any:
+        # Adjacent logical ranges need one slice, including the child ranges
+        # of ordinary lists. Keep sparse selections bounded without turning a
+        # contiguous list column into one Python array wrapper per row.
+        nonempty = lengths > 0
+        starts, lengths = starts[nonempty], lengths[nonempty]
+        if len(starts) > 1:
+            boundaries = np.flatnonzero(np.concatenate(([True], starts[1:] != starts[:-1] + lengths[:-1])))
+            starts, lengths = starts[boundaries], np.add.reduceat(lengths, boundaries)
+        # Select container metadata separately from referenced storage. Calling
+        # Arrow concatenation on containers would copy shared ListView children
+        # once per range/batch and erase their original source coordinates.
+        if isinstance(value, pa.ExtensionArray):
+            return pa.ExtensionArray.from_storage(value.type, concatenate_ranges(value.storage, starts, lengths))
+        if pa.types.is_dictionary(value.type):
+            indices = concatenate_plain_ranges(value.indices, starts, lengths)
+            return pa.DictionaryArray.from_arrays(indices, value.dictionary, ordered=value.type.ordered)
+        if isinstance(value, (pa.ListViewArray, pa.LargeListViewArray)):
+            return type(value).from_arrays(
+                concatenate_plain_ranges(value.offsets, starts, lengths),
+                concatenate_plain_ranges(value.sizes, starts, lengths),
+                value.values,
+                type=value.type,
+                mask=concatenate_plain_ranges(value.is_null(), starts, lengths) if value.null_count else None,
+            )
+        if pa.types.is_struct(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            # Arrow Map construction requires its entry struct's null count
+            # to be known as zero, even when a validity bitmap is present.
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[concatenate_ranges(child, starts, lengths) for child in _arrow_array_children(value)],
+            )
+        if pa.types.is_list(value.type) or pa.types.is_large_list(value.type) or pa.types.is_map(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            offsets = concatenate_plain_ranges(value.offsets, starts, lengths).to_numpy().astype(np.int64)
+            ends = concatenate_plain_ranges(value.offsets.slice(1), starts, lengths).to_numpy()
+            sizes = np.where(validity.to_numpy(zero_copy_only=False), ends - offsets, 0)
+            child_offsets = offsets[sizes > 0]
+            child_sizes = sizes[sizes > 0]
+            children = concatenate_ranges(value.values, child_offsets, child_sizes)
+            packed_offsets = pa.array(np.concatenate(([0], np.cumsum(sizes))), type=value.offsets.type)
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1], packed_offsets.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[children],
+            )
+        if pa.types.is_fixed_size_list(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            width = value.type.list_size
+            children = concatenate_ranges(value.values, (starts + value.offset) * width, lengths * width)
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[children],
+            )
+        if pa.types.is_union(value.type) and value.type.mode == "sparse":
+            codes = pa.Array.from_buffers(pa.int8(), len(value), value.buffers()[:2], offset=value.offset)
+            selected_codes = concatenate_plain_ranges(codes, starts, lengths)
+            return pa.Array.from_buffers(
+                value.type,
+                len(selected_codes),
+                [None, selected_codes.buffers()[1]],
+                null_count=0,
+                children=[concatenate_ranges(child, starts, lengths) for child in _arrow_array_children(value)],
+            )
+        if pa.types.is_run_end_encoded(value.type):
+            # Concatenate physical run IDs, then select the corresponding values
+            # once. Encoding the values themselves could duplicate nested views.
+            proxy = pa.RunEndEncodedArray.from_buffers(
+                pa.run_end_encoded(value.type.run_end_type, pa.int64()),
+                len(value),
+                [None],
+                offset=value.offset,
+                children=[value.run_ends, pa.array(np.arange(len(value.values), dtype=np.int64))],
+            )
+            selected = concatenate_plain_ranges(proxy, starts, lengths)
+            run_ids = selected.values.to_numpy()
+            children = concatenate_ranges(value.values, run_ids, np.ones(len(run_ids), dtype=np.int64))
+            return pa.RunEndEncodedArray.from_arrays(selected.run_ends, children, type=value.type)
+        return concatenate_plain_ranges(value, starts, lengths)
+
+    def materialize_descendants(value: Any) -> Any:
+        if isinstance(value, pa.ExtensionArray):
+            storage = value.storage
+            normalized_storage = materialize_descendants(storage)
+            if normalized_storage is storage:
+                return value
+            return pa.ExtensionArray.from_storage(value.type, normalized_storage)
+        if isinstance(value, (pa.ListViewArray, pa.LargeListViewArray)):
+            # List views can reference disjoint, overlapping, or reordered
+            # child ranges. Arrow concatenation trims only their outer bounds;
+            # pack the union of referenced ranges so gaps are not transported
+            # and overlapping views keep sharing the same child values.
+            offsets = value.offsets.to_numpy()
+            sizes = value.sizes.to_numpy()
+            nulls = value.is_null()
+            active = (~nulls.to_numpy(zero_copy_only=False)) & (sizes > 0)
+            packed_offsets = np.zeros(len(value), dtype=offsets.dtype)
+            packed_sizes = np.where(active, sizes, 0)
+            starts: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            lengths: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            if np.any(active):
+                # Keep interval metadata in fixed-width arrays rather than
+                # allocating Python tuples and integers for every sparse row.
+                starts = offsets[active].astype(np.int64, copy=False)
+                ends = starts + sizes[active]
+                order = np.argsort(starts)
+                starts = starts[order]
+                ends = np.maximum.accumulate(ends[order])
+                boundaries = np.concatenate(([True], starts[1:] > ends[:-1]))
+                starts = starts[boundaries]
+                ends = ends[np.concatenate((boundaries[1:], [True]))]
+                lengths = ends - starts
+                bases = np.cumsum(lengths) - lengths
+                range_ids = np.searchsorted(starts, offsets[active], side="right") - 1
+                packed_offsets[active] = offsets[active] - starts[range_ids] + bases[range_ids]
+            packed_values = materialize_descendants(concatenate_ranges(value.values, starts, lengths))
+            return type(value).from_arrays(
+                packed_offsets, packed_sizes, packed_values, type=value.type, mask=nulls if value.null_count else None
+            )
+        if pa.types.is_dictionary(value.type):
+            # Work on integer indices so dictionary values can themselves be
+            # nested or extension arrays. Keep their original dictionary order.
+            used = pc.drop_null(pc.unique(value.indices))
+            used = pc.take(used, pc.sort_indices(used))
+            indices = pc.index_in(value.indices, value_set=used).cast(value.type.index_type)
+            # Select contiguous runs with slices and concatenate them. Arrow's
+            # recursive take kernel cannot handle view or run-end-encoded
+            # descendants; concatenation preserves their original storage type.
+            # Coalescing adjacent indices avoids one slice per dictionary value
+            # when most or all of a dictionary is referenced.
+            used_indices = used.to_numpy().astype(np.int64, copy=False)
+            boundaries = np.flatnonzero(np.diff(used_indices) != 1) + 1
+            starts = np.concatenate((used_indices[:1], used_indices[boundaries]))
+            ends = np.concatenate((used_indices[boundaries - 1], used_indices[-1:])) + 1
+            selected = concatenate_ranges(value.dictionary, starts, ends - starts)
+            dictionary = materialize_descendants(selected)
+            return pa.DictionaryArray.from_arrays(indices, dictionary, ordered=value.type.ordered)
+
+        children = _arrow_array_children(value)
+        if not children:
+            if len(value.buffers()) > value.type.num_buffers:
+                # Concatenating view arrays copies their descriptors but retains
+                # all variadic buffers. Round-trip through offset storage to copy
+                # just the referenced bytes while preserving the view type.
+                return value.cast(pa.large_binary()).cast(value.type)
+            return value
+        normalized_children = tuple(materialize_descendants(child) for child in children)
+        if all(normalized is original for normalized, original in zip(normalized_children, children, strict=True)):
+            return value
+        return pa.Array.from_buffers(
+            value.type,
+            len(value),
+            value.buffers()[: value.type.num_buffers],
+            null_count=value.null_count,
+            offset=value.offset,
+            children=normalized_children,
+        )
+
+    # Each input chunk may have a different dictionary. Preserve chunk
+    # boundaries instead of requiring Arrow to unify nested dictionaries or
+    # fit their combined indices into the original (possibly int8) index type.
+    return pa.chunked_array(
+        [
+            materialize_descendants(
+                concatenate_ranges(chunk, np.array([0], dtype=np.int64), np.array([len(chunk)], dtype=np.int64))
+            )
+            for chunk in column.chunks
+        ],
+        type=column.type,
+    )
+
+
+def _snapshot_and_put_memory_source(table: Any) -> tuple[Any, list[Any]]:
+    """Copy selected Arrow columns into query-owned Ray partitions."""
+
+    import pyarrow as pa
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray must be initialized before planning a Pandas or Arrow in-memory relation")
+    if not isinstance(table, pa.Table):
+        raise TypeError(f"Expected a pyarrow.Table memory snapshot, got {type(table).__name__}")
+
+    if table.num_rows == 0:
+        partition_ranges = [(0, 0)]
+    else:
+        average_row_bytes = max(1, (table.nbytes + table.num_rows - 1) // table.num_rows)
+        rows_per_partition = max(1, min(_MAX_PARTITION_ROWS, _TARGET_PARTITION_BYTES // average_row_bytes))
+        partition_ranges = [
+            (offset, min(rows_per_partition, table.num_rows - offset))
+            for offset in range(0, table.num_rows, rows_per_partition)
+        ]
+
+    object_refs = []
+    for offset, row_count in partition_ranges:
+        sliced = table.slice(offset, row_count)
+        # A small table can still be a zero-copy view over much larger buffers.
+        # Materializing at the Ray ownership boundary prevents every ObjectRef
+        # from retaining or serializing bytes outside its partition.
+        partition = pa.Table.from_arrays(
+            [_materialize_partition_column(column) for column in sliced.columns], schema=table.schema
+        )
+        object_refs.append(_put_memory_partition(partition))
+    return table.schema, object_refs
+
+
+def _memory_source_tasks(
+    source_id: str, partition_count: int, column_indices: tuple[int, ...]
+) -> list[_RayMemorySourceTask]:
+    return [_RayMemorySourceTask(source_id, index, column_indices) for index in range(partition_count)]
+
+
+def _memory_source_schema(schema: Any, column_indices: tuple[int, ...]) -> Any:
+    import pyarrow as pa
+
+    return pa.schema([schema.field(column_index) for column_index in column_indices], metadata=schema.metadata)

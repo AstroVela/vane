@@ -28,12 +28,15 @@ public:
 	unsafe_unique_array<data_t> data;
 	idx_t offset;
 	idx_t total_written;
+	optional_idx closed_file_size;
 	unique_ptr<FileHandle> handle;
 
 public:
 	DUCKDB_API void WriteData(const_data_ptr_t buffer, idx_t write_size) override;
 	//! Flush all changes to the file and then close the file
 	DUCKDB_API void Close();
+	//! Flush, close, and return the final physical file size without reopening the file
+	DUCKDB_API idx_t CloseAndGetFileSize();
 	//! Flush all changes and fsync the file to disk
 	DUCKDB_API void Sync();
 	//! Flush the buffer to the file (without sync)

@@ -83,8 +83,8 @@ void LogStorage::Truncate() {
 }
 
 void LogStorage::UpdateConfig(DatabaseInstance &db, case_insensitive_map_t<Value> &config) {
-	if (config.size() > 1) {
-		throw InvalidInputException("LogStorage does not support passing configuration");
+	if (!config.empty()) {
+		throw InvalidInputException("Log storage '%s' does not support passing configuration", GetStorageName());
 	}
 }
 
@@ -327,7 +327,7 @@ unique_ptr<BufferedFileWriter> FileLogStorage::InitializeFileWriter(DatabaseInst
 	auto &fs = db.GetFileSystem();
 
 	// Create parent directories if non existent
-	auto pos = path.find_last_of(fs.PathSeparator(path));
+	auto pos = path.find_last_of("/\\");
 	if (pos != path.npos) {
 		fs.CreateDirectoriesRecursive(path.substr(0, pos));
 	}

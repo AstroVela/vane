@@ -32,6 +32,7 @@ public:
 	static constexpr idx_t FILE_FLAGS_MULTI_CLIENT_ACCESS = idx_t(1 << 11);
 	static constexpr idx_t FILE_FLAGS_DISABLE_LOGGING = idx_t(1 << 12);
 	static constexpr idx_t FILE_FLAGS_ENABLE_EXTENSION_INSTALL = idx_t(1 << 13);
+	static constexpr idx_t FILE_FLAGS_NONBLOCKING = idx_t(1 << 14);
 
 public:
 	FileOpenFlags() = default;
@@ -132,6 +133,9 @@ public:
 	inline bool EnableExtensionInstall() const {
 		return flags & FILE_FLAGS_ENABLE_EXTENSION_INSTALL;
 	}
+	inline bool OpenNonBlocking() const {
+		return flags & FILE_FLAGS_NONBLOCKING;
+	}
 	inline idx_t GetFlagsInternal() const {
 		return flags;
 	}
@@ -180,6 +184,8 @@ public:
 	//! Opened file is allowed to be a duckdb_extension
 	static constexpr FileOpenFlags FILE_FLAGS_ENABLE_EXTENSION_INSTALL =
 	    FileOpenFlags(FileOpenFlags::FILE_FLAGS_ENABLE_EXTENSION_INSTALL);
+	//! Open without waiting for a special-file peer. This has no effect on regular files.
+	static constexpr FileOpenFlags FILE_FLAGS_NONBLOCKING = FileOpenFlags(FileOpenFlags::FILE_FLAGS_NONBLOCKING);
 };
 
 } // namespace duckdb

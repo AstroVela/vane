@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+import threading
 import types
 
 import numpy as np
@@ -319,19 +320,129 @@ def test_numpy_object_tensor_output_rejects_partial_row_masks():
         )
 
 
-def test_batch_output_does_not_fall_back_across_formats():
+def test_non_arrow_batch_output_does_not_fall_back_across_formats():
     schema = [_duckdb_field("x", "BIGINT")]
 
     with pytest.raises(TypeError, match=r"batch_format='numpy'.*dict\[str, numpy.ndarray\]"):
         list(iter_udf_output_tables(pa.table({"x": [1]}), batch_format="numpy", output_schema=schema))
-    with pytest.raises(TypeError, match="batch_format='pyarrow'.*pyarrow.Table"):
-        list(
-            iter_udf_output_tables(
-                {"x": np.array([1], dtype=np.int64)},
-                batch_format="pyarrow",
-                output_schema=schema,
+    outputs = list(iter_udf_output_tables({"x": np.array([1], dtype=np.int64)}, batch_format="pyarrow"))
+    assert outputs[0].to_pydict() == {"x": [1]}
+
+
+@pytest.mark.parametrize("backend", ["ray_actor", "subprocess_actor"])
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+@pytest.mark.parametrize("stream_output", [False, True])
+def test_actor_formats_convert_on_owner_and_reuse_serial_worker(monkeypatch, backend, batch_format, stream_output):
+    import vane.execution._udf_runtime as runtime_module
+
+    if batch_format == "pandas":
+        pytest.importorskip("pandas")
+    owner = threading.get_ident()
+    events = []
+    adapt = runtime_module._format_udf_input
+    encode = runtime_module._iter_formatted_output_tables
+
+    def record_adapt(*args, **kwargs):
+        events.append(("adapt", threading.get_ident()))
+        return adapt(*args, **kwargs)
+
+    def record_encode(*args, **kwargs):
+        events.append(("encode", threading.get_ident()))
+        yield from encode(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_module, "_format_udf_input", record_adapt)
+    monkeypatch.setattr(runtime_module, "_iter_formatted_output_tables", record_encode)
+
+    class Model:
+        def __init__(self):
+            self.owner = threading.get_ident()
+            self.compute_threads = []
+
+        def __call__(self, batch):
+            assert threading.get_ident() != self.owner
+            self.compute_threads.append(threading.get_ident())
+            batch["x"] += 10
+            return batch
+
+    payload = _runtime_payload(
+        Model,
+        batch_format=batch_format,
+        output_schema=[_duckdb_field("x", "BIGINT"), _tensor_field("embedding", "FLOAT", (2, 2))],
+    )
+    payload.update(
+        execution_backend=backend, batch_size=2, stream_output=stream_output, preserve_compute_batch_boundaries=True
+    )
+    runtime = UDFExecutor(payload)
+    model = runtime._map_fn
+    table = _tensor_input_table()
+    try:
+        for _ in range(2):
+            outputs = runtime.iter_submit(table)
+            first = next(outputs)
+            if stream_output:
+                # The second compute batch must wait for downstream consumption.
+                assert events[-2:] == [("adapt", owner), ("encode", owner)]
+                assert len(events) in (2, 6)
+            result = pa.concat_tables([first, *outputs])
+            assert result.column("x").to_pylist() == [11, 12, 13]
+            assert result.column("embedding").equals(table.column("embedding"))
+        assert events == [("adapt", owner), ("encode", owner)] * 4
+        assert len(set(model.compute_threads)) == 1
+        # UDF mutation must not modify the source Arrow batch.
+        assert table.column("x").to_pylist() == [1, 2, 3]
+    finally:
+        runtime.close()
+    assert not any(t.ident in model.compute_threads and t.is_alive() for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+def test_non_arrow_formats_reject_variable_tensor_outputs(batch_format):
+    from vane.execution.udf_batch_format import resolve_udf_output_schema
+
+    with pytest.raises(TypeError, match="only fixed-shape tensor"):
+        resolve_udf_output_schema(batch_format, [{"name": "x", "kind": "tensor", "dtype": "FLOAT", "shape": [None, 2]}])
+
+
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+@pytest.mark.parametrize("backend", ["subprocess_actor", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_actor_formats_public_map_batches(request, monkeypatch, backend, batch_format):
+    import vane
+
+    if batch_format == "pandas":
+        pytest.importorskip("pandas")
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+
+    class Model:
+        def __init__(self):
+            self.owner = threading.get_ident()
+
+        def __call__(self, batch):
+            assert threading.get_ident() != self.owner
+            if batch_format == "numpy":
+                assert isinstance(batch, dict) and isinstance(batch["x"], np.ndarray)
+            else:
+                import pandas as pd
+
+                assert isinstance(batch, pd.DataFrame)
+            batch["x"] += 1
+            return batch
+
+    with vane.connect(config={"threads": 2}) as con:
+        output = (
+            con.sql("select range as x from range(5)")
+            .map_batches(
+                Model,
+                schema={"x": vane.sqltypes.BIGINT},
+                batch_format=batch_format,
+                batch_size=2,
+                execution_backend=backend,
+                actor_number=1,
             )
+            .fetchall()
         )
+    assert sorted(output) == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_batch_format_rejects_duplicate_input_column_names():

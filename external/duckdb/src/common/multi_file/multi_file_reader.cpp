@@ -60,6 +60,7 @@ MultiFileBindData::~MultiFileBindData() {
 
 unique_ptr<FunctionData> MultiFileBindData::Copy() const {
 	auto result = make_uniq<MultiFileBindData>();
+	result->column_ids = column_ids;
 	if (bind_data) {
 		if (typeid(*bind_data) == typeid(TableFunctionData)) {
 			result->bind_data = make_uniq<TableFunctionData>();
@@ -726,6 +727,9 @@ void MultiFileOptions::AutoDetectHiveTypesInternal(MultiFileList &files, ClientC
 			if (hive_types_schema.find(name) != hive_types_schema.end()) {
 				// type was explicitly provided by the user
 				continue;
+			}
+			if (HivePartitioning::IsNull(part.second)) {
+				continue; // don't update detected_types for this partition/file
 			}
 			LogicalType detected_type = LogicalType::VARCHAR;
 			Value value(part.second);

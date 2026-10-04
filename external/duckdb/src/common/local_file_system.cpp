@@ -13,6 +13,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <sys/stat.h>
@@ -357,6 +358,9 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 		open_flags |= O_DIRECT;
 #endif
 	}
+	if (flags.OpenNonBlocking()) {
+		open_flags |= O_NONBLOCK;
+	}
 
 	// Determine permissions
 	mode_t filesec;
@@ -699,6 +703,17 @@ void LocalFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener
 	}
 }
 
+string GetPosixVersionTag(struct stat s) {
+	// dev/ino should be enough, but to guard against in-place writes we also add file size and modification time
+	uint64_t version_tag[4];
+	Store(UnsafeNumericCast<uint64_t>(s.st_dev), data_ptr_cast(&version_tag[0]));
+	Store(UnsafeNumericCast<uint64_t>(s.st_ino), data_ptr_cast(&version_tag[1]));
+	Store(UnsafeNumericCast<uint64_t>(s.st_size), data_ptr_cast(&version_tag[2]));
+	Store(Timestamp::FromEpochSeconds(s.st_mtime).value, data_ptr_cast(&version_tag[3]));
+
+	return string(char_ptr_cast(version_tag), sizeof(uint64_t) * 4);
+}
+
 bool LocalFileSystem::ListFilesExtended(const string &directory,
                                         const std::function<void(OpenFileInfo &info)> &callback,
                                         optional_ptr<FileOpener> opener) {
@@ -741,6 +756,8 @@ bool LocalFileSystem::ListFilesExtended(const string &directory,
 		options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(status.st_size)));
 		// last modified time
 		options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromTimeT(status.st_mtime)));
+		// version tag
+		options.emplace("etag", Value::BLOB_RAW(GetPosixVersionTag(status)));
 
 		// invoke callback
 		callback(info);
@@ -824,6 +841,9 @@ string LocalFileSystem::MakePathAbsolute(const string &path_p, optional_ptr<File
 
 constexpr char PIPE_PREFIX[] = "\\\\.\\pipe\\";
 
+static const std::wstring WINDOWS_LOCAL_LONG_PATH_PREFIX = L"\\\\?\\";
+static const std::wstring WINDOWS_UNC_LONG_PATH_PREFIX = L"\\\\?\\UNC\\";
+
 // Returns the last Win32 error, in string format. Returns an empty string if there is no error.
 std::string LocalFileSystem::GetLastErrorAsString() {
 	// Get the error message, if any.
@@ -850,6 +870,24 @@ std::string LocalFileSystem::GetLastErrorAsString() {
 	return message;
 }
 
+static bool IsWindowsNotFoundError(DWORD error_code) {
+	return error_code == ERROR_FILE_NOT_FOUND || error_code == ERROR_PATH_NOT_FOUND ||
+	       error_code == ERROR_INVALID_DRIVE;
+}
+
+static unordered_map<string, string> WindowsErrorInfo(DWORD error_code) {
+	unordered_map<string, string> result;
+	result["windows_error"] = std::to_string(error_code);
+	if (IsWindowsNotFoundError(error_code)) {
+		result["errno"] = std::to_string(ENOENT);
+	} else if (error_code == ERROR_DIRECTORY) {
+		result["errno"] = std::to_string(ENOTDIR);
+	} else if (error_code == ERROR_ACCESS_DENIED) {
+		result["errno"] = std::to_string(EACCES);
+	}
+	return result;
+}
+
 static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
 	// https://stackoverflow.com/questions/29266743/what-is-dwlowdatetime-and-dwhighdatetime
 	ULARGE_INTEGER ul;
@@ -864,7 +902,7 @@ static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
 	// Adapted from: https://stackoverflow.com/questions/6161776/convert-windows-filetime-to-second-in-unix-linux
 	const auto WINDOWS_TICK = 10000000;
 	const auto SEC_TO_UNIX_EPOCH = 11644473600LL;
-	return Timestamp::FromTimeT(fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
+	return Timestamp::FromEpochSeconds(fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
 }
 
 static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
@@ -874,13 +912,13 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 	if (handle_type == FILE_TYPE_CHAR) {
 		file_metadata.file_type = FileType::FILE_TYPE_CHARDEV;
 		file_metadata.file_size = 0;
-		file_metadata.last_modification_time = Timestamp::FromTimeT(0);
+		file_metadata.last_modification_time = Timestamp::FromEpochSeconds(0);
 		return file_metadata;
 	}
 	if (handle_type == FILE_TYPE_PIPE) {
 		file_metadata.file_type = FileType::FILE_TYPE_FIFO;
 		file_metadata.file_size = 0;
-		file_metadata.last_modification_time = Timestamp::FromTimeT(0);
+		file_metadata.last_modification_time = Timestamp::FromEpochSeconds(0);
 		return file_metadata;
 	}
 
@@ -1060,19 +1098,26 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 	if (flags.DirectIO()) {
 		flags_and_attributes |= FILE_FLAG_NO_BUFFERING;
 	}
+	if (flags.OpenNonBlocking()) {
+		// This also lets the caller open a directory and reject it from the resulting handle type.
+		flags_and_attributes |= FILE_FLAG_BACKUP_SEMANTICS;
+	}
 	HANDLE hFile = CreateFileW(unicode_path.c_str(), desired_access, share_mode, NULL, creation_disposition,
 	                           flags_and_attributes, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) {
-		if (flags.ReturnNullIfNotExists() && GetLastError() == ERROR_FILE_NOT_FOUND) {
+		auto error_code = GetLastError();
+		if (flags.ReturnNullIfNotExists() && IsWindowsNotFoundError(error_code)) {
 			return nullptr;
 		}
+		SetLastError(error_code);
 		auto error = LocalFileSystem::GetLastErrorAsString();
 
 		auto extended_error = AdditionalLockInfo(unicode_path);
 		if (!extended_error.empty()) {
 			extended_error = "\n" + extended_error;
 		}
-		throw IOException("Cannot open file \"%s\": %s%s", path.c_str(), error, extended_error);
+		throw IOException(WindowsErrorInfo(error_code), "Cannot open file \"%s\": %s%s", path.c_str(), error,
+		                  extended_error);
 	}
 	auto handle = make_uniq<WindowsFileHandle>(*this, path.c_str(), hFile, flags);
 	if (flags.OpenForAppending()) {
@@ -1360,10 +1405,19 @@ bool LocalFileSystem::TryCanonicalizeExistingPath(string &input) {
 	DWORD len = GetFinalPathNameByHandleW(handle, resolved, MAX_PATH, FILE_NAME_NORMALIZED);
 	CloseHandle(handle);
 
-	if (len < 0 && len >= MAX_PATH) {
+	if (len == 0 || len >= MAX_PATH) {
 		return false;
 	}
-	input = WindowsUtil::UnicodeToUTF8(resolved);
+
+	std::wstring resolved_wstr(resolved, static_cast<size_t>(len));
+
+	if (resolved_wstr.find(WINDOWS_UNC_LONG_PATH_PREFIX) == 0) {
+		resolved_wstr = L"\\\\" + resolved_wstr.substr(WINDOWS_UNC_LONG_PATH_PREFIX.length());
+	} else if (resolved_wstr.find(WINDOWS_LOCAL_LONG_PATH_PREFIX) == 0) {
+		resolved_wstr = resolved_wstr.substr(WINDOWS_LOCAL_LONG_PATH_PREFIX.length());
+	}
+
+	input = WindowsUtil::UnicodeToUTF8(resolved_wstr.c_str());
 	return true;
 }
 
@@ -1510,15 +1564,7 @@ string LocalFileSystem::GetVersionTag(FileHandle &handle) {
 	if (fstat(fd, &s) == -1) {
 		throw IOException("Failed to get file size for file \"%s\": %s", handle.path, strerror(errno));
 	}
-
-	// dev/ino should be enough, but to guard against in-place writes we also add file size and modification time
-	uint64_t version_tag[4];
-	Store(NumericCast<uint64_t>(s.st_dev), data_ptr_cast(&version_tag[0]));
-	Store(NumericCast<uint64_t>(s.st_ino), data_ptr_cast(&version_tag[1]));
-	Store(NumericCast<uint64_t>(s.st_size), data_ptr_cast(&version_tag[2]));
-	Store(Timestamp::FromEpochSeconds(s.st_mtime).value, data_ptr_cast(&version_tag[3]));
-
-	return string(char_ptr_cast(version_tag), sizeof(uint64_t) * 4);
+	return GetPosixVersionTag(s);
 #endif
 }
 

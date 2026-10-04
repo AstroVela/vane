@@ -70,7 +70,7 @@ def test_run_write_parquet_does_not_crash_without_transient_relation_owner(tmp_p
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
-def test_scan_tasks_grouped_by_distributed_worker_slots(monkeypatch, tmp_path):
+def test_parquet_planning_emits_one_split_per_file_independent_of_worker_slots(monkeypatch, tmp_path):
     try:
         _runners.set_runner_ray()
     except Exception:
@@ -82,7 +82,6 @@ def test_scan_tasks_grouped_by_distributed_worker_slots(monkeypatch, tmp_path):
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "3")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "6")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1")
 
     source_path = tmp_path / "scan_grouping_input"
     con = vane.connect()
@@ -99,12 +98,12 @@ def test_scan_tasks_grouped_by_distributed_worker_slots(monkeypatch, tmp_path):
         relation = con.sql(f"SELECT id FROM read_parquet('{source_path}/**/*.parquet')")
         logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "scan-grouping-plan")
         distributed_plan = logical_plan.to_physical_plan(con)
-        scan_task_descriptors = distributed_plan.scan_task_descriptor_map()
-        assert scan_task_descriptors, "expected non-empty scan task descriptor map"
+        scan_split_batches = distributed_plan.scan_split_batch_map()
+        assert scan_split_batches, "expected non-empty scan split batch map"
 
-        descriptor_counts = [len(descriptors) for descriptors in scan_task_descriptors.values()]
-        assert descriptor_counts == [6], (
-            f"expected exactly one scan node with 6 scan task descriptors, got {descriptor_counts}"
+        split_counts = [len(batches) for batches in scan_split_batches.values()]
+        assert split_counts == [12], (
+            f"expected exactly one independently schedulable split per file, got {split_counts}"
         )
     finally:
         con.close()
@@ -112,7 +111,7 @@ def test_scan_tasks_grouped_by_distributed_worker_slots(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
-def test_scan_tasks_can_disable_size_grouping(monkeypatch, tmp_path):
+def test_file_splits_are_not_prebatched_by_extension_split_hint(monkeypatch, tmp_path):
     try:
         _runners.set_runner_ray()
     except Exception:
@@ -124,9 +123,7 @@ def test_scan_tasks_can_disable_size_grouping(monkeypatch, tmp_path):
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "3")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "6")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1GB")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MAX_BYTES", "2GB")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "32")
 
     source_path = tmp_path / "scan_disable_size_grouping_input"
     con = vane.connect()
@@ -143,20 +140,18 @@ def test_scan_tasks_can_disable_size_grouping(monkeypatch, tmp_path):
         relation = con.sql(f"SELECT id FROM read_parquet('{source_path}/**/*.parquet')")
         logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "scan-disable-size-grouping-plan")
         distributed_plan = logical_plan.to_physical_plan(con)
-        scan_task_descriptors = distributed_plan.scan_task_descriptor_map()
-        assert scan_task_descriptors, "expected non-empty scan task descriptor map"
+        scan_split_batches = distributed_plan.scan_split_batch_map()
+        assert scan_split_batches, "expected non-empty scan split batch map"
 
-        descriptor_counts = [len(descriptors) for descriptors in scan_task_descriptors.values()]
-        assert descriptor_counts == [6], (
-            f"expected count-based grouping when VANE_RAY_SCAN_TASK_SIZE_GROUPING=0, got {descriptor_counts}"
-        )
+        split_counts = [len(batches) for batches in scan_split_batches.values()]
+        assert split_counts == [12], f"expected file planning to remain one split per file, got {split_counts}"
     finally:
         con.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
-def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_path):
+def test_file_split_count_can_exceed_worker_slots(monkeypatch, tmp_path):
     try:
         _runners.set_runner_ray()
     except Exception:
@@ -168,8 +163,6 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
 
     monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
 
     source_path = tmp_path / "scan_min_partition_input"
     con = vane.connect()
@@ -186,19 +179,17 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
         relation = con.sql(f"SELECT id FROM read_parquet('{source_path}/**/*.parquet')")
         logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "scan-min-partition-plan")
         distributed_plan = logical_plan.to_physical_plan(con)
-        scan_task_descriptors = distributed_plan.scan_task_descriptor_map()
-        assert scan_task_descriptors, "expected non-empty scan task descriptor map"
+        scan_split_batches = distributed_plan.scan_split_batch_map()
+        assert scan_split_batches, "expected non-empty scan split batch map"
 
-        descriptor_counts = [len(descriptors) for descriptors in scan_task_descriptors.values()]
-        assert descriptor_counts == [8], (
-            f"expected min partition count above worker slots to produce 8 descriptors, got {descriptor_counts}"
-        )
+        split_counts = [len(batches) for batches in scan_split_batches.values()]
+        assert split_counts == [8], f"expected eight file splits despite two worker slots, got {split_counts}"
     finally:
         con.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
-def test_ray_runner_sets_scan_task_backlog_env(monkeypatch):
+def test_ray_runner_sets_scan_split_submission_backlog_env(monkeypatch):
     from vane.runners.ray import runner as ray_runner_mod
 
     monkeypatch.delenv("VANE_RAY_MAX_TASK_BACKLOG", raising=False)

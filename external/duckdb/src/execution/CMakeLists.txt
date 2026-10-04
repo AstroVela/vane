@@ -49,15 +49,8 @@ add_library_unity(
   udf_executor.cpp
   vllm_executor.cpp)
 
-# Include duckdb_execution and optionally the distributed execution module
-# object files
-if(BUILD_DISTRIBUTED)
-  set(ALL_OBJECT_FILES
-      ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_execution>
-      $<TARGET_OBJECTS:duckdb_execution_distributed>
-      PARENT_SCOPE)
-else()
-  set(ALL_OBJECT_FILES
-      ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_execution>
-      PARENT_SCOPE)
-endif()
+# Each child directory appends its own object targets to ALL_OBJECT_FILES.
+# Propagate that list together with this directory's target exactly once.
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_execution>
+    PARENT_SCOPE)

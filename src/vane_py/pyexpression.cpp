@@ -109,6 +109,32 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::Collate(const string &collati
 	return make_shared_ptr<DuckDBPyExpression>(std::move(collation_expression));
 }
 
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::AsFile(FileMediaType media_type) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(GetExpression().Copy());
+	if (media_type == FileMediaType::UNKNOWN) {
+		children.reserve(FileLogicalType::FIELD_COUNT);
+		for (idx_t index = 1; index < FileLogicalType::FIELD_COUNT; index++) {
+			children.push_back(make_uniq<duckdb::ConstantExpression>(Value()));
+		}
+	}
+	return InternalFunctionExpression(FileLogicalType::GetConstructorName(media_type), std::move(children));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileField(const string &field) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.reserve(2);
+	children.push_back(GetExpression().Copy());
+	children.push_back(make_uniq<duckdb::ConstantExpression>(Value(field)));
+	return InternalFunctionExpression("struct_extract", std::move(children));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileFunction(const string &function_name) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(GetExpression().Copy());
+	return InternalFunctionExpression(function_name, std::move(children));
+}
+
 // Case Expression modifiers
 
 void DuckDBPyExpression::AssertCaseExpression() const {

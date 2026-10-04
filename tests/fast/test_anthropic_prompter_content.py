@@ -145,3 +145,6 @@ def test_zero_max_tokens_prewarm_remains_successful(monkeypatch):
     prompter = _make_prompter(monkeypatch, [], stop_reason="max_tokens", max_tokens=0)
 
     assert asyncio.run(prompter.prompt(("hello",))) is None
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

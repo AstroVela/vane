@@ -9,10 +9,13 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/common/enums/stream_execution_result.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/pytype.hpp"
 #include "ray/safe_pyobject.hpp"
 
 #include <initializer_list>
@@ -200,6 +203,26 @@ static bool ResultPythonRuntimeUsable() {
 	return distributed::python::ray::SafePyObjectCanDecRef();
 }
 
+static bool DistributedResultTypeMatches(const LogicalType &actual, const LogicalType &expected) {
+	return GovernedLogicalType::IsCanonicalStorageType(actual, expected);
+}
+
+static void ValidateDistributedImageColumn(const py::object &column, const LogicalType &expected, idx_t partition_index,
+                                           idx_t column_index) {
+	if (!TypeVisitor::Contains(expected, ImageLogicalType::IsImage)) {
+		return;
+	}
+	auto boundary = StringUtil::Format("Distributed result partition %d column %d", partition_index, column_index);
+	try {
+		// Reuse the UDF boundary validator so distributed admission applies the same recursive IMAGE invariants.
+		// It validates pixel lengths, validity, and layout without Python pixel materialization.
+		auto validator = py::module_::import("vane.execution.udf_file_contract").attr("validate_file_arrow_array");
+		validator(column, make_shared_ptr<DuckDBPyType>(expected), py::arg("boundary") = boundary);
+	} catch (py::error_already_set &ex) {
+		throw InvalidInputException("%s failed IMAGE validation: %s", boundary, ex.what());
+	}
+}
+
 //! Flattens the iterator of pyarrow.Table partitions into one Arrow C stream.
 //! The external schema is derived from the relation rather than partition
 //! field names (distributed partitions currently use positional c0/c1 names).
@@ -207,7 +230,8 @@ struct DistributedArrowStreamOwner {
 	DistributedArrowStreamOwner(py::object iterator_p, py::object prefetched_partition_p, bool has_prefetched_partition,
 	                            bool iterator_exhausted, vector<string> names_p, vector<LogicalType> types_p,
 	                            const shared_ptr<ClientContext> &context_p, idx_t rows_per_batch_p)
-	    : iterator(SafePyObject(py::iter(iterator_p))), names(std::move(names_p)), types(std::move(types_p)),
+	    : interrupt_exception(SafePyObject(py::module_::import("vane._native").attr("InterruptException"))),
+	      iterator(SafePyObject(py::iter(iterator_p))), names(std::move(names_p)), types(std::move(types_p)),
 	      context(context_p), client_properties(context_p->GetClientProperties()), rows_per_batch(rows_per_batch_p),
 	      exhausted(iterator_exhausted) {
 		if (has_prefetched_partition) {
@@ -258,6 +282,7 @@ struct DistributedArrowStreamOwner {
 		try {
 			return self->Next(out);
 		} catch (py::error_already_set &ex) {
+			self->interrupted = ex.matches(self->interrupt_exception.get().ptr());
 			self->Fail(ex.what());
 			return -1;
 		} catch (std::exception &ex) {
@@ -375,7 +400,7 @@ struct DistributedArrowStreamOwner {
 				                            partition_index, actual_types.size(), types.size());
 			}
 			for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
-				if (actual_types[col_idx] != types[col_idx]) {
+				if (!DistributedResultTypeMatches(actual_types[col_idx], types[col_idx])) {
 					throw InvalidInputException("Distributed result partition %d column %d has type %s, expected %s",
 					                            partition_index, col_idx, actual_types[col_idx].ToString(),
 					                            types[col_idx].ToString());
@@ -416,6 +441,26 @@ struct DistributedArrowStreamOwner {
 			    py::cast<string>(actual_type.attr("type_name")) != py::cast<string>(expected_type.attr("type_name")) ||
 			    py::cast<string>(actual_type.attr("vendor_name")) !=
 			        py::cast<string>(expected_type.attr("vendor_name"))) {
+				return false;
+			}
+		} else if (extension_name == "arrow.fixed_shape_tensor") {
+			for (const auto *attribute : {"shape", "permutation", "dim_names"}) {
+				if (!py::hasattr(actual_type, attribute) || !py::hasattr(expected_type, attribute) ||
+				    !py::cast<bool>(actual_type.attr(attribute).attr("__eq__")(expected_type.attr(attribute)))) {
+					return false;
+				}
+			}
+		} else if (extension_name == "arrow.variable_shape_tensor") {
+			auto validate = py::module_::import("vane._tensor").attr("_validate_arrow_tensor_type");
+			auto actual_tensor = validate(actual_type);
+			auto expected_tensor = validate(expected_type);
+			if (!py::cast<bool>(
+			        actual_tensor.attr("uniform_shape").attr("__eq__")(expected_tensor.attr("uniform_shape")))) {
+				return false;
+			}
+		} else if (extension_name == "vane.image") {
+			if (!py::cast<bool>(actual_type.attr("__arrow_ext_serialize__")().attr("__eq__")(
+			        expected_type.attr("__arrow_ext_serialize__")()))) {
 				return false;
 			}
 		} else if (extension_name != "arrow.json") {
@@ -668,13 +713,15 @@ struct DistributedArrowStreamOwner {
 			auto column = table.attr("column")(col_idx);
 			py::object expected_type = schema.attr("field")(col_idx).attr("type");
 			auto actual_type = column.attr("type");
-			if (!py::cast<bool>(actual_type.attr("equals")(expected_type))) {
-				if (!CanNormalizeArrowType(actual_type, expected_type, type_predicates)) {
-					throw InvalidInputException(
-					    "Distributed result partition %d column %d has Arrow type %s, expected %s for DuckDB type %s",
-					    partition_index, col_idx, py::cast<string>(py::str(actual_type)),
-					    py::cast<string>(py::str(expected_type)), types[col_idx].ToString());
-				}
+			auto needs_normalization = !py::cast<bool>(actual_type.attr("equals")(expected_type));
+			if (needs_normalization && !CanNormalizeArrowType(actual_type, expected_type, type_predicates)) {
+				throw InvalidInputException(
+				    "Distributed result partition %d column %d has Arrow type %s, expected %s for DuckDB type %s",
+				    partition_index, col_idx, py::cast<string>(py::str(actual_type)),
+				    py::cast<string>(py::str(expected_type)), types[col_idx].ToString());
+			}
+			ValidateDistributedImageColumn(column, types[col_idx], partition_index, col_idx);
+			if (needs_normalization) {
 				try {
 					column = NormalizeArrowColumn(column, expected_type, pyarrow, type_predicates);
 				} catch (py::error_already_set &ex) {
@@ -726,6 +773,9 @@ struct DistributedArrowStreamOwner {
 	}
 
 	ArrowArrayStream stream;
+	SafePyObject interrupt_exception;
+	// An exported Arrow reader owns the connection independently of its cursor.
+	SafePyObject pinned_connection;
 	SafePyObject iterator;
 	SafePyObject prefetched_partition;
 	vector<string> names;
@@ -738,6 +788,7 @@ struct DistributedArrowStreamOwner {
 	bool exhausted = false;
 	bool closed = false;
 	bool failed = false;
+	bool interrupted = false;
 	string last_error;
 };
 
@@ -745,8 +796,10 @@ class DistributedArrowResultSource : public DuckDBPyResultSource {
 public:
 	DistributedArrowResultSource(py::object table_iterator, py::object prefetched_partition,
 	                             bool has_prefetched_partition_p, bool iterator_exhausted_p, vector<string> names,
-	                             vector<LogicalType> types, const shared_ptr<ClientContext> &context_p)
-	    : iterator(SafePyObject(std::move(table_iterator))), has_prefetched_partition(has_prefetched_partition_p),
+	                             vector<LogicalType> types, const shared_ptr<ClientContext> &context_p,
+	                             py::object connection_owner_p)
+	    : connection_owner(SafePyObject(std::move(connection_owner_p))),
+	      iterator(SafePyObject(std::move(table_iterator))), has_prefetched_partition(has_prefetched_partition_p),
 	      iterator_exhausted(iterator_exhausted_p), context(context_p) {
 		if (!context) {
 			throw InternalException("DistributedArrowResultSource created without a context");
@@ -777,7 +830,16 @@ public:
 		while (!current_scan ||
 		       current_scan->chunk_offset >= NumericCast<idx_t>(current_scan->chunk->arrow_array.length)) {
 			current_scan.reset();
-			auto array = stream->GetNextChunk();
+			shared_ptr<ArrowArrayWrapper> array;
+			try {
+				array = stream->GetNextChunk();
+			} catch (...) {
+				auto owner = reinterpret_cast<DistributedArrowStreamOwner *>(stream->arrow_array_stream.private_data);
+				if (owner->interrupted) {
+					throw InterruptException();
+				}
+				throw;
+			}
 			if (!array || !array->arrow_array.release) {
 				stream.reset();
 				closed = true;
@@ -816,6 +878,14 @@ public:
 			throw InvalidInputException("result closed");
 		}
 		auto result = stream->arrow_array_stream;
+		{
+			PythonGILWrapper gil;
+			auto owner = DuckDBPyConnection::ResolveOwner(connection_owner.get());
+			// Promote a connection-owned cursor's weak reference only as the
+			// stream leaves the connection. Row consumption must stay cycle-free.
+			auto stream_owner = reinterpret_cast<DistributedArrowStreamOwner *>(result.private_data);
+			stream_owner->pinned_connection = SafePyObject(std::move(owner));
+		}
 		stream->arrow_array_stream.release = nullptr;
 		stream.reset();
 		closed = true;
@@ -881,6 +951,7 @@ private:
 	}
 
 	DuckDBPyResultMetadata metadata;
+	SafePyObject connection_owner;
 	SafePyObject iterator;
 	SafePyObject prefetched_partition;
 	bool has_prefetched_partition;
@@ -902,10 +973,11 @@ unique_ptr<DuckDBPyResultSource> MakeLocalPyResultSource(unique_ptr<QueryResult>
 unique_ptr<DuckDBPyResultSource>
 MakeDistributedArrowPyResultSource(py::object table_iterator, py::object prefetched_partition,
                                    bool has_prefetched_partition, bool iterator_exhausted, vector<string> names,
-                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context) {
+                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context,
+                                   py::object connection_owner) {
 	return make_uniq<DistributedArrowResultSource>(std::move(table_iterator), std::move(prefetched_partition),
 	                                               has_prefetched_partition, iterator_exhausted, std::move(names),
-	                                               std::move(types), context);
+	                                               std::move(types), context, std::move(connection_owner));
 }
 
 } // namespace duckdb

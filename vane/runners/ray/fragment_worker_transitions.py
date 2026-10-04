@@ -21,7 +21,7 @@ from vane.runners.ray.fte_fragment_scheduler import (
     _fte_pressure_total_memory_bytes,
     _ordered_fte_fragment_execution_items_for_pending_drain,
     _required_fte_pressure_stats,
-    _sync_write_sink_unit_for_fragment,
+    _sync_fte_fragment_resource_state,
     fte_registry_query_is_closing,
 )
 
@@ -128,7 +128,7 @@ class FteWorkerTransitionMixin:
                 reason=reason,
             )
             fragment_execution_revoked = list(result.revoked)
-            _sync_write_sink_unit_for_fragment(fragment_execution)
+            _sync_fte_fragment_resource_state(fragment_execution)
             revoked.extend(fragment_execution_revoked)
             for failure in result.failures:
                 self._handles_for_fte_worker_control_failure(failure)

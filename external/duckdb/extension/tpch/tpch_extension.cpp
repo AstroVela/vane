@@ -171,6 +171,7 @@ static string PragmaTpchQuery(ClientContext &context, const FunctionParameters &
 
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction dbgen_func("dbgen", {}, DbgenFunction, DbgenBind);
+	dbgen_func.SetRequiresClientContext();
 	dbgen_func.named_parameters["sf"] = LogicalType::DOUBLE;
 	dbgen_func.named_parameters["overwrite"] = LogicalType::BOOLEAN;
 	dbgen_func.named_parameters["catalog"] = LogicalType::VARCHAR;

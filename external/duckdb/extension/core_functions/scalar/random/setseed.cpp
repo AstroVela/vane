@@ -60,6 +60,7 @@ ScalarFunction SetseedFun::GetFunction() {
 	ScalarFunction setseed("setseed", {LogicalType::DOUBLE}, LogicalType::SQLNULL, SetSeedFunction, SetSeedBind);
 	setseed.SetVolatile();
 	setseed.SetFallible();
+	setseed.SetRequiresClientContext();
 	return setseed;
 }
 

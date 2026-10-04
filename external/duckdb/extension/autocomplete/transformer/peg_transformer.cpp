@@ -76,7 +76,7 @@ unique_ptr<SQLStatement> PEGTransformer::GenerateCreateEnumStmt(unique_ptr<Creat
 	if (!entry->subquery) {
 		auto select_node = std::move(entry->base);
 		auto columnref = entry->column->Copy();
-		auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(columnref));
+		auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(columnref), false, true);
 		select_node->select_list.push_back(std::move(cast));
 
 		auto is_not_null =
@@ -92,6 +92,7 @@ unique_ptr<SQLStatement> PEGTransformer::GenerateCreateEnumStmt(unique_ptr<Creat
 		subselect = std::move(select_node);
 	} else {
 		subselect = std::move(entry->subquery);
+		info->query_internal_file_formatting = true;
 	}
 
 	auto select = make_uniq<SelectStatement>();
@@ -113,10 +114,13 @@ unique_ptr<SQLStatement> PEGTransformer::CreatePivotStatement(unique_ptr<SQLStat
 			    "PIVOT ... ON %s IN (val1, val2, ...)",
 			    pivot->column->ToString());
 		}
-		result->statements.push_back(GenerateCreateEnumStmt(std::move(pivot)));
+		auto enum_stmt = GenerateCreateEnumStmt(std::move(pivot));
+		enum_stmt->query = enum_stmt->ToString();
+		result->statements.push_back(std::move(enum_stmt));
 	}
 	result->stmt_location = statement->stmt_location;
 	result->stmt_length = statement->stmt_length;
+	statement->query = statement->ToString();
 	result->statements.push_back(std::move(statement));
 	return std::move(result);
 }
@@ -156,6 +160,14 @@ unique_ptr<WindowExpression> PEGTransformer::GetWindowClause(const string &windo
 		throw ParserException("window \"%s\" does not exist", window_name);
 	}
 	return unique_ptr_cast<ParsedExpression, WindowExpression>(it->second->Copy());
+}
+
+void PEGTransformer::SetQueryLocation(ParsedExpression &expr, optional_idx query_location) {
+	expr.SetQueryLocation(query_location);
+}
+
+void PEGTransformer::SetQueryLocation(TableRef &ref, optional_idx query_location) {
+	ref.query_location = query_location;
 }
 
 } // namespace duckdb

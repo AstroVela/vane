@@ -36,14 +36,14 @@ struct BoundCreateTableInfo {
 	ColumnDependencyManager column_dependency_manager;
 	//! List of constraints on the table
 	vector<unique_ptr<Constraint>> constraints;
-	//! Dependents of the table (in e.g. default values)
-	LogicalDependencyList dependencies;
 	//! The existing table data on disk (if any)
 	unique_ptr<PersistentTableData> data;
 	//! CREATE TABLE from QUERY
 	unique_ptr<LogicalOperator> query;
 	//! Indexes created by this table
 	vector<IndexStorageInfo> indexes;
+	//! Preserve the persisted table-incarnation identity when restoring catalog state
+	bool preserve_logical_write_target_identity = false;
 
 	CreateTableInfo &Base() {
 		D_ASSERT(base);

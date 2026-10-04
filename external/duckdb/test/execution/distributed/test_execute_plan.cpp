@@ -76,8 +76,8 @@ TEST_CASE("Pipeline produce_tasks: basic pipeline (scan->proj->filter)", "[distr
 	empty_plan->SetRoot(dummy);
 
 	SchemaRef scan_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
-	std::vector<ScanTaskDescriptor> scan_tasks;
-	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_tasks,
+	std::vector<ScanSplit> scan_splits;
+	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_splits,
 	                                                  scan_schema, DuckDBExecutionConfigRef(), false);
 	ExpressionRef proj_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(42));
 	std::vector<std::string> proj_names;
@@ -116,8 +116,8 @@ TEST_CASE("Pipeline produce_tasks yields a task with a printable plan", "[distri
 	empty_plan->SetRoot(dummy);
 
 	SchemaRef scan_schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
-	std::vector<ScanTaskDescriptor> scan_tasks;
-	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_tasks,
+	std::vector<ScanSplit> scan_splits;
+	auto scan_impl = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 1, "scan"), empty_plan, scan_splits,
 	                                                  scan_schema, DuckDBExecutionConfigRef(), false);
 	ExpressionRef proj_expr = std::make_shared<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(42));
 	std::vector<std::string> proj_names;

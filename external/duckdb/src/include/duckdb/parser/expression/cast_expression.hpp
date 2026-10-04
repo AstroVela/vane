@@ -19,14 +19,17 @@ public:
 	static constexpr const ExpressionClass TYPE = ExpressionClass::CAST;
 
 public:
-	DUCKDB_API CastExpression(LogicalType target, unique_ptr<ParsedExpression> child, bool try_cast = false);
+	DUCKDB_API CastExpression(LogicalType target, unique_ptr<ParsedExpression> child, bool try_cast = false,
+	                          bool file_internal_formatting = false);
 
 	//! The child of the cast expression
 	unique_ptr<ParsedExpression> child;
 	//! The type to cast to
 	LogicalType cast_type;
 	//! Whether or not this is a try_cast expression
-	bool try_cast;
+	bool try_cast = false;
+	//! Whether this engine-generated cast may format FILE-family values as VARCHAR.
+	bool file_internal_formatting = false;
 
 public:
 	string ToString() const override;

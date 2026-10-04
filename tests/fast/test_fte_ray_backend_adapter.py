@@ -216,6 +216,9 @@ class _FakeCoordinator:
     def materialization_barrier_completed(self, query_id, node_id):
         self.calls.append(("materialization_barrier_completed", (query_id, node_id)))
 
+    def task_production_finished(self, query_id):
+        self.calls.append(("task_production_finished", (query_id,)))
+
     def wait_fte_query(self, query_id, timeout_s):
         self.calls.append(("wait_fte_query", (query_id, timeout_s)))
         return {"query_id": query_id, "finished": True, "failed": False}
@@ -256,6 +259,7 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
     exhausted = backend.task_input_stream_exhausted("query-a", ("source-a",))
     assert [handle.poll().output for handle in exhausted] == ["exhausted"]
     backend.materialization_barrier_completed("query-a", "7")
+    backend.task_production_finished("query-a")
     handles = backend.wait_query("query-a", 2.0)
 
     assert [handle.poll().output for handle in handles] == ["popped"]
@@ -268,11 +272,29 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
         ("submit_tasks", ([{"query_id": "query-a", "resource_query_id": "query-a"}],)),
         ("task_input_stream_exhausted_for_query", ("query-a", ["source-a"])),
         ("materialization_barrier_completed", ("query-a", "7")),
+        ("task_production_finished", ("query-a",)),
         ("wait_fte_query", ("query-a", 2.0)),
         ("pop_fte_result_handles", ("query-a",)),
         ("fte_drop_query", ("query-a",)),
         ("shutdown", ()),
     ]
+
+
+def test_only_root_query_can_finish_native_task_production():
+    coordinator = _FakeCoordinator()
+    backend = RayWorkerManagerBackend(coordinator)
+    backend.register_query_owner("root", "root")
+    backend.register_query_owner("child", "root")
+    with pytest.raises(ValueError, match="requires the root resource query"):
+        backend.task_production_finished("child")
+    assert coordinator.calls == []
+    backend.task_production_finished(" root ")
+    assert coordinator.calls == [("task_production_finished", ("root",))]
+    # Rejecting a child must release its operation guard, allowing teardown.
+    dropped = threading.Thread(target=lambda: backend.drop_query("root"), daemon=True)
+    dropped.start()
+    dropped.join(timeout=5)
+    assert not dropped.is_alive()
 
 
 def test_ray_worker_manager_backend_requires_fte_drop_query_contract():

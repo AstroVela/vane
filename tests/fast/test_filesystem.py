@@ -73,6 +73,26 @@ class TestPythonFilesystem:
 
         duckdb_cursor.unregister_filesystem("memory")
 
+    def test_file_resolver_fails_before_registered_python_io(
+        self,
+        duckdb_cursor: DuckDBPyConnection,
+        memory: fsspec.AbstractFileSystem,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        duckdb_cursor.register_filesystem(memory)
+
+        def unexpected_open(*_args, **_kwargs):
+            pytest.fail("FILE resolver attempted registered Python filesystem I/O")
+
+        monkeypatch.setattr(memory, "open", unexpected_open)
+        with pytest.raises(vane.NotImplementedException, match="Nonblocking opens are not supported"):
+            duckdb_cursor.execute("SELECT to_file('memory://integers.csv')")
+
+        assert duckdb_cursor.execute("SELECT try_to_file('memory://integers.csv') IS NULL").fetchone() == (True,)
+        assert duckdb_cursor.execute(
+            "SELECT file_exists(file('memory://integers.csv', NULL, NULL, NULL, NULL)) IS NULL"
+        ).fetchone() == (True,)
+
     def test_reject_abstract_filesystem(self, duckdb_cursor: DuckDBPyConnection):
         with pytest.raises(InvalidInputException):
             duckdb_cursor.register_filesystem(fsspec.AbstractFileSystem())

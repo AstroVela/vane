@@ -31,7 +31,12 @@ void ArrowArrayScanState::AddDictionary(unique_ptr<Vector> dictionary_p, ArrowAr
 	D_ASSERT(arrow_dict);
 	arrow_dictionary = arrow_dict;
 	// Make sure the data referenced by the dictionary stays alive
-	dictionary->GetBuffer()->SetAuxiliaryData(make_uniq<ArrowAuxiliaryData>(owned_data));
+	auto buffer = dictionary->GetBuffer();
+	if (!buffer) {
+		// STRUCT and ARRAY vectors keep their storage in the auxiliary buffer.
+		buffer = dictionary->GetAuxiliary();
+	}
+	buffer->SetAuxiliaryData(make_uniq<ArrowAuxiliaryData>(owned_data));
 }
 
 bool ArrowArrayScanState::HasDictionary() const {

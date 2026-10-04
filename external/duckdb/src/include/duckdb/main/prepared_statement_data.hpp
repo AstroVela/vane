@@ -41,6 +41,8 @@ public:
 
 	//! The statement properties
 	StatementProperties properties;
+	//! A query-local handler took ownership of the bound plan before native planning.
+	bool bound_plan_exported = false;
 
 	//! The map of parameter index to the actual value entry
 	bound_parameter_map_t value_map;

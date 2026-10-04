@@ -176,6 +176,11 @@
         "id": 402,
         "name": "cascade",
         "type": "bool"
+      },
+      {
+        "id": 403,
+        "name": "new_logical_write_target_identity",
+        "type": "string"
       }
     ]
   },
@@ -692,6 +697,17 @@
         "id": 201,
         "name": "modifier",
         "type": "TransactionModifierType"
+      },
+      {
+        "id": 202,
+        "name": "invalidation_policy",
+        "type": "TransactionInvalidationPolicy",
+        "default" : "TransactionInvalidationPolicy::STANDARD_POLICY"
+      },
+      {
+        "id": 203,
+        "name": "auto_rollback",
+        "type": "bool"
       }
     ]
   },

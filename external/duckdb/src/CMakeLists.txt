@@ -93,6 +93,10 @@ set(DUCKDB_LINK_LIBS
     duckdb_yyjson
     duckdb_zstd)
 
+if(JEMALLOC_ENABLED)
+  list(APPEND DUCKDB_LINK_LIBS duckdb_jemalloc)
+endif()
+
 foreach(LINK_LIB ${DUCKDB_LINK_LIBS})
   list(APPEND LINK_OBJECTS $<TARGET_OBJECTS:${LINK_LIB}>)
 endforeach(LINK_LIB)
@@ -115,8 +119,10 @@ link_extension_libraries(duckdb PRIVATE)
 link_threads(duckdb PUBLIC)
 
 if(DUCKDB_DISTRIBUTED_LINK_LIBS)
-  target_link_libraries(duckdb_static PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
-  target_link_libraries(duckdb PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+  # Static consumers still receive the concrete libraries as link-only
+  # dependencies, without inheriting Arrow's C++20 compile requirement.
+  target_link_libraries(duckdb_static PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+  target_link_libraries(duckdb PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
 endif()
 
 if(SET_DUCKDB_LIBRARY_VERSION)
@@ -152,9 +158,11 @@ install(
   FILES_MATCHING
   PATTERN "*.hpp"
   PATTERN "*.ipp")
-install(FILES "${PROJECT_SOURCE_DIR}/src/include/duckdb.hpp"
-              "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
-        DESTINATION "${INSTALL_INCLUDE_DIR}")
+install(
+  FILES "${PROJECT_SOURCE_DIR}/src/include/duckdb.hpp"
+        "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
+        "${PROJECT_SOURCE_DIR}/src/include/duckdb_extension.h"
+  DESTINATION "${INSTALL_INCLUDE_DIR}")
 
 install(
   TARGETS duckdb duckdb_static

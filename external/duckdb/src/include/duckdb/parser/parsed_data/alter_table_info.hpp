@@ -239,6 +239,8 @@ struct RemoveColumnInfo : public AlterTableInfo {
 	bool if_column_exists;
 	//! Whether or not the column should be removed if a dependency conflict arises (used by GENERATED columns)
 	bool cascade;
+	//! Fresh table-incarnation identity selected for this physical remapping
+	string new_logical_write_target_identity;
 
 public:
 	unique_ptr<AlterInfo> Copy() const override;

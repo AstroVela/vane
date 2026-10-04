@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - "release/**"
   schedule:
     - cron: "43 2 * * 3"
   workflow_dispatch:
@@ -31,7 +32,7 @@ jobs:
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
-          deny-licenses: AGPL-1.0-only, AGPL-3.0-only, GPL-2.0-only, GPL-3.0-only, SSPL-1.0
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, GPL-1.0-only, GPL-1.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, SSPL-1.0
 
   codeql:
     name: CodeQL (${{ matrix.language }})
@@ -81,14 +82,15 @@ jobs:
             "cmake>=3.29" \
             "ninja>=1.10" \
             "pybind11[global]>=3.0.0" \
-            "scikit-build-core>=0.11.4"
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
 
       - name: Restore vcpkg binary cache
         if: matrix.language == 'c-cpp'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: codeql-vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-${{ hashFiles('vcpkg.json') }}
+          key: codeql-vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-release-${{ hashFiles('vcpkg.json') }}
 
       - name: Install pinned native dependencies
         if: matrix.language == 'c-cpp'

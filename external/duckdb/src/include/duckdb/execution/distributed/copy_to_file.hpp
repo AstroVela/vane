@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include "duckdb/common/enums/copy_overwrite_mode.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/filename_pattern.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -105,6 +106,34 @@ struct DistributedCopyResult {
 
 // ── Shared path utilities (used by scheduler + worker) ──────────────────────
 
+inline bool DistributedCopyPathHasProtocol(FileSystem &fs, const std::string &path) {
+	auto protocol = path.find("://");
+	if (protocol == std::string::npos) {
+		return false;
+	}
+	// A Windows drive path such as C://output is not a URI.
+	return !(protocol == 1 && fs.PathSeparator(path) == "\\" && fs.IsPathAbsolute(path));
+}
+
+inline std::string DistributedCopyPathSeparator(FileSystem &fs, const std::string &path) {
+	return DistributedCopyPathHasProtocol(fs, path) ? std::string("/") : fs.PathSeparator(path);
+}
+
+inline std::string NormalizeDistributedCopyPathForComparison(FileSystem &fs, const std::string &path) {
+	// Object-store keys use URI semantics even when the coordinator runs on
+	// Windows. Only normalize local paths, where Win32 accepts both separators
+	// but directory enumeration returns the native representation.
+	return DistributedCopyPathHasProtocol(fs, path) ? path : fs.ConvertSeparators(path);
+}
+
+inline std::string JoinDistributedCopyPath(FileSystem &fs, const std::string &base, const std::string &child) {
+	if (base.empty()) {
+		return child;
+	}
+	auto separator = DistributedCopyPathSeparator(fs, base);
+	return StringUtil::EndsWith(base, separator) ? base + child : base + separator + child;
+}
+
 inline bool IsDistributedCopyOutputPlaceholder(const std::string &path) {
 	return StringUtil::StartsWith(path, DISTRIBUTED_COPY_OUTPUT_PLACEHOLDER_PREFIX);
 }
@@ -192,6 +221,14 @@ inline std::string BuildCopyDirectTargetFilePath(const std::string &base_path, c
                                                  const std::string &separator = "/") {
 	auto root = NormalizeCopyDirectWriteRoot(base_path, separator);
 	return BuildCopyPathUnderRoot(root, BuildCopyDirectTargetFileName(run_id, worker_dir_name, file_name), separator);
+}
+
+inline std::string BuildCopyDirectTargetFilePath(FileSystem &fs, const std::string &base_path,
+                                                 const std::string &run_id, const std::string &worker_dir_name,
+                                                 const std::string &file_name) {
+	auto normalized_base_path = NormalizeDistributedCopyPathForComparison(fs, base_path);
+	return BuildCopyDirectTargetFilePath(normalized_base_path, run_id, worker_dir_name, file_name,
+	                                     DistributedCopyPathSeparator(fs, normalized_base_path));
 }
 
 inline std::string BuildCopyDirectTargetFilenamePattern(const std::string &run_id, const std::string &worker_dir_name) {

@@ -14,7 +14,6 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/built_in_functions.hpp"
-#include "duckdb/function/extension_file_list_provider.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
 namespace duckdb {
@@ -22,10 +21,11 @@ namespace duckdb {
 //! C callback type: given pickled task bytes, produce an ArrowArrayStream
 //! The callback must:
 //!   1. Unpickle the bytes into a DataSourceTask object
-//!   2. Call task.execute() to get a generator
+//!   2. Call the task's context-aware execution hook to get a generator
 //!   3. Wrap the generator into a RecordBatchReader
 //!   4. Export via _export_to_c into the ArrowArrayStream
-typedef void (*datasource_produce_stream_t)(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream);
+typedef void (*datasource_produce_stream_t)(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
+                                            ClientContext *execution_context);
 
 //! C callback type: given a serialized logical source package, produce the Arrow schema
 typedef void (*datasource_get_schema_t)(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
@@ -38,7 +38,7 @@ typedef void (*datasource_acquire_source_t)(const char *pickled_source, idx_t pi
                                             idx_t query_id_len);
 typedef void (*datasource_release_source_t)(const char *pickled_source, idx_t pickled_len);
 
-struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileListProvider {
+struct DataSourceScanBindData : public TableFunctionData {
 	//! Pickled DataSourceTask objects, one per task
 	vector<string> pickled_tasks;
 	//! Serialized logical source package (for schema extraction on workers)
@@ -49,6 +49,11 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileLi
 	datasource_produce_stream_t produce_stream;
 	//! Arrow schema metadata
 	ArrowTableSchema arrow_table;
+	//! Optional source cardinality captured by a planner-side rewrite.
+	optional_idx estimated_cardinality;
+	//! Native memory snapshots may erase ENUM identity and governed aliases in
+	//! Arrow storage. Only these validated transport conversions are permitted.
+	vector<LogicalType> snapshot_types;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DataSourceScanBindData>();
@@ -57,14 +62,10 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileLi
 		result->query_id = query_id;
 		result->produce_stream = produce_stream;
 		result->arrow_table = arrow_table;
+		result->estimated_cardinality = estimated_cardinality;
+		result->snapshot_types = snapshot_types;
 		return std::move(result);
 	}
-
-	//! ExtensionFileListProvider: encode each pickled task as a fake file path
-	vector<string> GetFileList() const override;
-
-	//! ExtensionFileListProvider: decode fake file paths back to pickled tasks
-	void SetFileList(const vector<string> &files) override;
 };
 
 struct DataSourceScanGlobalState : public GlobalTableFunctionState {
@@ -78,6 +79,7 @@ struct DataSourceScanGlobalState : public GlobalTableFunctionState {
 	datasource_release_source_t release_source = nullptr;
 	string pickled_source;
 	bool release_source_on_destroy = false;
+	vector<LogicalType> snapshot_storage_types;
 
 	idx_t MaxThreads() const override {
 		return total_tasks;
@@ -99,6 +101,8 @@ struct DataSourceScanLocalState : public LocalTableFunctionState {
 	unique_ptr<ArrowArrayStreamWrapper> stream;
 	//! Current Arrow batch and conversion offset, retained across output vectors
 	ArrowScanLocalState scan_state;
+	//! Arrow storage vectors before restoring native snapshot logical types.
+	DataChunk snapshot_chunk;
 	//! Explicit scan state for task, batch, and output-vector transitions
 	ScanState state = ScanState::NEED_TASK;
 };
@@ -106,6 +110,7 @@ struct DataSourceScanLocalState : public LocalTableFunctionState {
 struct DataSourceScanFunction {
 	static TableFunction GetFunction();
 	static void RegisterFunction(BuiltinFunctions &set);
+	static void SetSnapshotTypes(DataSourceScanBindData &bind_data, const vector<LogicalType> &types);
 
 	//! Register a global produce_stream callback for use on distributed workers.
 	//! Should be called once when the Python module loads.

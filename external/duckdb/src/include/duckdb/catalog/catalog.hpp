@@ -132,6 +132,11 @@ public:
 	DUCKDB_API const string &GetName() const;
 	DUCKDB_API idx_t GetOid();
 	DUCKDB_API virtual string GetCatalogType() = 0;
+	//! Whether a transported bound plan needs this catalog attached while it is deserialized.
+	//! Only opt out if every supported scan serializes self-contained bind state or physical paths.
+	virtual bool RequiresAttachmentForPlanDeserialization() const {
+		return true;
+	}
 
 	DUCKDB_API CatalogTransaction GetCatalogTransaction(ClientContext &context);
 
@@ -429,7 +434,7 @@ private:
 	                                  const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found);
 	static CatalogEntryLookup TryLookupEntry(CatalogEntryRetriever &retriever, const vector<CatalogLookup> &lookups,
 	                                         const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found,
-	                                         bool allow_default_table_lookup);
+	                                         bool allow_default_lookup);
 	static CatalogEntryLookup TryLookupEntry(CatalogEntryRetriever &retriever, const string &catalog,
 	                                         const string &schema, const EntryLookupInfo &lookup_info,
 	                                         OnEntryNotFound if_not_found);
@@ -438,6 +443,10 @@ private:
 	static CatalogEntryLookup TryLookupDefaultTable(CatalogEntryRetriever &retriever,
 	                                                const EntryLookupInfo &lookup_info,
 	                                                bool allow_ignore_at_clause = false);
+
+	//! Looks for a non-table entry in the default schema of any implicit search catalog
+	static CatalogEntryLookup TryLookupDefaultSchema(CatalogEntryRetriever &retriever,
+	                                                 const EntryLookupInfo &lookup_info);
 
 	//! Return an exception with did-you-mean suggestion.
 	static CatalogException CreateMissingEntryException(CatalogEntryRetriever &retriever,

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -12,7 +18,8 @@
 
 namespace duckdb {
 
-BaseStatistics::BaseStatistics() : type(LogicalType::INVALID) {
+BaseStatistics::BaseStatistics() : type(LogicalType::INVALID), has_null(false), has_no_null(false), distinct_count(0) {
+	memset(&stats_union, 0, sizeof(stats_union));
 }
 
 BaseStatistics::BaseStatistics(LogicalType type) {
@@ -20,7 +27,10 @@ BaseStatistics::BaseStatistics(LogicalType type) {
 }
 
 void BaseStatistics::Construct(BaseStatistics &stats, LogicalType type) {
+	stats.has_null = false;
+	stats.has_no_null = false;
 	stats.distinct_count = 0;
+	memset(&stats.stats_union, 0, sizeof(stats.stats_union));
 	stats.type = std::move(type);
 	switch (GetStatsType(stats.type)) {
 	case StatisticsType::LIST_STATS:
@@ -526,6 +536,28 @@ void BaseStatistics::Verify(Vector &vector, idx_t count) const {
 }
 
 BaseStatistics BaseStatistics::FromConstantType(const Value &input) {
+	if (auto bytes = ByteSequenceValue::TryGet(input)) {
+		auto pixel = input.type().id() == LogicalTypeId::LIST ? ListType::GetChildType(input.type())
+		                                                      : ArrayType::GetChildType(input.type());
+		if (pixel != LogicalType::UTINYINT) {
+			return CreateUnknown(input.type());
+		}
+		auto result = CreateEmpty(input.type());
+		if (!bytes->empty()) {
+			auto &child = input.type().id() == LogicalTypeId::LIST ? ListStats::GetChildStats(result)
+			                                                       : ArrayStats::GetChildStats(result);
+			uint8_t minimum = NumericLimits<uint8_t>::Maximum();
+			uint8_t maximum = 0;
+			for (auto byte : *bytes) {
+				minimum = MinValue(minimum, uint8_t(byte));
+				maximum = MaxValue(maximum, uint8_t(byte));
+			}
+			NumericStats::SetMin(child, minimum);
+			NumericStats::SetMax(child, maximum);
+			child.SetHasNoNull();
+		}
+		return result;
+	}
 	switch (GetStatsType(input.type())) {
 	case StatisticsType::NUMERIC_STATS: {
 		auto result = NumericStats::CreateEmpty(input.type());

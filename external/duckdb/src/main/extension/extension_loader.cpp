@@ -13,6 +13,7 @@
 #include "duckdb/parser/parsed_data/create_collation_info.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/database.hpp"
@@ -34,12 +35,48 @@ void ExtensionLoader::SetDescription(const string &description) {
 	extension_description = description;
 }
 
+DistributedExtensionManifest &ExtensionLoader::GetOrCreateDistributedManifest() {
+	if (!distributed_manifest) {
+		auto manifest = make_uniq<DistributedExtensionManifest>();
+		manifest->extension_name = extension_name;
+		distributed_manifest = std::move(manifest);
+	}
+	return *distributed_manifest;
+}
+
+void DistributedWriteOperatorExtension::Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension) {
+	loader.RegisterDistributedWriteOperatorExtension(std::move(extension));
+}
+
+void ExtensionLoader::RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension) {
+	auto &manifest = GetOrCreateDistributedManifest();
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::WRITE_OPERATOR;
+	capability.name = extension.name;
+	capability.protocol_version = extension.protocol_version;
+	DistributedExtensionCapabilityReference reference;
+	reference.extension_name = extension_name;
+	reference.capability = capability;
+	reference.Validate();
+	extension.Validate(reference.CanonicalIdentity());
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
+	candidate_manifest->capabilities.push_back(capability);
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+	distributed_write_operators.push_back(
+	    make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(extension)));
+	distributed_manifest = std::move(candidate_manifest);
+}
+
 void ExtensionLoader::FinalizeLoad() {
 	// Set extension description, if provided
 	if (!extension_description.empty() && extension_info) {
 		auto info = make_uniq<ExtensionLoadedInfo>();
 		info->description = extension_description;
 		extension_info->load_info = std::move(info);
+	}
+	if (distributed_manifest) {
+		DistributedExtensionManager::Get(db).RegisterExtension(*distributed_manifest,
+		                                                       std::move(distributed_write_operators));
 	}
 }
 
@@ -100,11 +137,55 @@ void ExtensionLoader::RegisterFunction(TableFunctionSet function) {
 	RegisterFunction(std::move(info));
 }
 
+unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFunctions(TableFunctionSet &functions) {
+	set<string> overload_signatures;
+	for (const auto &function : functions.functions) {
+		auto signature = GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs);
+		if (!overload_signatures.insert(signature).second) {
+			throw InvalidInputException("Table-function overload '%s' is declared more than once in one registration",
+			                            signature);
+		}
+	}
+
+	unique_ptr<DistributedExtensionManifest> candidate_manifest;
+	for (auto &function : functions.functions) {
+		if (!function.HasDistributedScanCallbacks()) {
+			continue;
+		}
+		const auto &callbacks = function.GetDistributedScanCallbacks();
+		callbacks.ValidateDefinition(functions.name);
+		if (!function.HasSerializationCallbacks()) {
+			throw InvalidInputException(
+			    "Distributed table-function overload '%s' must define serialize and deserialize callbacks before "
+			    "registration",
+			    GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs));
+		}
+		function.BindDistributedScanCapability(extension_name);
+		if (!candidate_manifest) {
+			if (distributed_manifest) {
+				candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+			} else {
+				candidate_manifest = make_uniq<DistributedExtensionManifest>();
+				candidate_manifest->extension_name = extension_name;
+			}
+		}
+		candidate_manifest->capabilities.push_back(function.GetDistributedScanCallbacks().GetCapability().capability);
+	}
+	if (candidate_manifest) {
+		DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+	}
+	return candidate_manifest;
+}
+
 void ExtensionLoader::RegisterFunction(CreateTableFunctionInfo info) {
 	D_ASSERT(!info.functions.name.empty());
+	auto candidate_manifest = BindDistributedTableFunctions(info.functions);
 	auto &system_catalog = Catalog::GetSystemCatalog(db);
 	auto data = CatalogTransaction::GetSystemTransaction(db);
 	system_catalog.CreateFunction(data, info);
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
+	}
 }
 
 void ExtensionLoader::RegisterFunction(PragmaFunction function) {
@@ -169,10 +250,27 @@ void ExtensionLoader::AddFunctionOverload(ScalarFunctionSet functions) { // NOLI
 }
 
 void ExtensionLoader::AddFunctionOverload(TableFunctionSet functions) { // NOLINT
-	auto &table_function = GetTableFunction(functions.name);
+	D_ASSERT(!functions.name.empty());
 	for (auto &function : functions.functions) {
 		function.name = functions.name;
+	}
+	auto &table_function = GetTableFunction(functions.name);
+	for (const auto &function : functions.functions) {
+		for (const auto &existing_function : table_function.functions.functions) {
+			if (!function.Equal(existing_function)) {
+				continue;
+			}
+			throw InvalidInputException(
+			    "Table-function overload '%s' is already registered",
+			    GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs));
+		}
+	}
+	auto candidate_manifest = BindDistributedTableFunctions(functions);
+	for (auto &function : functions.functions) {
 		table_function.functions.AddFunction(std::move(function));
+	}
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
 	}
 }
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -94,6 +95,9 @@ class RayWorkerActorHandle(
         self._fragment_drop_incomplete_queries: set[str] = set()
         self._worker_shutdown_started = False
         self._fte_failure_retirement_completed = False
+        self._fte_worker_failure_reconciliation_lock = threading.Lock()
+        self._fte_worker_failure_reconciliation_complete = threading.Event()
+        self._fte_worker_failure_reconciliation_error: BaseException | None = None
         with _FTE_REGISTRY_LOCK:
             current = _FTE_WORKER_HANDLES.get(worker_id)
             if current is not None and current is not self:
@@ -103,6 +107,29 @@ class RayWorkerActorHandle(
     @property
     def worker_incarnation_id(self) -> str:
         return self._worker_incarnation_id
+
+    def wait_fte_worker_failure_reconciliation(self, *, timeout_s: float) -> None:
+        """Wait until this worker incarnation's failure side effects are published."""
+
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_s must be finite and > 0")
+        if not self._fte_worker_failure_reconciliation_complete.wait(timeout):
+            raise TimeoutError(
+                "timed out waiting for FTE worker failure reconciliation: "
+                f"worker={self.worker_id} incarnation={self.worker_incarnation_id}"
+            )
+        with self._fte_worker_failure_reconciliation_lock:
+            error = self._fte_worker_failure_reconciliation_error
+        if error is not None:
+            raise error
+
+    def _complete_fte_worker_failure_reconciliation(self, error: BaseException | None) -> None:
+        with self._fte_worker_failure_reconciliation_lock:
+            if self._fte_worker_failure_reconciliation_complete.is_set():
+                return
+            self._fte_worker_failure_reconciliation_error = error
+            self._fte_worker_failure_reconciliation_complete.set()
 
     def close_session(self, session_id: str) -> None:
         import ray

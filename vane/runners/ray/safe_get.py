@@ -10,6 +10,7 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, Any
 
+from vane._query_interrupt import check_query_interrupted, has_query_interrupt_check
 from vane._ray_errors import restore_remote_ray_exception
 from vane.runners.common import QueryDeadlineExceeded as QueryDeadlineExceeded
 
@@ -27,22 +28,40 @@ def _positive_float_env(name: str) -> float | None:
     return value
 
 
+def _configured_ray_get_timeout(
+    timeout: float | None = None,
+    *,
+    honor_query_deadline: bool = True,
+    honor_object_get_timeout: bool = True,
+) -> tuple[float | None, bool]:
+    resolved_timeout = max(0.0, float(timeout)) if timeout is not None else None
+    query_deadline_limited = False
+    deadline = _positive_float_env("VANE_QUERY_DEADLINE_EPOCH_S") if honor_query_deadline else None
+    if deadline is not None:
+        remaining = deadline - time.time()
+        if remaining <= 0.0:
+            raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
+        if resolved_timeout is None or remaining <= resolved_timeout:
+            resolved_timeout = remaining
+            query_deadline_limited = True
+    configured = _positive_float_env("VANE_RAY_OBJECT_GET_TIMEOUT_S") if honor_object_get_timeout else None
+    if configured is not None and (resolved_timeout is None or configured < resolved_timeout):
+        resolved_timeout = configured
+        query_deadline_limited = False
+    return resolved_timeout, query_deadline_limited
+
+
 def configured_ray_get_timeout_s(
     timeout: float | None = None,
     *,
     honor_query_deadline: bool = True,
     honor_object_get_timeout: bool = True,
 ) -> float | None:
-    resolved_timeout = max(0.0, float(timeout)) if timeout is not None else None
-    deadline = _positive_float_env("VANE_QUERY_DEADLINE_EPOCH_S") if honor_query_deadline else None
-    if deadline is not None:
-        remaining = deadline - time.time()
-        if remaining <= 0.0:
-            raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
-        resolved_timeout = remaining if resolved_timeout is None else min(resolved_timeout, remaining)
-    configured = _positive_float_env("VANE_RAY_OBJECT_GET_TIMEOUT_S") if honor_object_get_timeout else None
-    if configured is not None:
-        resolved_timeout = configured if resolved_timeout is None else min(resolved_timeout, configured)
+    resolved_timeout, _ = _configured_ray_get_timeout(
+        timeout,
+        honor_query_deadline=honor_query_deadline,
+        honor_object_get_timeout=honor_object_get_timeout,
+    )
     return resolved_timeout
 
 
@@ -66,24 +85,35 @@ def _object_ref_future(ref: Any) -> Any:
 def _resolve_future(
     future: Any,
     *,
+    timeout: float | None,
     deadline: float | None,
+    query_deadline_limited: bool,
     on_wait: Callable[[], None] | None,
     wait_interval_s: float,
 ) -> Any:
     if on_wait is None:
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        return future.result(timeout=remaining)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as error:
+            done = getattr(future, "done", None)
+            if callable(done) and done():
+                return future.result()
+            if query_deadline_limited:
+                raise QueryDeadlineExceeded("query deadline expired while waiting for Ray ObjectRef") from error
+            raise
 
     while True:
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         wait_timeout = wait_interval_s if remaining is None else min(wait_interval_s, remaining)
         try:
             return future.result(timeout=wait_timeout)
-        except FutureTimeoutError:
+        except FutureTimeoutError as error:
             done = getattr(future, "done", None)
             if callable(done) and done():
-                raise
+                return future.result()
             if deadline is not None and time.monotonic() >= deadline:
+                if query_deadline_limited:
+                    raise QueryDeadlineExceeded("query deadline expired while waiting for Ray ObjectRef") from error
                 raise
             on_wait()
 
@@ -92,17 +122,18 @@ def _resolve_object_refs(
     object_refs: Any,
     timeout: float | None,
     *,
+    query_deadline_limited: bool,
     on_wait: Callable[[], None] | None,
     wait_interval_s: float,
 ) -> Any:
+    deadline = None if timeout is None else time.monotonic() + timeout
     if not isinstance(object_refs, list | tuple):
         future = _object_ref_future(object_refs)
-        if on_wait is None:
-            return future.result(timeout=timeout)
-        deadline = None if timeout is None else time.monotonic() + timeout
         return _resolve_future(
             future,
+            timeout=timeout,
             deadline=deadline,
+            query_deadline_limited=query_deadline_limited,
             on_wait=on_wait,
             wait_interval_s=wait_interval_s,
         )
@@ -110,13 +141,15 @@ def _resolve_object_refs(
         return []
 
     futures = [_object_ref_future(ref) for ref in object_refs]
-    deadline = None if timeout is None else time.monotonic() + timeout
     results = []
     for future in futures:
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         results.append(
             _resolve_future(
                 future,
+                timeout=remaining,
                 deadline=deadline,
+                query_deadline_limited=query_deadline_limited,
                 on_wait=on_wait,
                 wait_interval_s=wait_interval_s,
             )
@@ -130,6 +163,7 @@ def resolve_object_refs_blocking(
     timeout: float | None = None,
     honor_query_deadline: bool = True,
     honor_object_get_timeout: bool = True,
+    honor_query_interrupt: bool = True,
     on_wait: Callable[[], None] | None = None,
     wait_interval_s: float = 0.5,
 ) -> Any:
@@ -141,25 +175,47 @@ def resolve_object_refs_blocking(
     timeout is divided into bounded waits and the callback runs between them.
     Callers with a dedicated hard timeout may opt out of the process-wide
     ObjectRef timeout without disabling that explicit bound.
+    Query teardown can suppress connection interruption while it confirms that
+    the interrupted remote operation has stopped.
     """
-    timeout = configured_ray_get_timeout_s(
+    timeout, query_deadline_limited = _configured_ray_get_timeout(
         timeout,
         honor_query_deadline=honor_query_deadline,
         honor_object_get_timeout=honor_object_get_timeout,
     )
     wait_interval_s = float(wait_interval_s)
+    _reject_running_event_loop()
+    interruptible = honor_query_interrupt and has_query_interrupt_check()
+    if interruptible:
+        check_query_interrupted()
+        progress_callback = on_wait
+        progress_interval_s = wait_interval_s
+        next_progress_at = time.monotonic() + progress_interval_s
+
+        def wait_with_interrupt() -> None:
+            nonlocal next_progress_at
+            check_query_interrupted()
+            if progress_callback is not None and time.monotonic() >= next_progress_at:
+                progress_callback()
+                next_progress_at = time.monotonic() + progress_interval_s
+            check_query_interrupted()
+
+        on_wait = wait_with_interrupt
+        wait_interval_s = min(wait_interval_s, 0.1)
     if on_wait is not None and wait_interval_s <= 0:
         raise ValueError("wait_interval_s must be positive")
-
-    _reject_running_event_loop()
     restored: BaseException | None = None
     try:
-        return _resolve_object_refs(
+        result = _resolve_object_refs(
             object_refs,
             timeout,
+            query_deadline_limited=query_deadline_limited,
             on_wait=on_wait,
             wait_interval_s=wait_interval_s,
         )
+        if interruptible:
+            check_query_interrupted()
+        return result
     except BaseException as exc:
         restored = restore_remote_ray_exception(exc)
         if restored is None:

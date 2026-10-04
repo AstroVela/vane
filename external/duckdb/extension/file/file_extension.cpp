@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+
+#include "file_extension.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
+
+#include "file_functions.hpp"
+#include "file_list_function.hpp"
+#include "file_metadata_functions.hpp"
+#include "media_backend.hpp"
+
+#include "duckdb/function/scalar/nested_functions.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
+
+namespace duckdb {
+
+static LogicalType BindImageType(BindLogicalTypeInput &input) {
+	if (input.modifiers.empty()) {
+		return ImageLogicalType::Create();
+	}
+	if (input.modifiers.size() != 1 && input.modifiers.size() != 3) {
+		throw BinderException("IMAGE requires mode, optionally followed by height and width");
+	}
+	for (auto &argument : input.modifiers) {
+		if (argument.HasName() || !argument.IsNotNull()) {
+			throw BinderException("IMAGE requires non-NULL positional type arguments");
+		}
+	}
+	if (input.modifiers.size() == 1) {
+		if (input.modifiers[0].GetType() != LogicalType::VARCHAR) {
+			throw BinderException("IMAGE requires a string mode");
+		}
+		return ImageLogicalType::Create(input.modifiers[0].GetValue().GetValue<string>());
+	}
+	if (input.modifiers[0].GetType() != LogicalType::VARCHAR || !input.modifiers[1].GetType().IsIntegral() ||
+	    !input.modifiers[2].GetType().IsIntegral()) {
+		throw BinderException("IMAGE requires a string mode and integer height and width");
+	}
+	return ImageLogicalType::Create(input.modifiers[0].GetValue().GetValue<string>(),
+	                                input.modifiers[1].GetValue().GetValue<uint32_t>(),
+	                                input.modifiers[2].GetValue().GetValue<uint32_t>());
+}
+
+static void LoadInternal(ExtensionLoader &loader) {
+	MediaBackend::RegisterOption(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
+	}
+	loader.RegisterType(ImageLogicalType::TYPE_NAME, ImageLogicalType::Create(), BindImageType);
+	loader.RegisterType("FIXEDBINARY", FixedBinaryType::Create(1), [](BindLogicalTypeInput &input) {
+		if (input.modifiers.size() != 1 || input.modifiers[0].HasName() || !input.modifiers[0].IsNotNull() ||
+		    !input.modifiers[0].GetType().IsIntegral()) {
+			throw BinderException("FIXEDBINARY requires one non-negative integer byte width");
+		}
+		return FixedBinaryType::Create(input.modifiers[0].GetValue().GetValue<idx_t>());
+	});
+
+	for (auto &function : FileFunctions::GetFunctions()) {
+		loader.RegisterFunction(std::move(function));
+	}
+	for (auto &function : FileMetadataFunctions::GetFunctions()) {
+		loader.RegisterFunction(std::move(function));
+	}
+	for (auto &function : FileListFunction::GetFunctions()) {
+		loader.RegisterFunction(std::move(function));
+	}
+
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_key_extract = GetKeyExtractFunction();
+		file_key_extract.arguments[0] = FileLogicalType::Create(media_type);
+		loader.RegisterFunction(std::move(file_key_extract));
+	}
+	auto image_key_extract = GetKeyExtractFunction();
+	image_key_extract.arguments[0] = ImageLogicalType::Create();
+	loader.RegisterFunction(std::move(image_key_extract));
+}
+
+void FileExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
+}
+
+std::string FileExtension::Name() {
+	return "file";
+}
+
+std::string FileExtension::Version() const {
+#ifdef EXT_VERSION_FILE
+	return EXT_VERSION_FILE;
+#else
+	return "";
+#endif
+}
+
+} // namespace duckdb
+
+extern "C" {
+
+DUCKDB_CPP_EXTENSION_ENTRY(file, loader) {
+	duckdb::LoadInternal(loader);
+}
+}

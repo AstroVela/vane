@@ -217,6 +217,8 @@ def _actor_class(
             # Payload is injected via init_payload() immediately after creation.
             self._payload: dict[str, Any] | None = None
             self.executor: RuntimeUDFExecutor | None = None  # lazy init on first streaming submission
+            self._executor_closed = False
+            self._executor_close_started = False
             self._vane_location_report_ref: Any | None = None
             self._vane_location_report_error: BaseException | None = None
             try:
@@ -234,6 +236,8 @@ def _actor_class(
 
         def init_payload(self, payload: dict[str, Any]) -> str:
             """Inject payload after construction to avoid Ray object-store GC issues."""
+            if self._executor_closed or self._executor_close_started:
+                raise RuntimeError("Ray UDF actor executor is closed")
             self._payload = payload
             _actor_debug_log("init_payload", self._payload)
             if self.executor is None:
@@ -255,6 +259,8 @@ def _actor_class(
             return node_id
 
         def _ensure_executor(self, effective_payload: dict[str, Any]) -> RuntimeUDFExecutor:
+            if self._executor_closed or self._executor_close_started:
+                raise RuntimeError("Ray UDF actor executor is closed")
             executor = self.executor
             if executor is not None:
                 return executor
@@ -268,29 +274,42 @@ def _actor_class(
             configure_ray_actor_loaded_torch_threads(self._payload)
             return executor
 
+        def close_executor(self) -> None:
+            """Deterministically close the resident callable before actor termination."""
+            if self._executor_closed:
+                return
+            self._executor_close_started = True
+            executor = self.executor
+            if executor is not None:
+                executor.close()
+            self.executor = None
+            self._executor_closed = True
+
         def _run_row_preserving_batch(
             self,
             table: pa.Table,
             effective_payload: dict[str, Any],
-        ) -> pa.Table:
+        ) -> list[pa.Table]:
             from vane.execution.udf_row_preserving import (
-                fuse_row_preserving_output,
+                fuse_row_preserving_outputs,
                 split_row_preserving_input,
             )
 
             executor = self._ensure_executor(effective_payload)
+            expected_rows = table.num_rows
             args, passthrough = split_row_preserving_input(effective_payload, table)
             if args.num_rows == 0:
                 output = _empty_output_table_from_payload(effective_payload)
-                return fuse_row_preserving_output(effective_payload, passthrough, output)
-            executor.submit(args)
-            outputs = executor.drain_outputs()
-            if len(outputs) != 1:
-                raise RuntimeError("map_batches_rows actor produced %d outputs, expected exactly 1" % len(outputs))
-            return fuse_row_preserving_output(
+                outputs = [output]
+            else:
+                executor.submit(args)
+                outputs = executor.drain_outputs()
+            return fuse_row_preserving_outputs(
                 effective_payload,
                 passthrough,
-                _ensure_table(outputs[0]),
+                [_ensure_table(output) for output in outputs],
+                expected_rows=expected_rows,
+                mode="map_batches_rows actor",
             )
 
         def _run_block_stream_impl(
@@ -326,22 +345,23 @@ def _actor_class(
                     output_count += 1
 
             if str(effective_payload.get("call_mode") or "") == "map":
-                table = execute_scalar_map_layout(effective_payload, args, executor)
-                yield from emit(table)
+                for table in execute_scalar_map_layout(effective_payload, args, executor):
+                    yield from emit(table)
                 _actor_debug_log(
                     "run_block_stream_submit_done",
                     effective_payload,
                     rows=args.num_rows,
-                    outputs=1,
+                    outputs=output_count,
                 )
                 return
             if str(effective_payload.get("call_mode") or "") == "map_batches_rows":
-                yield from emit(self._run_row_preserving_batch(args, effective_payload))
+                for table in self._run_row_preserving_batch(args, effective_payload):
+                    yield from emit(table)
                 _actor_debug_log(
                     "run_block_stream_submit_done",
                     effective_payload,
                     rows=args.num_rows,
-                    outputs=1,
+                    outputs=output_count,
                 )
                 return
             for result in executor.iter_submit(args):

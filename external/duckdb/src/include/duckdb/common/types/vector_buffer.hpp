@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -86,6 +92,9 @@ public:
 public:
 	data_ptr_t GetData() {
 		return data.get();
+	}
+	idx_t GetDataSize() const {
+		return data.GetSize();
 	}
 
 	void SetData(AllocatedData &&new_data) {
@@ -329,6 +338,9 @@ public:
 	Vector &GetChild();
 	idx_t GetArraySize();
 	idx_t GetChildSize();
+	void SetSize(idx_t new_size) {
+		size = new_size;
+	}
 
 private:
 	unique_ptr<Vector> child;

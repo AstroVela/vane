@@ -34,7 +34,7 @@ BoundLimitNode CopyBoundLimitNode(const BoundLimitNode &node) {
 }
 
 bool LimitNode::is_materialization_barrier() const {
-	return ChildHasMultiplePartitions(child_);
+	return child_ && !child_->has_single_task_output();
 }
 
 std::vector<NodeID> LimitNode::materialized_input_node_ids() const {
@@ -42,7 +42,7 @@ std::vector<NodeID> LimitNode::materialized_input_node_ids() const {
 }
 
 bool StreamingLimitNode::is_materialization_barrier() const {
-	return ChildHasMultiplePartitions(child_);
+	return child_ && !child_->has_single_task_output();
 }
 
 std::vector<NodeID> StreamingLimitNode::materialized_input_node_ids() const {
@@ -50,7 +50,7 @@ std::vector<NodeID> StreamingLimitNode::materialized_input_node_ids() const {
 }
 
 bool LimitPercentNode::is_materialization_barrier() const {
-	return ChildHasMultiplePartitions(child_);
+	return child_ && !child_->has_single_task_output();
 }
 
 std::vector<NodeID> LimitPercentNode::materialized_input_node_ids() const {
@@ -60,6 +60,24 @@ std::vector<NodeID> LimitPercentNode::materialized_input_node_ids() const {
 namespace {
 using PlanBuilder = MaterializedPlanBuilder;
 using PerTaskBuilderFactory = PerTaskMaterializedPlanBuilderFactory;
+
+static DuckPhysicalPlanRef AddOrderedLimit(DuckPhysicalPlanRef plan, BoundLimitNode limit_val,
+                                           BoundLimitNode offset_val) {
+	auto &input = plan->Root();
+	PhysicalOperator *limit;
+	// Distributed rewrites replace sources after DuckDB chooses its limit
+	// operator. Re-evaluate the actual fragment's batch-index capability.
+	if (input.AllSourcesSupportBatchIndex()) {
+		limit = &plan->Make<PhysicalLimit>(input.GetTypes(), std::move(limit_val), std::move(offset_val),
+		                                   input.estimated_cardinality);
+	} else {
+		limit = &plan->Make<PhysicalStreamingLimit>(input.GetTypes(), std::move(limit_val), std::move(offset_val),
+		                                            input.estimated_cardinality, false);
+	}
+	limit->children.push_back(input);
+	plan->SetRoot(*limit);
+	return plan;
+}
 
 static std::string BoundLimitNodeToString(const BoundLimitNode &node) {
 	switch (node.Type()) {
@@ -120,9 +138,9 @@ static BoundLimitNode ConstantLimitRows(idx_t rows) {
 
 LimitNode::LimitNode(NodeID node_id, PipelineNodeRef child, BoundLimitNode limit_val, BoundLimitNode offset_val,
                      std::shared_ptr<ExchangeManager> exchange_mgr)
-    : ctx_(InheritPipelineNodeContext(child, node_id, "Limit")),
-      config_(child ? child->config() : PipelineNodeConfig()), child_(std::move(child)),
-      limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)), exchange_mgr_(std::move(exchange_mgr)) {
+    : ctx_(InheritPipelineNodeContext(child, node_id, "Limit")), config_(SingleTaskOutputConfig(child)),
+      child_(std::move(child)), limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)),
+      exchange_mgr_(std::move(exchange_mgr)) {
 }
 
 SubmittableTaskStream<WorkerTask> LimitNode::produce_tasks(PlanExecutionContext &plan_context) {
@@ -132,18 +150,10 @@ SubmittableTaskStream<WorkerTask> LimitNode::produce_tasks(PlanExecutionContext 
 		auto limit_val = CopyBoundLimitNode(*limit_template);
 		auto offset_val = CopyBoundLimitNode(*offset_template);
 
-		auto types = input_plan->Root().GetTypes();
-		idx_t estimated_cardinality = input_plan->Root().estimated_cardinality;
-
-		auto &old_root = input_plan->Root();
-		auto &limit_op = input_plan->Make<duckdb::PhysicalLimit>(types, std::move(limit_val), std::move(offset_val),
-		                                                         estimated_cardinality);
-		limit_op.children.push_back(old_root);
-		input_plan->SetRoot(limit_op);
-		return input_plan;
+		return AddOrderedLimit(std::move(input_plan), std::move(limit_val), std::move(offset_val));
 	};
 
-	if (!ChildHasMultiplePartitions(child_)) {
+	if (!is_materialization_barrier()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
@@ -156,22 +166,14 @@ SubmittableTaskStream<WorkerTask> LimitNode::produce_tasks(PlanExecutionContext 
 				auto limit_val = ConstantLimitRows(local_limit_rows.second);
 				auto offset_val = BoundLimitNode();
 
-				auto types = input_plan->Root().GetTypes();
-				idx_t estimated_cardinality = input_plan->Root().estimated_cardinality;
-
-				auto &old_root = input_plan->Root();
-				auto &limit_op = input_plan->Make<duckdb::PhysicalLimit>(types, std::move(limit_val),
-				                                                         std::move(offset_val), estimated_cardinality);
-				limit_op.children.push_back(old_root);
-				input_plan->SetRoot(limit_op);
-				return input_plan;
+				return AddOrderedLimit(std::move(input_plan), std::move(limit_val), std::move(offset_val));
 			};
 		};
 	}
 
 	return ProduceWithMaterializedCoordinator(
 	    plan_context, child_, std::static_pointer_cast<PipelineNodeImpl>(shared_from_this()),
-	    std::move(final_plan_builder), std::move(per_task_builder_factory), exchange_mgr_);
+	    std::move(final_plan_builder), std::move(per_task_builder_factory), exchange_mgr_, nullptr, true);
 }
 
 std::vector<std::string> LimitNode::multiline_display(bool /*verbose*/) const {
@@ -182,10 +184,9 @@ std::vector<std::string> LimitNode::multiline_display(bool /*verbose*/) const {
 StreamingLimitNode::StreamingLimitNode(NodeID node_id, PipelineNodeRef child, BoundLimitNode limit_val,
                                        BoundLimitNode offset_val, bool parallel,
                                        std::shared_ptr<ExchangeManager> exchange_mgr)
-    : ctx_(InheritPipelineNodeContext(child, node_id, "StreamingLimit")),
-      config_(child ? child->config() : PipelineNodeConfig()), child_(std::move(child)),
-      limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)), parallel_(parallel),
-      exchange_mgr_(std::move(exchange_mgr)) {
+    : ctx_(InheritPipelineNodeContext(child, node_id, "StreamingLimit")), config_(SingleTaskOutputConfig(child)),
+      child_(std::move(child)), limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)),
+      parallel_(parallel), exchange_mgr_(std::move(exchange_mgr)) {
 }
 
 SubmittableTaskStream<WorkerTask> StreamingLimitNode::produce_tasks(PlanExecutionContext &plan_context) {
@@ -209,7 +210,7 @@ SubmittableTaskStream<WorkerTask> StreamingLimitNode::produce_tasks(PlanExecutio
 		return input_plan;
 	};
 
-	if (!ChildHasMultiplePartitions(child_)) {
+	if (!is_materialization_barrier()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
@@ -237,7 +238,7 @@ SubmittableTaskStream<WorkerTask> StreamingLimitNode::produce_tasks(PlanExecutio
 
 	return ProduceWithMaterializedCoordinator(
 	    plan_context, child_, std::static_pointer_cast<PipelineNodeImpl>(shared_from_this()),
-	    std::move(final_plan_builder), std::move(per_task_builder_factory), exchange_mgr_);
+	    std::move(final_plan_builder), std::move(per_task_builder_factory), exchange_mgr_, nullptr, !parallel_);
 }
 
 std::vector<std::string> StreamingLimitNode::multiline_display(bool /*verbose*/) const {
@@ -247,9 +248,9 @@ std::vector<std::string> StreamingLimitNode::multiline_display(bool /*verbose*/)
 
 LimitPercentNode::LimitPercentNode(NodeID node_id, PipelineNodeRef child, BoundLimitNode limit_val,
                                    BoundLimitNode offset_val, std::shared_ptr<ExchangeManager> exchange_mgr)
-    : ctx_(InheritPipelineNodeContext(child, node_id, "LimitPercent")),
-      config_(child ? child->config() : PipelineNodeConfig()), child_(std::move(child)),
-      limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)), exchange_mgr_(std::move(exchange_mgr)) {
+    : ctx_(InheritPipelineNodeContext(child, node_id, "LimitPercent")), config_(SingleTaskOutputConfig(child)),
+      child_(std::move(child)), limit_val_(std::move(limit_val)), offset_val_(std::move(offset_val)),
+      exchange_mgr_(std::move(exchange_mgr)) {
 }
 
 SubmittableTaskStream<WorkerTask> LimitPercentNode::produce_tasks(PlanExecutionContext &plan_context) {
@@ -271,14 +272,14 @@ SubmittableTaskStream<WorkerTask> LimitPercentNode::produce_tasks(PlanExecutionC
 		return input_plan;
 	};
 
-	if (!ChildHasMultiplePartitions(child_)) {
+	if (!is_materialization_barrier()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
 
-	return ProduceWithMaterializedCoordinator(plan_context, child_,
-	                                          std::static_pointer_cast<PipelineNodeImpl>(shared_from_this()),
-	                                          std::move(final_plan_builder), PerTaskBuilderFactory(), exchange_mgr_);
+	return ProduceWithMaterializedCoordinator(
+	    plan_context, child_, std::static_pointer_cast<PipelineNodeImpl>(shared_from_this()),
+	    std::move(final_plan_builder), PerTaskBuilderFactory(), exchange_mgr_, nullptr, true);
 }
 
 std::vector<std::string> LimitPercentNode::multiline_display(bool /*verbose*/) const {

@@ -15,7 +15,10 @@ from pathlib import Path
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-import vane
+# Vane's import can create its default connection. Set the test policy before
+# that import; later environment changes do not change an existing connection.
+os.environ.setdefault("VANE_RUNNER", "local-fast")
+vane = import_module("vane")
 
 try:
     # need to ignore warnings that might be thrown deep inside pandas's import tree (from dateutil in this case)
@@ -41,8 +44,9 @@ PANDAS_GE_3 = _get_pandas_ge_3()
 @pytest.fixture(autouse=True)
 def default_vane_runner_for_tests(monkeypatch):
     """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
-    if "VANE_RUNNER" not in os.environ:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    # Record the current value even when it is already set. Runner-selection
+    # APIs mutate the environment directly and must not leak to later tests.
+    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
 
 
 def is_string_dtype(dtype):
@@ -382,16 +386,48 @@ def pytest_configure(config):
         faulthandler.enable()
         timeout = int(os.getenv("TEST_TIMEOUT", "300"))
         faulthandler.dump_traceback_later(timeout, repeat=False)
-        # record that we scheduled a dump so we can cancel it in pytest_unconfigure
+        # Cancel when collection ends, including failed session startup.
         config._vane_faulthandler_dump_scheduled = True
     except Exception:
         # best-effort; don't fail pytest initialization if this doesn't work
         pass
 
 
-def pytest_unconfigure(config):
+def _cancel_collection_watchdog(config):
     try:
         if getattr(config, "_vane_faulthandler_dump_scheduled", False):
             faulthandler.cancel_dump_traceback_later()
+            config._vane_faulthandler_dump_scheduled = False
     except Exception:
         pass
+
+
+def pytest_collection_finish(session):
+    # Per-test timeouts take over once collection finishes. Leaving this timer
+    # armed would dump stacks in the middle of otherwise healthy tests.
+    _cancel_collection_watchdog(session.config)
+
+
+def pytest_unconfigure(config):
+    _cancel_collection_watchdog(config)
+
+
+@pytest.fixture
+def application_provider_credentials(monkeypatch):
+    """These model-behavior tests use explicit application-side test credentials."""
+    for family in ("OPENAI", "GOOGLE", "ANTHROPIC"):
+        monkeypatch.setenv(f"{family}_API_KEY", "application-test-key")
+    for name in (
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT_ID",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)

@@ -282,6 +282,11 @@ LogicalType ExpressionBinder::ExchangeType(const LogicalType &type, LogicalTypeI
 	if (type.id() == target) {
 		return new_type;
 	}
+	if (!ContainsType(type, target)) {
+		// Keep the original type intact when this subtree has nothing to exchange. Besides avoiding unnecessary
+		// reconstruction, this preserves semantic aliases such as FILE on unaffected nested children.
+		return type;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT: {
 		// we make a copy of the child types of the struct here

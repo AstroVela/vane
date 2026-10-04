@@ -21,12 +21,45 @@
 
 namespace duckdb {
 
+//! Owned, deterministic representation of an OpenFileInfo used by a bound JSON scan.
+struct JSONFileSnapshot {
+	JSONFileSnapshot() = default;
+	JSONFileSnapshot(idx_t ordinal, const OpenFileInfo &file);
+
+	static constexpr const char *ORDINAL_OPTION = "__vane_json_file_ordinal";
+	static bool TryGetOrdinal(const OpenFileInfo &file, idx_t &ordinal);
+
+	string path;
+	map<string, Value> options;
+	idx_t ordinal = 0;
+
+	OpenFileInfo ToOpenFileInfo() const;
+	void Serialize(Serializer &serializer) const;
+	static JSONFileSnapshot Deserialize(Deserializer &deserializer);
+};
+
+struct JSONScanRange {
+	static constexpr const char *START_OPTION = "__vane_json_range_start";
+	static constexpr const char *END_OPTION = "__vane_json_range_end";
+	idx_t start = 0;
+	idx_t end = 0;
+	static bool TryGet(const OpenFileInfo &file, JSONScanRange &range);
+	static OpenFileInfo Set(const OpenFileInfo &file, idx_t start, idx_t end);
+	static OpenFileInfo Strip(const OpenFileInfo &file);
+};
+
+struct JSONScanData;
+TableFunctionDistributedScanCallbacks JSONDistributedScanCallbacks();
+void ValidateJSONDistributedState(const JSONScanData &data, const vector<OpenFileInfo> &files);
+
 struct JSONScanData : public TableFunctionData {
 public:
 	JSONScanData();
 
 	void InitializeFormats();
 	void InitializeFormats(bool auto_detect);
+	void InitializeTransformOptions();
+	unique_ptr<FunctionData> Copy() const override;
 
 public:
 	//! JSON reader options
@@ -42,6 +75,39 @@ public:
 
 	optional_idx max_threads;
 	optional_idx estimated_cardinality_per_file;
+	//! Detached worker authorization is separate from its currently assigned files.
+	bool distributed_worker = false;
+	bool distributed_splits_applied = false;
+	bool distributed_assignment_restricted = false;
+	vector<JSONFileSnapshot> distributed_allowed_files;
+	vector<string> distributed_split_ids;
+};
+
+//! Complete owned state required to reconstruct a bound JSON multi-file scan without reopening or resampling files.
+struct SerializedJSONScanData {
+	vector<JSONFileSnapshot> files;
+	vector<LogicalType> types;
+	vector<string> names;
+	MultiFileOptions file_options;
+	MultiFileReaderBindData reader_bind;
+	vector<string> table_columns;
+	vector<idx_t> bind_column_ids;
+	JSONReaderOptions options;
+	vector<string> key_names;
+	vector<StrpTimeFormat> date_formats;
+	vector<StrpTimeFormat> timestamp_formats;
+	optional_idx max_threads;
+	optional_idx estimated_cardinality_per_file;
+	bool distributed_worker = false;
+	bool distributed_splits_applied = false;
+	bool distributed_assignment_restricted = false;
+	vector<JSONFileSnapshot> distributed_allowed_files;
+	vector<string> distributed_split_ids;
+
+	vector<idx_t> reader_column_ids;
+
+	void Serialize(Serializer &serializer) const;
+	static SerializedJSONScanData Deserialize(Deserializer &deserializer);
 };
 
 struct JSONScanInfo : public TableFunctionInfo {

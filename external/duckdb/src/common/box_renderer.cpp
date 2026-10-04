@@ -4,6 +4,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/original/std/sstream.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -643,6 +644,13 @@ void RenderDataCollection::InitializeChunk(DataChunk &chunk) {
 	chunk.Initialize(context, render_values->Types());
 }
 
+static void CastRenderVector(ClientContext &context, Vector &source, Vector &target, idx_t count) {
+	auto &cast_functions = CastFunctionSet::Get(context);
+	GetCastFunctionInput cast_input(context);
+	cast_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
+	VectorOperations::TryCast(cast_functions, cast_input, source, target, count, nullptr);
+}
+
 void BoxRendererImplementation::FetchTopCollection(RenderDataCollection &top_collection,
                                                    const ColumnDataCollection &result, idx_t chunk_idx, idx_t row_idx,
                                                    idx_t top_rows, idx_t bottom_rows) {
@@ -673,7 +681,7 @@ void BoxRendererImplementation::FetchTopCollection(RenderDataCollection &top_col
 			auto &source_vector = fetch_result.data[c];
 			auto &target_vector = top_collection.Values(insert_result, c);
 			auto &render_lengths = top_collection.RenderLengths(insert_result, c);
-			VectorOperations::Cast(context, source_vector, target_vector, insert_count);
+			CastRenderVector(context, source_vector, target_vector, insert_count);
 			ConvertRenderVector(target_vector, render_lengths, insert_count, source_vector.GetType(),
 			                    null_render_length);
 		}
@@ -791,7 +799,7 @@ void BoxRendererImplementation::FetchBottomCollection(RenderDataCollection &bott
 			auto &source_vector = chunk.data[c];
 			auto &target_vector = bottom_collection.Values(insert_result, c);
 			auto &render_lengths = bottom_collection.RenderLengths(insert_result, c);
-			VectorOperations::Cast(context, source_vector, target_vector, insert_count);
+			CastRenderVector(context, source_vector, target_vector, insert_count);
 			ConvertRenderVector(target_vector, render_lengths, insert_count, source_vector.GetType(),
 			                    null_render_length);
 		}
@@ -1075,6 +1083,8 @@ bool JSONParser::Process(const string &value) {
 	state = JSONState::REGULAR;
 	char quote_char = '"';
 	bool can_parse_value = false;
+	bool in_unquoted_value = false;
+	success = true;
 	pos = 0;
 	for (; success && pos < value.size(); pos++) {
 		auto c = value[pos];
@@ -1103,10 +1113,12 @@ bool JSONParser::Process(const string &value) {
 			case ']': {
 				// closing bracket - move to next line and pop back the separator
 				if (separators.empty() || !SeparatorIsMatching(separators.back(), c)) {
-					throw InternalException("Failed to parse JSON string %s - invalid JSON", value);
+					success = false;
+					break;
 				}
 				separators.pop_back();
 				HandleBracketClose(c);
+				in_unquoted_value = false;
 				break;
 			}
 			case '"':
@@ -1118,6 +1130,7 @@ bool JSONParser::Process(const string &value) {
 			case ',':
 				// comma - move to next line
 				HandleComma(c);
+				in_unquoted_value = false;
 				break;
 			case ':':
 				HandleColon();
@@ -1133,11 +1146,16 @@ bool JSONParser::Process(const string &value) {
 				HandleCharacter(c);
 				break;
 			case ' ':
+				if (in_unquoted_value) {
+					HandleCharacter(c);
+				}
+				break;
 			case '\t':
 			case '\n':
 				// skip whitespace
 				break;
 			default:
+				in_unquoted_value = true;
 				HandleCharacter(c);
 				break;
 			}
@@ -1157,7 +1175,7 @@ bool JSONParser::Process(const string &value) {
 			state = JSONState::IN_QUOTE;
 			HandleCharacter(c);
 		} else {
-			throw InternalException("Invalid json state");
+			success = false;
 		}
 	}
 	if (!success) {
@@ -1522,6 +1540,20 @@ public:
 	explicit JSONHighlighter(BoxRenderValue &render_value) : render_value(render_value) {
 	}
 
+public:
+	bool Highlight(const string &value) {
+		const auto annotation_count = render_value.annotations.size();
+		if (JSONParser::Process(value)) {
+			return true;
+		}
+
+		while (render_value.annotations.size() > annotation_count) {
+			render_value.annotations.pop_back();
+		}
+
+		return false;
+	}
+
 protected:
 	void HandleNull() override {
 		render_value.annotations.emplace_back(ResultRenderType::NULL_VALUE, pos);
@@ -1568,7 +1600,7 @@ void BoxRendererImplementation::HighlightValue(BoxRenderValue &render_value) {
 		return;
 	}
 	JSONHighlighter highlighter(render_value);
-	highlighter.Process(render_value.text);
+	highlighter.Highlight(render_value.text);
 }
 
 void BoxRendererImplementation::PotentiallyExpandRow(BoxRenderRow &row, vector<BoxRenderRow> &rows,
@@ -1907,8 +1939,8 @@ void BoxRendererImplementation::ComputeRenderWidths(vector<RenderDataCollection>
 
 	// check if we shortened any columns that would be rendered and if we can expand them
 	// we only expand columns in the ".mode rows", and only if we haven't hidden any columns
-	if (shortened_columns && config.render_mode == RenderMode::ROWS && row_count + 5 < config.max_rows &&
-	    pruned_columns.empty()) {
+	if (shortened_columns && config.render_mode == RenderMode::ROWS && row_count > 0 &&
+	    row_count + 5 < config.max_rows && pruned_columns.empty()) {
 		max_rows_per_row = MaxValue<idx_t>(1, config.max_rows <= 5 ? 0 : (config.max_rows - 5) / row_count);
 		if (max_rows_per_row > 1) {
 			// we can expand rows - check if we should expand any rows

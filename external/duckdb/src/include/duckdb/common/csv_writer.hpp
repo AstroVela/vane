@@ -89,6 +89,8 @@ public:
 
 	//! Closes the writer, optionally writes a postfix
 	void Close();
+	//! Closes the writer and returns its final physical size
+	idx_t CloseAndGetFileSize();
 
 	vector<unique_ptr<Expression>> string_casts;
 

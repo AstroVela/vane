@@ -21,9 +21,10 @@ struct DataSourceStreamFactory {
 	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
 
-	//! C callback: unpickle task → task.execute() → RecordBatchReader → _export_to_c
+	//! C callback: unpickle task → context-aware execute → RecordBatchReader → _export_to_c
 	//! Called from pipeline threads — each call creates an independent stream.
-	static void ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream);
+	static void ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
+	                          ClientContext *context);
 
 	//! C callback: export the serialized or cached Arrow schema to ArrowSchema
 	static void GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
@@ -32,6 +33,15 @@ struct DataSourceStreamFactory {
 	static void AcquireSource(const char *pickled_source, idx_t pickled_len, const char *query_id, idx_t query_id_len);
 	static void ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept;
 };
+
+//! Build portable datasource_scan arguments without binding a nested connection query.
+vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id);
+
+//! Build a datasource_scan bind whose partition splits resolve Ray ObjectRefs.
+//! The Arrow tables themselves are retained outside the logical/physical plan.
+unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientContext &context, const string &source_id,
+                                                                     const py::object &arrow_schema,
+                                                                     const py::object &tasks);
 
 //! Clear all factory references to prevent segfault during Python shutdown.
 //! Must be called before Python interpreter finalizes.

@@ -1,0 +1,28 @@
+# name: test/sql/file/test_media_file_json.test
+# description: Test JSON serialization of media-specialized FILE values
+# group: [file]
+
+require file
+
+require json
+
+statement ok
+PRAGMA enable_verification
+
+# JSON is a semantic VARCHAR alias, not a file locator alias.
+statement error
+SELECT image_file(json '"image.png"')
+----
+<REGEX>:.*image_file.*requires VARCHAR, FILE, or IMAGEFILE.*JSON.*
+
+# JSON creation consumes FILE's canonical STRUCT representation without
+# stripping its semantic alias through an ordinary SQL cast.
+query TTTTT
+SELECT
+	to_json(image_file(file('image.png', 'image/png', 1, 2, 'sha256:image'))),
+	to_json([audio_file('audio.mp3')]),
+	row_to_json({'video': video_file('video.mp4')}),
+	to_json({'image': image_file('nested.png'), 'attributes': MAP {1: 'one'}}),
+	to_json(MAP {image_file('key.png'): 1})
+----
+{"url":"image.png","content_type":"image/png","position":1,"size":2,"checksum":"sha256:image"}	[{"url":"audio.mp3","content_type":null,"position":null,"size":null,"checksum":null}]	{"video":{"url":"video.mp4","content_type":null,"position":null,"size":null,"checksum":null}}	{"image":{"url":"nested.png","content_type":null,"position":null,"size":null,"checksum":null},"attributes":{"1":"one"}}	{"{'url': key.png, 'content_type': NULL, 'position': NULL, 'size': NULL, 'checksum': NULL}":1}

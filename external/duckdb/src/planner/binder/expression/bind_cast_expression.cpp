@@ -22,10 +22,14 @@ BindResult ExpressionBinder::BindExpression(CastExpression &expr, idx_t depth) {
 			// no cast required: type matches
 			return BindResult(std::move(child));
 		}
-		child = BoundCastExpression::AddCastToType(context, std::move(child), expr.cast_type, true);
+		child = expr.file_internal_formatting
+		            ? BoundCastExpression::AddCastToTypeForFormatting(context, std::move(child), expr.cast_type, true)
+		            : BoundCastExpression::AddExplicitCastToType(context, std::move(child), expr.cast_type, true);
 	} else {
 		// otherwise add a cast to the target type
-		child = BoundCastExpression::AddCastToType(context, std::move(child), expr.cast_type);
+		child = expr.file_internal_formatting
+		            ? BoundCastExpression::AddCastToTypeForFormatting(context, std::move(child), expr.cast_type)
+		            : BoundCastExpression::AddExplicitCastToType(context, std::move(child), expr.cast_type);
 	}
 	return BindResult(std::move(child));
 }

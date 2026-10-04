@@ -112,6 +112,14 @@ VirtualFileSystem::VirtualFileSystem(unique_ptr<FileSystem> &&inner)
 VirtualFileSystem::~VirtualFileSystem() {
 }
 
+FileSystem &VirtualFileSystem::GetDefaultFileSystem() {
+	auto &fs = *file_system_registry->default_fs->file_system;
+	if (SubSystemIsDisabled(fs.GetName())) {
+		throw PermissionException("File system %s has been disabled by configuration", fs.GetName());
+	}
+	return fs;
+}
+
 unique_ptr<FileHandle> VirtualFileSystem::OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
                                                            optional_ptr<FileOpener> opener) {
 	auto compression = flags.Compression();
@@ -322,6 +330,10 @@ vector<string> VirtualFileSystem::ListSubSystems() {
 
 std::string VirtualFileSystem::GetName() const {
 	return "VirtualFileSystem";
+}
+
+bool VirtualFileSystem::HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener) {
+	return FindFileSystem(path, opener).HasDirectorySemantics(path, opener);
 }
 
 bool VirtualFileSystem::SubSystemIsDisabled(const string &name) {

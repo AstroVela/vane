@@ -40,15 +40,6 @@ inline std::string BuildUniquePoolComponent(const std::string &value) {
 	return SanitizePoolComponent(value) + "_" + digest.FinishHex();
 }
 
-inline std::string BuildPoolName(const PipelineNodeContext &ctx, NodeID node_id) {
-	auto query_id = ctx.query_id();
-	if (query_id.empty()) {
-		query_id = std::to_string(ctx.query_idx());
-	}
-	auto safe_query = BuildUniquePoolComponent(query_id);
-	return "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
-}
-
 inline Value InjectDistributedOptions(const Value &options, const std::string &pool_name) {
 	child_list_t<Value> child_list;
 	if (options.IsNull()) {
@@ -142,11 +133,13 @@ public:
 		auto options = options_;
 		auto output_name = output_column_name_;
 		auto output_types = output_types_;
-		auto this_node_id = this->node_id();
-		// Prefer a pool name pre-injected by collect_vllm_nodes(); fall back
-		// to computing one from the pipeline-node context when absent.
-		auto existing_pool = ExtractPoolNameFromOptions(options);
-		auto pool_name = existing_pool.empty() ? BuildPoolName(this->ctx_, this_node_id) : existing_pool;
+		// The driver pre-injects ray_actor_pool_name via collect_vllm_nodes().
+		// A missing name means the driver never collected this node, so fail
+		// loudly instead of inventing a name the driver will not reuse.
+		auto pool_name = ExtractPoolNameFromOptions(options);
+		if (pool_name.empty()) {
+			throw InternalException("distributed vLLM node is missing a pre-injected ray_actor_pool_name");
+		}
 
 		return input_stream.pipeline_instruction(
 		    shared_from_this(),

@@ -162,6 +162,21 @@ def test_public_vllm_rejects_guided_decoding_alias_mapping():
         _plan_from_prompt_options({"generate_args": {"sampling_params": {"guided_decoding": {"regex": ".*"}}}})
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(_plan_from_prompt_options, id="prompt-entry-point-default-model"),
+        pytest.param(
+            lambda options: VLLMProvider().get_prompter(model="selected-model", options=options),
+            id="provider-factory-explicit-model",
+        ),
+    ],
+)
+def test_public_vllm_rejects_model_in_engine_args_during_planning(factory):
+    with pytest.raises(ValueError, match=r"engine_args\.model.*top-level 'model' argument"):
+        factory({"engine_args": {"model": "engine-model"}})
+
+
 @pytest.mark.parametrize("sampling_params", [{"temperature": -0.1}, '{"temperature":-0.1}'])
 @pytest.mark.parametrize(
     "factory",
@@ -291,6 +306,16 @@ class TestNoOpCases:
 
 class TestSQLPathFolds:
     """SQL struct_pack options flow through get_prompter into the same fold."""
+
+    def test_sql_rejects_model_in_engine_args_during_planning(self):
+        from vane.ai._sql import build_ai_prompt_sql_spec
+
+        with pytest.raises(ValueError, match=r"engine_args\.model.*top-level 'model' argument"):
+            build_ai_prompt_sql_spec(
+                provider="vllm",
+                model="selected-model",
+                options={"engine_args": {"model": "engine-model"}},
+            )
 
     def test_sql_top_level_options_fold(self):
         from vane.ai._sql import _normalize_sql_options

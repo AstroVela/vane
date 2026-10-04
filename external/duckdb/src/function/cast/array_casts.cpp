@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/cast/bound_cast_data.hpp"
@@ -60,10 +66,11 @@ static bool ArrayToArrayCast(Vector &source, Vector &result, idx_t count, CastPa
 
 		if (ConstantVector::IsNull(source)) {
 			ConstantVector::SetNull(result, true);
+			return true;
 		}
 
 		auto &source_cc = ArrayVector::GetEntry(source);
-		auto &result_cc = ArrayVector::GetEntry(result);
+		auto &result_cc = ArrayVector::GetEntryForWrite(result, 1);
 
 		// If the array vector is constant, the child vector must be flat (or constant if array size is 1)
 		D_ASSERT(source_cc.GetVectorType() == VectorType::FLAT_VECTOR || source_array_size == 1);
@@ -78,7 +85,7 @@ static bool ArrayToArrayCast(Vector &source, Vector &result, idx_t count, CastPa
 
 		FlatVector::SetValidity(result, FlatVector::Validity(source));
 		auto &source_cc = ArrayVector::GetEntry(source);
-		auto &result_cc = ArrayVector::GetEntry(result);
+		auto &result_cc = ArrayVector::GetEntryForWrite(result, count);
 
 		CastParameters child_parameters(parameters, cast_data.child_cast_info.cast_data, parameters.local_state);
 		bool all_ok =

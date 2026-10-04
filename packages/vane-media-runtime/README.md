@@ -1,0 +1,162 @@
+# Native media library build inputs
+
+This directory builds the shared libraries for Vane's `native_media` extension,
+which contains audio, image, and video modules. The intermediate runtime wheel
+is consumed by the extension wheel builder. Users install only
+`vane-extension-native-media`, which bundles these libraries with the extension;
+`vane-media-runtime` is not published to PyPI or installed separately. Vane's
+Python media backend does not require the native media package.
+
+The source distribution includes the corresponding upstream source archives,
+the exact vcpkg port trees and patches used to build them, the pinned vcpkg build
+scripts, the media feature selection, and the runtime packaging backend.
+`source-inventory.json` records every delivered file digest, upstream archive
+checksums, and recipe identities. License
+notices are checked against `components.json` before producing a wheel.
+The source SDK and wheel retain Vane's Apache-2.0 license and project NOTICE. Both the wheel's signed manifest
+and package metadata cover the project code and native library licenses.
+The source SDK declares its own `License-Expression` and `License-File` metadata.
+`source-licenses.json` binds all 45 upstream downloads to their reviewed source
+grants and notice hashes; the SDK exposes those notices alongside component,
+vcpkg, and auditwheel notices. Complete source archives also include unbuilt GPL
+tools and GFDL documentation, so this source expression differs from the runtime
+wheel's expression. Both fields are marked dynamic in the source metadata.
+Retain embedded file-specific grants and exceptions when modifying these sources.
+Updating an upstream archive requires reviewing its source license entry as well
+as the runtime component record. The exporter and source reader reject missing
+or changed notices, incomplete license declarations, and unreviewed downloads.
+The SDK supplies Boost.Multiprecision and its transitive dependencies for extension
+compilation. Boost.Container and Boost.Random shared libraries use the same
+namespacing and BSL-1.0 notice checks as the codec libraries.
+
+Versions are generated automatically, using the same Vane-version and digest
+encoder as the Iceberg provider wheel. The digest identifies the full Vane Git
+commit, working-tree contents when dirty, and Vane source version. Dirty source
+contents also determine a distinct library namespace, so fixtures from different
+edits cannot share filenames or SONAMEs. There is no separately
+maintained semantic release number. `runtime-version.json` freezes this identity
+in the source SDK; its manifest carries it into the wheel. Rebuilding the SDK
+without Git preserves the version. Dirty checkouts can produce private fixtures
+only. The extension descriptor binds the exact bundled runtime manifest; hash components
+do not imply chronological ordering within one Vane version.
+
+## Build a source distribution
+
+From a Vane checkout, first install the media dependencies using the triplet in
+this directory. Keep this installation separate from the base engine's static
+vcpkg installation. Then export the source SDK:
+
+Use `VCPKG_BINARY_SOURCES=clear` for that initial installation when populating
+the downloads directory. Binary caches do not carry the corresponding upstream
+source archives, including those needed by host build helpers. The fixture
+builder disables binary caches for both the initial install and the SDK rebuild.
+
+```bash
+python -m build --sdist packages/vane-media-runtime \
+  -C vcpkg-root=/path/to/pinned/vcpkg \
+  -C installed-root=/path/to/media/installed \
+  -C downloads=/path/to/vcpkg/downloads
+```
+
+The exporter fails if the actual source archives or exact recipes are missing.
+Vane inputs come only from tracked files; ignored binaries, bytecode, and editor
+backups are excluded. Private fixtures preserve tracked working-tree edits.
+Equivalent download-cache aliases produce the same source archive bytes.
+Build tools such as the compiler, NASM, CMake, Ninja, and pkg-config remain build
+prerequisites. The pinned vcpkg bootstrap and Meson acquisition scripts may
+download build tools; rebuilding does not require a Vane Git checkout.
+
+## Build an intermediate runtime wheel
+
+Maintainers publishing the official profile should use the
+[native media publication workflow](https://github.com/AstroVela/vane/blob/main/NATIVE_MEDIA_RELEASE.md). It calls
+`prepare_unsigned_wheel` to rebuild without a signing key and retain the SDK
+for extension compilation. Its `.whl.unsigned` output is signed and packaged
+in separate jobs. The PEP 517 command below remains available for independently
+managed builds; it signs during the build and is not the production workflow.
+
+Extract the source distribution and run the wheel build inside that directory.
+Use a build environment matching the advertised manylinux baseline. The build
+validates every shared object's dependencies and versioned symbols against the
+pinned platform policy; choosing an older tag does not make an incompatible
+binary portable.
+
+```bash
+python -m build --wheel \
+  -C "source-archive=/absolute/path/to/vane_media_runtime-<generated-version>.tar.gz" \
+  -C platform-tag=manylinux_2_28_x86_64 \
+  -C signing-key=/protected/path/to/runtime-signing-key.pem
+```
+
+For a different source host, pass
+`-C source-url=https://<host>/<immutable-assets>/<source-archive>.tar.gz`
+for the actual downloadable source archive. This signed reference is informational; verification uses the exact
+source archive filename and SHA-256, and the loader never fetches that URL.
+The default is the exact source SDK asset in the GitHub release tagged
+`native-media-<full-Vane-commit>`. The publication gate downloads and verifies
+this public archive before and after index publication. Keep the source SDK
+with the provider wheel in that immutable release; do not upload this
+intermediate runtime wheel to an index.
+
+The backend verifies required inputs and the complete file inventory, compares
+the extracted inputs with the supplied archive, then builds from a private copy
+of those verified archive bytes. Unarchived local files cannot enter the build.
+Use a fresh SDK extraction for each build; an existing `build` directory is
+rejected so previous installed binaries cannot satisfy a source rebuild.
+Binary caches are disabled. It namespaces all media
+SONAMEs, repairs their dependency references and RUNPATHs, checks the complete
+library graph, and finally hashes and signs the manifest. Do not modify or run
+an additional wheel repair tool after signing.
+
+Local fixture builds can use `-C test-only=true` and the repository integration
+test key. `-C sdk-prefix=/path/to/media/triplet` additionally permits an existing
+development SDK, but only for a fixture. Such wheels carry
+`Private :: Do Not Upload` and cannot be released.
+
+## Extension linkage and local replacement
+
+Configure extension builds with `VANE_MEDIA_RUNTIME_SDK` pointing to the media
+triplet and `VANE_MEDIA_RUNTIME_DIRECTORY` pointing to the staged runtime package
+directory. Keep `EXTENSION_STATIC_BUILD=ON`: DuckDB remains embedded in each
+extension, while the media libraries are shared. The build relocates unsigned
+extensions and binds their runtime manifest digest before extension signing.
+
+Users replacing a compatible library keep its namespaced filename and SONAME.
+The local runtime directory contains `.libs` and an updated
+`runtime-manifest.json` with the new file hashes. Before preparing any native
+media extension, select it explicitly:
+
+```python
+import vane
+
+vane.use_native_media_runtime("/absolute/path/to/my/runtime")
+```
+
+The official extension and its signature remain unchanged. The installed provider
+wheel still supplies the authenticated reference manifest; the explicit local
+selection authorizes the replacement code for this process. Start a new process
+to switch runtimes. To use a replacement on Ray, select it on the coordinator
+with `allow_distributed=True` and set `VANE_NATIVE_MEDIA_RUNTIME` independently
+in each node's environment before starting Ray. Do not pass that variable in
+a Ray Job or actor `runtime_env`. Snapshots carry the effective manifest SHA-256;
+every process verifies matching local library bytes before loading or reusing
+the extension. Paths can differ across nodes. Missing authorization or a
+different runtime fails before query admission. The default selection remains
+local-only, and each process permits only one runtime identity.
+
+
+## Loading model
+
+The resolver verifies the signed runtime manifest and every shared library,
+then prepares a private directory containing the extension and `.libs`.
+DuckDB loads the extension normally; the operating system follows its
+`$ORIGIN/.libs` RUNPATH and each library's `$ORIGIN` RUNPATH. Python does not
+preload libraries and the native loader does not call back into Python.
+A prepared directory can also be loaded directly with SQL `LOAD`, including
+in a fresh process, subject to the normal DuckDB ABI and signature checks.
+
+Manifest verification happens during preparation. Direct SQL loading does not
+revalidate runtime manifests or library hashes. Keep the complete prepared
+directory together and protect it against modification. Versioned Vane SONAMEs
+reduce collisions with independently installed codec packages, but do not
+provide isolation from arbitrary native code already loaded in a process.

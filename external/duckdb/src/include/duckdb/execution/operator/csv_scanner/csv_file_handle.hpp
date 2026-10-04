@@ -33,8 +33,11 @@ public:
 	bool IsPipe() const;
 
 	void Reset();
+	void SetScanRange(idx_t start, idx_t end, idx_t overlap);
 
 	idx_t FileSize() const;
+	bool HasScanRange() const;
+	idx_t ScanRangeStart() const;
 
 	bool FinishedReading() const;
 
@@ -63,6 +66,10 @@ private:
 	idx_t uncompressed_bytes_read = 0;
 
 	idx_t file_size = 0;
+	bool has_scan_range = false;
+	idx_t scan_range_start = 0;
+	idx_t scan_range_end = 0;
+	idx_t scan_read_end = 0;
 
 	idx_t requested_bytes = 0;
 	//! If we finished reading the file
