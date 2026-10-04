@@ -12,6 +12,7 @@ while the task control socket is waiting for output admission.
 from __future__ import annotations
 
 import atexit
+import gc
 import mmap
 import os
 import queue
@@ -33,9 +34,74 @@ _registry_lock = threading.RLock()
 _stores: dict[str, LocalShmStore] = {}
 _current_store: LocalShmStore | None = None
 _worker_client: WorkerShmClient | None = None
+_gc_lock = threading.RLock()
+_gc_holds = 0
+_gc_was_enabled = False
+
+
+def _pause_automatic_gc() -> None:
+    global _gc_holds, _gc_was_enabled
+    _gc_lock.acquire()
+    try:
+        if not _gc_holds:
+            _gc_was_enabled = gc.isenabled()
+            gc.disable()
+        # Count waiters as well as owners: releasing one critical section must
+        # not re-enable collection inside another thread's critical section.
+        _gc_holds += 1
+    finally:
+        _gc_lock.release()
+
+
+def _resume_automatic_gc() -> None:
+    global _gc_holds
+    # Bind release while GC is still paused. Re-enabling it must be followed
+    # only by the primitive unlock, not an allocating context-manager exit.
+    unlock = _gc_lock.release
+    _gc_lock.acquire()
+    try:
+        _gc_holds -= 1
+        if not _gc_holds and _gc_was_enabled:
+            gc.enable()
+    finally:
+        unlock()
+
+
+class _ForkLock:
+    """Keep automatic cyclic finalizers outside the allocation mutation lock."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def acquire(self) -> None:
+        # GC can release Arrow owners and acquire store/lease locks. Pause it
+        # before taking this inner lock, including recursive acquisitions.
+        _pause_automatic_gc()
+        try:
+            self._lock.acquire()
+        except BaseException:
+            _resume_automatic_gc()
+            raise
+
+    def release(self) -> None:
+        self._lock.release()
+        _resume_automatic_gc()
+
+    def __enter__(self) -> _ForkLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
+
+    def _is_owned(self) -> bool:
+        # CPython exposes this ownership probe outside the public type stub.
+        return self._lock._is_owned()  # type: ignore[attr-defined]
+
+
 # Always acquire this after registry/store locks. Fork preparation takes only
 # this lock, so a different thread holding a public store lock cannot block it.
-_fork_lock = threading.RLock()
+_fork_lock = _ForkLock()
 _fork_holds: set[_ForkHold] = set()
 _pending_fork: _ForkHold | None = None
 _inherited_fork_writers: set[int] = set()
@@ -147,24 +213,32 @@ def _resume_parent_after_fork() -> None:
 
 def _reset_registry_after_fork() -> None:
     global _registry_pid, _registry_lock, _stores, _current_store, _fork_lock, _fork_holds, _pending_fork
-    global _worker_clients
-    if _pending_fork is not None and _pending_fork.write_fd is not None:
-        # Keep the writer through normal exit, _exit, signals and further
-        # forks. CLOEXEC releases it when exec discards inherited mappings.
-        _inherited_fork_writers.add(_pending_fork.write_fd)
-    for hold in _fork_holds:
-        if hold.read_fd is not None:
-            os.close(hold.read_fd)
-    _fork_holds = set()
-    _pending_fork = None
-    _fork_lock = threading.RLock()
-    _worker_clients = weakref.WeakSet()
-    # Free lists and locks are process-local even though their backing mmap is
-    # shared. Discard inherited registry state without closing parent arenas.
-    _registry_lock = threading.RLock()
-    _stores = {}
-    _current_store = None
-    _registry_pid = os.getpid()
+    global _worker_clients, _gc_lock, _gc_holds
+    # Other parent threads may have been waiting for the mutation lock, or
+    # holding the GC-state lock. Neither their locks nor their hold count
+    # survives in the child. Keep one pause until registry reset completes.
+    _gc_lock = threading.RLock()
+    _gc_holds = 1
+    _fork_lock = _ForkLock()
+    try:
+        if _pending_fork is not None and _pending_fork.write_fd is not None:
+            # Keep the writer through normal exit, _exit, signals and further
+            # forks. CLOEXEC releases it when exec discards inherited mappings.
+            _inherited_fork_writers.add(_pending_fork.write_fd)
+        for hold in _fork_holds:
+            if hold.read_fd is not None:
+                os.close(hold.read_fd)
+        _fork_holds = set()
+        _pending_fork = None
+        _worker_clients = weakref.WeakSet()
+        # Free lists and locks are process-local even though their backing mmap
+        # is shared. Discard inherited state without closing parent arenas.
+        _registry_lock = threading.RLock()
+        _stores = {}
+        _current_store = None
+        _registry_pid = os.getpid()
+    finally:
+        _resume_automatic_gc()
 
 
 def _require_registry_owner() -> None:

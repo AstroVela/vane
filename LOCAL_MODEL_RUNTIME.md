@@ -1493,9 +1493,15 @@ These pins conservatively last for the inheriting processes' lifetimes even if
 they drop the views earlier, and count against the physical arena capacity.
 Allocation and cleanup paths collect completed pins synchronously; a background
 watcher also drains idle stores. Fork preparation uses a separate allocation
-mutation lock without acquiring registry, store, or lease locks. If notification
-setup fails, the affected regions remain pinned until owner-process exit, rather
-than being reused without proof that inherited views are gone.
+mutation lock without acquiring registry, store, or lease locks. Automatic
+cyclic GC is paused before acquiring that mutation lock and restored after the
+last owner or waiter leaves. This prevents Arrow/NumPy view finalizers from
+taking store or lease locks in reverse order inside the mutation critical
+section. Nested acquisitions preserve the caller's original GC setting; the
+fork child discards parent-thread pause counts before restoring its own GC
+setting after registry reset. If notification setup fails, the affected regions
+remain pinned until owner-process exit, rather than being reused without proof
+that inherited views are gone.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
