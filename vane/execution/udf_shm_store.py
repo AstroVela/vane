@@ -11,6 +11,7 @@ while the task control socket is waiting for output admission.
 
 from __future__ import annotations
 
+import atexit
 import mmap
 import os
 import queue
@@ -103,6 +104,7 @@ class LocalShmStore:
             raise ValueError("shared-memory store capacity must be at least 64 bytes")
         self.capacity = capacity
         self.store_id = uuid.uuid4().hex
+        self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._shm: Any = None
         self._free = [(0, capacity)]
@@ -117,11 +119,13 @@ class LocalShmStore:
         with _registry_lock:
             _stores[self.store_id] = self
 
-    def add_client(self, client_id: str) -> None:
+    def add_client(self, client_id: str) -> bool:
+        """Register atomically, or let the caller replace a retired arena."""
         with self._lock:
             if self._closed:
-                raise RuntimeError("shared-memory store is closed")
+                return False
             self._clients.add(client_id)
+            return True
 
     def remove_client(self, client_id: str) -> None:
         with self._lock:
@@ -156,6 +160,7 @@ class LocalShmStore:
                 from vane.execution.ref_bundle import _create_shm
 
                 self._shm = _create_shm(self.capacity, track=False)
+                self._owner_pid = os.getpid()
             offset, length = self._free.pop(index)
             if length > required:
                 self._free.insert(index, (offset + required, length - required))
@@ -219,15 +224,31 @@ class LocalShmStore:
                         self._shm._mmap.madvise(mmap.MADV_REMOVE, start, end - start)
             return
         if self._shm is not None:
-            from vane.execution.ref_bundle import _unlink_shm
-
-            if not self._unlinked:
-                _unlink_shm(self._shm, track=False)
-                self._unlinked = True
+            self._unlink_locked()
             self._shm.close()
             self._shm = None
         self._closed = True
         # Registry entries remain until cleanup succeeds, so close can retry.
+
+    def _unlink_locked(self) -> None:
+        if self._shm is not None and not self._unlinked:
+            from vane.execution.ref_bundle import _unlink_shm
+
+            try:
+                _unlink_shm(self._shm, track=False)
+            except FileNotFoundError:
+                pass
+            self._unlinked = True
+
+    def _unlink_at_exit(self) -> None:
+        # Forked children inherit the registry and its locks, but do not own
+        # these names. Check the owner before touching an inherited lock.
+        if self._owner_pid != os.getpid():
+            return
+        with self._lock:
+            # Unlinking preserves mapped buffers, including views accessed by
+            # later exit callbacks. The OS releases mappings on process exit.
+            self._unlink_locked()
 
     def close(self) -> None:
         with self._lock:
@@ -260,14 +281,35 @@ def current_store(client_id: str) -> LocalShmStore:
         for key, store in list(_stores.items()):
             if store._closed:
                 del _stores[key]
-        if _current_store is None or _current_store._closed:
-            from vane.execution.ref_bundle import _auto_local_shm_store_capacity_bytes, _parse_byte_size
+        # Retirement can race with this lookup. add_client() checks and pins
+        # under the store lock, so failure means we must create a new arena.
+        if _current_store is not None and _current_store.add_client(client_id):
+            return _current_store
+        from vane.execution.ref_bundle import _auto_local_shm_store_capacity_bytes, _parse_byte_size
 
-            raw = os.environ.get("VANE_LOCAL_SHM_STORE_BYTES", "auto").strip().lower()
-            capacity = _auto_local_shm_store_capacity_bytes() if raw == "auto" else _parse_byte_size(raw)
-            _current_store = LocalShmStore(capacity)
+        raw = os.environ.get("VANE_LOCAL_SHM_STORE_BYTES", "auto").strip().lower()
+        capacity = _auto_local_shm_store_capacity_bytes() if raw == "auto" else _parse_byte_size(raw)
+        _current_store = LocalShmStore(capacity)
         _current_store.add_client(client_id)
         return _current_store
+
+
+def _unlink_owned_stores_at_exit() -> None:
+    # Do not acquire the registry lock: a forked child can inherit it from a
+    # thread that no longer exists. Each arena checks its owning PID first.
+    error: Exception | None = None
+    for store in list(_stores.values()):
+        try:
+            store._unlink_at_exit()
+        except Exception as exc:
+            # A failed unlink must not prevent cleanup of the other arenas.
+            if error is None:
+                error = exc
+    if error is not None:
+        raise error
+
+
+atexit.register(_unlink_owned_stores_at_exit)
 
 
 def acquire_allocation(value: dict[str, Any]) -> StoreLease:
