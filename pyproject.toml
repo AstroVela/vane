@@ -311,6 +311,7 @@ include = [
     "/tests/fast/test_query_result_runtime.py",
     "/tests/fast/test_direct_exchange.py",
     "/tests/fast/test_direct_flight.py",
+    "/tests/fast/test_materialized_exchange.py",
     "/tests/fast/test_pipelined_plan.py",
     "/tests/fast/test_ray_pipelined.py",
     "/tests/fast/test_local_e2e.py",

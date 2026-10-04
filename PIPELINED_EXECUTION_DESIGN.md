@@ -7,10 +7,10 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 4 日（P2 更新） |
-| 开发分支 | feat/native-flight-exchange |
+| 日期 | 2026 年 10 月 5 日（P3.1 更新） |
+| 开发分支 | feat/materialized-exchange |
 | 基础分支 | integration/pipelined-execution |
-| Vane 参考提交 | 31191cae217d（PR #944 合入） |
+| Vane 参考提交 | 68b5407a4ca4（PR #962 合入） |
 | Trino 参考提交 | [6ead7e6c2f04c0bcfe5caf8e938dc1f5d3344f31][trino-revision]，调研时的 master，提交时间为 2026 年 10 月 2 日 02:30:56 UTC |
 | 兼容策略 | 不保留旧 API、旧协议、旧默认行为或旧执行入口 |
 | 实施记录 | [PIPELINED_EXECUTION_ROADMAP.md](PIPELINED_EXECUTION_ROADMAP.md) |
@@ -135,6 +135,8 @@ FteOptions
 PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创建后续 attempt。FteOptions 仅进入 FTE 查询快照，向 pipelined 查询传入重试参数时直接报配置错误。连接可以预先登记 exchange_store，供后续 FTE 查询使用；pipelined 查询不使用该存储。
 
 当前 [query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。exchange_store 目前只是注册存储的名字，P3 必须在实际准入前解析并验证其可用性与故障域。RayQuerySpec 覆盖计划准备所需的配置、快照和资源声明，尚不代表已预留资源或提交任务。公开连接入口继续按 roadmap 接线；local 不使用 RayQuerySpec。
+
+P3.1 提供内部 SharedDirectoryStore、native 物化读写与提交账本，供后续恢复调度器组合使用。它尚未接入 RayResources 或公开的 FTE 查询入口；普通 Parquet 的 FTE 准备仍被拒绝。文件输入冻结属于 P3.2，RecoveryScheduler 和 FTE 结果交付属于 P3.3。
 
 ### 公开 API 与后续目标
 
@@ -433,6 +435,35 @@ AttemptManifest 包含分区对象、长度、校验值、schema、输入身份�
 任务提交按 TaskId 和当前 attempt fencing token 原子选择。相同提交重复到达返回相同决定，过期 attempt 的迟到成功被拒绝。下游不能同时消费两个 attempt 的输出。
 
 如果提交已接受但确认丢失，重复 RPC 查询并返回既有决定，不创建新 attempt。coordinator 的提交表在本次查询内有效；第一版不提供 coordinator 故障恢复，因此无需为此增加跨 coordinator 选主协议。
+
+### P3.1 物化 I/O 与提交基础的实现边界
+
+实现位于 [native MaterializedIO](src/vane_py/execution/materialized_exchange.cpp)、[不可变 manifest](vane/execution/materialized_exchange.py) 与 [共享目录和提交账本](vane/execution/materialized_store.py)。native 读写与 Flight 共用 [Arrow frame codec](src/vane_py/execution/arrow_frame.cpp)，类型范围保持 basic types。没有新增执行器或调用旧 FTE manager。
+
+MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel 与现有 TaskRuntime 的 source/sink 连接。该 channel 是任务内部缓冲，不发布 Flight ticket，不把存储对象伪装成远程直接通道。Python 只处理身份、路径、长度、哈希和 manifest，数据批次不经过 Python 或 Ray ObjectRef。
+
+对象采用版本为 `vane.materialized-arrow:1` 的封存格式：
+
+| 部分 | 内容 |
+| --- | --- |
+| 文件头 | `VANEMAT1`、native schema 长度及字节 |
+| 数据帧 | Arrow IPC 长度、行数、该帧 SHA-256、含一个 batch 的独立 Arrow IPC stream |
+| 文件尾 | 零长度结束标记、总帧数、总行数 |
+| manifest 元数据 | 整个文件的长度和 SHA-256、行数、帧数、schema、分区与 attempt 身份 |
+
+整数使用 64 位小端编码。空分区也必须写入带 schema 和文件尾的对象。写端排空已封闭生产者后写入文件尾，sync 并关闭文件，才报告封存完成；关闭 writer 不删除文件。读端先以固定 64 KiB 缓冲核对整个文件的大小、SHA-256、schema 和文件尾，再逐帧校验、解码和交付；缺失、截断、变更或元数据不匹配均以错误结束。EOF 与 reader 完成状态在同一取消锁内发布，读到 EOF 后立即 close 不会把成功交付改为取消。
+
+每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 256 KiB` 的 staging，另外持有 channel 的窗口预算。native I/O 同时只处理一个帧，等待容量时保留所有权。P3.1 校验声明并限制文件/帧大小；跨 worker 的实际内存和 I/O 准入由 P3.3 接线，不将此设施描述为完整的进程内存硬限。
+
+SharedDirectoryStore 要求所有参与者访问同一个绝对路径和 `store_id`，支持独占创建、原子 hard link 发布和文件 sync。目录必须由部署方放在独立于计算 worker 的共享存储上；路径名称与 marker 只能校验身份和可见性，无法证明挂载的物理故障域。当前测试验证独立生产进程退出后数据保留，不宣称本地临时目录可承受整台存储节点失效。
+
+CommitCoordinator 在开始查询时接受固定的逻辑 task、输入指纹和全部输出分区声明。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。存储配额按对象最大预留长度计费，成功清理后才释放。
+
+commit 先核对 engine、查询、task、输入、epoch、fence、分区、schema 和对象预算，在决策锁外读取对象并发布不可变 `attempt.json`，最后再次验证 fence 并选择唯一成功输出。取消或新 attempt 可以在慢存储验证期间抢先生效。相同提交重复到达返回既有决定，冲突提交报错。`attempt.json` 是封存记录；即使文件存在，也不代表已被接受。只有本次 coordinator 的提交表选中的 attempt 可以进入 StageManifest。
+
+stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必须持有该 stage 的 ReadLease，不能用目录 listing 补全对象或从失败 attempt 取数据。成功对象归 query 所有，仍有 ReadLease 时 close 会保留对象及配额。调用方必须先停止 native I/O 或确认 worker 已退出，才能 discard 未提交 attempt；删除失败保持原有资源责任，可再次清理。已记录的输入错误优先于后续取消原因。
+
+这一步不实现自动重试、文件 source staging、ResultManifest、存储注册、失联查询的 TTL/orphan 回收或 coordinator 恢复。close 会等待 native I/O 线程退出；此文件提供者不能中断内核阻塞的文件 I/O，调度器还须管理清理期限和故障 worker 的退出。后续 P3.2/P3.3 完成这些接线与故障验收前，公开 FTE 查询继续拒绝执行。
 
 ### 重试与存储故障
 
@@ -822,6 +853,8 @@ local 直接连接原生查询与 QueryResult，验证结果、资源与取消�
 ### P3 在共同核心上实现 FTE
 
 实现 MaterializedExchange、存储提供者、AttemptManifest、StageManifest、RecoveryScheduler 和 ResultManifest。Ray FTE 与 Ray pipelined 使用同一 TaskRuntime 和 QueryResult；不实现 local FTE。
+
+按可独立审查的增量交付：P3.1 原生对象 I/O 与提交基础，P3.2 不可变文件输入与重放准备，P3.3 恢复调度、结果提交和失联资源回收。P3.1 的内部设施通过验收不等于整个 FTE 路径已经完成。
 
 退出条件：提交前后 worker 丢失、下游失败、重复提交、迟到 attempt、对象缺失和重试耗尽均有可控验证；恢复不会重复暴露行；生产 worker 退出后可从独立存储读到已提交输出。
 

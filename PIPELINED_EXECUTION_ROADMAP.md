@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 从此提交切出 feat/native-flight-exchange，完成 native Flight、Ray 调度与公开结果入口。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3.1 从此提交切出 feat/materialized-exchange，先交付 native 物化 I/O 与提交基础。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -19,8 +19,8 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | --- | --- | --- | --- |
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
 | P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1、P1.2 均已合入 |
-| P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已完成相关验收 |
-| P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
+| P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
+| P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1 实现与相关验收；P3.2、P3.3 待实现 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
 | P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
 
@@ -125,13 +125,35 @@ P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端
 
 ## P3 Ray FTE
 
+### P3.1 物化 I/O 与提交基础
+
+- [x] 独立 C++ 线程在有界任务缓冲与 Arrow IPC 对象之间读写，复用共同的 native TaskRuntime。
+- [x] SharedDirectoryStore 使用独立的 query/attempt 对象命名空间、存储身份和原子元数据发布。
+- [x] 不可变 AttemptManifest，固定输入身份、worker epoch、唯一成功 attempt 的 fencing 与幂等提交。
+- [x] 所有 task 和输出分区（包括空分区）提交后才能封闭 StageManifest。
+- [x] 校验对象长度、SHA-256、schema 和封存记录；缺失或损坏明确失败。
+- [x] 显式 attempt 清理、query 对象所有权和 ReadLease；失败清理保留存储配额。
+
+实现见 [native I/O](src/vane_py/execution/materialized_exchange.cpp)、[manifest](vane/execution/materialized_exchange.py) 与 [store/commit](vane/execution/materialized_store.py)。共享目录必须由部署方提供独立于计算 worker 的故障域；身份 marker 无法自动验证底层挂载的物理可靠性。这些是内部设施，尚未注册到公开 FTE 入口，也不代表已具备自动重试或全路径资源准入。
+
+验收：原生 fragment 写入后杀死生产进程，封存输出仍可提交和读取；封存前退出只留下不可提交的私有输出，丢弃后可用同一输入身份重放。单线程和四线程的共同 TaskRuntime 能消费物化输入。并发重复提交、迟到 attempt、校验期间取消/重试、空分区、对象损坏及清理失败均有定向测试。
+
+P3.1 本地相关验证为 **283 passed**：物化 I/O/提交 56、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray pipelined 13。非 editable 安装中的 277 个 Python/类型文件与 checkout 一致，native 与增量 Release 构建产物一致；格式、Ruff、全仓库 mypy 和源码版权清单通过。未运行完整 release/fast 套件。随后继续在本分支实现 P3.2/P3.3。
+
+### P3.2 不可变数据源与重放准备
+
 - [ ] 为文件 scan 接入不可变数据源版本或受查询生命周期保护的 staging；重试仍可读到同一份输入。
-- [ ] MaterializedExchange 和独立于计算 worker 的 store。
-- [ ] 不可变 AttemptManifest，唯一成功 attempt 的 fencing 与幂等提交。
-- [ ] StageManifest 封闭后调度下游，固定输入与 split 重放。
+- [ ] 冻结优化阶段依赖的数据源，在 worker 准备与重试时恢复同一连接/source 快照。
+- [ ] 将逻辑 task 的固定 split 与已提交上游 StageManifest 组成可验证的输入身份。
+
+### P3.3 恢复调度与公开结果
+
+- [ ] 注册并验证 exchange store，接通 worker、native 物化 binding、存储和 staging/I/O 准入。
+- [ ] StageManifest 封闭后才调度下游；重试时复用固定输入与 split。
 - [ ] RecoveryScheduler 的失败分类、重试上限、退避与共享 deadline。
 - [ ] ResultManifest 发布后才交付 FTE 结果。
-- [ ] 未提交对象、成功输出与结果 lease 各自清理。
+- [ ] 取消和清理期限、失联查询的有限 lease 与 orphan 回收。
+- [ ] 接通公开 ray/fte QueryResult，在真实 Ray worker 故障下验收。
 
 验收：提交前 worker 丢失可重试；提交后 worker 丢失仍可读；迟到或重复提交不会重复输出；下游重试读取同一 manifest；对象永久丢失明确失败；全路径不调用旧 FTE 引擎。不实现 local FTE。
 
