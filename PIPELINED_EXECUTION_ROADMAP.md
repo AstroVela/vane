@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 在该合入提交 b161c07fc3 上的独立分支 feat/query-result-runtime 实现；P1.2 在 P1.1 提交 277ac325d1 上的 feat/direct-exchange 实现。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 的 feat/direct-exchange 已迁到该合入提交之上，PR #944 直接面向 integration/pipelined-execution，仅包含 P1.2 增量。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -18,7 +18,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | 阶段 | 可交付能力 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
-| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1–P1.2 已完成 |
+| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1 已合入；P1.2 已实现，PR #944 待审查 |
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | 未开始 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
@@ -277,5 +277,14 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 **59 项**测试全部通过；连同 P1.1 的 46 项和 P0 的 371 项，最终相关回归共 **476 passed**。涵盖真实 Parquet、字符串/NULL/HASH、单帧窗口、迟到生产者、多输入、广播、部分发送、错误、超大行、取消、期限、原生与定时器清理、回调重入、单/多执行线程及源文件准备后变化。按要求未运行完整 release/fast 套件。
 - 当前 C++ 已从 build/python-release 增量 Release 构建并非 editable 安装；本增量未修改 DuckDB 子树。新测试已加入 release launcher 和 sdist 清单，供 CI 使用。
 - 安装后的 272 个 Python 源码/类型声明文件与 checkout 字节一致，native 与构建产物 SHA-256 一致；DuckDB SourceID 和 fragment engine identity 保持 P0/P1.1 基线。root 格式、ruff、全包 mypy、pre-commit、源码版权清单、67 个仓库文档链接及实际 sdist 发布校验全部通过。
+
+### P1.2 合入基线与专项审查（PR #944）
+
+- P1.2 已迁到 PR #943 的合入提交 `9f956003ae`；差异仍限于原来的 14 个 P1.2 文件，没有重复引入 P1.1 提交。
+- 检查 channel 条件判断与唤醒注册、部分发送恢复、广播及借用视图计费、并发取消、期限与生产完成、上下文清理；未发现需要修改执行逻辑的问题。
+- 最新基线上的 DirectExchange **59 项**与 QueryResult runtime **67 项**测试全部通过，合计 **126 passed**。仅运行这两个相关模块，未运行完整 release/fast 套件。
+- 本次未修改 C++ 或 Python 实现；非 editable 安装的 272 个 Python 源码/类型文件与 checkout 一致，native 与增量构建产物一致。
+- root 格式、Ruff、全包 mypy、适用的 pre-commit 检查、源码版权清单与 diff 检查通过。
+- PR #944 完成审查并合入后，从最新 integration/pipelined-execution 切独立的 P2.1 分支；跨平台构建与测试由该 PR 的 CI 验证。
 
 下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。
