@@ -100,7 +100,7 @@ def _task_payload():
     }
 
 
-def _corrupt_shm_result(descriptor, failure):
+def _corrupt_shm_result(descriptor, failure, *, monkeypatch=None):
     from vane.execution import ref_bundle
 
     ref = descriptor["block_refs"][0]
@@ -108,6 +108,21 @@ def _corrupt_shm_result(descriptor, failure):
         size = 8 if failure == "short_descriptor" else ref["ipc_size_bytes"] + 1
         return dict(descriptor, block_refs=[dict(ref, ipc_size_bytes=size)])
     allocation = ref.get("allocation")
+    if allocation is not None and failure in {"empty_mapping", "short_mapping"}:
+        from vane.execution.udf_shm_store import LocalShmStore
+
+        assert monkeypatch is not None
+        buffer = LocalShmStore.buffer
+
+        def damaged_region(store, slot):
+            if slot.descriptor() == allocation:
+                # Truncating a shared arena could SIGBUS unrelated views.
+                # Inject the damaged view at the pooled buffer boundary.
+                return memoryview(bytes(0 if failure == "empty_mapping" else 4))
+            return buffer(store, slot)
+
+        monkeypatch.setattr(LocalShmStore, "buffer", damaged_region)
+        return descriptor
     name = allocation["shm_name"] if allocation is not None else ref["shm_name"]
     shm = ref_bundle._open_existing_shm(name, track=False)
     try:
@@ -156,6 +171,41 @@ def _release_corrupted_descriptors(descriptors):
                 pass
 
 
+def _take_result(executor, ready=None):
+    from vane.execution import udf_subprocess as local
+
+    chunks = []
+    deadline = time.monotonic() + 15
+    try:
+        while True:
+            if ready is not None:
+                ready.clear()
+            result = executor.take_ready_result()
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool):
+                block, finished = result
+                if block is not None:
+                    chunks.append(block)
+                if finished:
+                    assert len(chunks) == 1, "expected one output block before task completion"
+                    return chunks.pop()
+            elif result is not None:
+                return result
+            assert time.monotonic() < deadline, "worker result did not arrive"
+            if ready is None:
+                time.sleep(0.01)
+            else:
+                ready.wait(0.01)
+    finally:
+        for chunk in chunks:
+            local._release_local_ref_bundle_result(chunk)
+
+
+def _submit_single(worker, value):
+    # Public submit installs the stream receiver and queues the terminal frame.
+    worker.submit(pa.table({"x": [value]}))
+    return _take_result(worker)
+
+
 def _execute(executor, value):
     table = pa.table({"x": [value]})
     ready = threading.Event()
@@ -167,13 +217,7 @@ def _execute(executor, value):
             ready.wait(0.01)
             assert time.monotonic() < deadline, "worker admission did not finish"
         executor.submit(table)
-        while True:
-            ready.clear()
-            result = executor.take_ready_result()
-            if result is not None:
-                return result
-            assert time.monotonic() < deadline, "worker result did not arrive"
-            ready.wait(0.01)
+        return _take_result(executor, ready)
     finally:
         executor.register_wakeup(None)
 
@@ -237,7 +281,7 @@ def test_idle_task_worker_loss_is_attributed_when_next_borrower_discovers_it():
 @pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
 @pytest.mark.parametrize("cancel_at", ["before_decode", "after_decode"])
 @pytest.mark.parametrize("foreign_grant", [False, True])
-def test_graceful_cancel_preserves_worker_with_late_ref_result(monkeypatch, backend, cancel_at, foreign_grant):
+def test_graceful_cancel_retires_worker_with_late_stream_chunk(monkeypatch, backend, cancel_at, foreign_grant):
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -308,8 +352,8 @@ def test_graceful_cancel_preserves_worker_with_late_ref_result(monkeypatch, back
             finally:
                 resume.set()
             closing.result(timeout=10)
-        assert pid() == original_pid
-        assert nonzero(metrics) == {}
+        assert pid() != original_pid
+        assert nonzero(metrics) == {"cancelled_workers": 1}
         assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
         if other_grant is not None:
             assert ref_bundle.local_shm_budget_manager().output_grant_pending(other_grant)
@@ -643,7 +687,7 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
 
     def receive_invalid_result(sock):
         message, payload = receive(sock)
-        if message != local._MSG_REF_BUNDLE_RESULT or descriptors:
+        if message not in (local._MSG_REF_BUNDLE_RESULT, local._MSG_REF_BUNDLE_CHUNK) or descriptors:
             return message, payload
         descriptor = loads(payload)
         descriptors.append(descriptor)
@@ -663,7 +707,7 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
             "invalid_ipc",
             "truncated_ipc_body",
         }:
-            return message, vane_pickle.dumps(_corrupt_shm_result(descriptor, failure))
+            return message, vane_pickle.dumps(_corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch))
         changes = {
             "block": {"block_refs": [{"provider": "local_shm", "ipc_size_bytes": 296}]},
             "block_size": {"block_refs": [dict(descriptor["block_refs"][0], ipc_size_bytes=0)]},
@@ -731,8 +775,10 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
                 "ipc_bytes_negative",
                 "ipc_bytes_overflow",
             }:
-                with pytest.raises(FileNotFoundError):
-                    ref_bundle._open_existing_shm(descriptors[0]["block_refs"][0]["shm_name"], track=False)
+                # Other workers may still share the arena; this generation,
+                # rather than its physical file, must have been released.
+                with pytest.raises(ValueError):
+                    ref_bundle.acquire_allocation(descriptors[0]["block_refs"][0]["allocation"])
             assert query().fetchall()[0][0] > 0
             assert runtime.resource_snapshot()["worker_failures"][field] == 1
     finally:
@@ -757,14 +803,14 @@ def test_native_invalid_result_replaces_registered_model_worker(monkeypatch, fai
 
     def corrupt_result(sock):
         message, payload = receive(sock)
-        if message == local._MSG_REF_BUNDLE_RESULT and not descriptors:
+        if message in (local._MSG_REF_BUNDLE_RESULT, local._MSG_REF_BUNDLE_CHUNK) and not descriptors:
             descriptor = vane_pickle.loads(payload)
             descriptors.append(descriptor)
             if failure == "metadata_ipc_size":
                 descriptor["metadata"][0]["ipc_size_bytes"] = "invalid IPC bytes"
                 payload = vane_pickle.dumps(descriptor)
             else:
-                _corrupt_shm_result(descriptor, failure)
+                _corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch)
         return message, payload
 
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
@@ -814,10 +860,10 @@ def test_native_chained_ipc_failure_replaces_registered_producer(monkeypatch, fa
 
     def corrupt_first_result(sock):
         message, payload = receive(sock)
-        if message == local._MSG_REF_BUNDLE_RESULT and not descriptors:
+        if message in (local._MSG_REF_BUNDLE_RESULT, local._MSG_REF_BUNDLE_CHUNK) and not descriptors:
             descriptor = vane_pickle.loads(payload)
             descriptors.append(descriptor)
-            _corrupt_shm_result(descriptor, failure)
+            _corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch)
         return message, payload
 
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
@@ -884,9 +930,9 @@ def test_chained_ipc_failure_notifies_only_the_bad_blocks_producer(monkeypatch, 
 
     try:
         for producer in (good, bad):
-            results.append(producer._submit_table(pa.table({"x": [1]})))
+            results.append(_submit_single(producer, 1))
         ref = results[1][1][0]
-        _corrupt_shm_result({"block_refs": [{"shm_name": ref.name}]}, failure)
+        _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(ref)]}, failure)
         if same_worker:
             # The physical task worker now belongs to the consuming runtime.
             bad._worker_lifecycle.bind(consumer_metrics)
@@ -896,7 +942,7 @@ def test_chained_ipc_failure_notifies_only_the_bad_blocks_producer(monkeypatch, 
             elif cleanup_failure == "producer":
                 patch.setattr(bad, "_close_data_shm", fail_cleanup)
             with pytest.raises(RuntimeError, match="ArrowInvalid|OSError"):
-                consumer._submit_ref_bundle(
+                consumer.submit_ref_bundle(
                     results[0][1] + results[1][1], None, results[0][2] + results[1][2], results[0][3]
                 )
         assert bool(injected) is (cleanup_failure is not None)
@@ -946,9 +992,9 @@ def test_chained_input_processing_failure_does_not_blame_producer(failure):
     )
     result = None
     try:
-        result = producer._submit_table(pa.table({"x": [1]}))
+        result = _submit_single(producer, 1)
         with pytest.raises(RuntimeError, match=f"planned downstream {failure} failure"):
-            consumer._submit_ref_bundle(result[1], None, result[2], result[3])
+            consumer.submit_ref_bundle(result[1], None, result[2], result[3])
         assert nonzero(producer_metrics) == {}
         assert producer.is_reusable()
         assert nonzero(consumer_metrics) == {"execution_errors": 1}
@@ -991,13 +1037,13 @@ def test_chained_decode_failure_cannot_notify_or_release_unowned_inputs(monkeypa
         return message, data
 
     try:
-        result = producer._submit_table(pa.table({"x": [1]}))
+        result = _submit_single(producer, 1)
         ref = result[1][0]
         foreign_lease = ref_bundle.create_local_shm_input_lease(result[1], reserve_output_credit=False)
-        _corrupt_shm_result({"block_refs": [{"shm_name": ref.name}]}, "invalid_ipc")
+        _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(ref)]}, "invalid_ipc")
         monkeypatch.setattr(local, "_recv_message", invalid_failure)
         with pytest.raises(RuntimeError):
-            consumer._submit_ref_bundle(result[1], None, result[2], result[3])
+            consumer.submit_ref_bundle(result[1], None, result[2], result[3])
         assert nonzero(producer_metrics) == {}
         assert producer.is_reusable()
         field = "cancelled_workers" if invalid_event == "foreign_lease_cancelled" else "worker_losses"
@@ -1036,11 +1082,7 @@ def test_deferred_task_ipc_failure_keeps_producer_attribution(monkeypatch, later
         result = run(first)
         worker = first._task_pool.idle[0].worker
         original = worker._proc.pid
-        shm = ref_bundle._open_existing_shm(result[1][0].name, track=False)
-        try:
-            shm.buf[8:16] = bytes(8)
-        finally:
-            shm.close()
+        _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(result[1][0])]}, "invalid_ipc")
         if later_borrow == "replaced":
             # A first terminal outcome and a new physical worker already exist.
             worker.close(kill=True)
@@ -1083,14 +1125,15 @@ def test_deferred_task_ipc_failure_keeps_producer_attribution(monkeypatch, later
 
 @pytest.mark.parametrize("failure", [pa.ArrowInvalid, pa.ArrowMemoryError, OSError])
 @pytest.mark.parametrize("cleanup_failure", [None, "worker", "mapping"])
-def test_deferred_decode_failure_precedes_cleanup_and_preserves_category(monkeypatch, failure, cleanup_failure):
+def test_standalone_deferred_decode_failure_precedes_cleanup_and_preserves_category(
+    monkeypatch, failure, cleanup_failure
+):
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
     metrics = WorkerMetrics()
     worker = local._SingleSubprocessExecutor(
-        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
-        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+        _task_payload(), startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics)
     )
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
     result = None
@@ -1113,7 +1156,12 @@ def test_deferred_decode_failure_precedes_cleanup_and_preserves_category(monkeyp
             raise RuntimeError("injected mapping cleanup failure")
 
     try:
-        result = worker._submit_table(pa.table({"x": [1]}))
+        # Standalone mappings remain the local-input format. Keep their close
+        # failure coverage separate from the pooled-buffer tests below.
+        descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(_submit_single(worker, 1))
+        result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+            descriptor, on_decode_error=worker._result_decode_error_handler()
+        )
         with monkeypatch.context() as patch:
             patch.setattr(pa.ipc, "open_stream", fail_decode)
             if cleanup_failure == "worker":
@@ -1205,7 +1253,7 @@ def test_deferred_result_observer_does_not_retain_worker(monkeypatch):
         dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
         startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
     )
-    result = worker._submit_table(pa.table({"x": [1]}))
+    result = _submit_single(worker, 1)
     worker_ref = weakref.ref(worker)
     try:
         worker.close(kill=True)
@@ -1247,11 +1295,7 @@ def test_deferred_ipc_failure_retires_worker_during_another_runtime_task(monkeyp
             return receive()
 
         monkeypatch.setattr(worker, "_recv_submit_result", pause_next_result)
-        shm = ref_bundle._open_existing_shm(result[1][0].name, track=False)
-        try:
-            shm.buf[8:16] = bytes(8)
-        finally:
-            shm.close()
+        _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(result[1][0])]}, "invalid_ipc")
         with ThreadPoolExecutor(1) as queries:
             pending = queries.submit(_execute, second, 1)
             try:
@@ -1277,7 +1321,7 @@ def test_deferred_ipc_failure_retires_worker_during_another_runtime_task(monkeyp
         second.close(kill=True)
 
 
-@pytest.mark.parametrize("failure", ["missing_shm", "allocation", "short_descriptor", "empty_mapping"])
+@pytest.mark.parametrize("failure", ["missing_shm", "allocation", "short_mapping", "empty_mapping"])
 @pytest.mark.parametrize("cleanup_failure", [None, "budget", "descriptor", "worker"])
 def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, failure, cleanup_failure):
     from vane.execution import ref_bundle
@@ -1289,7 +1333,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
     )
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
-    receive, open_shm = local._recv_message, ref_bundle._open_existing_shm
+    receive, acquire = local._recv_message, ref_bundle.acquire_allocation
     release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
     release_descriptor = local.release_local_shm_ref_bundle_descriptor
     descriptors = []
@@ -1297,25 +1341,18 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
 
     def missing_result(sock):
         message, payload = receive(sock)
-        if message == local._MSG_REF_BUNDLE_RESULT:
+        if message in (local._MSG_REF_BUNDLE_RESULT, local._MSG_REF_BUNDLE_CHUNK):
             descriptor = vane_pickle.loads(payload)
             descriptors.append(descriptor)
-            if failure == "missing_shm":
-                changed = dict(
-                    descriptor,
-                    block_refs=[
-                        dict(descriptor["block_refs"][0], shm_name=descriptor["block_refs"][0]["shm_name"] + "-missing")
-                    ],
-                )
-                payload = vane_pickle.dumps(changed)
-            elif failure in {"short_descriptor", "empty_mapping"}:
-                payload = vane_pickle.dumps(_corrupt_shm_result(descriptor, failure))
+            if failure in {"short_mapping", "empty_mapping"}:
+                payload = vane_pickle.dumps(_corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch))
         return message, payload
 
-    def fail_allocation(name, *, track):
-        if descriptors and name == descriptors[0]["block_refs"][0]["shm_name"]:
-            raise MemoryError("injected adoption allocation failure")
-        return open_shm(name, track=track)
+    def fail_allocation(allocation):
+        if descriptors and allocation == descriptors[0]["block_refs"][0]["allocation"]:
+            error = FileNotFoundError if failure == "missing_shm" else MemoryError
+            raise error("injected adoption allocation failure")
+        return acquire(allocation)
 
     def fail_cleanup(*_args, **_kwargs):
         injected.append(cleanup_failure)
@@ -1324,13 +1361,13 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     def fail_budget_callback(size, *, name=""):
         release_budget(size, name=name)
         # Model a failing post-release notification, without leaking a test
-        # allocation. The failed shm open must remain the primary exception.
+        # allocation. The failed region acquisition remains the primary error.
         if descriptors and not injected:
             fail_cleanup()
 
     monkeypatch.setattr(local, "_recv_message", missing_result)
-    if failure == "allocation":
-        monkeypatch.setattr(ref_bundle, "_open_existing_shm", fail_allocation)
+    if failure in {"missing_shm", "allocation"}:
+        monkeypatch.setattr(ref_bundle, "acquire_allocation", fail_allocation)
     if cleanup_failure == "budget":
         monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", fail_budget_callback)
     elif cleanup_failure == "descriptor":
@@ -1347,7 +1384,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         assert nonzero(metrics) == {field: 1}
         assert not worker.is_reusable()
     finally:
-        monkeypatch.setattr(ref_bundle, "_open_existing_shm", open_shm)
+        monkeypatch.setattr(ref_bundle, "acquire_allocation", acquire)
         monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", release_budget)
         monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", release_descriptor)
         monkeypatch.setattr(worker, "_close_data_shm", close_data)

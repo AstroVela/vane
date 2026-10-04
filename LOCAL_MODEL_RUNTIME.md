@@ -2004,6 +2004,11 @@ independently so downstream work can start before the physical task finishes.
 An explicit terminal result retains task completion and slot ownership until
 worker execution and cleanup finish. An error after earlier blocks still fails
 the query, and cancellation releases queued blocks and outstanding grants.
+If reception stops before the terminal response, the worker is retired before
+the pool can serve another invocation. This includes cancellation after a chunk
+arrives or after its buffers are adopted. A cancelled call whose terminal
+response has already been consumed can keep its healthy worker. Intentional
+stream retirement counts as `cancelled_workers`, rather than worker loss.
 Row-preserving calls keep their row-count validation and fused output contract.
 Local IPC transport and Ray's object store remain different implementations;
 this change does not imply equal throughput or equal memory budgets.
