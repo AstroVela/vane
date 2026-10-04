@@ -92,7 +92,7 @@ P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划�
 
 验收：受控上游尚未完成时下游已消费；极小预算、慢消费者、空分区、多输入及取消不会死锁，资源最终回到真实基线。
 
-实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。102 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误、已关闭 HASH 分区的超大行丢弃，以及已有 native/通道失败优先于后续超时。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
+实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。114 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误、已关闭 HASH 分区的超大行丢弃、已有 native/通道失败优先于后续超时，以及最后一个消费者关闭时保留已经发生的输入错误。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
 
 P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；跨查询资源池、Flight、Ray 调度、动态 split/routing 更新和分布式根结果交付仍属于 P2/P3。公开 local 查询路径不进入此设施。
 
@@ -311,5 +311,12 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 13 项回归及对照覆盖后台转换失败、真实定时器、直接 expiry、pump/release 两种清理入口、只有消费者任务的输入错误、FINISH 后的输出错误，以及超时中断正在执行的 pump。旧二进制上的定向验证为 **8 failed、4 passed**，并发中断对照随修复后的相关模块一起验证。
 - 修复后的相关验证共 **187 passed**：DirectExchange 102、QueryResult runtime 67、审查者独立复现及数据对照 12、原生转换异常和中断 6。缺少 fsspec 的基础依赖环境中，回调测试从 **5 failed** 变为 **5 skipped**。只运行相关测试，未运行完整 release/fast 套件。
 - C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件与 checkout 一致，native 与新构建产物一致。DuckDB SourceID 更新为 `346ef5b69e610bdb273d66138e6b4bc995857d2b`；未提交生成的身份清单。root/DuckDB 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 最后消费者关闭时的输入错误修复（PR #944）
+
+- 任务因失去全部输出消费者而提前收尾时，直接检查所有输入通道的持久错误。输入 abort 可能只唤醒原生任务，尚未被 CheckPulse 观察；已有错误必须先进入失败路径，不能清理后发送成功的 FINISH。
+- 新增 12 项回归覆盖单线程/四线程、status/pump/release 三个入口，以及持有或未持有输出批次。两个输入中第一个保持健康、第二个报错，确保检查不会漏掉后面的输入。失败后上下文和上游消费端均释放，原始原因在后续取消、超时和 release 中保留；借出的批次继续有效，关闭后归还容量。
+- 新回归在旧二进制上 **12 failed**；审查者的复现及对照为 **3 failed、5 passed**。修复后相关验证共 **189 passed**：DirectExchange 114、QueryResult runtime 67、审查者用例 8。只运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致。本次未改动 DuckDB 子树，engine identity 保持上一轮验证值。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
 
 下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。

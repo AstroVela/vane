@@ -401,6 +401,18 @@ void DirectTaskService::Refresh(Task &task) {
 		}
 	}
 	if (task.state == "RUNNING" && !live) {
+		// An input abort wakes native work, but CheckPulse may not observe it
+		// until that work executes. Do not discard an already recorded failure
+		// when losing output demand lets us bypass execution and send FINISH.
+		for (auto &port : task.inputs) {
+			for (auto &input : port.second) {
+				auto error = input.channel->Snapshot().error;
+				if (!error.empty()) {
+					Fail(task, error);
+					return;
+				}
+			}
+		}
 		// A source can be BLOCKED forever and never call Sink again. Stop its
 		// executor before closing production; cleanup also closes every input,
 		// propagating the loss of demand upstream. Borrowed output stays leased.

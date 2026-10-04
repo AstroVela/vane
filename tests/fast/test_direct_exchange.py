@@ -679,6 +679,66 @@ def test_last_output_close_stops_task_waiting_for_input(threads, routing, borrow
             service.release()
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("entry", ["status", "pump", "release"])
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_last_output_close_preserves_recorded_input_error(threads, entry, borrowed):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection)
+        upstream = [channel(connection), channel(connection)]
+        for source in upstream:
+            source.add_producer("upstream")
+            source.seal_producers()
+        output = channel(connection)
+        output.add_producer("task")
+        output.seal_producers()
+        service = prepare_root_task(connection, spec, [(source, "client") for source in upstream], [output])
+        batch = None
+        try:
+            service.start("task", "initial")
+            if borrowed:
+                upstream[0]._write_rows("upstream", 1, [(42,)])
+            deadline = time.monotonic() + 5
+            while any(not source.snapshot()["read_blocks"] for source in upstream) or (
+                borrowed and (output.snapshot()["accepted_rows"] != 1 or upstream[0].snapshot()["outstanding_frames"])
+            ):
+                assert time.monotonic() < deadline
+                service.pump(1)
+            if borrowed:
+                status, batch = output.poll("client")
+                assert status == "data" and batch.to_rows() == [(42,)]
+            # The first input is healthy: success requires checking every input,
+            # even when the executor has not run since the last input failed.
+            upstream[1].abort("input failed before consumer close")
+            output.close_consumer("client")
+            if entry == "pump":
+                service.pump(1)
+            else:
+                getattr(service, entry)()
+            state = service.status()[0]
+            assert state["state"] == "FAILED" and state["released"], state
+            assert "input failed before consumer close" in state["error"]
+            assert output.snapshot()["finished_producers"] == 0
+            with pytest.raises(vane.InvalidInputException, match="input failed before consumer close"):
+                output.poll("client")
+            assert all(source.snapshot()["closed_consumers"] == 1 for source in upstream)
+            assert all(source.snapshot()["bytes"] == 0 for source in upstream)
+            service.cancel("later cancellation")
+            assert not service.expire()
+            service.release()
+            assert service.status()[0] == state
+            if batch is not None:
+                assert batch.to_rows() == [(42,)]
+                assert output.snapshot()["bytes"] > 0
+                batch.close()
+            assert output.snapshot()["bytes"] == output.snapshot()["leased_bytes"] == 0
+        finally:
+            if batch is not None:
+                batch.close()
+            service.cancel("test cleanup")
+            service.release()
+
+
 @pytest.mark.parametrize("entry", ["status", "pump", "release", "expire"])
 @pytest.mark.parametrize("borrowed", [False, True])
 def test_aborted_output_fails_before_other_output_leases_drain(connection, entry, borrowed):
