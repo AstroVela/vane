@@ -1465,6 +1465,12 @@ reclaim inherited parent allocations or arenas. Allocation-lease release and
 arena cleanup check the owning PID before acquiring locks, including releases
 from block-ref finalizers and retained-view destructors. This prevents a child's
 stale free list from decommitting pages subsequently allocated by the parent.
+After `os.fork()`, the child starts with an empty output-store registry and a
+new registry lock. New workers allocate from child-owned arenas. Inherited
+stores and allocation leases reject new allocations, borrows, and buffer access
+before taking any inherited lock; they cannot reuse the parent's copied free
+list. Parent-owned results and already materialized views keep their existing
+ownership and cleanup rules.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
