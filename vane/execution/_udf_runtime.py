@@ -557,6 +557,7 @@ class UDFExecutor:
             and str(payload.get("execution_backend") or "").strip().lower() in ("ray_actor", "subprocess_actor")
             and self._async_runtime is None
             and not getattr(self._map_fn, "_vane_udf_owner_thread", False)
+            and callable(call)
             and not inspect.isgeneratorfunction(call)
             and not inspect.isgeneratorfunction(inspect.unwrap(call))
         ):
