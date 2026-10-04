@@ -9,6 +9,7 @@
 #include "duckdb/main/pending_query_result.hpp"
 
 namespace duckdb {
+class TaskErrorManager;
 namespace vane_execution {
 
 struct DirectInput {
@@ -62,12 +63,15 @@ private:
 		vector<DirectOutput> outputs;
 		shared_ptr<PreparedStatementData> prepared;
 		unique_ptr<PendingQueryResult> pending;
+		// Published/read under registry_lock, independently of the operation lock.
+		shared_ptr<TaskErrorManager> execution_errors;
+		string failure_reason;
 	};
 	void CheckCanceled() const;
 	void Refresh(Task &task);
 	void Cleanup(Task &task);
 	void Fail(Task &task, const string &message);
-	bool Stop(const string &reason, bool only_running);
+	bool Stop(const string &reason, bool only_running, optional_ptr<Task> failure = nullptr);
 	shared_ptr<DatabaseInstance> database;
 	mutex operation_lock;
 	mutex registry_lock;

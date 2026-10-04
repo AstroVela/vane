@@ -530,7 +530,9 @@ Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者�
 
 DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢复连接快照、校验 source、加载输入 binding 和输出路由，尚不创建 PendingQuery。所有 task 准备完后才能 start；同一 task 的相同 start token 幂等，不同 token 报错。start 再次验证数据源，然后创建带 DirectCollector 的原生执行器。pump 轮转调用 PendingQuery.ExecuteTask，一个执行线程也可推进多个相互等待的 fragment。native 生产完成后，pump 收取控制结果并释放查询上下文，状态进入 OUTPUT_PENDING；所有输出没有错误且 lease 均释放后，才进入 FINISHED。
 
-取消先通过独立控制入口中断 context、将 channel 置为持久错误并唤醒等待者，后续 release 负责确认清理。它不等待 pump 持有的操作锁。执行期限直接读取各输出生产者在 channel 锁下发布的 FINISH，不使用由 pump 更新的完成计数。全部输出已完成生产时，即使后台线程完成后尚未再次 pump，迟到的执行定时器也不能取消借用中的结果。尚未完成或尚未启动的生产者仍受执行期限约束。
+取消先通过独立控制入口中断 context、将 channel 置为持久错误并唤醒等待者，后续 release 负责确认清理。它不等待 pump 持有的操作锁。接受取消或执行超时前，先检查 native 执行器已记录的错误及所有输入、输出通道的持久错误；已有失败优先，发生错误的任务保持 FAILED，其余任务因该错误停止，结果端收到原始原因。执行器的 TaskErrorManager 以共享所有权保留，在开始调度前交给 TaskService；定时器读取它无需获取 context 锁，执行器释放后仍可读取已记录的错误。清理前移除该句柄，避免清理产生的中断覆盖既定结局。
+
+执行期限同时读取各输出生产者在 channel 锁下发布的 FINISH，不使用由 pump 更新的完成计数。没有已有失败且全部输出已完成生产时，即使后台线程完成后尚未再次 pump，迟到的执行定时器也不能取消借用中的结果。尚未完成或尚未启动的生产者仍受执行期限约束。失败和完成检查均独立于 pump；后续 pump、status、release 及再次取消保留首次接受的停止原因。
 
 控制层在 pump、status 和 release 中刷新输出状态。任务的所有输出均已失去消费者时，先检查已有执行错误，再停止并清理原生执行器、关闭上游消费端，最后封闭输出生产；该路径不依赖 Sink 再次被调用，等待空输入的任务也能退出。广播或多个输出只关闭一部分消费者时仍继续执行；已借出的输出仍保持计费及 OUTPUT_PENDING，直到最后引用释放。
 

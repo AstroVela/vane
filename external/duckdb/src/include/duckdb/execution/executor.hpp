@@ -91,6 +91,11 @@ public:
 	void PushError(ErrorData exception);
 
 	ErrorData GetError();
+	//! Retain the thread-safe error state independently of executor cleanup.
+	//! Acquire before executing tasks; reinitializing the executor resets this state.
+	shared_ptr<TaskErrorManager> GetErrorManager() const {
+		return error_manager;
+	}
 
 	//! True if an error has been thrown
 	bool HasError();
@@ -196,7 +201,7 @@ private:
 	//! The query profiler
 	shared_ptr<QueryProfiler> profiler;
 	//! Task error manager
-	TaskErrorManager error_manager;
+	shared_ptr<TaskErrorManager> error_manager;
 
 	//! The amount of completed pipelines of the query
 	atomic<idx_t> completed_pipelines;

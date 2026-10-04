@@ -4,6 +4,7 @@
 #include "direct_task.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
@@ -336,7 +337,15 @@ void DirectTaskService::Start(const string &id, const string &token) {
 			ValidateSources(context, task->fragment, task->source_snapshot, false);
 			PendingQueryParameters parameters;
 			auto outputs = task->outputs;
-			parameters.get_result_collector = [outputs](ClientContext &, PreparedStatementData &data) {
+			auto target = task.get();
+			parameters.get_result_collector = [this, target, outputs](ClientContext &context,
+			                                                          PreparedStatementData &data) {
+				// This factory runs synchronously before Initialize schedules any
+				// native tasks. Publish a lifetime-safe error handle before errors
+				// can occur, without requiring the timer to lock the context.
+				lock_guard<mutex> registry(registry_lock);
+				CheckCanceled();
+				target->execution_errors = context.GetExecutor().GetErrorManager();
 				return make_uniq<DirectCollector>(data, outputs);
 			};
 			task->pending =
@@ -361,13 +370,20 @@ void DirectTaskService::Refresh(Task &task) {
 	if (task.state == "FINISHED" || task.state == "FAILED") {
 		return;
 	}
-	if (canceled.load()) {
-		task.state = "CANCELED";
-		if (task.error.empty()) {
-			lock_guard<mutex> registry(registry_lock);
-			task.error = cancel_reason;
+	{
+		lock_guard<mutex> registry(registry_lock);
+		if (!task.failure_reason.empty()) {
+			task.state = "FAILED";
+			task.error = task.failure_reason;
+			return;
 		}
-		return;
+		if (canceled.load()) {
+			task.state = "CANCELED";
+			if (task.error.empty()) {
+				task.error = cancel_reason;
+			}
+			return;
+		}
 	}
 	bool live = false;
 	bool drained = true;
@@ -415,6 +431,12 @@ void DirectTaskService::Cleanup(Task &task) {
 	if (task.released) {
 		return;
 	}
+	{
+		lock_guard<mutex> registry(registry_lock);
+		// Teardown may itself interrupt native work. Those later interruptions
+		// must not replace an outcome already accepted by the control layer.
+		task.execution_errors.reset();
+	}
 	if (task.connection) {
 		task.connection->context->CancelTransaction();
 	}
@@ -430,9 +452,8 @@ void DirectTaskService::Cleanup(Task &task) {
 }
 
 void DirectTaskService::Fail(Task &task, const string &message) {
-	task.state = canceled.load() ? "CANCELED" : "FAILED";
-	task.error = message;
-	Cancel(message);
+	Stop(message, false, &task);
+	Refresh(task);
 	Cleanup(task);
 }
 
@@ -443,9 +464,7 @@ idx_t DirectTaskService::Pump(idx_t steps) {
 		auto &task = *tasks[next_task++ % tasks.size()];
 		if (canceled.load()) {
 			for (auto &pending : tasks) {
-				if (pending->state != "FINISHED" && pending->state != "FAILED") {
-					pending->state = "CANCELED";
-				}
+				Refresh(*pending);
 				Cleanup(*pending);
 			}
 			break;
@@ -456,10 +475,10 @@ idx_t DirectTaskService::Pump(idx_t steps) {
 		}
 		try {
 			auto result = task.pending->ExecuteTask();
-			CheckCanceled();
 			if (result == PendingExecutionResult::EXECUTION_ERROR) {
 				task.pending->ThrowError();
 			}
+			CheckCanceled();
 			if (PendingQueryResult::IsResultReady(result)) {
 				auto control = task.pending->Execute();
 				if (control->HasError()) {
@@ -492,34 +511,58 @@ bool DirectTaskService::Expire() {
 	return Stop("execution deadline exceeded", true);
 }
 
-bool DirectTaskService::Stop(const string &reason, bool only_running) {
+bool DirectTaskService::Stop(const string &reason, bool only_running, optional_ptr<Task> failure) {
 	vector<shared_ptr<ClientContext>> interrupt;
 	vector<shared_ptr<DirectChannel>> abort;
 	string message;
+	bool preceding_failure = false;
 	{
 		lock_guard<mutex> registry(registry_lock);
-		if (only_running) {
-			if (canceled.load()) {
-				return false;
-			}
+		if (only_running && canceled.load()) {
+			return false;
+		}
+		if (!canceled.load()) {
 			bool unfinished = false;
-			// Membership and output bindings are immutable after preparation.
-			// Read FINISH at its native publication point: background executor
-			// threads can complete without any subsequent Pump call. A deadline
-			// is accepted only while at least one output is still producing.
+			// Inspect the native failure record and every input/output before
+			// accepting a stop reason. No operation/context lock is needed, even
+			// while Pump is executing. Keep the original failed tasks distinct
+			// from peers canceled as a consequence of their failure.
 			for (auto &task : tasks) {
-				for (auto &output : task->outputs) {
-					for (auto &channel : output.channels) {
-						unfinished = !channel->ProducerStatus(output.producer).finished || unfinished;
+				if (task->execution_errors && task->execution_errors->HasError()) {
+					task->failure_reason = task->execution_errors->GetError().Message();
+				}
+				for (auto &port : task->inputs) {
+					for (auto &input : port.second) {
+						auto error = input.channel->Snapshot().error;
+						if (task->failure_reason.empty() && !error.empty()) {
+							task->failure_reason = std::move(error);
+						}
 					}
 				}
+				for (auto &output : task->outputs) {
+					for (auto &channel : output.channels) {
+						auto status = channel->ProducerStatus(output.producer);
+						unfinished = !status.finished || unfinished;
+						if (task->failure_reason.empty() && !status.error.empty()) {
+							task->failure_reason = std::move(status.error);
+						}
+					}
+				}
+				if (task.get() == failure.get() && task->failure_reason.empty()) {
+					task->failure_reason = reason;
+				}
+				if (message.empty() && !task->failure_reason.empty()) {
+					message = task->failure_reason;
+				}
 			}
-			if (!unfinished) {
+			preceding_failure = !message.empty();
+			// FINISH is read at native publication, independent of Pump. Existing
+			// failures still need propagation even when production has finished.
+			if (only_running && !preceding_failure && !unfinished) {
 				return false;
 			}
-		}
-		if (!canceled.exchange(true)) {
-			cancel_reason = reason.empty() ? "canceled" : reason;
+			cancel_reason = preceding_failure ? message : reason.empty() ? "canceled" : reason;
+			canceled.store(true);
 		}
 		message = cancel_reason;
 		for (auto &weak_context : contexts) {
@@ -536,7 +579,7 @@ bool DirectTaskService::Stop(const string &reason, bool only_running) {
 	for (auto &channel : abort) {
 		channel->Abort(message);
 	}
-	return true;
+	return !only_running || !preceding_failure;
 }
 
 void DirectTaskService::Release() {

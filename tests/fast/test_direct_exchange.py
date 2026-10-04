@@ -679,7 +679,7 @@ def test_last_output_close_stops_task_waiting_for_input(threads, routing, borrow
             service.release()
 
 
-@pytest.mark.parametrize("entry", ["status", "pump", "release"])
+@pytest.mark.parametrize("entry", ["status", "pump", "release", "expire"])
 @pytest.mark.parametrize("borrowed", [False, True])
 def test_aborted_output_fails_before_other_output_leases_drain(connection, entry, borrowed):
     spec = submission(connection, "select 42::bigint", partitions=1)
@@ -699,7 +699,10 @@ def test_aborted_output_fails_before_other_output_leases_drain(connection, entry
         right.abort("injected output failure")
         with pytest.raises(vane.InvalidInputException, match="injected output failure"):
             right.producer_drained("task")
-        if entry == "pump":
+        if entry == "expire":
+            assert not service.expire()  # The recorded failure precedes the deadline, even after FINISH.
+            service.release()
+        elif entry == "pump":
             service.pump(1)
         else:
             getattr(service, entry)()
@@ -754,6 +757,95 @@ def test_execution_error_after_partial_result_is_not_eof(connection):
         assert any(task["state"] == "FAILED" for task in service.snapshot()["tasks"])
         with pytest.raises(vane.InvalidInputException, match="late native error"):
             service.poll_result()
+
+
+@pytest.mark.parametrize("expiry", ["pump", "direct", "timer"])
+@pytest.mark.parametrize("cleanup", ["pump", "release"])
+def test_background_error_precedes_expiry_and_survives_cleanup(expiry, cleanup):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = "select (case when range >= 2048 then 'original native failure' else range::varchar end)::bigint from range(4096)"
+        spec = submission(connection, sql, partitions=1, timeout=1 if expiry == "timer" else 30)
+        limits = DirectExchangeLimits(65536, 32768, 1024, 16)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            deadline = time.monotonic() + 0.5
+            while service.result.snapshot()["accepted_rows"] != 2048:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            # The next native chunk fails without waiting for credit or Pump.
+            time.sleep(0.05)
+            status, batch = service.poll_result()
+            assert status == "data"
+            expected = batch.to_rows()
+            try:
+                if expiry == "pump":
+                    with pytest.raises(vane.ConversionException, match="original native failure"):
+                        service.pump(1)
+                elif expiry == "direct":
+                    assert not service.native.expire()
+                else:
+                    service._timer.join(timeout=3)
+                    assert not service._timer.is_alive()
+                if cleanup == "pump":
+                    service.native.pump(1)
+                else:
+                    service.native.release()
+                state = service.snapshot()["tasks"][0]
+                assert state["state"] == "FAILED" and state["released"], state
+                assert "original native failure" in state["error"]
+                with pytest.raises(vane.InvalidInputException, match="original native failure"):
+                    service.poll_result()
+                service.cancel("later cancellation")
+                assert not service.native.expire()
+                assert service.snapshot()["tasks"][0] == state
+                assert service.snapshot()["active_contexts"] == 0
+                assert service.snapshot()["owned_bytes"] > 0
+                assert batch.to_rows() == expected
+            finally:
+                batch.close()
+            assert service.snapshot()["owned_bytes"] == service.snapshot()["leased_bytes"] == 0
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("expiry", ["direct", "timer"])
+def test_input_error_precedes_expiry_without_an_upstream_task(threads, expiry):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection)
+        upstream, output = channel(connection), channel(connection)
+        upstream.add_producer("upstream")
+        upstream.seal_producers()
+        output.add_producer("task")
+        output.seal_producers()
+        service = prepare_root_task(connection, spec, [(upstream, "client")], [output])
+        timer = None
+        try:
+            service.start("task", "initial")
+            until_deadline = time.monotonic() + 5
+            while not upstream.snapshot()["read_blocks"]:
+                assert time.monotonic() < until_deadline
+                service.pump(1)
+            upstream.abort("original input failure")
+            if expiry == "direct":
+                assert not service.expire()
+            else:
+                timer = threading.Timer(0.05, service.expire)
+                timer.start()
+                timer.join(timeout=3)
+                assert not timer.is_alive()
+            service.release()
+            state = service.status()[0]
+            assert state["state"] == "FAILED" and state["released"], state
+            assert "original input failure" in state["error"]
+            with pytest.raises(vane.InvalidInputException, match="original input failure"):
+                output.poll("client")
+            assert upstream.snapshot()["closed_consumers"] == 1
+            assert upstream.snapshot()["bytes"] == output.snapshot()["bytes"] == 0
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join(timeout=3)
+            service.cancel("test cleanup")
+            service.release()
 
 
 def test_execution_deadline_interrupts_an_unpumped_blocked_query(connection):
@@ -927,6 +1019,7 @@ def test_partial_sink_resumes_second_output_without_replaying_first(connection):
 
 @pytest.mark.parametrize("method", ["pump", "start", "cancel", "close", "snapshot"])
 def test_task_entry_rejects_python_input_callback_before_locks_or_state_changes(method):
+    pytest.importorskip("fsspec")
     script = r"""
 import io, sys
 from datetime import datetime, timezone
@@ -997,10 +1090,11 @@ def test_collected_service_destructor_releases_tasks_but_not_exported_views(conn
     assert exchange.snapshot()["bytes"] == 0
 
 
-def test_cancel_interrupts_a_concurrent_pump_without_waiting_for_its_control_lock():
+@pytest.mark.parametrize("stop", ["cancel", "expire"])
+def test_stop_interrupts_a_concurrent_pump_without_waiting_for_its_control_lock(stop):
     script = r"""
 from concurrent.futures import ThreadPoolExecutor
-import threading, time
+import sys, threading, time
 import vane
 from vane.execution.compiler import FragmentCompileOptions
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -1030,7 +1124,10 @@ with vane.connect(backend='local', config={'threads': 1}) as connection:
             while not any(channel.snapshot()['read_blocks'] for channel in service.channels.values()):
                 assert time.monotonic() < deadline
                 time.sleep(0.001)
-            service.cancel('concurrent cancellation')
+            if sys.argv[1] == 'cancel':
+                service.cancel('concurrent cancellation')
+            else:
+                assert service.native.expire()
             future.result(timeout=3)
         service.native.release()
         assert service.snapshot()['active_contexts'] == 0
@@ -1038,5 +1135,5 @@ with vane.connect(backend='local', config={'threads': 1}) as connection:
         assert all(task['state'] == 'CANCELED' for task in service.snapshot()['tasks'])
     assert connection.execute('select 42').fetchone() == (42,)
 """
-    completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=15)
+    completed = subprocess.run([sys.executable, "-I", "-c", script, stop], capture_output=True, text=True, timeout=15)
     assert completed.returncode == 0, completed.stdout + completed.stderr
