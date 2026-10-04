@@ -10,7 +10,10 @@ import json
 import select
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -215,6 +218,191 @@ def test_close_with_retained_view_preserves_live_pages_and_finishes_on_last_view
     gc.collect()
     assert store._closed
     assert store._shm is None
+
+
+@pytest.mark.parametrize("retire_before_registration", [False, True])
+def test_worker_registration_racing_with_last_worker_retirement(monkeypatch, retire_before_registration):
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "4096")
+    monkeypatch.setattr(storage, "_stores", {})
+    monkeypatch.setattr(storage, "_current_store", None)
+    previous = storage.current_store("old-worker")
+    registering = threading.Event()
+    proceed = threading.Event()
+    original = previous.add_client
+
+    def pause_registration(client_id):
+        registering.set()
+        assert proceed.wait(5)
+        return original(client_id)
+
+    monkeypatch.setattr(previous, "add_client", pause_registration)
+    selected = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(storage.current_store, "new-worker")
+            try:
+                assert registering.wait(5)
+                if retire_before_registration:
+                    previous.remove_client("old-worker")
+            finally:
+                proceed.set()
+            selected = future.result(timeout=5)
+        if not retire_before_registration:
+            previous.remove_client("old-worker")
+        assert (selected is previous) == (not retire_before_registration)
+        assert selected.snapshot()["clients"] == 1
+        ref = _input(selected, [1, 2, 3])
+        try:
+            assert ref.to_table().column(0).to_pylist() == [1, 2, 3]
+        finally:
+            ref.release()
+    finally:
+        previous.remove_client("old-worker")
+        if selected is not None:
+            selected.remove_client("new-worker")
+
+
+_NORMAL_EXIT = """
+import atexit, gc, json, sys
+
+def check_late_view():
+    from pathlib import Path
+    values = None if kept is None else (kept.to_pylist() if hasattr(kept, 'to_pylist') else kept.tolist())
+    print(json.dumps({'late_values': values, 'unlinked': not (Path('/dev/shm') / name).exists()}), flush=True)
+
+# Run after the store's exit callback to verify that unlink leaves views valid.
+atexit.register(check_late_view)
+import pyarrow as pa
+from vane.execution import ref_bundle as refs
+from vane.execution.udf_shm_store import LocalShmStore
+pooled, drop_view = sys.argv[1] == 'True', sys.argv[2] == 'True'
+table = pa.table({'x': [1, 2, 3]})
+if pooled:
+    store = LocalShmStore(4096)
+    store.add_client('runtime')
+    block = refs.prepare_local_shm_block(table)
+    lease = store.allocate(block.ipc_size_bytes)
+    allocation = lease.allocation
+    region = store.buffer(allocation)
+    region[:8] = len(block.ipc).to_bytes(8, 'little')
+    region[8:] = memoryview(block.ipc).cast('B')
+    region.release()
+    ref = refs.LocalShmBlockRef(f'{allocation.identity}:0', allocation.size, budget_bytes=0, allocation_lease=lease)
+    name = allocation.shm_name
+else:
+    result = refs.make_local_shm_ref_bundle_result(table)
+    ref = result[1][0]
+    name = ref.name
+print(json.dumps({'name': name}), flush=True)
+kept = ref.to_table().column(0)
+if sys.argv[3] == 'numpy':
+    kept = kept.chunk(0).to_numpy(zero_copy_only=True)
+ref.release()
+if pooled:
+    store.remove_client('runtime')
+if drop_view:
+    kept = None
+    gc.collect()
+"""
+
+
+@pytest.mark.parametrize("pooled,drop_view", [(False, False), (True, True), (True, False)])
+@pytest.mark.parametrize("view_kind", ["arrow", "numpy"])
+def test_normal_exit_unlinks_arena_without_invalidating_retained_views(pooled, drop_view, view_kind):
+    child = subprocess.run(
+        [sys.executable, "-I", "-c", _NORMAL_EXIT, str(pooled), str(drop_view), view_kind],
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    records = [json.loads(line) for line in child.stdout.splitlines()]
+    name = records[0]["name"] if records else None
+    try:
+        assert child.returncode == 0, child.stderr
+        assert name is not None
+        assert not (Path("/dev/shm") / name).exists(), f"normal exit leaked arena {name}"
+        assert records[-1] == {"late_values": None if drop_view else [1, 2, 3], "unlinked": True}
+        assert "Exception ignored" not in child.stderr
+    finally:
+        if name is not None:
+            refs._unlink_shared_memory_name(name)
+
+
+def test_exit_cleanup_preserves_views_and_attempts_every_arena_after_failure(monkeypatch):
+    monkeypatch.setattr(storage, "_stores", {})
+    stores = [storage.LocalShmStore(4096) for _ in range(2)]
+    refs_to_release = [_input(store, [index]) for index, store in enumerate(stores)]
+    kept = [ref.to_table().column(0) for ref in refs_to_release]
+    for ref in refs_to_release:
+        ref.release()
+    original = refs._unlink_shm
+
+    def fail_first(shm, *, track):
+        if shm is stores[0]._shm:
+            raise OSError("planned exit unlink failure")
+        original(shm, track=track)
+
+    monkeypatch.setattr(refs, "_unlink_shm", fail_first)
+    try:
+        with pytest.raises(OSError, match="planned exit unlink failure"):
+            storage._unlink_owned_stores_at_exit()
+        assert not stores[0]._unlinked
+        assert stores[1]._unlinked
+        assert [view.to_pylist() for view in kept] == [[0], [1]]
+        monkeypatch.setattr(refs, "_unlink_shm", original)
+        storage._unlink_owned_stores_at_exit()
+        storage._unlink_owned_stores_at_exit()
+        assert [view.to_pylist() for view in kept] == [[0], [1]]
+    finally:
+        monkeypatch.setattr(refs, "_unlink_shm", original)
+        kept.clear()
+        gc.collect()
+        for store in stores:
+            store.close()
+
+
+_FORK_EXIT = """
+import os, signal, threading
+from vane.execution import udf_shm_store as storage
+from vane.execution import ref_bundle as refs
+store = storage.LocalShmStore(4096)
+lease = store.allocate(64)
+print(store._shm.name, flush=True)
+locked, proceed = threading.Event(), threading.Event()
+def hold_locks():
+    with storage._registry_lock, store._lock:
+        locked.set()
+        assert proceed.wait(10)
+thread = threading.Thread(target=hold_locks)
+thread.start()
+assert locked.wait(5)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    storage._unlink_owned_stores_at_exit()
+    os._exit(0)
+proceed.set()
+thread.join(5)
+try:
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, status
+    opened = refs._open_existing_shm(store._shm.name, track=False)
+    opened.close()
+finally:
+    lease.release()
+"""
+
+
+def test_forked_child_exit_does_not_lock_or_unlink_inherited_parent_arena():
+    child = subprocess.run([sys.executable, "-I", "-c", _FORK_EXIT], text=True, capture_output=True, timeout=15)
+    name = child.stdout.strip()
+    try:
+        assert child.returncode == 0, child.stderr
+        assert name
+        assert not (Path("/dev/shm") / name).exists()
+    finally:
+        if name:
+            refs._unlink_shared_memory_name(name)
 
 
 def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_shm_worker):

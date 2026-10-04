@@ -1451,7 +1451,10 @@ views or increase the store capacity before retrying.
 
 On Linux, closing the last worker decommits wholly free pages. Returned Arrow
 views remain valid after runtime shutdown; the arena closes after the last view
-is released. Cleanup failures retain the store for retry.
+is released. Cleanup failures retain the store for retry. Normal interpreter
+exit unlinks arenas owned by that process even when views remain alive, without
+invalidating their mappings for later exit callbacks. Forked children do not
+unlink inherited parent arenas during exit cleanup.
 `vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
 live allocation bytes, allocation counts, and reuse counts for diagnostics.
 
