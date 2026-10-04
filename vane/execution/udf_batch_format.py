@@ -36,7 +36,7 @@ class _OutputColumnSchema:
     name: str
     tensor_type: pa.DataType | None
     image_dtype: Any = None
-    map_container_type: pa.DataType | None = None
+    container_type: pa.DataType | None = None
 
 
 _OutputSchema = tuple[_OutputColumnSchema, ...]
@@ -98,31 +98,21 @@ def resolve_udf_output_schema(batch_format: str, output_schema: Any) -> _OutputS
         if tensor_type is not None and not isinstance(tensor_type, pa.FixedShapeTensorType):
             raise TypeError(f"batch_format={batch_format!r} supports only fixed-shape tensor outputs")
         image_dtype = None
-        map_container_type = None
+        container_type = None
         if kind == "duckdb_type":
             import vane
 
             dtype = vane.type(str(entry["type"]))
             if dtype.is_image():
                 image_dtype = dtype
-            elif _contains_map(dtype):
-                map_container_type = _arrow_type_from_output_schema_entry(entry)
+            elif dtype.id in ("list", "array", "struct", "map"):
+                container_type = _arrow_type_from_output_schema_entry(entry)
         columns.append(
             _OutputColumnSchema(
-                name=name, tensor_type=tensor_type, image_dtype=image_dtype, map_container_type=map_container_type
+                name=name, tensor_type=tensor_type, image_dtype=image_dtype, container_type=container_type
             )
         )
     return tuple(columns)
-
-
-def _contains_map(dtype: Any) -> bool:
-    if dtype.id == "map":
-        return True
-    if dtype.id in ("list", "array"):
-        return _contains_map(dict(dtype.children)["child"])
-    if dtype.id == "struct":
-        return any(_contains_map(child) for _, child in dtype.children)
-    return False
 
 
 def _iter_udf_output_tables(
@@ -258,18 +248,32 @@ def _tensor_numpy_view(array: pa.FixedShapeTensorArray) -> np.ndarray:
 
 
 def _arrow_values_to_numpy(array: pa.Array) -> np.ndarray:
-    if pa.types.is_list(array.type) or pa.types.is_large_list(array.type) or pa.types.is_fixed_size_list(array.type):
-        rows: NDArray[np.object_] = np.empty(len(array), dtype=object)
-        for index, scalar in enumerate(array):
-            rows[index] = _arrow_values_to_numpy(scalar.values) if scalar.is_valid else None
-        return rows
     if pa.types.is_nested(array.type) or array.null_count:
         # NumPy's floating NaN cannot represent SQL NULL without losing NaNs or
-        # integer precision. Object elements retain None at every nesting level.
+        # integer precision. Keep typed scalars as well as None: Python integers
+        # alone would infer int64 on output, overflowing large uint64 leaves.
         objects: NDArray[np.object_] = np.empty(len(array), dtype=object)
-        objects[:] = array.to_pylist()
+        for index, scalar in enumerate(array):
+            objects[index] = _arrow_scalar_to_numpy(scalar)
         return objects
     return array.to_numpy(zero_copy_only=False)
+
+
+def _arrow_scalar_to_numpy(scalar: pa.Scalar) -> Any:
+    if not scalar.is_valid:
+        return None
+    dtype = scalar.type
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        return _arrow_values_to_numpy(scalar.values)
+    if pa.types.is_struct(dtype):
+        return {field.name: _arrow_scalar_to_numpy(scalar[index]) for index, field in enumerate(dtype)}
+    if pa.types.is_map(dtype):
+        return [(_arrow_scalar_to_numpy(pair[0]), _arrow_scalar_to_numpy(pair[1])) for pair in scalar.values]
+    if pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_boolean(dtype):
+        return np.dtype(dtype.to_pandas_dtype()).type(scalar.as_py())
+    if pa.types.is_date32(dtype):
+        return np.datetime64(scalar.value, "D")
+    return scalar.as_py()
 
 
 def _arrow_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
@@ -408,16 +412,18 @@ def _numpy_column_to_arrow(value: np.ndarray, column_schema: _OutputColumnSchema
         return _image_values_to_arrow(value, column_schema)
     if column_schema.tensor_type is not None:
         return _tensor_values_to_arrow(value, column_schema)
-    if column_schema.map_container_type is not None:
-        return _map_container_values_to_arrow(value, column_schema.map_container_type)
+    if column_schema.container_type is not None:
+        return _container_values_to_arrow(value, column_schema.container_type)
     if value.ndim != 1:
         return pa.array(value.tolist())
     return pa.array(value)
 
 
-def _map_container_values_to_arrow(values: Any, dtype: pa.DataType) -> pa.Array:
-    """Preserve MAP containers while leaving ordinary leaf casts to DuckDB."""
-    rows = [None if value is np.ma.masked else value for value in values]
+def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: bool = False) -> pa.Array:
+    """Encode declared containers, retaining source leaf types for DuckDB casts."""
+    rows = [
+        None if value is np.ma.masked or (from_pandas and _is_null_object_value(value)) else value for value in values
+    ]
     if all(value is None for value in rows):
         return pa.array(rows, type=dtype)
     mask = pa.array([value is None for value in rows])
@@ -441,33 +447,56 @@ def _map_container_values_to_arrow(values: Any, dtype: pa.DataType) -> pa.Array:
             offsets.append(len(keys))
         return _map_array_from_offsets(
             offsets,
-            _map_container_values_to_arrow(keys, dtype.key_type),
-            _map_container_values_to_arrow(items, dtype.item_type),
+            _container_values_to_arrow(keys, dtype.key_type, from_pandas=from_pandas),
+            _container_values_to_arrow(items, dtype.item_type, from_pandas=from_pandas),
             mask=mask,
         )
     if pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype):
         offsets = [0]
         flattened: list[Any] = []
         for row in rows:
+            if row is not None and (
+                not isinstance(row, (Sequence, np.ndarray)) or isinstance(row, (str, bytes, bytearray))
+            ):
+                raise TypeError("LIST/ARRAY output requires materialized sequences or ndarrays")
             if pa.types.is_fixed_size_list(dtype):
                 if row is not None and len(row) != dtype.list_size:
-                    raise ValueError(f"MAP container output requires rows of size {dtype.list_size}")
+                    raise ValueError(f"ARRAY output requires rows of size {dtype.list_size}")
                 flattened.extend([None] * dtype.list_size if row is None else row)
             elif row is not None:
                 flattened.extend(row)
             offsets.append(len(flattened))
-        child = _map_container_values_to_arrow(flattened, dtype.value_type)
+        child = _container_values_to_arrow(flattened, dtype.value_type, from_pandas=from_pandas)
         if pa.types.is_fixed_size_list(dtype):
             return pa.FixedSizeListArray.from_arrays(child, dtype.list_size, mask=mask)
         return pa.ListArray.from_arrays(offsets, child, mask=mask)
     if pa.types.is_struct(dtype):
-        canonical = [_canonicalize_struct_field_names(row, dtype, boundary="map_batches output") for row in rows]
+        canonical = [
+            _canonicalize_struct_field_names(row, dtype, boundary="map_batches output", recursive=False) for row in rows
+        ]
         children = [
-            _map_container_values_to_arrow([None if row is None else row[field.name] for row in canonical], field.type)
+            _container_values_to_arrow(
+                [None if row is None else row[field.name] for row in canonical], field.type, from_pandas=from_pandas
+            )
             for field in dtype
         ]
         return pa.StructArray.from_arrays(children, names=[field.name for field in dtype], mask=mask)
-    return pa.array(rows)
+    return _primitive_values_to_arrow(rows, from_pandas=from_pandas)
+
+
+def _primitive_values_to_arrow(values: Any, *, from_pandas: bool = False) -> pa.Array:
+    """Infer leaf types without losing NumPy temporal units through Python scalars."""
+    if isinstance(values, np.ndarray) and values.dtype != object:
+        return pa.array(values, from_pandas=from_pandas)
+    rows = list(values)
+    temporal_dtype = next((value.dtype for value in rows if isinstance(value, np.datetime64)), None)
+    if temporal_dtype is not None and all(
+        value is None or (isinstance(value, np.datetime64) and value.dtype == temporal_dtype) for value in rows
+    ):
+        # Arrow accepts datetime64[D] ndarrays but not those same scalars in a
+        # Python sequence. A typed array also keeps dates outside Python's range.
+        return pa.array(np.array(rows, dtype=temporal_dtype), from_pandas=from_pandas)
+    return pa.array(rows, from_pandas=from_pandas)
 
 
 def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
@@ -479,6 +508,8 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
             arrays.append(_image_values_to_arrow(series.tolist(), column_schema))
         elif column_schema.tensor_type is not None:
             arrays.append(_tensor_values_to_arrow(series.tolist(), column_schema))
+        elif column_schema.container_type is not None and not isinstance(series.dtype, _import_pandas().ArrowDtype):
+            arrays.append(_container_values_to_arrow(series, column_schema.container_type, from_pandas=True))
         else:
             arrays.append(pa.array(series, from_pandas=True))
     return pa.Table.from_arrays(arrays, names=[column.name for column in schema])
@@ -536,7 +567,7 @@ def _tensor_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> 
                     "only whole tensor rows may be null"
                 )
             value = value.data
-        if _is_null_tensor_value(value):
+        if _is_null_object_value(value):
             storage_rows.append(pa.nulls(1, type=tensor_type.storage_type))
             continue
         tensor = np.asarray(value)
@@ -617,19 +648,21 @@ def _dense_tensor_values_to_arrow(
         # UBIGINT values. Integer-only input can be range-checked directly.
         flattened = pa.array(flat, type=tensor_type.value_type, safe=True)
     else:
-        flattened = pa.array(flat).cast(tensor_type.value_type, safe=True)
+        flattened = _primitive_values_to_arrow(flat).cast(tensor_type.value_type, safe=True)
     storage = pa.FixedSizeListArray.from_arrays(flattened, tensor_type.storage_type.list_size)
     return pa.ExtensionArray.from_storage(tensor_type, storage)
 
 
-def _is_null_tensor_value(value: Any) -> bool:
+def _is_null_object_value(value: Any) -> bool:
     if value is None:
         return True
     if value is np.ma.masked:
         return True
     if isinstance(value, (float, np.floating)):
         return bool(np.isnan(value))
-    return type(value).__name__ == "NAType" and type(value).__module__.partition(".")[0] == "pandas"
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return bool(np.isnat(value))
+    return type(value).__name__ in ("NAType", "NaTType") and type(value).__module__.partition(".")[0] == "pandas"
 
 
 def _import_pandas() -> Any:

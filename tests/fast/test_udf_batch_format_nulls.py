@@ -192,7 +192,12 @@ def test_public_identity_preserves_tensor_nested_nulls_and_maps(request, monkeyp
                [1., NULL, 'NaN'::DOUBLE]::DOUBLE[] AS list_float,
                [1152921504606846977, NULL]::BIGINT[] AS list_int,
                map(['a'], [1]) AS mapping,
-               [map(['a'], [1])] AS nested_mapping
+               [map(['a'], [1])] AS nested_mapping,
+               [9223372036854775809, NULL]::UBIGINT[] AS unsigned_list,
+               {'value': 9223372036854775809::UBIGINT, 'missing': NULL::UBIGINT} AS unsigned_struct,
+               map(['a', 'b'], [9223372036854775809::UBIGINT, NULL]) AS unsigned_map,
+               [DATE '2026-01-01', DATE '2026-01-02'] AS date_list,
+               [DATE '2026-01-01', DATE '2026-01-02']::DATE[2] AS date_array
     """
     with vane.connect(config={"threads": 2}) as con:
         relation = con.sql(sql)

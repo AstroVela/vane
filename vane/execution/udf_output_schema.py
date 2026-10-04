@@ -283,7 +283,7 @@ def materialized_output_schema(payload: dict[str, Any]) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary: str) -> Any:
+def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary: str, recursive: bool = True) -> Any:
     if value is None:
         return None
     if pa.types.is_struct(dtype):
@@ -297,18 +297,17 @@ def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary
                 or len(declared_names) != len(dtype)
             ):
                 raise _invalid_input(f"{boundary} STRUCT value must contain exactly the declared fields")
-            return {
-                field.name: _canonicalize_struct_field_names(
-                    _mapping_field_value(value, field.name, boundary=boundary, path="column"),
-                    field.type,
-                    boundary=boundary,
+            canonical = {}
+            for field in dtype:
+                child = _mapping_field_value(value, field.name, boundary=boundary, path="column")
+                canonical[field.name] = (
+                    _canonicalize_struct_field_names(child, field.type, boundary=boundary) if recursive else child
                 )
-                for field in dtype
-            }
+            return canonical
         if isinstance(value, tuple) and len(value) == len(dtype):
             # Inference recognizes mappings as STRUCTs; tuples infer as LISTs.
             return {
-                field.name: _canonicalize_struct_field_names(item, field.type, boundary=boundary)
+                field.name: _canonicalize_struct_field_names(item, field.type, boundary=boundary) if recursive else item
                 for item, field in zip(value, dtype, strict=True)
             }
         raise TypeError("STRUCT values require a mapping or a matching positional tuple")
