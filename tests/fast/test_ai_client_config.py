@@ -138,8 +138,11 @@ def test_descriptor_pins_application_identity_under_conflicting_sdk_environment(
         assert state["vertexai"] is False
         assert state["base_url"] == "https://generativelanguage.googleapis.com/"
     else:
-        assert state["project"] is None
-        assert state["organization"] is None
+        # Anthropic SDK 1.11+ exposes ``client.organization`` as an API resource
+        # namespace, so only OpenAI clients are checked for account identity.
+        if family == "openai":
+            assert state["project"] is None
+            assert state["organization"] is None
         assert state["auth_token"] is None
         assert "worker" not in repr(state["headers"])
         assert state["base_url"].startswith("https://api." + family + ".com")
