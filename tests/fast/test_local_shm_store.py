@@ -259,12 +259,16 @@ payload = json.loads(sys.stdin.readline())
 client.begin_input(payload)
 table = refs.materialize_ref_bundle(payload['block_refs'], payload['slices'], payload['metadata'], payload['names'])
 kept = table.column(0)
+if sys.argv[2] == 'numpy':
+    kept = kept.chunk(0).to_numpy(zero_copy_only=True)
+def values():
+    return kept.to_pylist() if hasattr(kept, 'to_pylist') else kept.tolist()
 del table
 client.end_input()
-print(json.dumps(kept.to_pylist()), flush=True)
+print(json.dumps(values()), flush=True)
 for command in sys.stdin:
     if command.strip() == 'read':
-        print(json.dumps(kept.to_pylist()), flush=True)
+        print(json.dumps(values()), flush=True)
     elif command.strip() == 'release':
         kept = None
         gc.collect()
@@ -283,7 +287,8 @@ def _line(proc):
 
 
 @pytest.mark.parametrize("crash", [False, True])
-def test_remote_view_survives_parent_ref_release_and_pins_until_last_buffer_or_exit(monkeypatch, crash):
+@pytest.mark.parametrize("view_kind", ["arrow", "numpy"])
+def test_remote_view_survives_parent_ref_release_and_pins_until_last_buffer_or_exit(monkeypatch, crash, view_kind):
     store = storage.LocalShmStore(4096)
 
     def acquire(client_id):
@@ -298,7 +303,7 @@ def test_remote_view_survives_parent_ref_release_and_pins_until_last_buffer_or_e
     peer.borrow_inputs(payload)
     fd = peer.child_sock.fileno()
     proc = subprocess.Popen(
-        [sys.executable, "-I", "-c", _CHILD, str(fd)],
+        [sys.executable, "-I", "-c", _CHILD, str(fd), view_kind],
         pass_fds=(fd,),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
