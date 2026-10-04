@@ -1169,6 +1169,8 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	InitializeDynamicExtensionBindings(m);
 	extern void RegisterExecutionPlanBindings(py::module_ & m);
 	RegisterExecutionPlanBindings(m);
+	extern void RegisterDirectRuntimeBindings(py::module_ & m);
+	RegisterDirectRuntimeBindings(m);
 	PythonObject::Initialize();
 	RegisterUDFExecutorFactory();
 	RegisterVLLMExecutorFactory();

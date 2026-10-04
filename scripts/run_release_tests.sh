@@ -50,6 +50,7 @@ release_tests=(
   "$project_root/tests/fast/test_python_binding_callbacks.py"
   "$project_root/tests/fast/test_query_execution_options.py"
   "$project_root/tests/fast/test_query_result_runtime.py"
+  "$project_root/tests/fast/test_direct_exchange.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
   "$project_root/tests/fast/test_vane_config.py"

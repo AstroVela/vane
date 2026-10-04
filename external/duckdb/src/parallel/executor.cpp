@@ -107,7 +107,8 @@ vector<PipelineProgressSnapshot> Executor::CapturePipelineProgressSnapshots() {
 	return result;
 }
 
-Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
+Executor::Executor(ClientContext &context)
+    : context(context), error_manager(make_shared_ptr<TaskErrorManager>()), executor_tasks(0), blocked_thread_time(0) {
 }
 
 Executor::~Executor() {
@@ -778,7 +779,7 @@ void Executor::Reset() {
 	root_pipeline_idx = 0;
 	completed_pipelines = 0;
 	total_pipelines = 0;
-	error_manager.Reset();
+	error_manager->Reset();
 	pipelines.clear();
 	final_pipeline_progress_snapshots.clear();
 	events.clear();
@@ -813,21 +814,21 @@ vector<LogicalType> Executor::GetTypes() {
 
 void Executor::PushError(ErrorData exception) {
 	// push the exception onto the stack
-	error_manager.PushError(std::move(exception));
+	error_manager->PushError(std::move(exception));
 	// interrupt execution of any other pipelines that belong to this executor
 	context.interrupted = true;
 }
 
 bool Executor::HasError() {
-	return error_manager.HasError();
+	return error_manager->HasError();
 }
 
 ErrorData Executor::GetError() {
-	return error_manager.GetError();
+	return error_manager->GetError();
 }
 
 void Executor::ThrowException() {
-	error_manager.ThrowException();
+	error_manager->ThrowException();
 }
 
 void Executor::Flush(ThreadContext &thread_context) {

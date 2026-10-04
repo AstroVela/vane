@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 在该合入提交 b161c07fc3 上的独立分支 feat/query-result-runtime 实现。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 的 feat/direct-exchange 已迁到该合入提交之上，PR #944 直接面向 integration/pipelined-execution，仅包含 P1.2 增量。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -18,7 +18,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | 阶段 | 可交付能力 | 依赖 | 状态 |
 | --- | --- | --- | --- |
 | P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
-| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1 已完成，P1.2 未开始 |
+| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1 已合入；P1.2 已实现，PR #944 待审查 |
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | 未开始 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
@@ -84,13 +84,17 @@ P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划�
 
 ### P1.2 DirectExchange 的进程内契约
 
-- [ ] 有界 channel、消费窗口、成员封闭、FINISH 和消费者关闭。
-- [ ] native source 无数据返回 BLOCKED，唤醒无丢失。
-- [ ] sink 部分发送后恢复不重发已接受的行。
-- [ ] 生产完成与输出排空分开，finalize 不等待远程消费。
-- [ ] 进程内 TaskService 测试两个 fragment 的并发推进。
+- [x] 有界 channel、消费窗口、成员封闭、FINISH 和消费者关闭。
+- [x] native source 无数据返回 BLOCKED，唤醒无丢失。
+- [x] sink 部分发送后恢复不重发已接受的行。
+- [x] 生产完成与输出排空分开，finalize 不等待远程消费。
+- [x] 进程内 TaskService 测试两个 fragment 的并发推进。
 
 验收：受控上游尚未完成时下游已消费；极小预算、慢消费者、空分区、多输入及取消不会死锁，资源最终回到真实基线。
+
+实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。123 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误、已关闭 HASH 分区的超大行丢弃、已有 native/通道失败优先于后续超时、最后一个消费者关闭时保留输入错误，以及输入已到 EOF、native 提前 finalize 或输出等待交付时仍检查输入的持久错误。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
+
+P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；跨查询资源池、Flight、Ray 调度、动态 split/routing 更新和分布式根结果交付仍属于 P2/P3。公开 local 查询路径不进入此设施。
 
 ## P2 Ray pipelined
 
@@ -186,7 +190,7 @@ P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端
 - root/DuckDB 格式、ruff、全仓库 mypy、源码版权清单和仓库文档链接检查通过。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3596 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3672 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。这次完整验收使用上述从当前 C++ 源码重建的 native。
 
-P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；下一增量 P1.2 在进程内验证分布式直接通道，不新增 local+pipelined 模式。TaskRuntime、Ray 调度器及网络数据面仍待后续阶段接线。
+P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；P1.2 完成原生 TaskRuntime 和进程内直接通道契约，不新增 local+pipelined 模式。Ray 调度器及网络数据面继续按 P2 接线。
 
 ### P0 审查修复（PR #935）
 
@@ -264,4 +268,63 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 13 项回归，覆盖省略 resources、相同及不同容量、字符串及路径写法，并检查活动 cursor 的准入限制、结果名额、完整结果和释放后的复用。
 - 查询结果与连接/cursor/默认连接相关验证 **89 passed**，审查者的独立复现 **1 passed**。C++ 已增量 Release 构建并非 editable 安装；270 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。格式、ruff、适用的 pre-commit 与源码版权检查通过；未运行完整 release/fast 套件。
 
-下一增量为 P1.2：先落实有界 DirectExchange channel 的所有权、FINISH 与取消契约，再接 native BLOCKED/唤醒和部分发送恢复，最后用两个 fragment 的进程内 TaskService 验证并发推进。该设施用于分布式执行契约验证；local 公开路径继续直接原生执行。
+### P1.2 原生 DirectExchange 与进程内 TaskService（2026 年 10 月 4 日）
+
+- 每帧拥有独立 native 缓冲，消费窗口包含排队、借出及切片引用；广播物理分配计一次，消费者各自计费。暂时没有额度时返回 BLOCKED，超大单行明确拒绝。成员封闭、严格序号、FINISH、持久错误及消费者关闭分别处理。
+- DirectSource/DirectCollector 使用原生 ExecutionBatch 和带 epoch 的弱 task 唤醒；检查与订阅共用通道锁，回调在锁外执行。HASH 继续使用原生分区表达式。sink 保存输出/分区/行游标，重试不重发已经接受的部分；finalize 只封闭生产，不等待输出排空。
+- TaskService.prepare 恢复快照并加载显式 binding；start 再次校验 source，对相同 token 幂等；pump 轮转推进真实 native fragment。取消无需等待 pump 操作锁，release 幂等清理上下文。OUTPUT_PENDING 与 FINISHED 依据实际输出 lease 区分，清理保留失败/取消状态。
+- 执行期限以 native FINISH 判断生产完成，已完成生产后的执行定时器失效。服务析构和关闭取消定时器、回收原生执行状态；晚释放的 native 切片仍有效。Python 输入回调重入在服务锁及状态修改前被拒绝。
+- 新增 **59 项**测试全部通过；连同 P1.1 的 46 项和 P0 的 371 项，最终相关回归共 **476 passed**。涵盖真实 Parquet、字符串/NULL/HASH、单帧窗口、迟到生产者、多输入、广播、部分发送、错误、超大行、取消、期限、原生与定时器清理、回调重入、单/多执行线程及源文件准备后变化。按要求未运行完整 release/fast 套件。
+- 初次实现的 C++ 已从 build/python-release 增量 Release 构建并非 editable 安装，当时未修改 DuckDB 子树；后续执行器错误记录修复见下文。新测试已加入 release launcher 和 sdist 清单，供 CI 使用。
+- 该次验收的 272 个 Python 源码/类型声明文件与 checkout 字节一致，native 与构建产物 SHA-256 一致；DuckDB SourceID 和 fragment engine identity 保持 P0/P1.1 基线。root 格式、ruff、全包 mypy、pre-commit、源码版权清单、67 个仓库文档链接及实际 sdist 发布校验全部通过。
+
+### P1.2 合入基线与专项审查（PR #944）
+
+- P1.2 已迁到 PR #943 的合入提交 `9f956003ae`；迁移时差异限于原来的 14 个 P1.2 文件，没有重复引入 P1.1 提交。后续的错误保留修复另修改两个 DuckDB 执行器文件，见下文。
+- 首轮检查覆盖 channel 条件判断与唤醒注册、部分发送恢复、广播及借用视图计费、并发取消、期限与生产完成、上下文清理；后续审查补充复现了三个异步收尾遗漏，修复见下文。
+- 最新基线上的 DirectExchange **59 项**与 QueryResult runtime **67 项**测试全部通过，合计 **126 passed**。仅运行这两个相关模块，未运行完整 release/fast 套件。
+- 本次未修改 C++ 或 Python 实现；非 editable 安装的 272 个 Python 源码/类型文件与 checkout 一致，native 与增量构建产物一致。
+- root 格式、Ruff、全包 mypy、适用的 pre-commit 检查、源码版权清单与 diff 检查通过。
+- PR #944 完成审查并合入后，从最新 integration/pipelined-execution 切独立的 P2.1 分支；跨平台构建与测试由该 PR 的 CI 验证。
+
+### P1.2 异步收尾修复（PR #944）
+
+- 执行期限直接检查每个任务输出生产者的 native FINISH，删除依赖 pump 更新的 `unfinished_production`。后台已完成生产后，不再 pump 或继续持有最后一批数据，都不会导致迟到的执行超时取消结果。
+- 控制层在推进和观察任务时检查全部输出的消费者。最后一个消费者关闭后，即使任务仍阻塞于空输入，也会检查执行错误、停止并回收执行器、关闭上游消费端和封闭输出；广播与多输出仍有消费者时继续执行，借用视图的计费持续到实际释放。
+- 通道在同一锁下提供生产完成、排空、消费者和错误状态。任务先检查所有输出错误，再判断交付完成；abort 丢弃队列不能把 OUTPUT_PENDING 变成 FINISHED。失败保留原始原因并停止其余任务，直接调用 producer_drained 也会显式报告通道错误。
+- 新增 **18 项**回归在旧版本全部失败，修复后全部通过。覆盖空/非空结果、真实定时器及直接过期调用、单/多线程、广播/多输出、保留批次，以及 status/pump/release 三种观察入口。审查者提供的 **3 项**独立复现也全部通过。
+- 两个相关模块 **144 passed**（DirectExchange 77、QueryResult runtime 67），加上独立复现共 **147 passed**。仅运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。root 格式、Ruff、全包 mypy、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 已关闭 HASH 分区修复（PR #944）
+
+- Sink 在每次计算目标帧大小前调用 HasConsumers；已无消费者的通道直接跳过剩余行。检查仍先报告持久通道错误，其他活跃分区继续交付并遵守帧容量限制。
+- 新增 **12 项**测试覆盖分区 0/1、单线程/四线程及关闭、仍开放、报错三种目标状态。旧实现中关闭分区的 **4 项失败**，其余 **8 项对照通过**；修复后全部通过，关闭分区未分配 payload，活跃分区无丢行或重复。
+- 两个相关模块 **156 passed**（DirectExchange 89、QueryResult runtime 67）；审查者的复现及对照 **6 passed**，合计 **162 passed**。仅运行相关测试。
+- C++ 已增量 Release 构建并非 editable 安装；安装源码及 native 与当前 checkout/构建产物一致。格式、Ruff、全包 mypy、适用的 pre-commit、源码版权与 diff 检查通过。
+
+### P1.2 基础安装与失败优先级修复（PR #944）
+
+- Python 文件系统回调测试在启动子进程前执行 `pytest.importorskip("fsspec")`；可选依赖缺失时只跳过对应的 5 项用例，不影响基础安装的 release gate。
+- native 执行器以共享所有权保存 TaskErrorManager，TaskService 在后台任务调度前取得其句柄。接受超时或取消前检查该错误记录和全部输入/输出通道；已经发生的失败优先于后来的停止原因，无需等待 pump 或 context 锁。已有失败即使发生在 FINISH 后也须传播。
+- 失败记录独立于上下文清理；发生错误的任务保持 FAILED，关联任务收到原始错误并停止。后续 pump、release、再次取消及超时不会覆盖原始原因；已借出的 batch 在清理后仍有效，最终关闭时归还容量。
+- 新增 13 项回归及对照覆盖后台转换失败、真实定时器、直接 expiry、pump/release 两种清理入口、只有消费者任务的输入错误、FINISH 后的输出错误，以及超时中断正在执行的 pump。旧二进制上的定向验证为 **8 failed、4 passed**，并发中断对照随修复后的相关模块一起验证。
+- 修复后的相关验证共 **187 passed**：DirectExchange 102、QueryResult runtime 67、审查者独立复现及数据对照 12、原生转换异常和中断 6。缺少 fsspec 的基础依赖环境中，回调测试从 **5 failed** 变为 **5 skipped**。只运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件与 checkout 一致，native 与新构建产物一致。DuckDB SourceID 更新为 `346ef5b69e610bdb273d66138e6b4bc995857d2b`；未提交生成的身份清单。root/DuckDB 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 最后消费者关闭时的输入错误修复（PR #944）
+
+- 任务因失去全部输出消费者而提前收尾时，直接检查所有输入通道的持久错误。输入 abort 可能只唤醒原生任务，尚未被 CheckPulse 观察；已有错误必须先进入失败路径，不能清理后发送成功的 FINISH。
+- 新增 12 项回归覆盖单线程/四线程、status/pump/release 三个入口，以及持有或未持有输出批次。两个输入中第一个保持健康、第二个报错，确保检查不会漏掉后面的输入。失败后上下文和上游消费端均释放，原始原因在后续取消、超时和 release 中保留；借出的批次继续有效，关闭后归还容量。
+- 新回归在旧二进制上 **12 failed**；审查者的复现及对照为 **3 failed、5 passed**。修复后相关验证共 **189 passed**：DirectExchange 114、QueryResult runtime 67、审查者用例 8。只运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致。本次未改动 DuckDB 子树，engine identity 保持上一轮验证值。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 EOF 后输入错误的统一检查（PR #944）
+
+- DirectSource 不再缓存并永久跳过已结束输入；每轮仍通过 Poll 检查通道，持久错误优先于 EOF/CLOSED。多个输入中 A 已到 EOF 后发生 abort，不能在 B 正常结束时被当作整个任务成功。
+- native DirectCollector 在发送 FINISH 前检查全部输入，覆盖 sink 提前停止而没有再次轮询 source 的路径。TaskService 对所有未完成交付的任务检查输入错误，包括 native 执行器已经清理的 OUTPUT_PENDING；错误使状态变为 FAILED，结果通道保留原始原因。
+- finalize、任务刷新、取消/期限判断复用同一输入错误检查，删除原来仅在最后消费者关闭分支中的局部检查。错误传播仍使用已有失败及清理路径，借出的批次不会因失败而失效。
+- 新增 9 项回归在旧版本为 **8 failed、1 passed**；审查者的复现和对照为 **2 failed、6 passed**。修复后相关验证共 **198 passed**：DirectExchange 123、QueryResult runtime 67、审查者用例 8。覆盖单线程/四线程、后台 native 完成前的通道观察、sink 提前结束、持有批次、status/pump/release 及无错误对照。只运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致，DuckDB 子树及 engine identity 未变。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
+
+下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。
