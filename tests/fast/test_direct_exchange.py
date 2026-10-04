@@ -17,6 +17,7 @@ import vane
 from vane._native import execution_runtime as native
 from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
+from vane.execution.plan import Distribution
 from vane.execution.query_options import DistributedMode, FteOptions, QueryExecutionOptions, RayExecution
 from vane.execution.resource_demand import MemoryDemand, ResourceDemand
 from vane.execution.submission import prepare_ray_query
@@ -245,6 +246,49 @@ def test_real_fragments_tiny_window_resume_without_duplicates(connection, hash_c
         for snapshot in service.snapshot()["channels"].values():
             assert snapshot["peak_bytes"] <= TINY.window_bytes
             assert snapshot["finished_producers"] == snapshot["producers"]
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("partition", [0, 1])
+@pytest.mark.parametrize("target_state", ["closed", "open", "failed"])
+def test_hash_partition_close_precedes_frame_sizing(threads, partition, target_state):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        large_value = "x" * 1000
+        sql = (
+            "select range as key, "
+            f"case when hash(range) % 2 = {partition} then '{large_value}' else 'ok' end as value "
+            "from range(20)"
+        )
+        expected = connection.execute(f"select * from ({sql}) where hash(key) % 2 != {partition}").fetchall()
+        assert expected
+        spec = submission(connection, sql, hash_columns=(0,))
+        edge = next(edge for edge in spec.graph.exchanges if edge.distribution is Distribution.HASH)
+        limits = DirectExchangeLimits(window_bytes=64, frame_bytes=64, frame_rows=1, frame_slots=1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            target = service.channels[f"{edge.exchange_id}/{partition}"]
+            if target_state != "open":
+                target.close_consumer(service.task_id(edge.consumer_fragment_id, partition))
+            if target_state == "failed":
+                target.abort("injected closed partition failure")
+            if target_state == "closed":
+                service.start()
+                assert sorted(collect(service)) == sorted(expected)
+                # The discarded partition never owns a frame. The other
+                # partition still delivers every row through its tiny window.
+                assert target.snapshot()["accepted_rows"] == 0
+                assert target.snapshot()["peak_bytes"] == 0
+                assert all(task["state"] == "FINISHED" for task in service.snapshot()["tasks"])
+            else:
+                message = "injected closed partition failure" if target_state == "failed" else "one row exceeds"
+                with pytest.raises(vane.InvalidInputException, match=message):
+                    service.start()
+                    collect(service)
+                service.native.release()
+                snapshot = service.snapshot()
+                assert any(task["state"] == "FAILED" for task in snapshot["tasks"])
+                assert snapshot["active_contexts"] == snapshot["owned_bytes"] == 0
+                with pytest.raises(vane.InvalidInputException, match=message):
+                    service.poll_result()
 
 
 def test_downstream_reads_before_upstream_finishes_and_retained_result_blocks(connection):

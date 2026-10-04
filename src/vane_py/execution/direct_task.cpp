@@ -151,6 +151,11 @@ public:
 				auto &channel = *output.channels[state.channel];
 				auto &rows = state.selections[state.output][state.channel];
 				while (state.offset < rows.size()) {
+					// Closed targets discard their remaining rows before sizing a
+					// frame. HasConsumers still reports a sticky channel error.
+					if (!channel.HasConsumers()) {
+						break;
+					}
 					auto count = channel.FrameRows(chunk, rows, state.offset);
 					auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk,
 					                               rows, state.offset, count, Wakeup(input.interrupt_state));

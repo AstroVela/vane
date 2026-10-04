@@ -92,7 +92,7 @@ P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划�
 
 验收：受控上游尚未完成时下游已消费；极小预算、慢消费者、空分区、多输入及取消不会死锁，资源最终回到真实基线。
 
-实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。77 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者及输出完成后的通道错误。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
+实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。89 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误及已关闭 HASH 分区的超大行丢弃。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
 
 P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；跨查询资源池、Flight、Ray 调度、动态 split/routing 更新和分布式根结果交付仍属于 P2/P3。公开 local 查询路径不进入此设施。
 
@@ -295,5 +295,12 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 **18 项**回归在旧版本全部失败，修复后全部通过。覆盖空/非空结果、真实定时器及直接过期调用、单/多线程、广播/多输出、保留批次，以及 status/pump/release 三种观察入口。审查者提供的 **3 项**独立复现也全部通过。
 - 两个相关模块 **144 passed**（DirectExchange 77、QueryResult runtime 67），加上独立复现共 **147 passed**。仅运行相关测试，未运行完整 release/fast 套件。
 - C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。root 格式、Ruff、全包 mypy、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 已关闭 HASH 分区修复（PR #944）
+
+- Sink 在每次计算目标帧大小前调用 HasConsumers；已无消费者的通道直接跳过剩余行。检查仍先报告持久通道错误，其他活跃分区继续交付并遵守帧容量限制。
+- 新增 **12 项**测试覆盖分区 0/1、单线程/四线程及关闭、仍开放、报错三种目标状态。旧实现中关闭分区的 **4 项失败**，其余 **8 项对照通过**；修复后全部通过，关闭分区未分配 payload，活跃分区无丢行或重复。
+- 两个相关模块 **156 passed**（DirectExchange 89、QueryResult runtime 67）；审查者的复现及对照 **6 passed**，合计 **162 passed**。仅运行相关测试。
+- C++ 已增量 Release 构建并非 editable 安装；安装源码及 native 与当前 checkout/构建产物一致。格式、Ruff、全包 mypy、适用的 pre-commit、源码版权与 diff 检查通过。
 
 下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。

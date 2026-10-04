@@ -526,7 +526,7 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 
-[direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 只发送 FINISH，控制结果为空，不收集 fragment 数据，也不等待消费者。
+[direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。每次计算目标帧大小前先检查通道错误和消费者；已无消费者的目标直接丢弃剩余行，不因该分区的超大行取消其他分区。仍有消费者的目标继续执行帧容量限制，通道错误始终传播。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 只发送 FINISH，控制结果为空，不收集 fragment 数据，也不等待消费者。
 
 DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢复连接快照、校验 source、加载输入 binding 和输出路由，尚不创建 PendingQuery。所有 task 准备完后才能 start；同一 task 的相同 start token 幂等，不同 token 报错。start 再次验证数据源，然后创建带 DirectCollector 的原生执行器。pump 轮转调用 PendingQuery.ExecuteTask，一个执行线程也可推进多个相互等待的 fragment。native 生产完成后，pump 收取控制结果并释放查询上下文，状态进入 OUTPUT_PENDING；所有输出没有错误且 lease 均释放后，才进入 FINISHED。
 
