@@ -150,7 +150,8 @@ def test_materialized_output_matches_nested_struct_field_names_case_insensitivel
         ]
     )
     row = {"X": 7, "CHILD": {"Y": 11}, "Items": [{"Z": 13}, None], "FIXED": [{"W": 17}]}
-    values = [tuple(row.values()) if positional else row, None, (None, None, None, None) if positional else {}]
+    null_row = {name: None for name in row}
+    values = [tuple(row.values()) if positional else row, None, tuple(null_row.values()) if positional else null_row]
     schema = pa.schema([("tensor", pa.fixed_shape_tensor(pa.int64(), [3])), ("record", record_type)])
     output = columns_to_output_table(
         {"tensor": np.arange(9).reshape(3, 3), "record": values}, schema, udf_name="casefold"
@@ -176,6 +177,26 @@ def test_materialized_output_rejects_ambiguous_struct_field_names(nested):
         value = [value]
     with pytest.raises(vane.InvalidInputException, match="ambiguous"):
         columns_to_output_table({"record": [value]}, pa.schema([("record", dtype)]), udf_name="ambiguous")
+
+
+@pytest.mark.parametrize("value", [{"X": 7, "extra": "private-extra-value"}, {}, {1: 7}])
+@pytest.mark.parametrize("container", ["struct", "nested_struct", "list", "array"])
+def test_materialized_output_validates_struct_fields_before_encoding(value, container):
+    import vane
+
+    dtype = pa.struct([("x", pa.int64())])
+    if container == "nested_struct":
+        dtype = pa.struct([("child", dtype)])
+        value = {"CHILD": value}
+    elif container in ("list", "array"):
+        dtype = pa.list_(dtype) if container == "list" else pa.list_(dtype, 1)
+        value = [value]
+    schema = pa.schema([("tensor", pa.fixed_shape_tensor(pa.int64(), [3])), ("record", dtype)])
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields") as error:
+        columns_to_output_table(
+            {"tensor": np.arange(3).reshape(1, 3), "record": [value]}, schema, udf_name="field-validation"
+        )
+    assert "private-extra-value" not in str(error.value)
 
 
 @pytest.mark.parametrize("layout", ["middle", "trailing", "row", "offset"])

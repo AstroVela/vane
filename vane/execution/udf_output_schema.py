@@ -270,8 +270,15 @@ def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary
         return None
     if pa.types.is_struct(dtype):
         if isinstance(value, Mapping):
-            from vane.execution.udf_file_contract import _mapping_field_value
+            from vane.execution.udf_file_contract import _invalid_input, _mapping_field_value
 
+            declared_names = {field.name.casefold() for field in dtype}
+            if (
+                any(not isinstance(name, str) for name in value)
+                or {name.casefold() for name in value} != declared_names
+                or len(declared_names) != len(dtype)
+            ):
+                raise _invalid_input(f"{boundary} STRUCT value must contain exactly the declared fields")
             return {
                 field.name: _canonicalize_struct_field_names(
                     _mapping_field_value(value, field.name, boundary=boundary, path="column"),
