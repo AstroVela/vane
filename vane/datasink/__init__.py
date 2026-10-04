@@ -823,6 +823,10 @@ def _make_batch_actor(
     key_validation: _KeyValidation | None,
 ) -> type[Any]:
     class DataSinkBatchActor:
+        # Open, write, abort and close must share the actor owner thread for
+        # thread-affine clients. This is an internal UDF runtime adapter.
+        _vane_udf_owner_thread = True
+
         # DataSink owns retries at the full-operation boundary. The native UDF
         # payload consumes this private marker to disable Ray actor task replay.
         _vane_datasink_no_task_retries = True

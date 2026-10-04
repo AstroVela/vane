@@ -549,12 +549,14 @@ class UDFExecutor:
         )
         self._bind_async_runtime()
         # Async adapters own an event loop on the actor thread. Generator UDFs
-        # also retain their existing lazy execution on that thread.
+        # also retain their existing lazy execution on that thread. Framework
+        # adapters with thread-affine clients keep their full lifecycle there.
         call = getattr(self._map_fn, "__call__", None)
         if (
             self._call_mode == "map_batches"
             and str(payload.get("execution_backend") or "").strip().lower() in ("ray_actor", "subprocess_actor")
             and self._async_runtime is None
+            and not getattr(self._map_fn, "_vane_udf_owner_thread", False)
             and not inspect.isgeneratorfunction(call)
             and not inspect.isgeneratorfunction(inspect.unwrap(call))
         ):

@@ -16,6 +16,9 @@ There is no additional public UDF base class or user-owned executor.
   schema for top-level fixed-shape numeric tensors with primitive/list/struct
   siblings. This path requires exactly the declared columns and list, tuple
   or NumPy column values. Empty detections and zero rows preserve their types.
+- Nested STRUCT mappings match field names without regard to case and must
+  contain exactly the declared fields. Missing, extra or ambiguous names are
+  rejected before typed Arrow encoding can discard them.
 - The default-format dict encoder requires tensors to match dtype and shape
   and use C-contiguous storage. This encoder performs no implicit dtype
   conversion or pixel expansion through `tolist()`.
@@ -27,8 +30,10 @@ There is no additional public UDF base class or user-owned executor.
   contracts still use normalization. Ordinary Arrow-returning UDFs keep
   their existing output handling.
 - Async-runtime adapters and generator functions retain execution on the
-  actor thread. Iterators returned by a regular callable remain lazily
-  consumed on the actor thread. Row-preserving/scalar/flat-map calls and task
+  actor thread. The internal DataSink adapter also keeps open, write, abort
+  and close on that thread for thread-affine clients. Iterators returned by a
+  regular callable remain lazily consumed on the actor thread.
+  Row-preserving/scalar/flat-map calls and task
   execution retain their existing execution path. Richer output types such
   as FILE/IMAGE and variable/nested tensors retain their Arrow path.
 - `prepare_batch` is not a hook. Thread-local contexts are not inherited by
