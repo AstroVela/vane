@@ -302,7 +302,6 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 			channels.insert(channels.end(), output.channels.begin(), output.channels.end());
 		}
 		tasks.push_back(std::move(task));
-		unfinished_production++;
 	}
 }
 
@@ -354,7 +353,10 @@ void DirectTaskService::Start(const string &id, const string &token) {
 }
 
 void DirectTaskService::Refresh(Task &task) {
-	if (canceled.load() && task.state != "FINISHED" && task.state != "FAILED") {
+	if (task.state == "FINISHED" || task.state == "FAILED") {
+		return;
+	}
+	if (canceled.load()) {
 		task.state = "CANCELED";
 		if (task.error.empty()) {
 			lock_guard<mutex> registry(registry_lock);
@@ -362,17 +364,46 @@ void DirectTaskService::Refresh(Task &task) {
 		}
 		return;
 	}
-	if (task.state != "OUTPUT_PENDING") {
-		return;
-	}
+	bool live = false;
+	bool drained = true;
 	for (auto &output : task.outputs) {
 		for (auto &channel : output.channels) {
-			if (!channel->ProducerDrained(output.producer)) {
+			auto status = channel->ProducerStatus(output.producer);
+			// Abort discards queued frames. That releases credit, but cannot
+			// turn failed delivery into success, even if another output is pending.
+			if (!status.error.empty()) {
+				Fail(task, status.error);
 				return;
 			}
+			live = live || status.has_consumers;
+			drained = drained && status.drained;
 		}
 	}
-	task.state = "FINISHED";
+	if (task.state == "RUNNING" && !live) {
+		// A source can be BLOCKED forever and never call Sink again. Stop its
+		// executor before closing production; cleanup also closes every input,
+		// propagating the loss of demand upstream. Borrowed output stays leased.
+		try {
+			if (task.pending->CheckPulse() == PendingExecutionResult::EXECUTION_ERROR) {
+				task.pending->ThrowError();
+			}
+			Cleanup(task);
+			for (auto &output : task.outputs) {
+				for (auto &channel : output.channels) {
+					channel->Finish(output.producer, channel->LastSequence(output.producer));
+				}
+			}
+			task.state = "OUTPUT_PENDING";
+		} catch (std::exception &ex) {
+			Fail(task, ex.what());
+			throw;
+		}
+		Refresh(task);
+		return;
+	}
+	if (task.state == "OUTPUT_PENDING" && drained) {
+		task.state = "FINISHED";
+	}
 }
 
 void DirectTaskService::Cleanup(Task &task) {
@@ -433,7 +464,6 @@ idx_t DirectTaskService::Pump(idx_t steps) {
 					lock_guard<mutex> registry(registry_lock);
 					CheckCanceled();
 					task.state = "OUTPUT_PENDING";
-					unfinished_production--;
 				}
 				Cleanup(task);
 				Refresh(task);
@@ -463,8 +493,25 @@ bool DirectTaskService::Stop(const string &reason, bool only_running) {
 	string message;
 	{
 		lock_guard<mutex> registry(registry_lock);
-		if (only_running && (!unfinished_production || canceled.load())) {
-			return false;
+		if (only_running) {
+			if (canceled.load()) {
+				return false;
+			}
+			bool unfinished = false;
+			// Membership and output bindings are immutable after preparation.
+			// Read FINISH at its native publication point: background executor
+			// threads can complete without any subsequent Pump call. A deadline
+			// is accepted only while at least one output is still producing.
+			for (auto &task : tasks) {
+				for (auto &output : task->outputs) {
+					for (auto &channel : output.channels) {
+						unfinished = !channel->ProducerStatus(output.producer).finished || unfinished;
+					}
+				}
+			}
+			if (!unfinished) {
+				return false;
+			}
 		}
 		if (!canceled.exchange(true)) {
 			cancel_reason = reason.empty() ? "canceled" : reason;

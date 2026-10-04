@@ -76,7 +76,6 @@ private:
 	vector<unique_ptr<Task>> tasks;
 	atomic<bool> canceled {false};
 	string cancel_reason;
-	idx_t unfinished_production = 0; // Guarded by registry_lock, including deadline vs completion.
 	bool started = false;
 	idx_t next_task = 0;
 };

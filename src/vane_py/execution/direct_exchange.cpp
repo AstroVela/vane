@@ -478,8 +478,22 @@ idx_t DirectChannel::LastSequence(const string &id) const {
 	return found->second.sequence;
 }
 
+DirectProducerStatus DirectChannel::ProducerStatus(const string &id) const {
+	lock_guard<mutex> guard(lock);
+	auto &producer = producers.at(id);
+	DirectProducerStatus result;
+	result.finished = producer.finished;
+	result.drained = producer.finished && producer.outstanding == 0;
+	result.error = error;
+	for (auto &entry : consumers) {
+		result.has_consumers = result.has_consumers || !entry.second.closed;
+	}
+	return result;
+}
+
 bool DirectChannel::ProducerDrained(const string &id) const {
 	lock_guard<mutex> guard(lock);
+	CheckError();
 	auto &producer = producers.at(id);
 	return producer.finished && producer.outstanding == 0;
 }

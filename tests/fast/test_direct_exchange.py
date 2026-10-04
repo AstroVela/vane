@@ -93,6 +93,22 @@ def collect(service):
     return rows
 
 
+def prepare_root_task(connection, spec, inputs, outputs):
+    fragment = next(item for item in spec.graph.fragments if item.fragment_id == spec.graph.result.fragment_id)
+    snapshot = next(item.payload for item in spec.source_snapshots if item.fragment_id == fragment.fragment_id)
+    service = native.TaskService(connection)
+    service.prepare(
+        "task",
+        fragment.native_plan,
+        spec.connection_snapshot,
+        snapshot,
+        {},
+        {fragment.inputs[0].port_id: inputs} if inputs else {},
+        [{"channels": [output], "producer": "task"} for output in outputs],
+    )
+    return service
+
+
 def test_membership_finish_and_sequences(connection):
     exchange = channel(connection)
     signal = native._TestSignal()
@@ -271,6 +287,45 @@ def test_output_pending_does_not_block_finalization(connection):
         assert service.snapshot()["tasks"][0]["state"] == "OUTPUT_PENDING"
         batch.close()
         assert service.snapshot()["tasks"][0]["state"] == "FINISHED"
+
+
+@pytest.mark.parametrize("expiry", ["direct", "timer"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_background_finish_prevents_execution_expiry(expiry, empty):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = "select 42::bigint where false" if empty else "select 42::bigint"
+        spec = submission(connection, sql, partitions=1, timeout=1 if expiry == "timer" else 30)
+        with InProcessTaskService(connection, spec, TINY) as service:
+            service.start()
+            deadline = time.monotonic() + 5
+            # Observe only the native channel. Neither pump nor status may be
+            # needed to publish completion to the independent deadline timer.
+            while service.result.snapshot()["finished_producers"] != 1:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            status, batch = service.poll_result()
+            if empty:
+                assert (status, batch) == ("end", None)
+            else:
+                assert status == "data" and batch.to_rows() == [(42,)]
+                assert service.poll_result() == ("end", None)
+            try:
+                if expiry == "timer":
+                    service._timer.join(timeout=5)
+                    assert not service._timer.is_alive()
+                assert not service.native.expire()
+                assert not service.result.snapshot()["error"]
+                assert service.poll_result() == ("end", None)
+                until(service, lambda: service.snapshot()["active_contexts"] == 0)
+                if batch is not None:
+                    assert batch.to_rows() == [(42,)]
+                    assert service.snapshot()["tasks"][0]["state"] == "OUTPUT_PENDING"
+                    assert service.snapshot()["owned_bytes"] > 0
+            finally:
+                if batch is not None:
+                    batch.close()
+            assert service.snapshot()["tasks"][0]["state"] == "FINISHED"
+            assert service.snapshot()["owned_bytes"] == 0
 
 
 @pytest.mark.parametrize("sql", ["select range from range(0)", "select range from range(2) where range > 5"])
@@ -513,6 +568,116 @@ def test_consumer_close_propagates_upstream_without_finishing_large_scan(connect
         assert service.snapshot()["owned_bytes"] == 0
         assert service.snapshot()["active_contexts"] == 0
         assert all(item["accepted_rows"] < 100 for item in service.snapshot()["channels"].values())
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("routing", ["broadcast", "outputs"])
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_last_output_close_stops_task_waiting_for_input(threads, routing, borrowed):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection)
+        upstream = channel(connection)
+        upstream.add_producer("upstream")
+        upstream.seal_producers()
+        if routing == "broadcast":
+            output = channel(connection, consumers=("first", "last"))
+            outputs = [output]
+            consumers = [(output, "first"), (output, "last")]
+        else:
+            outputs = [channel(connection), channel(connection)]
+            consumers = [(output, "client") for output in outputs]
+        for output in outputs:
+            output.add_producer("task")
+            output.seal_producers()
+        service = prepare_root_task(connection, spec, [(upstream, "client")], outputs)
+        batch = None
+        try:
+            service.start("task", "initial")
+            if borrowed:
+                upstream._write_rows("upstream", 1, [(42,)])
+            deadline = time.monotonic() + 5
+            while not upstream.snapshot()["read_blocks"] or (
+                borrowed
+                and (
+                    any(output.snapshot()["accepted_rows"] != 1 for output in outputs)
+                    or upstream.snapshot()["outstanding_frames"]
+                )
+            ):
+                assert time.monotonic() < deadline
+                service.pump(1)
+            if borrowed:
+                output, consumer = consumers[-1]
+                status, batch = output.poll(consumer)
+                assert status == "data" and batch.to_rows() == [(42,)]
+            consumers[0][0].close_consumer(consumers[0][1])
+            service.pump(3)
+            assert service.status()[0]["state"] == "RUNNING"
+            assert upstream.snapshot()["closed_consumers"] == 0
+            consumers[-1][0].close_consumer(consumers[-1][1])
+            service.pump(3)
+            state = service.status()[0]
+            assert state["state"] == ("OUTPUT_PENDING" if borrowed else "FINISHED")
+            assert state["released"] and not state["error"]
+            assert upstream.snapshot()["closed_consumers"] == 1
+            assert upstream.snapshot()["bytes"] == 0
+            assert all(output.snapshot()["finished_producers"] == 1 for output in outputs)
+            assert not service.expire()
+            if batch is not None:
+                assert batch.to_rows() == [(42,)]
+                assert sum(output.snapshot()["bytes"] for output in outputs) > 0
+                batch.close()
+            assert service.status()[0]["state"] == "FINISHED"
+            assert sum(output.snapshot()["bytes"] for output in outputs) == 0
+        finally:
+            if batch is not None:
+                batch.close()
+            service.cancel("test cleanup")
+            service.release()
+
+
+@pytest.mark.parametrize("entry", ["status", "pump", "release"])
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_aborted_output_fails_before_other_output_leases_drain(connection, entry, borrowed):
+    spec = submission(connection, "select 42::bigint", partitions=1)
+    left, right = channel(connection), channel(connection)
+    for output in (left, right):
+        output.add_producer("task")
+        output.seal_producers()
+    service = prepare_root_task(connection, spec, [], [left, right])
+    batch = None
+    try:
+        service.start("task", "initial")
+        service.pump(10)
+        assert service.status()[0]["state"] == "OUTPUT_PENDING"
+        assert left.snapshot()["queued_frames"] == right.snapshot()["queued_frames"] == 1
+        if borrowed:
+            _, batch = left.poll("client")
+        right.abort("injected output failure")
+        with pytest.raises(vane.InvalidInputException, match="injected output failure"):
+            right.producer_drained("task")
+        if entry == "pump":
+            service.pump(1)
+        else:
+            getattr(service, entry)()
+        state = service.status()[0]
+        assert state["state"] == "FAILED" and state["released"]
+        assert "injected output failure" in state["error"]
+        for output in (left, right):
+            with pytest.raises(vane.InvalidInputException, match="injected output failure"):
+                output.poll("client")
+        if batch is not None:
+            assert batch.to_rows() == [(42,)]
+            assert left.snapshot()["bytes"] > 0
+            batch.close()
+        assert left.snapshot()["bytes"] == right.snapshot()["bytes"] == 0
+        service.cancel("later cancellation")
+        assert service.status()[0]["state"] == "FAILED"
+        assert "injected output failure" in service.status()[0]["error"]
+    finally:
+        if batch is not None:
+            batch.close()
+        service.cancel("test cleanup")
+        service.release()
 
 
 def test_single_oversized_row_fails_without_allocating_exchange_buffer(connection):

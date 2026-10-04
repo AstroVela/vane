@@ -55,6 +55,13 @@ private:
 enum class DirectRead { DATA, BLOCKED, END, CLOSED };
 enum class DirectWrite { ACCEPTED, BLOCKED, CLOSED };
 
+struct DirectProducerStatus {
+	bool finished = false;
+	bool drained = false;
+	bool has_consumers = false;
+	string error;
+};
+
 struct DirectSnapshot {
 	idx_t bytes = 0;
 	idx_t peak_bytes = 0;
@@ -89,6 +96,7 @@ public:
 	                     idx_t offset, idx_t count, ExchangeWakeup wakeup = {});
 	idx_t FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_t offset) const;
 	idx_t LastSequence(const string &producer) const;
+	DirectProducerStatus ProducerStatus(const string &producer) const;
 	bool ProducerDrained(const string &producer) const;
 	bool HasConsumers() const;
 	void ValidateConsumer(const string &consumer) const;
