@@ -15,7 +15,11 @@ class YOLODetector(OriginalYOLODetector, BatchUDF):
 
     def prepare_batch(self, table):
         frame_indices = table.column("frame_index").to_pylist()
-        frames = _frame_batch(table.column("frame"))
+        frame_column = table.column("frame")
+        # Reuse a contiguous single chunk, as Ray's tensor batch formatter does.
+        if frame_column.num_chunks == 1:
+            frame_column = frame_column.chunk(0)
+        frames = _frame_batch(frame_column)
         return {"frame_index": frame_indices, "frame": frames}
 
     def __call__(self, batch):
