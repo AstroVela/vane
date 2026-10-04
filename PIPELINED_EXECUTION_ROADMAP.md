@@ -92,7 +92,7 @@ P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划�
 
 验收：受控上游尚未完成时下游已消费；极小预算、慢消费者、空分区、多输入及取消不会死锁，资源最终回到真实基线。
 
-实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。114 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误、已关闭 HASH 分区的超大行丢弃、已有 native/通道失败优先于后续超时，以及最后一个消费者关闭时保留已经发生的输入错误。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
+实现位于 [native channel](src/vane_py/execution/direct_exchange.cpp)、[native TaskService 与算子](src/vane_py/execution/direct_task.cpp) 和 [进程内控制设施](vane/execution/direct_exchange.py)。123 项[契约测试](tests/fast/test_direct_exchange.py)验证真实 GATHER/HASH fragment 在单线程与多线程下执行，64 字节、单帧窗口中的暂停和恢复，广播共享缓冲及保留切片，动态封闭成员、多输入、部分输出后的错误、消费者提前关闭、期限、并发取消和回调重入，并覆盖后台完成后不再 pump、等待输入时失去全部消费者、输出完成后的通道错误、已关闭 HASH 分区的超大行丢弃、已有 native/通道失败优先于后续超时、最后一个消费者关闭时保留输入错误，以及输入已到 EOF、native 提前 finalize 或输出等待交付时仍检查输入的持久错误。数据在 C++ 通道内传递，不调用旧 runner 或物化测试入口。
 
 P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；跨查询资源池、Flight、Ray 调度、动态 split/routing 更新和分布式根结果交付仍属于 P2/P3。公开 local 查询路径不进入此设施。
 
@@ -318,5 +318,13 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 12 项回归覆盖单线程/四线程、status/pump/release 三个入口，以及持有或未持有输出批次。两个输入中第一个保持健康、第二个报错，确保检查不会漏掉后面的输入。失败后上下文和上游消费端均释放，原始原因在后续取消、超时和 release 中保留；借出的批次继续有效，关闭后归还容量。
 - 新回归在旧二进制上 **12 failed**；审查者的复现及对照为 **3 failed、5 passed**。修复后相关验证共 **189 passed**：DirectExchange 114、QueryResult runtime 67、审查者用例 8。只运行相关测试，未运行完整 release/fast 套件。
 - C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致。本次未改动 DuckDB 子树，engine identity 保持上一轮验证值。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
+
+### P1.2 EOF 后输入错误的统一检查（PR #944）
+
+- DirectSource 不再缓存并永久跳过已结束输入；每轮仍通过 Poll 检查通道，持久错误优先于 EOF/CLOSED。多个输入中 A 已到 EOF 后发生 abort，不能在 B 正常结束时被当作整个任务成功。
+- native DirectCollector 在发送 FINISH 前检查全部输入，覆盖 sink 提前停止而没有再次轮询 source 的路径。TaskService 对所有未完成交付的任务检查输入错误，包括 native 执行器已经清理的 OUTPUT_PENDING；错误使状态变为 FAILED，结果通道保留原始原因。
+- finalize、任务刷新、取消/期限判断复用同一输入错误检查，删除原来仅在最后消费者关闭分支中的局部检查。错误传播仍使用已有失败及清理路径，借出的批次不会因失败而失效。
+- 新增 9 项回归在旧版本为 **8 failed、1 passed**；审查者的复现和对照为 **2 failed、6 passed**。修复后相关验证共 **198 passed**：DirectExchange 123、QueryResult runtime 67、审查者用例 8。覆盖单线程/四线程、后台 native 完成前的通道观察、sink 提前结束、持有批次、status/pump/release 及无错误对照。只运行相关测试，未运行完整 release/fast 套件。
+- C++ 已增量 Release 构建并非 editable 安装；272 个 Python 源码/类型文件和 native 均与当前 checkout/构建产物一致，DuckDB 子树及 engine identity 未变。root 格式、Ruff、适用的 pre-commit、源码版权及 diff 检查通过。
 
 下一步为 P2.1：在已验证的 channel/lease/TaskService 契约上实现 native Flight 数据面，先落地带查询、attempt、worker epoch 身份的通道协议，再用两个独立进程验收信用归还、慢消费、取消与断连错误。随后进入 P2.2 的 Ray 放置及活动组调度。

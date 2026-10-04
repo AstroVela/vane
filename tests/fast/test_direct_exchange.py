@@ -601,6 +601,164 @@ def test_native_source_merges_multiple_inputs_without_waiting_for_idle_input(con
         service.release()
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_ended_input_error_prevents_native_finish(threads, borrowed):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection)
+        left, right, output = (channel(connection) for _ in range(3))
+        for source in (left, right):
+            source.add_producer("upstream")
+            source.seal_producers()
+        output.add_producer("task")
+        output.seal_producers()
+        service = prepare_root_task(connection, spec, [(left, "client"), (right, "client")], [output])
+        batch = None
+        try:
+            if borrowed:
+                left._write_rows("upstream", 1, [(42,)])
+            left.finish("upstream", 1 if borrowed else 0)
+            service.start("task", "initial")
+            deadline = time.monotonic() + 5
+            while not right.snapshot()["read_blocks"]:
+                assert time.monotonic() < deadline
+                service.pump(1)
+            if borrowed:
+                status, batch = output.poll("client")
+                assert status == "data" and batch.to_rows() == [(42,)]
+            assert service.status()[0]["state"] == "RUNNING"
+            left.abort("input failed after EOF")
+            right.finish("upstream", 0)
+            if threads == 4:
+                # Observe native finalization before status/pump can propagate
+                # the error themselves. Background execution must not emit EOF.
+                time.sleep(0.05)
+                assert output.snapshot()["finished_producers"] == 0
+                assert output.poll("client")[0] != "end"
+            try:
+                service.pump(10)
+            except vane.Error as error:
+                assert "input failed after EOF" in str(error)
+            state = service.status()[0]
+            assert state["state"] == "FAILED" and state["released"], state
+            assert "input failed after EOF" in state["error"]
+            assert output.snapshot()["finished_producers"] == 0
+            with pytest.raises(vane.InvalidInputException, match="input failed after EOF"):
+                output.poll("client")
+            assert all(source.snapshot()["closed_consumers"] == 1 for source in (left, right))
+            assert left.snapshot()["bytes"] == right.snapshot()["bytes"] == 0
+            if batch is not None:
+                assert batch.to_rows() == [(42,)]
+                batch.close()
+            assert output.snapshot()["bytes"] == output.snapshot()["leased_bytes"] == 0
+        finally:
+            if batch is not None:
+                batch.close()
+            service.cancel("test cleanup")
+            service.release()
+
+
+@pytest.mark.parametrize("entry", ["status", "pump", "release"])
+def test_input_error_after_production_fails_pending_delivery(connection, entry):
+    spec = submission(connection)
+    left, right, output = (channel(connection) for _ in range(3))
+    for source in (left, right):
+        source.add_producer("upstream")
+        source.seal_producers()
+    output.add_producer("task")
+    output.seal_producers()
+    service = prepare_root_task(connection, spec, [(left, "client"), (right, "client")], [output])
+    batch = None
+    try:
+        left.finish("upstream", 0)
+        right._write_rows("upstream", 1, [(42,)])
+        right.finish("upstream", 1)
+        service.start("task", "initial")
+        service.pump(10)
+        assert service.status()[0]["state"] == "OUTPUT_PENDING"
+        _, batch = output.poll("client")
+        left.abort("input failed before delivery completed")
+        if entry == "pump":
+            service.pump(1)
+        else:
+            getattr(service, entry)()
+        state = service.status()[0]
+        assert state["state"] == "FAILED" and state["released"], state
+        assert "input failed before delivery completed" in state["error"]
+        with pytest.raises(vane.InvalidInputException, match="input failed before delivery completed"):
+            output.poll("client")
+        assert batch.to_rows() == [(42,)]
+        batch.close()
+        assert output.snapshot()["bytes"] == output.snapshot()["leased_bytes"] == 0
+        service.cancel("later cancellation")
+        assert service.status()[0] == state
+    finally:
+        if batch is not None:
+            batch.close()
+        service.cancel("test cleanup")
+        service.release()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_native_finalizer_checks_inputs_when_sink_stops_early(failed):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        spec = submission(connection)
+        left, right, output = (channel(connection) for _ in range(3))
+        for source in (left, right):
+            source.add_producer("upstream")
+            source.seal_producers()
+        output.add_producer("task")
+        output.seal_producers()
+        service = prepare_root_task(connection, spec, [(left, "client"), (right, "client")], [output])
+        batch = None
+        try:
+            left._write_rows("upstream", 1, [(42,)])
+            left.finish("upstream", 1)
+            service.start("task", "initial")
+            deadline = time.monotonic() + 5
+            while not right.snapshot()["read_blocks"]:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            _, batch = output.poll("client")
+            assert batch.to_rows() == [(42,)]
+            # Let the source observe left's EOF and block on right. Its next
+            # cursor is right, which can supply data before left is polled again.
+            time.sleep(0.05)
+            output.close_consumer("client")
+            if failed:
+                left.abort("input failed before sink finalization")
+            right._write_rows("upstream", 1, [(99,)])
+            if failed:
+                time.sleep(0.05)
+                assert output.snapshot()["finished_producers"] == 0
+            else:
+                while not output.snapshot()["finished_producers"]:
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+            try:
+                service.pump(10)
+            except vane.Error as error:
+                assert failed and "input failed before sink finalization" in str(error)
+            state = service.status()[0]
+            assert state["state"] == ("FAILED" if failed else "OUTPUT_PENDING"), state
+            assert state["released"]
+            if failed:
+                with pytest.raises(vane.InvalidInputException, match="input failed before sink finalization"):
+                    output.poll("client")
+            else:
+                assert not state["error"]
+            assert batch.to_rows() == [(42,)]
+            batch.close()
+            assert output.snapshot()["bytes"] == output.snapshot()["leased_bytes"] == 0
+            assert all(source.snapshot()["closed_consumers"] == 1 for source in (left, right))
+            assert left.snapshot()["bytes"] == right.snapshot()["bytes"] == 0
+        finally:
+            if batch is not None:
+                batch.close()
+            service.cancel("test cleanup")
+            service.release()
+
+
 def test_consumer_close_propagates_upstream_without_finishing_large_scan(connection):
     spec = submission(connection, "select range from range(1000000000)")
     with InProcessTaskService(connection, spec, TINY) as service:

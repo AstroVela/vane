@@ -526,7 +526,7 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 
-[direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。每次计算目标帧大小前先检查通道错误和消费者；已无消费者的目标直接丢弃剩余行，不因该分区的超大行取消其他分区。仍有消费者的目标继续执行帧容量限制，通道错误始终传播。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 只发送 FINISH，控制结果为空，不收集 fragment 数据，也不等待消费者。
+[direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。已读到 EOF 或已关闭的输入仍参加后续轮询，Poll 始终先检查持久错误，不缓存永久结束状态。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。每次计算目标帧大小前先检查通道错误和消费者；已无消费者的目标直接丢弃剩余行，不因该分区的超大行取消其他分区。仍有消费者的目标继续执行帧容量限制，通道错误始终传播。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 在发送 FINISH 前检查全部输入通道的持久错误，避免 sink 提前停止绕过下一次 source 轮询；控制结果为空，不收集 fragment 数据，也不等待消费者。
 
 DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢复连接快照、校验 source、加载输入 binding 和输出路由，尚不创建 PendingQuery。所有 task 准备完后才能 start；同一 task 的相同 start token 幂等，不同 token 报错。start 再次验证数据源，然后创建带 DirectCollector 的原生执行器。pump 轮转调用 PendingQuery.ExecuteTask，一个执行线程也可推进多个相互等待的 fragment。native 生产完成后，pump 收取控制结果并释放查询上下文，状态进入 OUTPUT_PENDING；所有输出没有错误且 lease 均释放后，才进入 FINISHED。
 
@@ -536,7 +536,7 @@ DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢
 
 控制层在 pump、status 和 release 中刷新输出状态。任务的所有输出均已失去消费者时，先检查所有输入通道的持久错误及已有执行错误，再停止并清理原生执行器、关闭上游消费端，最后封闭输出生产。输入 abort 只唤醒执行器，CheckPulse 不一定已经观察到错误；因此提前收尾必须直接检查输入通道。已有输入错误使任务进入 FAILED，保留并传播原始原因，不发送成功的 FINISH。该路径不依赖 Sink 再次被调用，等待空输入的任务也能退出。无错误时，广播或多个输出只关闭一部分消费者仍继续执行；已借出的输出仍保持计费及 OUTPUT_PENDING，直到最后引用释放。
 
-刷新时检查所有输出的持久错误，不能因前一个输出尚未排空就跳过后面的错误。abort 丢弃队列只代表归还容量，不代表交付成功；错误使任务进入 FAILED，并传播取消以停止其余任务。原错误在后续清理和取消中保留。Python 输入回调重入在获取服务锁或修改控制状态前拒绝。状态快照区分 native context 清理和输出所有权，取消、失败不会因为清理完成而变为成功。
+刷新时检查所有输入、输出的持久错误，不能因前一个输出尚未排空就跳过后面的错误。输入错误检查由 native finalize、状态刷新及取消/期限判断共同复用；即使输入已读到 EOF、执行器已清理，只要输出交付尚未完成，已有输入错误仍使任务进入 FAILED。abort 丢弃队列只代表归还容量，不代表交付成功；错误传播取消以停止其余任务，原错误在后续清理和取消中保留。Python 输入回调重入在获取服务锁或修改控制状态前拒绝。状态快照区分 native context 清理和输出所有权，取消、失败不会因为清理完成而变为成功。
 
 [InProcessTaskService](vane/execution/direct_exchange.py) 是内部契约设施，接收 pipelined RayQuerySpec，按图预先检查任务上下文数量、exchange 窗口总额和 result 窗口，再准备所有任务、固定 split 分配和封闭通道成员。Python 只处理元数据、控制与测试结果查看；fragment 间的数据不经过 Python，也不调用编译器的物化执行测试入口或旧 runner。根结果采用相同的 native channel，测试用 DirectBatch 支持显式关闭和保留切片。
 

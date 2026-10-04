@@ -22,11 +22,20 @@ ExchangeWakeup Wakeup(const InterruptState &interrupt) {
 	};
 }
 
+string InputError(const std::map<string, vector<DirectInput>> &inputs) {
+	for (auto &port : inputs) {
+		for (auto &input : port.second) {
+			auto error = input.channel->Snapshot().error;
+			if (!error.empty()) {
+				return error;
+			}
+		}
+	}
+	return string();
+}
+
 class DirectSourceState : public GlobalSourceState {
 public:
-	explicit DirectSourceState(idx_t count) : ended(count, false) {
-	}
-	vector<bool> ended;
 	idx_t cursor = 0;
 };
 
@@ -54,24 +63,23 @@ public:
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
 	}
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
-		return make_uniq<DirectSourceState>(inputs.size());
+		return make_uniq<DirectSourceState>();
 	}
 	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
 		auto &state = input.global_state.Cast<DirectSourceState>();
 		idx_t ended = 0;
 		for (idx_t step = 0; step < inputs.size(); step++) {
 			auto index = (state.cursor + step) % inputs.size();
-			if (!state.ended[index]) {
-				shared_ptr<DirectBatch> batch;
-				auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, Wakeup(input.interrupt_state));
-				if (result == DirectRead::DATA) {
-					batch->Reference(chunk);
-					state.cursor = (index + 1) % inputs.size();
-					return SourceResultType::HAVE_MORE_OUTPUT;
-				}
-				state.ended[index] = result == DirectRead::END || result == DirectRead::CLOSED;
+			// EOF and consumer closure do not freeze the channel's error state.
+			// Poll checks persistent errors before returning either terminal value.
+			shared_ptr<DirectBatch> batch;
+			auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, Wakeup(input.interrupt_state));
+			if (result == DirectRead::DATA) {
+				batch->Reference(chunk);
+				state.cursor = (index + 1) % inputs.size();
+				return SourceResultType::HAVE_MORE_OUTPUT;
 			}
-			ended += state.ended[index];
+			ended += result == DirectRead::END || result == DirectRead::CLOSED;
 		}
 		return ended == inputs.size() ? SourceResultType::FINISHED : SourceResultType::BLOCKED;
 	}
@@ -101,8 +109,10 @@ public:
 
 class DirectCollector : public PhysicalResultCollector {
 public:
-	DirectCollector(PreparedStatementData &data, vector<DirectOutput> outputs_p)
-	    : PhysicalResultCollector(*data.physical_plan, data), outputs(std::move(outputs_p)) {
+	DirectCollector(PreparedStatementData &data, std::map<string, vector<DirectInput>> inputs_p,
+	                vector<DirectOutput> outputs_p)
+	    : PhysicalResultCollector(*data.physical_plan, data), inputs(std::move(inputs_p)),
+	      outputs(std::move(outputs_p)) {
 	}
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
@@ -176,6 +186,12 @@ public:
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &) const override {
+		// An early sink stop may bypass the source's next poll. Check every
+		// input, including drained ones, before publishing native completion.
+		auto error = InputError(inputs);
+		if (!error.empty()) {
+			throw InvalidInputException("%s", error);
+		}
 		for (auto &output : outputs) {
 			for (auto &channel : output.channels) {
 				channel->Finish(output.producer, channel->LastSequence(output.producer));
@@ -190,6 +206,7 @@ public:
 		return make_uniq<MaterializedQueryResult>(statement_type, properties, names, CreateCollection(context),
 		                                          context.GetClientProperties());
 	}
+	const std::map<string, vector<DirectInput>> inputs;
 	const vector<DirectOutput> outputs;
 };
 
@@ -336,17 +353,18 @@ void DirectTaskService::Start(const string &id, const string &token) {
 			auto &context = *task->connection->context;
 			ValidateSources(context, task->fragment, task->source_snapshot, false);
 			PendingQueryParameters parameters;
+			auto inputs = task->inputs;
 			auto outputs = task->outputs;
 			auto target = task.get();
-			parameters.get_result_collector = [this, target, outputs](ClientContext &context,
-			                                                          PreparedStatementData &data) {
+			parameters.get_result_collector = [this, target, inputs, outputs](ClientContext &context,
+			                                                                  PreparedStatementData &data) {
 				// This factory runs synchronously before Initialize schedules any
 				// native tasks. Publish a lifetime-safe error handle before errors
 				// can occur, without requiring the timer to lock the context.
 				lock_guard<mutex> registry(registry_lock);
 				CheckCanceled();
 				target->execution_errors = context.GetExecutor().GetErrorManager();
-				return make_uniq<DirectCollector>(data, outputs);
+				return make_uniq<DirectCollector>(data, inputs, outputs);
 			};
 			task->pending =
 			    context.PendingQueryPreparedStatementNoRebind("direct fragment task", task->prepared, parameters);
@@ -385,6 +403,13 @@ void DirectTaskService::Refresh(Task &task) {
 			return;
 		}
 	}
+	// Input errors remain observable after native EOF and context cleanup,
+	// until the task's output delivery has successfully completed.
+	auto input_error = InputError(task.inputs);
+	if (!input_error.empty()) {
+		Fail(task, input_error);
+		return;
+	}
 	bool live = false;
 	bool drained = true;
 	for (auto &output : task.outputs) {
@@ -401,18 +426,6 @@ void DirectTaskService::Refresh(Task &task) {
 		}
 	}
 	if (task.state == "RUNNING" && !live) {
-		// An input abort wakes native work, but CheckPulse may not observe it
-		// until that work executes. Do not discard an already recorded failure
-		// when losing output demand lets us bypass execution and send FINISH.
-		for (auto &port : task.inputs) {
-			for (auto &input : port.second) {
-				auto error = input.channel->Snapshot().error;
-				if (!error.empty()) {
-					Fail(task, error);
-					return;
-				}
-			}
-		}
 		// A source can be BLOCKED forever and never call Sink again. Stop its
 		// executor before closing production; cleanup also closes every input,
 		// propagating the loss of demand upstream. Borrowed output stays leased.
@@ -543,13 +556,9 @@ bool DirectTaskService::Stop(const string &reason, bool only_running, optional_p
 				if (task->execution_errors && task->execution_errors->HasError()) {
 					task->failure_reason = task->execution_errors->GetError().Message();
 				}
-				for (auto &port : task->inputs) {
-					for (auto &input : port.second) {
-						auto error = input.channel->Snapshot().error;
-						if (task->failure_reason.empty() && !error.empty()) {
-							task->failure_reason = std::move(error);
-						}
-					}
+				auto input_error = InputError(task->inputs);
+				if (task->failure_reason.empty() && !input_error.empty()) {
+					task->failure_reason = std::move(input_error);
 				}
 				for (auto &output : task->outputs) {
 					for (auto &channel : output.channels) {
