@@ -139,6 +139,115 @@ def test_actor_udf_video_nested_values_preserve_types():
     assert table.column("features").to_pylist() == features
 
 
+@pytest.mark.parametrize("positional", [False, True])
+def test_materialized_output_matches_nested_struct_field_names_case_insensitively(positional):
+    record_type = pa.struct(
+        [
+            ("x", pa.int64()),
+            ("child", pa.struct([("y", pa.int64())])),
+            ("items", pa.list_(pa.struct([("z", pa.int64())]))),
+            ("fixed", pa.list_(pa.struct([("w", pa.int64())]), 1)),
+        ]
+    )
+    row = {"X": 7, "CHILD": {"Y": 11}, "Items": [{"Z": 13}, None], "FIXED": [{"W": 17}]}
+    values = [tuple(row.values()) if positional else row, None, (None, None, None, None) if positional else {}]
+    schema = pa.schema([("tensor", pa.fixed_shape_tensor(pa.int64(), [3])), ("record", record_type)])
+    output = columns_to_output_table(
+        {"tensor": np.arange(9).reshape(3, 3), "record": values}, schema, udf_name="casefold"
+    )
+
+    assert output.schema == schema
+    assert output.column("record").to_pylist() == [
+        {"x": 7, "child": {"y": 11}, "items": [{"z": 13}, None], "fixed": [{"w": 17}]},
+        None,
+        {"x": None, "child": None, "items": None, "fixed": None},
+    ]
+    assert row["CHILD"] == {"Y": 11}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_materialized_output_rejects_ambiguous_struct_field_names(nested):
+    import vane
+
+    dtype = pa.struct([("x", pa.int64())])
+    value = {"x": 7, "X": 8}
+    if nested:
+        dtype = pa.list_(dtype)
+        value = [value]
+    with pytest.raises(vane.InvalidInputException, match="ambiguous"):
+        columns_to_output_table({"record": [value]}, pa.schema([("record", dtype)]), udf_name="ambiguous")
+
+
+@pytest.mark.parametrize("layout", ["middle", "trailing", "row", "offset"])
+@pytest.mark.parametrize("dtype", [np.int64, np.float32])
+def test_materialized_output_canonicalizes_contiguous_tensor_views(layout, dtype):
+    base = np.arange(12, dtype=dtype).reshape(4, 3)
+    values = {
+        "middle": base[:, None, :],
+        "trailing": base[:, :, None],
+        "row": base[None, :, :],
+        "offset": base[1:3, None, :],
+    }[layout]
+    values.flags.writeable = False
+    assert values.flags.c_contiguous and 0 in values.strides
+    expected = values.copy()
+    tensor_type = pa.fixed_shape_tensor(pa.from_numpy_dtype(dtype), values.shape[1:])
+    output = columns_to_output_table({"tensor": values}, pa.schema([("tensor", tensor_type)]), udf_name="view")
+    tensor = output.column("tensor").chunk(0)
+
+    assert tensor.type == tensor_type
+    assert tensor.type.permutation is None
+    actual = tensor.to_numpy_ndarray()
+    assert np.shares_memory(actual, values)
+    del output, tensor, values, base
+    gc.collect()
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_actor_public_materialized_struct_names_and_singleton_tensor(request, monkeypatch, backend):
+    import vane
+
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+
+    class Output:
+        def __call__(self, table):
+            ids = table.column("id").to_numpy()
+            values = ids[:, None] * 3 + np.arange(3, dtype=np.int64)
+            return {
+                "id": ids,
+                "tensor": values[:, None, :],
+                "record": [{"X": int(i) + 7, "Items": [{"Y": int(i) + 9}]} for i in ids],
+            }
+
+    with vane.connect(config={"threads": 2}) as con:
+        output = (
+            con.sql("select range as id from range(2)")
+            .map_batches(
+                Output,
+                schema={
+                    "id": vane.sqltypes.BIGINT,
+                    "tensor": vane.tensor_type(vane.sqltypes.BIGINT, [1, 3]),
+                    "record": vane.type("STRUCT(x BIGINT, items STRUCT(y BIGINT)[])"),
+                },
+                batch_size=2,
+                execution_backend=backend,
+                actor_number=1,
+            )
+            .to_arrow_table()
+        )
+    output = output.sort_by("id")
+    assert output.column("record").to_pylist() == [
+        {"x": 7, "items": [{"y": 9}]},
+        {"x": 8, "items": [{"y": 10}]},
+    ]
+    np.testing.assert_array_equal(
+        output.column("tensor").combine_chunks().to_numpy_ndarray(), np.arange(6).reshape(2, 1, 3)
+    )
+
+
 @pytest.mark.parametrize("stream_output", [False, True])
 def test_actor_udf_nullable_nested_output_matches_ordinary_contract(stream_output):
     features = [None, [], [None], [{"label": None, "confidence": None, "bbox": [None, 2.0]}]]

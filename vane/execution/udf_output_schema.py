@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
+from numpy.typing import NDArray
 
 
 class _ArrowOpaqueCompatType(pa.ExtensionType):
@@ -262,9 +265,42 @@ def materialized_output_schema(payload: dict[str, Any]) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary: str) -> Any:
+    if value is None:
+        return None
+    if pa.types.is_struct(dtype):
+        if isinstance(value, Mapping):
+            from vane.execution.udf_file_contract import _mapping_field_value
+
+            return {
+                field.name: _canonicalize_struct_field_names(
+                    _mapping_field_value(value, field.name, boundary=boundary, path="column"),
+                    field.type,
+                    boundary=boundary,
+                )
+                for field in dtype
+            }
+        if isinstance(value, tuple) and len(value) == len(dtype):
+            return tuple(
+                _canonicalize_struct_field_names(item, field.type, boundary=boundary)
+                for item, field in zip(value, dtype, strict=True)
+            )
+    elif (pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype)) and isinstance(
+        value, (list, tuple, np.ndarray)
+    ):
+        return [_canonicalize_struct_field_names(item, dtype.value_type, boundary=boundary) for item in value]
+    return value
+
+
+def _fixed_shape_tensor_array(values: NDArray[Any], dtype: pa.FixedShapeTensorType) -> pa.ExtensionArray:
+    """Wrap matching C-contiguous values without inferring layout from singleton strides."""
+    flat = pa.array(values.reshape(-1), type=dtype.value_type)
+    storage = pa.FixedSizeListArray.from_arrays(flat, type=dtype.storage_type)
+    return pa.ExtensionArray.from_storage(dtype, storage)
+
+
 def columns_to_output_table(result: Any, schema: pa.Schema, *, udf_name: str) -> pa.Table:
     """Encode materialized columns on the actor thread without inferring types."""
-    import numpy as np
 
     from vane._tensor import _NUMPY_DTYPES
 
@@ -300,9 +336,18 @@ def columns_to_output_table(result: Any, schema: pa.Schema, *, udf_name: str) ->
             raise ValueError(f"{column_boundary} has {length} rows, expected {row_count}")
         row_count = length
         try:
-            if isinstance(field.type, pa.FixedShapeTensorType) and length:
-                array = pa.FixedShapeTensorArray.from_numpy_ndarray(values)
+            if isinstance(field.type, pa.FixedShapeTensorType):
+                array = _fixed_shape_tensor_array(values, field.type)
             else:
+                if (
+                    pa.types.is_struct(field.type)
+                    or pa.types.is_list(field.type)
+                    or pa.types.is_fixed_size_list(field.type)
+                ):
+                    values = [
+                        _canonicalize_struct_field_names(value, field.type, boundary=column_boundary)
+                        for value in values
+                    ]
                 array = pa.array(values if length else [], type=field.type)
         except (TypeError, ValueError, OverflowError, pa.ArrowException):
             # Arrow error messages may include complete input values.
