@@ -118,13 +118,40 @@ The shared numerical helpers and original default detector are unchanged.
 
 ## Recorded validation
 
+### Format integration check
+
+On 2026-10-04, code at `a076b94c33f4844ffefcf172e079a3fb66d336a3`
+was checked with three paired Arrow/NumPy queries on one RTX 2080 Ti.
+Each query used the same 64 decoded/resized RGB frames repeated four times
+(256 frames), YOLO11n, batch size 32, one actor, Torch threads 1 and a 2 GiB
+Ray object store. Both formats used the same inference, crop/PNG and Parquet
+path. Two 32-frame warmups preceded alternating format order.
+
+| Pair | Order | Arrow seconds | NumPy seconds | NumPy throughput change |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Arrow, NumPy | 26.657 | 14.792 | +80.21% |
+| 2 | NumPy, Arrow | 15.085 | 15.044 | +0.27% |
+| 3 | Arrow, NumPy | 15.133 | 15.202 | -0.45% |
+
+All six queries produced 1,000 rows with equal schemas and exact content
+hashes. The paired median was +0.27%; the first pair's large variation and
+the near-equal remaining pairs do not establish a reliable throughput gain.
+Timing includes actor startup, input reading, inference, crop/PNG, Parquet
+drain and connection close; it excludes Ray cluster startup, output validation
+and cleanup. This finite cached-input check is not an original-video or
+steady-state benchmark. Generated outputs and the input cache were removed
+after validation; configurations, identities, measurements and hashes were
+retained.
+
+### Earlier experimental protocol
+
 The frozen experiment baseline was Vane `9cccef7eefd`, Ray 2.58.0, Python 3.12,
 PyArrow 25.0.1, Torch 2.7.0, YOLO11n, one RTX 2080 Ti, 640x640 RGB, model
 batch32, Torch/OMP threads 1, object store 20 GiB and default allocator settings.
 These measurements came from the earlier experimental base-class protocol.
 They do not validate the current ordinary-class implementation or establish
-a throughput gain from adding a serial worker. No new GPU benchmark was run
-for this refactor.
+a throughput gain from adding a serial worker. The format integration check
+above is a separate comparison on the shared ordinary-class runtime.
 
 - Three paired five-minute cached-pixel windows: throughput gains +6.92%,
   +7.13%, +5.90%; paired median +6.92%.
