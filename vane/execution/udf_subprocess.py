@@ -465,6 +465,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._worker_lifecycle = WorkerLifecycle()
         self._local_gpu_assignment: tuple[str, int, int] | None = None
         self._pending_batches = 0
+        self._awaiting_submit_terminal = False
         self._wakeup: Callable[[], None] | None = None
         self._wakeup_error: BaseException | None = None
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
@@ -1108,8 +1109,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 scope = self._current_execution_scope()
                 with self._active_output_grants_lock:
                     # Cancellation releases grants before an in-flight result
-                    # arrives. Let the result's cancellation path discard it
-                    # without retiring an otherwise healthy pooled worker.
+                    # arrives. A consumed terminal result can be discarded
+                    # without retiring a healthy worker; an interrupted chunk
+                    # stream is fenced by the receive loop.
                     if grant_id not in self._active_output_grants and not scope.is_set():
                         raise ValueError(f"UDF subprocess result returned an unowned output grant {grant_id}")
             return normalized
@@ -1252,6 +1254,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         return False
 
     def _recv_submit_result(self) -> Any | None:
+        self._awaiting_submit_terminal = True
+        try:
+            return self._recv_submit_messages()
+        except BaseException as error:
+            if self._awaiting_submit_terminal and self._broken_error is None:
+                # A chunk transfers buffers, not the protocol connection. An
+                # interrupted receiver must retire the worker before another
+                # invocation can consume the previous task's remaining frames.
+                try:
+                    self._mark_broken("UDF subprocess output stream ended before its terminal response")
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
+
+    def _recv_submit_messages(self) -> Any | None:
         msg_type = None
         payload = b""
         while msg_type is None:
@@ -1268,6 +1285,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     _MSG_TASK_CANCELLED,
                 )
             )
+            if msg_type in (_MSG_OK, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
+                self._awaiting_submit_terminal = False
             try:
                 if self._handle_submit_control_message(msg_type, payload):
                     msg_type = None

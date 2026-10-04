@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pytest
@@ -13,6 +15,7 @@ import pytest
 from vane import pickle as vane_pickle
 from vane.execution import ref_bundle, udf_subprocess
 from vane.execution.resources import ResourceVector
+from vane.execution.udf_worker_metrics import WorkerMetrics
 
 
 @pytest.fixture
@@ -121,6 +124,132 @@ def test_block_arrives_before_producer_finishes_and_retains_task_ownership(runti
             rows += 1
     finally:
         executor.close(kill=True)
+        if pool is not None:
+            pool.shutdown(kill=True)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("cancel_at", ["descriptor", "adopted"])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cancelled_response_never_contaminates_the_next_invocation(
+    runtime, monkeypatch, tmp_path, backend, cancel_at, streaming
+):
+    gate = tmp_path / "resume_cancelled_generator"
+
+    def chunks(table):
+        value = table.column(0)[0].as_py()
+        if value == 1:
+            yield pa.table({"x": [111]})
+            deadline = time.monotonic() + 15
+            while not gate.exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("cancelled generator was not released")
+                time.sleep(0.01)
+            yield pa.table({"x": [999]})
+        else:
+            yield pa.table({"x": [222]})
+
+    def produce(table):
+        if streaming:
+            return chunks(table)
+        return pa.table({"x": [111 if table.column(0)[0].as_py() == 1 else 222]})
+
+    class Actor:
+        def __call__(self, table):
+            return produce(table)
+
+    metrics = WorkerMetrics()
+    payload = _payload(
+        Actor if backend == "subprocess_actor" else produce,
+        execution_backend=backend,
+        call_mode="map_batches" if streaming else "map_batches_rows",
+        scalar_arg_count=1,
+        batch_size=1,
+    )
+    pool = (
+        udf_subprocess.LocalSubprocessActorPool(payload, 1, worker_metrics=metrics)
+        if backend == "subprocess_actor"
+        else None
+    )
+    options = {"local_worker_metrics": metrics, **({"local_actor_pool": pool} if pool is not None else {})}
+    first, second = [udf_subprocess.UDFExecutor(payload, options) for _ in range(2)]
+    received, resume, cancelled, next_sent = [threading.Event() for _ in range(4)]
+    observed, pids = [], []
+    decode = udf_subprocess._SingleSubprocessExecutor._decode_ref_bundle_result
+    adopt = udf_subprocess.make_local_shm_ref_bundle_result_from_descriptor
+    send = udf_subprocess._SingleSubprocessExecutor._send_worker_message
+    wait_for_cleanup = first._wait_for_pending_futures
+
+    def pause():
+        received.set()
+        assert resume.wait(10), "cancelled response was not resumed"
+
+    def decode_result(worker, data):
+        result = decode(worker, data)
+        if not observed:
+            observed.append(worker)
+            pids.append(worker._proc.pid)
+            if cancel_at == "descriptor":
+                pause()
+        return result
+
+    def adopt_result(*args, **kwargs):
+        result = adopt(*args, **kwargs)
+        if cancel_at == "adopted" and not received.is_set():
+            pause()
+        return result
+
+    def wait_after_cancel(timeout):
+        cancelled.set()
+        return wait_for_cleanup(timeout)
+
+    def detect_next_input(worker, sock, kind, data=b""):
+        result = send(worker, sock, kind, data)
+        if kind == udf_subprocess._MSG_SUBMIT_REF_BUNDLE and observed and first._closed:
+            pids.append(worker._proc.pid)
+            next_sent.set()
+        return result
+
+    monkeypatch.setattr(udf_subprocess._SingleSubprocessExecutor, "_decode_ref_bundle_result", decode_result)
+    monkeypatch.setattr(udf_subprocess, "make_local_shm_ref_bundle_result_from_descriptor", adopt_result)
+    monkeypatch.setattr(udf_subprocess._SingleSubprocessExecutor, "_send_worker_message", detect_next_input)
+    monkeypatch.setattr(first, "_wait_for_pending_futures", wait_after_cancel)
+    try:
+        assert first.request_task_admission(8)
+        first.submit_with_id(1, pa.table({"x": [1]}))
+        assert received.wait(10)
+        with ThreadPoolExecutor(1) as closer:
+            closing = closer.submit(first.close, kill=False)
+            try:
+                assert cancelled.wait(5)
+            finally:
+                resume.set()
+            closing.result(timeout=10)
+        assert observed[0].is_reusable() is not streaming
+        assert second.request_task_admission(8)
+        second.submit_with_id(2, pa.table({"x": [2]}))
+        assert next_sent.wait(10), "next invocation waited for the cancelled generator"
+        assert (pids[0] != pids[1]) is streaming
+        gate.touch()
+        rows = []
+        while True:
+            item = _next(second)
+            assert item[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 2)
+            assert not isinstance(item[2], BaseException), item[2]
+            if len(item) == 3:
+                if item[2] is not None:
+                    rows.extend(_consume(item)["x"])
+                break
+            rows.extend(_consume(item)["x"])
+        assert rows == [222]
+        assert {key: count for key, count in metrics.snapshot().items() if count} == (
+            {"cancelled_workers": 1} if streaming else {}
+        )
+    finally:
+        resume.set()
+        gate.touch()
+        first.close(kill=True)
+        second.close(kill=True)
         if pool is not None:
             pool.shutdown(kill=True)
 
