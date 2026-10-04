@@ -16,17 +16,24 @@ There is no additional public UDF base class or user-owned executor.
   schema for top-level fixed-shape numeric tensors with primitive/list/struct
   siblings. This path requires exactly the declared columns and list, tuple
   or NumPy column values. Empty detections and zero rows preserve their types.
-- Nested STRUCT mappings match field names without regard to case and must
-  contain exactly the declared fields. Missing, extra or ambiguous names are
-  rejected before typed Arrow encoding can discard them.
+- Ordinary sibling columns retain their inferred source types so the existing
+  DuckDB conversion rules still apply, including rounding floats to integers
+  and escaping BLOBs converted to VARCHAR. Only Tensor storage is constructed
+  directly from the declared type.
+- Nested STRUCT values use mappings or positional tuples. Mappings match field
+  names without regard to case and must contain exactly the declared fields.
+  Missing, extra or ambiguous names are
+  rejected before Arrow encoding. Nested LIST/ARRAY values accept materialized
+  sequences (including `deque` and `UserList`) and NumPy arrays; other containers
+  are rejected before encoding so they cannot bypass recursive field checks.
 - The default-format dict encoder requires tensors to match dtype and shape
   and use C-contiguous storage. This encoder performs no implicit dtype
   conversion or pixel expansion through `tolist()`.
 - Returned arrays transfer ownership to the output; do not overwrite them
   while downstream consumers may still use them. Arrow retains their owners
   after the worker closes. Raw results/Futures are not cached across batches.
-- A matching schema from the restricted encoder establishes canonical
-  storage. Output validation remains in place; different logical storage
+- An exactly matching emitted schema from the restricted encoder establishes
+  canonical storage. Output validation remains in place; different logical storage
   contracts still use normalization. Ordinary Arrow-returning UDFs keep
   their existing output handling.
 - Async-runtime adapters and generator functions retain execution on the

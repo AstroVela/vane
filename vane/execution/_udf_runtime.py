@@ -704,7 +704,7 @@ class UDFExecutor:
                         table = columns_to_output_table(
                             batch, schema, udf_name=str(self._payload.get("udf_name") or "<UDF>")
                         )
-                        canonical = self._materialized_output_is_canonical
+                        canonical = self._materialized_output_is_canonical and table.schema.equals(schema)
                     else:
                         table = pa.table(batch)
                 else:

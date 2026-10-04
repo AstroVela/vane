@@ -12,6 +12,7 @@ import sys
 import textwrap
 import threading
 import weakref
+from collections import UserList, deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -120,7 +121,9 @@ def test_actor_udf_video_schema_empty_detections_and_zero_copy_frames(rows):
     frames = np.arange(rows * 18, dtype=np.uint8).reshape(rows, 2, 3, 3)
     columns = {"features": [[] for _ in range(rows)], "frame": frames, "frame_index": list(range(rows))}
     table = columns_to_output_table(columns, schema, udf_name="video")
-    assert table.schema == schema
+    if not rows:
+        assert table.schema == schema
+    assert table.column("frame").type == schema.field("frame").type
     assert table.num_rows == rows
     assert table.column("features").to_pylist() == [[] for _ in range(rows)]
     if rows:
@@ -157,7 +160,7 @@ def test_materialized_output_matches_nested_struct_field_names_case_insensitivel
         {"tensor": np.arange(9).reshape(3, 3), "record": values}, schema, udf_name="casefold"
     )
 
-    assert output.schema == schema
+    assert output.column("tensor").type == schema.field("tensor").type
     assert output.column("record").to_pylist() == [
         {"x": 7, "child": {"y": 11}, "items": [{"z": 13}, None], "fixed": [{"w": 17}]},
         None,
@@ -197,6 +200,126 @@ def test_materialized_output_validates_struct_fields_before_encoding(value, cont
             {"tensor": np.arange(3).reshape(1, 3), "record": [value]}, schema, udf_name="field-validation"
         )
     assert "private-extra-value" not in str(error.value)
+
+
+@pytest.mark.parametrize("container", [deque, UserList])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_materialized_output_checks_nested_sequence_struct_names(container, fixed):
+    dtype = pa.list_(pa.struct([("x", pa.int64())]), 1 if fixed else -1)
+    value = container([{"X": 7}])
+    output = columns_to_output_table({"record": [value]}, pa.schema([("record", dtype)]), udf_name="sequence")
+    assert output.column("record").to_pylist() == [[{"x": 7}]]
+    assert value[0] == {"X": 7}
+
+
+@pytest.mark.parametrize("container", [deque, UserList])
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("value", [{"X": 7, "extra": "private-extra-value"}, {}, {"x": 7, "X": 8}])
+def test_materialized_output_rejects_invalid_fields_in_nested_sequences(container, fixed, value):
+    import vane
+
+    dtype = pa.struct([("items", pa.list_(pa.struct([("x", pa.int64())]), 1 if fixed else -1))])
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields|ambiguous") as error:
+        columns_to_output_table(
+            {"record": [{"ITEMS": container([value])}]}, pa.schema([("record", dtype)]), udf_name="sequence"
+        )
+    assert "private-extra-value" not in str(error.value)
+
+
+def test_materialized_output_rejects_unchecked_nested_containers():
+    class UnregisteredSequence:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            if index != 0:
+                raise IndexError(index)
+            return {"x": 7, "extra": "private-extra-value"}
+
+    dtype = pa.list_(pa.struct([("x", pa.int64())]))
+    with pytest.raises(ValueError, match="could not encode") as error:
+        columns_to_output_table(
+            {"record": [UnregisteredSequence()]}, pa.schema([("record", dtype)]), udf_name="sequence"
+        )
+    assert "private-extra-value" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "values,declared,actual",
+    [
+        ([1.75, -2.5], pa.int64(), pa.float64()),
+        (np.array([1.75, -2.5]), pa.int64(), pa.float64()),
+        ([b"\x00A"], pa.string(), pa.binary()),
+        ([2**53 + 1], pa.float64(), pa.int64()),
+    ],
+)
+def test_materialized_output_preserves_source_types_for_duckdb_casts(values, declared, actual):
+    schema = pa.schema([("tensor", pa.fixed_shape_tensor(pa.int64(), [2])), ("value", declared)])
+    tensor = np.zeros((len(values), 2), dtype=np.int64)
+    output = columns_to_output_table({"tensor": tensor, "value": values}, schema, udf_name="casts")
+    assert output.column("value").type == actual
+    assert output.column("value").to_pylist() == list(values)
+    assert np.shares_memory(output.column("tensor").chunk(0).to_numpy_ndarray(), tensor)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch, backend):
+    import vane
+
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+    outputs = []
+    for materialized in (False, True):
+
+        class Output:
+            def __call__(self, table):
+                ids = table.column("id").to_pylist()
+                records = [{"X": [1.75, -2.5][i], "Text": b"\x00A"} for i in ids]
+                columns = {
+                    "id": ids,
+                    "tensor": np.zeros((len(ids), 2), dtype=np.int64),
+                    "number": [record["X"] for record in records],
+                    "text": [record["Text"] for record in records],
+                    "record": records,
+                    "items": [deque([record]) for record in records],
+                    "fixed": [UserList([record]) for record in records],
+                    "empty": [[] for _ in ids],
+                }
+                if materialized:
+                    return columns
+                columns["tensor"] = pa.FixedShapeTensorArray.from_numpy_ndarray(columns["tensor"])
+                columns["items"] = [list(items) for items in columns["items"]]
+                columns["fixed"] = [list(items) for items in columns["fixed"]]
+                return pa.table(columns)
+
+        with vane.connect(config={"threads": 2}) as con:
+            output = (
+                con.sql("select range as id from range(2)")
+                .map_batches(
+                    Output,
+                    schema={
+                        "id": "BIGINT",
+                        "tensor": vane.tensor_type(vane.sqltypes.BIGINT, [2]),
+                        "number": "BIGINT",
+                        "text": "VARCHAR",
+                        "record": "STRUCT(x BIGINT, text VARCHAR)",
+                        "items": "STRUCT(x BIGINT, text VARCHAR)[]",
+                        "fixed": "STRUCT(x BIGINT, text VARCHAR)[1]",
+                        "empty": "STRUCT(x BIGINT)[]",
+                    },
+                    batch_size=2,
+                    execution_backend=backend,
+                    actor_number=1,
+                )
+                .to_arrow_table()
+                .sort_by("id")
+            )
+        outputs.append(output)
+    assert outputs[0].column("number").to_pylist() == [2, -2]
+    assert outputs[0].column("text").to_pylist() == ["\\x00A", "\\x00A"]
+    assert outputs[0].column("empty").type == pa.list_(pa.struct([("x", pa.int64())]))
+    assert outputs[1].equals(outputs[0], check_metadata=True)
 
 
 @pytest.mark.parametrize("layout", ["middle", "trailing", "row", "offset"])
@@ -381,7 +504,7 @@ def test_actor_udf_rejects_mismatched_column_lengths_and_does_not_print_values()
             {"a": [1], "b": [1, 2]}, pa.schema([("a", pa.int64()), ("b", pa.int64())]), udf_name="test"
         )
     with pytest.raises(ValueError) as error:
-        columns_to_output_table({"y": ["private-pixel-content"]}, pa.schema([("y", pa.int64())]), udf_name="test")
+        columns_to_output_table({"y": [1, "private-pixel-content"]}, pa.schema([("y", pa.int64())]), udf_name="test")
     assert "private-pixel-content" not in str(error.value)
 
 
@@ -685,19 +808,27 @@ def test_numpy_tensor_output_without_pandas(rows, batch_format):
 
         class Output:
             def __call__(self, table):
-                return {"pixels": np.arange(rows * 6, dtype=np.uint8).reshape(rows, 2, 3)}
+                return {
+                    "pixels": np.arange(rows * 6, dtype=np.uint8).reshape(rows, 2, 3),
+                    "value": np.full(rows, 1.75) if sys.argv[2] == "numpy" else [1.75] * rows,
+                }
 
         runtime = UDFExecutor({
             "function_pickle": dumps(Output),
             "call_mode": "map_batches",
             "execution_backend": "subprocess_actor",
             "batch_format": sys.argv[2],
-            "output_schema": [{"name": "pixels", "kind": "tensor", "dtype": "UTINYINT", "shape": [2, 3]}],
+            "output_schema": [
+                {"name": "pixels", "kind": "tensor", "dtype": "UTINYINT", "shape": [2, 3]},
+                {"name": "value", "type": "BIGINT"},
+            ],
         })
         try:
             result = list(runtime.iter_submit(pa.table({"x": [1]})))[0]
             assert result.num_rows == rows
             assert result.column(0).type == pa.fixed_shape_tensor(pa.uint8(), [2, 3])
+            assert result.column("value").to_pylist() == [1.75] * rows
+            assert result.column("value").type == (pa.float64() if rows else pa.int64())
             if rows:
                 np.testing.assert_array_equal(
                     result.column(0).chunk(0).to_numpy_ndarray(), np.arange(6, dtype=np.uint8).reshape(1, 2, 3)
