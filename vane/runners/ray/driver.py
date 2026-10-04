@@ -3293,15 +3293,11 @@ class RayQueryDriverActor:
 
     def _schedule_query_fte_admission_pump(self, query_id: str) -> None:
         """Wake the FTE ownership domain without blocking the actor loop."""
-        from vane.runners.ray.fte_fragment_scheduler import (
-            has_fte_resource_admission_demand,
-        )
-
         query_key = str(query_id)
         if query_key in self._query_resource_closing_queries:
             return
-        if not has_fte_resource_admission_demand(query_key):
-            return
+        # The background drain rechecks demand. Checking it here can wait on
+        # fragment state locks and stall task/output admission on the actor loop.
         self._query_fte_admission_dirty_queries.add(query_key)
         existing = self._query_fte_admission_pumps.get(query_key)
         if existing is not None and not existing.done():
