@@ -20,6 +20,7 @@ import socket
 import struct
 import threading
 import uuid
+import weakref
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from itertools import count
@@ -38,11 +39,13 @@ _fork_lock = threading.RLock()
 _fork_holds: set[_ForkHold] = set()
 _pending_fork: _ForkHold | None = None
 _inherited_fork_writers: set[int] = set()
+_worker_clients: weakref.WeakSet[WorkerShmClient] = weakref.WeakSet()
 
 
 class _ForkHold:
     def __init__(self) -> None:
         self.stores: list[LocalShmStore] = []
+        self.clients: list[WorkerShmClient] = []
         self.read_fd: int | None = None
         self.write_fd: int | None = None
         self.alive = True
@@ -84,7 +87,12 @@ def _pin_stores_before_fork() -> None:
                 pinned = True
         if pinned:
             hold.stores.append(store)
-    if hold.stores:
+    for client in _worker_clients:
+        if client._live_reads:
+            for token in client._live_reads:
+                client._fork_reads.setdefault(token, set()).add(hold)
+            hold.clients.append(client)
+    if hold.stores or hold.clients:
         _fork_holds.add(hold)
         # Pins are installed before allocating descriptors. If pipe creation
         # fails, they remain owned until process exit instead of risking reuse.
@@ -98,6 +106,8 @@ def _watch_fork_exit(hold: _ForkHold) -> None:
     with _fork_lock:
         hold.alive = False
         hold.close_reader()
+        for client in hold.clients:
+            client._collect_fork_reads_locked()
     error: Exception | None = None
     for store in hold.stores:
         try:
@@ -110,6 +120,19 @@ def _watch_fork_exit(hold: _ForkHold) -> None:
         raise error
 
 
+def _start_fork_watcher(hold: _ForkHold) -> None:
+    with _fork_lock:
+        if hold.watching or hold.read_fd is None:
+            return
+        hold.watching = True
+        try:
+            threading.Thread(target=_watch_fork_exit, args=(hold,), name="vane-shm-fork-exit", daemon=True).start()
+        except BaseException:
+            # Allocation/drain and input-release paths can still observe EOF.
+            hold.watching = False
+            raise
+
+
 def _resume_parent_after_fork() -> None:
     global _pending_fork
     try:
@@ -117,19 +140,14 @@ def _resume_parent_after_fork() -> None:
         if hold is not None and hold.write_fd is not None:
             os.close(hold.write_fd)
             hold.write_fd = None
-            hold.watching = True
-            try:
-                threading.Thread(target=_watch_fork_exit, args=(hold,), name="vane-shm-fork-exit", daemon=True).start()
-            except BaseException:
-                # Allocation/drain paths can still observe EOF synchronously.
-                hold.watching = False
-                raise
+            _start_fork_watcher(hold)
     finally:
         _fork_lock.release()
 
 
 def _reset_registry_after_fork() -> None:
     global _registry_pid, _registry_lock, _stores, _current_store, _fork_lock, _fork_holds, _pending_fork
+    global _worker_clients
     if _pending_fork is not None and _pending_fork.write_fd is not None:
         # Keep the writer through normal exit, _exit, signals and further
         # forks. CLOEXEC releases it when exec discards inherited mappings.
@@ -140,6 +158,7 @@ def _reset_registry_after_fork() -> None:
     _fork_holds = set()
     _pending_fork = None
     _fork_lock = threading.RLock()
+    _worker_clients = weakref.WeakSet()
     # Free lists and locks are process-local even though their backing mmap is
     # shared. Discard inherited registry state without closing parent arenas.
     _registry_lock = threading.RLock()
@@ -534,15 +553,28 @@ class ParentShmPeer:
         self._writes: dict[int, StoreLease] = {}
         self._closed = False
         self._reader_error: BaseException | None = None
+        self._lifetime = _ForkHold()
         self.store = current_store(self.client_id)
         try:
             self.sock, self.child_sock = socket.socketpair()
+            # A separate lifetime descriptor survives release-channel shutdown
+            # and the worker's death when fork descendants still retain inputs.
+            # Pass it once at startup, without adding per-batch descriptors.
+            with _fork_lock:
+                self._lifetime.read_fd, write_fd = os.pipe()
+                _fork_holds.add(self._lifetime)
+                try:
+                    socket.send_fds(self.sock, [b"L"], [write_fd])
+                finally:
+                    os.close(write_fd)
             self._reader = threading.Thread(target=self._receive_releases, name="vane-shm-releases", daemon=True)
             self._reader.start()
         except BaseException:
             for name in ("sock", "child_sock"):
                 if (sock := getattr(self, name, None)) is not None:
                     sock.close()
+            with _fork_lock:
+                self._lifetime.close_reader()
             self.store.remove_client(self.client_id)
             raise
 
@@ -626,11 +658,30 @@ class ParentShmPeer:
         with self._lock:
             if self._closed:
                 return
+            self.child_sock.close()
+            with _fork_lock:
+                descendants_alive = self._lifetime.is_alive()
+            if descendants_alive and (self._reads or self._lifetime.stores):
+                # Transfer outstanding input ownership to process-lifetime
+                # pins before retiring this peer. The worker can die while its
+                # children or grandchildren still read the inherited mapping.
+                for lease in self._reads.values():
+                    store = lease.store
+                    with store._lock, _fork_lock:
+                        entry = store._require_locked(lease.allocation)
+                        if self._lifetime not in entry.forks:
+                            entry.forks.append(self._lifetime)
+                            store._forked[lease.allocation.generation] = entry
+                        if store not in self._lifetime.stores:
+                            self._lifetime.stores.append(store)
+                _start_fork_watcher(self._lifetime)
+            elif not self._lifetime.watching:
+                with _fork_lock:
+                    self._lifetime.close_reader()
             for leases in (self._reads, self._writes):
                 for token, lease in list(leases.items()):
                     lease.release()
                     del leases[token]
-            self.child_sock.close()
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -664,14 +715,34 @@ class _RemoteLease:
 
 class WorkerShmClient:
     def __init__(self, fd: int) -> None:
+        self._owner_pid = os.getpid()
+        self._lifetime_fd: int | None = None
         self.sock = socket.socket(fileno=fd)
         self._mappings: dict[str, _WorkerMapping] = {}
         self._reads: dict[int, _RemoteLease] = {}
+        self._live_reads: set[int] = set()
+        self._fork_reads: dict[int, set[_ForkHold]] = {}
         self._queue: queue.SimpleQueue[int | None] = queue.SimpleQueue()
         self._closed = False
         self._error: BaseException | None = None
-        self._writer = threading.Thread(target=self._send_releases, name="vane-shm-release-writer", daemon=True)
-        self._writer.start()
+        try:
+            with _fork_lock:
+                message, fds, flags, _ = socket.recv_fds(self.sock, 1, 1)
+                if message != b"L" or len(fds) != 1 or flags & socket.MSG_CTRUNC:
+                    for received_fd in fds:
+                        os.close(received_fd)
+                    raise RuntimeError("invalid shared-memory worker lifetime descriptor")
+                self._lifetime_fd = fds[0]
+                os.set_inheritable(self._lifetime_fd, False)
+                _worker_clients.add(self)
+            self._writer = threading.Thread(target=self._send_releases, name="vane-shm-release-writer", daemon=True)
+            self._writer.start()
+        except BaseException:
+            if self._lifetime_fd is not None:
+                os.close(self._lifetime_fd)
+                self._lifetime_fd = None
+            self.sock.close()
+            raise
 
     def _send_releases(self) -> None:
         try:
@@ -681,27 +752,36 @@ class WorkerShmClient:
             self._error = error
 
     def check(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("shared-memory worker client belongs to a different process")
         if self._closed or self._error is not None:
             raise RuntimeError("shared-memory release channel is unavailable") from self._error
 
     def begin_input(self, payload: dict[str, Any]) -> None:
         self.check()
         try:
-            for descriptor in payload["block_refs"]:
-                if "allocation" not in descriptor:
-                    continue
-                token = descriptor.get("borrow_id")
-                if type(token) is not int or token <= 0 or token in self._reads:
-                    raise ValueError("shared-memory input requires a unique borrow token")
-                self._reads[token] = _RemoteLease(self, token, ShmAllocation.parse(descriptor["allocation"]))
+            with _fork_lock:
+                self._collect_fork_reads_locked()
+                for descriptor in payload["block_refs"]:
+                    if "allocation" not in descriptor:
+                        continue
+                    token = descriptor.get("borrow_id")
+                    if type(token) is not int or token <= 0 or token in self._live_reads or token in self._fork_reads:
+                        raise ValueError("shared-memory input requires a unique borrow token")
+                    self._reads[token] = _RemoteLease(self, token, ShmAllocation.parse(descriptor["allocation"]))
+                    self._live_reads.add(token)
         except BaseException:
             self.end_input()
             raise
 
     def end_input(self) -> None:
-        self._reads.clear()
+        if self._owner_pid != os.getpid():
+            return
+        with _fork_lock:
+            self._reads.clear()
 
     def read_lease(self, value: dict[str, Any], token: int) -> _RemoteLease:
+        self.check()
         lease = self._reads.get(token)
         if lease is None or lease.allocation != ShmAllocation.parse(value):
             raise ValueError("shared-memory input has no live borrow lease")
@@ -718,14 +798,52 @@ class WorkerShmClient:
         return mapping
 
     def release(self, token: int) -> None:
-        if not self._closed:
-            self._queue.put(token)
+        # Inherited finalizers must neither queue a parent's token nor wait on
+        # a lock copied from a vanished thread.
+        if self._owner_pid != os.getpid():
+            return
+        with _fork_lock:
+            self._collect_fork_reads_locked()
+            if token in self._live_reads:
+                self._live_reads.remove(token)
+                if token not in self._fork_reads and not self._closed:
+                    self._queue.put(token)
+            self._close_lifetime_if_idle_locked()
+
+    def _collect_fork_reads_locked(self) -> None:
+        for token, holds in list(self._fork_reads.items()):
+            live = {hold for hold in holds if hold.is_alive()}
+            if live:
+                self._fork_reads[token] = live
+            else:
+                del self._fork_reads[token]
+                if token not in self._live_reads and not self._closed:
+                    self._queue.put(token)
+
+    def _close_lifetime_if_idle_locked(self) -> None:
+        # Late exit callbacks can still fork retained views after close().
+        # Keep the inheritable lifetime until those local views are gone;
+        # descriptors already inherited by children live until their exit.
+        if self._closed and not self._live_reads and self._lifetime_fd is not None:
+            os.close(self._lifetime_fd)
+            self._lifetime_fd = None
+
+    def __del__(self) -> None:
+        if self._owner_pid == os.getpid() and self._lifetime_fd is not None:
+            os.close(self._lifetime_fd)
+            self._lifetime_fd = None
 
     def close(self) -> None:
-        self.end_input()
-        self._closed = True
-        self._queue.put(None)
-        self._mappings.clear()
+        if self._owner_pid != os.getpid():
+            return
+        with _fork_lock:
+            if not self._closed:
+                self.end_input()
+                self._closed = True
+                _worker_clients.discard(self)
+                self._queue.put(None)
+                self._mappings.clear()
+                self._close_lifetime_if_idle_locked()
         # Late Python finalizers remain pinned in the parent until process exit.
         self._writer.join(timeout=1)
         try:
