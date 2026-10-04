@@ -25,10 +25,31 @@ from typing import Any
 
 _RELEASE = struct.Struct("!Q")
 _ALIGNMENT = 64
+_registry_pid = os.getpid()
 _registry_lock = threading.RLock()
 _stores: dict[str, LocalShmStore] = {}
 _current_store: LocalShmStore | None = None
 _worker_client: WorkerShmClient | None = None
+
+
+def _reset_registry_after_fork() -> None:
+    global _registry_pid, _registry_lock, _stores, _current_store
+    # Free lists and locks are process-local even though their backing mmap is
+    # shared. Discard inherited registry state without closing parent arenas.
+    _registry_lock = threading.RLock()
+    _stores = {}
+    _current_store = None
+    _registry_pid = os.getpid()
+
+
+def _require_registry_owner() -> None:
+    # Reject unregistered fork paths before touching an inherited lock.
+    if _registry_pid != os.getpid():
+        raise RuntimeError("shared-memory registry belongs to a different process")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_registry_after_fork)
 
 
 class LocalShmStoreCapacityError(RuntimeError):
@@ -82,6 +103,7 @@ class StoreLease:
         self._released = False
 
     def fork(self) -> StoreLease:
+        self.store._require_owner()
         with self._lock:
             if self._released:
                 raise RuntimeError("shared-memory allocation lease is released")
@@ -104,6 +126,7 @@ class StoreLease:
 
 class LocalShmStore:
     def __init__(self, capacity: int) -> None:
+        _require_registry_owner()
         if type(capacity) is not int or capacity < _ALIGNMENT:
             raise ValueError("shared-memory store capacity must be at least 64 bytes")
         self.capacity = capacity
@@ -123,8 +146,13 @@ class LocalShmStore:
         with _registry_lock:
             _stores[self.store_id] = self
 
+    def _require_owner(self) -> None:
+        if self._owner_pid != os.getpid():
+            raise RuntimeError("shared-memory store belongs to a different process")
+
     def add_client(self, client_id: str) -> bool:
         """Register atomically, or let the caller replace a retired arena."""
+        self._require_owner()
         with self._lock:
             if self._closed:
                 return False
@@ -140,6 +168,7 @@ class LocalShmStore:
                 self._drain_locked()
 
     def allocate(self, size: int) -> StoreLease:
+        self._require_owner()
         if type(size) is not int or size <= 0:
             raise ValueError("shared-memory allocation size must be positive")
         # Sixteen size classes per power-of-two range keep large-block slack
@@ -166,7 +195,6 @@ class LocalShmStore:
                 from vane.execution.ref_bundle import _create_shm
 
                 self._shm = _create_shm(self.capacity, track=False)
-                self._owner_pid = os.getpid()
             offset, length = self._free.pop(index)
             if length > required:
                 self._free.insert(index, (offset + required, length - required))
@@ -185,6 +213,7 @@ class LocalShmStore:
         return entry
 
     def acquire(self, allocation: ShmAllocation) -> StoreLease:
+        self._require_owner()
         with self._lock:
             entry = self._require_locked(allocation)
             entry.refs += 1
@@ -217,6 +246,7 @@ class LocalShmStore:
                 self._drain_locked()
 
     def buffer(self, allocation: ShmAllocation) -> memoryview:
+        self._require_owner()
         with self._lock:
             self._require_locked(allocation)
             return self._shm.buf[allocation.offset : allocation.offset + allocation.size]
@@ -269,6 +299,7 @@ class LocalShmStore:
             self._drain_locked()
 
     def snapshot(self) -> dict[str, int]:
+        self._require_owner()
         with self._lock:
             live = sum(entry.capacity for entry in self._live.values())
             return {
@@ -285,8 +316,10 @@ class LocalShmStore:
 
 def current_store(client_id: str) -> LocalShmStore:
     global _current_store
+    _require_registry_owner()
     with _registry_lock:
         if _current_store is not None:
+            _current_store._require_owner()
             with _current_store._lock:
                 if not _current_store._clients and not _current_store._live:
                     _current_store.close()
@@ -325,6 +358,7 @@ atexit.register(_unlink_owned_stores_at_exit)
 
 
 def acquire_allocation(value: dict[str, Any]) -> StoreLease:
+    _require_registry_owner()
     allocation = ShmAllocation.parse(value)
     with _registry_lock:
         store = _stores.get(allocation.store_id)
@@ -335,6 +369,7 @@ def acquire_allocation(value: dict[str, Any]) -> StoreLease:
 
 def local_shm_store_snapshot() -> dict[str, int]:
     """Diagnostic totals for current arenas and retained views from older ones."""
+    _require_registry_owner()
     with _registry_lock:
         snapshots = [store.snapshot() for store in _stores.values()]
     fields = (
