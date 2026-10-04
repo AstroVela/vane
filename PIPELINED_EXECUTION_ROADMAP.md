@@ -251,4 +251,10 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 11 项回归，覆盖查询竞争、转换期间中断、空/非空物化结果及结果名额和字节预算释放。
 - 6 个相关测试模块 **346 passed**，原生物化结果契约定向检查 **2 passed**；审查者提供的独立复现 **6 passed**。使用增量 Release 非 editable 安装，270 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。仅运行相关测试，未运行完整 release/fast 套件。
 
+### P1.1 原生批次读取异常修复（PR #943）
+
+- `QueryContext.read` 在原生读取失败时重新检查取消原因和执行期限，将 Arrow 包装的中断错误恢复为 `RequestCancelled` 或 `RequestExecutionTimeout`，并保留原始异常上下文；没有取消原因时继续传播原始读取错误。
+- 新增 4 项回归，在已交付 8192 行后的原生扫描中触发中断或超时，分别覆盖 `read_batch()` 和 `collect()`；同时检查重复读取的异常类型、查询状态、资源释放和连接复用。
+- 查询结果、结果交付、请求准入及期限四个相关模块 **178 passed**，审查者提供的独立复现 **2 passed**。本次仅修改 Python、测试及文档；非 editable 安装的 270 个 Python 源码/类型文件与 checkout 一致，native 与既有构建产物一致。格式、ruff、全包 mypy、pre-commit 和源码版权检查通过；未运行完整 release/fast 套件。
+
 下一增量为 P1.2：先落实有界 DirectExchange channel 的所有权、FINISH 与取消契约，再接 native BLOCKED/唤醒和部分发送恢复，最后用两个 fragment 的进程内 TaskService 验证并发推进。该设施用于分布式执行契约验证；local 公开路径继续直接原生执行。

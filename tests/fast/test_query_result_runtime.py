@@ -255,6 +255,55 @@ def test_execution_deadline_interrupts_native_computation_and_cursor_is_reusable
         assert connection.query("SELECT 7 AS x").collect().to_pylist() == [{"x": 7}]
 
 
+@pytest.mark.timeout(15)
+@pytest.mark.parametrize("reason", ["interrupt", "execution_timeout"])
+@pytest.mark.parametrize("method", ["read_batch", "collect"])
+def test_native_read_preserves_cancellation_error_after_partial_result(monkeypatch, reason, method):
+    entered = threading.Event()
+    expected = RequestCancelled if reason == "interrupt" else RequestExecutionTimeout
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("SET streaming_buffer_size = '8KB'")
+        with connection.query(
+            "SELECT i FROM range(10000000000) t(i) WHERE i < 8192 OR i > 9999999900",
+            options=options(execution=1 if reason == "execution_timeout" else 10),
+        ) as result:
+            rows = []
+            while len(rows) < 8192:
+                batch = result.read_batch()
+                rows.extend(batch.column(0).to_pylist())
+                del batch
+            assert rows == list(range(8192))
+            read_native = result.context._read_native
+
+            def read():
+                # Signal after QueryContext's pre-read check, then enter the
+                # real native scan rather than a delivery-buffer wait.
+                entered.set()
+                return read_native()
+
+            monkeypatch.setattr(result.context, "_read_native", read)
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(getattr(result, method))
+                try:
+                    assert entered.wait(3)
+                    if reason == "interrupt":
+                        connection.interrupt()
+                    with pytest.raises(expected) as caught:
+                        future.result(timeout=5)
+                finally:
+                    if not future.done():
+                        connection.interrupt()
+            assert isinstance(caught.value.__context__, OSError)
+            assert "Interrupted" in str(caught.value.__context__)
+            assert result.execution_state == ("CANCELED" if reason == "interrupt" else "FAILED")
+            assert result.state == "failed"
+            with pytest.raises(expected):
+                result.read_batch()
+        idle(connection.query_runtime)
+        assert connection.query("SELECT 7 AS x").collect().to_pylist() == [{"x": 7}]
+        idle(connection.query_runtime)
+
+
 def test_interrupt_wakes_byte_waiter_and_fences_later_query():
     with vane.connect(backend="local", resources=limits()) as connection, ThreadPoolExecutor(1) as threads:
         result = connection.query("SELECT i FROM range(10000) t(i)")

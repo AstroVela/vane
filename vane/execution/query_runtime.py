@@ -191,6 +191,9 @@ class QueryContext:
             result.completion_status = "ok" if self._had_rows else "empty"
             return False
         except BaseException as error:
+            # Arrow can wrap native interruption as OSError. Restore the
+            # recorded cancellation/deadline outcome before reporting failure.
+            self.check()
             if isinstance(error, ResultDeliveryFull):
                 error._execution_started = True
             with self._lock:
