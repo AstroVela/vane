@@ -3155,6 +3155,21 @@ private:
 						} else if (event_kind == "complete") {
 							event.kind = UDFOutputEventKind::COMPLETE;
 							event.submit_complete = true;
+							if (!payload.is_none()) {
+								if (py::isinstance<py::dict>(payload)) {
+									auto stats = payload.cast<py::dict>();
+									event.compute_duration_us = stats["compute_duration_us"].cast<int64_t>();
+									event.next_batch_rows = stats["next_batch_rows"].cast<int64_t>();
+									if (event.next_batch_rows <= 0) {
+										throw InvalidInputException("udf Actor batch target must be positive");
+									}
+								} else {
+									event.compute_duration_us = payload.cast<int64_t>();
+								}
+								if (event.compute_duration_us < 0) {
+									throw InvalidInputException("udf worker compute duration must be non-negative");
+								}
+							}
 						} else if (event_kind == "error") {
 							event.kind = UDFOutputEventKind::ERROR;
 							event.submit_complete = true;

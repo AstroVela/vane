@@ -95,6 +95,7 @@ from vane.execution.udf_ray_stream_protocol import (
     RAY_UDF_STREAM_BUFFER_BLOCKS,
     iter_bounded_stream_blocks,
     make_stream_block_metadata,
+    make_stream_compute_stats_pair,
     make_stream_error_pair,
     task_payload_with_lease,
     validate_task_runtime_node,
@@ -782,6 +783,11 @@ def _streaming_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return stream_payload
 
 
+def _iter_task_compute_stats(executor: RuntimeUDFExecutor, payload: dict[str, Any]) -> Iterator[Any]:
+    if payload.get("dynamic_batching", False):
+        yield from make_stream_compute_stats_pair(payload, executor.compute_duration_us)
+
+
 def _iter_materialized_task_outputs(
     payload: dict[str, Any],
     tables: list[pa.Table] | tuple[pa.Table, ...],
@@ -835,6 +841,7 @@ def _iter_materialized_task_outputs(
                         yield block
                         yield metadata
             executor.finished_submitting()
+            yield from _iter_task_compute_stats(executor, stream_payload)
             return
 
         for raw_table in tables:
@@ -847,6 +854,7 @@ def _iter_materialized_task_outputs(
             for block, metadata in emit(output):
                 yield block
                 yield metadata
+        yield from _iter_task_compute_stats(executor, stream_payload)
     finally:
         executor.close()
 
@@ -1004,6 +1012,7 @@ def _iter_ref_bundle_task_outputs(
                     yield output_metadata
         finally:
             executor.close()
+        yield from _iter_task_compute_stats(executor, stream_payload)
         if log_task:
             _ray_task_debug_log(
                 "worker_ref_bundle_finished",
@@ -1029,6 +1038,7 @@ def _iter_ref_bundle_task_outputs(
                 yield block
                 yield make_stream_block_metadata(block, payload, output_index=output_index)
                 output_index += 1
+        yield from _iter_task_compute_stats(executor, payload)
         return
 
     if call_mode != "map":

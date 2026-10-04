@@ -3118,6 +3118,197 @@ def test_udf_runtime_stream_output_default_uses_runtime_batch_size():
     assert executor.take_ready_result() is None
 
 
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"execution_backend": "subprocess_task", "gpus": 1.0}, "Ray execution backend"),
+        ({"execution_backend": "ray_task", "gpus": 0.0}, "positive 'gpus' value"),
+    ],
+)
+def test_udf_runtime_dynamic_batching_rejects_non_gpu_ray_contract(extra, match):
+    from vane.execution._udf_runtime import UDFExecutor
+
+    payload = _subprocess_map_payload(lambda table: table, dynamic_batching=True, **extra)
+
+    with pytest.raises(ValueError, match=match):
+        UDFExecutor(payload)
+
+
+def test_udf_runtime_ray_gpu_batch_rejects_static_fallback():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    payload = _subprocess_map_payload(
+        lambda table: table,
+        execution_backend="ray_task",
+        gpus=1.0,
+    )
+
+    with pytest.raises(ValueError, match="requires dynamic_batching=True"):
+        UDFExecutor(payload)
+
+
+def test_udf_runtime_dynamic_batching_treats_scheduler_envelope_as_one_compute_batch():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def identity(table):
+        return pa.table(
+            {
+                "result": table.column("x"),
+                "batch_rows": [table.num_rows] * table.num_rows,
+            }
+        )
+
+    payload = _subprocess_map_payload(
+        identity,
+        execution_backend="ray_task",
+        gpus=1.0,
+        batch_size=10,
+        prebatched_input=False,
+        stream_output=True,
+        dynamic_batching=True,
+    )
+    executor = UDFExecutor(payload)
+    executor.submit(pa.table({"x": list(range(25))}))
+
+    output = executor.take_ready_result()
+
+    assert output is not None
+    assert output.num_rows == 25
+    assert output.column("batch_rows").to_pylist() == [25] * 25
+    assert executor.take_ready_result() is None
+
+
+def _dynamic_actor_payload(fn, *, max_rows=10, initial_rows=None, **extra):
+    class ActorCallable:
+        def __call__(self, table):
+            return fn(table)
+
+    return _subprocess_map_payload(
+        ActorCallable,
+        execution_backend="ray_actor",
+        gpus=1.0,
+        batch_size=max_rows,
+        dynamic_batching=True,
+        dynamic_batch_size_min_rows=1,
+        dynamic_batch_size_max_rows=max_rows,
+        dynamic_batch_size_initial_rows=initial_rows or max_rows,
+        dynamic_batch_target_latency_ms=5000,
+        dynamic_batch_latency_tolerance_ms=1000,
+        dynamic_batch_step_size=16,
+        dynamic_batch_correction=4,
+        dynamic_batch_history_size=16,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("stream_output", [False, True])
+@pytest.mark.parametrize("call_mode", ["map_batches", "map_batches_rows"])
+def test_gpu_actor_splits_coalesced_envelopes_and_keeps_short_tails(stream_output, call_mode):
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def report_batch(table):
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = UDFExecutor(_dynamic_actor_payload(report_batch, call_mode=call_mode, stream_output=stream_output))
+    for count in [2040, 23, 20]:
+        executor.submit(pa.table({"x": list(range(count))}))
+        outputs = executor.drain_outputs()
+        result = pa.concat_tables(outputs)
+        assert result.column("result").to_pylist() == list(range(count))
+        expected = [10] * (count // 10 * 10) + [count % 10] * (count % 10)
+        assert result.column("batch_rows").to_pylist() == expected
+    assert executor._actor_batch_sizer.current_batch_rows == 10
+
+
+def test_gpu_actor_adapts_inside_envelope_and_retains_history_across_submissions():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def report_batch(table):
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = UDFExecutor(_dynamic_actor_payload(report_batch, max_rows=32, initial_rows=4))
+    executor.submit(pa.table({"x": list(range(64))}))
+    output = pa.concat_tables(executor.drain_outputs())
+    sizes = output.column("batch_rows").to_pylist()
+    assert sizes[:4] == [4] * 4
+    assert max(sizes) > 4
+    assert max(sizes) <= 32
+    next_size = executor._actor_batch_sizer.current_batch_rows
+    executor.submit(pa.table({"x": list(range(next_size))}))
+    output = pa.concat_tables(executor.drain_outputs())
+    assert output.column("batch_rows").to_pylist() == [next_size] * next_size
+
+
+def test_gpu_actor_times_generator_work_but_excludes_output_backpressure(monkeypatch):
+    import vane.execution._udf_runtime as runtime
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+
+    def generate(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(10_000_000)
+        yield pa.table({"result": table.column("x").slice(0, 5)})
+        runtime.time.advance(20_000_000)
+        yield pa.table({"result": table.column("x").slice(5)})
+
+    executor = runtime.UDFExecutor(_dynamic_actor_payload(generate, stream_output=True, output_batch_size=5))
+    native_sizer = executor._actor_batch_sizer
+    observations = []
+
+    class RecordingSizer:
+        @property
+        def current_batch_rows(self):
+            return native_sizer.current_batch_rows
+
+        def record(self, rows, duration_us):
+            observations.append((rows, duration_us))
+            native_sizer.record(rows, duration_us)
+
+    executor._actor_batch_sizer = RecordingSizer()
+    outputs = []
+    for output in executor.iter_submit(pa.table({"x": list(range(20))})):
+        outputs.append(output)
+        advance(60_000_000_000)
+    assert pa.concat_tables(outputs).column("result").to_pylist() == list(range(20))
+    assert observations == [(10, 30_000), (10, 30_000)]
+
+
+@pytest.mark.parametrize("input_rows", [128, 512])
+def test_gpu_actor_shrinks_batch_after_slow_compute(monkeypatch, input_rows):
+    import vane.execution._udf_runtime as runtime
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+
+    def slow(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(7_000_000_000)
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = runtime.UDFExecutor(_dynamic_actor_payload(slow, max_rows=512, initial_rows=256))
+    executor.submit(pa.table({"x": list(range(input_rows))}))
+    result = pa.concat_tables(executor.drain_outputs())
+    assert result.column("result").to_pylist() == list(range(input_rows))
+    sizes = result.column("batch_rows").to_pylist()
+    if input_rows < 256:
+        assert sizes == [input_rows] * input_rows
+        assert executor._actor_batch_sizer.current_batch_rows < input_rows
+    else:
+        assert sizes[:256] == [256] * 256
+        assert sizes[256] < 256
+
+
 def test_udf_runtime_stream_output_default_ignores_submit_and_method_batch_size():
     from vane.execution._udf_runtime import UDFExecutor
 
@@ -3263,6 +3454,82 @@ def test_ray_task_streaming_payload_enables_flat_map_stream_output():
     assert stream_payload["stream_output"] is True
     assert stream_payload["prebatched_input"] is False
     assert payload == {"call_mode": "flat_map", "prebatched_input": True}
+
+
+@pytest.mark.parametrize("input_kind", ["materialized", "ref_bundle"])
+@pytest.mark.parametrize("result_kind", ["table", "generator", "empty", "rows"])
+def test_gpu_ray_task_reports_compute_time_without_setup_or_output_waits(monkeypatch, input_kind, result_kind):
+    import vane.execution._udf_runtime as runtime
+    import vane.execution.udf_ray as udf_ray
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+    original_load = runtime._load_runtime_callable
+
+    def slow_load(*args, **kwargs):
+        advance(20_000_000_000)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_load_runtime_callable", slow_load)
+    monkeypatch.setattr(udf_ray, "validate_task_runtime_node", lambda payload: advance(20_000_000_000))
+
+    def compute(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(10_000_000)
+        result = pa.table({"result": table.column("x")})
+        if result_kind == "empty":
+            return None
+        if result_kind != "generator":
+            return result
+
+        def generate():
+            runtime.time.advance(20_000_000)
+            yield result.slice(0, 2)
+            runtime.time.advance(30_000_000)
+            yield result.slice(2)
+            runtime.time.advance(40_000_000)
+
+        return generate()
+
+    payload = _subprocess_map_payload(
+        compute,
+        execution_backend="ray_task",
+        call_mode="map_batches_rows" if result_kind == "rows" else "map_batches",
+        scalar_arg_count=1,
+        gpus=1.0,
+        dynamic_batching=True,
+        batch_size=2,
+        output_batch_size=2,
+        query_id="query-timing",
+        resource_unit_id="resource:query-timing:udf:node:1",
+        task_lease_id="lease-timing",
+        attempt_id="attempt-timing",
+        output_schema=[{"name": "result", "type": "BIGINT"}],
+        udf_output_target_max_bytes=128 * 1024**2,
+        output_window_bytes=256 * 1024**2,
+    )
+    table = pa.table({"x": list(range(4))})
+    if input_kind == "materialized":
+        stream = udf_ray._iter_materialized_task_outputs(payload, [table])
+    else:
+        stream = udf_ray._iter_ref_bundle_task_outputs(payload, [table], None, [{"num_rows": 4}], ["x"])
+    outputs = []
+    for item in stream:
+        outputs.append(item)
+        advance(60_000_000_000)
+
+    assert outputs[-2].num_rows == 0
+    stats = outputs[-1]
+    assert stats["event_kind"] == "compute_stats"
+    assert stats["compute_duration_us"] == (100_000 if result_kind == "generator" else 10_000)
+    assert stats["task_lease_id"] == "lease-timing"
+    result_rows = sum(item.num_rows for item in outputs[:-2] if isinstance(item, pa.Table))
+    assert result_rows == (0 if result_kind == "empty" else 4)
 
 
 def test_ray_task_ref_bundle_stream_flushes_compute_tail_after_finished_submitting(monkeypatch):
