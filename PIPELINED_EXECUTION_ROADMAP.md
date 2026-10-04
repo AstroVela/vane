@@ -257,4 +257,11 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 - 新增 4 项回归，在已交付 8192 行后的原生扫描中触发中断或超时，分别覆盖 `read_batch()` 和 `collect()`；同时检查重复读取的异常类型、查询状态、资源释放和连接复用。
 - 查询结果、结果交付、请求准入及期限四个相关模块 **178 passed**，审查者提供的独立复现 **2 passed**。本次仅修改 Python、测试及文档；非 editable 安装的 270 个 Python 源码/类型文件与 checkout 一致，native 与既有构建产物一致。格式、ruff、全包 mypy、pre-commit 和源码版权检查通过；未运行完整 release/fast 套件。
 
+### P1.1 默认连接会话资源修复（PR #943）
+
+- 默认连接获取统一拒绝显式 runner/backend，覆盖路径转换后的大小写字符串及 `Path`；`connect(":default:", backend="local", ...)` 抛出 `InvalidInputException`，不会替换已有 runtime 或其资源计费。
+- 不带配置的 `connect(":default:")` 继续返回已有连接并共用 runtime。通过创建 local 连接后调用 `set_default_connection` 设置默认连接；普通默认连接也不能通过额外 backend 选项原地升级。
+- 新增 13 项回归，覆盖省略 resources、相同及不同容量、字符串及路径写法，并检查活动 cursor 的准入限制、结果名额、完整结果和释放后的复用。
+- 查询结果与连接/cursor/默认连接相关验证 **89 passed**，审查者的独立复现 **1 passed**。C++ 已增量 Release 构建并非 editable 安装；270 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。格式、ruff、适用的 pre-commit 与源码版权检查通过；未运行完整 release/fast 套件。
+
 下一增量为 P1.2：先落实有界 DirectExchange channel 的所有权、FINISH 与取消契约，再接 native BLOCKED/唤醒和部分发送恢复，最后用两个 fragment 的进程内 TaskService 验证并发推进。该设施用于分布式执行契约验证；local 公开路径继续直接原生执行。

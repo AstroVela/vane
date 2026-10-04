@@ -140,6 +140,8 @@ PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创�
 
 P1.1 接通以下 local 入口。QueryResources 是会话共享的容量，独立 cursor 共用准入和结果预算；QueryExecutionOptions 是本次查询的不可变期限快照。
 
+`connect(":default:")` 只获取已有连接，不接受 `backend` 或 `resources` 等配置选项。需要 local 默认连接时，先通过 `connect(backend="local", resources=...)` 创建，再调用 `set_default_connection`；后续获取默认连接继续共用该会话的 runtime 和资源计费。
+
 ~~~python
 import vane
 

@@ -7,13 +7,19 @@ import gc
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
 import vane
 from vane.execution.query_runtime import QueryContext
-from vane.execution.request_admission import RequestCancelled, RequestExecutionTimeout, RequestQueueTimeout
+from vane.execution.request_admission import (
+    RequestCancelled,
+    RequestExecutionTimeout,
+    RequestQueueFull,
+    RequestQueueTimeout,
+)
 from vane.execution.result_delivery import ResultDeliveryCancelled, ResultDeliveryFull, ResultDeliveryTimeout
 
 
@@ -122,6 +128,56 @@ def test_module_query_uses_the_same_result_contract():
     with vane.connect() as unselected:
         with pytest.raises(vane.InvalidInputException, match="backend='local'"):
             unselected.query("SELECT 1")
+
+
+@pytest.mark.parametrize("database", [":default:", ":DeFaUlT:", Path(":default:"), Path(":DeFaUlT:")])
+@pytest.mark.parametrize("resources", ["omitted", "same", "different"])
+def test_default_connection_rejects_local_options_without_resetting_admission(database, resources):
+    original_default = vane.default_connection()
+    capacity = vane.QueryResources(1, 0, 1, 20_000)
+    with vane.connect(backend="local", resources=capacity) as connection:
+        vane.set_default_connection(connection)
+        try:
+            runtime = connection.query_runtime
+            cursor = connection.cursor()
+            with cursor.query("SELECT i FROM range(10000) t(i)") as result:
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 1
+                with pytest.raises(RequestQueueFull):
+                    connection.query("SELECT 42 AS x")
+                kwargs = {}
+                if resources != "omitted":
+                    kwargs["resources"] = capacity if resources == "same" else vane.QueryResources(4, 4, 4, 80_000)
+                with pytest.raises(vane.InvalidInputException, match="Default connection fetching.*additional options"):
+                    vane.connect(database, backend="local", **kwargs)
+                fetched = vane.connect(database)
+                assert fetched is connection
+                assert fetched.query_runtime is cursor.query_runtime is runtime
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 1
+                assert runtime.resource_snapshot()["result_delivery"]["active_results"] == 1
+                with pytest.raises(RequestQueueFull):
+                    fetched.query("SELECT 42 AS x")
+                assert result.collect().column(0).to_pylist() == list(range(10000))
+            idle(runtime)
+            assert fetched.query("SELECT 42 AS x").collect().to_pylist() == [{"x": 42}]
+            idle(runtime)
+        finally:
+            vane.set_default_connection(original_default)
+
+
+def test_default_connection_cannot_be_upgraded_to_local_runtime(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    original_default = vane.default_connection()
+    with vane.connect() as connection:
+        vane.set_default_connection(connection)
+        try:
+            assert connection.query_runtime is None
+            with pytest.raises(vane.InvalidInputException, match="Default connection fetching.*additional options"):
+                vane.connect(":default:", backend="local")
+            assert vane.connect(":default:") is connection
+            assert connection.query_runtime is None
+            assert connection.execute("SELECT 42").fetchone() == (42,)
+        finally:
+            vane.set_default_connection(original_default)
 
 
 @pytest.mark.parametrize("value", [None, "pipelined", "fte"])

@@ -3671,13 +3671,15 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 	return res;
 }
 
-bool IsDefaultConnectionString(const string &database, bool read_only, case_insensitive_map_t<Value> &config) {
+bool IsDefaultConnectionString(const string &database, bool read_only, case_insensitive_map_t<Value> &config,
+                               const string &runner_type) {
 	bool is_default = StringUtil::CIEquals(database, ":default:");
 	if (!is_default) {
 		return false;
 	}
-	// Only allow fetching the default connection when no options are passed
-	if (read_only == true || !config.empty()) {
+	// An explicit runner creates a new session. Fetching the default connection
+	// must never replace an existing session's runtime or resource accounting.
+	if (read_only || !config.empty() || !runner_type.empty()) {
 		throw InvalidInputException("Default connection fetching is only allowed without additional options");
 	}
 	return true;
@@ -3699,7 +3701,7 @@ static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database
 	DuckDBPyConnection::CheckCallbackEntry();
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
-	if (IsDefaultConnectionString(database, read_only, config_dict)) {
+	if (IsDefaultConnectionString(database, read_only, config_dict, runner_type)) {
 		return DuckDBPyConnection::DefaultConnection();
 	}
 	const auto selected_runner =
