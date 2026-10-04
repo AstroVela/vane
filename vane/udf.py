@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 
-"""Scalar UDF helpers and the experimental batch callable contract."""
+"""Scalar UDF modes and helpers for Vane."""
 
 import typing
 
@@ -20,35 +20,10 @@ __all__ = [
     "DEFAULT",
     "NATIVE",
     "SPECIAL",
-    "BatchUDF",
     "FunctionNullHandling",
     "PythonUDFType",
     "vectorized",
 ]
-
-
-class BatchUDF:
-    """Experimental materialized batch UDF for ``map_batches`` Ray actors.
-
-    Construction, ``prepare_batch``, warmup and cleanup run on the actor thread.
-    ``__call__`` runs serially on one persistent worker thread and must return
-    a dict of materialized columns. Vane constructs Arrow output on the actor
-    thread using the declared schema. Ordinary callable classes are unaffected.
-
-    The initial contract supports primitive/list/struct columns and contiguous
-    NumPy fixed-shape tensors. It excludes async and generator callables, FILE,
-    IMAGE and variable-shape tensors. Thread-local contexts are not inherited
-    by the worker. Returned arrays must not be overwritten while output can
-    still be consumed downstream; returning an array transfers its ownership.
-    """
-
-    def prepare_batch(self, table: typing.Any) -> typing.Any:
-        """Adapt an Arrow table on the actor thread before computation."""
-        return table
-
-    def __call__(self, prepared: typing.Any) -> dict[str, typing.Any]:
-        """Compute one batch on the persistent worker; return column values."""
-        raise NotImplementedError
 
 
 def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., typing.Any]:

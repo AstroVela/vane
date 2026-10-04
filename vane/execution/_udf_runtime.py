@@ -37,10 +37,10 @@ from vane.execution._udf_validation import ensure_synchronous_udf_result, valida
 from vane.execution.udf_file_contract import FileUDFContract
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
-from vane.udf import BatchUDF, FunctionNullHandling
+from vane.udf import FunctionNullHandling
 
 if TYPE_CHECKING:
-    from vane.execution.udf_batch_callable import BatchCallableRuntime
+    from vane.execution.udf_actor_callable import ActorCallableRuntime
 
 # Mirrors DuckDB's STANDARD_VECTOR_SIZE default batch size.
 BATCH_SIZE = 2048
@@ -83,10 +83,6 @@ def _load_runtime_callable(
         udf = load_udf_from_payload(payload)
 
     validate_synchronous_udf_callable(udf)
-    if inspect.isclass(udf) and issubclass(udf, BatchUDF):
-        from vane.execution.udf_batch_callable import validate_batch_udf_class
-
-        validate_batch_udf_class(udf, payload)
     if has_governed_inputs and getattr(udf, "_vane_row_actor_adapter", False):
         raise ValueError("vane.cls row UDFs do not support governed inputs; use vane.func or vane.cls.batch")
 
@@ -294,7 +290,7 @@ def _effective_output_batch_size(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
+def _iter_output_batches(result: Any) -> Iterable[pa.Table | dict[str, Any]]:
     """Iterate over output batches from a stream UDF result."""
     result = ensure_synchronous_udf_result(result)
     if result is None:
@@ -309,14 +305,14 @@ def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
         yield pa.Table.from_batches([result])
         return
     if isinstance(result, dict):
-        yield pa.table(result)
+        yield result
         return
 
     if isinstance(result, Iterable) and not isinstance(result, (str, bytes, bytearray)):
         for item in result:
             if item is None:
                 continue
-            yield from _iter_output_tables(item)
+            yield from _iter_output_batches(item)
         return
 
     raise TypeError("udf output must be Table/RecordBatch/dict, or an iterable yielding those types")
@@ -508,7 +504,7 @@ class UDFExecutor:
         self._closed = False
         self._close_started = False
         self._async_runtime: AsyncRuntime | None = None
-        self._batch_callable: BatchCallableRuntime | None = None
+        self._actor_callable: ActorCallableRuntime | None = None
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
             raise ValueError("UDF payload.call_mode must be one of: map_batches, map_batches_rows, flat_map, map")
@@ -539,13 +535,21 @@ class UDFExecutor:
             cache_max_entries=cache_max_entries,
             has_governed_inputs=self._file_contract.has_governed_inputs,
         )
-        if isinstance(self._map_fn, BatchUDF):
-            from vane.execution.udf_batch_callable import BatchCallableRuntime
-
-            if callable(getattr(self._map_fn, "bind_async_runtime", None)):
-                raise TypeError("BatchUDF does not support bind_async_runtime")
-            self._batch_callable = BatchCallableRuntime(payload, output_contract_types=self._file_contract.output_types)
         self._bind_async_runtime()
+        # Async adapters own an event loop on the actor thread. Generator UDFs
+        # also retain their existing lazy execution on that thread.
+        call = getattr(self._map_fn, "__call__", None)
+        if (
+            self._call_mode == "map_batches"
+            and str(payload.get("execution_backend") or "").strip().lower() in ("ray_actor", "subprocess_actor")
+            and self._async_runtime is None
+            and not inspect.isgeneratorfunction(call)
+            and not inspect.isgeneratorfunction(inspect.unwrap(call))
+        ):
+            from vane.execution.udf_actor_callable import ActorCallableRuntime
+
+            self._actor_callable = ActorCallableRuntime()
+        self._init_materialized_output(payload)
         self._mode = self._call_mode
         self._is_map_batches = self._call_mode == "map_batches"
         self._is_map_batches_rows = self._call_mode == "map_batches_rows"
@@ -620,7 +624,7 @@ class UDFExecutor:
         """Run an optional UDF-level warmup hook after deserialization."""
         warm_up = getattr(self._map_fn, "warm_up", None)
         if callable(warm_up):
-            if self._batch_callable is None:
+            if self._actor_callable is None:
                 warm_up()
             else:
                 ensure_synchronous_udf_result(warm_up())
@@ -634,28 +638,69 @@ class UDFExecutor:
             args = args.rename_columns(self._input_names)
         return args
 
-    def _iter_map_batches_output_tables(self, result: Any) -> Iterable[pa.Table]:
-        if result is None:
+    def _init_materialized_output(self, payload: dict[str, Any]) -> None:
+        from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype, materialized_output_schema
+
+        self._materialized_schema: pa.Schema | None = None
+        self._materialized_output_is_canonical = False
+        try:
+            schema = materialized_output_schema(payload)
+        except (TypeError, ValueError):
+            # Richer types keep the existing Arrow output contract.
             return
+        if not any(isinstance(field.type, pa.FixedShapeTensorType) for field in schema):
+            return
+        self._materialized_schema = schema
+        try:
+            types = self._file_contract.output_types
+            self._materialized_output_is_canonical = len(types) == len(schema) and all(
+                dtype is None or field.type.equals(_arrow_type_from_duckdb_pytype(dtype))
+                for field, dtype in zip(schema, types, strict=True)
+            )
+        except (TypeError, ValueError):
+            pass
+
+    def _iter_map_batches_output_tables(self, result: Any) -> Iterable[pa.Table]:
+        import numpy as np
+
+        from vane.execution.udf_output_schema import columns_to_output_table
 
         try:
-            tables = _iter_output_tables(result)
-            for table in tables:
-                if table is not None:
-                    if self._batch_callable is not None and self._batch_callable.output_is_canonical:
-                        self._file_contract.validate_output_table(table)
-                        yield table
+            for batch in _iter_output_batches(result):
+                canonical = False
+                if isinstance(batch, dict):
+                    schema = self._materialized_schema
+                    # Multidimensional NumPy columns previously could not be
+                    # passed to pa.table. Add typed encoding for these outputs
+                    # without changing inference/casts for existing dictionaries
+                    # or treating user-created Arrow as canonical storage.
+                    if (
+                        schema is not None
+                        and any(isinstance(value, np.ndarray) and value.ndim > 1 for value in batch.values())
+                        and all(isinstance(value, (list, tuple, np.ndarray)) for value in batch.values())
+                    ):
+                        table = columns_to_output_table(
+                            batch, schema, udf_name=str(self._payload.get("udf_name") or "<UDF>")
+                        )
+                        canonical = self._materialized_output_is_canonical
                     else:
-                        yield self._file_contract.normalize_output_table(table)
-            return
+                        table = pa.table(batch)
+                else:
+                    table = batch
+                if canonical:
+                    self._file_contract.validate_output_table(table)
+                    yield table
+                else:
+                    yield self._file_contract.normalize_output_table(table)
         except TypeError as exc:
             raise TypeError(
-                f"map_batches UDF must return pa.Table or Iterator[pa.Table], got {type(result)}: {exc}"
+                f"map_batches UDF must return pa.Table, RecordBatch, dict or an iterator of batches, "
+                f"got {type(result)}: {exc}"
             ) from exc
 
     def _invoke_map_batch(self, batch: pa.Table) -> Any:
-        if self._batch_callable is not None:
-            return self._batch_callable(self._map_fn, batch)
+        if self._actor_callable is not None:
+            return self._actor_callable(self._map_fn, batch)
         return ensure_synchronous_udf_result(self._map_fn(batch))
 
     def _coerce_row_preserving_batch_output(self, result: Any, expected_rows: int) -> pa.Table:
@@ -759,7 +804,7 @@ class UDFExecutor:
         table UDFs. The normal submit()/take_ready_result() path remains queue based and
         only returns after the callable finishes.
         """
-        if self._batch_callable is not None and (self._closed or self._close_started):
+        if self._closed or self._close_started:
             raise RuntimeError("UDF executor is closing or closed")
         args = _ensure_table(args)
         if args.num_rows == 0:
@@ -1033,8 +1078,8 @@ class UDFExecutor:
         """
         if self._closed:
             return
-        if self._batch_callable is not None:
-            self._batch_callable.check_owner()
+        if self._actor_callable is not None:
+            self._actor_callable.check_owner()
         self._close_started = True
         close_errors: list[tuple[str, BaseException]] = []
         try:
@@ -1046,7 +1091,7 @@ class UDFExecutor:
             try:
                 vane_close_fn = getattr(map_fn, "_vane_close", None)
                 if callable(vane_close_fn):
-                    if self._batch_callable is None:
+                    if self._actor_callable is None:
                         vane_close_fn()
                     else:
                         ensure_synchronous_udf_result(vane_close_fn())
@@ -1067,11 +1112,11 @@ class UDFExecutor:
                     close_errors.append(("async_runtime", error))
                 else:
                     self._async_runtime = None
-        if self._batch_callable is not None:
+        if self._actor_callable is not None:
             try:
-                self._batch_callable.close()
+                self._actor_callable.close()
             except BaseException as error:
-                close_errors.append(("batch_worker", error))
+                close_errors.append(("actor_worker", error))
         if close_errors:
             details = "; ".join(f"{stage}={_bounded_close_error(error)}" for stage, error in close_errors)
             message = bounded_utf8_text(
