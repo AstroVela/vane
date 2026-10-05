@@ -10,7 +10,6 @@ import uuid
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 from PIL import Image
 from ultralytics import YOLO
 from video_kernels import (
@@ -20,7 +19,6 @@ from video_kernels import (
 )
 
 import vane
-from vane._image import _image_arrow_scalar_to_numpy
 from vane.datasource import DataSource, read_datasource
 from vane.datasource.video_reader import VideoFrameSource
 
@@ -41,14 +39,6 @@ FRAME_WIDTH = 640
 VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 YOLO_MODEL = "yolo11n.pt"
 
-FEATURE_ARROW_TYPE = pa.struct(
-    [
-        ("label", pa.int64()),
-        ("confidence", pa.float64()),
-        ("bbox", pa.list_(pa.float64())),
-    ]
-)
-FEATURE_LIST_ARROW_TYPE = pa.list_(FEATURE_ARROW_TYPE)
 FRAME_TYPE = vane.tensor_type(vane.sqltypes.UTINYINT, (FRAME_HEIGHT, FRAME_WIDTH, 3))
 FEATURE_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])")
 FEATURE_LIST_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])[]")
@@ -82,35 +72,19 @@ class PythonVideoFrameSource(DataSource):
         return self.source.get_tasks()
 
 
-def _frame_batch(column) -> np.ndarray:
-    if isinstance(column, pa.ChunkedArray):
-        column = column.combine_chunks()
-    if column.null_count:
-        raise ValueError("Video frames cannot contain NULL values")
-    if isinstance(column, pa.FixedShapeTensorArray):
-        batch = column.to_numpy_ndarray()
-    elif isinstance(column, pa.ExtensionArray) and column.type.extension_name == "vane.image":
-        # Current VideoFrameSource exposes IMAGE. Read its Arrow pixel buffers
-        # in Python and preserve the legacy uint8 tensor boundary for YOLO/crop.
-        arrow_type = column.type
-        dtype = (
-            vane.image_type(arrow_type.mode, arrow_type.height, arrow_type.width)
-            if arrow_type.height is not None
-            else vane.image_type(arrow_type.mode)
-            if arrow_type.mode is not None
-            else vane.image_type()
-        )
-        batch = (
-            np.stack([_image_arrow_scalar_to_numpy(value, dtype) for value in column])
-            if len(column)
-            else np.empty((0, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-        )
-    else:
-        raise TypeError(f"Expected IMAGE or fixed-shape tensor frames, got {column.type}")
-    expected = (len(column), FRAME_HEIGHT, FRAME_WIDTH, 3)
-    if batch.shape != expected or batch.dtype != np.uint8:
-        raise ValueError(f"Unexpected frame batch: shape={batch.shape}, dtype={batch.dtype}")
-    return np.ascontiguousarray(batch)
+def _frame_batch(frames: np.ndarray) -> np.ndarray:
+    """Check the model's RGB/size contract after framework batch conversion."""
+    if frames.ndim == 1 and frames.dtype == object:
+        for frame in frames:
+            if frame is None:
+                raise ValueError("Video frames cannot contain NULL values")
+            if frame.shape != (FRAME_HEIGHT, FRAME_WIDTH, 3) or frame.dtype != np.uint8:
+                raise ValueError(f"Unexpected frame: shape={frame.shape}, dtype={frame.dtype}")
+        return frames
+    expected = (len(frames), FRAME_HEIGHT, FRAME_WIDTH, 3)
+    if frames.shape != expected or frames.dtype != np.uint8:
+        raise ValueError(f"Unexpected frame batch: shape={frames.shape}, dtype={frames.dtype}")
+    return frames
 
 
 def _feature_field(feature, name: str):
@@ -125,33 +99,28 @@ class YOLODetector:
         self.model = YOLO(YOLO_MODEL)
         self.model.to("cuda")
 
-    def __call__(self, table):
-        frame_indices = table.column("frame_index").to_pylist()
-        frame_column = table.column("frame")
-        frames = _frame_batch(frame_column)
-        tensor = frames_to_torch_tensor(frames, None)
-        results = self.model(tensor, verbose=False)
-        features = [yolo_result_to_features(result) for result in results]
-        return pa.table(
-            {
-                "frame_index": pa.array(frame_indices, type=pa.int64()),
-                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
-                "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
-            }
-        )
+    def __call__(self, batch):
+        frames = _frame_batch(batch["frame"])
+        features = np.empty(len(frames), dtype=object)
+        if len(frames):
+            tensor = frames_to_torch_tensor(frames, None)
+            results = self.model(tensor, verbose=False)
+            for index, result in zip(range(len(frames)), results, strict=True):
+                features[index] = yolo_result_to_features(result)
+        return {"frame_index": batch["frame_index"], "frame": frames, "features": features}
 
 
-def _crop_objects(table):
-    frame_indices = table.column("frame_index").to_pylist()
-    features = table.column("features").to_pylist()
-    frames = _frame_batch(table.column("frame"))
+def _crop_objects(batch):
+    frame_indices = batch["frame_index"]
+    features = batch["features"]
+    frames = _frame_batch(batch["frame"])
 
     output_indices = []
     output_features = []
     output_objects = []
     png_buffer = io.BytesIO()
     for index, frame_features in enumerate(features):
-        if not frame_features:
+        if frame_features is None or frame_features is np.ma.masked or len(frame_features) == 0:
             continue
         image = Image.fromarray(frames[index])
         for feature in frame_features:
@@ -166,13 +135,11 @@ def _crop_objects(table):
                 )
             )
 
-    return pa.table(
-        {
-            "frame_index": pa.array(output_indices, type=pa.int64()),
-            "features": pa.array(output_features, type=FEATURE_ARROW_TYPE),
-            "object": pa.array(output_objects, type=pa.binary()),
-        }
-    )
+    return {
+        "frame_index": np.asarray(output_indices, dtype=np.int64),
+        "features": np.asarray(output_features, dtype=object),
+        "object": np.asarray(output_objects, dtype=object),
+    }
 
 
 def main() -> None:
@@ -199,6 +166,7 @@ def main() -> None:
                 "frame": FRAME_TYPE,
                 "features": FEATURE_LIST_TYPE,
             },
+            batch_format="numpy",
             batch_size=BATCH_SIZE,
             actor_number=NUM_GPU_NODES,
             gpus=1.0,
@@ -210,6 +178,7 @@ def main() -> None:
                 "features": FEATURE_TYPE,
                 "object": vane.sqltypes.BLOB,
             },
+            batch_format="numpy",
         )
         rel.write_parquet(
             str(OUTPUT_DIR),
