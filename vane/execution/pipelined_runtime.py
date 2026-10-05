@@ -20,6 +20,7 @@ from vane.execution.query_options import DistributedMode, FteOptions, QueryExecu
 from vane.execution.query_runtime import QueryContext, QueryRuntime
 from vane.execution.resource_demand import MemoryDemand, ResourceDemand
 from vane.execution.submission import prepare_ray_query
+from vane.execution.worker_resources import WorkerResourceManager, pipelined_demand, worker_capacity
 
 
 def _get(reference: Any, context: QueryContext | None = None, timeout: float = 30) -> Any:
@@ -99,6 +100,7 @@ class PipelinedContext(QueryContext):
 class WorkerPool:
     def __init__(self, resources: RayResources) -> None:
         self.resources = resources
+        self.admission = WorkerResourceManager(worker_capacity(resources), resources.worker_count)
         self.lock = threading.Lock()
         self.workers: list[Any] = []
         self.epochs: list[str] = []
@@ -146,6 +148,7 @@ class WorkerPool:
 
         with self.lock:
             self.closed = True
+            self.admission.close()
             if ray.is_initialized():
                 for worker in self.workers:
                     ray.kill(worker, no_restart=True)
@@ -207,6 +210,7 @@ class PipelinedScheduler:
         self.failure = ""
         self.schema: Any = None
         self.result_endpoint: dict[str, str] = {}
+        self.reservation = f"pipelined/{spec.query_id}"
 
     def prepare(self) -> None:
         import ray
@@ -224,6 +228,13 @@ class PipelinedScheduler:
         ).remote(resources)
         self.relay_epoch = _get(self.relay.describe.remote(), self.context)
         assignments, routes = placement(self.spec, self.pool.epochs, self.relay_epoch)
+        demands = {
+            index: pipelined_demand(resources, index, [t for t, host in assignments.items() if host == index], routes)
+            for index in sorted(set(assignments.values()))
+        }
+        self.pool.admission.acquire(
+            self.reservation, self.spec.query_id, demands, self.context.check, self.spec.options.admission_timeout
+        )
         client_epoch = uuid.uuid4().hex
         ticket = DirectTicket(
             self.spec.query_id,
@@ -373,6 +384,7 @@ class PipelinedScheduler:
                 return
             self.failure = self.failure or reason
             self.stop.set()
+            self.pool.admission.cancel_waiting(self.spec.query_id)
             if self.client is not None:
                 self.client.cancel(reason)
             if not ray.is_initialized():
@@ -381,6 +393,34 @@ class PipelinedScheduler:
                 self.pool.workers[index].cancel.remote(self.pool.epochs[index], self.spec.query_id, reason)
             if self.relay is not None:
                 self.relay.cancel.remote(reason)
+
+    def diagnostics(self) -> dict[str, Any]:
+        calls: dict[int, Any] = {}
+        workers: dict[int, Any] = {}
+        with self.lock:
+            if not self.closed:
+                for index in sorted(self.prepared):
+                    try:
+                        calls[index] = self.pool.workers[index].status.remote(
+                            self.pool.epochs[index], self.spec.query_id
+                        )
+                    except Exception as error:
+                        workers[index] = {"unavailable": str(error)}
+        deadline = time.monotonic() + 2
+        for index, reference in calls.items():
+            try:
+                workers[index] = _get(reference, timeout=max(0.001, deadline - time.monotonic()))
+            except Exception as error:
+                # Diagnostics are observational; a delayed or lost probe must
+                # never change a query's execution outcome.
+                workers[index] = {"unavailable": str(error)}
+        return {
+            "mode": "pipelined",
+            "workers": workers,
+            "result_channel": self.channel.snapshot() if self.channel is not None else None,
+            "resources": self.pool.admission.snapshot(),
+            "cleanup_complete": self.closed,
+        }
 
     def close(self) -> None:
         import ray
@@ -397,6 +437,7 @@ class PipelinedScheduler:
             if self.client is not None:
                 self.client.close()
             if not ray.is_initialized():
+                self.pool.admission.release(self.reservation)
                 self.closed = True
                 return
             # Do not release a reservation before its prepare call has settled.
@@ -425,6 +466,7 @@ class PipelinedScheduler:
                     ray.kill(self.relay, no_restart=True)
             if errors:
                 raise RuntimeError("worker release failed; retry result.close()") from errors[0]
+            self.pool.admission.release(self.reservation)
             self.closed = True
 
 
@@ -459,6 +501,9 @@ class RayQueryRuntime(QueryRuntime):
             if name not in self.stores:
                 self.stores[name] = StorePool(config)
             return self.stores[name]
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        return {**super().resource_snapshot(), "workers": self.pool.admission.snapshot()}
 
     def submit(
         self,

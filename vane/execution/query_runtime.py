@@ -71,11 +71,29 @@ class QueryContext:
         self._read_native: Callable[[], Any] | None = None
         self._close_native: Callable[[bool], None] | None = None
         self._guard_native: Callable[[], None] | None = None
+        self._execution_diagnostics: dict[str, Any] = {"mode": runtime.backend}
 
     @property
     def state(self) -> str:
         with self._lock:
             return self._state
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            reader = self._reader
+            value: dict[str, Any] = {
+                "query_id": self.query_id,
+                "execution_state": self._state,
+                "cleanup": {
+                    "native_closed": self._native_closed,
+                    "cursor_retired": self._cursor_retired,
+                    "complete": self._done,
+                },
+            }
+        probe = getattr(reader, "diagnostics", None)
+        value["execution"] = probe() if probe is not None else self._execution_diagnostics
+        value["session_resources"] = self._runtime.resource_snapshot()
+        return value
 
     def begin(self) -> QueryResult:
         def reserve() -> None:
@@ -218,6 +236,12 @@ class QueryContext:
                 self._close_native(False)
             if self._reader is not None:
                 self._reader.close()
+                probe = getattr(self._reader, "diagnostics", None)
+                if probe is not None:
+                    try:
+                        self._execution_diagnostics = probe()
+                    except Exception as error:
+                        self._execution_diagnostics = {"unavailable": str(error)}
             self._reader = None
             self._read_native = None
             self._native_closed = True

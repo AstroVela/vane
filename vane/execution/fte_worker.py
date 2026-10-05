@@ -38,6 +38,7 @@ class MaterializedAttempt:
         self.service: Any = None
         self.readers: list[Any] = []
         self.writers: dict[str, Any] = {}
+        self.channels: dict[str, Any] = {}
         self.thread: threading.Thread | None = None
         self.watchdog: threading.Thread | None = None
         self.stop = threading.Event()
@@ -92,6 +93,7 @@ class MaterializedAttempt:
                         raise ValueError("input object belongs to another query namespace")
                     producer = f"{port}/{index}"
                     channel = _channel(obj.output.schema, self.resources, producer, token.task_id)
+                    self.channels[f"input/{producer}"] = channel
                     self.readers.append(
                         native.MaterializedIO.read(
                             str(self.reservation.store.path(obj.key)),
@@ -106,6 +108,7 @@ class MaterializedAttempt:
             outputs: dict[str, list[Any]] = {}
             for output in self.reservation.objects:
                 channel = _channel(output.output.schema, self.resources, token.task_id, "store")
+                self.channels[f"output/{output.key}"] = channel
                 self.writers[output.key] = native.MaterializedIO.write(
                     str(self.reservation.store.path(output.key)),
                     channel,
@@ -209,7 +212,14 @@ class MaterializedAttempt:
             if sealed
             else None
         )
-        return {"error": error, "sealed": bool(sealed), "manifest": manifest.to_dict() if manifest else None}
+        return {
+            "error": error,
+            "sealed": bool(sealed),
+            "manifest": manifest.to_dict() if manifest else None,
+            "tasks": self.service.diagnostics() if self.service is not None else [],
+            "channels": {key: c.snapshot() for key, c in tuple(self.channels.items())},
+            "cleanup_complete": self.closed,
+        }
 
     def cancel(self, reason: str) -> None:
         if self.closed:

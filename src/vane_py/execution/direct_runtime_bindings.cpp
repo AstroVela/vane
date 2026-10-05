@@ -447,6 +447,28 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 		         }
 		         return result;
 	         })
+	    .def("diagnostics",
+	         [](DirectTaskService &service) {
+		         TaskEntry entry;
+		         vector<DirectTaskStatus> values;
+		         {
+			         py::gil_scoped_release release;
+			         values = service.Diagnostics();
+		         }
+		         py::list result;
+		         for (auto &value : values) {
+			         py::dict item;
+			         item["task_id"] = value.task_id;
+			         item["state"] = value.state;
+			         item["error"] = value.error;
+			         item["released"] = value.released;
+			         item["blocked_on"] = value.blocked_on;
+			         item["builds_total"] = value.builds_total;
+			         item["builds_ready"] = value.builds_ready;
+			         result.append(std::move(item));
+		         }
+		         return result;
+	         })
 	    .def("production_status", [](DirectTaskService &service) {
 		    TaskEntry entry;
 		    DirectProducerStatus status;

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "direct_exchange.hpp"
+#include "exchange_types.hpp"
+#include "frame_vector.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector_buffer.hpp"
@@ -10,104 +12,14 @@
 
 namespace duckdb {
 namespace vane_execution {
-namespace {
-
-idx_t AddSize(idx_t left, idx_t right) {
-	if (right > NumericLimits<idx_t>::Maximum() - left) {
-		throw InvalidInputException("direct frame size overflow");
-	}
-	return left + right;
-}
-
-idx_t Align(idx_t size) {
-	return AddSize(size, 7) & ~idx_t(7);
-}
-
-struct FrameColumn {
-	idx_t validity;
-	idx_t values;
-};
-
-// Measure before allocating. The input is owned by the native operator while
-// blocked; no staging copy or string Value allocation is needed for sizing.
-idx_t Measure(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count,
-              vector<FrameColumn> *columns = nullptr) {
-	if (!count || offset > rows.size() || count > rows.size() - offset) {
-		throw InvalidInputException("invalid direct frame row selection");
-	}
-	for (idx_t row = offset; row < offset + count; row++) {
-		if (rows[row] >= input.size()) {
-			throw InvalidInputException("direct frame row selection is out of bounds");
-		}
-	}
-	idx_t size = 0;
-	for (auto &column : input.data) {
-		FrameColumn layout;
-		layout.validity = Align(size);
-		layout.values = layout.validity + ValidityMask::ValidityMaskSize(count);
-		size = AddSize(layout.values, count * GetTypeIdSize(column.GetType().InternalType()));
-		if (column.GetType().id() == LogicalTypeId::VARCHAR) {
-			UnifiedVectorFormat data;
-			column.ToUnifiedFormat(input.size(), data);
-			auto strings = UnifiedVectorFormat::GetData<string_t>(data);
-			for (idx_t row = offset; row < offset + count; row++) {
-				auto index = data.sel->get_index(rows[row]);
-				if (data.validity.RowIsValid(index) && !strings[index].IsInlined()) {
-					size = AddSize(size, strings[index].GetSize());
-				}
-			}
-		}
-		if (columns) {
-			columns->push_back(layout);
-		}
-	}
-	return size;
-}
-
-class LeaseBuffer : public VectorBuffer {
-public:
-	explicit LeaseBuffer(shared_ptr<DirectBatch> batch_p)
-	    : VectorBuffer(VectorBufferType::OPAQUE_BUFFER), batch(std::move(batch_p)) {
-	}
-	shared_ptr<DirectBatch> batch;
-};
-
-} // namespace
-
 struct DirectFrame {
 	DirectFrame(shared_ptr<DirectLedger> ledger_p, DataChunk &input, const vector<idx_t> &rows, idx_t offset,
 	            idx_t count_p)
 	    : ledger(std::move(ledger_p)), types(input.GetTypes()), count(count_p) {
-		bytes = Measure(input, rows, offset, count, &columns);
+		bytes = Measure(input, rows, offset, count, NumericLimits<idx_t>::Maximum() - 1);
 		buffer = Allocator::DefaultAllocator().Allocate(bytes);
 		memset(buffer.get(), 0, bytes);
-		for (idx_t col = 0; col < types.size(); col++) {
-			UnifiedVectorFormat source;
-			input.data[col].ToUnifiedFormat(input.size(), source);
-			auto &layout = columns[col];
-			ValidityMask validity(reinterpret_cast<validity_t *>(buffer.get() + layout.validity), count);
-			auto width = GetTypeIdSize(types[col].InternalType());
-			auto values = buffer.get() + layout.values;
-			auto string_data = values + width * count;
-			for (idx_t row = 0; row < count; row++) {
-				auto index = source.sel->get_index(rows[offset + row]);
-				if (!source.validity.RowIsValid(index)) {
-					continue;
-				}
-				validity.SetValid(row);
-				if (types[col].id() == LogicalTypeId::VARCHAR) {
-					auto value = UnifiedVectorFormat::GetData<string_t>(source)[index];
-					if (!value.IsInlined()) {
-						memcpy(string_data, value.GetData(), value.GetSize());
-						value = string_t(reinterpret_cast<const char *>(string_data), value.GetSize());
-						string_data += value.GetSize();
-					}
-					reinterpret_cast<string_t *>(values)[row] = value;
-				} else {
-					memcpy(values + width * row, source.data + width * index, width);
-				}
-			}
-		}
+		Measure(input, rows, offset, count, bytes, &columns, buffer.get());
 		auto current = ledger->bytes.fetch_add(bytes) + bytes;
 		auto peak = ledger->peak_bytes.load();
 		while (current > peak && !ledger->peak_bytes.compare_exchange_weak(peak, current)) {
@@ -161,19 +73,9 @@ void DirectBatch::Reference(DataChunk &target) {
 		target.InitializeEmpty(frame->types);
 	}
 	for (idx_t col = 0; col < frame->types.size(); col++) {
-		auto &layout = frame->columns[col];
-		Vector view(frame->types[col], frame->buffer.get() + layout.values);
-		FlatVector::SetValidity(
-		    view, ValidityMask(reinterpret_cast<validity_t *>(frame->buffer.get() + layout.validity), frame->count));
-		auto lease = make_buffer<LeaseBuffer>(shared_from_this());
-		if (frame->types[col].id() == LogicalTypeId::VARCHAR) {
-			auto strings = make_buffer<VectorStringBuffer>();
-			strings->AddHeapReference(std::move(lease));
-			view.SetAuxiliary(std::move(strings));
-		} else {
-			view.SetAuxiliary(std::move(lease));
-		}
-		target.data[col].Reference(view);
+		auto view =
+		    ReferenceFrameVector(frame->types[col], frame->columns[col], frame->buffer.get(), shared_from_this());
+		target.data[col].Reference(*view);
 	}
 	target.SetCardinality(frame->count);
 }
@@ -188,25 +90,8 @@ DirectChannel::DirectChannel(vector<LogicalType> types_p, DirectLimits limits_p,
 	}
 	idx_t minimum_frame = 0;
 	for (auto &type : types) {
-		switch (type.id()) {
-		case LogicalTypeId::BOOLEAN:
-		case LogicalTypeId::TINYINT:
-		case LogicalTypeId::SMALLINT:
-		case LogicalTypeId::INTEGER:
-		case LogicalTypeId::BIGINT:
-		case LogicalTypeId::UTINYINT:
-		case LogicalTypeId::USMALLINT:
-		case LogicalTypeId::UINTEGER:
-		case LogicalTypeId::UBIGINT:
-		case LogicalTypeId::FLOAT:
-		case LogicalTypeId::DOUBLE:
-		case LogicalTypeId::VARCHAR:
-		case LogicalTypeId::SQLNULL:
-			break;
-		default:
-			throw InvalidInputException("unsupported direct exchange type: %s", type.ToString());
-		}
-		minimum_frame = AddSize(Align(minimum_frame), sizeof(validity_t) + GetTypeIdSize(type.InternalType()));
+		CheckExchangeType(type);
+		minimum_frame = AddSize(Align(minimum_frame), sizeof(validity_t) + FrameWidth(type));
 	}
 	if (limits.frame_bytes < minimum_frame) {
 		throw InvalidInputException("direct frame_bytes cannot hold one row of its schema");
@@ -330,7 +215,7 @@ idx_t DirectChannel::FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_
 		throw InvalidInputException("direct frame schema or row selection mismatch");
 	}
 	auto count = MinValue<idx_t>(limits.frame_rows, rows.size() - offset);
-	while (Measure(input, rows, offset, count) > limits.frame_bytes) {
+	while (Measure(input, rows, offset, count, limits.frame_bytes) > limits.frame_bytes) {
 		if (count == 1) {
 			throw InvalidInputException("one row exceeds direct frame_bytes");
 		}
@@ -344,7 +229,7 @@ DirectWrite DirectChannel::TryWrite(const string &id, idx_t sequence, DataChunk 
 	if (input.GetTypes() != types || count > limits.frame_rows) {
 		throw InvalidInputException("direct frame schema or row count mismatch");
 	}
-	auto size = Measure(input, rows, offset, count);
+	auto size = Measure(input, rows, offset, count, limits.frame_bytes);
 	if (size > limits.frame_bytes) {
 		throw InvalidInputException("direct frame exceeds frame_bytes");
 	}

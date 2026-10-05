@@ -90,7 +90,7 @@ py::dict DescribeGraph(const FragmentGraph &graph) {
 		spec["producer_fragment_id"] = exchange.producer;
 		spec["producer_port"] = "out";
 		spec["consumer_fragment_id"] = exchange.consumer;
-		spec["consumer_port"] = "in";
+		spec["consumer_port"] = exchange.consumer_port;
 		spec["distribution"] = exchange.distribution;
 		spec["partitioning"] =
 		    exchange.partitioning.empty() ? py::object(py::none()) : py::object(py::bytes(exchange.partitioning));
@@ -162,9 +162,9 @@ py::dict CompilerCapabilities(DuckDBPyConnection &connection) {
 	py::dict result;
 	result["engine_identity"] = EngineIdentity();
 	result["protocol_version"] = 1;
-	result["type_profile"] = "vane.basic-types:1";
+	result["type_profile"] = "vane.analytical-types:1";
 	result["connection_profile"] = "vane.builtin-session:1";
-	result["distributions"] = vector<string> {"gather", "hash"};
+	result["distributions"] = vector<string> {"gather", "hash", "broadcast"};
 	result["scans"] = scans;
 	return result;
 }

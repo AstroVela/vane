@@ -51,6 +51,7 @@ struct ExchangeSpec {
 	string exchange_id;
 	string producer;
 	string consumer;
+	string consumer_port = "in";
 	string distribution;
 	string partitioning;
 };

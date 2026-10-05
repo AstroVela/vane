@@ -211,6 +211,7 @@ class InProcessTaskService:
         channels = {name: channel.snapshot() for name, channel in self.channels.items()}
         return {
             "tasks": tasks,
+            "diagnostics": self.native.diagnostics(),
             "channels": channels,
             "active_contexts": sum(not task["released"] for task in tasks),
             "owned_bytes": sum(channel["bytes"] for channel in channels.values()),

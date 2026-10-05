@@ -688,3 +688,17 @@ def test_query_requires_single_read_only_select_and_auto_commit():
             connection.query("SELECT 1")
         connection.execute("ROLLBACK")
         idle(connection.query_runtime)
+
+
+def test_query_diagnostics_observe_execution_and_retain_cleanup_state():
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        with connection.query("select range as value from range(7)", rows_per_batch=2) as result:
+            before = result.diagnostics()
+            assert before["query_id"] == result.query_id
+            assert before["execution"]["mode"] == "local"
+            assert not before["cleanup"]["complete"]
+            assert result.collect().column("value").to_pylist() == list(range(7))
+            after = result.diagnostics()
+            assert after["execution_state"] == "SUCCEEDED"
+            assert all(after["cleanup"].values())
+            assert after["session_resources"]["request_admission"]["active_requests"] == 0

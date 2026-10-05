@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果，已通过 PR #963 合入 a69e60ca43d9。P4 从该合入提交切出独立的 feat/analytical-execution 分支。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -21,7 +21,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | P1.1、P1.2 均已合入 |
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
-| P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
+| P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
 | P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
@@ -218,13 +218,15 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 ## P4 分析与混跑
 
-- [ ] aggregate、hash join、broadcast、全局 LIMIT、ORDER BY/TopN。
-- [ ] BuildReady、多个消费者独立关闭及顺序语义。
-- [ ] decimal、时间和嵌套类型按 native 类型能力扩展。
-- [ ] 两种 Ray 策略共享 ResourceManager，验证小容量与公平性。
-- [ ] 查询、task、channel、预算与清理诊断。
+- [x] P4.1：COUNT/SUM/MIN/MAX 与浮点 AVG partial/final 聚合；DISTINCT、整数/decimal/时间 AVG 按完整 group 执行；FILTER 与空输入保持原生语义。
+- [x] P4.2：等值 hash join、自动小 build 广播、native BuildReady、多个消费者独立关闭。
+- [x] P4.3：全局 LIMIT/OFFSET、单根 ORDER BY、partial/final TopN 与确定排序语义。
+- [x] P4.4：decimal、时间、二进制、LIST/STRUCT/MAP/ARRAY 的 native 帧及 Flight/物化传输。
+- [x] 两种 Ray 策略共用 FIFO WorkerResourceManager；图原子准入、FTE attempt 归还与重新排队、取消和清理所有权。
+- [x] QueryResult 诊断贯通 query、task、BuildReady、channel、预算和清理；native 状态探测不等待执行锁。
+- [x] 完成全部相关验收并记录构建身份、测试数量及边界。
 
-验收：与原生 DuckDB 比较 SQL 结果，覆盖 NULL、空输入、倾斜、重复执行及 FTE 故障注入。AI/GPU UDF 独立排期，按 backend 验证生命周期及重放保证。
+验收：与原生 DuckDB 比较 SQL 结果，覆盖 NULL、空输入、倾斜、重复执行及 FTE 故障注入；资源公平性同时覆盖只有三个上下文的一 worker 混跑。AI/GPU UDF 独立排期，按 backend 验证生命周期及重放保证。不运行完整 release/fast 套件。
 
 ## P5 删除与发布
 
@@ -428,3 +430,17 @@ P2 退出条件已满足；后续 P3 已在同一 FragmentGraph、worker 身份�
 - 新增真实 Ray 回归：60 秒执行期限下的长过滤查询正常完成，2 秒期限仍抛出 RequestExecutionTimeout，结束后资源账本清空。新增用例在旧版本为 **1 failed、1 passed**；审查者的监控/无监控对照在旧版本也为 **1 failed、1 passed**。修复后监控开启和关闭均约 14.3 秒成功完成。
 - 本次相关验证共 **107 passed**：Ray pipelined 13、DirectFlight 24、QueryResult runtime 67、审查者补充用例 3。覆盖故障传播、已完成生产、取消、执行/交付期限、背压与多查询共享 worker。按要求未运行完整 release/fast 套件。
 - 修复仅修改 Python 调度和测试，已重新进行非 editable 安装；275 个 Python 源码/类型文件与 checkout 一致，native 二进制及 engine identity 没有变化。root 格式、Ruff、全仓库 mypy、适用的 pre-commit、源码版权清单、文档本地链接及 diff 检查通过。
+
+
+### P4 分析执行与混跑（2026 年 10 月 6 日）
+
+- 从 PR #963 的合入提交 `a69e60ca43d9` 切出 `feat/analytical-execution`；继续以 `integration/pipelined-execution` 为目标分支。local 仍走原生查询；两种 Ray 策略共用新的分析 FragmentGraph，没有接入旧 runner 或 fallback。
+- [native planner](src/vane_py/execution/fragment_plan.cpp) 自动生成 partial/final 聚合、等值 hash join 与小 build 广播、全局 LIMIT/OFFSET、ORDER BY 和 partial/final TopN。拆分前恢复聚合 FILTER 的输入索引，保留优化前的数据源依赖。整数/decimal/时间 AVG 在完整分组内使用原生 finalizer，覆盖大整数 AVG 精度影响过滤结果的回归。
+- [原生帧布局](src/vane_py/execution/frame_vector.hpp) 按选中行递归复制全部嵌套子向量，精确计费值缓冲；每层视图保留同一个帧 lease。NULL 列表不读取未定义 offset，超大嵌套行在分配帧前拒绝；测量临时选择向量先检查上限再预留。DirectFlight 与物化 I/O 共用扩展后的 [Arrow codec](src/vane_py/execution/arrow_frame.cpp)。
+- [WorkerResourceManager](vane/execution/worker_resources.py) 统一整图和 attempt 的原子预留与 FIFO 排队。小容量混跑测试证明后续 FTE task 不会越过已经等待的 pipelined 图；故障测试同时覆盖资源排队与 FTE 重试，保留队首 task 身份而不遗留等待项。
+- native `TaskService.diagnostics()` 通过原子状态观察 BuildReady、输入/输出等待及清理，避免等待执行锁。公开 `QueryResult.diagnostics()` 同时提供查询、task、channel、资源和清理状态，诊断失败只标记 unavailable。
+- **相关用例去重合计 808 项通过：756 个非 Ray、52 个真实 Ray。** 完整相关批次为 746 个非 Ray 和 52 个 Ray；最终 AVG 精度修正及新增 10 项用例之后，定向重跑分析编译器/通道 **142 passed**、公开 Ray 分析与故障用例 **9 passed**。覆盖与 native SQL 对照、NULL/空输入、倾斜、过滤聚合、DISTINCT、六类 join、排序/TopN、嵌套类型、重复执行、Parquet、慢消费者、取消/期限和 FTE worker 故障。按用户要求未运行完整 release/fast 套件。
+- 当前 C++ 已用 `build/python-release` 增量 Release 编译并非 editable 安装；282 个 Python 源码/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:07178bf8aa7e6049795561d19131eb719d6099fca67155b0fc3fd842b0d2c15e`。
+- 新测试已加入 release launcher 和源码包清单；root 格式、Ruff、mypy、适用的 pre-commit、源码版权清单、文档本地链接及 diff 检查通过。没有修改 DuckDB 子树或引入新依赖。验证平台为 Linux，其他平台由 CI 验证。
+
+P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PIPELINED_EXECUTION_DESIGN.md#native-编译与加载)。FTE 仍按每个对象的声明上限预留存储，多阶段分析计划需要为保留对象及重试留足 query_bytes；不会通过少计配额获得成功。下一阶段为 P5：旧路径删除、支持矩阵及发布/性能验收。

@@ -26,6 +26,7 @@ from vane.execution.pipelined_runtime import PipelinedContext, WorkerPool, _get
 from vane.execution.query_options import QueryExecutionOptions, RayExecution
 from vane.execution.resource_demand import ResourceDemand
 from vane.execution.submission import RayQuerySpec, stage_ray_query
+from vane.execution.worker_resources import materialized_demand
 
 T = TypeVar("T")
 
@@ -39,6 +40,7 @@ class RunningAttempt:
     binding: TaskBinding
     reservation: AttemptReservation
     prepare: Any = None
+    capacity_token: str = ""
 
     @property
     def key(self) -> str:
@@ -216,27 +218,40 @@ class RecoveryScheduler:
             self.context._ticket.claimed_at + self.context.options.execution_timeout
         )
 
-    def _dispatch(self, index: int, partition: int, binding: TaskBinding, upstream: dict[str, StageManifest]) -> None:
+    def _dispatch(self, index: int, partition: int, binding: TaskBinding, upstream: dict[str, StageManifest]) -> bool:
         assert self.coordinator is not None and self.lease is not None
-        with self.lock:
-            self.context.check()
-            if self.stop.is_set():
-                raise RuntimeError("query canceled before materialized task dispatch")
-            worker, epoch = self.pool.workers[index], self.pool.epochs[index]
-            reserved = self.coordinator.begin(binding.task.task_id, epoch, object_bytes=self.store.config.object_bytes)
-            attempt = RunningAttempt(index, worker, epoch, partition, binding, reserved)
-            self.active[index] = attempt
-            self.history.append(reserved.token)
-            attempt.prepare = worker.prepare_materialized.remote(
-                epoch,
-                self.spec.to_dict(),
-                binding.task.stage_id,
-                partition,
-                {name: stage.to_dict() for name, stage in upstream.items()},
-                reserved.to_dict(),
-                self.lease.to_dict(),
-                self.resources.exchange.frame_rows,
-            )
+        token = f"fte/{self.spec.query_id}/{binding.task.task_id}/{index}"
+        if not self.pool.admission.try_acquire(
+            token, self.spec.query_id, {index: materialized_demand(self.resources, binding)}
+        ):
+            return False
+        try:
+            with self.lock:
+                self.context.check()
+                if self.stop.is_set():
+                    raise RuntimeError("query canceled before materialized task dispatch")
+                worker, epoch = self.pool.workers[index], self.pool.epochs[index]
+                reserved = self.coordinator.begin(
+                    binding.task.task_id, epoch, object_bytes=self.store.config.object_bytes
+                )
+                attempt = RunningAttempt(index, worker, epoch, partition, binding, reserved, capacity_token=token)
+                self.active[index] = attempt
+                self.history.append(reserved.token)
+                attempt.prepare = worker.prepare_materialized.remote(
+                    epoch,
+                    self.spec.to_dict(),
+                    binding.task.stage_id,
+                    partition,
+                    {name: stage.to_dict() for name, stage in upstream.items()},
+                    reserved.to_dict(),
+                    self.lease.to_dict(),
+                    self.resources.exchange.frame_rows,
+                )
+            return True
+        except BaseException:
+            if index not in self.active:
+                self.pool.admission.release(token)
+            raise
 
     def _release(self, attempt: RunningAttempt) -> None:
         import ray
@@ -248,6 +263,7 @@ class RecoveryScheduler:
         with self.lock:
             if self.active.get(attempt.index) is attempt:
                 self.active.pop(attempt.index)
+            self.pool.admission.release(attempt.capacity_token)
 
     def _discard_retired(self) -> None:
         assert self.coordinator is not None
@@ -296,13 +312,21 @@ class RecoveryScheduler:
         bindings = [bind_task(self.spec, fragment, part, upstream) for part in range(fragment.partition_count)]
         self.coordinator.declare_stage(tuple(binding.task for binding in bindings))
         pending = deque(range(fragment.partition_count))
+        waiting_worker: int | None = None
         while pending or self.active:
             self.context.check()
             self._discard_retired()
             for index in range(len(self.pool.workers)):
+                if waiting_worker is not None and index != waiting_worker:
+                    continue
                 if pending and index not in self.active:
-                    partition = pending.popleft()
-                    self._dispatch(index, partition, bindings[partition], upstream)
+                    partition = pending[0]
+                    if self._dispatch(index, partition, bindings[partition], upstream):
+                        pending.popleft()
+                        waiting_worker = None
+                    else:
+                        waiting_worker = index
+                        break
             for attempt in tuple(self.active.values()):
                 self.context.check()
                 try:
@@ -316,7 +340,9 @@ class RecoveryScheduler:
                     )
                 except ray.exceptions.RayActorError as error:
                     self._retry(attempt, error)
-                    pending.appendleft(attempt.partition)
+                    # Preserve a queued admission's partition/token. Moving a
+                    # retry ahead of it would leave the old FIFO head orphaned.
+                    pending.append(attempt.partition)
                     continue
                 if status["epoch"] != attempt.epoch:
                     raise RuntimeError("materialized attempt worker epoch changed")
@@ -403,6 +429,7 @@ class RecoveryScheduler:
             if self.closed:
                 return
             self.stop.set()
+            self.pool.admission.cancel_waiting(self.context.query_id)
             if self.coordinator is not None:
                 self.coordinator.cancel(reason)
             if self.planning_connection is not None:
@@ -442,6 +469,7 @@ class RecoveryScheduler:
                         self._release(attempt)
                     else:
                         self.active.pop(attempt.index, None)
+                        self.pool.admission.release(attempt.capacity_token)
                 except BaseException as error:
                     errors.append(error)
             if self.relay is not None and ray.is_initialized():
@@ -485,3 +513,23 @@ class RecoveryScheduler:
                 "committed": self.result_manifest is not None,
                 "store": self.coordinator.snapshot() if self.coordinator is not None else None,
             }
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self.lock:
+            active = tuple(self.active.values())
+        attempts: dict[str, Any] = {}
+        for attempt in active:
+            try:
+                attempts[attempt.key] = _get(
+                    attempt.worker.materialized_status.remote(attempt.epoch, attempt.key), timeout=2
+                )
+            except Exception as error:
+                attempts[attempt.key] = {"unavailable": str(error)}
+        return {
+            "mode": "fte",
+            **self.snapshot(),
+            "attempts": attempts,
+            "result_channel": self.channel.snapshot() if self.channel is not None else None,
+            "resources": self.pool.admission.snapshot(),
+            "cleanup_complete": self.closed,
+        }

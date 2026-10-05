@@ -51,6 +51,9 @@ def execute_graph(connection, graph):
             rows = [row for task_rows in outputs[edge.producer_fragment_id] for row in task_rows]
             if edge.distribution is Distribution.GATHER:
                 inputs[0][edge.consumer_port] = rows
+            elif edge.distribution is Distribution.BROADCAST:
+                for target in inputs:
+                    target[edge.consumer_port] = rows
             elif edge.distribution is Distribution.HASH:
                 ids = native._hash_rows_for_test(
                     connection, producer.outputs[0].schema, edge.partitioning, rows, fragment.partition_count
@@ -389,8 +392,9 @@ def test_optimized_parquet_dependencies_do_not_create_scan_tasks(connection, tmp
     fragment = graph.fragments[0]
     assert fragment.partition_count == 1
     assert not fragment.sources
-    assert len(fragment.source_dependencies) == 1
-    assert fragment.required_capabilities == (fragment.source_dependencies[0].capability,)
+    dependencies = [source for f in graph.fragments for source in f.source_dependencies]
+    assert len(dependencies) == 1
+    assert graph.fragments[-1].required_capabilities == (dependencies[0].capability,)
     transported = FragmentGraph.from_dict(
         json.loads(json.dumps(graph.to_dict())), expected_engine_identity=native.engine_identity()
     )
@@ -430,11 +434,10 @@ def test_native_local_query_does_not_enter_fragment_compiler(connection, monkeyp
         "select 1; select 2",
         "select random()",
         "select nextval('must_not_exist')",
-        "select sum(range) from range(10)",
-        "select * from range(10) order by range",
-        "select * from range(10) limit 1",
-        "select * from range(2) a join range(3) b on a.range = b.range",
-        "select 1.2::DECIMAL(8, 2)",
+        "select row_number() over () from range(10)",
+        "select median(range) from range(10)",
+        "select * from range(2) a join range(3) b on a.range < b.range",
+        "select 1::UUID",
         "select $1",
     ],
 )
@@ -465,8 +468,8 @@ def test_unbound_or_unknown_ports_cannot_execute_as_empty_input(connection):
     with pytest.raises(vane.InvalidInputException, match="missing fragment input"):
         native._execute_fragment_for_test(connection, root.native_plan, {}, {})
     with pytest.raises(vane.InvalidInputException, match="unexpected fragment input"):
-        native._execute_fragment_for_test(connection, root.native_plan, {"in": [], "unknown": []}, {})
-    assert native._execute_fragment_for_test(connection, root.native_plan, {"in": []}, {}) == []
+        native._execute_fragment_for_test(connection, root.native_plan, {root.inputs[0].port_id: [], "unknown": []}, {})
+    assert native._execute_fragment_for_test(connection, root.native_plan, {root.inputs[0].port_id: []}, {}) == []
 
 
 def test_source_assignments_are_explicit_and_validate_split_identity(connection):
