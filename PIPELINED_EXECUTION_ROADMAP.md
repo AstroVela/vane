@@ -196,6 +196,16 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 已增量 Release 构建；281 个 Python/类型文件与最终 checkout 一致，native 与构建产物 SHA-256 一致。root 格式、适用 pre-commit（含 mypy）、源码版权清单和 diff 检查通过。仅运行上述相关测试，未运行完整 release/fast 套件；本轮验证平台为 Linux。
 
+### PR #963 生成文件名列修复
+
+- FTE 在优化前同时检查虚拟 filename ID 和 MultiFileBindData.reader_bind.filename_idx，拒绝 `filename=true` 与自定义名称的生成列引用。投影、星号展开、仅用于过滤和之后被统计信息剪枝的引用都明确报错；未引用生成列的扫描继续支持。
+- 原生文件剪枝使用 filename 选项指定的实际列名，避免启用自定义生成列时误把真实物理 filename 列替换成文件路径。真实 filename/origin 列继续支持投影和过滤，local 与 Ray pipelined 保留生成列语义。
+- 新增 26 项长期回归，覆盖优化器启用/禁用、两种 Parquet 入口、物理列与自定义生成列并存，以及真实 Ray 中编译失败后的配额和快照清理、后续查询及 pipelined 对照。
+
+最终非 editable 安装上共 **385 passed**：文件冻结 64、native 编译/提交描述 295、普通 Parquet 16、CSV 文件名列对照 1、真实 Ray 定向用例 6，以及审查者提供的 3 条复现。审查复现修复前均失败，新增的两条物理列剪枝回归也验证了修复前失败。仅运行上述相关测试，未运行完整 release/fast 套件。
+
+已完成增量 Release 构建；281 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `c205cae1b6:fragment:2a5322a87d904c4d62808269f81d5e8f91ac5ae94e23a25682cc0e437db7b806`。root/DuckDB 格式检查、适用 pre-commit、源码版权清单和 diff 检查通过；本轮验证平台为 Linux。
+
 ## P4 分析与混跑
 
 - [ ] aggregate、hash join、broadcast、全局 LIMIT、ORDER BY/TopN。

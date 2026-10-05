@@ -109,11 +109,62 @@ def test_virtual_filename_is_rejected_but_physical_column_is_preserved(tmp_path)
     path = tmp_path / "source.parquet"
     with vane.connect(backend="local") as connection:
         connection.execute(f"copy (select 1 as value) to '{path}'")
-        with pytest.raises(Exception, match="virtual filename"):
+        with pytest.raises(vane.NotImplementedException, match="generated filename"):
             stage(connection, f"select filename from read_parquet('{path}')", tmp_path / "virtual")
         connection.execute(f"copy (select 'original' as filename) to '{path}' (overwrite true)")
         spec, _ = stage(connection, f"select filename from read_parquet('{path}')", tmp_path / "physical")
     assert run(spec) == [("original",)]
+
+
+@pytest.mark.parametrize(("option", "column"), [("true", "filename"), ("'origin'", "origin")])
+@pytest.mark.parametrize("reference", ["projection", "star", "filter", "pruned_filter"])
+@pytest.mark.parametrize("optimizer", [True, False])
+def test_explicit_generated_filename_is_rejected_before_optimization(tmp_path, option, column, reference, optimizer):
+    path = tmp_path / "input.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        if not optimizer:
+            connection.execute("pragma disable_optimizer")
+        scan = f"read_parquet('{path}', filename={option})"
+        if reference == "projection":
+            sql = f"select {column} as provenance from {scan}"
+            expected = [(str(path),)]
+        elif reference == "star":
+            sql = f"select * from {scan}"
+            expected = [(42, str(path))]
+        else:
+            sql = f"select value from {scan} where {column} = '{path}'"
+            expected = [(42,)]
+            if reference == "pruned_filter":
+                sql += " and value > 100"
+                expected = []
+        assert connection.execute(sql).fetchall() == expected
+        with pytest.raises(vane.NotImplementedException, match="generated filename"):
+            stage(connection, sql, tmp_path / "snapshots")
+
+
+@pytest.mark.parametrize(("option", "column"), [("true", "filename"), ("'origin'", "origin")])
+def test_unreferenced_generated_filename_does_not_prevent_fte(tmp_path, option, column):
+    path = tmp_path / "input.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        # EXCLUDE also exercises the binding of an ordinary-index generated
+        # column without requesting its values from the scan.
+        sql = f"select * exclude ({column}) from parquet_scan('{path}', filename={option}) where value = 42"
+        spec, _ = stage(connection, sql, tmp_path / "snapshots")
+    assert run(spec) == [(42,)]
+
+
+@pytest.mark.parametrize("column", ["filename", "origin"])
+@pytest.mark.parametrize("option", ["false", "'source_path'"])
+def test_physical_filename_columns_remain_filterable(tmp_path, column, option):
+    path = tmp_path / "input.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value, '{path}' as {column}) to '{path}'")
+        sql = f"select value, {column} from parquet_scan('{path}', filename={option}) where {column} = '{path}'"
+        expected = connection.execute(sql).fetchall()
+        spec, _ = stage(connection, sql, tmp_path / "snapshots")
+    assert run(spec) == expected == [(42, str(path))]
 
 
 def test_staging_does_not_evaluate_implicit_side_effects(tmp_path):

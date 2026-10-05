@@ -491,7 +491,7 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 [file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制、核对源文件两次 SHA-256 与元数据，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
 
-冻结路径编码从原始文件引用解析出的 Hive 分区键和值；解析发生在任何路径规范化之前。虚拟 filename 与 file_index 列明确拒绝，物理同名列正常保留。冻结发生在统计信息剪枝之前，被优化成 EMPTY_RESULT 的 scan 仍保留 source dependency。`vane.parquet-snapshot:1` split 携带冻结文件 SHA-256/长度，worker prepare/start 校验内容与精确文件状态。原文件覆盖、删除或 glob 新增成员不改变重试输入；冻结副本缺失/损坏则失败。
+冻结路径编码从原始文件引用解析出的 Hive 分区键和值；解析发生在任何路径规范化之前。FTE 在优化前按绑定列 ID 拒绝对生成 filename 列的引用，包括虚拟列以及 `filename=true`、`filename='origin'` 创建的普通索引列；仅在过滤中引用或之后被剪枝也拒绝。虚拟 file_index 同样拒绝，真实物理同名列和未引用生成 filename 的扫描仍可使用。local 与 Ray pipelined 保留生成 filename 的原始路径语义。冻结发生在统计信息剪枝之前，被优化成 EMPTY_RESULT 的 scan 仍保留 source dependency。`vane.parquet-snapshot:1` split 携带冻结文件 SHA-256/长度，worker prepare/start 校验内容与精确文件状态。原文件覆盖、删除或 glob 新增成员不改变重试输入；冻结副本缺失/损坏则失败。
 
 展开后的文件通过 scan 的原生 dependency 作为确定文件列表交给 Binder，校验与路径参数逐项一致后构造 SimpleMultiFileList；冻结路径中的 `*`、`?`、`[]` 不再作为 glob 解释。普通查询仍按原规则展开路径。快照目标由解析后的物理源路径哈希、原始引用的 Hive 分区键值和固定文件名组成。Hive 键值直接使用原生 HivePartitioning::Parse 的首次键优先及编码规则，例如 `part=42/../` 仍表示分区 42。同一物理文件、相同分区键值的别名复用副本并保留重复扫描；不同分区值保留独立副本并分别计费。symlink/`..` 解析到不同物理文件时也不会误合并。
 

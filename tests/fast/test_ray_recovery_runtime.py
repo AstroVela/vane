@@ -215,6 +215,30 @@ def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_pa
         assert_idle(connection)
 
 
+@pytest.mark.parametrize(("option", "column"), [("true", "filename"), ("'origin'", "origin")])
+def test_generated_filename_rejection_releases_fte_resources_and_preserves_pipelined(tmp_path, option, column):
+    path = tmp_path / "input.parquet"
+    with vane.connect(backend="local") as local:
+        local.execute(f"copy (select 42 as value) to '{path}'")
+    scan = f"parquet_scan('{path}', filename={option})"
+    queries = (
+        (f"select {column} as provenance from {scan}", [{"provenance": str(path)}]),
+        (f"select value from {scan} where {column} = '{path}'", [{"value": 42}]),
+    )
+    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+        for sql, expected in queries:
+            with pytest.raises(vane.NotImplementedException, match="generated filename"):
+                connection.query(sql, options=options())
+            assert_idle(connection)
+            assert not list((tmp_path / "store").rglob("*.parquet"))
+            assert connection.query(sql).collect().to_pylist() == expected
+            assert_idle(connection)
+        # The same FTE session can still execute a query that does not request
+        # the generated path, after both failed submissions have been cleaned.
+        assert connection.query(f"select value from {scan}", options=options()).collect().to_pylist() == [{"value": 42}]
+        assert_idle(connection)
+
+
 def test_native_hash_stages_and_fixed_inputs(tmp_path, monkeypatch):
     from vane.execution import recovery_runtime
     from vane.execution.compiler import FragmentCompileOptions

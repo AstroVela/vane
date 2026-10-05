@@ -309,9 +309,14 @@ public:
 			// Validate before filter pushdown can remove a filter-only virtual column.
 			CheckScanColumns(get.function.name, get.GetColumnIds());
 			if (frozen_files && IsParquetScan(get.function.name)) {
+				auto &filename_idx = get.bind_data->Cast<MultiFileBindData>().reader_bind.filename_idx;
 				for (auto &column : get.GetColumnIds()) {
-					if (column.GetPrimaryIndex() == MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
-						throw NotImplementedException("FTE snapshots do not support the virtual filename column");
+					auto column_id = column.GetPrimaryIndex();
+					// Explicit filename options add an ordinary-index generated column.
+					// Use its bound identity so real columns with the same name remain supported.
+					if (column_id == MultiFileReader::COLUMN_IDENTIFIER_FILENAME ||
+					    (filename_idx.IsValid() && column_id == filename_idx.GetIndex())) {
+						throw NotImplementedException("FTE snapshots do not support generated filename columns");
 					}
 				}
 			}

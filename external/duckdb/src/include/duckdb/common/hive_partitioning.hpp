@@ -26,6 +26,7 @@ struct HivePartitioningFilterInfo {
 	unordered_map<string, column_t> column_map;
 	bool hive_enabled;
 	bool filename_enabled;
+	string filename_column;
 };
 
 class HivePartitioning {
