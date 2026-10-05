@@ -116,7 +116,9 @@ def test_cancel_timeout_retains_executor_until_completion_callback_finishes(
                     assert (executor._actor_pool if actor else executor._task_pool) is pool
                     with pool.admission_slots._lock:
                         assert len(pool.admission_slots._active_slots) == 1
-                    assert manager.snapshot()["allocated_bytes"] > 0
+                    # Cancellation releases published chunks while the pending
+                    # terminal callback still owns task and request admission.
+                    assert manager.snapshot()["allocated_bytes"] == 0
                     state = runtime.resource_snapshot()["request_admission"]
                     assert state["running_requests"] == state["cleanup_pending_requests"] == 1
                     # Both native shutdown and explicit retries must observe
