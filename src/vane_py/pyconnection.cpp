@@ -930,9 +930,17 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
 }
 
+static vector<string> ReadFileSystemNames(DuckDBPyConnection &connection) {
+	// ExtractSubSystem moves a pointer shared by registry snapshots. Copy
+	// names under the writer lock, releasing the GIL before waiting for it.
+	py::gil_scoped_release release;
+	std::lock_guard<std::recursive_mutex> connection_guard(connection.py_connection_lock);
+	lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
+	return connection.con.GetDatabase().GetFileSystem().ListSubSystems();
+}
+
 py::list DuckDBPyConnection::ListFilesystems() {
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
+	auto subsystems = ReadFileSystemNames(*this);
 	py::list names;
 	for (auto &name : subsystems) {
 		names.append(py::str(name));
@@ -991,8 +999,7 @@ py::list DuckDBPyConnection::ExtractStatements(const string &query) {
 }
 
 bool DuckDBPyConnection::FileSystemIsRegistered(const string &name) {
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
+	auto subsystems = ReadFileSystemNames(*this);
 	return std::find(subsystems.begin(), subsystems.end(), name) != subsystems.end();
 }
 
