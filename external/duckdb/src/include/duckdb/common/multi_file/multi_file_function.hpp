@@ -181,7 +181,7 @@ public:
 		auto multi_file_reader = MultiFileReader::Create(input.table_function);
 
 		auto glob_input = multi_file_reader->GetGlobInput(*interface);
-		auto file_list = multi_file_reader->CreateFileList(context, input.inputs[0], glob_input);
+		auto file_list = multi_file_reader->CreateFileList(context, input, glob_input);
 
 		interface->InitializeInterface(context, *multi_file_reader, *file_list);
 

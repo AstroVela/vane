@@ -3,13 +3,16 @@
 
 """Storage quota and locks remain owned until actual I/O cleanup succeeds."""
 
+import shutil
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from vane import IOException
 from vane._native import execution_runtime as native
-from vane.execution.fte_store import ActiveStoreLease, ExchangeStore, StorePool
+from vane.execution.fte_store import ActiveStoreLease, ExchangeStore, StorePool, replace_metadata
 
 
 def pool(tmp_path, **changes):
@@ -147,3 +150,59 @@ def test_replaced_query_directory_is_rejected_before_creating_an_allocation(tmp_
         store.reserve("query")
     assert list(foreign.iterdir()) == []
     assert store.snapshot()["queries"] == 0
+
+
+@pytest.mark.parametrize("failure", ["lock", "partial_delete", "allocation_delete"])
+def test_orphan_cleanup_failure_is_isolated_charged_and_retried(tmp_path, monkeypatch, failure):
+    store = pool(tmp_path, capacity_bytes=3 * 2048)
+    blocked, removable = store.reserve("blocked"), store.reserve("removable")
+    blocked_record = store.allocations / f"{blocked.value['namespace']}.json"
+    for lease in (blocked, removable):
+        record = store.allocations / f"{lease.value['namespace']}.json"
+        replace_metadata(record, {**lease.value, "expires": time.time() - 1})
+        lease.guard.close()
+    live = extra = None
+    try:
+        acquire, rmtree, unlink = native.StoreGuard.acquire, shutil.rmtree, Path.unlink
+
+        def fail_lock(path, exclusive, create):
+            if Path(path).parent == blocked.directory:
+                raise IOException("orphan lock unavailable")
+            return acquire(path, exclusive, create)
+
+        def fail_partial_delete(path, *args, **kwargs):
+            if Path(path) == blocked.directory:
+                (blocked.directory / "lease.lock").unlink(missing_ok=True)
+                raise PermissionError("orphan deletion denied")
+            return rmtree(path, *args, **kwargs)
+
+        def fail_allocation_delete(path, *args, **kwargs):
+            if path == blocked_record:
+                raise PermissionError("orphan allocation deletion denied")
+            return unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            if failure == "lock":
+                patch.setattr(native.StoreGuard, "acquire", fail_lock)
+            elif failure == "partial_delete":
+                patch.setattr(shutil, "rmtree", fail_partial_delete)
+            else:
+                patch.setattr(Path, "unlink", fail_allocation_delete)
+            store.collect_expired()
+            assert not removable.directory.exists()
+            assert blocked_record.exists()
+            assert store.snapshot() == {"queries": 1, "reserved_bytes": 2048}
+            # Admission retries cleanup, but retained quota cannot be reused.
+            live, extra = store.reserve("live"), store.reserve("extra")
+            live.renew()
+            with pytest.raises(RuntimeError, match="capacity"):
+                store.reserve("full")
+        store.collect_expired()
+        assert not blocked.directory.exists()
+        assert not blocked_record.exists()
+        assert store.snapshot() == {"queries": 2, "reserved_bytes": 4096}
+    finally:
+        for lease in (blocked, removable, live, extra):
+            if lease is not None:
+                lease.close(lambda: None)
+    assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}

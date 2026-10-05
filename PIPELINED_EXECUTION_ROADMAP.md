@@ -165,13 +165,25 @@ P3.1 本地相关验证为 **283 passed**：物化 I/O/提交 56、DirectExchang
 
 ### P3 完整验收
 
-本地分组运行受影响测试，共 **685 passed**：物化交换/提交 56、文件冻结 17、存储租约/配额 8、配置与放置 13、native 编译/提交描述 295、查询配置 45、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray FTE 24、真实 Ray pipelined 13。仅运行相关测试，未运行完整 release/fast 套件。
+P3 初版（`6097810`）分组运行受影响测试，共 **685 passed**：物化交换/提交 56、文件冻结 17、存储租约/配额 8、配置与放置 13、native 编译/提交描述 295、查询配置 45、DirectExchange 123、DirectFlight 24、QueryResult 67、真实 Ray FTE 24、真实 Ray pipelined 13。仅运行相关测试，未运行完整 release/fast 套件。
 
 真实 Ray 验收覆盖上游/下游 worker 丢失、提交后计算节点退出、重试耗尽、退避与原执行期限、原文件变更、HASH 阶段、空结果、取消和交付期限、已提交输入损坏/丢失、ResultService 丢失、两种策略并发与共享准入、独立于 native pump 的状态探测、三种 manifest 发布的确认丢失，以及真实 native worker 的租约过期和 orphan 清理。测试同时核对无重复行、固定输入身份、新 epoch/fence 及结束后的资源账本。
 
 C++ 已增量 Release 构建并非 editable 安装；281 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `346ef5b69e:fragment:39b1018536dc95747a225e38632714a553a2a550a6cfddb6a026a911a708b244`。root 格式、适用 pre-commit（含全仓库 mypy）、源码版权清单、文档本地链接及源码包检查通过。新增物化交换、文件冻结、存储和真实 Ray 恢复测试已加入 release launcher 与 sdist 清单；原有旧 FTE 测试保留到 P5 迁移阶段。
 
 P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、调度公平性和诊断扩展。本地验证平台为 Linux；macOS/Windows 构建与运行仍由 CI 验证。
+
+### PR #963 审查修复
+
+- 冻结文件通过原生 scan dependency 作为确定列表绑定，保留顺序及重复引用；路径中的通配符不再展开，子查询复制和 union_by_name 也使用同一列表。
+- 按实际快照目标去重，`./` 与普通父目录别名只复制、计费一次，扫描仍返回重复引用的行。目标同时包含解析后的源路径哈希，避免 symlink/`..` 将不同文件合并；原 Hive 目录结构保留。
+- orphan 加锁或删除 I/O 失败按目录隔离，保留外部 allocation 和配额，继续清理其他目录并允许有剩余容量的查询准入。后续回收重试；当前查询续租和存储校验错误仍正常传播。
+
+新增 18 项长期回归，覆盖文件名/目录/存储前缀中的通配符、相邻快照目录、嵌套子查询、路径别名的字节计费、symlink 父目录遍历、native 锁失败、部分删除、allocation 删除失败，以及真实 Ray 心跳和新查询准入。
+
+本轮仅运行相关测试，共 **435 passed**：文件冻结 31、存储租约 11、native 编译/提交描述 295、物化交换 56、普通 Parquet 14、真实 Ray 恢复 25，以及审查者提供的 3 条复现（修复前均失败，修复后均通过）。未运行完整 release/fast 套件。
+
+已增量 Release 构建、非 editable 安装；281 个 Python/类型文件及 native 构建产物一致性检查通过。当前 engine identity 为 `b4a4a5b19d:fragment:5b6fc20c60dd8a909ed06793a52f5e36d5721f4de09731f92eb5a89903db1760`。root/DuckDB 格式检查、适用 pre-commit（含 mypy）、源码版权清单与 diff 检查通过；本轮验证平台为 Linux。
 
 ## P4 分析与混跑
 

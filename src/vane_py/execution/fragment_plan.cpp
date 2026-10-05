@@ -541,7 +541,6 @@ void FilePatterns(ParsedExpression &expression, vector<string> &patterns, bool a
 
 void StageFileArguments(ClientContext &context, SelectStatement &select, const string &directory, idx_t budget,
                         unordered_map<string, FrozenFile> &frozen, idx_t &used) {
-	unordered_map<string, FrozenFile> originals;
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    *select.node, [](unique_ptr<ParsedExpression> &) {},
 	    [&](TableRef &ref) {
@@ -565,6 +564,7 @@ void StageFileArguments(ClientContext &context, SelectStatement &select, const s
 			    throw InvalidInputException("FTE source pattern count exceeds limit");
 		    }
 		    vector<Value> paths;
+		    vector<OpenFileInfo> files;
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    for (auto &pattern : patterns) {
 			    if (!fs.IsPathAbsolute(pattern)) {
@@ -574,20 +574,22 @@ void StageFileArguments(ClientContext &context, SelectStatement &select, const s
 				    if (paths.size() >= 4096) {
 					    throw InvalidInputException("FTE source file reference count exceeds limit");
 				    }
-				    auto existing = originals.find(file.path);
-				    if (existing == originals.end()) {
-					    if (originals.size() >= 4096) {
+				    auto target = FrozenFilePath(context, file.path, directory);
+				    auto existing = frozen.find(target);
+				    if (existing == frozen.end()) {
+					    if (frozen.size() >= 4096) {
 						    throw InvalidInputException("FTE source file count exceeds limit");
 					    }
-					    auto snapshot = FreezeFile(context, file.path, directory, budget - used);
+					    auto snapshot = FreezeFile(context, file.path, target, budget - used);
 					    used += snapshot.bytes;
-					    frozen.emplace(snapshot.path, snapshot);
-					    existing = originals.emplace(file.path, std::move(snapshot)).first;
+					    existing = frozen.emplace(target, std::move(snapshot)).first;
 				    }
 				    paths.push_back(Value(existing->second.path));
+				    files.emplace_back(existing->second.path);
 			    }
 		    }
 		    function.children[0] = make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths)));
+		    MultiFileReader::SetFileList(ref.Cast<TableFunctionRef>(), std::move(files));
 	    });
 }
 

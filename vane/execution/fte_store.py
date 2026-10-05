@@ -171,6 +171,7 @@ class StorePool:
         return result
 
     def _collect(self) -> None:
+        from vane import IOException
         from vane._native import execution_runtime as native
 
         self.store.descriptor.check()
@@ -181,16 +182,21 @@ class StorePool:
             if value["expires"] > time.time():
                 continue
             directory = self.root / "queries" / value["namespace"]
-            if directory.resolve() != directory:
-                raise ValueError("query directory contains a symlink")
             guard = None
             try:
+                if directory.resolve() != directory:
+                    raise ValueError("query directory contains a symlink")
                 if directory.exists():
                     guard = native.StoreGuard.acquire(str(directory / "lease.lock"), True, True)
                     if guard is None:
                         continue
                     shutil.rmtree(directory)
                 record.unlink()
+            except (OSError, IOException):
+                # A failed orphan cleanup must not fail another query's
+                # heartbeat or admission. Keep its external allocation (and
+                # quota) until a later collection can complete the deletion.
+                continue
             finally:
                 if guard is not None:
                     guard.close()

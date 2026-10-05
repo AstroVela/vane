@@ -17,7 +17,8 @@ struct FrozenFile {
 
 // Copy before binding/optimization. Files remain owned by the query store,
 // including partial copies on failure, until its cleanup succeeds.
-FrozenFile FreezeFile(ClientContext &context, const string &source, const string &directory, idx_t remaining);
+string FrozenFilePath(ClientContext &context, const string &source, const string &directory);
+FrozenFile FreezeFile(ClientContext &context, const string &source, const string &destination, idx_t remaining);
 string FileFingerprint(ClientContext &context, const OpenFileInfo &source);
 
 // Open-description locks, not POSIX process-associated record locks: closing

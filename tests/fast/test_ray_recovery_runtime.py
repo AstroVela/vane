@@ -87,6 +87,51 @@ def test_fte_options_and_pipelined_share_one_session_pool(tmp_path):
         assert_idle(connection)
 
 
+def test_failed_orphan_cleanup_preserves_live_result_and_new_admission(tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+    from threading import Event
+
+    from vane.execution.fte_store import replace_metadata
+
+    with vane.connect(backend="ray", execution="fte", resources=resources(tmp_path)) as connection:
+        result = connection.query("select 42 as value")
+        store = result.context._reader.store
+        orphan = None
+        try:
+            deadline = time.monotonic() + 10
+            while not result.context.production_done:
+                result.context.check()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            orphan = store.reserve("unrelated-orphan")
+            (orphan.directory / "object.mat").write_bytes(b"orphan")
+            attempted = Event()
+            rmtree = shutil.rmtree
+
+            def fail_orphan(path, *args, **kwargs):
+                if Path(path) == orphan.directory:
+                    attempted.set()
+                    raise PermissionError("unrelated orphan deletion denied")
+                return rmtree(path, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(shutil, "rmtree", fail_orphan)
+                record = store.allocations / f"{orphan.value['namespace']}.json"
+                replace_metadata(record, {**orphan.value, "expires": time.time() - 1})
+                orphan.guard.close()
+                assert attempted.wait(5), "heartbeat did not attempt orphan cleanup"
+                assert result.collect().column("value").to_pylist() == [42]
+                assert connection.query("select 7 as value").collect().column("value").to_pylist() == [7]
+                assert store.snapshot() == {"queries": 1, "reserved_bytes": store.config.query_bytes}
+            store.collect_expired()
+            assert_idle(connection)
+        finally:
+            close_result(result)
+            if orphan is not None:
+                orphan.close(lambda: None)
+
+
 @pytest.mark.parametrize("predicate", ["", " where value > 10"])
 def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_path, predicate):
     path = tmp_path / "input.parquet"

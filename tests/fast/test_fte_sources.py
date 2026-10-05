@@ -201,3 +201,68 @@ def test_repeated_globs_cannot_bypass_the_file_reference_limit(tmp_path):
         paths = ",".join([f"'{tmp_path}/*.parquet'"] * 2050)
         with pytest.raises(Exception, match="reference count exceeds limit"):
             stage(connection, f"select * from read_parquet([{paths}])", tmp_path / "snapshots")
+
+
+@pytest.mark.parametrize("marker", ["*", "?", "[x]"])
+@pytest.mark.parametrize("location", ["filename", "directory", "store"])
+def test_frozen_paths_with_glob_characters_are_bound_as_exact_files(tmp_path, marker, location):
+    if os.name == "nt" and marker in {"*", "?"}:
+        pytest.skip("Windows filenames cannot contain '*' or '?'")
+    source = tmp_path / "input"
+    source.mkdir()
+    snapshots = tmp_path / (f"store{marker}" if location == "store" else "store")
+    with vane.connect(backend="local") as connection:
+        for suffix, value in ((marker, 1), ("x", 2)):
+            directory = source / (f"part={suffix}" if location == "directory" else "files")
+            directory.mkdir(exist_ok=True)
+            path = directory / f"data{suffix if location == 'filename' else value}.parquet"
+            connection.execute(f"copy (select {value} as value) to '{path}'")
+        sql = f"select value from read_parquet('{source}/*/data*.parquet')"
+        expected = connection.execute(sql).fetchall()
+        if location == "store":
+            # A neighboring store matches the literal wildcard characters in
+            # this query's root. Binding must not discover those older copies.
+            stage(connection, sql, tmp_path / "storex")
+        spec, _ = stage(connection, sql, snapshots)
+    assert sorted(run(spec)) == sorted(expected) == [(1,), (2,)]
+
+
+@pytest.mark.parametrize("wrapper", ["select * from ({scan}) t", "select * from (select * from ({scan}) t) u"])
+def test_exact_file_binding_survives_nested_table_references(tmp_path, wrapper):
+    path = tmp_path / "data[x].parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        scan = f"select value from read_parquet('{tmp_path}/data*.parquet', union_by_name=true)"
+        spec, _ = stage(connection, wrapper.format(scan=scan), tmp_path / "store")
+    assert run(spec) == [(42,)]
+
+
+@pytest.mark.parametrize("alias", ["./", "child/../"])
+def test_path_aliases_share_snapshot_bytes_but_keep_scan_references(tmp_path, alias):
+    path = tmp_path / "data.parquet"
+    (tmp_path / "child").mkdir()
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        sql = f"select * from read_parquet(['{path}', '{tmp_path}/{alias}data.parquet'])"
+        expected = connection.execute(sql).fetchall()
+        spec, used = stage(connection, sql, tmp_path / "store", budget=path.stat().st_size)
+    assert used == path.stat().st_size
+    assert len(list((tmp_path / "store").rglob("*.parquet"))) == 1
+    assert run(spec) == expected == [(42,), (42,)]
+
+
+def test_symlink_parent_traversal_does_not_merge_different_sources(tmp_path):
+    other = tmp_path / "other"
+    (other / "child").mkdir(parents=True)
+    try:
+        (tmp_path / "link").symlink_to(other / "child", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    with vane.connect(backend="local") as connection:
+        for directory, value in ((tmp_path, 1), (other, 2)):
+            connection.execute(f"copy (select {value} as value) to '{directory / 'data.parquet'}'")
+        sql = f"select * from read_parquet(['{tmp_path}/data.parquet', '{tmp_path}/link/../data.parquet'])"
+        expected = connection.execute(sql).fetchall()
+        spec, used = stage(connection, sql, tmp_path / "store")
+    assert used == sum((p / "data.parquet").stat().st_size for p in (tmp_path, other))
+    assert sorted(run(spec)) == sorted(expected) == [(1,), (2,)]

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -18,6 +24,8 @@
 
 namespace duckdb {
 class TableFunction;
+class TableFunctionRef;
+struct TableFunctionBindInput;
 class TableFunctionSet;
 class TableFilterSet;
 class LogicalGet;
@@ -71,6 +79,13 @@ public:
 	//! Shorthand for ParsePaths + CreateFileList
 	DUCKDB_API shared_ptr<MultiFileList>
 	CreateFileList(ClientContext &context, const Value &input,
+	               const FileGlobInput &glob_input = FileGlobOptions::DISALLOW_EMPTY);
+	//! Attach an already expanded file list to this scan, preserving order and repeated references.
+	//! The attachment survives TableRef copies and is checked against the bound path argument.
+	DUCKDB_API static void SetFileList(TableFunctionRef &ref, vector<OpenFileInfo> files);
+	//! Use an attached exact file list when present, otherwise expand the path argument normally.
+	DUCKDB_API shared_ptr<MultiFileList>
+	CreateFileList(ClientContext &context, TableFunctionBindInput &input,
 	               const FileGlobInput &glob_input = FileGlobOptions::DISALLOW_EMPTY);
 
 	//! Parse the named parameters of a multi-file reader

@@ -13,6 +13,8 @@
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/external_dependencies.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/common/multi_file/multi_file_column_mapper.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -140,6 +142,46 @@ shared_ptr<MultiFileList> MultiFileReader::CreateFileList(ClientContext &context
                                                           const FileGlobInput &glob_input) {
 	auto paths = ParsePaths(input);
 	return CreateFileList(context, paths, glob_input);
+}
+
+namespace {
+class FileListDependency : public DependencyItem {
+public:
+	explicit FileListDependency(vector<OpenFileInfo> files_p) : files(std::move(files_p)) {
+	}
+	const vector<OpenFileInfo> files;
+};
+const char *const FILE_LIST_DEPENDENCY = "multi_file_reader_files";
+} // namespace
+
+void MultiFileReader::SetFileList(TableFunctionRef &ref, vector<OpenFileInfo> files) {
+	if (!ref.external_dependency) {
+		ref.external_dependency = make_shared_ptr<ExternalDependency>();
+	}
+	ref.external_dependency->AddDependency(FILE_LIST_DEPENDENCY, make_shared_ptr<FileListDependency>(std::move(files)));
+}
+
+shared_ptr<MultiFileList> MultiFileReader::CreateFileList(ClientContext &context, TableFunctionBindInput &input,
+                                                          const FileGlobInput &glob_input) {
+	auto dependency =
+	    input.ref.external_dependency ? input.ref.external_dependency->GetDependency(FILE_LIST_DEPENDENCY) : nullptr;
+	if (!dependency) {
+		return CreateFileList(context, input.inputs[0], glob_input);
+	}
+	auto &files = dependency->Cast<FileListDependency>().files;
+	auto paths = ParsePaths(input.inputs[0]);
+	if (paths.size() != files.size()) {
+		throw InternalException("attached file list does not match scan paths");
+	}
+	for (idx_t i = 0; i < paths.size(); i++) {
+		if (paths[i] != files[i].path) {
+			throw InternalException("attached file list does not match scan paths");
+		}
+	}
+	if (files.empty() && glob_input.behavior != FileGlobOptions::ALLOW_EMPTY) {
+		throw IOException("%s needs at least one file to read", function_name);
+	}
+	return make_shared_ptr<SimpleMultiFileList>(files);
 }
 
 bool MultiFileReader::ParseOption(const string &key, const Value &val, MultiFileOptions &options,

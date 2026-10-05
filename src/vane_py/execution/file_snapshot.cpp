@@ -78,20 +78,29 @@ string FileFingerprint(ClientContext &context, const OpenFileInfo &source) {
 	return Fingerprint(context, *file, nullptr, 1ULL << 40);
 }
 
-FrozenFile FreezeFile(ClientContext &context, const string &source, const string &directory, idx_t remaining) {
+string FrozenFilePath(ClientContext &context, const string &source, const string &directory) {
 	namespace paths = std::filesystem;
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (!fs.IsPathAbsolute(source) || !fs.IsPathAbsolute(directory) || directory.find('=') != string::npos) {
 		throw InvalidInputException("FTE snapshot paths must be absolute; the store prefix cannot contain '='");
 	}
-	auto input = fs.OpenFile(source, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
-	CheckFile(*input);
 	auto original = paths::u8path(source).lexically_normal();
 	auto root = paths::u8path(directory).lexically_normal();
-	Hash root_hash;
-	auto drive = UTF8Path(original.root_path());
-	root_hash.AddBytes(reinterpret_cast<const_data_ptr_t>(drive.data()), drive.size());
-	auto destination = root / Finish(root_hash) / original.relative_path();
+	// Resolving before normalization distinguishes symlink/../file from a
+	// different file with the same lexical path. Keep the reference's directory
+	// layout below this namespace so Hive keys retain their original meaning.
+	Hash source_hash;
+	auto identity = UTF8Path(paths::weakly_canonical(paths::u8path(source)));
+	source_hash.AddBytes(reinterpret_cast<const_data_ptr_t>(identity.data()), identity.size());
+	return UTF8Path(root / Finish(source_hash) / original.relative_path());
+}
+
+FrozenFile FreezeFile(ClientContext &context, const string &source, const string &target, idx_t remaining) {
+	namespace paths = std::filesystem;
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto input = fs.OpenFile(source, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
+	CheckFile(*input);
+	auto destination = paths::u8path(target);
 	// Preserve original hive key=value directories, without introducing new
 	// partition keys. Filename virtual columns are rejected during validation.
 	if (paths::weakly_canonical(destination) != destination) {
