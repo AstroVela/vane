@@ -15,11 +15,17 @@
 
 using namespace vane_fs;
 namespace {
+// The mount's exclusive branch lease routes every live mutation through this
+// kernel, which invalidates its entries/attributes on mutations. Snapshots are
+// immutable. Out-of-band writers would require explicit cache invalidation.
+constexpr double METADATA_TIMEOUT = 60.0;
+
 struct Mount {
 	Workspace workspace;
 	std::shared_ptr<Session> session;
 	std::string database;
 	bool readonly;
+	fuse_session *fuse = nullptr;
 	uid_t uid = getuid();
 	gid_t gid = getgid();
 	std::map<uint64_t, std::vector<std::pair<std::string, FileStat>>> directories;
@@ -113,7 +119,9 @@ fuse_entry_param Entry(Mount &mount, const FileStat &stat) {
 	result.ino = stat.inode;
 	result.generation = 1; // Inode IDs are never reused.
 	result.attr = Describe(mount, stat);
-	return result; // Zero timeouts avoid stale namespace/attribute caches.
+	result.entry_timeout = METADATA_TIMEOUT;
+	result.attr_timeout = METADATA_TIMEOUT;
+	return result;
 }
 void ReplyEntry(fuse_req_t request, const FileStat &stat) {
 	auto &mount = Context(request);
@@ -125,6 +133,14 @@ void ConfigureHandle(Mount &mount, fuse_file_info *info, int64_t inode) {
 	info->fh = inode;
 	info->direct_io = !mount.readonly;
 	info->keep_cache = mount.readonly;
+}
+void InvalidateAttributes(Mount &mount, int64_t inode) {
+	// Linux invalidates size/mtime after writes, but our atime aliases mtime.
+	// Invalidate all attributes before replying, including for statx(ATIME).
+	// An attributes-only notification has no dirty pages to flush or wait for.
+	auto error = fuse_lowlevel_notify_inval_inode(mount.fuse, inode, -1, 0);
+	if (error && error != -ENOENT)
+		throw Error(ErrorCode::Storage, "Could not invalidate inode attributes: " + std::to_string(-error));
 }
 fuse_lowlevel_ops Operations() {
 	fuse_lowlevel_ops ops {};
@@ -146,7 +162,7 @@ fuse_lowlevel_ops Operations() {
 	ops.getattr = [](fuse_req_t req, fuse_ino_t inode, fuse_file_info *) {
 		Guard(req, [&] {
 			auto stat = Describe(Context(req), Context(req).session->StatInode(inode));
-			fuse_reply_attr(req, &stat, 0);
+			fuse_reply_attr(req, &stat, METADATA_TIMEOUT);
 		});
 	};
 	ops.open = [](fuse_req_t req, fuse_ino_t inode, fuse_file_info *info) {
@@ -155,6 +171,13 @@ fuse_lowlevel_ops Operations() {
 			if ((info->flags & O_ACCMODE) != O_RDONLY || (info->flags & O_TRUNC))
 				Mutable(mount);
 			mount.session->OpenInode(inode, false, info->flags & O_TRUNC);
+			try {
+				if (info->flags & O_TRUNC)
+					InvalidateAttributes(mount, inode);
+			} catch (...) {
+				Close(mount, inode, 1);
+				throw;
+			}
 			ConfigureHandle(mount, info, inode);
 			if (fuse_reply_open(req, info) < 0)
 				Close(mount, inode, 1);
@@ -191,6 +214,7 @@ fuse_lowlevel_ops Operations() {
 			auto &mount = Context(req);
 			Mutable(mount);
 			mount.session->WriteInode(info->fh, std::string(buffer, size), offset, info->flags & O_APPEND);
+			InvalidateAttributes(mount, info->fh);
 			fuse_reply_write(req, size);
 		});
 	};
@@ -323,7 +347,7 @@ fuse_lowlevel_ops Operations() {
 			}
 			mount.session->SetAttributes("", mode, modified, inode, size);
 			auto stat = Describe(mount, mount.session->StatInode(inode));
-			fuse_reply_attr(req, &stat, 0);
+			fuse_reply_attr(req, &stat, METADATA_TIMEOUT);
 		});
 	};
 	// synchronous=FULL commits finish before write/setattr replies.
@@ -405,6 +429,7 @@ int main(int argc, char **argv) {
 		fuse.session = fuse_session_new(&fuse.args, &operations, sizeof(operations), &mount);
 		if (!fuse.session)
 			throw std::runtime_error("Could not create FUSE session");
+		mount.fuse = fuse.session;
 		if (fuse_set_signal_handlers(fuse.session) != 0)
 			throw std::runtime_error("Could not install FUSE signal handlers");
 		fuse.signals = true;

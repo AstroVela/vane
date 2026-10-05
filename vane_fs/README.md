@@ -98,10 +98,16 @@ writeback is disabled, and `fsync` has no deferred application data to flush.
 
 A writable mount exclusively leases its branch. Other connections may read
 it, but writes, fork, snapshot, merge and deletion involving that branch require
-unmounting first. Other branches and existing snapshots remain usable. Live
-mounts use direct I/O and zero namespace/attribute timeouts; read-only snapshot
-mounts can retain immutable file data in the kernel cache. Requests currently
-run through one native dispatch loop and one SQLite connection.
+unmounting first. Other branches and existing snapshots remain usable. Positive
+directory entries and attributes have a 60-second kernel cache timeout. All live
+mutations go through this mount, so Linux invalidates the affected cached
+metadata as part of each operation. Writes and O_TRUNC also send an explicit
+attribute invalidation to preserve the atime/mtime alias, including for statx
+queries that request only atime. Missing entries are not cached. Live mounts
+still use direct I/O; read-only snapshots can retain immutable file data in the
+kernel cache. Requests run through one native dispatch loop and one SQLite
+connection. Allowing future out-of-band writers would require a notification
+protocol before retaining these cache timeouts.
 
 Each open directory handle retains the sorted entry list captured at open,
 including across pagination and rewind. Removing, renaming or adding entries
@@ -393,3 +399,8 @@ before/after measurements.
 The [FUSE I/O optimization measurements](benchmarks/IO_OPTIMIZATION.md) compare
 the prepared-statement and block-range changes against the previous core using
 the same 64 MiB workloads, with unchanged FULL durability and live-mount caching.
+
+The subsequent [metadata cache measurements](benchmarks/METADATA_OPTIMIZATION.md)
+record stat, directory and Git workloads after enabling kernel metadata caching
+under the exclusive mount lease, including invalidation checks and an I/O
+regression comparison.

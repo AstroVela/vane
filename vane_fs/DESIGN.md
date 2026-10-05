@@ -256,11 +256,21 @@ mount is released, so snapshots and merges cannot capture transient orphans.
 Existing snapshots and other branches remain usable. The optional fsspec
 adapter's handles refer to immutable, pinned snapshots.
 
-Mutable mounts disable kernel writeback and data caching, use zero attribute
-and entry timeouts, and commit every mutation with SQLite `synchronous=FULL`.
-Read-only snapshot mounts may cache immutable bytes. Each mount currently uses
-one dispatch loop and one SQLite connection. The supported POSIX subset and
-metadata limitations are listed in [the usage guide](README.md#native-commands-and-linux-mounts).
+Mutable mounts disable kernel writeback and data caching and commit every
+mutation with SQLite `synchronous=FULL`. Positive directory entries and inode
+attributes use a 60-second kernel timeout. The exclusive lease keeps all live
+mutations on this mount; Linux's mutation paths invalidate affected metadata.
+The [libfuse guidance](https://github.com/libfuse/libfuse/blob/fuse-3.14.0/include/fuse_common.h)
+supports attribute caching when all changes go through the kernel.
+Missing entries are not cached. Writes and O_TRUNC additionally invalidate all
+inode attributes before replying: Linux's size/mtime invalidation alone does
+not cover VaneFS's atime alias when statx requests only atime. These notifications
+invalidate attributes only, without flushing or invalidating file data. Future
+out-of-band writers must add invalidation notifications before sharing a branch
+with a cached mount. Read-only snapshots may also cache immutable file bytes.
+Each mount currently uses one dispatch loop and one SQLite connection. The
+supported POSIX subset and metadata limitations are listed in
+[the usage guide](README.md#native-commands-and-linux-mounts).
 
 Directory cookies index a fixed entry list owned by each `opendir` handle.
 `readdir` uses that list for the handle's lifetime, including rewinds, so a

@@ -5,6 +5,7 @@ import errno
 import os
 import shutil
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -176,6 +177,129 @@ def test_live_handles_observe_other_writes_and_atomic_append(tmp_path):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(append, range(4)))
             assert sorted(path.read_text().splitlines()) == sorted(f"{i}:{j}" for i in range(4) for j in range(30))
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_warm_stat_reuses_kernel_metadata_without_new_lookups(tmp_path, readonly):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.mkdir("/dir")
+        branch.write_file("/dir/file", b"content")
+        selector, identity = ("snapshot", workspace.snapshot()) if readonly else ("branch", "main")
+        with mount_workspace(tmp_path, database, selector, identity) as (point, _):
+            path = point / "dir/file"
+            expected = path.stat()
+            log = tmp_path / f"{point.name}.log"
+            before = log.stat().st_size
+            for _ in range(100):
+                actual = path.stat()
+                assert (actual.st_ino, actual.st_size, actual.st_mtime_ns) == (
+                    expected.st_ino,
+                    expected.st_size,
+                    expected.st_mtime_ns,
+                )
+            output = log.read_bytes()[before:]
+            assert b"opcode: LOOKUP" not in output
+            assert b"opcode: GETATTR" not in output
+            if readonly:
+                branch.write_file("/dir/file", b"a different live file")
+                assert path.stat().st_size == len(b"content")
+
+
+def test_cached_metadata_observes_other_process_mutations_immediately(tmp_path):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.mkdir("/dir")
+        branch.write_file("/dir/file", b"before")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            path = point / "dir/file"
+            descriptor = os.open(path, os.O_RDONLY)
+
+            def mutate(program):
+                # Warm both path and descriptor attributes before every change.
+                path.stat()
+                os.fstat(descriptor)
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        "import os,sys; from pathlib import Path; "
+                        "root=Path(sys.argv[1]); path=root/'dir/file'; " + program,
+                        str(point),
+                    ],
+                    check=True,
+                    timeout=10,
+                )
+
+            def current():
+                expected = branch.stat("/dir/file")
+                for actual in (path.stat(), os.fstat(descriptor)):
+                    assert (actual.st_size, actual.st_mode & 0o777, actual.st_mtime_ns) == (
+                        expected.size,
+                        expected.mode,
+                        expected.mtime_ns,
+                    )
+                    assert actual.st_atime_ns == actual.st_ctime_ns == actual.st_mtime_ns
+
+            try:
+                mutate("path.write_bytes(b'longer contents')")
+                current()
+                mutate("os.truncate(path, 3)")
+                current()
+                mutate("os.chmod(path, 0)")
+                current()
+                if os.geteuid() != 0:
+                    with pytest.raises(PermissionError):
+                        path.open("rb")
+                mutate("os.chmod(path, 0o640); os.utime(path, ns=(1700000000123456789,1700000000123456789))")
+                current()
+                mutate("path.open('wb').close()")
+                current()
+                missing = point / "dir/missing"
+                assert not missing.exists()
+                mutate("(root/'dir/missing').write_bytes(b'created'); os.replace(root/'dir/missing', path)")
+                assert path.read_bytes() == b"created"
+                assert path.stat().st_ino != os.fstat(descriptor).st_ino
+                assert os.fstat(descriptor).st_nlink == 0
+                assert not missing.exists()
+                parent_before = (point / "dir").stat()
+                mutate("path.unlink(); path.write_bytes(b'new inode')")
+                assert path.read_bytes() == b"new inode"
+                assert (point / "dir").stat().st_mtime_ns == branch.stat("/dir").mtime_ns
+                assert (point / "dir").stat().st_mtime_ns != parent_before.st_mtime_ns
+                assert not (point / "moved").exists()
+                mutate("(root/'dir').rename(root/'moved'); (root/'dir').mkdir()")
+                assert not path.exists()
+                assert (point / "moved/file").read_bytes() == b"new inode"
+                assert os.listdir(point / "dir") == []
+                assert os.fstat(descriptor).st_nlink == 0
+            finally:
+                os.close(descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["write", "truncate_open"])
+def test_cached_atime_alias_tracks_mtime_for_statx_atime_only(tmp_path, mutation):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.write_file("/file", b"before")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            path = point / "file"
+            os.utime(path, ns=(946684800000000000, 946684800000000000))
+            assert path.stat().st_atime_ns == 946684800000000000
+            descriptor = os.open(path, os.O_WRONLY | (os.O_TRUNC if mutation == "truncate_open" else 0))
+            try:
+                if mutation == "write":
+                    os.write(descriptor, b"new")
+                # GNU stat requests only STATX_ATIME for this format. A full
+                # stat would refresh all attributes and hide a stale alias.
+                atime = int(subprocess.check_output(["stat", "-c", "%X", str(path)], text=True, timeout=10))
+                assert atime == branch.stat("/file").mtime_ns // 1_000_000_000
+            finally:
+                os.close(descriptor)
 
 
 @pytest.mark.parametrize("mutation", ["unlink", "rename", "insert"])
