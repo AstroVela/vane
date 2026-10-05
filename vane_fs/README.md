@@ -92,13 +92,40 @@ build/core/vane-fs-mount /tmp/workspace.sqlite --snapshot "$snapshot_id" /tmp/va
 The C++ adapter uses libfuse's low-level inode interface. Kernel lookup and
 open references retain unlinked inodes; rename, replacement and unlink cannot
 retarget an existing file descriptor. The final reference release reclaims an
-orphan. Appends select the current EOF inside the write transaction. Each file
-write and namespace/attribute mutation commits with `synchronous=FULL` before
-replying; kernel writeback is disabled, and `fsync` has no deferred application
-data to flush.
+orphan. Appends select the current EOF inside the write transaction. The default
+`--durability=strict` commits each file write and namespace/attribute mutation
+with SQLite WAL `synchronous=FULL` before replying.
+
+Use `--durability=fsync` to commit ordinary mutations with `synchronous=NORMAL`.
+Each operation still commits immediately and remains visible to other handles
+and Workspace connections. A successful `fsync` or `fdatasync` performs a FULL
+commit that changes a dedicated barrier row, synchronizing all preceding WAL
+commits, including namespace changes. Directory `fsync` uses the same barrier.
+An empty transaction would not guarantee a WAL sync. `O_SYNC` and `O_DSYNC`
+writes use FULL within the write transaction. Kernel writeback remains disabled
+in both modes; no application buffer delays read visibility.
+
+```bash
+build/core/vane-fs-mount /tmp/workspace.sqlite --branch candidate /tmp/vane-fs-live --durability=fsync
+```
+
+In `fsync` mode, writes without a successful barrier can be lost after an OS
+crash or power failure. Ordinary file close is not a barrier. Clean unmount
+performs a final FULL commit; wait for the mount process to exit successfully
+to check that result. A failed barrier returns an error and can be retried;
+the connection conservatively remains at FULL until a successful synchronous
+commit. These guarantees depend on the underlying storage honoring sync.
+Snapshot mounts remain read-only and use strict mode.
+
+C++ callers can select `Workspace(path, timeout_ms, Durability::Fsync)` and call
+`Workspace::Sync()` for the same database-wide barrier. Call `Close()` explicitly
+to observe errors during final synchronization; destructors cannot report them.
+The Python Workspace API continues to use strict mode. The optional barrier
+table is compatible with existing format-2 databases and does not change file
+content storage, branch intervals, or snapshot isolation.
 
 Automatic WAL checkpoints trigger at 4,096 pages (16 MiB with default pages).
-This amortizes checkpoint syncs while each mutation retains its FULL commit.
+This amortizes checkpoint syncs in both durability modes.
 The threshold is not a WAL size limit; active readers can delay checkpoint
 progress, and closing a connection may need to complete remaining work.
 
@@ -435,3 +462,8 @@ The [directory enumeration measurements](benchmarks/DIRECTORY_OPTIMIZATION.md)
 record lazy first-read capture and batched child-inode queries, including stable
 pagination tests, SQL counts, Git results and the separate write-through
 experiment that leaves the production cache mode unchanged.
+
+The [optional fsync measurements](benchmarks/FSYNC_OPTIMIZATION.md) compare the
+strict default with immediate NORMAL commits and explicit FULL barriers. They
+include sync-failure injection, recovery from synchronized file images, actual
+write-plus-fsync timing, read regression checks and shutdown results.

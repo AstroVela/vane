@@ -666,8 +666,9 @@ public:
 	std::string uuid, owner = NewId();
 	OwnerLock owner_lock;
 	int64_t process = OwnerLock::Process();
+	const Durability durability;
 
-	explicit Database(const std::string &path, int timeout_ms) {
+	explicit Database(const std::string &path, int timeout_ms, Durability durability) : durability(durability) {
 		if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos || timeout_ms < 0) {
 			Fail(ErrorCode::Invalid, "A durable database path and nonnegative timeout are required");
 		}
@@ -698,7 +699,7 @@ public:
 				}
 			}
 			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
-			// Every mutation still synchronizes its WAL commit before returning.
+			// Strict mode also synchronizes every WAL commit before returning.
 			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
 			Exec(db, "BEGIN IMMEDIATE");
 			ValidateIdentity();
@@ -715,6 +716,8 @@ CREATE TABLE IF NOT EXISTS orphans(branch TEXT NOT NULL REFERENCES branches(id),
  PRIMARY KEY(branch,inode)) STRICT;
 CREATE INDEX IF NOT EXISTS dirent_targets ON dirent_versions(inode,low,high);
 CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload);
+CREATE TABLE IF NOT EXISTS sync_barrier(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL CHECK(value IN(0,1))) STRICT;
+INSERT OR IGNORE INTO sync_barrier VALUES(1,0);
 UPDATE format SET version=2;
 )SQL");
 			owner_lock.Create(sqlite3_db_filename(db, "main"), owner);
@@ -727,6 +730,8 @@ UPDATE format SET version=2;
 				insert.Step();
 			}
 			Exec(db, "COMMIT");
+			if (durability == Durability::Fsync)
+				Exec(db, "PRAGMA synchronous=NORMAL");
 		} catch (...) {
 			if (db) {
 				statements.Clear();
@@ -769,7 +774,9 @@ UPDATE format SET version=2;
 namespace {
 class Transaction {
 public:
-	Transaction(Database &database, bool write) : database(database), lock(database.mutex, std::defer_lock) {
+	Transaction(Database &database, bool write, bool synchronous = false)
+	    : database(database), lock(database.mutex, std::defer_lock),
+	      restore_normal(write && synchronous && database.durability == Durability::Fsync) {
 		if (database.process != OwnerLock::Process()) {
 			Fail(ErrorCode::Closed, "Reopen the workspace after fork");
 		}
@@ -777,6 +784,10 @@ public:
 		if (!database.db) {
 			Fail(ErrorCode::Closed, "Workspace is closed");
 		}
+		// SQLite requires changing synchronous outside a transaction. On failure
+		// leave FULL enabled until a subsequent successful synchronous commit.
+		if (restore_normal)
+			Exec(database.db, "PRAGMA synchronous=FULL");
 		Exec(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
 		try {
 			if (write) {
@@ -813,6 +824,8 @@ public:
 		for (const auto &pin : retired_pins) {
 			Pins().Forget(pin);
 		}
+		if (restore_normal)
+			Exec(database.db, "PRAGMA synchronous=NORMAL");
 	}
 
 private:
@@ -820,6 +833,7 @@ private:
 	std::unique_lock<std::mutex> lock;
 	std::vector<std::shared_ptr<SnapshotPin>> retired_pins;
 	bool committed = false;
+	bool restore_normal;
 };
 
 void CheckMount(sqlite3 *db, const std::string &branch, bool require_unmounted = false) {
@@ -974,11 +988,20 @@ CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(len
 	Exec(db, "PRAGMA application_id=" + std::to_string(APPLICATION_ID));
 }
 
-Workspace::Workspace(const std::string &path, int timeout_ms) : database(std::make_shared<Database>(path, timeout_ms)) {
+Workspace::Workspace(const std::string &path, int timeout_ms, Durability durability)
+    : database(std::make_shared<Database>(path, timeout_ms, durability)) {
 }
 Workspace::~Workspace() = default;
 void Workspace::Close() {
 	database->Close();
+}
+void Workspace::Sync() {
+	Transaction tx(*database, true, true);
+	// An empty transaction need not write or synchronize the WAL. Changing
+	// this page forces a FULL commit, covering every earlier WAL commit, even
+	// when another connection used NORMAL and this connection uses Strict.
+	Exec(database->db, "UPDATE sync_barrier SET value=1-value WHERE id=1");
+	tx.Commit();
 }
 std::string Workspace::Id() const {
 	return database->uuid;
@@ -1755,6 +1778,8 @@ void Database::Close() {
 	if (!db) {
 		return;
 	}
+	if (durability == Durability::Fsync)
+		Exec(db, "PRAGMA synchronous=FULL");
 	Exec(db, "BEGIN IMMEDIATE");
 	try {
 		RetireOwner(db, owner);
@@ -1965,8 +1990,8 @@ std::string Session::ReadInode(int64_t inode, int64_t offset, int64_t size) {
 	return result;
 }
 
-void Session::WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append) {
-	Transaction tx(*database, true);
+void Session::WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append, bool synchronous) {
+	Transaction tx(*database, true, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, true);
 	auto node = OpenedInode(database->db, inode, view);
 	WriteBytes(database->db, node, data, append ? node.fields[1] : offset, view);
@@ -2037,8 +2062,8 @@ int64_t ParentInode(sqlite3 *db, int64_t inode, const View &view) {
 }
 } // namespace
 
-FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate) {
-	Transaction tx(*database, !snapshot);
+FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate, bool synchronous) {
+	Transaction tx(*database, !snapshot, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, truncate);
 	auto node = OpenedInode(database->db, inode, view);
 	if (bool(node.fields[0]) != directory)
@@ -2074,8 +2099,8 @@ FileStat Session::LookupInode(int64_t parent, const std::string &name) {
 }
 
 FileStat Session::CreateNode(int64_t parent, const std::string &name, bool directory, int64_t mode, bool exclusive,
-                             bool truncate, int64_t references) {
-	Transaction tx(*database, true);
+                             bool truncate, int64_t references, bool synchronous) {
+	Transaction tx(*database, true, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, true);
 	auto key = ChildKey(database->db, parent, name, view);
 	Record entry, node;
