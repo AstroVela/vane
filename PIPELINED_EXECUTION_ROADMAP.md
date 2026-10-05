@@ -206,6 +206,16 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 已完成增量 Release 构建；281 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `c205cae1b6:fragment:2a5322a87d904c4d62808269f81d5e8f91ac5ae94e23a25682cc0e437db7b806`。root/DuckDB 格式检查、适用 pre-commit、源码版权清单和 diff 检查通过；本轮验证平台为 Linux。
 
+### PR #963 glob 展开与快照隔离修复
+
+- 在创建任何快照前，先收集整个查询所有 scan 的完整文件引用列表，并完成每个 scan 的模式和引用数量校验。然后按既有快照身份去重复制、计费和绑定，保留原始引用顺序与重复扫描。
+- exchange store 可以位于递归扫描目录内；本次创建的副本不会混入后续 glob。展开时已存在且匹配的存储目录文件仍正常参与扫描，不按目录前缀排除合法输入。
+- 新增 7 项长期回归，覆盖精确路径加递归 glob、重复递归 glob、已有存储目录文件、跨 scan 展开、精确 source_bytes 预算、删除原文件后的重放，以及真实 Ray 单/多分区的连续查询和资源清理。加强原有引用上限测试，确认超限在复制前被拒绝。
+
+最终非 editable 安装上共 **375 passed**：文件冻结 69、native 编译/提交描述 295、真实 Ray 定向用例 8，以及审查者提供的 3 条复现（修复前均失败）。仅运行上述相关测试，未运行完整 release/fast 套件。
+
+已完成增量 Release 构建；281 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `c205cae1b6:fragment:4d3ce533e0efce81679fd69ace1590c6fd29da17cc57a1c196291ec15e47f4e9`。root 格式检查、适用 pre-commit、源码版权清单和 diff 检查通过；本轮验证平台为 Linux。
+
 ## P4 分析与混跑
 
 - [ ] aggregate、hash join、broadcast、全局 LIMIT、ORDER BY/TopN。

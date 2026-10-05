@@ -245,6 +245,53 @@ def test_literal_path_list_preserves_duplicate_files(tmp_path):
             stage(connection, f"select * from read_parquet([['{paths[0]}']])", tmp_path / "nested")
 
 
+@pytest.mark.parametrize("first_pattern", ["exact", "recursive"])
+@pytest.mark.parametrize("existing_store_input", [False, True])
+def test_all_globs_expand_before_creating_snapshots(tmp_path, first_pattern, existing_store_input):
+    path = tmp_path / "input.parquet"
+    store = tmp_path / "store"
+    recursive = f"{tmp_path}/**/*.parquet"
+    first = str(path) if first_pattern == "exact" else recursive
+    sql = f"select value from read_parquet(['{first}', '{recursive}'])"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        budget = path.stat().st_size
+        if existing_store_input:
+            # Existing matching files remain valid inputs even under the store.
+            # Only files created by this staging must be absent from expansion.
+            store.mkdir()
+            prior = store / "prior.parquet"
+            connection.execute(f"copy (select 84 as value) to '{prior}'")
+            budget += prior.stat().st_size
+        expected = connection.execute(sql).fetchall()
+        assert expected.count((42,)) == 2
+        assert expected.count((84,)) == (1 + (first_pattern == "recursive") if existing_store_input else 0)
+        spec, used = stage(connection, sql, store, budget=budget)
+    assert used == budget
+    assert len(list(store.rglob("*.parquet"))) == (3 if existing_store_input else 1)
+    assert sorted(run(spec)) == sorted(expected)
+    path.unlink()
+    (store / "prior.parquet").unlink(missing_ok=True)
+    # A replay must keep the fixed references even when only snapshots remain.
+    assert sorted(run(spec)) == sorted(expected)
+
+
+def test_glob_expansion_precedes_snapshots_across_all_scans(tmp_path):
+    path = tmp_path / "input.parquet"
+    # Traversal visits the main scan before the unused CTE. A per-scan expansion
+    # pass would let the CTE pick up the snapshot produced by the main scan.
+    sql = (
+        f"with unused as (select value from read_parquet('{tmp_path}/**/*.parquet')) "
+        f"select value from parquet_scan('{path}')"
+    )
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        expected = connection.execute(sql).fetchall()
+        spec, used = stage(connection, sql, tmp_path / "store", budget=path.stat().st_size)
+    assert used == path.stat().st_size
+    assert run(spec) == expected == [(42,)]
+
+
 def test_repeated_globs_cannot_bypass_the_file_reference_limit(tmp_path):
     with vane.connect(backend="local") as connection:
         for name in ("a", "b"):
@@ -252,6 +299,7 @@ def test_repeated_globs_cannot_bypass_the_file_reference_limit(tmp_path):
         paths = ",".join([f"'{tmp_path}/*.parquet'"] * 2050)
         with pytest.raises(Exception, match="reference count exceeds limit"):
             stage(connection, f"select * from read_parquet([{paths}])", tmp_path / "snapshots")
+    assert not (tmp_path / "snapshots").exists()
 
 
 @pytest.mark.parametrize("marker", ["*", "?", "[x]"])

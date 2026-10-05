@@ -215,6 +215,23 @@ def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_pa
         assert_idle(connection)
 
 
+@pytest.mark.parametrize("partitions", [1, 2])
+def test_fte_store_inside_recursive_input_glob_preserves_duplicate_rows(tmp_path, partitions):
+    path = tmp_path / "input.parquet"
+    sql = f"select value from read_parquet(['{path}', '{tmp_path}/**/*.parquet'])"
+    with vane.connect(backend="local") as local:
+        local.execute(f"copy (select 42 as value) to '{path}'")
+        expected = [row[0] for row in local.execute(sql).fetchall()]
+    assert expected == [42, 42]
+    config = resources(tmp_path, worker_count=partitions, partitions=partitions)
+    config = replace(config, exchange_stores=(replace(config.exchange_stores[0], source_bytes=path.stat().st_size),))
+    with vane.connect(backend="ray", execution="fte", resources=config) as connection:
+        for _ in range(2):
+            assert connection.query(sql).collect().column("value").to_pylist() == expected
+            assert_idle(connection)
+            assert not list((tmp_path / "store").rglob("*.parquet"))
+
+
 @pytest.mark.parametrize(("option", "column"), [("true", "filename"), ("'origin'", "origin")])
 def test_generated_filename_rejection_releases_fte_resources_and_preserves_pipelined(tmp_path, option, column):
     path = tmp_path / "input.parquet"

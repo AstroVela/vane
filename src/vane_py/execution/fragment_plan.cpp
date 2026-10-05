@@ -546,6 +546,14 @@ void FilePatterns(ParsedExpression &expression, vector<string> &patterns, bool a
 
 void StageFileArguments(ClientContext &context, SelectStatement &select, const string &directory, idx_t budget,
                         unordered_map<string, FrozenFile> &frozen, idx_t &used) {
+	struct FileScan {
+		TableFunctionRef &ref;
+		vector<OpenFileInfo> files;
+	};
+	vector<FileScan> scans;
+	auto &fs = FileSystem::GetFileSystem(context);
+	// Expand every scan before writing: the snapshot directory can be inside a
+	// recursive input glob. Keep repeated references in their original order.
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    *select.node, [](unique_ptr<ParsedExpression> &) {},
 	    [&](TableRef &ref) {
@@ -568,34 +576,47 @@ void StageFileArguments(ClientContext &context, SelectStatement &select, const s
 		    if (patterns.empty() || patterns.size() > 4096) {
 			    throw InvalidInputException("FTE source pattern count exceeds limit");
 		    }
-		    vector<Value> paths;
 		    vector<OpenFileInfo> files;
-		    auto &fs = FileSystem::GetFileSystem(context);
 		    for (auto &pattern : patterns) {
+			    if (context.IsInterrupted()) {
+				    throw InterruptException();
+			    }
 			    if (!fs.IsPathAbsolute(pattern)) {
 				    throw NotImplementedException("FTE snapshots require absolute local paths");
 			    }
 			    for (auto &file : fs.GlobFiles(pattern)) {
-				    if (paths.size() >= 4096) {
+				    if (files.size() >= 4096) {
 					    throw InvalidInputException("FTE source file reference count exceeds limit");
 				    }
-				    auto target = FrozenFilePath(context, file.path, directory);
-				    auto existing = frozen.find(target);
-				    if (existing == frozen.end()) {
-					    if (frozen.size() >= 4096) {
-						    throw InvalidInputException("FTE source file count exceeds limit");
-					    }
-					    auto snapshot = FreezeFile(context, file.path, target, budget - used);
-					    used += snapshot.bytes;
-					    existing = frozen.emplace(target, std::move(snapshot)).first;
-				    }
-				    paths.push_back(Value(existing->second.path));
-				    files.emplace_back(existing->second.path);
+				    files.push_back(std::move(file));
 			    }
 		    }
-		    function.children[0] = make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths)));
-		    MultiFileReader::SetFileList(ref.Cast<TableFunctionRef>(), std::move(files));
+		    scans.push_back({ref.Cast<TableFunctionRef>(), std::move(files)});
 	    });
+	for (auto &scan : scans) {
+		vector<Value> paths;
+		vector<OpenFileInfo> files;
+		for (auto &file : scan.files) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			auto target = FrozenFilePath(context, file.path, directory);
+			auto existing = frozen.find(target);
+			if (existing == frozen.end()) {
+				if (frozen.size() >= 4096) {
+					throw InvalidInputException("FTE source file count exceeds limit");
+				}
+				auto snapshot = FreezeFile(context, file.path, target, budget - used);
+				used += snapshot.bytes;
+				existing = frozen.emplace(target, std::move(snapshot)).first;
+			}
+			paths.push_back(Value(existing->second.path));
+			files.emplace_back(existing->second.path);
+		}
+		auto &function = scan.ref.function->Cast<FunctionExpression>();
+		function.children[0] = make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths)));
+		MultiFileReader::SetFileList(scan.ref, std::move(files));
+	}
 }
 
 void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, FrozenFile> &frozen) {
