@@ -175,6 +175,12 @@ snapshot, provider and stateless filesystem implementation. The provider shares
 one live immutable session per snapshot across these references, releasing its
 SQLite pin with the final handle. This avoids a durable write pair per file
 while removing expired session-cache entries immediately.
+If SQLite refuses the final pin deletion, a process-local registry retains its
+token. The next write transaction on the same database, through any connection
+in that process, retries abandoned pins and forgets them only after commit.
+Live sessions keep their tokens and cannot be retired this way. Explicit
+session close still reports a timeout and can be retried by the caller; query
+and reader destructors defer failed cleanup without losing the token.
 Closing the caller's workspace or unregistering the routing filesystem cannot
 invalidate an open reader. Positional reads preserve the implicit cursor;
 short exact reads fail. Nonblocking virtual opens cannot encounter host FIFOs.
@@ -196,7 +202,8 @@ underlying serialization; the application must still enforce this ordering.
 The implementation configures WAL, `synchronous=FULL`, foreign-key checks and a
 bounded busy timeout on each connection, and verifies that WAL was enabled.
 Lock contention beyond the timeout raises `Busy`; other SQLite failures raise
-`Storage`. There is no additional application retry or cancellation mechanism.
+`Storage`. Apart from deferred pin cleanup, there is no additional application
+retry or cancellation mechanism.
 Callers may retry complete operations, never an arbitrary suffix of a failed
 split. Keep SQL read transactions short; application snapshots and pins provide
 longer retention without holding a SQLite transaction for an entire query.
@@ -274,7 +281,10 @@ work; neither would prove that a merge is semantically safe.
 
 Validate the complete proposed namespace before committing: every visible
 entry targets a visible inode, entry names are unique per directory, directories
-have no cycles, and file sizes agree with block visibility. Generic row-level
+have no cycles, and file sizes agree with block visibility. Each selected entry
+also retains its parent inode identity. A directory renamed or replaced on the
+other branch cannot silently receive children of a different directory; the
+caller must resolve a consistent set of parent and child entries. Generic row-level
 comparison does not establish these filesystem invariants. With all records
 inside one database, a resolved merge commits in one SQLite transaction.
 

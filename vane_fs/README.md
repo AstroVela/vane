@@ -207,6 +207,8 @@ merge and allocation failures. Recompute a stale preview before publishing.
 Resolve a conflict with a path mapping such as
 `workspace.merge(preview, {"/config.txt": "source"})`; the other choice is
 `"target"`. Namespace inconsistencies also reject the complete merge.
+This includes a selected child whose parent path now names a different inode.
+Resolve the parent and affected entries together to keep a consistent tree.
 
 ## Vane queries
 
@@ -259,6 +261,12 @@ SQLite write access is required to record/release retention pins. Interrupts
 are checked between 1 MiB read chunks; a SQLite lock wait is bounded by
 `timeout_ms` (default 5000), not immediately interrupted. Query completion
 releases pins; it does not delete explicitly retained snapshots.
+If a write lock prevents pin cleanup during reader close or query completion,
+the next write transaction on that database in the same process retries it.
+Both `recover_owners()` and `drop_snapshot()` perform this retry, without
+unregistering the workspace. A failed retry or rolled-back transaction keeps
+the cleanup pending. An explicit snapshot session `close()` instead raises
+the SQLite error and leaves the session available for another close attempt.
 
 The older fsspec adapter remains available for listing, globbing and clients
 that use Python file objects. Use it on a separate Vane database instance from

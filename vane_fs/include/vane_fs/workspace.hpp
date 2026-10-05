@@ -13,6 +13,8 @@
 
 namespace vane_fs {
 
+struct SnapshotPin;
+
 enum class ErrorCode {
 	Invalid,
 	NotFound,
@@ -121,9 +123,10 @@ public:
 
 private:
 	friend class Workspace;
-	Session(std::shared_ptr<Database> database, std::string id, bool snapshot, std::string pin = {});
+	Session(std::shared_ptr<Database> database, std::string id, bool snapshot);
 	std::shared_ptr<Database> database;
-	std::string id, pin;
+	std::string id;
+	std::shared_ptr<SnapshotPin> pin;
 	bool snapshot, closed = false;
 };
 

@@ -7,6 +7,7 @@ import ctypes
 import io
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -143,18 +144,81 @@ def test_standalone_reader_does_not_pin_an_unrelated_streaming_result(native):
     assert connection.fetchall() == []
 
 
-def test_python_and_native_filesystem_registration_cannot_shadow_each_other(native):
+@pytest.mark.parametrize("protocol", ["vanefs", ("vane_alias", "vanefs"), ("first", "second", "vanefs")])
+def test_python_and_native_filesystem_registration_cannot_shadow_each_other(native, protocol):
     from vane_fs.fsspec import SnapshotFileSystem
 
-    workspace, connection, database, frozen, _ = native
-    with SnapshotFileSystem(workspace, frozen) as fs:
+    class AliasedSnapshotFileSystem(SnapshotFileSystem):
+        pass
+
+    AliasedSnapshotFileSystem.protocol = protocol
+    workspace, connection, database, frozen, url = native
+    with AliasedSnapshotFileSystem(workspace, frozen) as fs:
         with pytest.raises(vane.InvalidInputException, match="separate"):
             connection.register_filesystem(fs)
         with vane.connect() as other:
             other.register_filesystem(fs)
-            with pytest.raises(vane.InvalidInputException, match="Python vanefs"):
-                register_workspace(other, database)
-            other.unregister_filesystem("vanefs")
+            # Filesystem routing is shared by cursors, even though native
+            # provider registration is scoped to each connection.
+            with other.cursor() as cursor:
+                with pytest.raises(vane.InvalidInputException, match="Python vanefs"):
+                    register_workspace(cursor, database)
+            other.unregister_filesystem(protocol if isinstance(protocol, str) else protocol[0])
+            register_workspace(other, database)
+            with vane.File(url).open(connection=other) as reader:
+                assert reader.read() == b"0123456789abcdef"
+
+
+@pytest.mark.parametrize("release", ["reader", "query"])
+@pytest.mark.parametrize("recover", [False, True])
+def test_native_pin_cleanup_retries_after_writer_timeout(native, sqlite_writer, release, recover):
+    workspace, connection, database, frozen, url = native
+    register_workspace(connection, database, timeout_ms=50)
+    if release == "reader":
+        reader = vane.File(url).open(connection=connection)
+    else:
+        connection.execute("SELECT to_file(?) FROM range(4096)", [url]).fetchone()
+    with sqlite_writer(database):
+        if release == "reader":
+            reader.close()
+            reader.close()
+        else:
+            assert len(connection.fetchall()) == 4095
+    if recover:
+        assert workspace.recover_owners().pins == 0
+    workspace.drop_snapshot(frozen)
+    # The provider remains registered and usable; cleanup needs no unregister.
+    fresh = workspace.snapshot()
+    with vane.File(snapshot_url(workspace.id, fresh, "/data/file")).open(connection=connection) as reader:
+        assert reader.read() == b"0123456789abcdef"
+    workspace.drop_snapshot(fresh)
+
+
+def test_concurrent_python_and_native_registration_cannot_both_succeed(native):
+    from vane_fs.fsspec import SnapshotFileSystem
+
+    class AliasedSnapshotFileSystem(SnapshotFileSystem):
+        protocol = ("vane_alias", "vanefs")
+
+    workspace, _, database, frozen, _ = native
+    barrier = threading.Barrier(2)
+    with AliasedSnapshotFileSystem(workspace, frozen) as fs, vane.connect() as connection:
+        with connection.cursor() as cursor:
+
+            def register(python):
+                barrier.wait(timeout=5)
+                try:
+                    if python:
+                        connection.register_filesystem(fs)
+                    else:
+                        register_workspace(cursor, database)
+                    return True
+                except vane.InvalidInputException as error:
+                    assert "separate" in str(error) or "Python vanefs" in str(error)
+                    return False
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                assert sorted(pool.map(register, [False, True])) == [False, True]
 
 
 def test_query_error_releases_snapshot_pin(native):

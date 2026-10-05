@@ -328,6 +328,11 @@ vector<string> VirtualFileSystem::ListSubSystems() {
 	return names;
 }
 
+bool VirtualFileSystem::CanHandleFile(const string &path) {
+	auto registry = file_system_registry.atomic_load();
+	return FindFileSystemInternal(*registry, path) != nullptr;
+}
+
 std::string VirtualFileSystem::GetName() const {
 	return "VirtualFileSystem";
 }

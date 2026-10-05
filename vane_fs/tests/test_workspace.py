@@ -360,6 +360,66 @@ def test_merge_rename_vs_edit_cannot_create_duplicate_inode(workspace):
     assert main.read("/new") == b"base"
 
 
+@pytest.mark.parametrize("replace_on", ["source", "target"])
+@pytest.mark.parametrize("rename", [False, True])
+@pytest.mark.parametrize("keep_original", [False, True])
+def test_merge_replaced_parent_requires_consistent_inode_resolution(workspace, replace_on, rename, keep_original):
+    main = workspace.checkout()
+    main.mkdir("/directory")
+    original = main.stat("/directory").inode
+    child = workspace.fork("main", "child")
+    source = workspace.checkout(child.id)
+    replacing, adding = (source, main) if replace_on == "source" else (main, source)
+    adding.write_file("/directory/new", b"original directory")
+    if rename:
+        replacing.rename("/directory", "/moved")
+    else:
+        replacing.rmdir("/directory")
+    replacing.mkdir("/directory")
+    replacement = replacing.stat("/directory").inode
+    assert replacement != original
+    preview = workspace.preview_merge(child.id, "main")
+    assert preview.conflicts == ["/directory"]
+    generation = workspace.branch().generation
+    with pytest.raises(ConflictError):
+        workspace.merge(preview)
+    # Selecting the replacement directory still cannot retarget its child.
+    with pytest.raises(ConflictError):
+        workspace.merge(preview, {"/directory": replace_on})
+    assert workspace.branch().generation == generation
+    assert workspace.branch(child.id).state == "writable"
+    if keep_original:
+        original_side = "target" if replace_on == "source" else "source"
+        resolutions = {"/directory": original_side}
+        if rename:
+            resolutions["/moved"] = original_side
+    else:
+        resolutions = {"/directory/new": replace_on}
+    workspace.merge(preview, resolutions)
+    workspace.collect_garbage()
+    assert main.stat("/directory").inode == (original if keep_original else replacement)
+    if keep_original:
+        assert main.read("/directory/new") == b"original directory"
+    else:
+        assert main.listdir("/directory") == []
+        if rename:
+            assert main.stat("/moved").inode == original
+
+
+def test_merge_independently_created_directories_cannot_mix_children(workspace):
+    child = workspace.fork("main", "child")
+    source, target = workspace.checkout(child.id), workspace.checkout()
+    for session, name in [(source, "source"), (target, "target")]:
+        session.mkdir("/directory")
+        session.write_file("/directory/" + name, name.encode())
+    preview = workspace.preview_merge(child.id, "main")
+    with pytest.raises(ConflictError):
+        workspace.merge(preview, {"/directory": "source"})
+    workspace.merge(preview, {"/directory": "source", "/directory/target": "source"})
+    assert target.listdir("/directory") == ["source"]
+    assert target.stat("/directory").inode == source.stat("/directory").inode
+
+
 def test_merge_rejects_unrelated_nonleaf_and_foreign_previews(workspace, tmp_path):
     child = workspace.fork("main", "child")
     sibling = workspace.fork("main", "sibling")

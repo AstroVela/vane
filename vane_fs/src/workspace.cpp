@@ -549,6 +549,32 @@ void Erase(sqlite3 *db, const Key &entry, const Record &node, const View &view) 
 }
 } // namespace
 
+struct SnapshotPin {
+	std::string id = NewId();
+	std::string path, workspace, owner;
+	int64_t process = OwnerLock::Process();
+};
+
+namespace {
+// Register before publishing a pin. If a destructor cannot delete its SQLite
+// row, the registry keeps the token without allocating during error cleanup.
+// A token owned only by this registry no longer protects a live session.
+struct PinRegistry {
+	std::mutex mutex;
+	std::vector<std::shared_ptr<SnapshotPin>> pins;
+
+	void Forget(const std::shared_ptr<SnapshotPin> &pin) {
+		std::lock_guard<std::mutex> lock(mutex);
+		pins.erase(std::remove(pins.begin(), pins.end(), pin), pins.end());
+	}
+};
+
+PinRegistry &Pins() {
+	static PinRegistry registry;
+	return registry;
+}
+} // namespace
+
 class Database {
 public:
 	sqlite3 *db = nullptr;
@@ -660,6 +686,29 @@ public:
 			Fail(ErrorCode::Closed, "Workspace is closed");
 		}
 		Exec(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
+		try {
+			if (write) {
+				{
+					auto &registry = Pins();
+					std::lock_guard<std::mutex> guard(registry.mutex);
+					for (const auto &pin : registry.pins) {
+						if (pin.use_count() == 1 && pin->process == database.process &&
+						    pin->workspace == database.uuid && pin->path == sqlite3_db_filename(database.db, "main")) {
+							retired_pins.push_back(pin);
+						}
+					}
+				}
+				for (const auto &pin : retired_pins) {
+					Statement remove(database.db, "DELETE FROM pins WHERE id=? AND owner=?");
+					remove.Bind(1, pin->id);
+					remove.Bind(2, pin->owner);
+					remove.Step();
+				}
+			}
+		} catch (...) {
+			sqlite3_exec(database.db, "ROLLBACK", nullptr, nullptr, nullptr);
+			throw;
+		}
 	}
 	~Transaction() {
 		if (!committed) {
@@ -669,11 +718,15 @@ public:
 	void Commit() {
 		Exec(database.db, "COMMIT");
 		committed = true;
+		for (const auto &pin : retired_pins) {
+			Pins().Forget(pin);
+		}
 	}
 
 private:
 	Database &database;
 	std::unique_lock<std::mutex> lock;
+	std::vector<std::shared_ptr<SnapshotPin>> retired_pins;
 	bool committed = false;
 };
 
@@ -842,13 +895,15 @@ std::string Workspace::SQLiteVersion() {
 	return sqlite3_libversion();
 }
 
-Session::Session(std::shared_ptr<Database> database, std::string id, bool snapshot, std::string pin)
-    : database(std::move(database)), id(std::move(id)), pin(std::move(pin)), snapshot(snapshot) {
+Session::Session(std::shared_ptr<Database> database, std::string id, bool snapshot)
+    : database(std::move(database)), id(std::move(id)), snapshot(snapshot) {
 }
 Session::~Session() {
 	try {
 		Close();
 	} catch (...) {
+		// Releasing our token leaves it in the registry for the next write
+		// transaction on this database, including through another connection.
 	}
 }
 void Session::Close() {
@@ -860,10 +915,14 @@ void Session::Close() {
 	if (closed) {
 		return;
 	}
-	if (database->db && !pin.empty()) {
+	if (database->db && pin) {
 		Statement remove(database->db, "DELETE FROM pins WHERE id=?");
-		remove.Bind(1, pin);
+		remove.Bind(1, pin->id);
 		remove.Step();
+	}
+	if (pin) {
+		Pins().Forget(pin);
+		pin.reset();
 	}
 	closed = true;
 }
@@ -1114,13 +1173,21 @@ std::shared_ptr<Session> Workspace::OpenSnapshot(const std::string &snapshot) {
 	auto result = std::shared_ptr<Session>(new Session(database, snapshot, true));
 	Transaction tx(*database, true);
 	SnapshotPoint(database->db, snapshot);
-	auto pin = NewId();
+	auto pin = std::make_shared<SnapshotPin>();
+	pin->path = sqlite3_db_filename(database->db, "main");
+	pin->workspace = database->uuid;
+	pin->owner = database->owner;
+	{
+		auto &registry = Pins();
+		std::lock_guard<std::mutex> lock(registry.mutex);
+		registry.pins.push_back(pin);
+	}
+	result->pin = pin;
 	Statement insert(database->db, "INSERT INTO pins VALUES(?,?,?)");
-	insert.Bind(1, pin);
+	insert.Bind(1, pin->id);
 	insert.Bind(2, snapshot);
 	insert.Bind(3, database->owner);
 	insert.Step();
-	result->pin = pin;
 	tx.Commit();
 	return result;
 }
@@ -1147,6 +1214,7 @@ namespace {
 struct TreeEntry {
 	Record node;
 	std::map<int64_t, int64_t> blocks;
+	int64_t parent;
 };
 using Tree = std::map<std::string, TreeEntry>;
 
@@ -1171,15 +1239,15 @@ Tree ReadTree(sqlite3 *db, const Coordinate &point) {
 	}
 	Tree tree;
 	std::map<int64_t, std::string> paths;
-	std::vector<std::pair<std::string, int64_t>> queue {{"/", 1}};
+	std::vector<std::tuple<std::string, int64_t, int64_t>> queue {{"/", 1, 0}};
 	for (size_t i = 0; i < queue.size(); ++i) {
-		auto path = queue[i].first;
-		auto id = queue[i].second;
+		auto path = std::get<0>(queue[i]);
+		auto id = std::get<1>(queue[i]);
 		if (!nodes.count(id) || !paths.emplace(id, path).second) {
 			Fail(ErrorCode::Storage, "Invalid inode reference, cycle or hard link");
 		}
 		auto node = nodes.at(id);
-		if (!tree.emplace(path, TreeEntry {node, {}}).second) {
+		if (!tree.emplace(path, TreeEntry {node, {}, std::get<2>(queue[i])}).second) {
 			Fail(ErrorCode::Storage, "Duplicate directory entry");
 		}
 		if (!children[id].empty() && !node.fields[0]) {
@@ -1190,7 +1258,7 @@ Tree ReadTree(sqlite3 *db, const Coordinate &point) {
 			    entry.key.name.find('/') != std::string::npos) {
 				Fail(ErrorCode::Storage, "Invalid directory entry");
 			}
-			queue.emplace_back(path == "/" ? path + entry.key.name : path + "/" + entry.key.name, entry.fields[0]);
+			queue.emplace_back(path == "/" ? path + entry.key.name : path + "/" + entry.key.name, entry.fields[0], id);
 		}
 	}
 	if (paths.size() != nodes.size()) {
@@ -1226,7 +1294,7 @@ bool Equal(sqlite3 *db, const TreeEntry *left, const TreeEntry *right) {
 	if (!left || !right) {
 		return left == right;
 	}
-	if (left->node.key.inode != right->node.key.inode) {
+	if (left->node.key.inode != right->node.key.inode || left->parent != right->parent) {
 		return false;
 	}
 	// Modification times describe an operation, not a semantic merge conflict.
@@ -1290,7 +1358,7 @@ std::set<std::string> NamespaceConflicts(const Tree &tree) {
 		if (entry.first != "/") {
 			auto parent_path = ParentPath(entry.first);
 			auto parent = Entry(tree, parent_path);
-			if (!parent || !parent->node.fields[0]) {
+			if (!parent || !parent->node.fields[0] || parent->node.key.inode != entry.second.parent) {
 				conflicts.insert(parent_path);
 			}
 		}
@@ -1601,6 +1669,13 @@ void Database::Close() {
 	} catch (...) {
 		sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
 		throw;
+	}
+	{
+		auto &registry = Pins();
+		std::lock_guard<std::mutex> guard(registry.mutex);
+		registry.pins.erase(std::remove_if(registry.pins.begin(), registry.pins.end(),
+		                                   [&](const auto &pin) { return pin->owner == owner; }),
+		                    registry.pins.end());
 	}
 	Check(db, sqlite3_close(db));
 	db = nullptr;

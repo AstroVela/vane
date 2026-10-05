@@ -318,6 +318,11 @@ VaneFSStandaloneOpenScope::~VaneFSStandaloneOpenScope() {
 	standalone_context = previous;
 }
 
+mutex &VaneFSRegistrationLock() {
+	static mutex registration_lock;
+	return registration_lock;
+}
+
 void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>> &connection) {
 	connection.def("_register_vane_fs", [](DuckDBPyConnection &owner, py::object capsule) {
 		auto provider = make_shared_ptr<SnapshotProvider>(std::move(capsule));
@@ -330,15 +335,19 @@ void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnecti
 		auto &context = *owner.con.GetConnection().context;
 		// Registration is infrequent. Serialize the list/register pair across
 		// connections sharing one database; file reads do not use this lock.
-		static mutex registration_lock;
-		lock_guard<mutex> registration_guard(registration_lock);
-		auto &fs = owner.con.GetDatabase().GetFileSystem();
-		auto names = fs.ListSubSystems();
-		if (std::find(names.begin(), names.end(), "vanefs") != names.end()) {
-			throw InvalidInputException("Unregister the Python vanefs filesystem before registering native VaneFS");
-		}
-		if (std::find(names.begin(), names.end(), FILESYSTEM_NAME) == names.end()) {
-			fs.RegisterSubSystem(make_uniq<SnapshotFileSystem>());
+		{
+			lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
+			auto &fs = owner.con.GetDatabase().GetFileSystem();
+			auto names = fs.ListSubSystems();
+			if (std::find(names.begin(), names.end(), FILESYSTEM_NAME) == names.end()) {
+				// GetName/ListSubSystems expose only the first fsspec protocol.
+				// Ask the router so secondary aliases are checked as well.
+				if (fs.CanHandleFile("vanefs://")) {
+					throw InvalidInputException(
+					    "Unregister the Python vanefs filesystem before registering native VaneFS");
+				}
+				fs.RegisterSubSystem(make_uniq<SnapshotFileSystem>());
+			}
 		}
 		auto state = context.registered_state->GetOrCreate<SnapshotState>(STATE_KEY);
 		lock_guard<mutex> guard(state->lock);

@@ -8,6 +8,10 @@
 namespace duckdb {
 void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>> &connection);
 
+// Serialize native and Python filesystem registration across connections.
+// Callers must release the GIL before acquiring this lock.
+mutex &VaneFSRegistrationLock();
+
 // Public File.open owns its snapshot through the returned reader, even if an
 // unrelated streaming SQL result is still active on the same connection.
 class VaneFSStandaloneOpenScope {

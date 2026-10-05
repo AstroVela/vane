@@ -61,6 +61,48 @@ def test_live_connections_in_one_process_cannot_recover_each_other(tmp_path):
         first.drop_snapshot(frozen)
 
 
+@pytest.mark.parametrize("explicit_close", [False, True])
+def test_snapshot_close_can_retry_after_writer_timeout(tmp_path, sqlite_writer, explicit_close):
+    path = tmp_path / "workspace.sqlite"
+    with Workspace(path) as first, Workspace(path, timeout_ms=50) as second:
+        first.checkout().write_file("/data", b"retained")
+        frozen = first.snapshot()
+        session = second.open_snapshot(frozen)
+        with sqlite_writer(path):
+            if explicit_close:
+                with pytest.raises(BlockingIOError, match="locked"):
+                    session.close()
+                assert session.read("/data") == b"retained"
+            else:
+                del session
+        if explicit_close:
+            # Recovery must never retire a session whose failed explicit
+            # close left it live and available to the caller.
+            assert first.recover_owners().pins == 0
+            with pytest.raises(BlockingIOError, match="pinned"):
+                first.drop_snapshot(frozen)
+            session.close()
+        first.drop_snapshot(frozen)
+        assert second.checkout().read("/data") == b"retained"
+
+
+def test_deferred_pin_cleanup_survives_transaction_rollback(tmp_path, sqlite_writer):
+    path = tmp_path / "workspace.sqlite"
+    with Workspace(path) as first, Workspace(path, timeout_ms=50) as second:
+        frozen = first.snapshot()
+        live = first.open_snapshot(frozen)
+        abandoned = second.open_snapshot(frozen)
+        with sqlite_writer(path):
+            del abandoned
+        # The pending delete happens in this transaction and must roll back
+        # with it because another live pin prevents dropping the snapshot.
+        with pytest.raises(BlockingIOError, match="pinned"):
+            first.drop_snapshot(frozen)
+        assert live.stat("/").is_directory
+        live.close()
+        first.drop_snapshot(frozen)
+
+
 @pytest.mark.parametrize("replace", [False, True])
 @pytest.mark.skipif(os.name == "nt", reason="Requires POSIX owner locks")
 def test_missing_or_replaced_lock_does_not_prove_owner_dead(tmp_path, replace):
