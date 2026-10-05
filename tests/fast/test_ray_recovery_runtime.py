@@ -132,6 +132,76 @@ def test_failed_orphan_cleanup_preserves_live_result_and_new_admission(tmp_path,
                 orphan.close(lambda: None)
 
 
+def test_slow_orphan_cleanup_does_not_stop_heartbeats_or_result_delivery(tmp_path, monkeypatch):
+    import json
+    import shutil
+    from pathlib import Path
+    from threading import Event
+
+    from vane.execution.fte_store import replace_metadata
+    from vane.execution.materialized_store import StorageCleanupPending
+
+    config = resources(tmp_path)
+    config = replace(config, exchange_stores=(replace(config.exchange_stores[0], lease_seconds=2),))
+    with vane.connect(backend="ray", execution="fte", resources=config) as connection:
+        result = connection.query("select 42 as value")
+        scheduler = result.context._reader
+        store = scheduler.store
+        orphan = None
+        entered, release = Event(), Event()
+        rmtree = shutil.rmtree
+        try:
+            deadline = time.monotonic() + 10
+            while not result.context.production_done:
+                result.context.check()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            orphan = store.reserve("slow-orphan")
+
+            def slow_delete(path, *args, **kwargs):
+                if Path(path) == orphan.directory:
+                    entered.set()
+                    assert release.wait(20), "test did not release slow orphan deletion"
+                return rmtree(path, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(shutil, "rmtree", slow_delete)
+                record = store.allocations / f"{orphan.value['namespace']}.json"
+                replace_metadata(record, {**orphan.value, "expires": time.time() - 1})
+                orphan.guard.close()
+                assert entered.wait(5)
+                live_record = store.allocations / f"{scheduler.lease.value['namespace']}.json"
+                original = json.loads(live_record.read_bytes())["expires"]
+                # Keep deletion blocked for more than two lease durations.
+                # The heartbeat that requested it must continue renewing.
+                end = time.monotonic() + 4.5
+                while time.monotonic() < end:
+                    result.context.check()
+                    time.sleep(0.05)
+                assert json.loads(live_record.read_bytes())["expires"] > original + 3
+                assert result.collect().column("value").to_pylist() == [42]
+                assert connection.query("select 7 as value").collect().column("value").to_pylist() == [7]
+                assert store.snapshot() == {"queries": 1, "reserved_bytes": store.config.query_bytes}
+                release.set()
+                end = time.monotonic() + 5
+                while record.exists():
+                    assert time.monotonic() < end
+                    time.sleep(0.01)
+            assert_idle(connection)
+        finally:
+            release.set()
+            close_result(result)
+            if orphan is not None:
+                end = time.monotonic() + 5
+                while True:
+                    try:
+                        orphan.close(lambda: None)
+                        break
+                    except StorageCleanupPending:
+                        assert time.monotonic() < end
+                        time.sleep(0.01)
+
+
 @pytest.mark.parametrize("predicate", ["", " where value > 10"])
 def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_path, predicate):
     path = tmp_path / "input.parquet"

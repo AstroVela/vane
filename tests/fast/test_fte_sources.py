@@ -266,3 +266,51 @@ def test_symlink_parent_traversal_does_not_merge_different_sources(tmp_path):
         spec, used = stage(connection, sql, tmp_path / "store")
     assert used == sum((p / "data.parquet").stat().st_size for p in (tmp_path, other))
     assert sorted(run(spec)) == sorted(expected) == [(1,), (2,)]
+
+
+@pytest.mark.parametrize("columns", ["*", "value, part"])
+@pytest.mark.parametrize("predicate", ["", " where part = 42", " where part = 99"])
+def test_parent_traversal_preserves_hive_schema_values_and_pruning(tmp_path, columns, predicate):
+    (tmp_path / "part=42").mkdir()
+    (tmp_path / "part=99").mkdir()
+    path = tmp_path / "data.parquet"
+    # Native Hive parsing keeps the first occurrence, even if filesystem
+    # traversal removes both directories from the physical file identity.
+    reference = f"{tmp_path}/part=42/../part=99/../data.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select {columns} from read_parquet('{reference}', hive_partitioning=true){predicate}"
+        expected = connection.execute(sql).fetchall()
+        names = tuple(column[0] for column in connection.description)
+        spec, _ = stage(connection, sql, tmp_path / "store")
+    path.unlink()
+    assert names == spec.result_names == ("value", "part")
+    assert run(spec) == expected == ([] if predicate.endswith("99") else [(1, 42)])
+
+
+@pytest.mark.parametrize("second", [42, 99])
+def test_physical_aliases_keep_distinct_hive_values(tmp_path, second):
+    for value in {42, second}:
+        (tmp_path / f"part={value}").mkdir()
+    path = tmp_path / "data.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select value, part from read_parquet(['{tmp_path}/part=42/../data.parquet', "
+        sql += f"'{tmp_path}/part={second}/./../data.parquet'], hive_partitioning=true)"
+        expected = connection.execute(sql).fetchall()
+        budget = path.stat().st_size * (1 if second == 42 else 2)
+        spec, used = stage(connection, sql, tmp_path / "store", budget=budget)
+    assert used == budget
+    assert sorted(run(spec)) == sorted(expected) == [(1, 42), (1, second)]
+
+
+@pytest.mark.parametrize("part", ["a%2Fb", "__HIVE_DEFAULT_PARTITION__", "中文"])
+def test_hive_alias_retains_encoded_null_and_unicode_values(tmp_path, part):
+    (tmp_path / f"part={part}").mkdir()
+    path = tmp_path / "data.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select part from read_parquet('{tmp_path}/part={part}/../data.parquet', hive_partitioning=true)"
+        expected = connection.execute(sql).fetchall()
+        spec, _ = stage(connection, sql, tmp_path / "store")
+    assert run(spec) == expected

@@ -205,7 +205,7 @@ class RecoveryScheduler:
         try:
             while not self.stop.wait(interval):
                 self.lease.renew()
-                self.store.collect_expired()
+                self.store.request_collection()
         except BaseException as error:
             if not self.stop.is_set():
                 self.context.failed(str(error))

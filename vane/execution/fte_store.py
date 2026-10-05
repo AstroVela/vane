@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -126,7 +127,10 @@ class ActiveStoreLease:
         self.directory = Path(self.store.root) / "queries" / self.namespace
         if self.directory.resolve() != self.directory:
             raise ValueError("query lease path contains a symlink")
-        self.guard = native.StoreGuard.acquire(str(self.directory / "lease.lock"), False, False)
+        allocations = Path(self.store.root) / "allocations"
+        if allocations.resolve() != allocations:
+            raise ValueError("allocation root contains a symlink")
+        self.guard = native.StoreGuard.acquire(str(allocations / f"{self.namespace}.lock"), False, False)
         if self.guard is None:
             raise RuntimeError("query store is being cleaned")
         try:
@@ -158,6 +162,9 @@ class StorePool:
         if self.allocations.is_symlink():
             raise ValueError("allocation root contains a symlink")
         _publish(self.root / "capacity.json", {"bytes": config.capacity_bytes, "protocol": 1})
+        self._collection_lock = threading.Lock()
+        self._collection_thread: threading.Thread | None = None
+        self._collection_error: BaseException | None = None
 
     def _records(self) -> list[tuple[Path, dict[str, Any]]]:
         if self.allocations.resolve() != self.allocations:
@@ -170,28 +177,64 @@ class StorePool:
             result.append((path, value))
         return result
 
-    def _collect(self) -> None:
-        from vane import IOException
-        from vane._native import execution_runtime as native
-
+    def _check(self) -> None:
         self.store.descriptor.check()
         queries = self.root / "queries"
         if queries.resolve() != queries:
             raise ValueError("query directory contains a symlink")
-        for record, value in self._records():
-            if value["expires"] > time.time():
-                continue
-            directory = self.root / "queries" / value["namespace"]
+        if self.allocations.resolve() != self.allocations:
+            raise ValueError("allocation root contains a symlink")
+
+    def _candidates(self) -> list[Path]:
+        with store_lock(self.root / "allocation.lock"):
+            self._check()
+            return [record for record, value in self._records() if value["expires"] <= time.time()]
+
+    def _retire(self, record: Path, value: Mapping[str, Any], guard: Any) -> None:
+        # The directory is gone, and its external lock still excludes native
+        # participants and other cleaners. Retire lock + quota together under
+        # the metadata lock, releasing the old inode before another claim.
+        with store_lock(self.root / "allocation.lock"):
+            try:
+                self._check()
+                current = _read(record)
+                if (current["namespace"], current["lease_id"]) != (value["namespace"], value["lease_id"]):
+                    raise RuntimeError("query storage lease changed during cleanup")
+                (self.allocations / f"{value['namespace']}.lock").unlink()
+                record.unlink()
+                _sync_directory(self.allocations)
+            finally:
+                guard.close()
+
+    def _collect(self, candidates: list[Path]) -> None:
+        from vane import IOException
+        from vane._native import execution_runtime as native
+
+        for record in candidates:
             guard = None
             try:
-                if directory.resolve() != directory:
-                    raise ValueError("query directory contains a symlink")
-                if directory.exists():
-                    guard = native.StoreGuard.acquire(str(directory / "lease.lock"), True, True)
+                with store_lock(self.root / "allocation.lock"):
+                    self._check()
+                    if not record.exists():
+                        continue
+                    value = _read(record)
+                    if record.name != f"{value['namespace']}.json":
+                        raise ValueError("store allocation namespace mismatch")
+                    # A lease may have renewed since the candidate scan.
+                    if value["expires"] > time.time():
+                        continue
+                    directory = self.root / "queries" / value["namespace"]
+                    if directory.resolve() != directory:
+                        raise ValueError("query directory contains a symlink")
+                    guard = native.StoreGuard.acquire(str(self.allocations / f"{value['namespace']}.lock"), True, True)
                     if guard is None:
                         continue
+                # Neither recursive deletion nor query cleanup callbacks may
+                # hold allocation.lock. The external lease lock survives even
+                # a partial rmtree, and the allocation keeps charging quota.
+                if directory.exists():
                     shutil.rmtree(directory)
-                record.unlink()
+                self._retire(record, value, guard)
             except (OSError, IOException):
                 # A failed orphan cleanup must not fail another query's
                 # heartbeat or admission. Keep its external allocation (and
@@ -202,15 +245,38 @@ class StorePool:
                     guard.close()
 
     def collect_expired(self) -> None:
-        with store_lock(self.root / "allocation.lock"):
-            self._collect()
+        self._collect(self._candidates())
+
+    def request_collection(self) -> None:
+        # One background collector per pool: a heartbeat must keep renewing
+        # even when an unrelated deletion exceeds that query's lease duration.
+        with self._collection_lock:
+            if self._collection_error is not None:
+                error, self._collection_error = self._collection_error, None
+                raise error
+            if self._collection_thread is not None and self._collection_thread.is_alive():
+                return
+            candidates = self._candidates()
+            if not candidates:
+                return
+
+            def collect() -> None:
+                try:
+                    self._collect(candidates)
+                except BaseException as error:
+                    with self._collection_lock:
+                        self._collection_error = error
+
+            self._collection_thread = threading.Thread(target=collect, name="vane-fte-orphan-cleanup", daemon=True)
+            self._collection_thread.start()
 
     def reserve(self, query_id: str) -> QueryStoreLease:
         from vane._native import execution_runtime as native
 
         _label(query_id, "query_id")
+        self.request_collection()
         with store_lock(self.root / "allocation.lock"):
-            self._collect()
+            self._check()
             records = self._records()
             if (
                 len(records) >= 4096
@@ -228,13 +294,15 @@ class StorePool:
             }
             directory = self.root / "queries" / namespace
             directory.mkdir(mode=0o700)
-            guard = native.StoreGuard.acquire(str(directory / "lease.lock"), False, True)
+            lock_path = self.allocations / f"{namespace}.lock"
+            guard = native.StoreGuard.acquire(str(lock_path), False, True)
             assert guard is not None
             try:
                 _publish(self.allocations / f"{namespace}.json", value)
             except BaseException:
                 guard.close()
-                shutil.rmtree(directory)
+                directory.rmdir()  # Not published to any native participant.
+                lock_path.unlink()
                 raise
             return QueryStoreLease(self, value, guard)
 
@@ -248,7 +316,10 @@ class QueryStoreLease:
     def __init__(self, pool: StorePool, value: dict[str, Any], guard: Any) -> None:
         self.pool, self.value, self.guard = pool, value, guard
         self.directory = pool.root / "queries" / value["namespace"]
+        self.lock_path = pool.allocations / f"{value['namespace']}.lock"
+        self._close_lock = threading.Lock()
         self.exclusive = False
+        self.closing = False
         self.closed = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -259,9 +330,9 @@ class QueryStoreLease:
         }
 
     def renew(self) -> None:
-        if self.closed:
-            return
         with store_lock(self.pool.root / "allocation.lock"):
+            if self.closed or self.closing:
+                return
             record = self.pool.allocations / f"{self.value['namespace']}.json"
             current = _read(record)
             if current["lease_id"] != self.value["lease_id"] or current["expires"] <= time.time():
@@ -272,28 +343,46 @@ class QueryStoreLease:
     def close(self, cleanup: Callable[[], None]) -> None:
         from vane._native import execution_runtime as native
 
-        if self.closed:
-            return
-        with store_lock(self.pool.root / "allocation.lock"):
-            record = self.pool.allocations / f"{self.value['namespace']}.json"
-            if not record.exists() and not self.directory.exists():
-                self.guard.close()
-                self.closed = True
+        with self._close_lock:
+            if self.closed:
                 return
-            if _read(record)["lease_id"] != self.value["lease_id"]:
-                raise RuntimeError("query storage lease changed before cleanup")
-            if not self.exclusive and self.directory.exists():
-                self.guard.close()
-                self.guard = native.StoreGuard.acquire(str(self.directory / "lease.lock"), True, True)
-                if self.guard is None:
-                    self.guard = native.StoreGuard.acquire(str(self.directory / "lease.lock"), False, False)
-                    assert self.guard is not None
-                    raise StorageCleanupPending("native storage participants still hold query leases")
-                self.exclusive = True
+            collected = False
+            with store_lock(self.pool.root / "allocation.lock"):
+                self.pool._check()
+                record = self.pool.allocations / f"{self.value['namespace']}.json"
+                if not record.exists() and not self.directory.exists():
+                    self.guard.close()
+                    collected = True
+                else:
+                    current = _read(record)
+                    if current["lease_id"] != self.value["lease_id"]:
+                        raise RuntimeError("query storage lease changed before cleanup")
+                    # Fence late native arrivals, including after a failed
+                    # retirement releases the lock for later retries.
+                    self.closing = True
+                    current["expires"] = min(current["expires"], time.time())
+                    replace_metadata(record, current)
+                    if not self.exclusive:
+                        self.guard.close()
+                        guard = native.StoreGuard.acquire(str(self.lock_path), True, True)
+                        if guard is None:
+                            shared = native.StoreGuard.acquire(str(self.lock_path), False, False)
+                            if shared is not None:
+                                self.guard = shared
+                            # An orphan collector may already own the exclusive
+                            # lock; keep the closed handle valid for close retry.
+                            raise StorageCleanupPending("native storage participants still hold query leases")
+                        self.guard = guard
+                        self.exclusive = True
+            # Even if an orphan collector finished first, release this
+            # coordinator's in-memory accounting through its cleanup callback.
             cleanup()
-            if self.directory.exists():
-                shutil.rmtree(self.directory)
-            record.unlink()
-            _sync_directory(self.pool.allocations)
-            self.guard.close()
+            if not collected:
+                if self.directory.exists():
+                    shutil.rmtree(self.directory)
+                try:
+                    self.pool._retire(record, self.value, self.guard)
+                finally:
+                    self.guard.close()
+                    self.exclusive = False
             self.closed = True

@@ -3,6 +3,7 @@
 
 #include "file_snapshot.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mbedtls_wrapper.hpp"
@@ -84,15 +85,20 @@ string FrozenFilePath(ClientContext &context, const string &source, const string
 	if (!fs.IsPathAbsolute(source) || !fs.IsPathAbsolute(directory) || directory.find('=') != string::npos) {
 		throw InvalidInputException("FTE snapshot paths must be absolute; the store prefix cannot contain '='");
 	}
-	auto original = paths::u8path(source).lexically_normal();
 	auto root = paths::u8path(directory).lexically_normal();
-	// Resolving before normalization distinguishes symlink/../file from a
-	// different file with the same lexical path. Keep the reference's directory
-	// layout below this namespace so Hive keys retain their original meaning.
+	// Physical identity and Hive values are distinct: parent traversal may
+	// remove a directory from the physical path while Hive still reads its key.
 	Hash source_hash;
 	auto identity = UTF8Path(paths::weakly_canonical(paths::u8path(source)));
 	source_hash.AddBytes(reinterpret_cast<const_data_ptr_t>(identity.data()), identity.size());
-	return UTF8Path(root / Finish(source_hash) / original.relative_path());
+	auto target = root / Finish(source_hash);
+	// Parse before normalization, using the same first-key-wins and escaping
+	// rules as binding, pruning and execution. Parse only returns directory
+	// components, so each key=value segment is safe to append without traversal.
+	for (auto &part : HivePartitioning::Parse(source)) {
+		target /= paths::u8path(part.first + "=" + part.second);
+	}
+	return UTF8Path(target / "data.parquet");
 }
 
 FrozenFile FreezeFile(ClientContext &context, const string &source, const string &target, idx_t remaining) {
@@ -101,8 +107,8 @@ FrozenFile FreezeFile(ClientContext &context, const string &source, const string
 	auto input = fs.OpenFile(source, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
 	CheckFile(*input);
 	auto destination = paths::u8path(target);
-	// Preserve original hive key=value directories, without introducing new
-	// partition keys. Filename virtual columns are rejected during validation.
+	// Filename virtual columns are rejected during validation. Only the Hive
+	// values extracted from the original reference are encoded in this path.
 	if (paths::weakly_canonical(destination) != destination) {
 		throw InvalidInputException("FTE snapshot path contains a symlink");
 	}

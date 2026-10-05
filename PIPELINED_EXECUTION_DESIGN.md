@@ -491,9 +491,9 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 [file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制、核对源文件两次 SHA-256 与元数据，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
 
-冻结路径保留原路径中的 Hive 分区目录。虚拟 filename 与 file_index 列明确拒绝，物理同名列正常保留。冻结发生在统计信息剪枝之前，被优化成 EMPTY_RESULT 的 scan 仍保留 source dependency。`vane.parquet-snapshot:1` split 携带冻结文件 SHA-256/长度，worker prepare/start 校验内容与精确文件状态。原文件覆盖、删除或 glob 新增成员不改变重试输入；冻结副本缺失/损坏则失败。
+冻结路径编码从原始文件引用解析出的 Hive 分区键和值；解析发生在任何路径规范化之前。虚拟 filename 与 file_index 列明确拒绝，物理同名列正常保留。冻结发生在统计信息剪枝之前，被优化成 EMPTY_RESULT 的 scan 仍保留 source dependency。`vane.parquet-snapshot:1` split 携带冻结文件 SHA-256/长度，worker prepare/start 校验内容与精确文件状态。原文件覆盖、删除或 glob 新增成员不改变重试输入；冻结副本缺失/损坏则失败。
 
-展开后的文件通过 scan 的原生 dependency 作为确定文件列表交给 Binder，校验与路径参数逐项一致后构造 SimpleMultiFileList；冻结路径中的 `*`、`?`、`[]` 不再作为 glob 解释。普通查询仍按原规则展开路径。快照按实际目标路径去重，别名复用副本但保留每次扫描引用；目标命名同时包含解析后的源路径哈希和原引用的目录结构，防止 symlink/`..` 产生相同规范化路径时误合并不同文件，并保留 Hive 分区语义。
+展开后的文件通过 scan 的原生 dependency 作为确定文件列表交给 Binder，校验与路径参数逐项一致后构造 SimpleMultiFileList；冻结路径中的 `*`、`?`、`[]` 不再作为 glob 解释。普通查询仍按原规则展开路径。快照目标由解析后的物理源路径哈希、原始引用的 Hive 分区键值和固定文件名组成。Hive 键值直接使用原生 HivePartitioning::Parse 的首次键优先及编码规则，例如 `part=42/../` 仍表示分区 42。同一物理文件、相同分区键值的别名复用副本并保留重复扫描；不同分区值保留独立副本并分别计费。symlink/`..` 解析到不同物理文件时也不会误合并。
 
 [fte_plan.py](vane/execution/fte_plan.py) 将不可变 QuerySpec、固定 split assignment、partition 与实际上游 StageManifest 指纹组成输入身份。每次 attempt 使用相同身份；不重新编译 SQL，不重新展开 glob，也不替换已提交对象。
 
@@ -503,11 +503,13 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 [StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量，exchange 按各对象最大长度预留。失败 attempt 未清理完成时继续占用配额。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
 
-每个查询具有随机 namespace、lease_id 和有限到期时间。coordinator 独立线程续租；worker 与 ResultService 独立线程检查 lease/fence，过期即取消 native 执行并清理。所有 native 参与者持有查询共享锁，attempt 另有 I/O 锁。删除必须取得独占锁；Unix 使用 open-description flock，Windows 使用 LockFileEx，不能用会被同进程其他 close 释放的进程级锁替代。
+每个查询具有随机 namespace、lease_id 和有限到期时间。coordinator 独立线程续租；worker 与 ResultService 独立线程检查 lease/fence，过期即取消 native 执行并清理。所有 native 参与者持有查询共享锁，attempt 另有 I/O 锁。查询锁位于数据目录外的 `allocations/<namespace>.lock`，不会被递归删除带走。删除必须取得独占锁；Unix 使用 open-description flock，Windows 使用 LockFileEx，不能用会被同进程其他 close 释放的进程级锁替代。
 
 query 配额记录位于对象目录外，部分删除失败不会丢失计费记录。actor 死亡通知可能先于进程释放锁，清理对此提供有限宽限；仍不能取得锁时保留 CleanupPending，调用方可以重试 close。文件提供者不能中断内核阻塞的文件 I/O，因此不承诺任意存储故障下的物理清理时限。RPC/线程等待有期限，不能因此先释放仍在使用的对象。
 
-每次准入、活跃查询心跳和 worker orphan 清理都会扫描过期租约；没有活跃参与者时，可由服务调用 `StorePool.collect_expired()` 或等下一次准入回收。租约使用墙钟，部署要求节点时钟同步；存储要求共享可见性、跨进程 advisory lock、原子创建/替换和 sync。coordinator 丢失会终止查询并回收 orphan，不恢复查询或接管旧提交账本。
+全局 `allocation.lock` 仅保护配额和租约元数据：扫描候选后，在全局锁内再次检查有效期并取得查询独占锁，释放全局锁后删除数据，最后重新进入全局锁核对 lease_id 并移除查询锁及 allocation。整个删除期间继续计费，其他回收者即使看到数据目录已消失，也必须先取得查询独占锁。普通 close 的清理回调和递归删除同样在全局锁外；close 先使租约过期，阻止迟到的 native 参与者，清理失败保留所有权与配额。
+
+每次准入和活跃查询心跳请求后台回收；每个 StorePool 同时至多运行一个后台清理线程，慢删除不阻塞续租或有剩余容量的新查询。尚未清理的 allocation 继续占用容量，容量不足时准入明确拒绝，可在回收完成后重试。worker orphan 清理以及显式 `StorePool.collect_expired()` 可以同步回收，但仍不占用全局锁执行删除。租约使用墙钟，部署要求节点时钟同步；存储要求共享可见性、跨进程 advisory lock、原子创建/替换和 sync。coordinator 丢失会终止查询并回收 orphan，不恢复查询或接管旧提交账本。
 
 单个过期目录的加锁或删除 I/O 失败按目录隔离，继续回收其他 orphan；未删除的外部 allocation 保留配额，后续心跳或准入重试，有剩余容量时仍允许新查询。当前查询续租失败、存储身份变化及元数据损坏仍按原契约报错。
 

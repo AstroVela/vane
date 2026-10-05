@@ -5,8 +5,10 @@
 
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -108,15 +110,21 @@ def test_cleanup_failure_retains_external_allocation_record(tmp_path):
     store = pool(tmp_path)
     lease = store.reserve("query")
 
-    # A partial deletion can remove the query's metadata and lock file. The
-    # capacity record lives outside that directory and must survive it.
+    # Query data can be removed before cleanup fails. Both the lease lock and
+    # allocation live outside that directory and must survive the deletion.
+    (lease.directory / "object.mat").write_bytes(b"partial")
+
     def fail_after_partial_delete():
-        (lease.directory / "lease.lock").unlink()
+        (lease.directory / "object.mat").unlink()
+        assert lease.lock_path.exists()
         raise OSError("storage unavailable")
 
     with pytest.raises(OSError, match="storage unavailable"):
         lease.close(fail_after_partial_delete)
     assert store.snapshot()["reserved_bytes"] == 2048
+    lease.renew()  # Closing cannot revive a lease for new native participants.
+    with pytest.raises(RuntimeError, match="being cleaned"):
+        ActiveStoreLease(lease.to_dict())
     lease.close(lambda: None)
     assert store.snapshot()["reserved_bytes"] == 0
 
@@ -157,6 +165,7 @@ def test_orphan_cleanup_failure_is_isolated_charged_and_retried(tmp_path, monkey
     store = pool(tmp_path, capacity_bytes=3 * 2048)
     blocked, removable = store.reserve("blocked"), store.reserve("removable")
     blocked_record = store.allocations / f"{blocked.value['namespace']}.json"
+    (blocked.directory / "object.mat").write_bytes(b"partial")
     for lease in (blocked, removable):
         record = store.allocations / f"{lease.value['namespace']}.json"
         replace_metadata(record, {**lease.value, "expires": time.time() - 1})
@@ -166,13 +175,13 @@ def test_orphan_cleanup_failure_is_isolated_charged_and_retried(tmp_path, monkey
         acquire, rmtree, unlink = native.StoreGuard.acquire, shutil.rmtree, Path.unlink
 
         def fail_lock(path, exclusive, create):
-            if Path(path).parent == blocked.directory:
+            if Path(path) == blocked.lock_path:
                 raise IOException("orphan lock unavailable")
             return acquire(path, exclusive, create)
 
         def fail_partial_delete(path, *args, **kwargs):
             if Path(path) == blocked.directory:
-                (blocked.directory / "lease.lock").unlink(missing_ok=True)
+                (blocked.directory / "object.mat").unlink(missing_ok=True)
                 raise PermissionError("orphan deletion denied")
             return rmtree(path, *args, **kwargs)
 
@@ -197,7 +206,11 @@ def test_orphan_cleanup_failure_is_isolated_charged_and_retried(tmp_path, monkey
             live.renew()
             with pytest.raises(RuntimeError, match="capacity"):
                 store.reserve("full")
-        store.collect_expired()
+        deadline = time.monotonic() + 5
+        while blocked_record.exists():
+            store.collect_expired()
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
         assert not blocked.directory.exists()
         assert not blocked_record.exists()
         assert store.snapshot() == {"queries": 2, "reserved_bytes": 4096}
@@ -206,3 +219,72 @@ def test_orphan_cleanup_failure_is_isolated_charged_and_retried(tmp_path, monkey
             if lease is not None:
                 lease.close(lambda: None)
     assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+
+
+@pytest.mark.parametrize("cleanup", ["orphan", "close_delete", "close_callback"])
+def test_slow_cleanup_keeps_renewal_admission_and_quota_independent(tmp_path, monkeypatch, cleanup):
+    store, other = pool(tmp_path, capacity_bytes=6144), pool(tmp_path, capacity_bytes=6144)
+    victim, live = store.reserve("victim"), other.reserve("live")
+    if cleanup == "orphan":
+        record = store.allocations / f"{victim.value['namespace']}.json"
+        replace_metadata(record, {**victim.value, "expires": time.time() - 1})
+        victim.guard.close()
+    entered, release = Event(), Event()
+    rmtree = shutil.rmtree
+
+    def pause():
+        entered.set()
+        assert release.wait(15), "test did not release slow cleanup"
+
+    def slow_delete(path, *args, **kwargs):
+        result = rmtree(path, *args, **kwargs)
+        if Path(path) == victim.directory:
+            # Even removing the entire tree cannot remove the lease lock and
+            # allow a competing collector to release this owner's quota.
+            pause()
+        return result
+
+    extra = None
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(1) as executor:
+            if cleanup != "close_callback":
+                patch.setattr(shutil, "rmtree", slow_delete)
+
+            def clean():
+                if cleanup == "orphan":
+                    store.collect_expired()
+                else:
+                    victim.close(pause if cleanup == "close_callback" else lambda: None)
+
+            future = executor.submit(clean)
+            try:
+                assert entered.wait(5)
+                assert native.StoreGuard.acquire(str(victim.lock_path), True, False) is None
+                started = time.monotonic()
+                live.renew()
+                other.collect_expired()  # A second pool cannot steal cleanup.
+                extra = other.reserve("new")
+                assert other.snapshot() == {"queries": 3, "reserved_bytes": 6144}
+                with pytest.raises(RuntimeError, match="capacity"):
+                    other.reserve("full")
+                with pytest.raises(RuntimeError, match="being cleaned"):
+                    ActiveStoreLease(victim.to_dict())
+                if cleanup == "orphan":
+                    with pytest.raises(RuntimeError, match="participants"):
+                        victim.close(lambda: pytest.fail("cleanup must wait for its exclusive lock"))
+                assert time.monotonic() - started < 2
+                assert not future.done()
+            finally:
+                release.set()
+                future.result(timeout=5)
+            if cleanup == "orphan":
+                callbacks = []
+                victim.close(lambda: callbacks.append(True))
+                assert callbacks == [True]  # Still clear coordinator memory after peer collection.
+    finally:
+        release.set()
+        for lease in (victim, live, extra):
+            if lease is not None:
+                lease.close(lambda: None)
+    assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+    assert list(store.allocations.glob("*.lock")) == []
