@@ -1,0 +1,3410 @@
+{
+  "schema": 1,
+  "build": {
+    "baseline_commit": "9ee791a625b50a571e0939c7bc4e6b1ebc52e244",
+    "created_epoch": 1791214913.6652896,
+    "flags": "GCC 13.3.0 Release -O3 -DNDEBUG, static SQLite 3.53.2, libfuse 3.14.0",
+    "free_bytes": 32503197696,
+    "baseline_source_sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2",
+    "baseline_binary_sha256": {
+      "baseline-cli": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b",
+      "baseline-mount": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    },
+    "optimized_source_sha256": "9fbe2d0e3d0ce83d592b2410fb7cc979605c99aa740c64ca8571d16e646d256b",
+    "optimized_binary_sha256": {
+      "optimized-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4",
+      "optimized-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+    },
+    "configuration": {
+      "baseline_checkpoint_pages": 1000,
+      "optimized_checkpoint_pages": 4096,
+      "synchronous": "FULL",
+      "metadata_ttl_seconds": 60,
+      "live_file_data": "direct_io; no writeback",
+      "page_cache_kib": 2000
+    }
+  },
+  "io_comparison": {
+    "started_epoch": 1791215981.8022807,
+    "data_root": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0",
+    "config": {
+      "runs": 3,
+      "cache_state": "hot",
+      "environment": "local",
+      "drop_caches_command": "",
+      "small_count": 32,
+      "stat_count": 128,
+      "dir_large_count": 128,
+      "large_mib": 64,
+      "random_reads": 4096,
+      "macro_files": 16,
+      "macro_total_mib": 1,
+      "git_clone_mode": "local",
+      "keep_workdirs": false
+    },
+    "build": {
+      "baseline_commit": "9ee791a625b50a571e0939c7bc4e6b1ebc52e244",
+      "created_epoch": 1791214913.6652896,
+      "flags": "GCC 13.3.0 Release -O3 -DNDEBUG, static SQLite 3.53.2, libfuse 3.14.0",
+      "free_bytes": 32503197696,
+      "baseline_source_sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2",
+      "baseline_binary_sha256": {
+        "baseline-cli": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b",
+        "baseline-mount": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+      },
+      "optimized_source_sha256": "9fbe2d0e3d0ce83d592b2410fb7cc979605c99aa740c64ca8571d16e646d256b",
+      "optimized_binary_sha256": {
+        "optimized-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4",
+        "optimized-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+      },
+      "configuration": {
+        "baseline_checkpoint_pages": 1000,
+        "optimized_checkpoint_pages": 4096,
+        "synchronous": "FULL",
+        "metadata_ttl_seconds": 60,
+        "live_file_data": "direct_io; no writeback",
+        "page_cache_kib": 2000
+      }
+    },
+    "scope": "Three paired repetitions, alternating order, fresh database per variant/repetition. Production live FUSE with direct_io and FULL synchronous WAL; metadata TTL 60 s for both variants; hot OS cache. Agent-owned builds/tests finished before measurement; unrelated builds and services were active on the shared host. Sequential write includes flush/fsync/close. Fixture preparation and validation are untimed.",
+    "free_bytes_before": 32431026176,
+    "samples": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "seconds": 1.4910149589995854,
+        "bytes": 67108864,
+        "mib_s": 42.92378128985479
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "seconds": 0.07621951602050103,
+        "bytes": 67108864,
+        "mib_s": 839.6799578573248
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "seconds": 0.24192098499042913,
+        "bytes": 16777216,
+        "mib_s": 66.13729685596721
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "seconds": 1.33295821401407,
+        "bytes": 67108864,
+        "mib_s": 48.01350809585427
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "seconds": 0.08003266199375503,
+        "bytes": 67108864,
+        "mib_s": 799.6735133587576
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "seconds": 0.26018296799156815,
+        "bytes": 16777216,
+        "mib_s": 61.49518595897683
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "seconds": 1.3598790030227974,
+        "bytes": 67108864,
+        "mib_s": 47.06301064854892
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "seconds": 0.08010467598796822,
+        "bytes": 67108864,
+        "mib_s": 798.9546079633709
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "seconds": 0.2452569239831064,
+        "bytes": 16777216,
+        "mib_s": 65.23770966442562
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "seconds": 1.4873510369798169,
+        "bytes": 67108864,
+        "mib_s": 43.02951919807514
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "seconds": 0.07438402099069208,
+        "bytes": 67108864,
+        "mib_s": 860.3998432406408
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "seconds": 0.23885244599659927,
+        "bytes": 16777216,
+        "mib_s": 66.9869631572783
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "seconds": 1.48553069299669,
+        "bytes": 67108864,
+        "mib_s": 43.082246837253734
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "seconds": 0.07871305500157177,
+        "bytes": 67108864,
+        "mib_s": 813.0798632923347
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "seconds": 0.2428186959878076,
+        "bytes": 16777216,
+        "mib_s": 65.89278446995445
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "seconds": 1.3721487229922786,
+        "bytes": 67108864,
+        "mib_s": 46.6421743704528
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "seconds": 0.08109655097359791,
+        "bytes": 67108864,
+        "mib_s": 789.1827609393163
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "seconds": 0.2471111940103583,
+        "bytes": 16777216,
+        "mib_s": 64.74817971754577
+      }
+    ],
+    "validated_files": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      }
+    ],
+    "owned_processes": [
+      {
+        "pid": 3907643,
+        "name": "baseline-0",
+        "returncode": 0,
+        "unmount_seconds": 0.03616965402034111
+      },
+      {
+        "pid": 3907919,
+        "name": "optimized-0",
+        "returncode": 0,
+        "unmount_seconds": 0.11816349701257423
+      },
+      {
+        "pid": 3908194,
+        "name": "optimized-1",
+        "returncode": 0,
+        "unmount_seconds": 0.11836764300824143
+      },
+      {
+        "pid": 3908457,
+        "name": "baseline-1",
+        "returncode": 0,
+        "unmount_seconds": 0.11848534300224856
+      },
+      {
+        "pid": 3909109,
+        "name": "baseline-2",
+        "returncode": 0,
+        "unmount_seconds": 0.035722951986826956
+      },
+      {
+        "pid": 3909485,
+        "name": "optimized-2",
+        "returncode": 0,
+        "unmount_seconds": 0.8197594780067448
+      }
+    ],
+    "cleanup": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1.sqlite",
+        "bytes": 240648192,
+        "sha256": "93e905ff2615b1d4f27be0a43549cec86fb4942407d6f146fc33dba8c7126fc7"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0.sqlite",
+        "bytes": 240648192,
+        "sha256": "25ec1f74c846e4d6e6707a36b7d0387243adee59fcb58ad2be7a07217a622def"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2.sqlite",
+        "bytes": 240648192,
+        "sha256": "d6742d972b8d4c9dbf027052f4c2eba42fee86086b6a9ab7b0a37b0ac0262cc3"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0.sqlite",
+        "bytes": 240648192,
+        "sha256": "4ff433ee2562f214264b987ad892ab8dea8601be8e3a172063e2108c334110cc"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2.sqlite",
+        "bytes": 240648192,
+        "sha256": "f12f06af977623818c1490cfa0221329d9e790402b71005b4e62e02f40c44422"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1.sqlite",
+        "bytes": 240648192,
+        "sha256": "fac215b8652fe4ebccd2b726b0983b676434428e995d8b452eec2249c0b60f65"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      }
+    ],
+    "wal_sizes": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "bytes": 5450792
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "bytes": 17983832
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "bytes": 18152752
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "bytes": 18189832
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "bytes": 17983832
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "bytes": 18152752
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "bytes": 18189832
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "bytes": 5450792
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "bytes": 5450792
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "bytes": 17983832
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "bytes": 18152752
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "bytes": 18189832
+      }
+    ],
+    "upstream_commit": "3334e43d47e00d1411c32defe837a87a969d1e56",
+    "upstream_sha256": "352cce87372ea37aba28da8a9fb06ace1b9ff1b5060d8733cdfa0c7260d96629",
+    "binary_sha256": {
+      "baseline-mount": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a",
+      "baseline-cli": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b",
+      "optimized-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719",
+      "optimized-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4"
+    },
+    "patch_sha256": "d4e0d954c1dcff2f31a6f79146dd392a88dfe563a49e39a9fd087672366f5474",
+    "medians_mib_s": {
+      "baseline": {
+        "sequential_write": 43.02951919807514,
+        "sequential_read": 839.6799578573248,
+        "random_read_4k": 66.13729685596721
+      },
+      "optimized": {
+        "sequential_write": 47.06301064854892,
+        "sequential_read": 798.9546079633709,
+        "random_read_4k": 64.74817971754577
+      }
+    },
+    "status": "PASS",
+    "ended_epoch": 1791216032.6739564,
+    "owned_mounts_remaining": [],
+    "database_checks": [
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-1.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-0.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-2.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/baseline-0.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-2.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      {
+        "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-data-3k1huss0/optimized-1.sqlite",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ]
+      }
+    ],
+    "cleanup_removed": true,
+    "free_bytes_after": 32429977600
+  },
+  "diagnostics": {
+    "64_mib": {
+      "scope": "Diagnostic only: unchanged 9ee791a625 core with per-connection settings on disposable databases. All variants use FULL; native writes reproduce 1048528+48 FUSE splitting. Linker wrappers count syncs and SQL, so timings include instrumentation. Checkpoint and close costs are also recorded.",
+      "started_epoch": 1791215083.8997707,
+      "runs": [
+        {
+          "variant": "baseline",
+          "repetition": 0,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.45846,
+              "user_seconds": 0.499576,
+              "system_seconds": 0.281037,
+              "sync_calls": 191,
+              "sync_seconds": 0.752181,
+              "cache_hits": 358594,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00218977
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 1.05551
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000198126,
+                "step_seconds": 0.24414918400000002,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00400052,
+              "user_seconds": 6.8e-05,
+              "system_seconds": 0.002029,
+              "sync_calls": 2,
+              "sync_seconds": 0.00205549,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0592372,
+              "user_seconds": 0.040134,
+              "system_seconds": 0.019088,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 8.4317e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000252976
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044302495000000004,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0111565,
+              "user_seconds": 0.001228,
+              "system_seconds": 0.000129,
+              "sync_calls": 6,
+              "sync_seconds": 0.0101013,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.2839e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0084852
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00022775400000000002,
+                "step_seconds": 0.000101748,
+                "finalize_seconds": 5.912e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.47361702
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 0,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.30548,
+              "user_seconds": 0.470545,
+              "system_seconds": 0.251055,
+              "sync_calls": 140,
+              "sync_seconds": 0.645042,
+              "cache_hits": 358624,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00227466
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 0.916676
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000238983,
+                "step_seconds": 0.236828079,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0712086,
+              "user_seconds": 0.009025,
+              "system_seconds": 0.031071,
+              "sync_calls": 2,
+              "sync_seconds": 0.037458,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0595349,
+              "user_seconds": 0.033658,
+              "system_seconds": 0.02588,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 8.998e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000268997
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044217286,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0107499,
+              "user_seconds": 0.000267,
+              "system_seconds": 0.001182,
+              "sync_calls": 6,
+              "sync_seconds": 0.00961133,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3058e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00792553
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000216317,
+                "step_seconds": 9.8054e-05,
+                "finalize_seconds": 6.2721e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.3874385
+        },
+        {
+          "variant": "cache",
+          "repetition": 0,
+          "checkpoint_pages": 1000,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.42656,
+              "user_seconds": 0.475807,
+              "system_seconds": 0.267793,
+              "sync_calls": 191,
+              "sync_seconds": 0.757821,
+              "cache_hits": 358675,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00240522
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 1.05469
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00019542599999999998,
+                "step_seconds": 0.231648048,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00415755,
+              "user_seconds": 9.2e-05,
+              "system_seconds": 0.002073,
+              "sync_calls": 2,
+              "sync_seconds": 0.00215936,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0605973,
+              "user_seconds": 0.034721,
+              "system_seconds": 0.02588,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 0.00010615
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000323147
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.045154331,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0191061,
+              "user_seconds": 0.001623,
+              "system_seconds": 0.000368,
+              "sync_calls": 6,
+              "sync_seconds": 0.0174475,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 5.103e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0157908
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000285725,
+                "step_seconds": 0.00011651499999999999,
+                "finalize_seconds": 6.2848e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.4498236500000001
+        },
+        {
+          "variant": "both",
+          "repetition": 0,
+          "checkpoint_pages": 4096,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.33036,
+              "user_seconds": 0.475653,
+              "system_seconds": 0.259285,
+              "sync_calls": 140,
+              "sync_seconds": 0.667708,
+              "cache_hits": 358705,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00245001
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 0.935148
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000180235,
+                "step_seconds": 0.24607832,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0748865,
+              "user_seconds": 0.003137,
+              "system_seconds": 0.041667,
+              "sync_calls": 2,
+              "sync_seconds": 0.0362688,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0599237,
+              "user_seconds": 0.037967,
+              "system_seconds": 0.021959,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 9.4336e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000257327
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044502945999999995,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0106089,
+              "user_seconds": 0.001102,
+              "system_seconds": 0.000681,
+              "sync_calls": 6,
+              "sync_seconds": 0.0091484,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3934e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00755028
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00022432300000000001,
+                "step_seconds": 0.000102261,
+                "finalize_seconds": 6.6375e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.4158553999999999
+        },
+        {
+          "variant": "both",
+          "repetition": 1,
+          "checkpoint_pages": 4096,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.26587,
+              "user_seconds": 0.451358,
+              "system_seconds": 0.249218,
+              "sync_calls": 140,
+              "sync_seconds": 0.623151,
+              "cache_hits": 358705,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00240087
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 0.88743
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000198083,
+                "step_seconds": 0.236466104,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0708593,
+              "user_seconds": 0.007748,
+              "system_seconds": 0.038236,
+              "sync_calls": 2,
+              "sync_seconds": 0.0372164,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.059256,
+              "user_seconds": 0.042216,
+              "system_seconds": 0.017043,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 8.9434e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000254481
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044121101999999995,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0198157,
+              "user_seconds": 0.000793,
+              "system_seconds": 0.00088,
+              "sync_calls": 6,
+              "sync_seconds": 0.0184755,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3576e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0168606
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000232339,
+                "step_seconds": 0.000102127,
+                "finalize_seconds": 5.6225e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.3565450000000001
+        },
+        {
+          "variant": "cache",
+          "repetition": 1,
+          "checkpoint_pages": 1000,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.41999,
+              "user_seconds": 0.4794,
+              "system_seconds": 0.269318,
+              "sync_calls": 191,
+              "sync_seconds": 0.745609,
+              "cache_hits": 358675,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00232907
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 1.03983
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000197071,
+                "step_seconds": 0.23812229799999998,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00404506,
+              "user_seconds": 0.0001,
+              "system_seconds": 0.002048,
+              "sync_calls": 2,
+              "sync_seconds": 0.00207439,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0598586,
+              "user_seconds": 0.035921,
+              "system_seconds": 0.02394,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 9.7131e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000269605
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044428761,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0179817,
+              "user_seconds": 0.001634,
+              "system_seconds": 0.000371,
+              "sync_calls": 6,
+              "sync_seconds": 0.0163972,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.581e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0147172
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000232924,
+                "step_seconds": 0.00010545,
+                "finalize_seconds": 8.5673e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.44201676
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 1,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.3401,
+              "user_seconds": 0.477623,
+              "system_seconds": 0.274219,
+              "sync_calls": 140,
+              "sync_seconds": 0.663498,
+              "cache_hits": 358624,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00234146
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 0.953638
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00019882599999999998,
+                "step_seconds": 0.238582986,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0706671,
+              "user_seconds": 0.003752,
+              "system_seconds": 0.041977,
+              "sync_calls": 2,
+              "sync_seconds": 0.0349141,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0589653,
+              "user_seconds": 0.035991,
+              "system_seconds": 0.022978,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 0.000102817
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000287563
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.043644664,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0190385,
+              "user_seconds": 0.000479,
+              "system_seconds": 0.001336,
+              "sync_calls": 6,
+              "sync_seconds": 0.0176233,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 4.5217e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0158427
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000283359,
+                "step_seconds": 0.000110676,
+                "finalize_seconds": 8.743e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.4298056000000001
+        },
+        {
+          "variant": "baseline",
+          "repetition": 1,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 7.68834,
+              "user_seconds": 0.520226,
+              "system_seconds": 0.286635,
+              "sync_calls": 191,
+              "sync_seconds": 6.95888,
+              "cache_hits": 358594,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00274346
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 7.27712
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00038217,
+                "step_seconds": 0.251639922,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00363275,
+              "user_seconds": 0,
+              "system_seconds": 0.001657,
+              "sync_calls": 2,
+              "sync_seconds": 0.00216987,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0612121,
+              "user_seconds": 0.036134,
+              "system_seconds": 0.025081,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 9.8583e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000284072
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.046131511,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.422069,
+              "user_seconds": 0.001195,
+              "system_seconds": 0.000686,
+              "sync_calls": 6,
+              "sync_seconds": 0.420544,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 4.6159e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.345475
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000285185,
+                "step_seconds": 0.0001205,
+                "finalize_seconds": 7.115e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 8.11404175
+        },
+        {
+          "variant": "baseline",
+          "repetition": 2,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 6.86772,
+              "user_seconds": 0.554668,
+              "system_seconds": 0.271672,
+              "sync_calls": 191,
+              "sync_seconds": 6.11839,
+              "cache_hits": 358594,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00263353
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 6.43309
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000369218,
+                "step_seconds": 0.26072255699999997,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00321355,
+              "user_seconds": 0.000258,
+              "system_seconds": 0.00115,
+              "sync_calls": 2,
+              "sync_seconds": 0.00194946,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0582225,
+              "user_seconds": 0.039164,
+              "system_seconds": 0.019062,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 8.3076e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.0002556
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.043681586,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0185814,
+              "user_seconds": 0,
+              "system_seconds": 0.001502,
+              "sync_calls": 6,
+              "sync_seconds": 0.0173976,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.7197e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0156975
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00024041499999999998,
+                "step_seconds": 0.000107466,
+                "finalize_seconds": 8.6624e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 6.889514950000001
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 2,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.56681,
+              "user_seconds": 0.453143,
+              "system_seconds": 0.259752,
+              "sync_calls": 140,
+              "sync_seconds": 0.926243,
+              "cache_hits": 358624,
+              "cache_misses": 88,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00247061
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 1.18486
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000201831,
+                "step_seconds": 0.234116256,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0709349,
+              "user_seconds": 0.006246,
+              "system_seconds": 0.036051,
+              "sync_calls": 2,
+              "sync_seconds": 0.0343251,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0604689,
+              "user_seconds": 0.039279,
+              "system_seconds": 0.021192,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 0.000109001
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000340473
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.045316357999999994,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0104536,
+              "user_seconds": 0.000415,
+              "system_seconds": 0.001022,
+              "sync_calls": 6,
+              "sync_seconds": 0.00934074,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.4028e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0077643
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000221403,
+                "step_seconds": 9.9527e-05,
+                "finalize_seconds": 6.7439e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.6481985000000001
+        },
+        {
+          "variant": "cache",
+          "repetition": 2,
+          "checkpoint_pages": 1000,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.44522,
+              "user_seconds": 0.483129,
+              "system_seconds": 0.304095,
+              "sync_calls": 191,
+              "sync_seconds": 0.733945,
+              "cache_hits": 358675,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.0023225
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 1.0459
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00016929,
+                "step_seconds": 0.249253798,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00417326,
+              "user_seconds": 8.6e-05,
+              "system_seconds": 0.002089,
+              "sync_calls": 2,
+              "sync_seconds": 0.00220863,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0608015,
+              "user_seconds": 0.037455,
+              "system_seconds": 0.023281,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 0.00010142
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000283244
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.044728161,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0107931,
+              "user_seconds": 0.00195,
+              "system_seconds": 0,
+              "sync_calls": 6,
+              "sync_seconds": 0.00920707,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.5062e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00749836
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00025232900000000003,
+                "step_seconds": 0.000122641,
+                "finalize_seconds": 8.8323e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.46018636
+        },
+        {
+          "variant": "both",
+          "repetition": 2,
+          "checkpoint_pages": 4096,
+          "cache_kib": 8192,
+          "total_mib": 64,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 1.29215,
+              "user_seconds": 0.472719,
+              "system_seconds": 0.222339,
+              "sync_calls": 140,
+              "sync_seconds": 0.649827,
+              "cache_hits": 358705,
+              "cache_misses": 7,
+              "cache_writes": 21433,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 128,
+                  "seconds": 0.00218996
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 128,
+                  "seconds": 0.908918
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 67584,
+                "vm_steps": 1978624,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000225354,
+                "step_seconds": 0.240026172,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0688764,
+              "user_seconds": 0.007614,
+              "system_seconds": 0.032459,
+              "sync_calls": 2,
+              "sync_seconds": 0.035051,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.0580781,
+              "user_seconds": 0.038043,
+              "system_seconds": 0.02002,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 805,
+              "cache_misses": 2574,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 64,
+                  "seconds": 9.279e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 64,
+                  "seconds": 0.000271773
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 16704,
+                "vm_steps": 267711,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.043419317,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0122336,
+              "user_seconds": 0.000543,
+              "system_seconds": 0.001215,
+              "sync_calls": 6,
+              "sync_seconds": 0.0108099,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3302e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00916887
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000223777,
+                "step_seconds": 9.7189e-05,
+                "finalize_seconds": 8.9427e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 1.37326
+        }
+      ],
+      "cleanup": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-0.sqlite",
+          "bytes": 80297984,
+          "sha256": "387fc8bfc92646941db2d5c0110ba813803d6de801a77ba20187942198f6e937"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-0.sqlite",
+          "bytes": 80297984,
+          "sha256": "78a2469904d0069612c49b49358e45cc746243a2d0ea9f3b62d5919838a1f03b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-0.sqlite",
+          "bytes": 80297984,
+          "sha256": "a9def343acf722cc4d05710d86a1d521d9e94cf45f3d47d4ca7e116f68ebdaf7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-0.sqlite",
+          "bytes": 80297984,
+          "sha256": "d5a5d2e048fac680f49c973d719dd934f5effec3259ece7f532ece76810ad91b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-1.sqlite",
+          "bytes": 80297984,
+          "sha256": "c16279dc57bfe479b683992c4c5f0f0725f58a83c453539419245ce53f854441"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-1.sqlite",
+          "bytes": 80297984,
+          "sha256": "817094d5e741598a0ec77634ae0e5c87ca54fe7f1498eccbba157969379df6e0"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-1.sqlite",
+          "bytes": 80297984,
+          "sha256": "d646b41c28452c3a67aabb406db9e9ae6e268ad5ec3f4d9d070fcb807b36f093"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-1.sqlite",
+          "bytes": 80297984,
+          "sha256": "c562748cea2dddaa1263a9c4476c67e841914eea2c6d15c40ca1238215d9b049"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/baseline-2.sqlite",
+          "bytes": 80297984,
+          "sha256": "c15137a39cf0be86e5f0f28e02418cfe133d12e848ae3f17c9f920dcd631e3d8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-2.sqlite",
+          "bytes": 80297984,
+          "sha256": "8868b7481ff0132940eb1a4f7cce9b857eb50d8ecc00b50ef2291bfa1143cc77"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/checkpoint-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-2.sqlite",
+          "bytes": 80297984,
+          "sha256": "79b727f0455123da173bd34849d0864776d9a9598424318bda42cd464b164ec3"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/cache-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-2.sqlite",
+          "bytes": 80297984,
+          "sha256": "61c61b23476f35a7d0d92ea1c80d159b66f4f83261cb2a13c8e571f1dbc9e0b1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe-v3k6w7uk/both-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        }
+      ],
+      "status": "PASS",
+      "cleanup_removed": true,
+      "ended_epoch": 1791215120.4077852,
+      "raw_report": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe-results.json",
+        "sha256": "741090f615366525fa55e97291cdfee37f53165ed9dd26695add5d6867be6113"
+      }
+    },
+    "256_mib": {
+      "scope": "Diagnostic only: unchanged 9ee791a625 core with per-connection settings on disposable databases. All variants use FULL; native writes reproduce 1048528+48 FUSE splitting. Linker wrappers count syncs and SQL, so timings include instrumentation. Checkpoint and close costs are also recorded.",
+      "started_epoch": 1791215276.2036846,
+      "runs": [
+        {
+          "variant": "baseline",
+          "repetition": 0,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 6.12998,
+              "user_seconds": 2.1975,
+              "system_seconds": 1.16125,
+              "sync_calls": 767,
+              "sync_seconds": 3.09882,
+              "cache_hits": 1583271,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.0101757
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 4.39339
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00019306800000000002,
+                "step_seconds": 1.07987255,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00431983,
+              "user_seconds": 0.000167,
+              "system_seconds": 0.00212,
+              "sync_calls": 2,
+              "sync_seconds": 0.00221668,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.241203,
+              "user_seconds": 0.144951,
+              "system_seconds": 0.09622,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.00041048
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.00126572
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.177475995,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0102218,
+              "user_seconds": 0,
+              "system_seconds": 0.001424,
+              "sync_calls": 6,
+              "sync_seconds": 0.00911262,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3527e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00758506
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000230357,
+                "step_seconds": 0.000103067,
+                "finalize_seconds": 5.1608e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 6.14452163
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 0,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 5.54888,
+              "user_seconds": 2.05816,
+              "system_seconds": 1.11547,
+              "sync_calls": 569,
+              "sync_seconds": 2.66641,
+              "cache_hits": 1583397,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.0100544
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 3.89906
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000228586,
+                "step_seconds": 1.03022865,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.057741,
+              "user_seconds": 0.002173,
+              "system_seconds": 0.032953,
+              "sync_calls": 2,
+              "sync_seconds": 0.0284627,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.243618,
+              "user_seconds": 0.149663,
+              "system_seconds": 0.093922,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.000394403
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.00118017
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.181569645,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0192136,
+              "user_seconds": 0.000238,
+              "system_seconds": 0.001145,
+              "sync_calls": 6,
+              "sync_seconds": 0.0181272,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3114e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0165764
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000219683,
+                "step_seconds": 9.9263e-05,
+                "finalize_seconds": 5.3426e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 5.625834599999999
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 1,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 5.54025,
+              "user_seconds": 1.99682,
+              "system_seconds": 1.09768,
+              "sync_calls": 569,
+              "sync_seconds": 2.74764,
+              "cache_hits": 1583397,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.00974027
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 3.94339
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000204957,
+                "step_seconds": 1.000804268,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0493434,
+              "user_seconds": 0.003311,
+              "system_seconds": 0.022756,
+              "sync_calls": 2,
+              "sync_seconds": 0.0278686,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.229135,
+              "user_seconds": 0.146039,
+              "system_seconds": 0.083021,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.000342072
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.000960893
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.170962201,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0101694,
+              "user_seconds": 0,
+              "system_seconds": 0.001394,
+              "sync_calls": 6,
+              "sync_seconds": 0.00906166,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3814e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00741765
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000225964,
+                "step_seconds": 9.9204e-05,
+                "finalize_seconds": 5.9461e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 5.599762800000001
+        },
+        {
+          "variant": "baseline",
+          "repetition": 1,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 6.0245,
+              "user_seconds": 2.12395,
+              "system_seconds": 1.14809,
+              "sync_calls": 767,
+              "sync_seconds": 3.07057,
+              "cache_hits": 1583271,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.00977903
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 4.3068
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000224613,
+                "step_seconds": 1.07059593,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00333807,
+              "user_seconds": 0,
+              "system_seconds": 0.001505,
+              "sync_calls": 2,
+              "sync_seconds": 0.0020159,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.232266,
+              "user_seconds": 0.152195,
+              "system_seconds": 0.080074,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.00033289
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.000970389
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.173755979,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0100923,
+              "user_seconds": 0.000376,
+              "system_seconds": 0.00112,
+              "sync_calls": 6,
+              "sync_seconds": 0.0088846,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 4.3274e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00731272
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000277134,
+                "step_seconds": 0.000143695,
+                "finalize_seconds": 5.9569e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 6.03793037
+        },
+        {
+          "variant": "baseline",
+          "repetition": 2,
+          "checkpoint_pages": 1000,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 11.2698,
+              "user_seconds": 2.14363,
+              "system_seconds": 1.13262,
+              "sync_calls": 767,
+              "sync_seconds": 8.31394,
+              "cache_hits": 1583271,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.00965434
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 9.55877
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000427597,
+                "step_seconds": 1.07024585,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.00321564,
+              "user_seconds": 0,
+              "system_seconds": 0.001505,
+              "sync_calls": 2,
+              "sync_seconds": 0.00189763,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.237058,
+              "user_seconds": 0.155037,
+              "system_seconds": 0.08201,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.000364616
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.00104715
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.175839203,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.018187,
+              "user_seconds": 0.000877,
+              "system_seconds": 0.000467,
+              "sync_calls": 6,
+              "sync_seconds": 0.0171444,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.3232e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.0154855
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000215986,
+                "step_seconds": 9.6732e-05,
+                "finalize_seconds": 6.0885e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 11.29120264
+        },
+        {
+          "variant": "checkpoint",
+          "repetition": 2,
+          "checkpoint_pages": 4096,
+          "cache_kib": 2000,
+          "total_mib": 256,
+          "phases": [
+            {
+              "phase": "write",
+              "seconds": 5.58481,
+              "user_seconds": 2.11982,
+              "system_seconds": 1.11018,
+              "sync_calls": 569,
+              "sync_seconds": 2.6911,
+              "cache_hits": 1583397,
+              "cache_misses": 430,
+              "cache_writes": 86131,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 512,
+                  "seconds": 0.0103652
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 512,
+                  "seconds": 3.86049
+                }
+              ],
+              "sql_totals": {
+                "prepares": 7,
+                "steps": 270336,
+                "vm_steps": 7914496,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.00020463,
+                "step_seconds": 1.07639633,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "checkpoint",
+              "seconds": 0.0558993,
+              "user_seconds": 0.007366,
+              "system_seconds": 0.027197,
+              "sync_calls": 2,
+              "sync_seconds": 0.0268804,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 0,
+                "vm_steps": 0,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "hot_read",
+              "seconds": 0.242195,
+              "user_seconds": 0.161125,
+              "system_seconds": 0.08104,
+              "sync_calls": 0,
+              "sync_seconds": 0,
+              "cache_hits": 3483,
+              "cache_misses": 10327,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN",
+                  "count": 256,
+                  "seconds": 0.000411077
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 256,
+                  "seconds": 0.00111497
+                }
+              ],
+              "sql_totals": {
+                "prepares": 0,
+                "steps": 66816,
+                "vm_steps": 1070847,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0,
+                "step_seconds": 0.177827215,
+                "finalize_seconds": 0
+              }
+            },
+            {
+              "phase": "close",
+              "seconds": 0.0111248,
+              "user_seconds": 0,
+              "system_seconds": 0.001813,
+              "sync_calls": 6,
+              "sync_seconds": 0.0096747,
+              "cache_hits": 0,
+              "cache_misses": 0,
+              "cache_writes": 0,
+              "exec": [
+                {
+                  "text": "BEGIN IMMEDIATE",
+                  "count": 3,
+                  "seconds": 3.4846e-05
+                },
+                {
+                  "text": "COMMIT",
+                  "count": 3,
+                  "seconds": 0.00808737
+                }
+              ],
+              "sql_totals": {
+                "prepares": 11,
+                "steps": 19,
+                "vm_steps": 298,
+                "fullscan_steps": 0,
+                "prepare_seconds": 0.000223555,
+                "step_seconds": 0.000102707,
+                "finalize_seconds": 6.6001e-05
+              }
+            }
+          ],
+          "write_and_tail_seconds": 5.6518341
+        }
+      ],
+      "cleanup": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-0.sqlite",
+          "bytes": 321040384,
+          "sha256": "f9d0e57efc4db046c8949e2976b23351c664d85df4b4c7c15ac5b1abe39b211a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-0.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-0.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-0.sqlite",
+          "bytes": 321040384,
+          "sha256": "a3a3a14e99ca9a36580d13e8ba2c1bae1cec017ac27da07337ddff7c6d7af0da"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-1.sqlite",
+          "bytes": 321040384,
+          "sha256": "789756f312fec3254be56b347489c65a5f2ad0ae16802af2ea62c4db490a0d8c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-1.sqlite",
+          "bytes": 321040384,
+          "sha256": "6c84891b8a0f96473640e5b6826f1b6ebaf736d9392a9e3ea43f722ff2a21abc"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-1.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-1.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/baseline-2.sqlite",
+          "bytes": 321040384,
+          "sha256": "1786ce456b6cdacd36a5873c67e199da537bd6455a303fcd04dc1f2f1f26965a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-2.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-2.sqlite",
+          "bytes": 321040384,
+          "sha256": "7180b7a329df77d7be4a91d46915ef4806c2f095810c6b60345a2b5f19f5d908"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/owned-probe256-npxt8eua/checkpoint-2.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "status": "PASS",
+      "cleanup_removed": true,
+      "ended_epoch": 1791215327.985944,
+      "raw_report": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe256-results.json",
+        "sha256": "fc49c8fdac675b529f973b245c1de78b537549474d044b5cbd29b998c14740af"
+      }
+    }
+  },
+  "validation": {
+    "python": {
+      "passed": 111,
+      "command": "PATH=\"$PWD/.venv/bin:$PATH\" VANE_FS_MOUNT_BINARY=\"$PWD/vane_fs/build/core/vane-fs-mount\" scripts/run_installed_pytest.sh \"$PWD/vane_fs/tests\" --rootdir=\"$PWD/vane_fs\" -q"
+    },
+    "native": {
+      "passed_per_build": 3,
+      "builds": [
+        "Release",
+        "ASan/UBSan"
+      ],
+      "commands": [
+        "ctest --test-dir vane_fs/build/core --output-on-failure",
+        "ASAN_OPTIONS=detect_leaks=1 ctest --test-dir vane_fs/build/sanitize --output-on-failure"
+      ]
+    },
+    "fuse_sanitizer": {
+      "passed": 4,
+      "deselected": 15,
+      "command": "PATH=\"$PWD/.venv/bin:$PATH\" ASAN_OPTIONS=detect_leaks=1 VANE_FS_MOUNT_BINARY=\"$PWD/vane_fs/build/sanitize/vane-fs-mount\" scripts/run_installed_pytest.sh \"$PWD/vane_fs/tests/test_fuse.py\" --rootdir=\"$PWD/vane_fs\" -q -k \"acknowledged_write or mount_crash\"",
+      "logged_diagnostics": false,
+      "limitation": "Process-kill cases do not simulate hardware power loss; SIGKILL prevents exit-time leak diagnostics."
+    },
+    "scope": "Only affected component tests; no full repository suite.",
+    "crash_payload_bytes": [
+      4096,
+      4194304,
+      20971520
+    ],
+    "test_source_sha256": "590f01c11b9b1cd8ed73c50a38f630c298209bcef017218c9da3c726b7d49d3f"
+  },
+  "limitations": [
+    "Shared host with unrelated jobs; no owned builds/tests overlap measurement.",
+    "Passive checkpoint trigger is not a WAL size cap.",
+    "FULL per-mutation commits remain; write commit count is unchanged.",
+    "Read medians decline in these FUSE samples; closing costs and outliers are retained.",
+    "Diagnostic timings include linker-wrapper overhead and are not FUSE throughput."
+  ],
+  "local_artifact_hashes": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_acknowledged_write_surviv0.log",
+      "bytes": 796,
+      "sha256": "cf84a2c05b9f5305b7bedc7ddf57ed1e7b14dd78776f2fd16bd9ef1336feb9a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_acknowledged_write_surviv1.log",
+      "bytes": 1331,
+      "sha256": "3136dc6b610e7557e17eb4b4a58d3f02c419b4d194d7fa134e7d45a857223a73"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_acknowledged_write_surviv2.log",
+      "bytes": 3475,
+      "sha256": "ab59542a90caa6fc12daf6a11724835178faed37529a02656d46d995d86b3e85"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_acknowledged_write_survivcurrent.log",
+      "bytes": 3475,
+      "sha256": "ab59542a90caa6fc12daf6a11724835178faed37529a02656d46d995d86b3e85"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_mount_crash_reclaims_orph0.log",
+      "bytes": 1782,
+      "sha256": "dc3551392530a380a9cc151ca3c11027267d731572361bdfb0b51ff37a7ef187"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/asan-test_mount_crash_reclaims_orphcurrent.log",
+      "bytes": 1782,
+      "sha256": "dc3551392530a380a9cc151ca3c11027267d731572361bdfb0b51ff37a7ef187"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-cli",
+      "bytes": 1702552,
+      "sha256": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-mount",
+      "bytes": 1743544,
+      "sha256": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/baseline-workspace.cpp",
+      "bytes": 74588,
+      "sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/build.json",
+      "bytes": 1080,
+      "sha256": "ba6e5e226c66f392b373cae8d65ab9aaf5fc4f00b47187dfbba49130e7d606f5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/core-ctest.log",
+      "bytes": 2031,
+      "sha256": "813d154a9cf7a2b37b93e4547a065762683ed994d712c70659a4358070728508"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimization.patch",
+      "bytes": 814,
+      "sha256": "d4e0d954c1dcff2f31a6f79146dd392a88dfe563a49e39a9fd087672366f5474"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimized-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimized-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimized-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimized-cli",
+      "bytes": 1702552,
+      "sha256": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/optimized-mount",
+      "bytes": 1743544,
+      "sha256": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe-results.json",
+      "bytes": 301961,
+      "sha256": "741090f615366525fa55e97291cdfee37f53165ed9dd26695add5d6867be6113"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe256-results.json",
+      "bytes": 151273,
+      "sha256": "fc49c8fdac675b529f973b245c1de78b537549474d044b5cbd29b998c14740af"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe256_run.py",
+      "bytes": 2463,
+      "sha256": "7b8f0ef02898e1af76fd256340ad1f88279545c01e33e8eef8988a3799d9d117"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/probe_run.py",
+      "bytes": 2494,
+      "sha256": "5610c1f2c5bb09d8765203e609584e5201d5994fe2611e73d21cd25751a79703"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/results.json",
+      "bytes": 21405,
+      "sha256": "c1a71c37fbc36f7b29d30c94ddc0da81f466f8401ea187eebd1fcafc67339bba"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/run.log",
+      "bytes": 2973,
+      "sha256": "4e8bd566c468c182829bdd022cfd496b1a26c7c2807b2d60367364cc10fae765"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/run.py",
+      "bytes": 7934,
+      "sha256": "333bf98db7a363b403d166115ace5f65bc401b31cbfc2285f5a1df15543ce441"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/sanitize-ctest.log",
+      "bytes": 2055,
+      "sha256": "6699ebc3d8dd85b8e85c8490bed643dbccad93108c3b3217b3385d4151e0e43d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/validation.json",
+      "bytes": 1259,
+      "sha256": "70d45f53f96c4f29aa7976d6d39eaa89d4bf507a91c6071808cb77668ef257f2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/write-probe",
+      "bytes": 1742064,
+      "sha256": "8983a9d0a19017c766ad48104cd14465f3a914cf0c085b642285e4e051a2bf2e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/write-optimization-20261005/write_probe.cpp",
+      "bytes": 7553,
+      "sha256": "a3405e54dba69f87eee16434639b1ada28d5d29f8430e74579e9f8277f3e36ee"
+    }
+  ],
+  "cleanup_removed_database_bytes": 4334493696
+}

@@ -211,6 +211,15 @@ longer retention without holding a SQLite transaction for an entire query.
 The [synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous)
 describes the durability tradeoff; weakening it must be an explicit option.
 
+Each connection triggers a passive WAL checkpoint at 4,096 pages (16 MiB with
+the default 4 KiB pages), amortizing checkpoint syncs across more commits than
+SQLite's default 1,000-page threshold. Every mutation still synchronizes its
+WAL commit before returning. The threshold is not a size limit: a transaction
+can exceed it and active readers can delay checkpoint progress. Larger WALs
+also increase recovery/closing work and can affect reads; see the
+[checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) and SQLite's
+[checkpoint documentation](https://www.sqlite.org/wal.html#checkpointing).
+
 The native build and runtime require SQLite 3.51.3 or later. The pinned build
 uses 3.53.2, independent of the Python runtime's SQLite version. See the
 [official WAL-reset notice](https://www.sqlite.org/wal.html#walresetbug).

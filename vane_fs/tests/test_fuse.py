@@ -416,6 +416,32 @@ def test_mount_crash_reclaims_orphans_and_preserves_committed_data(tmp_path):
         workspace.collect_garbage()
 
 
+@pytest.mark.parametrize("size", [4096, 4 * 1024 * 1024, 20 * 1024 * 1024])
+def test_acknowledged_write_survives_mount_crash_without_fsync_or_close(tmp_path, size):
+    database = tmp_path / "workspace.sqlite"
+    payload = bytes(range(256)) * (size // 256)
+    with Workspace(database) as workspace:
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, process):
+            fd = os.open(point / "committed", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                assert os.write(fd, payload) == len(payload)
+                # No fsync, flush, close, or subsequent filesystem operation
+                # can help persist the write before the mount is killed.
+                process.kill()
+                process.wait(timeout=10)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    assert error.errno in (errno.ENOTCONN, errno.EIO)
+        recovered = workspace.recover_owners()
+        assert recovered.owners == recovered.mounts == 1
+        assert workspace.checkout().read("/committed") == payload
+        workspace.collect_garbage()
+        with workspace.open_snapshot(workspace.snapshot()) as snapshot:
+            assert snapshot.read("/committed") == payload
+
+
 def test_mount_rejects_database_inside_mountpoint(tmp_path):
     point = tmp_path / "mount"
     point.mkdir()

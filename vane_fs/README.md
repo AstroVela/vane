@@ -97,6 +97,11 @@ write and namespace/attribute mutation commits with `synchronous=FULL` before
 replying; kernel writeback is disabled, and `fsync` has no deferred application
 data to flush.
 
+Automatic WAL checkpoints trigger at 4,096 pages (16 MiB with default pages).
+This amortizes checkpoint syncs while each mutation retains its FULL commit.
+The threshold is not a WAL size limit; active readers can delay checkpoint
+progress, and closing a connection may need to complete remaining work.
+
 The first inode reference persists a pin; intermediate opens and releases update
 exact counts in a connection-private in-memory SQLite table. The final release
 removes the pin and reclaims an orphan atomically. Temporary counts participate
@@ -417,3 +422,8 @@ The [inode reference measurements](benchmarks/REFERENCE_OPTIMIZATION.md) record
 directory and Git workloads after moving exact reference counts into
 connection-private memory, while retaining durable first/last pins and FULL
 file-mutation commits. They include rollback/lifetime tests and syscall counts.
+
+The [WAL checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) record
+sequential-write gains, read and WAL-size tradeoffs, and closing costs after
+raising the automatic checkpoint threshold. Crash tests verify acknowledged
+writes survive a killed mount without an intervening fsync or close.

@@ -25,6 +25,7 @@
 namespace vane_fs {
 namespace {
 constexpr int64_t BLOCK_SIZE = 4096;
+constexpr int WAL_CHECKPOINT_PAGES = 4096;
 constexpr int APPLICATION_ID = 0x56465331;
 
 [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
@@ -693,6 +694,9 @@ public:
 					Fail(ErrorCode::Storage, "Could not enable SQLite WAL");
 				}
 			}
+			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
+			// Every mutation still synchronizes its WAL commit before returning.
+			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
 			Exec(db, "BEGIN IMMEDIATE");
 			ValidateIdentity();
 			Initialize();
