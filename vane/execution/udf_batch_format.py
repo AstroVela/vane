@@ -462,7 +462,9 @@ def _numpy_column_to_arrow(value: np.ndarray, column_schema: _OutputColumnSchema
 def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: bool = False) -> pa.Array:
     """Encode declared containers, retaining source leaf types for DuckDB casts."""
     if _is_fixed_shape_tensor(dtype):
-        return _tensor_values_to_arrow(values, _OutputColumnSchema(name="nested Tensor", tensor_type=dtype))
+        return _tensor_values_to_arrow(
+            values, _OutputColumnSchema(name="nested Tensor", tensor_type=dtype), from_pandas=from_pandas
+        )
     nan_is_null = pa.types.is_nested(dtype) and not pa.types.is_union(dtype)
     rows = [
         None
@@ -566,7 +568,7 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
         if column_schema.image_dtype is not None:
             arrays.append(_image_values_to_arrow(series.tolist(), column_schema))
         elif column_schema.tensor_type is not None:
-            arrays.append(_tensor_values_to_arrow(series.tolist(), column_schema))
+            arrays.append(_pandas_tensor_to_arrow(series, column_schema))
         elif column_schema.container_type is not None and not isinstance(series.dtype, _import_pandas().ArrowDtype):
             arrays.append(_container_values_to_arrow(series, column_schema.container_type, from_pandas=True))
         elif series.dtype == object:
@@ -574,6 +576,35 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
         else:
             arrays.append(pa.array(series, from_pandas=True))
     return pa.Table.from_arrays(arrays, names=[column.name for column in schema])
+
+
+def _pandas_tensor_to_arrow(series: Any, column_schema: _OutputColumnSchema) -> pa.Array | pa.ChunkedArray:
+    if not isinstance(series.dtype, _import_pandas().ArrowDtype) or not _is_fixed_shape_tensor(
+        series.dtype.pyarrow_dtype
+    ):
+        return _tensor_values_to_arrow(series.tolist(), column_schema, from_pandas=True)
+
+    tensor_type = column_schema.tensor_type
+    assert tensor_type is not None
+    source_type = series.dtype.pyarrow_dtype
+    if (
+        source_type.shape != tensor_type.shape
+        or source_type.permutation not in (None, list(range(len(tensor_type.shape))))
+        or source_type.dim_names is not None
+    ):
+        raise ValueError(f"tensor output column {column_schema.name!r} must use its declared Arrow tensor metadata")
+    # pandas' scalar iteration exposes flat storage lists, losing tensor shape.
+    # Use its Arrow protocol instead, retaining chunks, offsets and validity.
+    column = pa.array(series)
+    if source_type == tensor_type:
+        return column
+    chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+    # Convert logical rows through the checked Tensor encoder. A direct storage
+    # cast also visits sliced-out values and payloads hidden by NULL tensor rows.
+    return pa.chunked_array(
+        [_tensor_values_to_arrow(_arrow_column_to_numpy(pa.chunked_array([chunk])), column_schema) for chunk in chunks],
+        type=tensor_type,
+    )
 
 
 def _image_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> pa.Array:
@@ -605,14 +636,14 @@ def _validate_output_names(actual_names: list[Any], schema: _OutputSchema) -> No
         raise ValueError(f"map_batches output columns do not match schema; missing={missing}, extra={extra}")
 
 
-def _tensor_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> pa.Array:
+def _tensor_values_to_arrow(values: Any, column_schema: _OutputColumnSchema, *, from_pandas: bool = False) -> pa.Array:
     tensor_type = column_schema.tensor_type
     assert tensor_type is not None
     shape = tuple(int(dim) for dim in tensor_type.shape)
     if np.ma.isMaskedArray(values):  # type: ignore[no-untyped-call]
-        return _masked_tensor_values_to_arrow(values, column_schema, shape)
+        return _masked_tensor_values_to_arrow(values, column_schema, shape, from_pandas=from_pandas)
     if isinstance(values, np.ndarray) and values.ndim == len(shape) + 1 and values.dtype != object:
-        return _dense_tensor_values_to_arrow(values, column_schema, shape)
+        return _dense_tensor_values_to_arrow(values, column_schema, shape, from_pandas=from_pandas)
 
     rows = list(values)
     storage_rows: list[pa.Array] = []
@@ -636,7 +667,9 @@ def _tensor_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> 
             raise ValueError(
                 f"tensor output column {column_schema.name!r} row {index} has shape {tensor.shape}, expected {shape}"
             )
-        storage_rows.append(_dense_tensor_values_to_arrow(tensor[np.newaxis], column_schema, shape).storage)
+        storage_rows.append(
+            _dense_tensor_values_to_arrow(tensor[np.newaxis], column_schema, shape, from_pandas=from_pandas).storage
+        )
     storage = pa.concat_arrays(storage_rows) if storage_rows else pa.array([], type=tensor_type.storage_type)
     return pa.ExtensionArray.from_storage(tensor_type, storage)
 
@@ -645,13 +678,15 @@ def _masked_tensor_values_to_arrow(
     values: np.ma.MaskedArray,
     column_schema: _OutputColumnSchema,
     shape: tuple[int, ...],
+    *,
+    from_pandas: bool = False,
 ) -> pa.Array:
     if len(values) == 0:
-        return _dense_tensor_values_to_arrow(np.asarray(values.data), column_schema, shape)
+        return _dense_tensor_values_to_arrow(np.asarray(values.data), column_schema, shape, from_pandas=from_pandas)
     if values.ndim == 1 and values.dtype == object:
         row_mask = np.ma.getmaskarray(values)  # type: ignore[no-untyped-call]
         rows = [None if row_mask[index] else values.data[index] for index in range(len(values))]
-        return _tensor_values_to_arrow(rows, column_schema)
+        return _tensor_values_to_arrow(rows, column_schema, from_pandas=from_pandas)
 
     if values.ndim != len(shape) + 1 or tuple(values.shape[1:]) != shape:
         raise ValueError(f"tensor output column {column_schema.name!r} has shape {values.shape[1:]}, expected {shape}")
@@ -669,16 +704,18 @@ def _masked_tensor_values_to_arrow(
             "only whole tensor rows may be null"
         )
     if not masked_rows.any():
-        return _dense_tensor_values_to_arrow(np.asarray(values.data), column_schema, shape)
+        return _dense_tensor_values_to_arrow(np.asarray(values.data), column_schema, shape, from_pandas=from_pandas)
 
     rows = [None if masked_rows[index] else np.asarray(values.data[index]) for index in range(len(values))]
-    return _tensor_values_to_arrow(rows, column_schema)
+    return _tensor_values_to_arrow(rows, column_schema, from_pandas=from_pandas)
 
 
 def _dense_tensor_values_to_arrow(
     values: np.ndarray,
     column_schema: _OutputColumnSchema,
     shape: tuple[int, ...],
+    *,
+    from_pandas: bool = False,
 ) -> pa.Array:
     tensor_type = column_schema.tensor_type
     assert tensor_type is not None
@@ -700,6 +737,10 @@ def _dense_tensor_values_to_arrow(
     # Infer the source type first: constructing a typed Arrow array from Python
     # floats can truncate even with safe=True. Casting checks the original data.
     flat = contiguous.reshape(-1)
+    if from_pandas and flat.dtype == object:
+        flat = np.array(
+            [None if _is_null_object_value(value, nan_is_null=False) else value for value in flat], dtype=object
+        )
     if (
         flat.dtype == object
         and pa.types.is_integer(tensor_type.value_type)
