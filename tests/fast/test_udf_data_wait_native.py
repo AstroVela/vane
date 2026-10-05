@@ -181,7 +181,8 @@ def test_native_later_query_waits_for_a_slow_consumer_view(native_environment, l
 
     def retain_view(executor):
         result = take_result(executor)
-        if result is not None and not isinstance(result[2], BaseException):
+        # A successful stream also returns a terminal envelope with no payload.
+        if result is not None and result[2] is not None and not isinstance(result[2], BaseException):
             views.extend(ref.to_table() for ref in result[2][1])
         return result
 
@@ -192,6 +193,7 @@ def test_native_later_query_waits_for_a_slow_consumer_view(native_environment, l
             with monkeypatch.context() as consumer:
                 consumer.setattr(udf_subprocess.UDFExecutor, "take_ready_result", retain_view)
                 result = runtime.request().execute(first, {}, conn=first_cursor)
+            assert len(views) == 1
             retained = runtime.resource_snapshot()["data"]["usage_bytes"]
             assert retained > 0
             request = runtime.request()

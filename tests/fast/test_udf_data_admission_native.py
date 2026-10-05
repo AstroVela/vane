@@ -22,11 +22,37 @@ from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
 def _wait_result(executor):
     deadline = time.monotonic() + 15
+    blocks = []
     while time.monotonic() < deadline:
         result = executor.take_ready_result()
         if result is not None:
+            tagged = (
+                isinstance(result, tuple) and len(result) in (3, 4) and result[0] == ref_bundle.SUBMIT_RESULT_MARKER
+            )
+            untagged = isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool)
+            if (tagged and len(result) == 4 and result[3] is False) or (untagged and result[1] is False):
+                blocks.append(result[2] if tagged else result[0])
+                continue
+            if blocks:
+                terminal = result[2] if tagged else result[0] if untagged else result
+                if isinstance(terminal, BaseException):
+                    for block in blocks:
+                        for ref in block[1]:
+                            ref.release()
+                else:
+                    assert terminal is None
+                    output = (
+                        ref_bundle.REF_BUNDLE_RESULT_MARKER,
+                        [ref for block in blocks for ref in block[1]],
+                        [meta for block in blocks for meta in block[2]],
+                        blocks[0][3],
+                    )
+                    return (result[0], result[1], output) if tagged else output
             return result
         time.sleep(0.01)
+    for block in blocks:
+        for ref in block[1]:
+            ref.release()
     raise TimeoutError("byte-admitted subprocess did not finish")
 
 
@@ -513,6 +539,10 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
             else:
                 executor.submit_with_id(submit_id, pa.table({"x": [1]}))
             assert executor._wait_for_pending_futures(15)
+            # A published block can precede a failure completing its task.
+            block = executor.take_ready_result()
+            assert (block[1] if submit_id is None else block[3]) is False
+            _release_local_ref_bundle_result(block)
             result = executor.take_ready_result()
             error = result if submit_id is None else result[2]
             assert isinstance(error, OSError)
@@ -524,7 +554,7 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
         assert executor.request_task_admission(8)
         executor.submit_with_id(2, pa.table({"x": [2]}))
         assert executor._wait_for_pending_futures(15)
-        result = executor.take_ready_result()
+        result = _wait_result(executor)
         assert not isinstance(result[2], BaseException)
         _release_local_ref_bundle_result(result)
     finally:

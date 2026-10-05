@@ -1418,6 +1418,90 @@ path. Common tests exercise that owner against both local and Ray managers.
 Strict retained-byte admission and output-completion reservations are described
 below. Data accounting alone preserves the observational behavior above.
 
+## Reusable local output storage
+
+Local subprocess workers write output into a bounded shared-memory arena owned
+by the parent process. Workers share the arena and cache its mapping across
+tasks. Allocations carry a generation so a stale descriptor cannot refer to a
+later output that reuses the same offset. Multiple output blocks can share one
+allocation; its space becomes reusable only after every block is released.
+Large allocations use size classes with at most 6.25% rounding overhead, so
+small IPC metadata changes between batches do not strand a nearly usable slot.
+Physical capacity includes this rounding.
+
+Storage ownership is independent of transport admission. Input acknowledgments
+may return transport credit, but do not release physical buffers. Before sending
+an input, the parent registers a read lease for the receiving worker. Arrow and
+NumPy views retain this lease through the underlying buffer owner, including
+views saved in actor state after a task returns. Last-buffer notifications use a
+separate channel so they can arrive while the task channel waits for an output
+grant. A disconnected channel does not release a worker's buffers: cleanup must
+first confirm that the process exited. Failed process cleanup retains ownership
+for retry.
+
+When a UDF forks, the worker also pins all live remote input leases, including
+views retained by an earlier invocation. Last-buffer notifications wait for the
+inheriting child and its descendants to exit or exec. One lifetime pipe per
+worker, transferred at startup, lets the parent retain outstanding input regions
+even if the worker exits before those descendants. Worker shutdown transfers
+these leases to arena pins; they keep preventing reuse and page reclamation
+until the inherited writers close. Ordinary batches do not allocate additional
+descriptors. Worker-client cleanup and inherited input finalizers check the
+creator PID before touching locks, release queues, or sockets, so a fork child's
+normal exit cannot shut down its parent's release channel.
+
+`VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
+`auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
+available `/dev/shm` space when the store is created. Pages are populated on use;
+the arena's virtual size is not its resident memory. Each worker maps the entire
+arena on first use and retains that mapping across tasks. Processes using
+`RLIMIT_AS` must leave room for this mapping in addition to their heap and IPC
+buffers; set `VANE_LOCAL_SHM_STORE_BYTES` explicitly when testing within a fixed
+address-space allowance. This limit is separate from
+`VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
+outputs, not model heap or the existing input/control allocations. When live
+buffers or fragmentation prevent an allocation, the task receives an explicit
+capacity error instead of waiting while holding input buffers. Release retained
+views or increase the store capacity before retrying.
+
+On Linux, closing the last worker decommits wholly free pages. Returned Arrow
+views remain valid after runtime shutdown; the arena closes after the last view
+is released. Cleanup failures retain the store for retry. Normal interpreter
+exit unlinks arenas owned by that process even when views remain alive, without
+invalidating their mappings for later exit callbacks. Forked children do not
+reclaim inherited parent allocations or arenas. Allocation-lease release and
+arena cleanup check the owning PID before acquiring locks, including releases
+from block-ref finalizers and retained-view destructors. This prevents a child's
+stale free list from decommitting pages subsequently allocated by the parent.
+After `os.fork()`, the child starts with an empty output-store registry and a
+new registry lock. New workers allocate from child-owned arenas. Inherited
+stores and allocation leases reject new allocations, borrows, and buffer access
+before taking any inherited lock; they cannot reuse the parent's copied free
+list. Parent-owned results and already materialized views keep their existing
+ownership and cleanup rules. Worker-peer cleanup also checks its creator PID
+before taking locks or shutting down the release channel, so inherited executor
+finalizers cannot close the parent's live channel when a fork child exits.
+Before a driver forks, its live allocations gain process-lifetime pins. The
+parent cannot reuse these regions or decommit their pages after releasing its
+own Arrow or NumPy views. An inherited pipe writer keeps the pins alive until
+the child and any inheriting descendants exit or replace their address space
+with `exec`; this includes normal exit, `os._exit()`, and signal termination.
+These pins conservatively last for the inheriting processes' lifetimes even if
+they drop the views earlier, and count against the physical arena capacity.
+Allocation and cleanup paths collect completed pins synchronously; a background
+watcher also drains idle stores. Fork preparation uses a separate allocation
+mutation lock without acquiring registry, store, or lease locks. Automatic
+cyclic GC is paused before acquiring that mutation lock and restored after the
+last owner or waiter leaves. This prevents Arrow/NumPy view finalizers from
+taking store or lease locks in reverse order inside the mutation critical
+section. Nested acquisitions preserve the caller's original GC setting; the
+fork child discards parent-thread pause counts before restoring its own GC
+setting after registry reset. If notification setup fails, the affected regions
+remain pinned until owner-process exit, rather than being reused without proof
+that inherited views are gone.
+`vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
+live allocation bytes, allocation counts, and reuse counts for diagnostics.
+
 ## Strict shared-memory byte admission
 
 Pass `data_limit` to reserve a complete input/output envelope before each UDF
@@ -1908,6 +1992,23 @@ the fast-test shards.
 | Dispatcher notifications cannot be lost while entering a wait | Controlled admission-ready and result-ready notifications between the empty check and the condition-variable wait |
 | Final UDF counters survive native cleanup | `test_execute_native_subprocess_udf_reports_admission_task_stats`, with waiting enabled and disabled, reusing the same plan |
 | Shared Local/Ray contracts remain compatible | Reentrant wakeups, callback removal, late grants after close, exact input handoff, idempotent lease release, retained-output accounting and retry |
+
+Local table-producing `map_batches` and `flat_map` subprocess calls publish
+bounded output blocks as the callable produces them. Each block is serialized
+once into an Arrow IPC buffer; its exact size, including the transport header,
+is admitted before shared memory is allocated. The parent adopts each block
+independently so downstream work can start before the physical task finishes.
+An explicit terminal result retains task completion and slot ownership until
+worker execution and cleanup finish. An error after earlier blocks still fails
+the query, and cancellation releases queued blocks and outstanding grants.
+If reception stops before the terminal response, the worker is retired before
+the pool can serve another invocation. This includes cancellation after a chunk
+arrives or after its buffers are adopted. A cancelled call whose terminal
+response has already been consumed can keep its healthy worker. Intentional
+stream retirement counts as `cancelled_workers`, rather than worker loss.
+Row-preserving calls keep their row-count validation and fused output contract.
+Local IPC transport and Ray's object store remain different implementations;
+this change does not imply equal throughput or equal memory budgets.
 
 Common byte-accounting tests also verify the intentional backend differences:
 Local preserves a complete task envelope even at a zero reservation ratio;

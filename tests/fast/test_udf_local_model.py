@@ -79,20 +79,33 @@ def _submit(executor, table):
 
 
 def _wait_result(executor):
+    from vane.execution.udf_subprocess import _release_local_ref_bundle_result
+
     ready = threading.Event()
     executor.register_wakeup(ready.set)
     deadline = time.monotonic() + 10
+    chunks = []
     try:
         while True:
             ready.clear()
             result = executor.take_ready_result()
-            if result is not None:
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool):
+                block, finished = result
+                if block is not None:
+                    chunks.append(block)
+                if finished:
+                    assert len(chunks) == 1, "expected one output block before task completion"
+                    return chunks.pop()
+                continue
+            elif result is not None:
                 return result
             remaining = deadline - time.monotonic()
             assert remaining > 0, "model request did not finish"
             ready.wait(remaining)
     finally:
         executor.register_wakeup(None)
+        for chunk in chunks:
+            _release_local_ref_bundle_result(chunk)
 
 
 def _wait_until(predicate, message):
@@ -126,7 +139,8 @@ def test_runtime_tracks_queued_outputs_and_views_after_query_and_model_close(bac
         resources = runtime.prepare(plan, bindings)
         executor = build_executor(payload, plan.published[-1]["1"])
         _submit(executor, pa.table({"x": list(range(128))}))
-        _wait_until(lambda: bool(executor._queue), "output did not enter result queue")
+        # A queued chunk can precede input cleanup and task completion.
+        assert executor._wait_for_pending_futures(15)
         snapshot = runtime.resource_snapshot()
         data = snapshot["data"]
         size = data["retained_bytes"]
@@ -135,7 +149,7 @@ def test_runtime_tracks_queued_outputs_and_views_after_query_and_model_close(bac
         assert data["output_bytes"] == data["output_state_bytes"]["unit_queue"] == size
         assert snapshot["task_admission"]["running_tasks"] == 0
 
-        result = executor.take_ready_result()
+        result = _wait_result(executor)
         assert runtime.resource_snapshot()["data"]["output_state_bytes"]["downstream_input"] == size
         table = result[1][0].to_table()
         view = table.slice(3, 2)
