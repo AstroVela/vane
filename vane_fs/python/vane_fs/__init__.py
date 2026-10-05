@@ -17,6 +17,7 @@ from vane_fs._native import (
     StalePreviewError,
     Workspace,
 )
+from vane_fs.vane import register_workspace, snapshot_url, unregister_workspace
 
 __all__ = [
     "BranchInfo",
@@ -31,4 +32,7 @@ __all__ = [
     "Session",
     "StalePreviewError",
     "Workspace",
+    "register_workspace",
+    "snapshot_url",
+    "unregister_workspace",
 ]

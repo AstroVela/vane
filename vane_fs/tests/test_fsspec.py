@@ -106,7 +106,7 @@ def test_vane_reads_csv_and_parquet_from_a_stable_snapshot(tmp_path, monkeypatch
                 (1, "first"),
                 (2, "second"),
             ]
-            # Full FILE/media support remains a separate native connector stage.
+            # FILE/media use register_workspace(), not this Python filesystem.
             with pytest.raises(vane.NotImplementedException, match="Nonblocking"):
                 connection.execute("SELECT to_file(?)", [fs.url("/table.csv")])
             connection.unregister_filesystem("vanefs")

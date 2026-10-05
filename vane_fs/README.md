@@ -6,8 +6,8 @@ The native library owns file and directory operations, 4 KiB block copy-on-write
 Python provides pybind11 bindings and an optional read-only fsspec adapter.
 
 This is a separately installed experimental component. It supports local
-workspaces, Linux FUSE mounts and Vane CSV/Parquet queries over immutable
-snapshots. Native FILE/media support and remote Ray access remain later stages in the
+workspaces, Linux FUSE mounts and native Vane FILE, CSV/Parquet and media reads
+over immutable snapshots. Remote Ray access remains a later stage in the
 [architecture and roadmap](DESIGN.md).
 
 ## Build and install
@@ -210,8 +210,60 @@ Resolve a conflict with a path mapping such as
 
 ## Vane queries
 
-With Vane installed, register a read-only snapshot adapter on an explicitly local
-connection. Keep the adapter and workspace open through query completion.
+With a Vane build that includes the native connector, register an existing
+workspace on an explicitly local connection. The optional `vane-fs` package
+owns SQLite; the base Vane wheel does not link it.
+
+```python
+import os
+
+os.environ["VANE_RUNNER"] = "local-fast"
+import vane
+from vane_fs import Workspace, register_workspace, snapshot_url, unregister_workspace
+
+database = "/tmp/query.sqlite"
+with Workspace(database) as workspace, vane.connect() as connection:
+    workspace.checkout().write_file("/data.csv", b"id,value\n1,example\n")
+    frozen = workspace.snapshot()
+    identity = register_workspace(connection, database)
+    url = snapshot_url(identity, frozen, "/data.csv")
+    assert connection.execute("SELECT * FROM read_csv(?)", [url]).fetchall() == [(1, "example")]
+    value = connection.execute("SELECT to_file(?)", [url]).fetchall()[0][0]
+    with value.open(connection=connection) as reader:
+        assert reader.read(2) == b"id"
+    unregister_workspace(connection, identity)
+    workspace.drop_snapshot(frozen)
+```
+
+Native file opens, metadata and positional reads call C++ directly through a
+versioned C interface. They do not call Python/fsspec for file I/O or share
+private DuckDB C++ objects between extension modules. This supports `File.open`,
+`to_file`, range-limited FILE values, CSV/Parquet, `ImageFile` metadata/decoding,
+and `VideoFile` metadata/frames with Vane's applicable media dependencies.
+
+Each connection, including a cursor, must register its own mapping from
+workspace ID to database. URLs contain immutable snapshot IDs and literal
+UTF-8 paths, without URL decoding or embedded database filenames. Registration
+opens an independent native workspace: closing the original `Workspace` does
+not invalidate registered reads. Queries retain each accessed snapshot until
+completion, failure or cancellation; standalone file readers retain it until
+closed. A streaming result keeps its query pin until exhausted or closed;
+`fetchone()` alone may leave that result active. Standalone reads do not attach
+pins to unrelated active results. Unregistering prevents new opens without
+invalidating open readers.
+`drop_snapshot` fails while either kind of reference remains.
+
+The native connector is read-only and currently requires `local-fast`. It
+supports explicit file paths, not wildcard expansion or directory listing.
+SQLite write access is required to record/release retention pins. Interrupts
+are checked between 1 MiB read chunks; a SQLite lock wait is bounded by
+`timeout_ms` (default 5000), not immediately interrupted. Query completion
+releases pins; it does not delete explicitly retained snapshots.
+
+The older fsspec adapter remains available for listing, globbing and clients
+that use Python file objects. Use it on a separate Vane database instance from
+the native connector; its nonblocking-open limitation still prevents FILE and
+media access through `connection.register_filesystem`.
 
 ```python
 import os
@@ -258,7 +310,7 @@ read handles. Explicitly closing the workspace invalidates all its sessions.
 - GC scans retained states and version tables; it is not yet optimized for large
   histories. SQLite checkpointing and page reuse do not guarantee that the main
   database file immediately shrinks on disk.
-- Directory import, native FILE/media support, SQL COPY writes and remote/Ray access are not
+- Directory import, SQL COPY writes and remote/Ray access are not
   implemented. Put the database on local storage outside managed file content.
 
 ## Verification
@@ -277,10 +329,15 @@ the variable set, unavailable mount support is a test failure. The dedicated
 [VaneFS CI workflow](../.github/workflows/vane-fs.yml) builds SQLite at the pinned
 baseline, tests the native core, rebuilds a wheel from its source archive,
 executes real mounts, checks ASan/UBSan, and verifies benchmark cleanup.
+The main [CI workflow](../.github/workflows/ci.yml) additionally installs both
+packages on Python 3.12 and runs native FILE/media acceptance against the built
+Vane wheel. Those tests cover connection isolation, reader and query lifetimes,
+streaming results, cancellation, range reads, and image/video parity.
 
 The component root avoids pytest constructing a source-tree `vane_fs` namespace
-over the installed package. Vane integration tests require Vane and PyArrow;
-the storage tests require only the installed component and pytest.
+over the installed package. The fsspec Vane integration test requires Vane and
+PyArrow. Native media acceptance also requires Pillow, PyAV and NumPy; the
+storage tests require only the installed component and pytest.
 
 Coverage includes reopen, no-copy forks, snapshot retention, sparse and
 cross-block writes, shrink/re-extend, rename, conflict and stale-preview rejection,

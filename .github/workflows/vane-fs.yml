@@ -80,7 +80,7 @@ jobs:
               names = source.getnames()
           excluded = {"build", "vcpkg_installed", ".venv", ".cache", "__pycache__"}
           assert not any(excluded.intersection(pathlib.PurePosixPath(name).parts) for name in names), names
-          required = {"src/owner_lock.hpp", "src/fuse.cpp", "tests/test_crash.cpp", "benchmarks/run.py"}
+          required = {"src/owner_lock.hpp", "src/fuse.cpp", "src/native_reader.cpp", "src/native_reader.hpp", "include/vane_fs/reader_abi.h", "tests/test_crash.cpp", "benchmarks/run.py"}
           prefix = archive.name.removesuffix(".tar.gz")
           assert all(f"{prefix}/{name}" in names for name in required), names
           PY

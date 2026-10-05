@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vane_fs/workspace.hpp"
+#include "native_reader.hpp"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -12,6 +13,7 @@ using namespace vane_fs;
 
 PYBIND11_MODULE(_native, module) {
 	module.doc() = "Native SQLite storage and branching for VaneFS";
+	RegisterNativeReader(module);
 	py::register_exception<Error>(module, "Error");
 	for (const auto *name : {"ConflictError", "StalePreviewError", "CapacityError"}) {
 		auto qualified = std::string("vane_fs._native.") + name;

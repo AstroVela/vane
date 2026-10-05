@@ -49,7 +49,7 @@ endif()
 
 if(VANE_FS_BUILD_PYTHON)
   find_package(pybind11 CONFIG REQUIRED)
-  pybind11_add_module(_native src/python.cpp)
+  pybind11_add_module(_native src/python.cpp src/native_reader.cpp)
   target_link_libraries(_native PRIVATE vane_fs)
   target_compile_definitions(_native PRIVATE PYBIND11_COMPILER_TYPE="vane_fs")
   if(UNIX AND NOT APPLE)

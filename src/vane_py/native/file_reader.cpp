@@ -7,6 +7,7 @@
 #include "file_value.hpp"
 #include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/file.hpp"
+#include "vane_python/vane_fs.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -123,8 +124,10 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
 		unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
-		RunReaderContextOperation(*context, *connection, interrupt_generation,
-		                          [&](ReaderContextScope &) { resolved = ResolvedFile::Open(*context, reference); });
+		RunReaderContextOperation(*context, *connection, interrupt_generation, [&](ReaderContextScope &) {
+			VaneFSStandaloneOpenScope snapshot_scope(*context);
+			resolved = ResolvedFile::Open(*context, reference);
+		});
 	}
 	return shared_ptr<PythonFileReaderHandle>(
 	    new PythonFileReaderHandle(std::move(reference.url), buffer_size, std::move(connection), nullptr,

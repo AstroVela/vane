@@ -6,6 +6,7 @@
 
 #include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/query_parameters.hpp"
+#include "vane_python/vane_fs.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
@@ -894,6 +895,19 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 			protocols.push_back(py::str(sub_protocol));
 		}
 	}
+	for (const auto &name : protocols) {
+		if (name == "vanefs_native") {
+			throw InvalidInputException("The vanefs_native filesystem name is reserved for the native VaneFS reader");
+		}
+		if (name == "vanefs") {
+			for (const auto &registered : fs.ListSubSystems()) {
+				if (registered == "vanefs_native") {
+					throw InvalidInputException(
+					    "Python and native VaneFS filesystems require separate Vane database instances");
+				}
+			}
+		}
+	}
 
 	// fsspec does not expose a general capability that distinguishes concrete
 	// directories from object-store prefixes. Its LocalFileSystem hierarchy has
@@ -1307,6 +1321,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	connection_module.def("__del__", &DuckDBPyConnection::Close);
 
 	InitializeConnectionMethods(connection_module);
+	InitializeVaneFS(connection_module);
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");

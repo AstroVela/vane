@@ -6,9 +6,9 @@ is a filesystem API with durable snapshots and branch isolation. Vane query
 adapters, a FUSE mount, and access from multiple machines are separate stages.
 
 Status: the C++ core, bindings and read-only adapter implement stages 1–3.
-Stage 4 now includes a Linux FUSE adapter; the native FILE/media connector
-remains future work. Owner recovery, mount retention and benchmark tooling are
-implemented alongside it.
+Stage 4 includes a Linux FUSE adapter and a local native FILE/media connector.
+Owner recovery, mount retention and benchmark tooling are implemented alongside
+them. Remote worker access remains future work.
 See [build instructions and current limits](README.md). The assessment uses Vane
 `upstream/main` at `3095a34737d991097ed5f9737b89761736678050`, fetched on
 2026-10-05. Later stages remain proposals and do not imply current support.
@@ -160,6 +160,28 @@ make an old session or FILE reference access a new branch. Initial URL proposal:
 location through adapter configuration; do not embed machine paths or secrets
 in persistent FILE values.
 
+The implemented native connector registers that mapping in each Vane
+`ClientContext`. A stateless `vanefs_native` router handles the `vanefs://`
+scheme; it resolves no database without a mapping on the invoking connection.
+The optional package exports `vane_fs.snapshot_reader.v1`, a versioned capsule
+of C function pointers, opaque handles and fixed-layout metadata. It owns all
+SQLite state and native allocations. The base Vane adapter retains the capsule
+and consumes no private engine or STL objects from the provider. This keeps
+SQLite optional and preserves the private native-module symbol boundary.
+
+Each query pins a snapshot on its first access until `QueryEnd`, including
+errors and cancellation. Individual file handles independently retain their inode
+snapshot, provider and stateless filesystem implementation. The provider shares
+one live immutable session per snapshot across these references, releasing its
+SQLite pin with the final handle. This avoids a durable write pair per file
+while removing expired session-cache entries immediately.
+Closing the caller's workspace or unregistering the routing filesystem cannot
+invalidate an open reader. Positional reads preserve the implicit cursor;
+short exact reads fail. Nonblocking virtual opens cannot encounter host FIFOs.
+Reads check cancellation between bounded chunks, with SQLite lock waits still
+limited by the configured busy timeout. The connector accepts explicit paths
+on `local-fast`; it does not serialize SQLite connections or callbacks to Ray.
+
 ## Transactions and durability
 
 Every mutating filesystem operation starts a `BEGIN IMMEDIATE` transaction,
@@ -286,7 +308,7 @@ not extend to an external table merely because both use the same branch name.
 | 1 | SQLite store, filesystem API, forks, snapshots and retention | Reopen durability, parent/child isolation, no file-row copying on fork, atomic rename and truncate |
 | 2 | Diff, conservative direct-parent merge, retirement and GC | Conflicts and stale previews cannot partially publish; retained states survive deletion and GC |
 | 3 | Optional fsspec adapter | Explicit local-runner CSV/Parquet reads from pinned snapshots; ordinary adapter I/O tests and directory semantics |
-| 4 | Linux FUSE implemented; native FILE connector pending | Mounted inode lifetime and cache isolation tested; FILE range/nonblocking contracts and media reads still require separate work |
+| 4 | Linux FUSE and local native FILE connector | Mounted inode lifetime; FILE ranges, connection isolation, query/reader retention, cancellation, image decode and video frames |
 | 5 | Remote service and Ray support | Stable snapshot identity, per-worker setup, leases, retry behavior and multi-node correctness |
 
 Stage 3 provides read-only Vane query integration. Native write APIs
