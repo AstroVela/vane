@@ -40,7 +40,22 @@ def _wait(check):
 
 
 def _result(executor):
-    return _wait(executor.take_ready_result)
+    chunks = []
+    try:
+        while True:
+            result = _wait(executor.take_ready_result)
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool):
+                block, finished = result
+                if block is not None:
+                    chunks.append(block)
+                if finished:
+                    assert len(chunks) == 1, "expected one output block before task completion"
+                    return chunks.pop()
+            else:
+                return result
+    finally:
+        for chunk in chunks:
+            udf_subprocess._release_local_ref_bundle_result(chunk)
 
 
 def _admit(executor):
@@ -333,6 +348,7 @@ def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consume
         result = _result(consumer)
         assert result[2].to_pydict() == {"length": [3000]}
         output = _result(producer)
+        assert output[1][0].to_table().column(0).to_pylist() == [b"p" * 1000]
         assert _demand(producer_model[0]) == _demand(consumer_model[0]) == 0
         assert h.runtime.snapshot()["waiting_tasks"] == 0
     finally:

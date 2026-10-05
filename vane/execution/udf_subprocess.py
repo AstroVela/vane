@@ -93,6 +93,7 @@ from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuEx
 from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
+from vane.execution.udf_shm_store import ParentShmPeer
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
@@ -101,6 +102,7 @@ from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
 
 _active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
+_active_local_output: ContextVar[Callable[[Any], None] | None] = ContextVar("vane_local_output", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -118,6 +120,8 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+_MSG_REF_BUNDLE_CHUNK = 0x11
+_MSG_OUTPUT_GRANT_FAILED = 0x12
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -452,6 +456,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise ValueError("UDF payload is required")
 
         self._queue: deque[Any] = deque()
+        self._stream_result_lock = threading.Lock()
         self._finished_submitting = False
         self._closed = False
         self._cleanup_finished = False
@@ -460,6 +465,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._worker_lifecycle = WorkerLifecycle()
         self._local_gpu_assignment: tuple[str, int, int] | None = None
         self._pending_batches = 0
+        self._awaiting_submit_terminal = False
         self._wakeup: Callable[[], None] | None = None
         self._wakeup_error: BaseException | None = None
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
@@ -482,6 +488,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._sock: socket.socket | None = None
         self._startup_child_sock: socket.socket | None = None
         self._proc: subprocess.Popen[bytes] | None = None
+        self._shm_peer: ParentShmPeer | None = None
 
         try:
             self._start_worker(payload, startup_observer=startup_observer)
@@ -496,6 +503,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._sock,
             self._payload_shm,
             self._data_shm,
+            self._shm_peer,
         )
 
     def _start_worker(
@@ -523,6 +531,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._sock = parent_sock
             self._startup_child_sock = child_sock
             child_fd = child_sock.fileno()
+            self._shm_peer = ParentShmPeer()
+            shm_fd = self._shm_peer.child_sock.fileno()
 
             _write_ipc_to_shm(payload_shm, payload_bytes)
             cmd = [
@@ -533,6 +543,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 payload_shm.name,
                 str(payload_size),
                 data_shm.name,
+                str(shm_fd),
             ]
             env = (
                 dict(os.environ)
@@ -543,7 +554,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             env["PYTHONUNBUFFERED"] = "1"
             self._proc = subprocess.Popen(
                 cmd,
-                pass_fds=(child_fd,),
+                pass_fds=(child_fd, shm_fd),
                 close_fds=True,
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -552,6 +563,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             )
             child_sock.close()
             self._startup_child_sock = None
+            self._shm_peer.child_sock.close()
             self._raise_if_startup_cancelled()
             msg_type, payload_data = self._recv_expected(
                 (_MSG_READY, _MSG_ERROR),
@@ -1089,12 +1101,17 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             descriptor = vane_pickle.loads(payload)
             normalized = normalize_local_shm_ref_bundle_descriptor(descriptor)
             grant_id = normalized["grant_id"]
+            if self._shm_peer is None:
+                raise RuntimeError("worker has no shared-memory ownership channel")
+            for block in normalized["block_refs"]:
+                self._shm_peer.validate_write(grant_id, block["allocation"])
             if grant_id is not None:
                 scope = self._current_execution_scope()
                 with self._active_output_grants_lock:
                     # Cancellation releases grants before an in-flight result
-                    # arrives. Let the result's cancellation path discard it
-                    # without retiring an otherwise healthy pooled worker.
+                    # arrives. A consumed terminal result can be discarded
+                    # without retiring a healthy worker; an interrupted chunk
+                    # stream is fenced by the receive loop.
                     if grant_id not in self._active_output_grants and not scope.is_set():
                         raise ValueError(f"UDF subprocess result returned an unowned output grant {grant_id}")
             return normalized
@@ -1198,16 +1215,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
+                if self._shm_peer is None:
+                    raise RuntimeError("worker has no shared-memory ownership channel")
+                allocation = self._shm_peer.reserve_write(grant_id, size)
             except BaseException as exc:
                 if grant_id > 0:
+                    if self._shm_peer is not None:
+                        self._shm_peer.finish_write(grant_id)
                     self._release_output_grant(grant_id, name=f"udf-output-{request_id}-cancelled")
                 self._send_worker_message(
                     self._require_socket(),
-                    _MSG_OUTPUT_GRANT_CANCELLED,
+                    _MSG_OUTPUT_GRANT_CANCELLED if scope.is_set() else _MSG_OUTPUT_GRANT_FAILED,
                     str(exc).encode("utf-8", errors="replace"),
                 )
                 return True
-            response = {"request_id": request_id, "grant_id": int(grant_id)}
+            response = {"request_id": request_id, "grant_id": int(grant_id), "allocation": allocation}
             try:
                 try:
                     response_payload = vane_pickle.dumps(response)
@@ -1224,12 +1246,29 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             return True
         if msg_type == _MSG_OUTPUT_GRANT_RELEASE:
             grant_id = event["grant_id"]
+            if self._shm_peer is not None:
+                self._shm_peer.finish_write(grant_id)
             self._release_output_grant(grant_id, name="udf-output-worker-release")
             self._notify_wakeup()
             return True
         return False
 
     def _recv_submit_result(self) -> Any | None:
+        self._awaiting_submit_terminal = True
+        try:
+            return self._recv_submit_messages()
+        except BaseException as error:
+            if self._awaiting_submit_terminal and self._broken_error is None:
+                # A chunk transfers buffers, not the protocol connection. An
+                # interrupted receiver must retire the worker before another
+                # invocation can consume the previous task's remaining frames.
+                try:
+                    self._mark_broken("UDF subprocess output stream ended before its terminal response")
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
+
+    def _recv_submit_messages(self) -> Any | None:
         msg_type = None
         payload = b""
         while msg_type is None:
@@ -1237,6 +1276,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 (
                     _MSG_OK,
                     _MSG_REF_BUNDLE_RESULT,
+                    _MSG_REF_BUNDLE_CHUNK,
                     _MSG_ERROR,
                     _MSG_INPUT_CONSUMED,
                     _MSG_INPUT_CONSUME_FAILED,
@@ -1245,6 +1285,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     _MSG_TASK_CANCELLED,
                 )
             )
+            if msg_type in (_MSG_OK, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
+                self._awaiting_submit_terminal = False
             try:
                 if self._handle_submit_control_message(msg_type, payload):
                     msg_type = None
@@ -1274,7 +1316,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     raise ExecutionCancelledError(f"UDF subprocess task cancelled: {scope.cancel_reason or error}")
                 self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
                 raise RuntimeError(self._broken_error)
-            if msg_type == _MSG_REF_BUNDLE_RESULT:
+            if msg_type in (_MSG_REF_BUNDLE_RESULT, _MSG_REF_BUNDLE_CHUNK):
                 descriptor = self._decode_ref_bundle_result(payload)
                 grant_id = descriptor["grant_id"]
                 scope = self._current_execution_scope()
@@ -1282,6 +1324,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     try:
                         release_local_shm_ref_bundle_descriptor(descriptor)
                     finally:
+                        if self._shm_peer is not None and grant_id is not None:
+                            self._shm_peer.finish_write(grant_id)
                         # The cancelled descriptor may refer to an already
                         # released grant. Release only this scope's tracked
                         # grants, never an unverified ID from the late result.
@@ -1300,6 +1344,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     if (task := current_data_task()) is not None:
                         track_local_shm_output(task, result)
                 except BaseException as exc:
+                    if self._shm_peer is not None and grant_id is not None:
+                        self._shm_peer.finish_write(grant_id)
                     if result is None and isinstance(
                         exc, (InvalidLocalShmReferenceError, FileNotFoundError, MemoryError)
                     ):
@@ -1316,12 +1362,28 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                             self._release_output_grant(grant_id, name="udf-output-descriptor-wrap-failed")
                     raise
                 if grant_id is not None:
+                    if self._shm_peer is not None:
+                        self._shm_peer.finish_write(grant_id)
                     self._untrack_output_grant(grant_id)
                 try:
                     scope.raise_if_cancelled("UDF subprocess result")
                 except BaseException:
                     _release_local_ref_bundle_result(result)
                     raise
+                if msg_type == _MSG_REF_BUNDLE_CHUNK:
+                    receiver = _active_local_output.get()
+                    if receiver is None:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream has no receiver", actor_lost=True)
+                        raise RuntimeError(self._broken_error)
+                    try:
+                        receiver(result)
+                    except BaseException:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream receiver failed", actor_lost=True)
+                        raise
+                    msg_type = None
+                    continue
                 return result
             if len(payload) != 8:
                 self._mark_broken("UDF subprocess returned malformed OK response", actor_lost=True)
@@ -1363,6 +1425,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 scope.raise_if_cancelled("UDF subprocess submit")
         try:
             try:
+                if any("allocation" in block for block in payload.get("block_refs", ())):
+                    if self._shm_peer is None:
+                        raise RuntimeError("worker has no shared-memory ownership channel")
+                    self._shm_peer.borrow_inputs(payload)
                 payload_bytes = vane_pickle.dumps(payload)
             except Exception:
                 self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
@@ -1431,18 +1497,22 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def submit(self, args: pa.Table) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
         try:
             result = self._submit_table(args)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
         self._notify_wakeup()
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
         try:
             result = self._submit_table(args)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
@@ -1456,20 +1526,34 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         names: Any,
     ) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
     def submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> None:
         self._pending_batches += 1
+        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
         try:
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
         finally:
+            _active_local_output.reset(token)
             self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
+        self._notify_wakeup()
+
+    def _queue_stream_result(self, submit_id: int | None, result: Any) -> None:
+        with self._stream_result_lock:
+            if self._closed:
+                _release_local_ref_bundle_result(result)
+                raise ExecutionCancelledError("UDF output stream worker closed")
+            self._queue.append(
+                (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+            )
         self._notify_wakeup()
 
     def take_ready_result(self) -> Any | None:
@@ -1591,6 +1675,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 pass
         self._record_worker_outcome(outcome)
         self._closed = True
+        stream_lock = getattr(self, "_stream_result_lock", None)
+        if stream_lock is not None:
+            with stream_lock:
+                while self._queue:
+                    _release_local_ref_bundle_result(self._queue.popleft())
         cleanup_errors: list[BaseException] = []
         try:
             self.cancel_output_grants()
@@ -1686,6 +1775,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._proc = proc
         else:
             self._proc = None
+        if self._proc is None and self._shm_peer is not None:
+            try:
+                self._shm_peer.close_after_exit()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._shm_peer = None
         try:
             self._close_payload_shm()
         except BaseException as exc:
@@ -1706,7 +1802,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             and not active_output_grants
             and all(
                 getattr(self, attribute, None) is None
-                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm")
+                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm", "_shm_peer")
             )
         )
         finalizer = getattr(self, "_finalizer", None)
@@ -1812,6 +1908,8 @@ def _record_worker_cancellation(worker: Any) -> None:
 def _release_local_ref_bundle_result(value: Any) -> None:
     if isinstance(value, tuple) and len(value) >= 3 and value[0] == SUBMIT_RESULT_MARKER:
         value = value[2]
+    elif isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], bool):
+        value = value[0]
     if not (isinstance(value, tuple) and len(value) >= 2 and value[0] == REF_BUNDLE_RESULT_MARKER):
         return
     for ref in list(value[1] or []):
@@ -3756,6 +3854,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return (SUBMIT_RESULT_MARKER, int(submit_id), result)
         return result if result is not None else (None, True)
 
+    def _publish_stream_result(self, submit_id: int | None, result: Any) -> None:
+        transition_local_shm_output(result, "unit_queue")
+        self._record_output_budget_result(result)
+        item = (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+        with self._queue_lock:
+            if self._closed:
+                _release_local_ref_bundle_result(result)
+                raise ExecutionCancelledError("UDF output stream executor closed")
+            self._queue.append(item)
+            # A block transfers data ownership only. The terminal result retains
+            # the physical task slot until backend cleanup has completed.
+            self._result_admissions.append(None)
+        self._notify_wakeup()
+
     def _output_budget_estimate(self, num_rows: int | None) -> int:
         if not self._ref_bundle_output:
             return 0
@@ -4162,6 +4274,17 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         _active_local_admission.reset(token)
 
                 fn = run_admitted
+
+            output_fn = fn
+
+            def run_streaming(worker: _SingleSubprocessExecutor) -> Any | None:
+                token = _active_local_output.set(lambda result: self._publish_stream_result(submit_id, result))
+                try:
+                    return output_fn(worker)
+                finally:
+                    _active_local_output.reset(token)
+
+            fn = run_streaming
 
             if unit_task is not None:
                 unit_task.transition("submitted")
@@ -4659,6 +4782,7 @@ def _cleanup_subprocess_executor(
     sock: socket.socket | None,
     payload_shm: shared_memory.SharedMemory | None,
     data_shm: shared_memory.SharedMemory | None,
+    shm_peer: ParentShmPeer | None = None,
 ) -> None:
     if sock is not None:
         try:
@@ -4686,10 +4810,14 @@ def _cleanup_subprocess_executor(
             shm.close()
         except Exception:
             pass
+
         try:
             _unlink_shm(shm, track=False)
         except Exception:
             pass
+
+    if shm_peer is not None and (proc is None or proc.poll() is not None):
+        shm_peer.close_after_exit()
 
 
 __all__ = ["UDFExecutor"]
