@@ -9,6 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -602,7 +603,8 @@ def test_preparation_capacity_failure_releases_borrows_and_preserves_resident_bu
     assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
 
 
-def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypatch):
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypatch, batch_format):
     import vane.execution.udf_subprocess as local
     from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
 
@@ -625,7 +627,12 @@ def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypat
 
     monkeypatch.setattr(local, "request_local_shm_output_grant", request)
     payload = _payload(
-        _Identity, actor_number=2, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"
+        _Identity,
+        actor_number=2,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+        batch_format=batch_format,
+        output_schema=[{"name": "x", "kind": "duckdb_type", "type": "BIGINT"}],
     )
     with LocalModelRuntime(session_id="session", session_config={}) as runtime:
         runtime.register("model", version="v1", payload=payload)
@@ -884,7 +891,12 @@ def test_mixed_native_plan_uses_captured_session_for_every_udf(monkeypatch, back
         assert os.environ[variable] == "session-b"
 
 
-def test_independent_native_queries_reuse_registered_model_sequentially_and_concurrently(monkeypatch, tmp_path):
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy", "pandas"])
+def test_independent_native_queries_reuse_registered_model_sequentially_and_concurrently(
+    monkeypatch, tmp_path, batch_format
+):
+    if batch_format == "pandas":
+        pytest.importorskip("pandas")
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     initialized = str(tmp_path / "initializations.txt")
 
@@ -893,21 +905,45 @@ def test_independent_native_queries_reuse_registered_model_sequentially_and_conc
             import os
 
             self.pid = os.getpid()
+            self.owner = threading.get_ident()
             self.calls = 0
             with open(initialized, "a") as file:
                 file.write(f"{self.pid}\n")
 
+        def warm_up(self):
+            assert threading.get_ident() == self.owner
+
+        def _vane_close(self):
+            assert threading.get_ident() == self.owner
+
         def __call__(self, table):
             self.calls += 1
-            return pa.table({"x": table.column("x"), "pid": [self.pid], "calls": [self.calls]})
+            assert threading.get_ident() != self.owner
+            values = table.column("x").to_numpy() if batch_format == "pyarrow" else np.asarray(table["x"])
+            result = {
+                "x": values,
+                "pid": np.full(len(values), self.pid, dtype=np.int64),
+                "calls": np.full(len(values), self.calls, dtype=np.int64),
+                "thread": np.full(len(values), threading.get_ident(), dtype=np.int64),
+            }
+            if batch_format == "pyarrow":
+                return pa.table(result)
+            if batch_format == "pandas":
+                import pandas as pd
 
-    schema = {"x": vane.sqltypes.BIGINT, "pid": vane.sqltypes.BIGINT, "calls": vane.sqltypes.BIGINT}
+                return pd.DataFrame(result)
+            assert not table["x"].flags.writeable
+            return result
+
+    schema = {name: vane.sqltypes.BIGINT for name in ("x", "pid", "calls", "thread")}
     with vane.connect() as connection:
         plans = []
         cursors = [connection.cursor() for _ in range(4)]
         for value in range(4):
             relation = (
-                cursors[value].sql(f"SELECT {value}::BIGINT AS x").map_batches(Model, schema=schema, actor_number=1)
+                cursors[value]
+                .sql(f"SELECT {value}::BIGINT AS x")
+                .map_batches(Model, schema=schema, actor_number=1, batch_format=batch_format)
             )
             plans.append(
                 vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
@@ -939,7 +975,9 @@ def test_independent_native_queries_reuse_registered_model_sequentially_and_conc
                 assert sorted(row["x"] for row in rows) == [0, 1, 2, 3]
                 assert sorted(row["calls"] for row in rows) == [1, 2, 3, 4]
                 assert len({row["pid"] for row in rows}) == 1
+                assert len({row["thread"] for row in rows}) == 1
                 assert (tmp_path / "initializations.txt").read_text().splitlines() == [str(rows[0]["pid"])]
+                assert runtime.resource_snapshot()["active_borrows"] == 0
             finally:
                 for cursor in cursors:
                     cursor.close()
