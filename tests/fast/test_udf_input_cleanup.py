@@ -333,6 +333,7 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
     from vane import pickle as vane_pickle
     from vane.execution import ref_bundle
     from vane.execution.udf import build_executor
+    from vane.execution.udf_subprocess import _release_local_ref_bundle_result
 
     manager = LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -346,6 +347,7 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
     )
     executor = build_executor(payload, {"local_input_cleanup": query})
     cancel = manager.cancel_input_lease
+    block = None
 
     def fail(*args, **kwargs):
         raise RuntimeError("planned materialized input cleanup failure")
@@ -364,6 +366,15 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
             assert executor.request_task_admission(8)
             executor.submit_with_id(1, pa.table({"x": [7]}))
             assert executor._wait_for_pending_futures(15)
+            if failure == "completion":
+                # Input ACK failure prevents output; completion failure follows
+                # an already-published chunk and must arrive as the terminal.
+                block = executor.take_ready_result()
+                assert block[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 1)
+                assert block[3] is False
+                assert block[2][1][0].to_table().to_pydict() == {"x": [7]}
+                _release_local_ref_bundle_result(block)
+                block = None
             result = executor.take_ready_result()
             assert isinstance(result[2], BaseException)
             assert "materialized input cleanup failure" in str(result[2])
@@ -374,9 +385,10 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
         query.shutdown()
         assert not query.cleanup_pending()
         assert manager.snapshot()["active_input_leases"] == 0
-        # A successful worker output rejected by completion cleanup was released.
+        # The consumed output and retried input cleanup release both owners.
         assert manager.snapshot()["usage_bytes"] == 0
     finally:
+        _release_local_ref_bundle_result(block)
         executor.close(kill=True)
         query.shutdown()
 
