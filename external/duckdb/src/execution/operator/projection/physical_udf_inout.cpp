@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -1565,6 +1566,9 @@ static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &
 static void SetStreamingError(StreamingUDFState &state, const string &msg);
 static void NotifyStreamingDispatcherFinished(StreamingUDFState &state);
 
+// Scoped to the calling test thread; production dispatchers never install it.
+static thread_local std::function<void()> *streaming_after_event_publish_for_testing = nullptr;
+
 static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 	auto guard = state.Lock();
 	// Queue insertion is a real state transition for both sides. The source is
@@ -1580,13 +1584,20 @@ static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 
 static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &&event) {
 	{
-		lock_guard<mutex> event_guard(state.output_event_lock);
+		unique_lock<mutex> event_guard(state.output_event_lock);
 		state.pending_output_events.push_back(std::move(event));
 		state.queued_output_events.fetch_add(1, std::memory_order_relaxed);
+		// A consumer can drain the event as soon as this lock is released.
+		// Clear capacity before publishing it so we cannot overwrite the
+		// capacity that the consumer restores after draining the queue.
+		state.output_capacity_rows_snapshot.store(0, std::memory_order_relaxed);
+		state.output_capacity_bytes_snapshot.store(0, std::memory_order_relaxed);
+		state.output_capacity_item_bytes_snapshot.store(0, std::memory_order_relaxed);
+		event_guard.unlock();
+		if (streaming_after_event_publish_for_testing) {
+			(*streaming_after_event_publish_for_testing)();
+		}
 	}
-	state.output_capacity_rows_snapshot.store(0, std::memory_order_relaxed);
-	state.output_capacity_bytes_snapshot.store(0, std::memory_order_relaxed);
-	state.output_capacity_item_bytes_snapshot.store(0, std::memory_order_relaxed);
 	TryWakeStreamingTasksForQueuedEvent(state);
 }
 
@@ -2689,6 +2700,61 @@ static bool DrainStreamingOutputEventsLocked(StreamingUDFState &state, unique_lo
 		}
 	}
 	return did_work;
+}
+
+vector<idx_t> TestStreamingOutputCapacityPublication() {
+	if (!DebugEnvFlagEnabled("VANE_ENABLE_UDF_TEST_HOOKS")) {
+		throw InvalidInputException("streaming output capacity test requires VANE_ENABLE_UDF_TEST_HOOKS=1");
+	}
+	auto payload = Value::STRUCT({{"execution_backend", Value("ray_task")},
+	                              {"call_mode", Value("map")},
+	                              {"udf_task_input_max_bytes", Value::BIGINT(4096)},
+	                              {"udf_output_target_max_bytes", Value::BIGINT(4096)}});
+	auto state = std::make_shared<StreamingUDFState>(payload, nullptr);
+	state->self = state;
+	state->op = make_uniq<UDFOperatorState>(payload);
+	// Model a submit whose DATA has already been consumed downstream.
+	StreamingInflightBatch inflight;
+	inflight.submit_id = 1;
+	inflight.total_rows = inflight.emitted_rows = 1;
+	inflight.bytes = 8;
+	state->inflight_batches.emplace(1, inflight);
+	state->inflight_rows = 1;
+	state->inflight_bytes = 8;
+
+	std::function<void()> consume_before_publisher_resumes = [&]() {
+		std::exception_ptr error;
+		std::thread consumer([&]() {
+			try {
+				auto guard = state->Lock();
+				if (!DrainStreamingOutputEventsLocked(*state, guard)) {
+					throw InternalException("capacity test did not consume the published event");
+				}
+				ThrowIfStreamingError(*state);
+			} catch (...) {
+				error = std::current_exception();
+			}
+		});
+		consumer.join();
+		if (error) {
+			std::rethrow_exception(error);
+		}
+	};
+	streaming_after_event_publish_for_testing = &consume_before_publisher_resumes;
+	try {
+		UDFOutputEvent event;
+		event.kind = UDFOutputEventKind::COMPLETE;
+		event.submit_id = 1;
+		event.submit_complete = true;
+		QueueStreamingOutputEvent(*state, std::move(event));
+	} catch (...) {
+		streaming_after_event_publish_for_testing = nullptr;
+		throw;
+	}
+	streaming_after_event_publish_for_testing = nullptr;
+	return {state->output_capacity_rows_snapshot.load(), state->output_capacity_bytes_snapshot.load(),
+	        state->output_capacity_item_bytes_snapshot.load(), state->queued_output_events.load(),
+	        state->completed_batches.load()};
 }
 
 static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, StreamingUDFState &state,
