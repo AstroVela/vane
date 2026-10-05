@@ -4,7 +4,9 @@
 #
 # Modified by Vane contributors.
 
+import subprocess
 import sys
+import textwrap
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from shutil import copyfileobj
@@ -61,6 +63,93 @@ def add_file(fs, filename=FILENAME):
 class TestPythonFilesystem:
     def test_unregister_non_existent_filesystem(self, duckdb_cursor: DuckDBPyConnection):
         duckdb_cursor.unregister_filesystem("fake")
+
+    @pytest.mark.parametrize("api", ["connection", "module"])
+    @pytest.mark.parametrize("operation", ["list", "contains"])
+    def test_registry_reads_during_unregister_on_shared_cursors(self, api, operation):
+        # Isolate native threads so a crash or GIL/registry-lock deadlock has a
+        # bounded failure instead of hanging the pytest process.
+        program = textwrap.dedent(
+            """
+            import os
+            import sys
+            import threading
+            from concurrent.futures import ThreadPoolExecutor
+
+            os.environ["VANE_RUNNER"] = "local-fast"
+            import vane
+            from fsspec import AbstractFileSystem
+
+            class RaceFS(AbstractFileSystem):
+                protocol = "registry_race"
+                cachable = False
+
+            class StableFS(AbstractFileSystem):
+                protocol = "registry_stable"
+                cachable = False
+
+            api, operation = sys.argv[1:]
+            sys.setswitchinterval(0.0001)
+            start = threading.Barrier(2)
+            stop = threading.Event()
+
+            def call(connection, name, *args):
+                if api == "module":
+                    return getattr(vane, name)(*args, connection=connection)
+                return getattr(connection, name)(*args)
+
+            with vane.connect() as connection, connection.cursor() as reader:
+                fs = RaceFS()
+                connection.register_filesystem(StableFS())
+                connection.register_filesystem(fs)
+
+                def write_registry():
+                    start.wait(timeout=5)
+                    try:
+                        for _ in range(20000):
+                            if stop.is_set():
+                                break
+                            call(connection, "unregister_filesystem", fs.protocol)
+                            call(connection, "register_filesystem", fs)
+                    finally:
+                        stop.set()
+
+                def read_registry():
+                    start.wait(timeout=5)
+                    checks = 0
+                    try:
+                        while not stop.is_set():
+                            if operation == "list":
+                                names = call(reader, "list_filesystems")
+                                assert "registry_stable" in names
+                                assert names.count(fs.protocol) <= 1
+                            else:
+                                assert call(reader, "filesystem_is_registered", "registry_stable")
+                                assert isinstance(call(reader, "filesystem_is_registered", fs.protocol), bool)
+                            checks += 1
+                        return checks
+                    finally:
+                        stop.set()
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    writer = pool.submit(write_registry)
+                    reads = pool.submit(read_registry)
+                    writer.result(timeout=30)
+                    assert reads.result(timeout=5) > 0
+
+                assert reader.filesystem_is_registered(fs.protocol)
+                assert reader.list_filesystems().count(fs.protocol) == 1
+                connection.unregister_filesystem(fs.protocol)
+                assert not reader.filesystem_is_registered(fs.protocol)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-X", "faulthandler", "-c", program, api, operation],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_memory_filesystem(self, duckdb_cursor: DuckDBPyConnection, memory: fsspec.AbstractFileSystem):
         duckdb_cursor.register_filesystem(memory)

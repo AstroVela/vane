@@ -381,6 +381,23 @@ jobs:
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py
 
+      # The optional package owns SQLite; the base wheel only consumes its
+      # versioned C reader interface. Exercise both installed wheels together.
+      - name: Exercise the optional native VaneFS reader
+        if: matrix.python-version == '3.12'
+        env:
+          SKBUILD_BUILD_DIR: ${{ github.workspace }}/vane_fs/build/python-release
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vane_fs/vcpkg_installed/x64-linux-release
+        run: |
+          "$VCPKG_ROOT/vcpkg" install \
+            --x-manifest-root="$PWD/vane_fs" --x-install-root="$PWD/vane_fs/vcpkg_installed" \
+            --triplet=x64-linux-release --host-triplet=x64-linux-release \
+            --clean-buildtrees-after-build --clean-packages-after-build
+          python -m pip install './vane_fs[test]' --no-build-isolation
+          python -I -c 'import vane, vane_fs, av, numpy, PIL; assert hasattr(vane.DuckDBPyConnection, "_register_vane_fs")'
+          scripts/run_installed_pytest.sh "$PWD/vane_fs/tests/test_vane.py" --rootdir="$PWD/vane_fs" --timeout=60
+
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'
         run: |

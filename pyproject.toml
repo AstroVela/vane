@@ -236,6 +236,7 @@ include = [
     "/DUCKDB_UPSTREAM_VERSION",
 
     # Build configuration
+    "/vane_fs/include/vane_fs/reader_abi.h",
     "/build_backend.py",
     "/vane_packaging/**",
     "/packages/vane-media-runtime/**",
