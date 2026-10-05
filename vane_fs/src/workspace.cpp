@@ -15,6 +15,7 @@
 #include <random>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #if SQLITE_VERSION_NUMBER < 3051003
@@ -99,13 +100,40 @@ struct Coordinate {
 	}
 };
 
+// Access is serialized by Database::mutex. A slot holds at most one idle
+// statement; nested uses of the same SQL prepare their own active statement.
+struct StatementCache {
+	std::unordered_map<std::string, sqlite3_stmt *> idle;
+	~StatementCache() {
+		Clear();
+	}
+	void Clear() {
+		for (auto &entry : idle) {
+			sqlite3_finalize(entry.second);
+		}
+		idle.clear();
+	}
+};
+constexpr const char *STATEMENT_CACHE = "vane_fs.statement_cache";
+
 class Statement {
 public:
 	Statement(sqlite3 *db, const std::string &sql) : db(db) {
-		Check(db, sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr));
+		if (auto cache = static_cast<StatementCache *>(sqlite3_get_clientdata(db, STATEMENT_CACHE))) {
+			// References to unordered_map elements survive rehashing.
+			slot = &cache->idle[sql];
+			statement = std::exchange(*slot, nullptr);
+		}
+		if (!statement) {
+			Check(db, sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr));
+		}
 	}
 	~Statement() {
-		sqlite3_finalize(statement);
+		if (slot && !*slot && sqlite3_reset(statement) == SQLITE_OK && sqlite3_clear_bindings(statement) == SQLITE_OK) {
+			*slot = statement;
+		} else {
+			sqlite3_finalize(statement);
+		}
 	}
 	Statement(const Statement &) = delete;
 	Statement &operator=(const Statement &) = delete;
@@ -137,8 +165,14 @@ public:
 		return value ? std::string(reinterpret_cast<const char *>(value), sqlite3_column_bytes(statement, index)) : "";
 	}
 	std::string Bytes(int index) const {
-		auto value = sqlite3_column_blob(statement, index);
-		return value ? std::string(static_cast<const char *>(value), sqlite3_column_bytes(statement, index)) : "";
+		auto value = BytesData(index);
+		return value ? std::string(value, BytesSize(index)) : "";
+	}
+	const char *BytesData(int index) const {
+		return static_cast<const char *>(sqlite3_column_blob(statement, index));
+	}
+	int BytesSize(int index) const {
+		return sqlite3_column_bytes(statement, index);
 	}
 	Coordinate Point(int index) const {
 		if (sqlite3_column_type(statement, index) != SQLITE_BLOB || sqlite3_column_bytes(statement, index) != 32) {
@@ -152,6 +186,7 @@ public:
 private:
 	sqlite3 *db;
 	sqlite3_stmt *statement = nullptr;
+	sqlite3_stmt **slot = nullptr;
 };
 
 std::string NewId() {
@@ -440,6 +475,45 @@ std::string Block(sqlite3 *db, int64_t inode, int64_t block, const View &view) {
 	                                                               : std::string(BLOCK_SIZE, '\0');
 }
 
+std::string ReadBytes(sqlite3 *db, int64_t inode, int64_t offset, int64_t length, const View &view) {
+	std::string result(size_t(length), '\0');
+	if (!length) {
+		return result;
+	}
+	// Keep absent blocks as zeroes. A LEFT JOIN must expose a missing payload
+	// as corruption, rather than silently turning a dangling reference into a hole.
+	Statement blocks(db, "SELECT b.block,p.data FROM block_versions b "
+	                     "LEFT JOIN block_payloads p ON p.id=b.payload "
+	                     "WHERE b.inode=? AND b.block>=? AND b.block<=? "
+	                     "AND b.low<=? AND b.high>? AND b.deleted=0 ORDER BY b.block");
+	blocks.Bind(1, inode);
+	blocks.Bind(2, offset / BLOCK_SIZE);
+	blocks.Bind(3, (offset + length - 1) / BLOCK_SIZE);
+	blocks.Bind(4, view.point);
+	blocks.Bind(5, view.point);
+	int64_t previous = -1;
+	while (blocks.Step()) {
+		auto block = blocks.Integer(0);
+		if (block == previous) {
+			Fail(ErrorCode::Storage, "Overlapping visible versions");
+		}
+		previous = block;
+		auto bytes = blocks.BytesData(1);
+		if (!bytes) {
+			Fail(ErrorCode::Storage, "Missing block payload");
+		}
+		if (blocks.BytesSize(1) != BLOCK_SIZE) {
+			Fail(ErrorCode::Storage, "Invalid block payload size");
+		}
+		auto start = std::max(offset, block * BLOCK_SIZE);
+		auto source_offset = start - block * BLOCK_SIZE;
+		auto target_offset = start - offset;
+		auto amount = std::min(BLOCK_SIZE - source_offset, length - target_offset);
+		std::memcpy(&result[size_t(target_offset)], bytes + source_offset, size_t(amount));
+	}
+	return result;
+}
+
 void StoreBlock(sqlite3 *db, int64_t inode, int64_t block, const std::string &data, const View &view) {
 	Key key {inode, {}, block};
 	Record old;
@@ -498,9 +572,14 @@ void WriteBytes(sqlite3 *db, Record &node, const std::string &data, int64_t offs
 	size_t consumed = 0;
 	while (consumed < data.size()) {
 		int64_t position = offset + int64_t(consumed);
-		auto bytes = Block(db, node.key.inode, position / BLOCK_SIZE, view);
 		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, data.size() - consumed);
-		bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
+		std::string bytes;
+		if (amount == BLOCK_SIZE) {
+			bytes.assign(data.data() + consumed, amount);
+		} else {
+			bytes = Block(db, node.key.inode, position / BLOCK_SIZE, view);
+			bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
+		}
 		StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
 		consumed += amount;
 	}
@@ -578,6 +657,7 @@ PinRegistry &Pins() {
 class Database {
 public:
 	sqlite3 *db = nullptr;
+	StatementCache statements;
 	std::mutex mutex;
 	std::string uuid, owner = NewId();
 	OwnerLock owner_lock;
@@ -597,6 +677,7 @@ public:
 			Check(db, code);
 			Check(db, sqlite3_busy_timeout(db, timeout_ms));
 			Check(db, sqlite3_extended_result_codes(db, 1));
+			Check(db, sqlite3_set_clientdata(db, STATEMENT_CACHE, &statements, nullptr));
 			Check(db, sqlite3_create_function_v2(
 			              db, "vane_fs_owner", 0, SQLITE_UTF8, &owner,
 			              [](sqlite3_context *context, int, sqlite3_value **) {
@@ -639,6 +720,7 @@ UPDATE format SET version=2;
 			Exec(db, "COMMIT");
 		} catch (...) {
 			if (db) {
+				statements.Clear();
 				sqlite3_close_v2(db);
 				db = nullptr;
 			}
@@ -651,6 +733,7 @@ UPDATE format SET version=2;
 			Close();
 		} catch (...) {
 			if (db) {
+				statements.Clear();
 				sqlite3_close_v2(db);
 			}
 		}
@@ -962,15 +1045,7 @@ std::string Session::Read(const std::string &path, int64_t offset, int64_t size)
 	RequireFile(node);
 	int64_t available = std::max<int64_t>(0, node.fields[1] - offset);
 	int64_t length = size < 0 ? available : std::min(size, available);
-	std::string result(size_t(length), '\0');
-	size_t consumed = 0;
-	while (consumed < result.size()) {
-		int64_t position = offset + int64_t(consumed);
-		auto bytes = Block(database->db, node.key.inode, position / BLOCK_SIZE, view);
-		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, result.size() - consumed);
-		std::memcpy(&result[consumed], bytes.data() + position % BLOCK_SIZE, amount);
-		consumed += amount;
-	}
+	auto result = ReadBytes(database->db, node.key.inode, offset, length, view);
 	tx.Commit();
 	return result;
 }
@@ -1654,6 +1729,7 @@ FileStat Describe(const Record &node) {
 void Database::Close() {
 	if (process != OwnerLock::Process()) {
 		// SQLite connections and C++ mutexes must not be reused across fork.
+		statements.idle.clear(); // Abandon inherited statements without calling SQLite.
 		db = nullptr;
 		owner_lock.Close();
 		return;
@@ -1677,6 +1753,7 @@ void Database::Close() {
 		                                   [&](const auto &pin) { return pin->owner == owner; }),
 		                    registry.pins.end());
 	}
+	statements.Clear();
 	Check(db, sqlite3_close(db));
 	db = nullptr;
 	owner_lock.Remove();
@@ -1857,14 +1934,7 @@ std::string Session::ReadInode(int64_t inode, int64_t offset, int64_t size) {
 	auto node = OpenedInode(database->db, inode, view);
 	RequireFile(node);
 	int64_t length = std::min(size, std::max<int64_t>(0, node.fields[1] - offset));
-	std::string result(size_t(length), '\0');
-	for (int64_t consumed = 0; consumed < length;) {
-		auto position = offset + consumed;
-		auto bytes = Block(database->db, inode, position / BLOCK_SIZE, view);
-		auto amount = std::min(BLOCK_SIZE - position % BLOCK_SIZE, length - consumed);
-		std::memcpy(&result[size_t(consumed)], bytes.data() + position % BLOCK_SIZE, size_t(amount));
-		consumed += amount;
-	}
+	auto result = ReadBytes(database->db, inode, offset, length, view);
 	tx.Commit();
 	return result;
 }

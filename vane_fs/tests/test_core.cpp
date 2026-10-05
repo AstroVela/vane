@@ -82,10 +82,21 @@ int main() {
 			SQL(path, "DROP TRIGGER fail_payload; DROP TABLE fault_counter");
 			Require(main->Read("/rollback") == "before", "Write failure did not roll back");
 			Require(workspace.GetBranch().generation == generation, "Failed write advanced branch generation");
+			main->WriteFile("/retry", std::string(16384, 'r'));
+			Require(main->Read("/retry") == std::string(16384, 'r'), "Failed statement poisoned later writes");
 			main->MakeDirectory("/nested");
 			main->MakeDirectory("/nested/child");
 			Expect(ErrorCode::Invalid, [&] { main->Rename("/nested", "/nested/child/cycle"); });
 			Expect(ErrorCode::NotEmpty, [&] { main->RemoveDirectory("/nested"); });
+			workspace.AcquireMount("main");
+			auto handle = main->OpenFile("/inode-ranges", true, true);
+			main->WriteInode(handle.inode, std::string(4096, 'b'), 4096);
+			main->TruncateInode(handle.inode, 12288);
+			Require(main->ReadInode(handle.inode, 4094, 4100) ==
+			            std::string(2, '\0') + std::string(4096, 'b') + std::string(2, '\0'),
+			        "Inode range read lost a partial block or sparse boundary");
+			main->CloseFile(handle.inode);
+			workspace.ReleaseMount("main");
 			workspace.Close();
 			Expect(ErrorCode::Closed, [&] { main->Stat("/"); });
 		}

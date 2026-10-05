@@ -233,6 +233,13 @@ blocks and clear the unused tail of its final block so re-extension cannot
 reveal old bytes. Writing data and unlinking or renaming its entry must never
 leave a partially updated namespace after a crash.
 
+Each SQLite connection reuses prepared statements under its existing mutex,
+resetting execution and clearing bindings after each use. This cache stores SQL
+programs, not branch frontiers or file contents. Offset reads fetch visible
+payloads for the requested block range in one ordered join, leaving holes zero.
+Full-block writes skip the preliminary read used for partial-block patching;
+payload equality checks and copy-on-write interval updates still run.
+
 Renames update directory entries atomically while preserving inode identity.
 Enforce directory-cycle checks, file/directory replacement rules and
 empty-directory requirements. Handle identity is a branch/snapshot plus inode,

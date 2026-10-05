@@ -389,3 +389,7 @@ not measure FUSE throughput or establish performance for large video workloads.
 The [2026-10-05 baseline](benchmarks/BASELINE.md) records three repetitions per
 profile, including the GC payload-reference index investigation and its
 before/after measurements.
+
+The [FUSE I/O optimization measurements](benchmarks/IO_OPTIMIZATION.md) compare
+the prepared-statement and block-range changes against the previous core using
+the same 64 MiB workloads, with unchanged FULL durability and live-mount caching.
