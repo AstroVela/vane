@@ -686,7 +686,7 @@ public:
 			              },
 			              nullptr, nullptr, nullptr));
 			ValidateIdentity();
-			Exec(db, "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL");
+			Exec(db, "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY");
 			{
 				Statement mode(db, "PRAGMA journal_mode=WAL");
 				if (!mode.Step() || mode.Text(0) != "wal") {
@@ -702,6 +702,8 @@ CREATE TABLE IF NOT EXISTS mounts(branch TEXT PRIMARY KEY REFERENCES branches(id
 CREATE TABLE IF NOT EXISTS open_inodes(owner TEXT NOT NULL REFERENCES owners(id), branch TEXT NOT NULL REFERENCES branches(id),
  inode INTEGER NOT NULL REFERENCES inode_ids(id), refs INTEGER NOT NULL CHECK(refs>0), PRIMARY KEY(owner,branch,inode)) STRICT;
 CREATE INDEX IF NOT EXISTS opened_inodes ON open_inodes(branch,inode);
+CREATE TEMP TABLE inode_references(branch TEXT NOT NULL, inode INTEGER NOT NULL,
+ refs INTEGER NOT NULL CHECK(refs>0), PRIMARY KEY(branch,inode)) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS orphans(branch TEXT NOT NULL REFERENCES branches(id), inode INTEGER NOT NULL REFERENCES inode_ids(id),
  PRIMARY KEY(branch,inode)) STRICT;
 CREATE INDEX IF NOT EXISTS dirent_targets ON dirent_versions(inode,low,high);
@@ -1700,12 +1702,20 @@ void PinInode(sqlite3 *db, int64_t inode, const View &view, int64_t references =
 	RequireOwnMount(db, view);
 	if (references < 1)
 		Fail(ErrorCode::Invalid, "Invalid inode reference count");
-	Statement pin(db, "INSERT INTO open_inodes VALUES(vane_fs_owner(),?,?,?) "
-	                  "ON CONFLICT(owner,branch,inode) DO UPDATE SET refs=refs+excluded.refs");
+	// The durable row protects the inode across connections and crash recovery.
+	// Exact counts are connection-local and roll back with the same transaction;
+	// additional opens/lookups need no WAL writes while this pin remains live.
+	Statement pin(db, "INSERT INTO open_inodes VALUES(vane_fs_owner(),?,?,1) "
+	                  "ON CONFLICT(owner,branch,inode) DO NOTHING");
 	pin.Bind(1, view.branch);
 	pin.Bind(2, inode);
-	pin.Bind(3, references);
 	pin.Step();
+	Statement count(db, "INSERT INTO temp.inode_references VALUES(?,?,?) "
+	                    "ON CONFLICT(branch,inode) DO UPDATE SET refs=refs+excluded.refs");
+	count.Bind(1, view.branch);
+	count.Bind(2, inode);
+	count.Bind(3, references);
+	count.Step();
 }
 
 Record OpenedInode(sqlite3 *db, int64_t inode, const View &view) {
@@ -1809,6 +1819,9 @@ void Workspace::ReleaseMount(const std::string &branch) {
 	Transaction tx(*database, true);
 	auto view = Branch(database->db, branch, false, true);
 	RequireOwnMount(database->db, view);
+	Statement references(database->db, "DELETE FROM temp.inode_references WHERE branch=?");
+	references.Bind(1, view.branch);
+	references.Step();
 	for (const auto *table : {"open_inodes", "mounts"}) {
 		Statement remove(database->db,
 		                 "DELETE FROM " + std::string(table) + " WHERE owner=vane_fs_owner() AND branch=?");
@@ -1870,26 +1883,32 @@ void Session::CloseFile(int64_t inode, int64_t references) {
 	auto view = SessionView(database->db, id, snapshot, closed);
 	if (!snapshot) {
 		OpenedInode(database->db, inode, view);
-		Statement count(database->db,
-		                "SELECT refs FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
+		Statement count(database->db, "SELECT refs FROM temp.inode_references WHERE branch=? AND inode=?");
 		count.Bind(1, id);
 		count.Bind(2, inode);
-		count.Step();
+		if (!count.Step())
+			Fail(ErrorCode::Closed, "Inode handle is closed");
 		if (count.Integer(0) < references)
 			Fail(ErrorCode::Invalid, "Too many inode references released");
-		Statement remove(database->db,
-		                 "DELETE FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=? AND refs=?");
-		remove.Bind(1, id);
-		remove.Bind(2, inode);
-		remove.Bind(3, references);
-		remove.Step();
-		Statement decrement(database->db,
-		                    "UPDATE open_inodes SET refs=refs-? WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
-		decrement.Bind(1, references);
-		decrement.Bind(2, id);
-		decrement.Bind(3, inode);
-		decrement.Step();
-		CleanupOrphans(database->db);
+		if (count.Integer(0) == references) {
+			Statement remove_refs(database->db, "DELETE FROM temp.inode_references WHERE branch=? AND inode=?");
+			remove_refs.Bind(1, id);
+			remove_refs.Bind(2, inode);
+			remove_refs.Step();
+			Statement remove(database->db,
+			                 "DELETE FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
+			remove.Bind(1, id);
+			remove.Bind(2, inode);
+			remove.Step();
+			CleanupOrphans(database->db);
+		} else {
+			Statement decrement(database->db,
+			                    "UPDATE temp.inode_references SET refs=refs-? WHERE branch=? AND inode=?");
+			decrement.Bind(1, references);
+			decrement.Bind(2, id);
+			decrement.Bind(3, inode);
+			decrement.Step();
+		}
 	}
 	tx.Commit();
 }

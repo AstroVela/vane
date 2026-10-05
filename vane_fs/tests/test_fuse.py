@@ -4,11 +4,12 @@
 import errno
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,33 @@ def test_live_handles_observe_other_writes_and_atomic_append(tmp_path):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(append, range(4)))
             assert sorted(path.read_text().splitlines()) == sorted(f"{i}:{j}" for i in range(4) for j in range(30))
+
+
+def test_repeated_open_release_does_not_commit_existing_inode_references(tmp_path):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.mkdir("/dir")
+        branch.write_file("/dir/file", b"content")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            directory = point / "dir"
+            path = directory / "file"
+            # Keep file and directory references live independently of kernel
+            # dentry eviction while exercising additional opens and releases.
+            file_fd = os.open(path, os.O_RDONLY)
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                assert path.read_bytes() == b"content"
+                assert os.listdir(directory) == ["file"]
+                with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as db:
+                    before = db.execute("PRAGMA data_version").fetchone()
+                    for _ in range(20):
+                        assert path.read_bytes() == b"content"
+                        assert os.listdir(directory) == ["file"]
+                    assert db.execute("PRAGMA data_version").fetchone() == before
+            finally:
+                os.close(file_fd)
+                os.close(dir_fd)
 
 
 @pytest.mark.parametrize("readonly", [False, True])

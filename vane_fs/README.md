@@ -92,9 +92,17 @@ build/core/vane-fs-mount /tmp/workspace.sqlite --snapshot "$snapshot_id" /tmp/va
 The C++ adapter uses libfuse's low-level inode interface. Kernel lookup and
 open references retain unlinked inodes; rename, replacement and unlink cannot
 retarget an existing file descriptor. The final reference release reclaims an
-orphan. Appends select the current EOF inside the write transaction. Each write
-and metadata operation commits with `synchronous=FULL` before replying; kernel
-writeback is disabled, and `fsync` has no deferred application data to flush.
+orphan. Appends select the current EOF inside the write transaction. Each file
+write and namespace/attribute mutation commits with `synchronous=FULL` before
+replying; kernel writeback is disabled, and `fsync` has no deferred application
+data to flush.
+
+The first inode reference persists a pin; intermediate opens and releases update
+exact counts in a connection-private in-memory SQLite table. The final release
+removes the pin and reclaims an orphan atomically. Temporary counts participate
+in transaction rollback, while durable owner pins protect live handles from GC
+and allow recovery after a mount crash. Reference operations retain writer-lock
+serialization but avoid repeated WAL writes and syncs for an already-pinned inode.
 
 A writable mount exclusively leases its branch. Other connections may read
 it, but writes, fork, snapshot, merge and deletion involving that branch require
@@ -404,3 +412,8 @@ The subsequent [metadata cache measurements](benchmarks/METADATA_OPTIMIZATION.md
 record stat, directory and Git workloads after enabling kernel metadata caching
 under the exclusive mount lease, including invalidation checks and an I/O
 regression comparison.
+
+The [inode reference measurements](benchmarks/REFERENCE_OPTIMIZATION.md) record
+directory and Git workloads after moving exact reference counts into
+connection-private memory, while retaining durable first/last pins and FULL
+file-mutation commits. They include rollback/lifetime tests and syscall counts.

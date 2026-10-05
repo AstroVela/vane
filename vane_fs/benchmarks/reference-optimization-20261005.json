@@ -1,0 +1,1521 @@
+{
+  "schema": 1,
+  "build": {
+    "baseline_commit": "98b0fe44c6d475a3331b9de8cebbc15084a12571",
+    "created_epoch": 1791213280.5460722,
+    "flags": "GCC 13.3.0 Release -O3 -DNDEBUG, static SQLite 3.53.2, libfuse 3.14.0",
+    "free_bytes": 32559476736,
+    "baseline_binary_sha256": {
+      "baseline-cli": "bd430f96d6298a2b0bd525f0a1718c18bb66ac1e3d4d38f204d7941a3109fab7",
+      "baseline-mount": "87de2135d07c4f6f2119b0308105555e922c9e761c9a803a48bf612c7d314bda"
+    },
+    "optimized_source_sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2",
+    "optimized_binary_sha256": {
+      "optimized-cli": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b",
+      "optimized-mount": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    }
+  },
+  "workloads": {
+    "source_commit": "3334e43d47e00d1411c32defe837a87a969d1e56",
+    "source_sha256": "352cce87372ea37aba28da8a9fb06ace1b9ff1b5060d8733cdfa0c7260d96629",
+    "source_path": "vane_fs/build/drive9-comparison/drive9/tools/bench/drive9_fuse_bench.py",
+    "metadata_config": {
+      "runs": 3,
+      "cache_state": "hot",
+      "environment": "local",
+      "drop_caches_command": "",
+      "small_count": 1000,
+      "stat_count": 1000,
+      "dir_large_count": 1000,
+      "large_mib": 64,
+      "random_reads": 4096,
+      "macro_files": 100,
+      "macro_total_mib": 4,
+      "git_clone_mode": "no-local",
+      "keep_workdirs": false
+    },
+    "io_config": {
+      "runs": 3,
+      "cache_state": "hot",
+      "environment": "local",
+      "drop_caches_command": "",
+      "small_count": 32,
+      "stat_count": 128,
+      "dir_large_count": 128,
+      "large_mib": 64,
+      "random_reads": 4096,
+      "macro_files": 16,
+      "macro_total_mib": 1,
+      "git_clone_mode": "local",
+      "keep_workdirs": false
+    },
+    "order": [
+      "baseline-0",
+      "optimized-0",
+      "optimized-1",
+      "baseline-1",
+      "baseline-2",
+      "optimized-2"
+    ]
+  },
+  "scope": "Three alternating before/after pairs using fresh databases. Baseline includes the earlier SQL and FUSE metadata-cache optimizations. Both variants use FULL WAL commits, direct file I/O and 60-second positive metadata caching. Other host workloads were active; agent-owned builds and tests did not overlap timed runs. No comparison server was rerun.",
+  "metadata": {
+    "samples": [
+      {
+        "variant": "baseline",
+        "metric": "stat",
+        "repetition": 0,
+        "seconds": 0.00899219000712037,
+        "value": 111207.61451972884,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_small",
+        "repetition": 0,
+        "seconds": 0.004367838992038742,
+        "value": 4578.923361519047,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_large",
+        "repetition": 0,
+        "seconds": 0.01229841000167653,
+        "value": 81311.32397307287,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_clone",
+        "repetition": 0,
+        "seconds": 2.690591405000305,
+        "value": 2.690591405000305,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_status_dirty",
+        "repetition": 0,
+        "seconds": 0.1228945110051427,
+        "value": 0.1228945110051427,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 0,
+        "seconds": 0.045941310992930084,
+        "value": 0.045941310992930084,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_find_files",
+        "repetition": 0,
+        "seconds": 0.12757069399231113,
+        "value": 0.12757069399231113,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_go_build",
+        "repetition": 0,
+        "seconds": 0.365512338001281,
+        "value": 0.365512338001281,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "stat",
+        "repetition": 1,
+        "seconds": 0.009211707016220316,
+        "value": 108557.51254780062,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_small",
+        "repetition": 1,
+        "seconds": 0.004332255979534239,
+        "value": 4616.532378160674,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_large",
+        "repetition": 1,
+        "seconds": 0.012256785004865378,
+        "value": 81587.46356430712,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_clone",
+        "repetition": 1,
+        "seconds": 2.190490074979607,
+        "value": 2.190490074979607,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_status_dirty",
+        "repetition": 1,
+        "seconds": 0.1392512159945909,
+        "value": 0.1392512159945909,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 1,
+        "seconds": 0.07218664098763838,
+        "value": 0.07218664098763838,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_find_files",
+        "repetition": 1,
+        "seconds": 0.0880331190128345,
+        "value": 0.0880331190128345,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_go_build",
+        "repetition": 1,
+        "seconds": 0.3315554900036659,
+        "value": 0.3315554900036659,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "stat",
+        "repetition": 2,
+        "seconds": 0.004747054015751928,
+        "value": 210656.9667591198,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_small",
+        "repetition": 2,
+        "seconds": 0.004463338991627097,
+        "value": 4480.950256639382,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "baseline",
+        "metric": "readdir_large",
+        "repetition": 2,
+        "seconds": 0.01241153001319617,
+        "value": 80570.2438729779,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_clone",
+        "repetition": 2,
+        "seconds": 2.246157500980189,
+        "value": 2.246157500980189,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_status_dirty",
+        "repetition": 2,
+        "seconds": 0.13838298598420806,
+        "value": 0.13838298598420806,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 2,
+        "seconds": 0.05457589999423362,
+        "value": 0.05457589999423362,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_find_files",
+        "repetition": 2,
+        "seconds": 0.09084085398353636,
+        "value": 0.09084085398353636,
+        "unit": "seconds"
+      },
+      {
+        "variant": "baseline",
+        "metric": "macro_go_build",
+        "repetition": 2,
+        "seconds": 0.30733857201994397,
+        "value": 0.30733857201994397,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "stat",
+        "repetition": 0,
+        "seconds": 0.008835618995362893,
+        "value": 113178.2618201192,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_small",
+        "repetition": 0,
+        "seconds": 0.0005668429948855191,
+        "value": 35283.13868294208,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_large",
+        "repetition": 0,
+        "seconds": 0.008819807990221307,
+        "value": 113381.15309411718,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_clone",
+        "repetition": 0,
+        "seconds": 13.238016386982054,
+        "value": 13.238016386982054,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_status_dirty",
+        "repetition": 0,
+        "seconds": 0.03890884399879724,
+        "value": 0.03890884399879724,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 0,
+        "seconds": 0.01994182399357669,
+        "value": 0.01994182399357669,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_find_files",
+        "repetition": 0,
+        "seconds": 0.012186990003101528,
+        "value": 0.012186990003101528,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_go_build",
+        "repetition": 0,
+        "seconds": 0.10931780000100844,
+        "value": 0.10931780000100844,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "stat",
+        "repetition": 1,
+        "seconds": 0.005397900997195393,
+        "value": 185257.1954394076,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_small",
+        "repetition": 1,
+        "seconds": 0.0005454960046336055,
+        "value": 36663.87990033666,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_large",
+        "repetition": 1,
+        "seconds": 0.009004510007798672,
+        "value": 111055.45988997901,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_clone",
+        "repetition": 1,
+        "seconds": 1.6823435480182525,
+        "value": 1.6823435480182525,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_status_dirty",
+        "repetition": 1,
+        "seconds": 0.0715336189896334,
+        "value": 0.0715336189896334,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 1,
+        "seconds": 0.05187975999433547,
+        "value": 0.05187975999433547,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_find_files",
+        "repetition": 1,
+        "seconds": 0.011959505005506799,
+        "value": 0.011959505005506799,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_go_build",
+        "repetition": 1,
+        "seconds": 0.09272389498073608,
+        "value": 0.09272389498073608,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "stat",
+        "repetition": 2,
+        "seconds": 0.009225687012076378,
+        "value": 108393.01167392792,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_small",
+        "repetition": 2,
+        "seconds": 0.0005531460046768188,
+        "value": 36156.81905121091,
+        "unit": "ops/s",
+        "operations": 20
+      },
+      {
+        "variant": "optimized",
+        "metric": "readdir_large",
+        "repetition": 2,
+        "seconds": 0.008527569007128477,
+        "value": 117266.71448381912,
+        "unit": "ops/s",
+        "operations": 1000
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_clone",
+        "repetition": 2,
+        "seconds": 1.5728057619999163,
+        "value": 1.5728057619999163,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_status_dirty",
+        "repetition": 2,
+        "seconds": 0.0665948620007839,
+        "value": 0.0665948620007839,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_git_diff_dirty",
+        "repetition": 2,
+        "seconds": 0.05608188299811445,
+        "value": 0.05608188299811445,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_find_files",
+        "repetition": 2,
+        "seconds": 0.012041013018460944,
+        "value": 0.012041013018460944,
+        "unit": "seconds"
+      },
+      {
+        "variant": "optimized",
+        "metric": "macro_go_build",
+        "repetition": 2,
+        "seconds": 0.09203075000550598,
+        "value": 0.09203075000550598,
+        "unit": "seconds"
+      }
+    ],
+    "medians": {
+      "baseline": {
+        "macro_find_files": 0.09084085398353636,
+        "macro_git_clone": 2.246157500980189,
+        "macro_git_diff_dirty": 0.05457589999423362,
+        "macro_git_status_dirty": 0.13838298598420806,
+        "macro_go_build": 0.3315554900036659,
+        "readdir_large": 81311.32397307287,
+        "readdir_small": 4578.923361519047,
+        "stat": 111207.61451972884
+      },
+      "optimized": {
+        "macro_find_files": 0.012041013018460944,
+        "macro_git_clone": 1.6823435480182525,
+        "macro_git_diff_dirty": 0.05187975999433547,
+        "macro_git_status_dirty": 0.0665948620007839,
+        "macro_go_build": 0.09272389498073608,
+        "readdir_large": 113381.15309411718,
+        "readdir_small": 36156.81905121091,
+        "stat": 113178.2618201192
+      }
+    },
+    "units": "stat: operations/s; readdir: entries/s; macro workloads: seconds",
+    "validation": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "files": 2120,
+        "aggregate_sha256": "87249651eea302cea36c97f4706e5b958f7227b257e43cb39aa116fbba0ea208"
+      }
+    ]
+  },
+  "reference_diagnostic": {
+    "description": "64 warmed file open/read/close cycles, each followed by directory open/list/close; an FSYNCDIR request drains releases. Timings include strace and are excluded from performance comparisons. The reused runner labels this diagnostic metric stat in its raw output; it exercises references, not stat calls.",
+    "variants": {
+      "baseline": {
+        "metric": "stat",
+        "repetition": 0,
+        "seconds": 0.9081961319898255,
+        "value": 70.4693598064311,
+        "unit": "ops/s",
+        "operations": 64,
+        "start_epoch": 1791213832.950338,
+        "log_start": 105044,
+        "end_epoch": 1791213833.858581,
+        "log_end": 190681,
+        "fuse_requests": {
+          "OPEN": 64,
+          "GETATTR": 128,
+          "IOCTL": 64,
+          "READ": 128,
+          "FLUSH": 64,
+          "RELEASE": 64,
+          "OPENDIR": 64,
+          "READDIR": 128,
+          "RELEASEDIR": 64,
+          "FSYNCDIR": 1
+        },
+        "syscalls": {
+          "pwrite64": 512,
+          "fsync": 256
+        }
+      },
+      "optimized": {
+        "metric": "stat",
+        "repetition": 0,
+        "seconds": 0.2673378320178017,
+        "value": 239.39746767954009,
+        "unit": "ops/s",
+        "operations": 64,
+        "start_epoch": 1791213835.0842438,
+        "log_start": 105044,
+        "end_epoch": 1791213835.3516266,
+        "log_end": 190681,
+        "fuse_requests": {
+          "OPEN": 64,
+          "GETATTR": 128,
+          "IOCTL": 64,
+          "READ": 128,
+          "FLUSH": 64,
+          "RELEASE": 64,
+          "OPENDIR": 64,
+          "READDIR": 128,
+          "RELEASEDIR": 64,
+          "FSYNCDIR": 1
+        },
+        "syscalls": {}
+      }
+    },
+    "validation": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "files": 64,
+        "aggregate_sha256": "10e14a08e012ea67be2e23af19e7ca1fa89f886cfe836f90fcb377b55cf96f19"
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "files": 64,
+        "aggregate_sha256": "10e14a08e012ea67be2e23af19e7ca1fa89f886cfe836f90fcb377b55cf96f19"
+      }
+    ]
+  },
+  "io_regression_check": {
+    "samples": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "seconds": 1.7469806970038917,
+        "bytes": 67108864,
+        "mib_s": 36.63463489308229
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "seconds": 0.0957375809957739,
+        "bytes": 67108864,
+        "mib_s": 668.4940159792122
+      },
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "seconds": 0.30710344601538964,
+        "bytes": 16777216,
+        "mib_s": 52.09970844546695
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_write",
+        "seconds": 1.420494835008867,
+        "bytes": 67108864,
+        "mib_s": 45.054722074790575
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "sequential_read",
+        "seconds": 0.07993170100962743,
+        "bytes": 67108864,
+        "mib_s": 800.6835734959709
+      },
+      {
+        "variant": "optimized",
+        "repetition": 0,
+        "metric": "random_read_4k",
+        "seconds": 0.24438669998198748,
+        "bytes": 16777216,
+        "mib_s": 65.47001126157552
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "seconds": 1.489474958012579,
+        "bytes": 67108864,
+        "mib_s": 42.96816113336731
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "seconds": 0.08039293697220273,
+        "bytes": 67108864,
+        "mib_s": 796.0898358786061
+      },
+      {
+        "variant": "optimized",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "seconds": 0.23312845500186086,
+        "bytes": 16777216,
+        "mib_s": 68.63169062683612
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_write",
+        "seconds": 1.5068290880008135,
+        "bytes": 67108864,
+        "mib_s": 42.47329740953703
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "sequential_read",
+        "seconds": 0.08759221900254488,
+        "bytes": 67108864,
+        "mib_s": 730.6585074427737
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "metric": "random_read_4k",
+        "seconds": 0.24707731997477822,
+        "bytes": 16777216,
+        "mib_s": 64.75705662354314
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "seconds": 1.4818403359968215,
+        "bytes": 67108864,
+        "mib_s": 43.18953833642795
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "seconds": 0.08624232898000628,
+        "bytes": 67108864,
+        "mib_s": 742.0949869621128
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "seconds": 0.24122456199256703,
+        "bytes": 16777216,
+        "mib_s": 66.32823733966616
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_write",
+        "seconds": 1.4356471789942589,
+        "bytes": 67108864,
+        "mib_s": 44.579198104115754
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "sequential_read",
+        "seconds": 0.07693843700690195,
+        "bytes": 67108864,
+        "mib_s": 831.8338985006769
+      },
+      {
+        "variant": "optimized",
+        "repetition": 2,
+        "metric": "random_read_4k",
+        "seconds": 0.2361496300145518,
+        "bytes": 16777216,
+        "mib_s": 67.75365262699782
+      }
+    ],
+    "medians_mib_s": {
+      "baseline": {
+        "sequential_write": 42.47329740953703,
+        "sequential_read": 730.6585074427737,
+        "random_read_4k": 64.75705662354314
+      },
+      "optimized": {
+        "sequential_write": 44.579198104115754,
+        "sequential_read": 800.6835734959709,
+        "random_read_4k": 67.75365262699782
+      }
+    },
+    "validated_files": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2-mount/sequential_write/seq-write/large.bin",
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2-mount/sequential_read/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2-mount/random_read_4k/large/large.bin",
+        "bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      }
+    ]
+  },
+  "validation": {
+    "python_related_tests": 108,
+    "native_release_tests": 3,
+    "native_asan_ubsan_tests": 3,
+    "fuse_asan_ubsan_tests": 4,
+    "sanitizer_logs": [
+      {
+        "path": "/tmp/pytest-of-kaka/pytest-132/test_repeated_open_release_doe0/mount-branch-main.log",
+        "sha256": "dee6ab706852fac6cc12164b680ce45735022525d79ec7cc132440e9f49614ae"
+      },
+      {
+        "path": "/tmp/pytest-of-kaka/pytest-132/test_live_handles_observe_othe0/mount-branch-main.log",
+        "sha256": "f88138ae2644bbcf766064ddfcbda2337c33aa6f15cfb010e724b44a665936b9"
+      },
+      {
+        "path": "/tmp/pytest-of-kaka/pytest-132/test_open_handles_survive_unli0/mount-branch-main.log",
+        "sha256": "eeb24c652ee95de2103f67d31811dede45173174e00a3e830a164ad1c90d4f58"
+      },
+      {
+        "path": "/tmp/pytest-of-kaka/pytest-132/test_mount_crash_reclaims_orph0/mount-branch-main.log",
+        "sha256": "a3481e6043c1f04920a7d9129f667f57404b1faee35e2efe39f842dae27840da"
+      }
+    ],
+    "regression_baseline": "test_repeated_open_release_does_not_commit_existing_inode_references failed against 98b0fe44c6 (data_version changed 2 -> 3); passes with optimization",
+    "source_sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2",
+    "metadata_fixture_files": 12848,
+    "io_files": 18,
+    "database_quick_checks": 14
+  },
+  "limitations": [
+    "Shared host, three repetitions only; all samples are retained.",
+    "Optimized Git clone has a 13.238-second outlier; its other samples are 1.682 and 1.573 seconds. The cause of the outlier is not established.",
+    "Git diff improvement is small relative to variation. Hot stat remains served by the kernel cache.",
+    "Reference operations still serialize through BEGIN IMMEDIATE; first/last pins and content/namespace mutations remain durable. Sequential-write FULL commit cost is unchanged."
+  ],
+  "owned_processes": [
+    {
+      "pid": 3842882,
+      "name": "baseline-0",
+      "repetition": 0,
+      "returncode": 0
+    },
+    {
+      "pid": 3845452,
+      "name": "baseline-1",
+      "repetition": 1,
+      "returncode": 0
+    },
+    {
+      "pid": 3846364,
+      "name": "baseline-2",
+      "repetition": 2,
+      "returncode": 0
+    },
+    {
+      "pid": 3843692,
+      "name": "optimized-0",
+      "repetition": 0,
+      "returncode": 0
+    },
+    {
+      "pid": 3844764,
+      "name": "optimized-1",
+      "repetition": 1,
+      "returncode": 0
+    },
+    {
+      "pid": 3847734,
+      "name": "optimized-2",
+      "repetition": 2,
+      "returncode": 0
+    },
+    {
+      "pid": 3839616,
+      "name": "baseline-trace",
+      "repetition": 0,
+      "returncode": 0
+    },
+    {
+      "pid": 3839716,
+      "name": "optimized-trace",
+      "repetition": 0,
+      "returncode": 0
+    },
+    {
+      "pid": 3850050,
+      "name": "baseline-0",
+      "returncode": 0
+    },
+    {
+      "pid": 3850243,
+      "name": "optimized-0",
+      "returncode": 0
+    },
+    {
+      "pid": 3850517,
+      "name": "optimized-1",
+      "returncode": 0
+    },
+    {
+      "pid": 3850883,
+      "name": "baseline-1",
+      "returncode": 0
+    },
+    {
+      "pid": 3851038,
+      "name": "baseline-2",
+      "returncode": 0
+    },
+    {
+      "pid": 3851341,
+      "name": "optimized-2",
+      "returncode": 0
+    }
+  ],
+  "database_checks": [
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-0-vhem0f7v/workspace-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-1-34dvb360/workspace-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-2-ehamxlz0/workspace-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-0-tsg4rlpo/workspace-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-1-plpmlhws/workspace-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-2-sjm9ggck/workspace-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-trace-ny6jh6ny/workspace-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-trace-9vxs76jy/workspace-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    }
+  ],
+  "cleanup": {
+    "all_removed": true,
+    "remaining_mounts": [],
+    "removed_bytes": 1559855104,
+    "manifest": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-0-vhem0f7v/workspace-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-0-vhem0f7v/workspace-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-0-vhem0f7v/workspace-0.sqlite",
+        "bytes": 19099648,
+        "sha256": "e8719e416666543d5e844c34fe904ca4640fea876ae008fbe82a992c0957e188"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-1-34dvb360/workspace-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-1-34dvb360/workspace-1.sqlite",
+        "bytes": 19099648,
+        "sha256": "bf1c2aec357428b5e3e06bc51b8ab6aebb1b85740952a29905a495586a71b814"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-1-34dvb360/workspace-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-2-ehamxlz0/workspace-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-2-ehamxlz0/workspace-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-2-ehamxlz0/workspace-2.sqlite",
+        "bytes": 19042304,
+        "sha256": "c33caad7caf5b4e72913e6de7c2aec55f1d315b2a776eb092abf7b4bfb9dedfb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-0-tsg4rlpo/workspace-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-0-tsg4rlpo/workspace-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-0-tsg4rlpo/workspace-0.sqlite",
+        "bytes": 19099648,
+        "sha256": "231d8775de0580c6950acdc1666667265f8dbc9846c66b66637c0183a0037538"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-1-plpmlhws/workspace-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-1-plpmlhws/workspace-1.sqlite",
+        "bytes": 19079168,
+        "sha256": "057735962e5d240d8056db28fffc2d28db6217bbc56647b0fa45f33b1faab0c5"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-1-plpmlhws/workspace-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-2-sjm9ggck/workspace-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-2-sjm9ggck/workspace-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-2-sjm9ggck/workspace-2.sqlite",
+        "bytes": 19079168,
+        "sha256": "901d20d3b7d216e7d17c7b77134d7dc4fe9ab39f55bdf4580b47a7fdbccf6b34"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-trace-ny6jh6ny/workspace-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-trace-ny6jh6ny/workspace-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-baseline-trace-ny6jh6ny/workspace-0.sqlite",
+        "bytes": 503808,
+        "sha256": "2a7d7afd7f56326897ca7fdb24c76e696524ba9ecb28f3a338189f165dace44d"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-trace-9vxs76jy/workspace-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-trace-9vxs76jy/workspace-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-optimization-20261005/owned-optimized-trace-9vxs76jy/workspace-0.sqlite",
+        "bytes": 503808,
+        "sha256": "b5d9cdb2678c34259c7d81f494f5879ac87b2bb0a8741cd0adcf50c8fd0d16db"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1.sqlite",
+        "bytes": 240648192,
+        "sha256": "3df7f5d2fd6f06cf67b84da508c1e62ff2b7ae5b1e8db8ec82c3216b547c7073"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0.sqlite",
+        "bytes": 240648192,
+        "sha256": "e4811910e1a93d2805796fab15e1ab8d3617e58e5c6d8a4a454cf9a5a266ec40"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-2.sqlite",
+        "bytes": 240648192,
+        "sha256": "9dbdf7f71a116461765c0d3fbedaa30555bd2ec0f17389497ca75526467fc896"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0.sqlite",
+        "bytes": 240648192,
+        "sha256": "a3e23f1e79558c5510d3f44772b224da8e232412da39a9c1350759174100fa8e"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/baseline-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-2.sqlite",
+        "bytes": 240648192,
+        "sha256": "41cddbbdf8bae2e42d916289b310dd71bcbb4a25c5598adcaefbbe5ffc041469"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-1.sqlite",
+        "bytes": 240648192,
+        "sha256": "2d61e492a366718ddd78ce6133cb01bdc27039ecb6f11102bd9242ffb7105865"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/reference-io-20261005/owned-data-tzi679b4/optimized-0.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      }
+    ]
+  },
+  "local_artifact_hashes": [
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-0-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-0-results.json",
+      "bytes": 5323,
+      "sha256": "d33c1390ba37118840f2278c5f5d3638a2acf32814d6751aa382beffa33601fc"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-1-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-1-results.json",
+      "bytes": 5321,
+      "sha256": "9b3e89b04c5d443486de021c878695204dab77912191895de03c2f7aa9f71eae"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-2-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-2-results.json",
+      "bytes": 5325,
+      "sha256": "a5a1a414ba7cb5e983d57eb96db80f2180eb53dcc3c08aad3dfd7e55bb59b8f0"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-cli",
+      "bytes": 1698456,
+      "sha256": "bd430f96d6298a2b0bd525f0a1718c18bb66ac1e3d4d38f204d7941a3109fab7"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-fuse.cpp",
+      "bytes": 15309,
+      "sha256": "5435a5b952dddb4e242f76a337a3241a38c05f11201481f70c0324bde194952f"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-mount",
+      "bytes": 1743544,
+      "sha256": "87de2135d07c4f6f2119b0308105555e922c9e761c9a803a48bf612c7d314bda"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-trace-0-mount.log",
+      "bytes": 190788,
+      "sha256": "86592212e5da0e398092a49b766941f44d9cdc3d72eb7e58ba19764b97ea8c49"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-trace-results.json",
+      "bytes": 4264,
+      "sha256": "0cdfe312696c9c5c127eb7134b9074437c0b165cbee5c73f3337c75eccc1bbb9"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-trace-syscalls.log",
+      "bytes": 940299,
+      "sha256": "71f363adc35e83d05805b855b71dba08f4af115ff2bd7ac063a61b85f5c091e6"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/baseline-workspace.cpp",
+      "bytes": 73592,
+      "sha256": "40e3069295c57a5e1b73e39883f48f937b655b8068b6fe324a76387c9d6bed5d"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/build.json",
+      "bytes": 744,
+      "sha256": "13321497f7e90b78d5a223552da0a925735e5e09134c63383243277dfdd011dd"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/host-load.txt",
+      "bytes": 70,
+      "sha256": "d5917233a1b2c77e374ec3d115536c4853fff6c0689e9e797aebfff46a62d6bc"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimization.patch",
+      "bytes": 5147,
+      "sha256": "71456c2699a93ede775360a0c08152db300577df744dba25afb8f509f7275914"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-0-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-0-results.json",
+      "bytes": 5346,
+      "sha256": "4429ca571a9cfbffeafebfb9f663998c7c8fb1fa125350cbfd56bf00c1b7f2b1"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-1-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-1-results.json",
+      "bytes": 5343,
+      "sha256": "cf454fba0b5e481403b7f903cd0859b2babdc70e79f17923d0719a1f86e37103"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-2-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-2-results.json",
+      "bytes": 5344,
+      "sha256": "e430a9c863a184cb09dbaa50ce2bfbf60bde0f0d38b4644a5c45b259c653e6c3"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-cli",
+      "bytes": 1702552,
+      "sha256": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-mount",
+      "bytes": 1743544,
+      "sha256": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-trace-0-mount.log",
+      "bytes": 190788,
+      "sha256": "ac301bd13506756dbc4d9819f6811de2e7ddbc5812dd1b6439efaab62b398d6b"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-trace-results.json",
+      "bytes": 4224,
+      "sha256": "d93357c6919c38a48d3ae24be61e30ee60a7a2556541d2b49513cee25b1f4b78"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/optimized-trace-syscalls.log",
+      "bytes": 663608,
+      "sha256": "59f7a9144f3aa762f81bfd48619a390945d54d93636ed3f80332b219cfa00eb8"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/run.log",
+      "bytes": 8371,
+      "sha256": "dbe4cea1dba63644057e6a1e4d3f1c5714fc4083f455dfd67ac45f5bab2df4ea"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/run.py",
+      "bytes": 11112,
+      "sha256": "07b37a96040792b8bc40f27048050c958d4e338dedeaefb19204611c0b4dd2a3"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-optimization-20261005/validation.json",
+      "bytes": 1209,
+      "sha256": "d984a69c035494b76332addd5f41d7b802ad5412dae42f1e400f34d833071339"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/baseline-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/baseline-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/baseline-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/baseline-cli",
+      "bytes": 1698456,
+      "sha256": "bd430f96d6298a2b0bd525f0a1718c18bb66ac1e3d4d38f204d7941a3109fab7"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/baseline-mount",
+      "bytes": 1743544,
+      "sha256": "87de2135d07c4f6f2119b0308105555e922c9e761c9a803a48bf612c7d314bda"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/build.json",
+      "bytes": 744,
+      "sha256": "13321497f7e90b78d5a223552da0a925735e5e09134c63383243277dfdd011dd"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimization.patch",
+      "bytes": 5147,
+      "sha256": "71456c2699a93ede775360a0c08152db300577df744dba25afb8f509f7275914"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimized-0-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimized-1-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimized-2-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimized-cli",
+      "bytes": 1702552,
+      "sha256": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/optimized-mount",
+      "bytes": 1743544,
+      "sha256": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/results.json",
+      "bytes": 18271,
+      "sha256": "02b8d159d8d2ae44042d5df5bed572155c657be9bdaf22816077243645717a8b"
+    },
+    {
+      "path": "vane_fs/build/drive9-comparison/reference-io-20261005/run.py",
+      "bytes": 7579,
+      "sha256": "1ec8036dec69eac47373e9013cba16147f6071665a50c8eb5e7dfed0745a0e2e"
+    }
+  ]
+}

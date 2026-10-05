@@ -68,6 +68,11 @@ if(VANE_FS_BUILD_TESTS)
     vane_fs_test PRIVATE vane_fs unofficial::sqlite3::sqlite3 Threads::Threads)
   add_test(NAME vane_fs_core COMMAND vane_fs_test)
   set_tests_properties(vane_fs_core PROPERTIES TIMEOUT 60)
+  add_executable(vane_fs_inode_refs_test tests/test_inode_refs.cpp)
+  target_link_libraries(vane_fs_inode_refs_test
+                        PRIVATE vane_fs unofficial::sqlite3::sqlite3)
+  add_test(NAME vane_fs_inode_refs COMMAND vane_fs_inode_refs_test)
+  set_tests_properties(vane_fs_inode_refs PROPERTIES TIMEOUT 60)
   if(UNIX)
     add_executable(vane_fs_crash_test tests/test_crash.cpp)
     target_link_libraries(vane_fs_crash_test

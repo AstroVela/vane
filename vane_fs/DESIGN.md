@@ -91,7 +91,8 @@ can commit together. Initial table responsibilities are:
 | `inode_ids` | Monotonic SQLite integer | Allocates inode identities across all branches |
 | `owners` | Connection ID | OS lock location and file identity used to prove an owner has exited |
 | `mounts` | Branch ID | Exclusive writable mount owner |
-| `open_inodes` | Owner, branch, inode | Kernel lookup and open reference counts |
+| `open_inodes` | Owner, branch, inode | Durable pin while any lookup/open reference remains |
+| `temp.inode_references` | Branch, inode | Exact reference counts, private to each connection in memory |
 | `orphans` | Branch, inode | Unlinked nodes retained until their final reference closes |
 
 All three version tables carry `low`, `high`, `writer`, and `deleted`.
@@ -255,6 +256,24 @@ orphan's live versions. Branch topology/publication operations wait until the
 mount is released, so snapshots and merges cannot capture transient orphans.
 Existing snapshots and other branches remain usable. The optional fsspec
 adapter's handles refer to immutable, pinned snapshots.
+
+The first live reference inserts a durable `open_inodes` row. Further lookup
+and open references update only `temp.inode_references`; the last release
+deletes the durable pin and reclaims any orphan in the same transaction.
+SQLite rolls back temporary counts along with failed pin, namespace and lease
+operations, so retrying a failed release cannot lose or duplicate references.
+The [temporary store](https://www.sqlite.org/pragma.html#pragma_temp_store)
+uses memory. These counts need not survive process exit: recovery retires the
+dead owner's durable pins after proving its OS lock is available. Live owners
+remain protected from recovery and garbage collection.
+
+The persistent schema stays at format 2; new pins use its existing `refs`
+column with value 1, and legacy owners' positive counts remain valid pins.
+All sessions sharing a connection share the temporary counts, keyed by both
+branch and inode. Lease release clears that branch's counts transactionally.
+Reference operations still acquire the SQLite writer lock; this removes
+repeated WAL writes and syncs, not writer-lock contention. File-content and
+namespace/attribute mutations retain their FULL commit boundary.
 
 Mutable mounts disable kernel writeback and data caching and commit every
 mutation with SQLite `synchronous=FULL`. Positive directory entries and inode
