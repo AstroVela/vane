@@ -239,6 +239,7 @@ class PipelinedWorker:
         self.epoch = uuid.uuid4().hex
         self.lock = threading.RLock()
         self.queries: dict[str, _Query] = {}
+        self.attempts: dict[str, Any] = {}
         self.reservations: dict[str, dict[str, int]] = {}
         with vane.connect(backend="local") as connection:
             self.engine = native_plan_capabilities(connection).engine_identity
@@ -248,7 +249,7 @@ class PipelinedWorker:
 
     def _check(self, epoch: str) -> None:
         if epoch != self.epoch:
-            raise RuntimeError("worker epoch changed; pipelined attempts cannot be replayed")
+            raise RuntimeError("worker epoch changed; a new attempt requires scheduler admission")
 
     def prepare(
         self,
@@ -347,6 +348,134 @@ class PipelinedWorker:
         with self.lock:
             return {"epoch": self.epoch, "reservations": dict(self.reservations)}
 
+    def check_store(self, epoch: str, descriptor: dict[str, str]) -> None:
+        from pathlib import Path
+
+        from vane.execution.materialized_store import StoreDescriptor
+
+        self._check(epoch)
+        store = StoreDescriptor.from_dict(descriptor)
+        if not any(str(Path(c.root).resolve()) == store.root for c in self.resources.exchange_stores):
+            raise ValueError("worker has no registration for this exchange store")
+        store.check()
+
+    def prepare_materialized(
+        self,
+        epoch: str,
+        encoded: dict[str, Any],
+        fragment_id: str,
+        partition: int,
+        upstream: dict[str, Any],
+        reserved: dict[str, Any],
+        lease: dict[str, Any],
+        frame_rows: int,
+    ) -> None:
+        from pathlib import Path
+
+        from vane._native import execution_runtime as native
+        from vane.execution.fte_plan import bind_task
+        from vane.execution.fte_worker import MaterializedAttempt
+        from vane.execution.materialized_exchange import StageManifest
+        from vane.execution.materialized_store import AttemptReservation
+
+        self._check(epoch)
+        spec = RayQuerySpec.from_dict(encoded, expected_engine_identity=self.engine)
+        if not spec.requires_replay:
+            raise ValueError("materialized worker requires FTE execution")
+        reservation = AttemptReservation.from_dict(reserved)
+        token = reservation.token
+        if reservation.engine_identity != self.engine or token.worker_epoch != epoch or token.query_id != spec.query_id:
+            raise ValueError("attempt engine, epoch or query identity mismatch")
+        options = spec.options.target
+        assert hasattr(options, "fte_options") and options.fte_options is not None
+        registered = next(
+            (s for s in self.resources.exchange_stores if s.name == options.fte_options.exchange_store), None
+        )
+        if registered is None or str(Path(registered.root).resolve()) != reservation.store.root:
+            raise ValueError("worker exchange store registration mismatch")
+        self.check_store(epoch, reservation.store.to_dict())
+        fragment = next(f for f in spec.graph.fragments if f.fragment_id == fragment_id)
+        binding = bind_task(
+            spec, fragment, partition, {name: StageManifest.from_dict(s) for name, s in upstream.items()}
+        )
+        if (token.task_id, token.stage_id, token.input_id) != (
+            binding.task.task_id,
+            fragment_id,
+            binding.task.input_id,
+        ):
+            raise ValueError("attempt does not have the declared immutable input")
+        if tuple(o.output for o in reservation.objects) != binding.task.outputs:
+            raise ValueError("attempt output partitions differ from the fragment graph")
+        if type(frame_rows) is not int or not 0 < frame_rows <= self.resources.exchange.frame_rows:
+            raise ValueError("invalid materialized frame row capacity")
+        links = sum(len(o) for o in binding.inputs.values()) + len(binding.task.outputs)
+        demand = {
+            "contexts": 1,
+            "exchange": links * self.resources.exchange.window_bytes,
+            "staging": links * native.MaterializedIO.staging_bytes(self.resources.exchange.frame_bytes),
+            "io": links,
+            "operator": self.resources.operator_memory_bytes // self.resources.max_active_queries,
+        }
+        capacity = {
+            "contexts": self.resources.task_contexts_per_worker,
+            "exchange": self.resources.exchange_buffer_bytes,
+            "staging": self.resources.staging_buffer_bytes,
+            "io": self.resources.io_concurrency,
+            "operator": self.resources.operator_memory_bytes,
+        }
+        key = f"fte/{spec.query_id}/{token.fence}"
+        resources = replace(self.resources, exchange=replace(self.resources.exchange, frame_rows=frame_rows))
+
+        def orphan() -> None:
+            from vane.execution.fte_store import StorePool
+
+            self.release_materialized(epoch, key)
+            StorePool(registered).collect_expired()
+
+        with self.lock:
+            if key in self.reservations:
+                raise ValueError("attempt already prepared")
+            if any(
+                amount + sum(r[name] for r in self.reservations.values()) > capacity[name]
+                for name, amount in demand.items()
+            ):
+                raise RuntimeError("worker has insufficient materialized capacity")
+            owner = MaterializedAttempt(spec, resources, binding, reservation, lease, orphan)
+            self.reservations[key] = demand
+            self.attempts[key] = owner
+        try:
+            owner.prepare(demand["operator"])
+        except BaseException as primary:
+            try:
+                self.release_materialized(epoch, key)
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+
+    def materialized_status(self, epoch: str, key: str) -> dict[str, Any]:
+        self._check(epoch)
+        with self.lock:
+            owner = self.attempts[key]
+        return {"epoch": self.epoch, **owner.status()}
+
+    def cancel_materialized(self, epoch: str, key: str, reason: str) -> None:
+        self._check(epoch)
+        with self.lock:
+            owner = self.attempts.get(key)
+        if owner is not None:
+            owner.cancel(reason)
+
+    def release_materialized(self, epoch: str, key: str) -> None:
+        self._check(epoch)
+        with self.lock:
+            owner = self.attempts.get(key)
+        if owner is not None:
+            owner.close()
+        with self.lock:
+            if self.attempts.get(key) is owner:
+                self.attempts.pop(key, None)
+                self.reservations.pop(key, None)
+
 
 class ResultService:
     """A reachable native relay with independently bounded upstream/client windows."""
@@ -356,6 +485,12 @@ class ResultService:
         self.resources = resources
         self.channel: Any = None
         self.flight: Any = None
+        self.schema = b""
+        self.materialized: Any = None
+        self.store_lease: Any = None
+        self.stop = threading.Event()
+        self.lifecycle = threading.RLock()
+        self.watchdog: threading.Thread | None = None
 
     def describe(self) -> str:
         return self.epoch
@@ -365,6 +500,7 @@ class ResultService:
 
         if epoch != self.epoch or self.flight is not None:
             raise RuntimeError("invalid result service epoch or duplicate preparation")
+        self.schema = schema
         self.channel = _channel(schema, self.resources, "root", "client")
         self.flight = native.DirectFlight(
             "0.0.0.0",
@@ -383,14 +519,74 @@ class ResultService:
         return {
             "epoch": self.epoch,
             "channel": self.channel.snapshot(),
-            "error": self.flight.error,
+            "error": self.flight.error or (self.materialized.status()["error"] if self.materialized else ""),
             "ready": self.flight.ready,
         }
 
     def cancel(self, reason: str) -> None:
+        self.stop.set()
+        if self.materialized is not None:
+            self.materialized.cancel(reason)
         if self.flight is not None:
             self.flight.cancel(reason)
 
     def release(self) -> None:
-        if self.flight is not None:
-            self.flight.close()
+        self.cancel("result service released")
+        with self.lifecycle:
+            if self.materialized is not None:
+                self.materialized.close()
+            if self.flight is not None:
+                self.flight.close()
+            if self.store_lease is not None:
+                self.store_lease.close()
+
+    def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+        import json
+
+        from vane._native import execution_plan
+        from vane._native import execution_runtime as native
+        from vane.execution.fte_store import ActiveStoreLease
+        from vane.execution.materialized_exchange import ResultManifest
+
+        with self.lifecycle:
+            if epoch != self.epoch or self.materialized is not None or self.stop.is_set():
+                raise RuntimeError("result service no longer accepts a manifest")
+            result = ResultManifest.from_dict(manifest)
+            if (
+                result.stage.engine_identity != execution_plan.engine_identity()
+                or result.output.output.schema != self.schema
+            ):
+                raise ValueError("result manifest native engine or schema mismatch")
+            self.store_lease = ActiveStoreLease(lease)
+            # Own cleanup as soon as the lease is pinned, including failures
+            # while validating a manifest whose coordinator subsequently exits.
+            self.watchdog = threading.Thread(target=self._watch_materialized, name="vane-fte-result-lease", daemon=True)
+            self.watchdog.start()
+            value = self.store_lease.check()
+            if (
+                value["query_id"] != result.stage.query_id
+                or result.output.key.split("/")[0] != self.store_lease.namespace
+            ):
+                raise ValueError("result belongs to another query storage lease")
+            path = self.store_lease.directory / "result.json"
+            if path.is_symlink() or path.stat().st_size > 32 << 20 or json.loads(path.read_bytes()) != manifest:
+                raise ValueError("result manifest has not been published by its coordinator")
+            obj = result.output
+            self.materialized = native.MaterializedIO.read(
+                str(self.store_lease.store.path(obj.key)),
+                self.channel,
+                "root",
+                obj.metadata.bytes,
+                native.MaterializedIO.staging_bytes(self.resources.exchange.frame_bytes),
+                obj.metadata.to_dict(),
+            )
+
+    def _watch_materialized(self) -> None:
+        while not self.stop.is_set():
+            try:
+                value = self.store_lease.check()
+            except BaseException as error:
+                self.cancel(str(error))
+                self.release()
+                return
+            self.stop.wait(min(0.5, value["seconds"] / 4))

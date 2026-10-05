@@ -68,7 +68,10 @@ add_library(
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
 
 # Arrow's C++ API is isolated from the C++11 engine/binding translation units.
-add_library(python_direct_flight OBJECT execution/direct_flight.cpp)
+add_library(
+  python_direct_flight OBJECT
+  execution/direct_flight.cpp execution/arrow_frame.cpp
+  execution/materialized_exchange.cpp execution/file_snapshot.cpp)
 set_target_properties(python_direct_flight PROPERTIES CXX_STANDARD 17)
 target_link_libraries(
   python_direct_flight
@@ -78,6 +81,7 @@ target_link_libraries(
 target_include_directories(
   python_direct_flight
   PRIVATE
+    "${DUCKDB_SOURCE_PATH}/third_party/mbedtls/include"
     $<TARGET_PROPERTY:duckdb_execution_distributed_exchange,INCLUDE_DIRECTORIES>
 )
 

@@ -117,16 +117,19 @@ py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const s
 }
 
 py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
-                           const vector<idx_t> &hash_columns, bool require_replay) {
+                           const vector<idx_t> &hash_columns, bool require_replay,
+                           const string &snapshot_directory = "", idx_t source_budget = 0) {
 	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
 	string snapshot;
 	vector<string> sources;
+	idx_t source_bytes = 0;
 	{
 		py::gil_scoped_release release;
 		snapshot = CaptureConnection(context);
-		graph = Compile(context, sql, query_id, partitions, hash_columns);
+		graph =
+		    Compile(context, sql, query_id, partitions, hash_columns, snapshot_directory, source_budget, &source_bytes);
 		for (auto &fragment : graph.fragments) {
 			sources.push_back(CaptureSources(context, fragment, require_replay));
 		}
@@ -143,6 +146,9 @@ py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, co
 	}
 	result["source_snapshots"] = source_snapshots;
 	result["result_names"] = graph.fragments.back().names;
+	if (!snapshot_directory.empty()) {
+		result["source_bytes"] = source_bytes;
+	}
 	return result;
 }
 
@@ -326,8 +332,25 @@ void RegisterExecutionPlanBindings(py::module_ &module) {
 	execution.def("engine_identity", &vane_execution::EngineIdentity);
 	execution.def("compile", &CompileGraph, py::arg("connection"), py::arg("sql"), py::arg("query_id"),
 	              py::arg("partition_count"), py::arg("hash_columns"));
-	execution.def("compile_submission", &CompileSubmission, py::arg("connection"), py::arg("sql"), py::arg("query_id"),
-	              py::arg("partition_count"), py::arg("hash_columns"), py::arg("require_replay"));
+	execution.def(
+	    "compile_submission",
+	    [](DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
+	       const vector<idx_t> &hash_columns,
+	       bool replay) { return CompileSubmission(connection, sql, query_id, partitions, hash_columns, replay); },
+	    py::arg("connection"), py::arg("sql"), py::arg("query_id"), py::arg("partition_count"), py::arg("hash_columns"),
+	    py::arg("require_replay"));
+	execution.def(
+	    "stage_submission",
+	    [](DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
+	       const vector<idx_t> &hash_columns, const string &directory, idx_t source_budget) {
+		    if (directory.empty() || !source_budget || source_budget > (1ULL << 40)) {
+			    throw InvalidInputException("FTE staging requires a directory and finite source storage budget");
+		    }
+		    return CompileSubmission(connection, sql, query_id, partitions, hash_columns, true, directory,
+		                             source_budget);
+	    },
+	    py::arg("connection"), py::arg("sql"), py::arg("query_id"), py::arg("partition_count"), py::arg("hash_columns"),
+	    py::arg("directory"), py::arg("source_budget"));
 	execution.def("compiler_capabilities", &CompilerCapabilities, py::arg("connection"));
 	execution.def("inspect_submitted_fragment", &InspectSubmittedFragment, py::arg("connection"), py::arg("payload"),
 	              py::arg("connection_snapshot"), py::arg("source_snapshot"), py::arg("require_replay"));

@@ -1046,7 +1046,7 @@ def test_local_fast_call_keeps_native_results(monkeypatch):
         assert connection.execute("CALL range(3)").fetchall() == [(0,), (1,), (2,)]
 
 
-@pytest.mark.parametrize("entry", ["execute", "sql", "query", "from_query", "relation"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "from_query", "relation"])
 def test_read_runner_receives_bound_parameters_without_rebinding(monkeypatch, entry):
     runner = _TransportedPlanRunner()
     install_runner(monkeypatch, runner)

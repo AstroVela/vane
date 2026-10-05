@@ -45,8 +45,8 @@ def _seconds(value: float, name: str, *, allow_zero: bool = False) -> float:
 class FteOptions:
     """Recovery policy referencing a store registered with the query service.
 
-    The store name is not a claim of durability. The service must resolve it
-    and verify its failure domain before admitting a distributed query.
+    The service resolves the name and checks shared store identity/visibility.
+    A failure domain independent of compute remains a deployment requirement.
     """
 
     exchange_store: str

@@ -25,6 +25,18 @@ def tmp_parquets(tmp_path_factory):
 
 
 class TestParquet:
+    @pytest.mark.parametrize("scan", ["read_parquet", "parquet_scan"])
+    def test_filename_filter_distinguishes_custom_generated_and_physical_columns(self, tmp_path, scan):
+        path = tmp_path / "input.parquet"
+        with vane.connect(backend="local") as connection:
+            connection.execute(f"copy (select 42 as value, 'logical-name' as filename) to '{path}'")
+            query = f"select value, filename, origin from {scan}('{path}', filename='origin')"
+            expected = [(42, "logical-name", str(path))]
+            assert connection.execute(query + " where filename = 'logical-name'").fetchall() == expected
+            assert connection.execute(query + f" where filename = '{path}'").fetchall() == []
+            assert connection.execute(query + f" where origin = '{path}'").fetchall() == expected
+            assert connection.execute(query + " where origin = 'logical-name'").fetchall() == []
+
     def test_scan_binary(self, duckdb_cursor):
         conn = vane.connect()
         res = conn.execute("SELECT typeof(#1) FROM parquet_scan('" + filename + "') limit 1").fetchall()

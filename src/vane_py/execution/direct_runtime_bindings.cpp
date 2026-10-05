@@ -3,6 +3,8 @@
 
 #include "direct_task.hpp"
 #include "direct_flight.hpp"
+#include "materialized_exchange.hpp"
+#include "file_snapshot.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -15,6 +17,31 @@ namespace duckdb {
 namespace {
 
 using namespace vane_execution;
+
+MaterializedObject ParseMaterializedObject(const py::dict &value) {
+	if (value.size() != 4 || !value.contains("bytes") || !value.contains("rows") || !value.contains("frames") ||
+	    !value.contains("sha256")) {
+		throw py::value_error("invalid materialized object metadata");
+	}
+	MaterializedObject object;
+	object.bytes = value["bytes"].cast<idx_t>();
+	object.rows = value["rows"].cast<idx_t>();
+	object.frames = value["frames"].cast<idx_t>();
+	object.sha256 = value["sha256"].cast<string>();
+	return object;
+}
+
+shared_ptr<MaterializedIO> Materialized(bool write, const string &path, shared_ptr<DirectChannel> channel,
+                                        const string &identity, idx_t max_bytes, idx_t staging,
+                                        MaterializedObject expected = {}) {
+	py::gil_scoped_release release;
+	return shared_ptr<MaterializedIO>(
+	    new MaterializedIO(write, path, std::move(channel), identity, max_bytes, staging, std::move(expected)),
+	    [](MaterializedIO *io) {
+		    py::gil_scoped_release release;
+		    delete io;
+	    });
+}
 
 // No Python callable is retained by a channel or invoked from an engine thread.
 struct DirectTestSignal {
@@ -206,6 +233,70 @@ void Prepare(DirectTaskService &service, const string &id, const string &payload
 void RegisterDirectRuntimeBindings(py::module_ &module) {
 	auto runtime = module.def_submodule("execution_runtime", "Internal native DirectExchange and TaskService");
 	runtime.def("check_entry", &DuckDBPyConnection::CheckCallbackEntry);
+	py::class_<StoreGuard, shared_ptr<StoreGuard>>(runtime, "StoreGuard")
+	    .def_static("acquire",
+	                [](const string &path, bool exclusive, bool create) {
+		                TaskEntry entry;
+		                py::gil_scoped_release release;
+		                return StoreGuard::Acquire(path, exclusive, create);
+	                })
+	    .def("close", [](StoreGuard &guard) {
+		    TaskEntry entry;
+		    py::gil_scoped_release release;
+		    guard.Close();
+	    });
+	py::class_<MaterializedIO, shared_ptr<MaterializedIO>>(runtime, "MaterializedIO")
+	    .def_static("staging_bytes", &MaterializedIO::StagingBytes)
+	    .def_static("write",
+	                [](const string &path, shared_ptr<DirectChannel> channel, const string &consumer, idx_t max_bytes,
+	                   idx_t staging) {
+		                TaskEntry entry;
+		                return Materialized(true, path, std::move(channel), consumer, max_bytes, staging);
+	                })
+	    .def_static("read",
+	                [](const string &path, shared_ptr<DirectChannel> channel, const string &producer, idx_t max_bytes,
+	                   idx_t staging, const py::dict &expected) {
+		                TaskEntry entry;
+		                return Materialized(false, path, std::move(channel), producer, max_bytes, staging,
+		                                    ParseMaterializedObject(expected));
+	                })
+	    .def_static("verify",
+	                [](const string &path, const py::dict &expected, const string &schema) {
+		                TaskEntry entry;
+		                auto object = ParseMaterializedObject(expected);
+		                py::gil_scoped_release release;
+		                MaterializedIO::Verify(path, object, schema);
+	                })
+	    .def("status",
+	         [](MaterializedIO &io) {
+		         TaskEntry entry;
+		         MaterializedStatus value;
+		         {
+			         py::gil_scoped_release release;
+			         value = io.Status();
+		         }
+		         py::dict object;
+		         object["bytes"] = value.object.bytes;
+		         object["rows"] = value.object.rows;
+		         object["frames"] = value.object.frames;
+		         object["sha256"] = value.object.sha256;
+		         py::dict result;
+		         result["done"] = value.done;
+		         result["error"] = value.error;
+		         result["object"] = std::move(object);
+		         return result;
+	         })
+	    .def("cancel",
+	         [](MaterializedIO &io, const string &reason) {
+		         TaskEntry entry;
+		         py::gil_scoped_release release;
+		         io.Cancel(reason);
+	         })
+	    .def("close", [](MaterializedIO &io) {
+		    TaskEntry entry;
+		    py::gil_scoped_release release;
+		    io.Close();
+	    });
 	py::class_<DirectLimits>(runtime, "DirectLimits")
 	    .def(py::init([](idx_t window_bytes, idx_t frame_bytes, idx_t frame_rows, idx_t frame_slots) {
 		    DirectLimits limits {window_bytes, frame_bytes, frame_rows, frame_slots};
