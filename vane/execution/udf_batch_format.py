@@ -205,6 +205,14 @@ def _is_fixed_shape_tensor(data_type: pa.DataType) -> bool:
     return getattr(data_type, "extension_name", None) == "arrow.fixed_shape_tensor"
 
 
+def _contains_extension_type(data_type: pa.DataType) -> bool:
+    if isinstance(data_type, pa.BaseExtensionType):
+        return True
+    if pa.types.is_dictionary(data_type):
+        return _contains_extension_type(data_type.value_type)
+    return any(_contains_extension_type(data_type.field(index).type) for index in range(data_type.num_fields))
+
+
 def _numpy_input_buffers(values: np.ndarray, zero_copy_batch: bool) -> np.ndarray:
     """Expose read-only buffers, or detach all buffers for in-place UDF mutation."""
     if not zero_copy_batch:
@@ -248,7 +256,14 @@ def _tensor_numpy_view(array: pa.FixedShapeTensorArray) -> np.ndarray:
 
 
 def _arrow_values_to_numpy(array: pa.Array) -> np.ndarray:
-    if pa.types.is_nested(array.type) or array.null_count:
+    if pa.types.is_dictionary(array.type):
+        return _arrow_values_to_numpy(array.dictionary_decode())
+    if (
+        pa.types.is_nested(array.type)
+        or isinstance(array.type, pa.BaseExtensionType)
+        or (pa.types.is_timestamp(array.type) and array.type.tz is not None)
+        or array.null_count
+    ):
         # NumPy's floating NaN cannot represent SQL NULL without losing NaNs or
         # integer precision. Keep typed scalars as well as None: Python integers
         # alone would infer int64 on output, overflowing large uint64 leaves.
@@ -263,6 +278,15 @@ def _arrow_scalar_to_numpy(scalar: pa.Scalar) -> Any:
     if not scalar.is_valid:
         return None
     dtype = scalar.type
+    if _is_fixed_shape_tensor(dtype):
+        values = _arrow_values_to_numpy(scalar.value.values).reshape(dtype.shape)
+        return values.transpose(dtype.permutation) if dtype.permutation else values
+    if isinstance(dtype, pa.BaseExtensionType) or (pa.types.is_timestamp(dtype) and dtype.tz is not None):
+        # Neither opaque extension storage nor a timezone has an equivalent
+        # NumPy dtype. Keep the Arrow scalar, including its logical type.
+        return scalar
+    if pa.types.is_dictionary(dtype):
+        return _arrow_scalar_to_numpy(scalar.value)
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
         return _arrow_values_to_numpy(scalar.values)
     if pa.types.is_struct(dtype):
@@ -273,6 +297,8 @@ def _arrow_scalar_to_numpy(scalar: pa.Scalar) -> Any:
         return np.dtype(dtype.to_pandas_dtype()).type(scalar.as_py())
     if pa.types.is_date32(dtype):
         return np.datetime64(scalar.value, "D")
+    if pa.types.is_timestamp(dtype):
+        return np.datetime64(scalar.value, dtype.unit)
     return scalar.as_py()
 
 
@@ -334,31 +360,26 @@ def _image_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
 
 def _arrow_table_to_pandas(table: pa.Table) -> Any:
     pandas = _import_pandas()
-    tensor_indices = [
-        index
-        for index, field in enumerate(table.schema)
-        if _is_fixed_shape_tensor(field.type) or isinstance(field.type, _ImageArrowType)
-    ]
-    if not tensor_indices:
+    extension_indices = [index for index, field in enumerate(table.schema) if _contains_extension_type(field.type)]
+    if not extension_indices:
         return _arrow_regular_table_to_pandas(table, pandas)
 
-    tensor_index_set = set(tensor_indices)
-    regular_columns = [index for index in range(table.num_columns) if index not in tensor_index_set]
+    extension_index_set = set(extension_indices)
+    regular_columns = [index for index in range(table.num_columns) if index not in extension_index_set]
     if regular_columns:
         frame = _arrow_regular_table_to_pandas(table.select(regular_columns), pandas)
     else:
         frame = pandas.DataFrame(index=pandas.RangeIndex(table.num_rows))
     for index, field in enumerate(table.schema):
-        if index not in tensor_index_set:
+        if index not in extension_index_set:
             continue
-        if isinstance(field.type, _ImageArrowType):
-            values = _image_column_to_numpy(table.column(index))
-            tensor_values: NDArray[np.object_] = np.empty(len(values), dtype=object)
-            for row, value in enumerate(values):
-                tensor_values[row] = None if value is None else value.copy()
-        else:
-            tensor_values = _tensor_column_to_object_array(table.column(index))
-        frame.insert(index, field.name, pandas.Series(tensor_values, index=frame.index, dtype=object))
+        # Arrow's pandas bridge cannot safely materialize nested extensions.
+        # Decode their containers ourselves, including Tensor shape/validity.
+        values = _arrow_column_to_numpy(table.column(index))
+        objects: NDArray[np.object_] = np.empty(len(values), dtype=object)
+        for row, value in enumerate(values):
+            objects[row] = None if value is np.ma.masked else copy.deepcopy(value)
+        frame.insert(index, field.name, pandas.Series(objects, index=frame.index, dtype=object))
     return frame
 
 
@@ -369,16 +390,6 @@ def _arrow_regular_table_to_pandas(table: pa.Table, pandas: Any) -> Any:
         return pandas.ArrowDtype(data_type)
 
     return table.to_pandas(types_mapper=types_mapper)
-
-
-def _tensor_column_to_object_array(column: pa.ChunkedArray) -> np.ndarray:
-    array = _single_arrow_array(column)
-    dense = _tensor_numpy_view(array)
-    valid = array.is_valid().to_numpy(zero_copy_only=False) if array.null_count else None
-    values: NDArray[np.object_] = np.empty(len(array), dtype=object)
-    for index in range(len(array)):
-        values[index] = None if valid is not None and not valid[index] else np.array(dense[index], copy=True)
-    return values
 
 
 def _arrow_table_to_cudf(table: pa.Table) -> Any:
@@ -416,16 +427,18 @@ def _numpy_column_to_arrow(value: np.ndarray, column_schema: _OutputColumnSchema
         return _container_values_to_arrow(value, column_schema.container_type)
     if value.ndim != 1:
         return pa.array(value.tolist())
-    return pa.array(value)
+    return _primitive_values_to_arrow(value)
 
 
 def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: bool = False) -> pa.Array:
     """Encode declared containers, retaining source leaf types for DuckDB casts."""
+    if _is_fixed_shape_tensor(dtype):
+        return _tensor_values_to_arrow(values, _OutputColumnSchema(name="nested Tensor", tensor_type=dtype))
     rows = [
         None if value is np.ma.masked or (from_pandas and _is_null_object_value(value)) else value for value in values
     ]
     if all(value is None for value in rows):
-        return pa.array(rows, type=dtype)
+        return pa.nulls(len(rows), type=dtype)
     mask = pa.array([value is None for value in rows])
     if pa.types.is_map(dtype):
         offsets = [0]
@@ -488,7 +501,9 @@ def _primitive_values_to_arrow(values: Any, *, from_pandas: bool = False) -> pa.
     """Infer leaf types without losing NumPy temporal units through Python scalars."""
     if isinstance(values, np.ndarray) and values.dtype != object:
         return pa.array(values, from_pandas=from_pandas)
-    rows = list(values)
+    rows = [
+        None if value is np.ma.masked or (from_pandas and _is_null_object_value(value)) else value for value in values
+    ]
     temporal_dtype = next((value.dtype for value in rows if isinstance(value, np.datetime64)), None)
     if temporal_dtype is not None and all(
         value is None or (isinstance(value, np.datetime64) and value.dtype == temporal_dtype) for value in rows
@@ -510,6 +525,8 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
             arrays.append(_tensor_values_to_arrow(series.tolist(), column_schema))
         elif column_schema.container_type is not None and not isinstance(series.dtype, _import_pandas().ArrowDtype):
             arrays.append(_container_values_to_arrow(series, column_schema.container_type, from_pandas=True))
+        elif series.dtype == object:
+            arrays.append(_primitive_values_to_arrow(series, from_pandas=True))
         else:
             arrays.append(pa.array(series, from_pandas=True))
     return pa.Table.from_arrays(arrays, names=[column.name for column in schema])
