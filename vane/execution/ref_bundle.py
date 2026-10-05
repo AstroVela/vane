@@ -1727,6 +1727,50 @@ def prepare_local_shm_block(table: pa.Table) -> PreparedLocalShmBlock:
     )
 
 
+@dataclass(frozen=True)
+class PreparedPooledShmBlock:
+    table: pa.Table
+    names: list[str]
+    num_rows: int
+    size_bytes: int
+    ipc_size_bytes: int
+
+
+def prepare_pooled_shm_block(table: pa.Table) -> PreparedPooledShmBlock:
+    """Count the exact IPC size without allocating a serialized payload buffer."""
+    table = _ensure_table(table)
+    with pa.MockOutputStream() as sink:
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        required = _IPC_HEADER_SIZE + sink.tell()
+    return PreparedPooledShmBlock(
+        table, list(table.schema.names), table.num_rows, int(estimate_table_bytes(table)), required
+    )
+
+
+def _write_pooled_ipc(region: memoryview, block: PreparedPooledShmBlock) -> None:
+    """Serialize directly into the admitted region; publish its header last."""
+    view = region[_IPC_HEADER_SIZE:]
+    target = sink = writer = None
+    try:
+        target = pa.py_buffer(view)
+        sink = pa.FixedSizeBufferWriter(target)
+        with pa.ipc.new_stream(sink, block.table.schema) as writer:
+            writer.write_table(block.table)
+        actual = sink.tell()
+        if actual + _IPC_HEADER_SIZE != block.ipc_size_bytes:
+            raise BufferError("Arrow IPC size changed after shared-memory admission")
+        region[:_IPC_HEADER_SIZE] = actual.to_bytes(_IPC_HEADER_SIZE, "little")
+    finally:
+        try:
+            if sink is not None:
+                sink.close()
+        finally:
+            # Destroy Arrow's exported writers before releasing the mapped view.
+            writer = sink = target = None
+            view.release()
+
+
 def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | None = None) -> dict[str, Any]:
     """Create a worker-safe local shm descriptor for a single Arrow table block."""
     return make_local_shm_descriptor_from_ipc(prepare_local_shm_block(table), grant_id=grant_id)
@@ -1771,7 +1815,7 @@ def make_local_shm_descriptor_from_ipc(block: PreparedLocalShmBlock, *, grant_id
 
 
 def make_pooled_shm_descriptor(
-    blocks: list[PreparedLocalShmBlock], *, allocation: dict[str, Any], grant_id: int
+    blocks: list[PreparedPooledShmBlock], *, allocation: dict[str, Any], grant_id: int
 ) -> dict[str, Any]:
     """Write only into the exact allocation supplied by the parent grant."""
     slot = ShmAllocation.parse(allocation)
@@ -1786,8 +1830,7 @@ def make_pooled_shm_descriptor(
         start = slot.offset + offset
         region = mapping.shm.buf[start : start + size]
         try:
-            region[:_IPC_HEADER_SIZE] = len(block.ipc).to_bytes(_IPC_HEADER_SIZE, "little")
-            region[_IPC_HEADER_SIZE:] = memoryview(block.ipc).cast("B")
+            _write_pooled_ipc(region, block)
         finally:
             region.release()
         descriptor = {

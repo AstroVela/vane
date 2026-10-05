@@ -9465,7 +9465,7 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
                 pa.table({"payload": [b"b" * 64]}),
             ]
 
-    required = sum(worker.prepare_local_shm_block(t).ipc_size_bytes for t in FakeExecutor().drain_outputs())
+    required = sum(worker.prepare_pooled_shm_block(t).ipc_size_bytes for t in FakeExecutor().drain_outputs())
     allocation = pooled_shm_worker.reserve_write(101, required)
     grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101, "allocation": allocation})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
@@ -9522,7 +9522,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
     captured: list[pa.Table] = []
 
     def make_descriptor(blocks, *, allocation, grant_id):
-        tables = [pa.ipc.open_stream(block.ipc).read_all() for block in blocks]
+        tables = [block.table for block in blocks]
         captured.extend(tables)
         return {
             "block_refs": [],
@@ -9584,7 +9584,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
             return [pa.table({"rows": [self.input_rows]})]
 
     def make_descriptor(blocks, *, allocation, grant_id):
-        table = pa.ipc.open_stream(blocks[0].ipc).read_all()
+        table = blocks[0].table
         assert grant_id == 88
         return {
             "grant_id": grant_id,
