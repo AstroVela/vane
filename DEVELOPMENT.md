@@ -112,6 +112,7 @@ and staging a release-approved extension, package it with:
 python -I scripts/build_extension_wheel.py \
   --artifact "$SKBUILD_BUILD_DIR/vane_extensions/<extension>.duckdb_extension" \
   --extension-name <extension> \
+  --release-number 1 \
   --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \
   --license-expression "Apache-2.0 AND MIT" \

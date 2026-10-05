@@ -25,6 +25,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True, type=Path, help="Path to <extension>.duckdb_extension")
     parser.add_argument("--extension-name", required=True, help="Lowercase DuckDB extension name")
+    parser.add_argument(
+        "--release-number", type=int, required=True, help="Independent positive fourth version component"
+    )
     parser.add_argument("--output-directory", required=True, type=Path, help="Directory for the generated wheel")
     parser.add_argument(
         "--platform-tag",
@@ -83,6 +86,7 @@ def main() -> int:
         trust_identity=arguments.trust_identity,
         license_expression=arguments.license_expression,
         license_files=arguments.license_file,
+        release_number=arguments.release_number,
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
         release_materials=arguments.release_materials,

@@ -18,7 +18,7 @@ from urllib.request import Request, build_opener
 from xml.etree import ElementTree
 
 from packaging.utils import parse_wheel_filename
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from vane_packaging.media_bundle import read_native_media_wheel
 from vane_packaging.media_release import (
@@ -81,6 +81,28 @@ def index_files(channel: str, distribution: str, version: str) -> dict[str, dict
             raise ValueError("index artifact must come from the public Python package file host")
         files[name] = record
     return files
+
+
+def _require_increasing_release(channel: str, distribution: str, version: str) -> None:
+    candidate = Version(version)
+    if len(candidate.release) != 4 or candidate.release[3] < 1:
+        return
+    document = _json(f"{INDEXES[channel]}/pypi/{quote(distribution, safe='')}/json", missing=True)
+    if document is None:
+        return
+    if not isinstance(document, dict) or not isinstance(document.get("releases"), dict):
+        raise ValueError("cannot verify the provider release sequence on the package index")
+    for value in document["releases"]:
+        try:
+            previous = Version(value)
+        except InvalidVersion:
+            continue
+        if (
+            len(previous.release) == 4
+            and previous.release[:3] == candidate.release[:3]
+            and previous.release[3] >= candidate.release[3]
+        ):
+            raise ValueError("provider release_number must increase for the same Vane X.Y.Z, including stage changes")
 
 
 def _match_index(record: dict, expected: dict) -> None:
@@ -318,6 +340,8 @@ def stage_index(directory: Path, digest: str, *, channel: str, output: Path) -> 
     existing = index_files(channel, distribution, version) or {}
     if not existing.keys() <= expected.keys():
         raise ValueError("index contains unexpected release artifacts")
+    if not existing:
+        _require_increasing_release(channel, distribution, version)
     with _output_directory(output) as stage:
         with tempfile.TemporaryDirectory(prefix="vane-index-resume-") as value:
             for name, record in existing.items():

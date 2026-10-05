@@ -436,6 +436,7 @@ def build_extension_wheel(
     trust_identity: str,
     license_expression: str,
     license_files: Iterable[str | Path],
+    release_number: int = 1,
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
     release_materials: str | Path | None = None,
@@ -577,7 +578,7 @@ def build_extension_wheel(
 
     vane_version = _validate_vane_version(vane.__version__)
     descriptor_digest = _descriptor_digest(descriptor)
-    distribution_version = _extension_distribution_version(vane_version, descriptor)
+    distribution_version = _extension_release_version(vane_version, release_number)
     distribution_name = f"vane-extension-{name}"
     distribution_root = f"vane_extension_{name}-{distribution_version}"
     wheel_tag = f"{interpreter_tag}-none-{normalized_platform_tag}"
@@ -612,7 +613,11 @@ def build_extension_wheel(
             tuple(
                 (
                     dependency.name,
-                    _extension_distribution_version(vane_version, dependency),
+                    next(
+                        wheel.distribution_version
+                        for wheel in resolved_dependency_wheels
+                        if wheel.descriptor.identity == dependency.identity
+                    ),
                 )
                 for dependency in dependencies
             ),
@@ -856,7 +861,8 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, test_only: boo
                 raise ValueError("dependency extension wheel artifact SHA-256 does not match its descriptor")
 
             distribution_name = f"vane-extension-{descriptor.name}"
-            distribution_version = _extension_distribution_version(descriptor.vane_version, descriptor)
+            distribution_version = str(filename_version)
+            _validate_extension_distribution_version(distribution_version, descriptor.vane_version, descriptor_digest)
             if filename_name != canonicalize_name(distribution_name) or filename_version != Version(
                 distribution_version
             ):
@@ -3279,6 +3285,31 @@ def _extension_interpreter_tag() -> str:
 
 def _descriptor_digest(descriptor: DynamicExtensionDescriptor) -> str:
     return hashlib.sha256(descriptor.to_json().encode("utf-8")).hexdigest()
+
+
+def _extension_release_version(vane_version: str, release_number: int) -> str:
+    """Append a provider counter that continues across stages of the same X.Y.Z."""
+    if type(release_number) is not int or release_number < 1:
+        raise ValueError("extension release_number must be a positive integer")
+    base = Version(_validate_vane_version(vane_version))
+    if base.epoch or base.local is not None or len(base.release) != 3:
+        raise ValueError("four-part extension versions require a Vane X.Y.Z version without epoch or local label")
+    prefix = ".".join(str(component) for component in base.release)
+    suffix = str(base)[len(prefix) :]
+    return str(Version(f"{prefix}.{release_number}{suffix}"))
+
+
+def _validate_extension_distribution_version(value: str, vane_version: str, descriptor_digest: str) -> None:
+    """Accept numbered provider releases and exact historical descriptor versions."""
+    parsed = Version(value)
+    if len(parsed.release) == 4 and parsed.release[3] > 0:
+        expected = _extension_release_version(vane_version, parsed.release[3])
+    else:
+        expected = _extension_distribution_version_from_digest(vane_version, descriptor_digest)
+    if value != expected:
+        raise ValueError(
+            f"extension wheel version does not match its descriptor-bound distribution: expected={expected}, actual={value}"
+        )
 
 
 def _extension_distribution_version(
