@@ -68,6 +68,20 @@ request and native preparation. Unregistered local subprocess actors remain
 query-owned in this entry point. Explicitly registered models use resident
 pools through the same preparation and cleanup path.
 
+Relation-level `map_batches` accepts `batch_format="numpy"`, `"pandas"`, or
+`"cudf"` through the same conversion code as Ray. Arrow remains the default.
+Eligible NumPy buffers are read-only views; `zero_copy_batch=False` requests
+detached writable NumPy input. Conversion runs on the actor owner thread;
+ordinary synchronous `map_batches` callable classes use one framework-owned
+serial compute worker per actor. A resident model retains that worker across
+query borrows, and model shutdown owns its cleanup. Output conversion still
+feeds the existing shared-memory, admission and backpressure path.
+
+The public `register_model` API continues to accept `vane.cls` and
+`vane.cls.batch` definitions with their scalar or Arrow-column contracts.
+Their query results can feed formatted `map_batches` stages; selecting a batch
+format for a stage does not change the registered model's argument contract.
+
 An active runtime query rejects another query or relation binding on the same
 cursor before taking connection locks. Concurrent clients use independent
 cursors. DataSource callbacks include task deserialization, `execute()`, batch
