@@ -95,6 +95,20 @@ def test_real_shared_pool_preserves_other_units_share_and_retries_after_completi
             executor.submit_with_id(value, pa.table({"x": [value]}))
             _wait(lambda: (tmp_path / str(value)).exists())
 
+        def take_outputs(executor, submit_ids):
+            remaining = set(submit_ids)
+            while remaining:
+                result = _wait(executor.take_ready_result)
+                assert result[0] == ref_bundle.SUBMIT_RESULT_MARKER
+                assert result[1] in remaining
+                assert not isinstance(result[2], BaseException), result[2]
+                if len(result) == 4:
+                    assert result[3] is False
+                    outputs.extend(result[2][1])
+                else:
+                    assert result[2] is None
+                    remaining.remove(result[1])
+
         submit(busy, 0)
         submit(busy, 1)
         submit(other, 2)
@@ -114,19 +128,14 @@ def test_real_shared_pool_preserves_other_units_share_and_retries_after_completi
         assert ledger.snapshot()["usage_bytes"] == 16_384
         assert transport.snapshot()["waiting_output_grants"] == 0
         go.touch()
-        for executor in executors:
-            for _ in range(2):
-                result = _wait(executor.take_ready_result)
-                assert not isinstance(result[2], BaseException), result[2]
-                outputs.extend(result[2][1])
+        take_outputs(busy, {0, 1})
+        take_outputs(other, {2, 3})
         _wait(lambda: ledger.snapshot()["reserved_bytes"] == 0)
         budget = ledger.snapshot()["unit_budget"]
         assert budget["usage_bytes"] == budget["inactive_usage_bytes"] > 0
         assert sum(unit["usage_bytes"] for unit in budget["units"]) == budget["usage_bytes"]
         submit(busy, 4)
-        result = _wait(busy.take_ready_result)
-        assert not isinstance(result[2], BaseException), result[2]
-        outputs.extend(result[2][1])
+        take_outputs(busy, {4})
         assert sorted(ref.to_table().column(0)[0].as_py() for ref in outputs) == list(range(5))
     finally:
         go.touch()

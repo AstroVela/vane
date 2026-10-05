@@ -147,15 +147,17 @@ def test_projection_input_survives_an_operator_with_more_output(native_environme
 @pytest.mark.parametrize("limited", [False, True])
 def test_projection_cleanup_keeps_external_views_charged(native_environment, monkeypatch, limited):
     views = []
-    completions = []
+    output_count = 0
     take_result = udf_subprocess.UDFExecutor.take_ready_result
 
     def retain_first_output(executor):
+        nonlocal output_count
         result = take_result(executor)
-        if result is not None and not isinstance(result[2], BaseException):
-            if not completions:
+        # Count data outputs without counting the stream's terminal envelope.
+        if result is not None and result[2] is not None and not isinstance(result[2], BaseException):
+            if output_count == 0:
                 views.extend(ref.to_table().column(0) for ref in result[2][1])
-            completions.append(result[0])
+            output_count += 1
         return result
 
     monkeypatch.setattr(udf_subprocess.UDFExecutor, "take_ready_result", retain_first_output)
@@ -169,7 +171,7 @@ def test_projection_cleanup_keeps_external_views_charged(native_environment, mon
                     deadline = time.monotonic() + 10
                     while True:
                         snapshot = runtime.resource_snapshot()["data"]
-                        if len(completions) >= 2 and snapshot["queued_byte_admissions"] and not snapshot["tasks"]:
+                        if output_count >= 2 and snapshot["queued_byte_admissions"] and not snapshot["tasks"]:
                             break
                         if future.done():
                             future.result()
