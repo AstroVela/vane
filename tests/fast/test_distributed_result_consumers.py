@@ -196,7 +196,7 @@ def test_connection_query_ray_rejects_invalid_parameters_before_runner(monkeypat
 
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray", "", None])
-@pytest.mark.parametrize("method", ["sql", "query", "from_query", "module_sql"])
+@pytest.mark.parametrize("method", ["sql", "from_query", "module_sql"])
 def test_parameterized_sql_entrypoints_are_lazy_and_select_the_runner(monkeypatch, configured, method):
     runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
@@ -214,6 +214,23 @@ def test_parameterized_sql_entrypoints_are_lazy_and_select_the_runner(monkeypatc
         assert factory_calls == []
         assert relation.fetchall() == [(7 if configured == "local-fast" else 42,)]
         assert len(runner.calls) == (0 if configured == "local-fast" else 1)
+
+
+@pytest.mark.parametrize("configured", ["local-fast", "ray", "", None])
+def test_parameterized_local_query_returns_query_result_without_legacy_runner(monkeypatch, configured):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    if configured is None:
+        monkeypatch.delenv("VANE_RUNNER")
+    else:
+        monkeypatch.setenv("VANE_RUNNER", configured)
+    with vane.connect(backend="local") as connection:
+        with connection.query("SELECT ?::BIGINT AS value", [7]) as result:
+            assert isinstance(result, vane.QueryResult)
+            assert result.schema == pa.schema([("value", pa.int64())])
+            assert result.collect().to_pylist() == [{"value": 7}]
+    assert factory_calls == []
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray"])

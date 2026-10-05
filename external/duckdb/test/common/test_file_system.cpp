@@ -194,6 +194,39 @@ TEST_CASE("Test file operations", "[file_system]") {
 	fs->RemoveFile(fname);
 }
 
+TEST_CASE("Local glob metadata matches open file handles", "[file_system]") {
+	auto fs = FileSystem::CreateLocal();
+	auto directory = TestCreatePath("glob_metadata");
+	TestCreateDirectory(directory);
+	auto path = fs->JoinPath(directory, "input.txt");
+	create_dummy_file(path);
+
+	auto check_metadata = [&]() {
+		auto files = fs->Glob(fs->JoinPath(directory, "*.txt"));
+		REQUIRE(files.size() == 1);
+		REQUIRE(files[0].extended_info);
+		auto &options = files[0].extended_info->options;
+		REQUIRE(options.count("etag") == 1);
+		REQUIRE(options.count("last_modified") == 1);
+		REQUIRE(options.count("file_size") == 1);
+		auto handle = fs->OpenFile(path, FileFlags::FILE_FLAGS_READ);
+		auto version = fs->GetVersionTag(*handle);
+		REQUIRE(!version.empty());
+		REQUIRE(StringValue::Get(options.at("etag")) == version);
+		REQUIRE(options.at("last_modified").GetValue<timestamp_t>() == fs->GetLastModifiedTime(*handle));
+		REQUIRE(options.at("file_size").GetValue<int64_t>() == fs->GetFileSize(*handle));
+		return version;
+	};
+	auto original_version = check_metadata();
+	{
+		auto handle = fs->OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		const string contents = "changed";
+		handle->Write(QueryContext(), const_cast<char *>(contents.data()), contents.size(), 0);
+	}
+	REQUIRE(check_metadata() != original_version);
+	fs->RemoveDirectory(directory);
+}
+
 #if !defined(_WIN32) && !defined(WIN32)
 TEST_CASE("Nonblocking local opens do not wait for FIFO peers", "[file_system]") {
 	auto fs = FileSystem::CreateLocal();

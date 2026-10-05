@@ -913,6 +913,15 @@ static uint64_t FiletimeToTicks(FILETIME file_time) {
 	return ul.QuadPart;
 }
 
+static string GetWindowsVersionTag(const BY_HANDLE_FILE_INFORMATION &info) {
+	uint64_t version_tag[4];
+	Store(static_cast<uint64_t>(info.dwVolumeSerialNumber), data_ptr_cast(&version_tag[0]));
+	Store((static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow, data_ptr_cast(&version_tag[1]));
+	Store((static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow, data_ptr_cast(&version_tag[2]));
+	Store(FiletimeToTicks(info.ftLastWriteTime), data_ptr_cast(&version_tag[3]));
+	return string(char_ptr_cast(version_tag), sizeof(version_tag));
+}
+
 static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
 	// FILETIME contains a 64-bit value representing the number of
 	// 100-nanosecond intervals since January 1, 1601 (UTC).
@@ -1368,6 +1377,26 @@ bool LocalFileSystem::ListFilesExtended(const string &directory,
 		auto last_modified_time = FiletimeToTimeStamp(ffd.ftLastWriteTime);
 		options.emplace("last_modified", Value::TIMESTAMP(last_modified_time));
 
+		if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+			// Directory enumeration has no file identity. Query metadata without requiring read access so
+			// glob results can validate caches against the same version tag as an open file handle.
+			auto file_path = NormalizePathAndConvertToUnicode(*this, JoinPath(directory, name), opener);
+			auto file_handle = CreateFileW(file_path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file_handle != INVALID_HANDLE_VALUE) {
+				BY_HANDLE_FILE_INFORMATION file_info;
+				auto have_info = GetFileInformationByHandle(file_handle, &file_info);
+				CloseHandle(file_handle);
+				if (have_info) {
+					// Keep all cache-validation metadata from the same observation of the file.
+					options["file_size"] = Value::BIGINT((static_cast<int64_t>(file_info.nFileSizeHigh) << 32) |
+					                                     static_cast<int64_t>(file_info.nFileSizeLow));
+					options["last_modified"] = Value::TIMESTAMP(FiletimeToTimeStamp(file_info.ftLastWriteTime));
+					options.emplace("etag", Value::BLOB_RAW(GetWindowsVersionTag(file_info)));
+				}
+			}
+		}
+
 		// callback
 		callback(info);
 	} while (FindNextFileW(hFind, &ffd) != 0);
@@ -1584,12 +1613,7 @@ string LocalFileSystem::GetVersionTag(FileHandle &handle) {
 	if (!GetFileInformationByHandle(hfile, &info)) {
 		throw IOException("Failed to get file version for file \"%s\": %s", handle.path, GetLastErrorAsString());
 	}
-	uint64_t version_tag[4];
-	Store(static_cast<uint64_t>(info.dwVolumeSerialNumber), data_ptr_cast(&version_tag[0]));
-	Store((static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow, data_ptr_cast(&version_tag[1]));
-	Store((static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow, data_ptr_cast(&version_tag[2]));
-	Store(FiletimeToTicks(info.ftLastWriteTime), data_ptr_cast(&version_tag[3]));
-	return string(char_ptr_cast(version_tag), sizeof(version_tag));
+	return GetWindowsVersionTag(info);
 #else
 	int fd = handle.Cast<UnixFileHandle>().fd;
 	struct stat s;
