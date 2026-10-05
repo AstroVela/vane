@@ -122,11 +122,14 @@ kernel cache. Requests run through one native dispatch loop and one SQLite
 connection. Allowing future out-of-band writers would require a notification
 protocol before retaining these cache timeouts.
 
-Each open directory handle retains the sorted entry list captured at open,
-including across pagination and rewind. Removing, renaming or adding entries
-cannot skip or duplicate unrelated entries in that stream. Open a new directory
-handle to see the latest listing. Listing memory is proportional to the entries
-in each open directory and is released when the handle closes or the mount exits.
+Each directory handle captures its sorted entry list on the first read and
+retains it across pagination and rewind. Opening a directory for `openat` or
+`chdir` does not enumerate its contents. Child inode attributes are fetched in
+one query at the same branch or snapshot view point. Removing, renaming or adding
+entries cannot skip or duplicate unrelated entries after a stream's first read.
+Open a new directory handle to see the latest listing. Listing memory is
+proportional to the entries in each enumerated directory handle and is released
+when the handle closes or the mount exits.
 
 This is a filesystem subset: regular files, directories, modes through `0777`,
 mtime, seek/read/write, append, truncate, rename, unlink and directory removal.
@@ -427,3 +430,8 @@ The [WAL checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) record
 sequential-write gains, read and WAL-size tradeoffs, and closing costs after
 raising the automatic checkpoint threshold. Crash tests verify acknowledged
 writes survive a killed mount without an intervening fsync or close.
+
+The [directory enumeration measurements](benchmarks/DIRECTORY_OPTIMIZATION.md)
+record lazy first-read capture and batched child-inode queries, including stable
+pagination tests, SQL counts, Git results and the separate write-through
+experiment that leaves the production cache mode unchanged.

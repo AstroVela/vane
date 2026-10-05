@@ -161,6 +161,9 @@ public:
 	int64_t Integer(int index) const {
 		return sqlite3_column_int64(statement, index);
 	}
+	bool IsNull(int index) const {
+		return sqlite3_column_type(statement, index) == SQLITE_NULL;
+	}
 	std::string Text(int index) const {
 		auto value = sqlite3_column_text(statement, index);
 		return value ? std::string(reinterpret_cast<const char *>(value), sqlite3_column_bytes(statement, index)) : "";
@@ -2161,8 +2164,23 @@ std::vector<std::pair<std::string, FileStat>> Session::DirectoryEntries(int64_t 
 			throw;
 	}
 	result.emplace_back(".", Describe(node));
-	for (const auto &entry : Visible(database->db, DIRENTS, view.point, inode)) {
-		result.emplace_back(entry.key.name, Describe(Inode(database->db, entry.fields[0], view)));
+	// Resolve every child's inode at the same view point in one query. Keep a
+	// missing inode visible to the caller instead of silently dropping its name.
+	Statement entries(database->db,
+	                  "SELECT d.name,i.inode,i.kind,i.size,i.mode,i.mtime_ns FROM dirent_versions d "
+	                  "LEFT JOIN inode_versions i ON i.inode=d.inode AND i.low<=?1 AND i.high>?1 AND i.deleted=0 "
+	                  "WHERE d.parent=?2 AND d.low<=?1 AND d.high>?1 AND d.deleted=0 ORDER BY d.name");
+	entries.Bind(1, view.point);
+	entries.Bind(2, inode);
+	while (entries.Step()) {
+		if (entries.IsNull(1))
+			Fail(ErrorCode::NotFound, "Inode does not exist");
+		auto name = entries.Text(0);
+		if (result.back().first == name)
+			Fail(ErrorCode::Storage, "Overlapping visible versions");
+		bool directory = entries.Integer(2) != 0;
+		result.emplace_back(std::move(name), FileStat {entries.Integer(1), directory, entries.Integer(3),
+		                                               entries.Integer(4), entries.Integer(5), directory ? 2 : 1});
 	}
 	std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
 	tx.Commit();

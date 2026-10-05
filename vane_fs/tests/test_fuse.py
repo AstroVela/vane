@@ -391,6 +391,47 @@ def test_directory_lists_belong_to_each_open_handle_and_survive_rewind(tmp_path)
             assert os.listdir(point) == ["replacement"]
 
 
+def test_directory_listing_is_captured_on_first_read(tmp_path):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.mkdir("/dir")
+        branch.write_file("/dir/removed-before-read", b"")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            directory = point / "dir"
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                (directory / "removed-before-read").unlink()
+                (directory / "created-before-read").touch()
+                directory.rename(point / "renamed")
+                assert os.listdir(descriptor) == ["created-before-read"]
+                (point / "renamed" / "created-after-read").touch()
+                assert os.listdir(descriptor) == ["created-before-read"]
+                assert sorted(os.listdir(point / "renamed")) == ["created-after-read", "created-before-read"]
+            finally:
+                os.close(descriptor)
+
+
+def test_unread_directory_handle_survives_removal_and_gc(tmp_path):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.mkdir("/parent")
+        branch.mkdir("/parent/child")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            descriptor = os.open(point / "parent" / "child", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                (point / "parent" / "child").rmdir()
+                (point / "parent").rmdir()
+                workspace.collect_garbage()
+                assert os.listdir(descriptor) == []
+                assert os.fstat(descriptor).st_nlink == 0
+            finally:
+                os.close(descriptor)
+        snapshot = workspace.snapshot()
+        assert workspace.diff(snapshot, snapshot) == []
+
+
 def test_mount_crash_reclaims_orphans_and_preserves_committed_data(tmp_path):
     database = tmp_path / "workspace.sqlite"
     with Workspace(database) as workspace:

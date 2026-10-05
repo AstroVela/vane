@@ -28,7 +28,7 @@ struct Mount {
 	fuse_session *fuse = nullptr;
 	uid_t uid = getuid();
 	gid_t gid = getgid();
-	std::map<uint64_t, std::vector<std::pair<std::string, FileStat>>> directories;
+	std::map<uint64_t, std::optional<std::vector<std::pair<std::string, FileStat>>>> directories;
 	uint64_t next_directory = 0;
 	Mount(const std::string &path, const std::string &id, bool readonly)
 	    : workspace(path), database(path), readonly(readonly) {
@@ -229,11 +229,8 @@ fuse_lowlevel_ops Operations() {
 			auto &mount = Context(req);
 			mount.session->OpenInode(inode, true);
 			try {
-				// Cookies index this handle's fixed listing, so namespace
-				// mutations cannot shift entries between readdir requests.
-				auto entries = mount.session->DirectoryEntries(inode);
 				info->fh = ++mount.next_directory;
-				mount.directories.emplace(info->fh, std::move(entries));
+				mount.directories.emplace(info->fh, std::nullopt);
 			} catch (...) {
 				Close(mount, inode, 1);
 				throw;
@@ -244,7 +241,7 @@ fuse_lowlevel_ops Operations() {
 			}
 		});
 	};
-	ops.readdir = [](fuse_req_t req, fuse_ino_t, size_t size, off_t offset, fuse_file_info *info) {
+	ops.readdir = [](fuse_req_t req, fuse_ino_t inode, size_t size, off_t offset, fuse_file_info *info) {
 		Guard(req, [&] {
 			if (offset < 0 || size > INT_MAX) {
 				fuse_reply_err(req, EINVAL);
@@ -255,7 +252,12 @@ fuse_lowlevel_ops Operations() {
 				return;
 			}
 			auto &mount = Context(req);
-			const auto &entries = mount.directories.at(info->fh);
+			auto &listing = mount.directories.at(info->fh);
+			// Opening a directory for openat/chdir needs no listing. Capture it
+			// on the first read, then keep cookies stable even across rewind.
+			if (!listing)
+				listing = mount.session->DirectoryEntries(inode);
+			const auto &entries = *listing;
 			std::vector<char> buffer(size);
 			size_t used = 0;
 			for (size_t i = size_t(offset); i < entries.size(); ++i) {

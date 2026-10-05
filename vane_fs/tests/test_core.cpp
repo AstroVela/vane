@@ -39,11 +39,79 @@ static void SQL(const std::string &path, const std::string &sql) {
 	}
 }
 
+static void CheckDirectoryEntries(const std::string &path) {
+	Workspace workspace(path);
+	auto main = workspace.Checkout();
+	main->MakeDirectory("/entries");
+	main->MakeDirectory("/entries/subdir");
+	main->WriteFile("/entries/file", "original");
+	main->WriteFile("/entries/removed", "x");
+	auto frozen = workspace.OpenSnapshot(workspace.Snapshot());
+	auto child = workspace.Checkout(workspace.Fork("main", "child").id);
+	child->WriteFile("/entries/file", std::string(8193, 'c'));
+	child->SetAttributes("/entries/file", 0600, 123456789);
+	child->Unlink("/entries/removed");
+	child->Rename("/entries/subdir", "/entries/renamed");
+	main->WriteFile("/entries/parent-only", "parent");
+	main->MakeDirectory("/broken");
+	main->WriteFile("/broken/file", "x");
+	auto broken_inode = std::to_string(main->Stat("/broken/file").inode);
+	// Advance the frontier so fault injection can introduce overlapping rows
+	// with distinct primary keys at the live view point.
+	workspace.Snapshot();
+	workspace.AcquireMount("main");
+	workspace.AcquireMount("child");
+	auto check = [&](const std::shared_ptr<Session> &session, const std::vector<std::string> &names) {
+		auto handle = session->OpenDirectory("/entries");
+		auto entries = session->DirectoryEntries(handle.inode);
+		Require(entries.size() == names.size(), "Directory entry count differs across views");
+		for (size_t i = 0; i < names.size(); ++i) {
+			Require(entries[i].first == names[i], "Directory listing has wrong names or order");
+			auto expected = session->Stat(names[i] == "."    ? "/entries"
+			                              : names[i] == ".." ? "/"
+			                                                 : "/entries/" + names[i]);
+			const auto &actual = entries[i].second;
+			Require(actual.inode == expected.inode && actual.is_directory == expected.is_directory &&
+			            actual.size == expected.size && actual.mode == expected.mode &&
+			            actual.mtime_ns == expected.mtime_ns && actual.links == expected.links,
+			        "Directory attributes came from the wrong inode version");
+		}
+		session->CloseFile(handle.inode);
+	};
+	check(main, {".", "..", "file", "parent-only", "removed", "subdir"});
+	check(child, {".", "..", "file", "renamed"});
+	check(frozen, {".", "..", "file", "removed", "subdir"});
+	frozen->Close();
+
+	auto handle = main->OpenDirectory("/broken");
+	SQL(path, "CREATE TABLE saved_inode AS SELECT * FROM inode_versions WHERE inode=" + broken_inode);
+	for (int fault = 0; fault < 3; ++fault) {
+		if (fault == 0)
+			SQL(path, "DELETE FROM inode_versions WHERE inode=" + broken_inode);
+		else if (fault == 1)
+			SQL(path, "UPDATE inode_versions SET deleted=1 WHERE inode=" + broken_inode);
+		else
+			SQL(path, "INSERT INTO inode_versions SELECT inode,(SELECT frontier FROM branches WHERE name='main'),"
+			          "high,writer,deleted,kind,size,mode,mtime_ns FROM saved_inode");
+		for (int retry = 0; retry < 2; ++retry)
+			Expect(fault == 2 ? ErrorCode::Storage : ErrorCode::NotFound,
+			       [&] { main->DirectoryEntries(handle.inode); });
+		SQL(path, "DELETE FROM inode_versions WHERE inode=" + broken_inode +
+		              "; INSERT INTO inode_versions SELECT * FROM saved_inode");
+		Require(main->DirectoryEntries(handle.inode).size() == 3, "Failed listing poisoned a later query");
+	}
+	SQL(path, "DROP TABLE saved_inode");
+	main->CloseFile(handle.inode);
+	workspace.ReleaseMount("child");
+	workspace.ReleaseMount("main");
+}
+
 int main() {
 	auto root = std::filesystem::temp_directory_path() /
 	            ("vane-fs-native-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	try {
 		std::filesystem::create_directory(root);
+		CheckDirectoryEntries((root / "directories.sqlite").string());
 		auto path = (root / "workspace.sqlite").string();
 		{
 			Workspace workspace(path);
