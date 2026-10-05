@@ -217,7 +217,9 @@ def test_deadline_keeps_request_charged_after_callback_cleanup_timeout(monkeypat
                     assert request.state == "cancelling" and queued.state == "queued"
                     assert request.cancellation_reason == "execution_timeout"
                     assert executors[0].cleanup_pending()
-                    assert manager.snapshot()["allocated_bytes"] > 0
+                    # Published chunks can be released before the terminal
+                    # callback returns the request's admission allowance.
+                    assert manager.snapshot()["allocated_bytes"] == 0
                     state = runtime.resource_snapshot()["request_admission"]
                     assert state["active_requests"] == state["cleanup_pending_requests"] == 1
                     assert state["execution_timed_out_requests"] == 0
