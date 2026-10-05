@@ -365,7 +365,7 @@ def test_nested_tensor_siblings_keep_nan_separate_from_null(batch_format, writab
 @pytest.mark.parametrize("container", ["plain", "list", "struct", "map"])
 def test_pandas_object_float_output_keeps_nan_and_explicit_missing_values(container):
     pd = pytest.importorskip("pandas")
-    rows = [np.nan, pd.NA, pd.NaT, np.datetime64("NaT"), np.ma.masked, None, 1.5]
+    rows = [np.nan, pd.NA, pd.NaT, np.datetime64("NaT", "ns"), np.ma.masked, None, 1.5]
     declaration = "DOUBLE"
     if container == "list":
         rows, declaration = [[value] for value in rows], "DOUBLE[]"
