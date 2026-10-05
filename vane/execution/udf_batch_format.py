@@ -105,7 +105,7 @@ def resolve_udf_output_schema(batch_format: str, output_schema: Any) -> _OutputS
             dtype = vane.type(str(entry["type"]))
             if dtype.is_image():
                 image_dtype = dtype
-            elif dtype.id in ("list", "array", "struct", "map"):
+            elif dtype.id in ("list", "array", "struct", "map", "union"):
                 container_type = _arrow_type_from_output_schema_entry(entry)
         columns.append(
             _OutputColumnSchema(
@@ -218,9 +218,27 @@ def _numpy_input_buffers(values: np.ndarray, zero_copy_batch: bool) -> np.ndarra
     if not zero_copy_batch:
         # Object columns can contain array views (lists, nullable tensors, images).
         # A shallow ndarray.copy() would retain those shared, read-only buffers.
-        return copy.deepcopy(values) if values.dtype.hasobject else values.copy()
+        return _copy_numpy_buffers(values)
     _freeze_numpy_buffers(values)
     return values
+
+
+def _copy_numpy_buffers(value: Any) -> Any:
+    if isinstance(value, (pa.Scalar, pa.Array)):
+        # Arrow values are immutable. Scalar pickle/deepcopy goes through as_py(),
+        # which cannot preserve sub-microsecond times.
+        return value
+    if isinstance(value, np.ndarray):
+        copied = value.copy()
+        if value.dtype.hasobject:
+            for index in np.ndindex(value.shape):
+                copied[index] = _copy_numpy_buffers(value[index])
+        return copied
+    if isinstance(value, dict):
+        return {key: _copy_numpy_buffers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_copy_numpy_buffers(item) for item in value)
+    return copy.deepcopy(value)
 
 
 def _freeze_numpy_buffers(value: Any) -> None:
@@ -261,6 +279,7 @@ def _arrow_values_to_numpy(array: pa.Array) -> np.ndarray:
     if (
         pa.types.is_nested(array.type)
         or isinstance(array.type, pa.BaseExtensionType)
+        or pa.types.is_time(array.type)
         or (pa.types.is_timestamp(array.type) and array.type.tz is not None)
         or array.null_count
     ):
@@ -268,31 +287,41 @@ def _arrow_values_to_numpy(array: pa.Array) -> np.ndarray:
         # integer precision. Keep typed scalars as well as None: Python integers
         # alone would infer int64 on output, overflowing large uint64 leaves.
         objects: NDArray[np.object_] = np.empty(len(array), dtype=object)
-        for index, scalar in enumerate(array):
-            objects[index] = _arrow_scalar_to_numpy(scalar)
+        for index in range(len(array)):
+            objects[index] = _arrow_value_to_numpy(array, index)
         return objects
     return array.to_numpy(zero_copy_only=False)
 
 
-def _arrow_scalar_to_numpy(scalar: pa.Scalar) -> Any:
+def _arrow_value_to_numpy(array: pa.Array, index: int) -> Any:
+    dtype = array.type
+    if pa.types.is_union(dtype):
+        # Arrow's scalar extraction resets the tag of NULL union members. A
+        # one-row array retains the tag, member type and nested storage together.
+        return array.slice(index, 1)
+    if pa.types.is_dictionary(dtype):
+        position = array.indices[index]
+        return _arrow_value_to_numpy(array.dictionary, position.as_py()) if position.is_valid else None
+    scalar = array[index]
     if not scalar.is_valid:
         return None
-    dtype = scalar.type
     if _is_fixed_shape_tensor(dtype):
         values = _arrow_values_to_numpy(scalar.value.values).reshape(dtype.shape)
         return values.transpose(dtype.permutation) if dtype.permutation else values
-    if isinstance(dtype, pa.BaseExtensionType) or (pa.types.is_timestamp(dtype) and dtype.tz is not None):
-        # Neither opaque extension storage nor a timezone has an equivalent
-        # NumPy dtype. Keep the Arrow scalar, including its logical type.
+    if (
+        isinstance(dtype, pa.BaseExtensionType)
+        or pa.types.is_time(dtype)
+        or (pa.types.is_timestamp(dtype) and dtype.tz is not None)
+    ):
+        # These types have no lossless NumPy equivalent. Keep the Arrow scalar,
+        # including its logical type, timezone and sub-microsecond time value.
         return scalar
-    if pa.types.is_dictionary(dtype):
-        return _arrow_scalar_to_numpy(scalar.value)
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
         return _arrow_values_to_numpy(scalar.values)
     if pa.types.is_struct(dtype):
-        return {field.name: _arrow_scalar_to_numpy(scalar[index]) for index, field in enumerate(dtype)}
+        return {field.name: _arrow_value_to_numpy(array.field(child), index) for child, field in enumerate(dtype)}
     if pa.types.is_map(dtype):
-        return [(_arrow_scalar_to_numpy(pair[0]), _arrow_scalar_to_numpy(pair[1])) for pair in scalar.values]
+        return list(zip(_arrow_values_to_numpy(scalar.values.field(0)), _arrow_values_to_numpy(scalar.values.field(1))))
     if pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_boolean(dtype):
         return np.dtype(dtype.to_pandas_dtype()).type(scalar.as_py())
     if pa.types.is_date32(dtype):
@@ -378,7 +407,7 @@ def _arrow_table_to_pandas(table: pa.Table) -> Any:
         values = _arrow_column_to_numpy(table.column(index))
         objects: NDArray[np.object_] = np.empty(len(values), dtype=object)
         for row, value in enumerate(values):
-            objects[row] = None if value is np.ma.masked else copy.deepcopy(value)
+            objects[row] = None if value is np.ma.masked else _copy_numpy_buffers(value)
         frame.insert(index, field.name, pandas.Series(objects, index=frame.index, dtype=object))
     return frame
 
@@ -434,8 +463,12 @@ def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: 
     """Encode declared containers, retaining source leaf types for DuckDB casts."""
     if _is_fixed_shape_tensor(dtype):
         return _tensor_values_to_arrow(values, _OutputColumnSchema(name="nested Tensor", tensor_type=dtype))
+    nan_is_null = pa.types.is_nested(dtype) and not pa.types.is_union(dtype)
     rows = [
-        None if value is np.ma.masked or (from_pandas and _is_null_object_value(value)) else value for value in values
+        None
+        if value is np.ma.masked or (from_pandas and _is_null_object_value(value, nan_is_null=nan_is_null))
+        else value
+        for value in values
     ]
     if all(value is None for value in rows):
         return pa.nulls(len(rows), type=dtype)
@@ -500,18 +533,29 @@ def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: 
 def _primitive_values_to_arrow(values: Any, *, from_pandas: bool = False) -> pa.Array:
     """Infer leaf types without losing NumPy temporal units through Python scalars."""
     if isinstance(values, np.ndarray) and values.dtype != object:
-        return pa.array(values, from_pandas=from_pandas)
+        return pa.array(values, from_pandas=False)
     rows = [
-        None if value is np.ma.masked or (from_pandas and _is_null_object_value(value)) else value for value in values
+        None if value is np.ma.masked or (from_pandas and _is_null_object_value(value, nan_is_null=False)) else value
+        for value in values
     ]
+    union_type = next((value.type for value in rows if isinstance(value, pa.UnionArray)), None)
+    if union_type is not None:
+        if any(
+            value is not None and (not isinstance(value, pa.UnionArray) or len(value) != 1 or value.type != union_type)
+            for value in rows
+        ):
+            raise TypeError("UNION output must contain one-row Arrow union arrays of one type or None")
+        return pa.concat_arrays([pa.nulls(1, type=union_type) if value is None else value for value in rows])
     temporal_dtype = next((value.dtype for value in rows if isinstance(value, np.datetime64)), None)
     if temporal_dtype is not None and all(
         value is None or (isinstance(value, np.datetime64) and value.dtype == temporal_dtype) for value in rows
     ):
         # Arrow accepts datetime64[D] ndarrays but not those same scalars in a
         # Python sequence. A typed array also keeps dates outside Python's range.
-        return pa.array(np.array(rows, dtype=temporal_dtype), from_pandas=from_pandas)
-    return pa.array(rows, from_pandas=from_pandas)
+        return pa.array(np.array(rows, dtype=temporal_dtype), from_pandas=False)
+    # Missing pandas scalars were normalized explicitly above. from_pandas=True
+    # would also erase valid floating NaNs from object columns and nested leaves.
+    return pa.array(rows, from_pandas=False)
 
 
 def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
@@ -670,13 +714,13 @@ def _dense_tensor_values_to_arrow(
     return pa.ExtensionArray.from_storage(tensor_type, storage)
 
 
-def _is_null_object_value(value: Any) -> bool:
+def _is_null_object_value(value: Any, *, nan_is_null: bool = True) -> bool:
     if value is None:
         return True
     if value is np.ma.masked:
         return True
     if isinstance(value, (float, np.floating)):
-        return bool(np.isnan(value))
+        return nan_is_null and bool(np.isnan(value))
     if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
     return type(value).__name__ in ("NAType", "NaTType") and type(value).__module__.partition(".")[0] == "pandas"
