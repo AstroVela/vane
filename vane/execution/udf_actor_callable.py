@@ -9,8 +9,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import pyarrow as pa
-
 from vane.execution._udf_validation import ensure_synchronous_udf_result
 
 
@@ -31,13 +29,13 @@ class ActorCallableRuntime:
         if threading.get_ident() != self._owner:
             raise RuntimeError("UDF must be called and closed by its owning actor thread")
 
-    def __call__(self, udf: Any, table: pa.Table) -> Any:
+    def __call__(self, udf: Any, batch: Any) -> Any:
         self.check_owner()
         if self._closed:
             raise RuntimeError("UDF actor worker is closed")
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-actor-udf")
-        future = self._pool.submit(udf, table)
+        future = self._pool.submit(udf, batch)
         try:
             return ensure_synchronous_udf_result(future.result())
         finally:

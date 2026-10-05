@@ -34,6 +34,10 @@ from vane.execution._common import (
 )
 from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution.udf_batch_format import format_udf_input as _format_udf_input
+from vane.execution.udf_batch_format import iter_udf_output_tables as _iter_formatted_output_tables
+from vane.execution.udf_batch_format import normalize_batch_format as _normalize_batch_format
+from vane.execution.udf_batch_format import resolve_udf_output_schema as _resolve_udf_output_schema
 from vane.execution.udf_file_contract import FileUDFContract
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
@@ -484,7 +488,7 @@ class UDFExecutor:
     """Execute a Python UDF locally according to payload.call_mode.
 
     Supported call modes:
-    - ``map_batches``: ``fn(pa.Table) → pa.Table | Iterator[pa.Table]``
+    - ``map_batches``: batch calls in the format selected by ``payload.batch_format``.
     - ``map_batches_rows``: ``fn(pa.Table) → pa.Table`` with one output row per input row.
     - ``flat_map``:    ``fn(dict) → dict | Iterator[dict]``
     - ``map``:
@@ -522,6 +526,19 @@ class UDFExecutor:
         output_schema = payload.get("output_schema")
         if output_schema:
             self._output_names = [str(entry.get("name") or "") for entry in output_schema]
+        self._batch_format = (
+            _normalize_batch_format(payload.get("batch_format", "pyarrow"))
+            if self._call_mode == "map_batches"
+            else "pyarrow"
+        )
+        self._zero_copy_batch = payload.get("zero_copy_batch", True)
+        if type(self._zero_copy_batch) is not bool:
+            raise TypeError("zero_copy_batch must be a bool")
+        if not self._zero_copy_batch and self._batch_format != "numpy":
+            raise ValueError("zero_copy_batch=False requires batch_format='numpy'")
+        self._batch_output_schema = (
+            _resolve_udf_output_schema(self._batch_format, output_schema) if self._batch_format != "pyarrow" else None
+        )
 
         # Input names for renaming args columns
         self._input_names: list[str] | None = None
@@ -669,6 +686,14 @@ class UDFExecutor:
         from vane.execution.udf_output_schema import columns_to_output_table
 
         try:
+            if self._batch_format != "pyarrow":
+                for table in _iter_formatted_output_tables(
+                    result,
+                    batch_format=self._batch_format,
+                    resolved_output_schema=self._batch_output_schema,
+                ):
+                    yield self._file_contract.normalize_output_table(table)
+                return
             for batch in _iter_output_batches(result):
                 canonical = False
                 if isinstance(batch, dict):
@@ -696,15 +721,24 @@ class UDFExecutor:
                 else:
                     yield self._file_contract.normalize_output_table(table)
         except TypeError as exc:
+            if self._batch_format != "pyarrow":
+                raise TypeError(f"map_batches UDF returned an invalid {self._batch_format!r} batch: {exc}") from exc
             raise TypeError(
                 f"map_batches UDF must return pa.Table, RecordBatch, dict or an iterator of batches, "
                 f"got {type(result)}: {exc}"
             ) from exc
 
     def _invoke_map_batch(self, batch: pa.Table) -> Any:
+        # Adapt each compute batch on the actor owner before handing it to the
+        # serial worker. Both runners use this same conversion boundary.
+        udf_batch = (
+            _format_udf_input(batch, self._batch_format, zero_copy_batch=self._zero_copy_batch)
+            if self._is_map_batches
+            else batch
+        )
         if self._actor_callable is not None:
-            return self._actor_callable(self._map_fn, batch)
-        return ensure_synchronous_udf_result(self._map_fn(batch))
+            return self._actor_callable(self._map_fn, udf_batch)
+        return ensure_synchronous_udf_result(self._map_fn(udf_batch))
 
     def _coerce_row_preserving_batch_output(self, result: Any, expected_rows: int) -> pa.Table:
         if isinstance(result, pa.Table):

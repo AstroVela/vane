@@ -203,11 +203,19 @@ export NUM_GPU_NODES=1
 
 ### Video object detection
 
+The Vane detector and crop UDFs use `map_batches(batch_format="numpy")`.
+The execution framework converts Tensor/IMAGE columns to pixel arrays and
+encodes UDF outputs. Eligible single-chunk fixed-size inputs share read-only
+Arrow buffers; combining chunks and decoding variable-size images can allocate.
+The benchmark checks uint8 RGB frames at 640x640 and keeps model preprocessing,
+GPU transfer and PNG cropping in the application. Both UDFs use ordinary
+callables without an application-owned executor.
+
 The Vane video benchmark uses an explicit Python DataSource for video decoding
 and Pillow cropping/PNG encoding. It does not require the optional
 `native_media` extension. The source retains uint8 tensor batches instead of
-opting into the built-in source's automatic `IMAGE` conversion. The Python
-frame helper also accepts `IMAGE` buffers for compatibility.
+opting into the built-in source's automatic `IMAGE` conversion. The framework
+also prepares pixel arrays from `IMAGE` inputs for these UDFs.
 Use PyAV 17.1 (as specified in `video_object_detection/requirements.in`) with
 the current Vane engine.
 

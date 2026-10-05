@@ -648,6 +648,8 @@ class DuckDBPyRelation:
         function: Callable[..., typing.Any],
         schema: dict[str, sqltypes.DuckDBPyType] | None = None,
         *,
+        batch_format: typing.Literal["pyarrow", "numpy", "pandas", "cudf"] = "pyarrow",
+        zero_copy_batch: bool = True,
         batch_size: int | None = None,
         output_batch_size: int | None = None,
         min_task_batch_size: int | None = None,

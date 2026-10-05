@@ -219,6 +219,24 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     return _arrow_type_from_name(str(entry.get("type") or ""))
 
 
+def normalize_output_schema_entries(output_schema: Any) -> tuple[tuple[str, dict[str, Any]], ...]:
+    if not output_schema:
+        raise ValueError("UDF output conversion requires payload.output_schema")
+    normalized: list[tuple[str, dict[str, Any]]] = []
+    names = set()
+    for entry in output_schema:
+        if not isinstance(entry, dict):
+            raise ValueError("payload.output_schema entries must be dicts")
+        name = str(entry.get("name") or "")
+        if not name:
+            raise ValueError("payload.output_schema entries require non-empty names")
+        if name in names:
+            raise ValueError(f"payload.output_schema contains duplicate name {name!r}")
+        names.add(name)
+        normalized.append((name, entry))
+    return tuple(normalized)
+
+
 def _materialized_type_supported(dtype: pa.DataType, *, top_level: bool = True) -> bool:
     if isinstance(dtype, pa.FixedShapeTensorType):
         return top_level and (pa.types.is_integer(dtype.value_type) or pa.types.is_floating(dtype.value_type))
@@ -265,7 +283,7 @@ def materialized_output_schema(payload: dict[str, Any]) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary: str) -> Any:
+def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary: str, recursive: bool = True) -> Any:
     if value is None:
         return None
     if pa.types.is_struct(dtype):
@@ -279,18 +297,17 @@ def _canonicalize_struct_field_names(value: Any, dtype: pa.DataType, *, boundary
                 or len(declared_names) != len(dtype)
             ):
                 raise _invalid_input(f"{boundary} STRUCT value must contain exactly the declared fields")
-            return {
-                field.name: _canonicalize_struct_field_names(
-                    _mapping_field_value(value, field.name, boundary=boundary, path="column"),
-                    field.type,
-                    boundary=boundary,
+            canonical = {}
+            for field in dtype:
+                child = _mapping_field_value(value, field.name, boundary=boundary, path="column")
+                canonical[field.name] = (
+                    _canonicalize_struct_field_names(child, field.type, boundary=boundary) if recursive else child
                 )
-                for field in dtype
-            }
+            return canonical
         if isinstance(value, tuple) and len(value) == len(dtype):
             # Inference recognizes mappings as STRUCTs; tuples infer as LISTs.
             return {
-                field.name: _canonicalize_struct_field_names(item, field.type, boundary=boundary)
+                field.name: _canonicalize_struct_field_names(item, field.type, boundary=boundary) if recursive else item
                 for item, field in zip(value, dtype, strict=True)
             }
         raise TypeError("STRUCT values require a mapping or a matching positional tuple")
@@ -391,7 +408,10 @@ def empty_output_table_from_schema(output_schema: Any, *, output_contract_types:
     arrays = {}
     for index, entry in enumerate(entries):
         name = str(entry.get("name") or "")
-        if logical_table is not None and file_contract.output_types[index] is not None:
+        # FILE/IMAGE leaves need their logical storage. Ordinary columns and
+        # numeric tensors must use declared types, not inference from no rows.
+        dtype = file_contract.output_types[index] if logical_table is not None else None
+        if logical_table is not None and dtype is not None and _duckdb_pytype_contains_governed(dtype):
             arrays[name] = logical_table.column(index)
             continue
         try:

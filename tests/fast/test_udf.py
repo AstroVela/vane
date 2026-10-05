@@ -2429,6 +2429,108 @@ def test_map_batches_tensor_through_local_exchange():
     assert out.fetchall() == [(1, 10.0), (3, 18.0), (5, 26.0), (7, 34.0)]
 
 
+def test_map_batches_numpy_batch_format_end_to_end():
+    import numpy as np
+
+    import vane
+
+    def add_columns(batch):
+        assert set(batch) == {"x", "label"}
+        assert all(isinstance(column, np.ndarray) for column in batch.values())
+        assert batch["label"].tolist() == [f"item-{value}" for value in batch["x"]]
+        return {"x": batch["x"], "score": batch["x"] * 3}
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x, ('item-' || i)::VARCHAR as label from range(4) t(i)")
+        .map_batches(
+            add_columns,
+            schema={"x": vane.sqltypes.BIGINT, "score": vane.sqltypes.BIGINT},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(0, 0), (1, 3), (2, 6), (3, 9)]
+
+
+def test_map_batches_pandas_batch_format_end_to_end():
+    pd = pytest.importorskip("pandas")
+
+    import vane
+
+    def transform(frame):
+        assert isinstance(frame, pd.DataFrame)
+        return pd.DataFrame({"x": frame["x"], "label": frame["label"].str.upper()})
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x, ('item-' || i)::VARCHAR as label from range(3) t(i)")
+        .map_batches(
+            transform,
+            schema={"x": vane.sqltypes.BIGINT, "label": vane.sqltypes.VARCHAR},
+            batch_format="pandas",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(0, "ITEM-0"), (1, "ITEM-1"), (2, "ITEM-2")]
+
+
+def test_map_batches_numpy_tensor_round_trip_end_to_end():
+    import numpy as np
+
+    import vane
+
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, (2, 2))
+
+    def build_tensor(batch):
+        values = batch["x"].astype(np.float32)
+        tensors = np.stack([np.array([[x, x + 1], [x + 2, x + 3]], dtype=np.float32) for x in values])
+        return {"x": batch["x"], "embedding": tensors}
+
+    def reduce_tensor(batch):
+        assert batch["embedding"].shape == (2, 2, 2)
+        return {"x": batch["x"], "total": batch["embedding"].sum(axis=(1, 2), dtype=np.float32)}
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x from range(1, 5) t(i)")
+        .map_batches(
+            build_tensor,
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .map_batches(
+            reduce_tensor,
+            schema={"x": vane.sqltypes.BIGINT, "total": vane.sqltypes.FLOAT},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(1, 10.0), (2, 14.0), (3, 18.0), (4, 22.0)]
+
+
+def test_map_batches_rejects_unknown_batch_format():
+    import pyarrow as pa
+
+    import vane
+
+    con = vane.connect()
+    with pytest.raises(vane.InvalidInputException, match="batch_format must be one of"):
+        con.sql("select 1::BIGINT as x").map_batches(
+            lambda table: pa.table({"x": table.column("x")}),
+            schema={"x": vane.sqltypes.BIGINT},
+            batch_format="polars",
+        )
+
+
 def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
     """Large tensor intermediates should not force STANDARD_VECTOR_SIZE capacity."""
     pytest.importorskip("pyarrow")
