@@ -2590,6 +2590,13 @@ static bool IsSubprocessExecutionBackend(const string &backend) {
 	return backend == "subprocess_task" || backend == "subprocess_actor";
 }
 
+static string ResolveBatchFormat(const string &batch_format) {
+	if (batch_format != "pyarrow" && batch_format != "numpy" && batch_format != "pandas" && batch_format != "cudf") {
+		throw InvalidInputException("batch_format must be one of: cudf, numpy, pandas, pyarrow");
+	}
+	return batch_format;
+}
+
 static string ResolveRayActorThreadPolicy(const Optional<py::object> &thread_policy, const string &execution_backend,
                                           const string &operation_name) {
 	if (thread_policy.is_none()) {
@@ -2668,16 +2675,24 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
-    py::function fun, Optional<py::object> schema, const Optional<py::object> &batch_size,
-    const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
-    const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
-    const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
+    py::function fun, Optional<py::object> schema, const string &batch_format, const py::object &zero_copy_batch,
+    const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
+    const Optional<py::object> &min_task_batch_size, const Optional<py::object> &preserve_compute_batch_boundaries,
+    const Optional<py::object> &cpus, const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
     const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
     const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
     const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
 	AssertRelation();
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("map_batches requires a schema dict");
+	}
+	auto resolved_batch_format = ResolveBatchFormat(batch_format);
+	if (!PyBool_Check(zero_copy_batch.ptr())) {
+		throw InvalidInputException("zero_copy_batch must be a bool");
+	}
+	const bool resolved_zero_copy_batch = zero_copy_batch.ptr() == Py_True;
+	if (!resolved_zero_copy_batch && resolved_batch_format != "numpy") {
+		throw InvalidInputException("zero_copy_batch=False requires batch_format='numpy'");
 	}
 	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, GetRunnerType());
 	auto resolved_ray_actor_thread_policy =
@@ -2704,6 +2719,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 		auto child_name = StructType::GetChildName(existing_type, i);
 		new_children.emplace_back(child_name, existing_children[i]);
 	}
+	new_children.emplace_back("batch_format", Value(resolved_batch_format));
+	new_children.emplace_back("zero_copy_batch", Value::BOOLEAN(resolved_zero_copy_batch));
 	if (!resolved_ray_actor_thread_policy.empty()) {
 		new_children.emplace_back("ray_actor_thread_policy", Value(resolved_ray_actor_thread_policy));
 	}

@@ -787,7 +787,8 @@ def test_existing_dict_output_preserves_inference_and_column_order():
 
 
 @pytest.mark.parametrize("rows", [0, 1])
-def test_numpy_tensor_output_without_pandas(rows):
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+def test_numpy_tensor_output_without_pandas(rows, batch_format):
     script = textwrap.dedent("""
         import importlib.abc
         import sys
@@ -807,12 +808,16 @@ def test_numpy_tensor_output_without_pandas(rows):
 
         class Output:
             def __call__(self, table):
-                return {"pixels": np.arange(rows * 6, dtype=np.uint8).reshape(rows, 2, 3), "value": [1.75] * rows}
+                return {
+                    "pixels": np.arange(rows * 6, dtype=np.uint8).reshape(rows, 2, 3),
+                    "value": np.full(rows, 1.75) if sys.argv[2] == "numpy" else [1.75] * rows,
+                }
 
         runtime = UDFExecutor({
             "function_pickle": dumps(Output),
             "call_mode": "map_batches",
             "execution_backend": "subprocess_actor",
+            "batch_format": sys.argv[2],
             "output_schema": [
                 {"name": "pixels", "kind": "tensor", "dtype": "UTINYINT", "shape": [2, 3]},
                 {"name": "value", "type": "BIGINT"},
@@ -833,7 +838,7 @@ def test_numpy_tensor_output_without_pandas(rows):
             runtime.close()
     """)
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(rows)], capture_output=True, text=True, timeout=30
+        [sys.executable, "-I", "-c", script, str(rows), batch_format], capture_output=True, text=True, timeout=30
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

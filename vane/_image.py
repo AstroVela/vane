@@ -278,8 +278,8 @@ def _image_storage_to_numpy(value: Any, dtype: Any) -> Image:
     return array.astype(_MODE_DTYPES[mode]).reshape(height, width, channels)
 
 
-def _image_arrow_scalar_to_numpy(value: Any, dtype: Any) -> Image:
-    """Copy a validated Image scalar directly from Arrow's typed pixel buffer."""
+def _image_arrow_scalar_to_numpy(value: Any, dtype: Any, *, copy: bool = True) -> Image:
+    """Materialize validated HWC pixels, optionally sharing Arrow's typed buffer."""
     storage = value.value if isinstance(value, pa.ExtensionScalar) else value
     if dtype.is_fixed_shape_image():
         height, width = dtype.shape
@@ -290,7 +290,7 @@ def _image_arrow_scalar_to_numpy(value: Any, dtype: Any) -> Image:
         height, width, channels = (storage[name].as_py() for name in ("height", "width", "channel"))
         pixels = storage["data"].values
         mode = _MODE_NAMES[storage["mode"].as_py()]
-    return pixels.to_numpy().astype(_MODE_DTYPES[mode]).reshape(height, width, channels)
+    return pixels.to_numpy().astype(_MODE_DTYPES[mode], copy=copy).reshape(height, width, channels)
 
 
 def _image_expression(value: Any) -> vane.Expression:
