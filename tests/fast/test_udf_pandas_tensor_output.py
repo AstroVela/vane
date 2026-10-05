@@ -86,27 +86,29 @@ def test_pandas_tensor_missing_elements_do_not_disable_checked_integer_cast(cont
 
 @pytest.mark.parametrize("shape", [(4,), (2, 2), (1, 2, 2)])
 @pytest.mark.parametrize("layout", ["sliced", "chunked", "empty"])
-def test_pandas_arrow_tensor_output_keeps_shape_validity_and_buffers(shape, layout):
+@pytest.mark.parametrize("extension", [False, True])
+def test_pandas_arrow_tensor_output_keeps_shape_validity_and_buffers(shape, layout, extension):
     pd = pytest.importorskip("pandas")
     dtype = pa.fixed_shape_tensor(pa.float64(), shape)
     child = pa.array([-1, 0, 0, 0, 0, 1.5, None, np.nan, 4, 0, 0, 0, 0], from_pandas=False).slice(1)
     storage = pa.FixedSizeListArray.from_arrays(child, 4, mask=pa.array([False, False, True])).slice(1)
-    array = pa.ExtensionArray.from_storage(dtype, storage)
+    array = pa.ExtensionArray.from_storage(dtype, storage) if extension else storage
     if layout == "empty":
         chunks = []
     elif layout == "chunked":
         chunks = [array.slice(0, 1), array.slice(1)]
     else:
         chunks = [array]
-    source = pa.chunked_array(chunks, type=dtype)
-    result = _encode(pd.Series(source, dtype=pd.ArrowDtype(dtype)), "DOUBLE", shape)
+    source = pa.chunked_array(chunks, type=array.type)
+    result = _encode(pd.Series(source, dtype=pd.ArrowDtype(array.type)), "DOUBLE", shape)
 
     assert result.type == dtype
     assert result.num_chunks == source.num_chunks
     assert len(result) == len(source)
     for expected, actual in zip(source.chunks, result.chunks, strict=True):
         assert actual.offset == expected.offset
-        assert actual.storage.values.offset == expected.storage.values.offset
+        expected_storage = expected.storage if extension else expected
+        assert actual.storage.values.offset == expected_storage.values.offset
         assert actual.is_valid().to_pylist() == expected.is_valid().to_pylist()
         assert [None if b is None else b.address for b in actual.buffers()] == [
             None if b is None else b.address for b in expected.buffers()
@@ -127,14 +129,15 @@ def test_pandas_arrow_tensor_output_rejects_lossy_integer_cast(value):
 
 
 @pytest.mark.parametrize("empty", [False, True])
-def test_pandas_arrow_tensor_output_checked_cast_preserves_chunks_and_nulls(empty):
+@pytest.mark.parametrize("extension", [False, True])
+def test_pandas_arrow_tensor_output_checked_cast_preserves_chunks_and_nulls(empty, extension):
     pd = pytest.importorskip("pandas")
     dtype = pa.fixed_shape_tensor(pa.float64(), (2, 2), permutation=[0, 1])
     child = pa.array([1.5] * 4 + [1, None, 3, 4] + [1.5] * 8)
     storage = pa.FixedSizeListArray.from_arrays(child, 4, mask=pa.array([False, False, True, False])).slice(1, 2)
-    array = pa.ExtensionArray.from_storage(dtype, storage)
-    source = pa.chunked_array([] if empty else [array.slice(0, 1), array.slice(1)], type=dtype)
-    result = _encode(pd.Series(source, dtype=pd.ArrowDtype(dtype)))
+    array = pa.ExtensionArray.from_storage(dtype, storage) if extension else storage
+    source = pa.chunked_array([] if empty else [array.slice(0, 1), array.slice(1)], type=array.type)
+    result = _encode(pd.Series(source, dtype=pd.ArrowDtype(array.type)))
     assert result.type == pa.fixed_shape_tensor(pa.int64(), (2, 2))
     assert result.num_chunks == source.num_chunks
     assert result.combine_chunks().storage.to_pylist() == ([] if empty else [[1, None, 3, 4], None])
@@ -214,31 +217,127 @@ def _wrap_arrow_tensors(array, container, mask=None):
     return pa.MapArray.from_arrays(offsets, pa.array(["key"] * len(array), type=pa.string()), array, mask=mask)
 
 
+@pytest.mark.parametrize("container", ["plain", "struct", "list", "array", "map"])
+@pytest.mark.parametrize(
+    "storage_type",
+    [
+        pa.list_(pa.float64(), 4),
+        pa.list_(pa.field("element", pa.float64()), 4),
+        pa.list_(pa.float64()),
+        pa.large_list(pa.float64()),
+        pa.list_view(pa.float64()),
+        pa.large_list_view(pa.float64()),
+    ],
+)
+@pytest.mark.parametrize("value", [2.0, 1.5, float(2**63)])
+def test_raw_arrow_tensor_storage_restores_shape_before_checked_cast(container, storage_type, value):
+    pd = pytest.importorskip("pandas")
+    storage = pa.array([[value, None, 3, 4], None], type=storage_type)
+    array = storage if container == "plain" else _wrap_arrow_tensors(storage, container)
+    series = pd.Series(array, dtype=pd.ArrowDtype(array.type))
+    if value != 2.0:
+        with pytest.raises(pa.ArrowInvalid, match="truncated|out of bounds|not in range"):
+            _encode(series, container=container)
+    else:
+        result = _encode(series, container=container)
+        if container == "plain":
+            assert result.type == pa.fixed_shape_tensor(pa.int64(), (2, 2))
+            assert result.combine_chunks().storage.to_pylist() == [[2, None, 3, 4], None]
+        else:
+            assert result.combine_chunks().equals(array)
+
+
+@pytest.mark.parametrize("container", ["plain", "struct", "list", "array", "map"])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_raw_arrow_tensor_storage_rejects_wrong_element_count(container, fixed):
+    pd = pytest.importorskip("pandas")
+    dtype = pa.list_(pa.int64(), 3) if fixed else pa.list_(pa.int64())
+    storage = pa.array([[1, 2, 3]], type=dtype)
+    array = storage if container == "plain" else _wrap_arrow_tensors(storage, container)
+    with pytest.raises(ValueError, match="declared storage size"):
+        _encode(pd.Series(array, dtype=pd.ArrowDtype(array.type)), container=container)
+
+
+@pytest.mark.parametrize("batch_format", ["pyarrow", "pandas"])
+@pytest.mark.parametrize("backend", ["subprocess_task", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_public_raw_arrow_storage_for_multidimensional_tensor(request, monkeypatch, batch_format, backend):
+    pd = pytest.importorskip("pandas")
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+    storage = pa.array([[1.0, None, 3.0, 4.0], None], type=pa.list_(pa.float64(), 4))
+    containers = ["plain", "struct", "list", "array", "map"]
+    arrays = {name: storage if name == "plain" else _wrap_arrow_tensors(storage, name) for name in containers}
+    table = pa.table(arrays)
+    frame = pd.DataFrame({name: pd.Series(array, dtype=pd.ArrowDtype(array.type)) for name, array in arrays.items()})
+    tensor_type = vane.tensor_type(vane.sqltypes.BIGINT, [2, 2])
+    schema = {
+        "plain": tensor_type,
+        "struct": vane.struct_type({"value": tensor_type}),
+        "list": vane.list_type(tensor_type),
+        "array": vane.array_type(tensor_type, 1),
+        "map": vane.map_type(vane.sqltypes.VARCHAR, tensor_type),
+    }
+
+    class Output:
+        def __call__(self, batch):
+            return table if batch_format == "pyarrow" else frame
+
+    with vane.connect(config={"threads": 2}) as con:
+        result = (
+            con.sql("SELECT 1 AS input")
+            .map_batches(
+                Output if backend == "ray_actor" else lambda batch: Output()(batch),
+                schema=schema,
+                batch_format=batch_format,
+                execution_backend=backend,
+                actor_number=1 if backend == "ray_actor" else None,
+            )
+            .to_arrow_table()
+        )
+    assert result.num_rows == 2
+    for name in containers:
+        tensor = result[name].combine_chunks()
+        if name == "struct":
+            tensor = tensor.field("value")
+        elif name in ("list", "array"):
+            tensor = tensor.values
+        elif name == "map":
+            tensor = tensor.items
+        assert tensor.type == pa.fixed_shape_tensor(pa.int64(), [2, 2])
+        assert tensor.storage.to_pylist() == [[1, None, 3, 4], None]
+
+
 @pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
 @pytest.mark.parametrize("extension", [False, True])
 @pytest.mark.parametrize("value", [1.5, float(2**63)])
-def test_nested_arrow_tensor_output_checks_integer_cast_in_each_chunk(container, extension, value):
+@pytest.mark.parametrize("shape", [(2,), (2, 2)])
+def test_nested_arrow_tensor_output_checks_integer_cast_in_each_chunk(container, extension, value, shape):
     pd = pytest.importorskip("pandas")
-    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
-    storage = pa.array([[1, None], [value, 2]], type=dtype.storage_type)
+    dtype = pa.fixed_shape_tensor(pa.float64(), shape)
+    size = dtype.storage_type.list_size
+    storage = pa.array([[1] * (size - 1) + [None], [value] + [2] * (size - 1)], type=dtype.storage_type)
     leaf = pa.ExtensionArray.from_storage(dtype, storage) if extension else storage
     array = _wrap_arrow_tensors(leaf, container)
     column = pa.chunked_array([array.slice(0, 1), array.slice(1)])
     with pytest.raises(pa.ArrowInvalid, match="truncated|out of bounds|not in range"):
-        _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), shape=(2,), container=container)
+        _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), shape=shape, container=container)
 
 
 @pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
 @pytest.mark.parametrize("layout", ["sliced", "chunked", "empty"])
-def test_nested_arrow_tensor_checks_ignore_hidden_rows_and_preserve_storage(container, layout):
+@pytest.mark.parametrize("extension", [False, True])
+def test_nested_arrow_tensor_checks_ignore_hidden_rows_and_preserve_storage(container, layout, extension):
     pd = pytest.importorskip("pandas")
-    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
-    storage = pa.array([[1.5, 2]] * 2 + [[1, None], [1.5, 2], [3, 4], [1.5, 2]], type=dtype.storage_type).slice(1)
-    leaf = pa.ExtensionArray.from_storage(dtype, storage)
+    dtype = pa.fixed_shape_tensor(pa.float64(), (2, 2))
+    storage = pa.array(
+        [[1.5] * 4] * 2 + [[1, None, 3, 4], [1.5] * 4, [5, 6, 7, 8], [1.5] * 4], type=dtype.storage_type
+    ).slice(1)
+    leaf = pa.ExtensionArray.from_storage(dtype, storage) if extension else storage
     array = _wrap_arrow_tensors(leaf, container, pa.array([False, False, True, False, False])).slice(1, 3)
     chunks = [] if layout == "empty" else [array.slice(0, 1), array.slice(1)] if layout == "chunked" else [array]
     column = pa.chunked_array(chunks, type=array.type)
-    result = _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), shape=(2,), container=container)
+    result = _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), container=container)
     assert result.equals(column)
     assert result.num_chunks == column.num_chunks
     for actual, expected in zip(result.chunks, column.chunks, strict=True):

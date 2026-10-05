@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from decimal import Decimal
 
 import numpy as np
 import pyarrow as pa
@@ -39,6 +40,75 @@ def _wrap_leaf(leaf, declaration, container):
             f"MAP(VARCHAR, {declaration})",
         )
     return leaf, declaration
+
+
+@pytest.mark.parametrize("writable", [False, True])
+@pytest.mark.parametrize("container", ["plain", "list", "array", "struct", "map"])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_numpy_hugeint_keeps_decimal128_source_type_at_signed_boundaries(writable, container, chunked):
+    # DuckDB exports HUGEINT as decimal128(38, 0), whose physical buffer can
+    # contain 39-digit integers outside the nominal decimal precision.
+    values = [-1, -(2**127), 0, 2**127 - 1, 10**38 - 1]
+    data = b"".join(value.to_bytes(16, "little", signed=True) for value in values)
+    leaf = pa.Array.from_buffers(pa.decimal128(38, 0), 5, [pa.py_buffer(b"\x1b"), pa.py_buffer(data)]).slice(1)
+    array, declaration = _wrap_leaf(leaf, "HUGEINT", container)
+    source = pa.chunked_array([array.slice(0, 1), array.slice(1)]) if chunked else array
+    batch, result = _round_trip(source, declaration, "numpy", writable)
+    assert result.equals(array)
+    if container == "plain":
+        assert isinstance(batch["x"][0], pa.Decimal128Scalar)
+        assert batch["x"][0].as_py() == Decimal(-(2**127))
+        assert batch["x"].flags.writeable == writable
+
+
+@pytest.mark.parametrize("container", ["plain", "list", "array", "struct", "map"])
+def test_numpy_decimal_retains_precision_and_scale(container):
+    leaf = pa.array([Decimal("1.2500"), None, Decimal("-123456789.9876")], type=pa.decimal128(18, 4))
+    array, declaration = _wrap_leaf(leaf, "DECIMAL(18, 4)", container)
+    _, result = _round_trip(array, declaration, "numpy")
+    assert result.equals(array)
+
+
+@pytest.mark.parametrize("mode", ["pyarrow", "numpy", "numpy_writable", "pandas"])
+@pytest.mark.parametrize("backend", ["subprocess_task", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_public_hugeint_identity_with_default_arrow_conversion(request, monkeypatch, mode, backend):
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+
+    class Identity:
+        def __call__(self, batch):
+            return batch
+
+    values = [-(2**127), 2**127 - 1, 10**38 - 1, 0, None]
+    rows = ", ".join(
+        f"({index}, {'NULL' if value is None else repr(str(value))}::HUGEINT)" for index, value in enumerate(values)
+    )
+    with vane.connect(config={"threads": 2}) as con:
+        relation = con.sql(
+            "SELECT id, x, [x, NULL::HUGEINT] AS list_value, [x, NULL::HUGEINT]::HUGEINT[2] AS array_value, "
+            "{'value': x} AS struct_value, map(['key'], [x]) AS map_value "
+            f"FROM (VALUES {rows}) t(id, x)"
+        )
+        # Ray's final result transport rejects HUGEINT when lossless Arrow is
+        # disabled. Keep HUGEINT through the UDF, then compare exact SQL text
+        # after a downstream projection, without changing the default input.
+        projection = "id, " + ", ".join(f"{name}::VARCHAR AS {name}" for name in relation.columns[1:])
+        expected = relation.project(projection).order("id").fetchall()
+        actual = (
+            relation.map_batches(
+                Identity if backend == "ray_actor" else lambda batch: batch,
+                schema=dict(zip(relation.columns, relation.types, strict=True)),
+                batch_format="numpy" if mode == "numpy_writable" else mode,
+                zero_copy_batch=mode != "numpy_writable",
+                execution_backend=backend,
+                actor_number=1 if backend == "ray_actor" else None,
+            )
+            .project(projection)
+            .order("id")
+            .fetchall()
+        )
+    assert actual == expected
 
 
 @pytest.mark.parametrize("batch_format,writable", [("numpy", False), ("numpy", True), ("pandas", False)])
