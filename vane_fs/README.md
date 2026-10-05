@@ -103,6 +103,12 @@ mounts use direct I/O and zero namespace/attribute timeouts; read-only snapshot
 mounts can retain immutable file data in the kernel cache. Requests currently
 run through one native dispatch loop and one SQLite connection.
 
+Each open directory handle retains the sorted entry list captured at open,
+including across pagination and rewind. Removing, renaming or adding entries
+cannot skip or duplicate unrelated entries in that stream. Open a new directory
+handle to see the latest listing. Listing memory is proportional to the entries
+in each open directory and is released when the handle closes or the mount exits.
+
 This is a filesystem subset: regular files, directories, modes through `0777`,
 mtime, seek/read/write, append, truncate, rename, unlink and directory removal.
 All entries belong to the mounting user/group; atime and ctime report mtime.

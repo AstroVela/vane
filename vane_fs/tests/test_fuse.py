@@ -178,6 +178,67 @@ def test_live_handles_observe_other_writes_and_atomic_append(tmp_path):
             assert sorted(path.read_text().splitlines()) == sorted(f"{i}:{j}" for i in range(4) for j in range(30))
 
 
+@pytest.mark.parametrize("mutation", ["unlink", "rename", "insert"])
+def test_directory_pagination_is_stable_during_mutation(tmp_path, mutation):
+    database = tmp_path / "workspace.sqlite"
+    # Exceed both a FUSE reply and libc's directory buffer, so scandir must
+    # resume through multiple readdir requests after the directory changes.
+    original = {f"file-{index:04}" for index in range(1800)}
+    added = {f"added-{index:04}" for index in range(40)}
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        for name in sorted(original):
+            branch.write_file("/" + name, b"")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            seen = set()
+            with os.scandir(point) as entries:
+                for entry in entries:
+                    assert entry.name in original
+                    assert entry.name not in seen, f"Repeated directory entry: {entry.name}"
+                    seen.add(entry.name)
+                    if mutation == "unlink":
+                        os.unlink(entry.path)
+                    elif mutation == "rename":
+                        os.rename(entry.path, point / ("renamed-" + entry.name))
+                    elif len(seen) == 1:
+                        for name in sorted(added):
+                            (point / name).touch()
+            assert seen == original
+            if mutation == "unlink":
+                expected = set()
+            elif mutation == "rename":
+                expected = {"renamed-" + name for name in original}
+            else:
+                expected = original | added
+            assert set(os.listdir(point)) == expected
+        assert set(branch.listdir()) == expected
+
+
+def test_directory_lists_belong_to_each_open_handle_and_survive_rewind(tmp_path):
+    database = tmp_path / "workspace.sqlite"
+    with Workspace(database) as workspace:
+        branch = workspace.checkout()
+        branch.write_file("/original", b"")
+        with mount_workspace(tmp_path, database, "branch", "main") as (point, _):
+            first = os.open(point, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                assert os.listdir(first) == ["original"]
+                (point / "original").unlink()
+                (point / "replacement").touch()
+                second = os.open(point, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    assert os.listdir(second) == ["replacement"]
+                    # listdir(fd) rewinds the directory stream. Its saved
+                    # listing must remain valid at offset zero as well.
+                    assert os.listdir(first) == ["original"]
+                finally:
+                    os.close(second)
+                assert os.listdir(first) == ["original"]
+            finally:
+                os.close(first)
+            assert os.listdir(point) == ["replacement"]
+
+
 def test_mount_crash_reclaims_orphans_and_preserves_committed_data(tmp_path):
     database = tmp_path / "workspace.sqlite"
     with Workspace(database) as workspace:

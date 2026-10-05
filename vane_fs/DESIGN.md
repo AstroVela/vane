@@ -255,6 +255,14 @@ Read-only snapshot mounts may cache immutable bytes. Each mount currently uses
 one dispatch loop and one SQLite connection. The supported POSIX subset and
 metadata limitations are listed in [the usage guide](README.md#native-commands-and-linux-mounts).
 
+Directory cookies index a fixed entry list owned by each `opendir` handle.
+`readdir` uses that list for the handle's lifetime, including rewinds, so a
+mutation cannot shift a continuation offset past untouched entries or cause
+duplicates. New handles capture the latest directory contents. `releasedir`
+frees the list and releases its inode reference; failed open replies and mount
+shutdown also discard their lists. Listing memory scales with the total entries
+held by open directory handles.
+
 Directory import is a future convenience API. A later lazy importer may
 refer to an immutable host snapshot or immutable object version, but a pathname
 plus size/mtime is not sufficient to preserve content. Source mutation, symlinks

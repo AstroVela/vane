@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <unistd.h>
 
 using namespace vane_fs;
@@ -21,6 +22,8 @@ struct Mount {
 	bool readonly;
 	uid_t uid = getuid();
 	gid_t gid = getgid();
+	std::map<uint64_t, std::vector<std::pair<std::string, FileStat>>> directories;
+	uint64_t next_directory = 0;
 	Mount(const std::string &path, const std::string &id, bool readonly)
 	    : workspace(path), database(path), readonly(readonly) {
 		workspace.RecoverOwners();
@@ -201,9 +204,20 @@ fuse_lowlevel_ops Operations() {
 		Guard(req, [&] {
 			auto &mount = Context(req);
 			mount.session->OpenInode(inode, true);
-			info->fh = inode;
-			if (fuse_reply_open(req, info) < 0)
+			try {
+				// Cookies index this handle's fixed listing, so namespace
+				// mutations cannot shift entries between readdir requests.
+				auto entries = mount.session->DirectoryEntries(inode);
+				info->fh = ++mount.next_directory;
+				mount.directories.emplace(info->fh, std::move(entries));
+			} catch (...) {
 				Close(mount, inode, 1);
+				throw;
+			}
+			if (fuse_reply_open(req, info) < 0) {
+				mount.directories.erase(info->fh);
+				Close(mount, inode, 1);
+			}
 		});
 	};
 	ops.readdir = [](fuse_req_t req, fuse_ino_t, size_t size, off_t offset, fuse_file_info *info) {
@@ -217,7 +231,7 @@ fuse_lowlevel_ops Operations() {
 				return;
 			}
 			auto &mount = Context(req);
-			auto entries = mount.session->DirectoryEntries(info->fh);
+			const auto &entries = mount.directories.at(info->fh);
 			std::vector<char> buffer(size);
 			size_t used = 0;
 			for (size_t i = size_t(offset); i < entries.size(); ++i) {
@@ -231,7 +245,14 @@ fuse_lowlevel_ops Operations() {
 			fuse_reply_buf(req, buffer.data(), used);
 		});
 	};
-	ops.releasedir = ops.release;
+	ops.releasedir = [](fuse_req_t req, fuse_ino_t inode, fuse_file_info *info) {
+		Guard(req, [&] {
+			auto &mount = Context(req);
+			mount.directories.erase(info->fh);
+			mount.session->CloseFile(inode);
+			fuse_reply_err(req, 0);
+		});
+	};
 	ops.mkdir = [](fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode) {
 		Guard(req, [&] {
 			Mutable(Context(req));
