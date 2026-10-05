@@ -1460,7 +1460,11 @@ normal exit cannot shut down its parent's release channel.
 `VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
 `auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
 available `/dev/shm` space when the store is created. Pages are populated on use;
-the arena's virtual size is not its resident memory. This limit is separate from
+the arena's virtual size is not its resident memory. Each worker maps the entire
+arena on first use and retains that mapping across tasks. Processes using
+`RLIMIT_AS` must leave room for this mapping in addition to their heap and IPC
+buffers; set `VANE_LOCAL_SHM_STORE_BYTES` explicitly when testing within a fixed
+address-space allowance. This limit is separate from
 `VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
 outputs, not model heap or the existing input/control allocations. When live
 buffers or fragmentation prevent an allocation, the task receives an explicit
