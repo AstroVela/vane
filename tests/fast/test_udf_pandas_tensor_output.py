@@ -23,6 +23,8 @@ def _encode(series, dtype="BIGINT", shape=(2, 2), container="plain"):
             declaration = f"STRUCT(value {declaration})"
         elif container == "map":
             declaration = f"MAP(VARCHAR, {declaration})"
+        elif container == "array":
+            declaration += "[1]"
         else:
             declaration += "[]"
         entry = {"name": "x", "kind": "duckdb_type", "type": declaration}
@@ -199,3 +201,151 @@ def test_public_pandas_tensor_output_preserves_missing_elements_and_arrow_shape(
     assert result["nested"].combine_chunks().field("value").storage.to_pylist() == [[1.5, None], None]
     assert result["arrow_tensor"].type.shape == [2, 2]
     assert result["arrow_tensor"].combine_chunks().storage.to_pylist() == [[1, None, 3, 4], None]
+
+
+def _wrap_arrow_tensors(array, container, mask=None):
+    if container == "struct":
+        return pa.StructArray.from_arrays([array], names=["VALUE"], mask=mask)
+    if container == "array":
+        return pa.FixedSizeListArray.from_arrays(array, 1, mask=mask)
+    offsets = list(range(len(array) + 1))
+    if container == "list":
+        return pa.ListArray.from_arrays(offsets, array, mask=mask)
+    return pa.MapArray.from_arrays(offsets, pa.array(["key"] * len(array), type=pa.string()), array, mask=mask)
+
+
+@pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
+@pytest.mark.parametrize("extension", [False, True])
+@pytest.mark.parametrize("value", [1.5, float(2**63)])
+def test_nested_arrow_tensor_output_checks_integer_cast_in_each_chunk(container, extension, value):
+    pd = pytest.importorskip("pandas")
+    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
+    storage = pa.array([[1, None], [value, 2]], type=dtype.storage_type)
+    leaf = pa.ExtensionArray.from_storage(dtype, storage) if extension else storage
+    array = _wrap_arrow_tensors(leaf, container)
+    column = pa.chunked_array([array.slice(0, 1), array.slice(1)])
+    with pytest.raises(pa.ArrowInvalid, match="truncated|out of bounds|not in range"):
+        _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), shape=(2,), container=container)
+
+
+@pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
+@pytest.mark.parametrize("layout", ["sliced", "chunked", "empty"])
+def test_nested_arrow_tensor_checks_ignore_hidden_rows_and_preserve_storage(container, layout):
+    pd = pytest.importorskip("pandas")
+    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
+    storage = pa.array([[1.5, 2]] * 2 + [[1, None], [1.5, 2], [3, 4], [1.5, 2]], type=dtype.storage_type).slice(1)
+    leaf = pa.ExtensionArray.from_storage(dtype, storage)
+    array = _wrap_arrow_tensors(leaf, container, pa.array([False, False, True, False, False])).slice(1, 3)
+    chunks = [] if layout == "empty" else [array.slice(0, 1), array.slice(1)] if layout == "chunked" else [array]
+    column = pa.chunked_array(chunks, type=array.type)
+    result = _encode(pd.Series(column, dtype=pd.ArrowDtype(column.type)), shape=(2,), container=container)
+    assert result.equals(column)
+    assert result.num_chunks == column.num_chunks
+    for actual, expected in zip(result.chunks, column.chunks, strict=True):
+        assert actual.offset == expected.offset
+        assert [None if buffer is None else buffer.address for buffer in actual.buffers()] == [
+            None if buffer is None else buffer.address for buffer in expected.buffers()
+        ]
+
+
+@pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
+def test_nested_arrow_tensor_output_checks_shape_metadata(container):
+    pd = pytest.importorskip("pandas")
+    dtype = pa.fixed_shape_tensor(pa.int64(), (1, 2))
+    leaf = pa.ExtensionArray.from_storage(dtype, pa.array([[1, 2]], type=dtype.storage_type))
+    array = _wrap_arrow_tensors(leaf, container)
+    with pytest.raises(ValueError, match="declared Arrow tensor metadata"):
+        _encode(pd.Series(array, dtype=pd.ArrowDtype(array.type)), shape=(2,), container=container)
+
+
+@pytest.mark.parametrize("value", [2.0, 1.5])
+def test_arrow_tensor_cast_checks_recurse_through_multiple_containers(value):
+    pd = pytest.importorskip("pandas")
+    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
+    leaf = pa.ExtensionArray.from_storage(dtype, pa.array([[value, None]], type=dtype.storage_type))
+    array = _wrap_arrow_tensors(_wrap_arrow_tensors(_wrap_arrow_tensors(leaf, "list"), "map"), "struct")
+    frame = pd.DataFrame({"x": pd.Series(array, dtype=pd.ArrowDtype(array.type))})
+    outputs = iter_udf_output_tables(
+        frame,
+        batch_format="pandas",
+        output_schema=[
+            {"name": "x", "kind": "duckdb_type", "type": "STRUCT(value MAP(VARCHAR, TENSOR(BIGINT, [2])[]))"}
+        ],
+    )
+    if value == 1.5:
+        with pytest.raises(pa.ArrowInvalid, match="truncated"):
+            list(outputs)
+    else:
+        (result,) = outputs
+        assert result["x"].combine_chunks().equals(array)
+
+
+def test_nested_arrow_tensor_checks_preserve_sibling_cast_types(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    tensor_type = pa.fixed_shape_tensor(pa.float64(), (2,))
+    leaf = pa.ExtensionArray.from_storage(tensor_type, pa.array([[1, None]], type=tensor_type.storage_type))
+    array = pa.StructArray.from_arrays(
+        [leaf, pa.array([1.75]), pa.array([b"\xff"]), pa.array([123], type=pa.timestamp("ns"))],
+        names=["tensor", "number", "text", "stamp"],
+    )
+    declaration = "STRUCT(tensor TENSOR(BIGINT, [2]), number BIGINT, text VARCHAR, stamp TIMESTAMP_NS)"
+    frame = pd.DataFrame({"x": pd.Series(array, dtype=pd.ArrowDtype(array.type))})
+    (encoded,) = iter_udf_output_tables(
+        frame, batch_format="pandas", output_schema=[{"name": "x", "kind": "duckdb_type", "type": declaration}]
+    )
+    assert encoded["x"].combine_chunks().equals(array)
+    with vane.connect(config={"threads": 2}) as con:
+        result = (
+            con.sql("SELECT 1 AS input")
+            .map_batches(
+                lambda batch: frame,
+                schema={"x": vane.type(declaration)},
+                batch_format="pandas",
+                execution_backend="subprocess_task",
+            )
+            .to_arrow_table()["x"]
+            .combine_chunks()
+        )
+    assert result.field("tensor").storage.to_pylist() == [[1, None]]
+    assert result.field("number").to_pylist() == [2]
+    assert result.field("text").to_pylist() == [r"\xFF"]
+    assert result.field("stamp").cast(pa.int64()).to_pylist() == [123]
+
+
+@pytest.mark.parametrize("container", ["struct", "list", "array", "map"])
+@pytest.mark.parametrize("backend", ["subprocess_task", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
+def test_public_nested_arrow_tensor_rejects_fractional_integer_cast(request, monkeypatch, container, backend):
+    pd = pytest.importorskip("pandas")
+    error_type = vane.InvalidInputException
+    if backend == "ray_actor":
+        request.getfixturevalue("ray_local")
+        from ray.exceptions import RayTaskError
+
+        error_type = RayTaskError
+    monkeypatch.setenv("VANE_RUNNER", "ray" if backend == "ray_actor" else "local-fast")
+    dtype = pa.fixed_shape_tensor(pa.float64(), (2,))
+    leaf = pa.ExtensionArray.from_storage(dtype, pa.array([[1.5, 2]], type=dtype.storage_type))
+    array = _wrap_arrow_tensors(leaf, container)
+    frame = pd.DataFrame({"x": pd.Series(array, dtype=pd.ArrowDtype(array.type))})
+    declarations = {
+        "struct": "STRUCT(value TENSOR(BIGINT, [2]))",
+        "list": "TENSOR(BIGINT, [2])[]",
+        "array": "TENSOR(BIGINT, [2])[1]",
+        "map": "MAP(VARCHAR, TENSOR(BIGINT, [2]))",
+    }
+
+    class Output:
+        def __call__(self, batch):
+            return frame
+
+    with vane.connect(config={"threads": 2}) as con:
+        result = con.sql("SELECT 1 AS input").map_batches(
+            Output if backend == "ray_actor" else lambda batch: frame,
+            schema={"x": vane.type(declarations[container])},
+            batch_format="pandas",
+            execution_backend=backend,
+            actor_number=1 if backend == "ray_actor" else None,
+        )
+        with pytest.raises(error_type, match="was truncated converting to int64"):
+            result.to_arrow_table()

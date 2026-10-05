@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -34,6 +39,102 @@ def _wrap_leaf(leaf, declaration, container):
             f"MAP(VARCHAR, {declaration})",
         )
     return leaf, declaration
+
+
+@pytest.mark.parametrize("batch_format,writable", [("numpy", False), ("numpy", True), ("pandas", False)])
+@pytest.mark.parametrize("container", ["plain", "list", "array", "struct", "map"])
+def test_intervals_preserve_calendar_components_nanoseconds_and_nulls(batch_format, writable, container):
+    leaf = pa.array([(1, 2, 123), None, (-2, -3, -987)], type=pa.month_day_nano_interval())
+    array, declaration = _wrap_leaf(leaf, "INTERVAL", container)
+    batch, result = _round_trip(array, declaration, batch_format, writable)
+    assert result.equals(array)
+    if batch_format == "numpy" and container == "plain":
+        assert isinstance(batch["x"][0], pa.MonthDayNanoIntervalScalar)
+        assert batch["x"][0].as_py() == pa.MonthDayNano((1, 2, 123))
+        assert batch["x"].flags.writeable == writable
+
+
+@pytest.mark.parametrize("route", ["adapter", "public"])
+@pytest.mark.parametrize("mode", ["pyarrow", "numpy", "numpy_writable"])
+def test_interval_batches_without_optional_pandas(tmp_path, route, mode):
+    # sitecustomize applies before Arrow imports in both this fresh interpreter
+    # and the public API's subprocess worker. A prior pandas import cannot mask
+    # the missing-dependency crash in Arrow's INTERVAL NumPy bridge.
+    (tmp_path / "sitecustomize.py").write_text(
+        textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        class NoPandas(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "pandas" or fullname.startswith("pandas."):
+                    raise ModuleNotFoundError("pandas is not installed", name=fullname)
+
+        sys.meta_path.insert(0, NoPandas())
+        if sys.platform != "win32":
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    """)
+    )
+    script = textwrap.dedent('''
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.udf_batch_format import format_udf_input, iter_udf_output_tables
+
+        def identity(batch):
+            assert "pandas" not in sys.modules
+            try:
+                import pandas
+            except ModuleNotFoundError:
+                return batch
+            raise AssertionError("pandas must be unavailable in the worker")
+
+        route, mode = sys.argv[1:]
+        fmt = "numpy" if mode.startswith("numpy") else "pyarrow"
+        zero_copy = mode != "numpy_writable"
+        with vane.connect(config={"threads": 2}) as con:
+            relation = con.sql("""
+                SELECT x, [x, NULL::INTERVAL] AS items,
+                       [x, NULL::INTERVAL]::INTERVAL[2] AS fixed_items,
+                       {'value': x} AS record, map(['key'], [x]) AS mapping
+                FROM (VALUES (INTERVAL '1 month 2 days 3 microseconds'),
+                             (NULL), (INTERVAL '-2 months -3 days -4 microseconds')) t(x)
+            """)
+            expected = relation.to_arrow_table()
+            if route == "public":
+                result = relation.map_batches(
+                    identity, schema=dict(zip(relation.columns, relation.types)),
+                    batch_format=fmt, zero_copy_batch=zero_copy,
+                    execution_backend="subprocess_task",
+                ).to_arrow_table()
+                assert result.equals(expected)
+            else:
+                schema = [{"name": name, "kind": "duckdb_type", "type": str(dtype)}
+                          for name, dtype in zip(relation.columns, relation.types)]
+                for table in (expected, expected.slice(1), expected.slice(0, 0),
+                              pa.concat_tables([expected.slice(0, 1), expected.slice(1)])):
+                    batch = identity(format_udf_input(table, fmt, zero_copy_batch=zero_copy))
+                    result, = iter_udf_output_tables(batch, batch_format=fmt, output_schema=schema)
+                    assert result.to_pydict() == table.to_pydict()
+                    if len(table):
+                        assert result.schema == table.schema
+            assert "pandas" not in sys.modules
+    ''')
+    environment = {
+        **os.environ,
+        "VANE_RUNNER": "local-fast",
+        "PYTHONPATH": str(tmp_path) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
+    completed = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", script, route, mode],
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("batch_format,writable", [("numpy", False), ("numpy", True), ("pandas", False)])

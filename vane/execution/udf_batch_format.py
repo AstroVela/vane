@@ -17,8 +17,11 @@ from numpy.typing import NDArray
 from vane._image import _MODE_CHANNELS, _MODE_DTYPES, _image_arrow_scalar_to_numpy, _ImageArrowType
 from vane.execution._udf_validation import ensure_synchronous_udf_result
 from vane.execution.udf_file_contract import (
+    _child_window,
+    _list_storage_parts,
     _map_array_from_offsets,
     _native_outputs_to_arrow_array,
+    _struct_field_index,
     validate_file_arrow_array,
 )
 from vane.execution.udf_output_schema import (
@@ -205,6 +208,12 @@ def _is_fixed_shape_tensor(data_type: pa.DataType) -> bool:
     return getattr(data_type, "extension_name", None) == "arrow.fixed_shape_tensor"
 
 
+def _contains_fixed_shape_tensor(data_type: pa.DataType) -> bool:
+    return _is_fixed_shape_tensor(data_type) or any(
+        _contains_fixed_shape_tensor(data_type.field(index).type) for index in range(data_type.num_fields)
+    )
+
+
 def _contains_extension_type(data_type: pa.DataType) -> bool:
     if isinstance(data_type, pa.BaseExtensionType):
         return True
@@ -280,6 +289,7 @@ def _arrow_values_to_numpy(array: pa.Array) -> np.ndarray:
         pa.types.is_nested(array.type)
         or isinstance(array.type, pa.BaseExtensionType)
         or pa.types.is_time(array.type)
+        or pa.types.is_interval(array.type)
         or (pa.types.is_timestamp(array.type) and array.type.tz is not None)
         or array.null_count
     ):
@@ -311,10 +321,13 @@ def _arrow_value_to_numpy(array: pa.Array, index: int) -> Any:
     if (
         isinstance(dtype, pa.BaseExtensionType)
         or pa.types.is_time(dtype)
+        or pa.types.is_interval(dtype)
         or (pa.types.is_timestamp(dtype) and dtype.tz is not None)
     ):
         # These types have no lossless NumPy equivalent. Keep the Arrow scalar,
         # including its logical type, timezone and sub-microsecond time value.
+        # INTERVAL's NumPy bridge requires pandas; its Arrow scalar retains the
+        # independent month/day/nanosecond components without that dependency.
         return scalar
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
         return _arrow_values_to_numpy(scalar.values)
@@ -569,8 +582,13 @@ def _pandas_batch_to_arrow(frame: Any, schema: _OutputSchema) -> pa.Table:
             arrays.append(_image_values_to_arrow(series.tolist(), column_schema))
         elif column_schema.tensor_type is not None:
             arrays.append(_pandas_tensor_to_arrow(series, column_schema))
-        elif column_schema.container_type is not None and not isinstance(series.dtype, _import_pandas().ArrowDtype):
-            arrays.append(_container_values_to_arrow(series, column_schema.container_type, from_pandas=True))
+        elif column_schema.container_type is not None:
+            if isinstance(series.dtype, _import_pandas().ArrowDtype):
+                column = pa.array(series)
+                _validate_arrow_tensor_casts(column, column_schema.container_type)
+                arrays.append(column)
+            else:
+                arrays.append(_container_values_to_arrow(series, column_schema.container_type, from_pandas=True))
         elif series.dtype == object:
             arrays.append(_primitive_values_to_arrow(series, from_pandas=True))
         else:
@@ -584,18 +602,23 @@ def _pandas_tensor_to_arrow(series: Any, column_schema: _OutputColumnSchema) -> 
     ):
         return _tensor_values_to_arrow(series.tolist(), column_schema, from_pandas=True)
 
+    # pandas' scalar iteration exposes flat storage lists, losing tensor shape.
+    # Use its Arrow protocol instead, retaining chunks, offsets and validity.
+    return _arrow_tensor_to_arrow(pa.array(series), column_schema)
+
+
+def _arrow_tensor_to_arrow(
+    column: pa.Array | pa.ChunkedArray, column_schema: _OutputColumnSchema
+) -> pa.Array | pa.ChunkedArray:
     tensor_type = column_schema.tensor_type
     assert tensor_type is not None
-    source_type = series.dtype.pyarrow_dtype
+    source_type = column.type
     if (
         source_type.shape != tensor_type.shape
         or source_type.permutation not in (None, list(range(len(tensor_type.shape))))
         or source_type.dim_names is not None
     ):
         raise ValueError(f"tensor output column {column_schema.name!r} must use its declared Arrow tensor metadata")
-    # pandas' scalar iteration exposes flat storage lists, losing tensor shape.
-    # Use its Arrow protocol instead, retaining chunks, offsets and validity.
-    column = pa.array(series)
     if source_type == tensor_type:
         return column
     chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
@@ -605,6 +628,44 @@ def _pandas_tensor_to_arrow(series: Any, column_schema: _OutputColumnSchema) -> 
         [_tensor_values_to_arrow(_arrow_column_to_numpy(pa.chunked_array([chunk])), column_schema) for chunk in chunks],
         type=tensor_type,
     )
+
+
+def _validate_arrow_tensor_casts(column: pa.Array | pa.ChunkedArray, dtype: pa.DataType) -> None:
+    """Check nested Tensor casts while leaving other Arrow leaf types for DuckDB."""
+    if column.type == dtype or pa.types.is_null(column.type) or not _contains_fixed_shape_tensor(dtype):
+        return
+    if isinstance(column, pa.ChunkedArray):
+        for chunk in column.chunks:
+            _validate_arrow_tensor_casts(chunk, dtype)
+        return
+    if _is_fixed_shape_tensor(dtype):
+        schema = _OutputColumnSchema(name="nested Tensor", tensor_type=dtype)
+        if _is_fixed_shape_tensor(column.type):
+            _arrow_tensor_to_arrow(column, schema)
+        else:
+            _tensor_values_to_arrow(_arrow_column_to_numpy(pa.chunked_array([column])), schema)
+        return
+
+    # Only logically present rows participate in casts. Children of NULL
+    # structs/lists/maps can contain arbitrary physical payloads.
+    if column.null_count:
+        column = column.drop_null()
+    if pa.types.is_struct(dtype) and pa.types.is_struct(column.type):
+        for field in dtype:
+            if _contains_fixed_shape_tensor(field.type):
+                index = _struct_field_index(column.type, field.name, boundary="map_batches output", path="column")
+                _validate_arrow_tensor_casts(column.field(index), field.type)
+    elif pa.types.is_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        parts = _list_storage_parts(column)
+        if parts is None:
+            raise TypeError("nested Tensor output requires Arrow list-like storage")
+        _validate_arrow_tensor_casts(parts[1], dtype.value_type)
+    elif pa.types.is_map(dtype) and pa.types.is_map(column.type):
+        start, length, _ = _child_window(column)
+        _validate_arrow_tensor_casts(column.keys.slice(start, length), dtype.key_type)
+        _validate_arrow_tensor_casts(column.items.slice(start, length), dtype.item_type)
+    else:
+        raise TypeError("nested Tensor output requires its declared Arrow container type")
 
 
 def _image_values_to_arrow(values: Any, column_schema: _OutputColumnSchema) -> pa.Array:
