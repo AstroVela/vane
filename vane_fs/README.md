@@ -455,6 +455,9 @@ before/after measurements.
 The [FUSE I/O optimization measurements](benchmarks/IO_OPTIMIZATION.md) compare
 the prepared-statement and block-range changes against the previous core using
 the same 64 MiB workloads, with unchanged FULL durability and live-mount caching.
+The later [new-block batching results](benchmarks/IO_OPTIMIZATION.md#new-block-batching-2026-10-06)
+measure bounded bulk inserts for vacant block ranges against the existing fsync
+mode. Logical blocks, version visibility and per-operation commits are retained.
 
 The subsequent [metadata cache measurements](benchmarks/METADATA_OPTIMIZATION.md)
 record stat, directory and Git workloads after enabling kernel metadata caching

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 import random
 import sqlite3
 import subprocess
@@ -91,6 +92,96 @@ def test_replacement_reuses_unchanged_blocks_and_clears_tail(workspace, database
     session.truncate("/file", len(original))
     assert session.read("/file") == b"a" * 4096 + b"b" + b"\0" * (len(original) - 4097)
     assert main.read("/file") == original
+
+
+@pytest.mark.parametrize("offset", [0, 1, 4095])
+def test_large_sparse_write_preserves_payload_mapping_and_versions(workspace, database_path, offset):
+    block = 4096
+    data = b"".join(bytes([i if i % 5 else 0]) * block for i in range(193)) + b"tail"
+    expected = b"\0" * offset + data
+    main = workspace.checkout()
+    main.write_file("/file", b"")
+    empty = workspace.snapshot()
+    main.write("/file", data, offset)
+    saved = workspace.snapshot()
+    child = workspace.checkout(workspace.fork("main", "child").id)
+    child.truncate("/file", 17)
+    child.truncate("/file", len(expected))
+    child.write("/file", data, offset)
+    with workspace.open_snapshot(empty) as before, workspace.open_snapshot(saved) as frozen:
+        assert before.read("/file") == b""
+        for session in [main, child, frozen]:
+            assert session.read("/file") == expected
+            assert session.read("/file", 63 * block - 3, 4 * block + 7) == expected[63 * block - 3 : 67 * block + 4]
+        workspace.collect_garbage()
+        assert frozen.read("/file") == expected
+    with Workspace(database_path) as reopened:
+        assert reopened.checkout().read("/file") == expected
+        assert reopened.checkout(child.id).read("/file") == expected
+
+
+@pytest.mark.parametrize("table", ["block_payloads", "block_versions"])
+def test_large_write_failure_rolls_back_all_batches(workspace, database_path, table):
+    def sql(script):
+        # Even closing a read-only connection from another SQLite copy can
+        # drop this process's locks. Isolate both inspection and fault injection.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); "
+                "print(json.dumps([db.execute('SELECT count(*) FROM '+t).fetchone()[0] "
+                "for t in ('inode_versions','dirent_versions','block_versions','block_payloads')])); db.close()",
+                str(database_path),
+                script,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return json.loads(result.stdout)
+
+    main = workspace.checkout()
+    main.write_file("/file", b"before")
+    before = sql("")
+    generation = workspace.branch().generation
+    sql(
+        "CREATE TABLE fault_counter AS SELECT 0 AS writes;"
+        f"CREATE TRIGGER fail_batch BEFORE INSERT ON {table} BEGIN "
+        "UPDATE fault_counter SET writes=writes+1;"
+        "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
+        "THEN RAISE(ABORT,'injected batch failure') END; END;"
+    )
+    data = bytes(range(256)) * (193 * 16)
+    try:
+        with pytest.raises(Error, match="injected batch failure"):
+            main.write("/file", data, offset=8191)
+        assert main.read("/file") == b"before"
+        assert sql("") == before
+        assert workspace.branch().generation == generation
+    finally:
+        sql("DROP TRIGGER fail_batch; DROP TABLE fault_counter;")
+    main.write("/file", data, offset=8191)
+    assert main.read("/file") == b"before" + b"\0" * (8191 - 6) + data
+
+
+def test_concurrent_large_writes_allocate_independent_payloads(workspace, database_path):
+    barrier = threading.Barrier(2)
+
+    def write(index):
+        data = bytes(range(index, index + 193)) * 4096
+        with Workspace(database_path) as connection:
+            session = connection.checkout()
+            barrier.wait(timeout=10)
+            for iteration in range(3):
+                session.write_file(f"/writer-{index}-{iteration}", data)
+        return index, data
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for index, data in executor.map(write, range(2)):
+            for iteration in range(3):
+                assert workspace.checkout().read(f"/writer-{index}-{iteration}") == data
 
 
 def test_range_reads_preserve_sparse_blocks_across_versions(workspace):

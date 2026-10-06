@@ -1,0 +1,2526 @@
+{
+  "baseline": {
+    "baseline": "0fc47514e438c6bf965b6af3af198281927e00a5",
+    "files": {
+      "before-mount": "deab6a7113e3703402e789b2177a1f44a0c09e93bd6d23c13bc9b1070936b5fe",
+      "before-core.a": "5c79a2b2d1dd165bd183e8e31894be09ca7dcd7d81bf2b16ddfb711fe5980e74",
+      "vane-cli": "70f88dbfb7c3e4f6a4d82334ecdb79f15552be29a9a85928a5a3119609f2811c"
+    },
+    "source": {
+      "vane_fs/src/workspace.cpp": "f26ece0bee1e003a80d3483092187f55f187f3ea16b84f1fd84fc6114191f9b8",
+      "vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+      "vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    "free_bytes": 27488677888
+  },
+  "build": {
+    "commands": [
+      [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-fPIC",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/src",
+        "-isystem",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "-c",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/workspace.cpp",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/workspace.o"
+      ],
+      [
+        "c++",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/probe.cpp.o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/workspace.o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_prepare_v2",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_exec",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/probe-after"
+      ]
+    ],
+    "after_source_sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "files": {
+      "probe-before": "c002e54e596a498fba43d2248286039a09e49008888fee0628994b970ab9d256",
+      "probe-after": "202026578a6d424c67308ad94e95f4f101674adac8c11ceb286112b13da03cec",
+      "before-mount": "deab6a7113e3703402e789b2177a1f44a0c09e93bd6d23c13bc9b1070936b5fe",
+      "after-mount": "2275479eb0a02a59c31d37d3399a71a560d99d759da23c83ddc2d2b66f427639",
+      "probe.cpp": "95b8d232ed286d422e7e90ed0fe0869538d64d8a79ec0923a868f3a4ad9b06c4",
+      "probe.hpp": "d7fb22966a50b8f2e9d61f5a812868480090b1a5fc90ccc6354c15513806262c",
+      "checkpoint.hpp": "689c3a048e4d80abcd75f7597dc2b18e14e294afb2fceb2532a943229e111362"
+    }
+  },
+  "plan": {
+    "baseline": "0fc47514e438c6bf965b6af3af198281927e00a5",
+    "scope": "Only new-block batching; format, logical block size, checkpoint parameters, durability and transaction boundaries unchanged. No comparison service is started.",
+    "native": {
+      "tmpfs_rounds": 6,
+      "ext4_rounds": 6,
+      "MiB": 256,
+      "application_request_shape": [
+        1048528,
+        48
+      ],
+      "validation": "full readback then database quick_check"
+    },
+    "fuse": {
+      "rounds": 6,
+      "order": "before/after then after/before, each three times",
+      "MiB": 256,
+      "durability": "fsync",
+      "database": "fresh per sample",
+      "validation": "full SHA-256 readback, quick_check, unmount timing"
+    },
+    "telemetry": "1-second host CPU/disk/memory/PSI snapshots",
+    "prohibition": "No owned builds or tests during measurement",
+    "retention": "keep every sample, errors, logs, code/binary hashes and cleanup manifests; remove owned DBs after shutdown outside timers"
+  },
+  "native": {
+    "tmpfs": {
+      "scope": "Instrumented native 256 MiB write+fsync with split FUSE-size requests. tmpfs isolates SQL/CPU costs and is not a physical durability benchmark.",
+      "storage": "/dev/shm",
+      "summary": {
+        "before": {
+          "write_sync_seconds": {
+            "median": 1.2811895684999999,
+            "min": 1.237910622,
+            "max": 1.3019609470000002
+          },
+          "write_seconds": {
+            "median": 1.2811022445,
+            "min": 1.237837391,
+            "max": 1.301886271
+          },
+          "sync_seconds": {
+            "median": 7.6016e-05,
+            "min": 7.3231e-05,
+            "max": 9.9533e-05
+          },
+          "close_seconds": {
+            "median": 0.015276781,
+            "min": 0.014885764,
+            "max": 0.015869191
+          },
+          "body_seconds": {
+            "median": 0.851980592,
+            "min": 0.819304373,
+            "max": 0.881706066
+          },
+          "admission_seconds": {
+            "median": 0.007277854,
+            "min": 0.007026935,
+            "max": 0.007485901
+          },
+          "commit_seconds": {
+            "median": 0.39948536300000004,
+            "min": 0.392650749,
+            "max": 0.403864921
+          },
+          "sql_steps": {
+            "median": 270336.0,
+            "min": 270336,
+            "max": 270336
+          },
+          "wal_write_bytes": {
+            "median": 354859880.0,
+            "min": 354859880,
+            "max": 354859880
+          },
+          "max_sampled_wal_bytes": {
+            "median": 66719312.0,
+            "min": 66719312,
+            "max": 66719312
+          }
+        },
+        "after": {
+          "write_sync_seconds": {
+            "median": 0.790140912,
+            "min": 0.771691191,
+            "max": 0.831857538
+          },
+          "write_seconds": {
+            "median": 0.7900574380000001,
+            "min": 0.771605823,
+            "max": 0.831769177
+          },
+          "sync_seconds": {
+            "median": 8.5747e-05,
+            "min": 6.9715e-05,
+            "max": 9.7233e-05
+          },
+          "close_seconds": {
+            "median": 0.0150288195,
+            "min": 0.014877658,
+            "max": 0.017666633
+          },
+          "body_seconds": {
+            "median": 0.357945918,
+            "min": 0.346864376,
+            "max": 0.379935553
+          },
+          "admission_seconds": {
+            "median": 0.007232684,
+            "min": 0.007180712,
+            "max": 0.008088923
+          },
+          "commit_seconds": {
+            "median": 0.4021740065,
+            "min": 0.396846928,
+            "max": 0.422682432
+          },
+          "sql_steps": {
+            "median": 10496.0,
+            "min": 10496,
+            "max": 10496
+          },
+          "wal_write_bytes": {
+            "median": 354859880.0,
+            "min": 354859880,
+            "max": 354859880
+          },
+          "max_sampled_wal_bytes": {
+            "median": 66719312.0,
+            "min": 66719312,
+            "max": 66719312
+          }
+        }
+      },
+      "samples": [
+        {
+          "variant": "before",
+          "repetition": 0,
+          "started_epoch": 1791276117.237422,
+          "finished_epoch": 1791276118.9598908,
+          "load": [
+            2.57568359375,
+            2.6650390625,
+            2.169921875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "d46825d28f63cbec74c418755a8953b6736ef8869236b1650f8b0737b094439d",
+          "write_seconds": 1.278079173,
+          "sync_seconds": 9.9533e-05,
+          "close_seconds": 0.015016786,
+          "write_sync_seconds": 1.278178706,
+          "all_phases_seconds": 1.52860776,
+          "body_seconds": 0.850209665,
+          "admission_seconds": 0.007026935,
+          "commit_seconds": 0.401532064,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 281,
+          "worker_wal_sync_seconds": 0.000487972,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 0,
+          "started_epoch": 1791276120.0344913,
+          "finished_epoch": 1791276121.2427716,
+          "load": [
+            2.529296875,
+            2.65380859375,
+            2.1689453125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "aebb47c8f9096e338ba85c3973cfbaa586f4b5527d3cc344d5ba97ef6905fb89",
+          "write_seconds": 0.783113483,
+          "sync_seconds": 9.7233e-05,
+          "close_seconds": 0.014984587,
+          "write_sync_seconds": 0.783210716,
+          "all_phases_seconds": 1.040092434,
+          "body_seconds": 0.355511196,
+          "admission_seconds": 0.007225856,
+          "commit_seconds": 0.400135,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 222,
+          "worker_wal_sync_seconds": 0.000319677,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 1,
+          "started_epoch": 1791276122.282711,
+          "finished_epoch": 1791276123.466617,
+          "load": [
+            2.529296875,
+            2.65380859375,
+            2.1689453125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "69ccb6abb9ed3ffad59c3efa264186b2af61a8628a2ef960d06113d9955d7e90",
+          "write_seconds": 0.772079912,
+          "sync_seconds": 8.6126e-05,
+          "close_seconds": 0.014877658,
+          "write_sync_seconds": 0.772166038,
+          "all_phases_seconds": 1.017674633,
+          "body_seconds": 0.346864376,
+          "admission_seconds": 0.007239512,
+          "commit_seconds": 0.398227077,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 231,
+          "worker_wal_sync_seconds": 0.000309165,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 1,
+          "started_epoch": 1791276124.5298402,
+          "finished_epoch": 1791276126.1880083,
+          "load": [
+            2.40673828125,
+            2.6259765625,
+            2.16259765625
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "8ba535c614da5210956e4b995d700a820f3dabc01c399a1c98bebe84d9c351a2",
+          "write_seconds": 1.237837391,
+          "sync_seconds": 7.3231e-05,
+          "close_seconds": 0.014896852,
+          "write_sync_seconds": 1.237910622,
+          "all_phases_seconds": 1.483772309,
+          "body_seconds": 0.819304373,
+          "admission_seconds": 0.007260113,
+          "commit_seconds": 0.392650749,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 275,
+          "worker_wal_sync_seconds": 0.000494776,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 2,
+          "started_epoch": 1791276127.2503524,
+          "finished_epoch": 1791276128.9876761,
+          "load": [
+            2.40673828125,
+            2.6259765625,
+            2.16259765625
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "0de412570d9688a10d89afadc100c2019dd9184e0a16fce5fc73d244bba7cb65",
+          "write_seconds": 1.28670258,
+          "sync_seconds": 7.7741e-05,
+          "close_seconds": 0.015869191,
+          "write_sync_seconds": 1.286780321,
+          "all_phases_seconds": 1.539719504,
+          "body_seconds": 0.856674894,
+          "admission_seconds": 0.007243023,
+          "commit_seconds": 0.403864921,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 266,
+          "worker_wal_sync_seconds": 0.000516483,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 2,
+          "started_epoch": 1791276130.0630503,
+          "finished_epoch": 1791276131.2815304,
+          "load": [
+            2.45458984375,
+            2.63232421875,
+            2.16748046875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "54b310ac299974939e834d3c9b33f3488e94910008891036fc6983ec1cf25ce9",
+          "write_seconds": 0.771605823,
+          "sync_seconds": 8.5368e-05,
+          "close_seconds": 0.015216728,
+          "write_sync_seconds": 0.771691191,
+          "all_phases_seconds": 1.027214574,
+          "body_seconds": 0.347703925,
+          "admission_seconds": 0.00718126,
+          "commit_seconds": 0.396846928,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 231,
+          "worker_wal_sync_seconds": 0.00031612,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 3,
+          "started_epoch": 1791276132.3632479,
+          "finished_epoch": 1791276133.6058183,
+          "load": [
+            2.45458984375,
+            2.63232421875,
+            2.16748046875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "98674a325be790dc2e7a569938126b306a742d80c0394fa8dab9d6d4fde2fecd",
+          "write_seconds": 0.797001393,
+          "sync_seconds": 6.9715e-05,
+          "close_seconds": 0.015073052,
+          "write_sync_seconds": 0.7970711079999999,
+          "all_phases_seconds": 1.051006914,
+          "body_seconds": 0.365625848,
+          "admission_seconds": 0.007180712,
+          "commit_seconds": 0.404213013,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 235,
+          "worker_wal_sync_seconds": 0.000319818,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 3,
+          "started_epoch": 1791276134.6538177,
+          "finished_epoch": 1791276136.3910322,
+          "load": [
+            2.337890625,
+            2.60498046875,
+            2.1611328125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "dc78cc095d4553b712eabf41cf9ac45cf9ac7a3f9aae0cb851e997ea9254ecf9",
+          "write_seconds": 1.301886271,
+          "sync_seconds": 7.4676e-05,
+          "close_seconds": 0.014885764,
+          "write_sync_seconds": 1.3019609470000002,
+          "all_phases_seconds": 1.5454168190000002,
+          "body_seconds": 0.881706066,
+          "admission_seconds": 0.007485901,
+          "commit_seconds": 0.393033001,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 283,
+          "worker_wal_sync_seconds": 0.000530365,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 4,
+          "started_epoch": 1791276137.4364696,
+          "finished_epoch": 1791276139.1155531,
+          "load": [
+            2.337890625,
+            2.60498046875,
+            2.1611328125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "d88fc8b07159732905dbbac785a1fe73bb028d54a4ddea259970f6169df72766",
+          "write_seconds": 1.262080613,
+          "sync_seconds": 7.6917e-05,
+          "close_seconds": 0.015653584,
+          "write_sync_seconds": 1.2621575299999999,
+          "all_phases_seconds": 1.512134184,
+          "body_seconds": 0.838035948,
+          "admission_seconds": 0.007295595,
+          "commit_seconds": 0.397438662,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 278,
+          "worker_wal_sync_seconds": 0.000488758,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 4,
+          "started_epoch": 1791276140.1620688,
+          "finished_epoch": 1791276141.3782804,
+          "load": [
+            2.23046875,
+            2.578125,
+            2.15478515625
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "e3f67aeb54e1a1f6b46bc7060ba0876112cbe0c632237b7a42fd33785e13ba0f",
+          "write_seconds": 0.800323603,
+          "sync_seconds": 7.31e-05,
+          "close_seconds": 0.014967966,
+          "write_sync_seconds": 0.8003967030000001,
+          "all_phases_seconds": 1.050920976,
+          "body_seconds": 0.36038064,
+          "admission_seconds": 0.007359448,
+          "commit_seconds": 0.412400971,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 237,
+          "worker_wal_sync_seconds": 0.000341922,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 5,
+          "started_epoch": 1791276142.4761295,
+          "finished_epoch": 1791276143.7338352,
+          "load": [
+            2.23046875,
+            2.578125,
+            2.15478515625
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "f2f279f9d1f62797a822ad96e0e72bf70b18a50f26a0ccb8995192fdfe33df67",
+          "write_seconds": 0.831769177,
+          "sync_seconds": 8.8361e-05,
+          "close_seconds": 0.017666633,
+          "write_sync_seconds": 0.831857538,
+          "all_phases_seconds": 1.092885895,
+          "body_seconds": 0.379935553,
+          "admission_seconds": 0.008088923,
+          "commit_seconds": 0.422682432,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 229,
+          "worker_wal_sync_seconds": 0.000321256,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 5,
+          "started_epoch": 1791276144.78618,
+          "finished_epoch": 1791276146.5156844,
+          "load": [
+            2.29248046875,
+            2.58544921875,
+            2.15966796875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "d608323214bcc5169c51430dde2a150605961b3ed766250a858ae7866f3ca17c",
+          "write_seconds": 1.284125316,
+          "sync_seconds": 7.5115e-05,
+          "close_seconds": 0.015536776,
+          "write_sync_seconds": 1.284200431,
+          "all_phases_seconds": 1.538724937,
+          "body_seconds": 0.853751519,
+          "admission_seconds": 0.007409598,
+          "commit_seconds": 0.403251068,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 280,
+          "worker_wal_sync_seconds": 0.000519723,
+          "max_sampled_wal_bytes": 66719312
+        }
+      ],
+      "cleanup": [
+        {
+          "path": "/dev/shm/vane-bulk-owned-vkep7bwi",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-vkep7bwi/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-vkep7bwi/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-vkep7bwi/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "8e82a6a5d237a1f6eef5b1b948e802387212e3696146cb915bc35c74acbad5df"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-tog9hqa0",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-tog9hqa0/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-tog9hqa0/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-tog9hqa0/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "c411c460fd780f558c2b141fbe2a611af765e0db4d112e0255ce8d26379ba9bf"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-cbyescuk",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-cbyescuk/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-cbyescuk/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-cbyescuk/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "ef3ed23aad97a18b0099bb00d4302421f86615ea2ce788da8a390c376233a03a"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-sia95hcf",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-sia95hcf/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-sia95hcf/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-sia95hcf/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "f3fafe66aaa7f62c06a50c5494bee758ff0db43d7d895bb71d87524a1c0442ea"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-ll7oaa39",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-ll7oaa39/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-ll7oaa39/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-ll7oaa39/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "8be03d6ee09aff71cf6c014976621b7b588e21af3752ab40846a1a3d7e8b3449"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-fnyf3r5d",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-fnyf3r5d/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-fnyf3r5d/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-fnyf3r5d/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "43752f7c946a3e5ef1f3766e0fc294db4caa35f8862537b8e48631681d04324b"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-7lk52wu5",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-7lk52wu5/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-7lk52wu5/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-7lk52wu5/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "cd37c6a80925a04d902db7be1ea83d54b4c40aad2d64ec51698fdc338d73c13d"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-9g2g3l1m",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-9g2g3l1m/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-9g2g3l1m/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-9g2g3l1m/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "257f8b8f7417e0337346ce1babbab797cfad731bf18a5f2a6f541331eead3f9a"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-q4ek_cv1",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-q4ek_cv1/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-q4ek_cv1/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-q4ek_cv1/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "69df6f2238656f698516531a81a23850ac40b37091cb330d51b316e6a4df2fc5"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-o6w7ita3",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-o6w7ita3/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-o6w7ita3/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-o6w7ita3/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "6fd795210e85d397524e29ccf1574f9f011c9835b4c12b12f01cfe789a53da96"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-uihcgdzj",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-uihcgdzj/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-uihcgdzj/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-uihcgdzj/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "94b903375bbeacd31c058a8ff85a48ce0c579b83555bc47d9b9d55d7cbb14e1a"
+            }
+          ]
+        },
+        {
+          "path": "/dev/shm/vane-bulk-owned-tz9gthd_",
+          "removed": true,
+          "files": [
+            {
+              "path": "/dev/shm/vane-bulk-owned-tz9gthd_/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-tz9gthd_/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            {
+              "path": "/dev/shm/vane-bulk-owned-tz9gthd_/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "7afa48b479a60ed97fd212e8aec82ad5210ba4a4465a1269a70b12d3670206ee"
+            }
+          ]
+        }
+      ]
+    },
+    "ext4": {
+      "scope": "Instrumented native 256 MiB write+fsync with split FUSE-size requests. tmpfs isolates SQL/CPU costs and is not a physical durability benchmark.",
+      "storage": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z",
+      "summary": {
+        "before": {
+          "write_sync_seconds": {
+            "median": 2.794369008,
+            "min": 2.731558384,
+            "max": 7.829338271
+          },
+          "write_seconds": {
+            "median": 2.74311441,
+            "min": 2.683335829,
+            "max": 7.79437662
+          },
+          "sync_seconds": {
+            "median": 0.038043619,
+            "min": 0.03439084,
+            "max": 0.064646038
+          },
+          "close_seconds": {
+            "median": 0.060701183,
+            "min": 0.05443519,
+            "max": 1.111287442
+          },
+          "body_seconds": {
+            "median": 0.8729471615,
+            "min": 0.837149136,
+            "max": 0.955327771
+          },
+          "admission_seconds": {
+            "median": 1.316945445,
+            "min": 1.211448617,
+            "max": 6.240629424
+          },
+          "commit_seconds": {
+            "median": 0.5406085414999999,
+            "min": 0.502805699,
+            "max": 0.579468984
+          },
+          "sql_steps": {
+            "median": 270336.0,
+            "min": 270336,
+            "max": 270336
+          },
+          "wal_write_bytes": {
+            "median": 354859880.0,
+            "min": 354859880,
+            "max": 354859880
+          },
+          "max_sampled_wal_bytes": {
+            "median": 66719312.0,
+            "min": 66719312,
+            "max": 66719312
+          }
+        },
+        "after": {
+          "write_sync_seconds": {
+            "median": 2.6748385545,
+            "min": 2.556173967,
+            "max": 7.395542156
+          },
+          "write_seconds": {
+            "median": 2.6364018805000002,
+            "min": 2.521777352,
+            "max": 7.361019704
+          },
+          "sync_seconds": {
+            "median": 0.034706732500000004,
+            "min": 0.034200877,
+            "max": 0.041982335
+          },
+          "close_seconds": {
+            "median": 0.0579191585,
+            "min": 0.056841622,
+            "max": 0.091098048
+          },
+          "body_seconds": {
+            "median": 0.433565684,
+            "min": 0.391436319,
+            "max": 0.462152462
+          },
+          "admission_seconds": {
+            "median": 1.6167942155000001,
+            "min": 1.45504647,
+            "max": 6.231731736
+          },
+          "commit_seconds": {
+            "median": 0.6168874934999999,
+            "min": 0.556757716,
+            "max": 0.64017237
+          },
+          "sql_steps": {
+            "median": 10496.0,
+            "min": 10496,
+            "max": 10496
+          },
+          "wal_write_bytes": {
+            "median": 354859880.0,
+            "min": 354859880,
+            "max": 354859880
+          },
+          "max_sampled_wal_bytes": {
+            "median": 66719312.0,
+            "min": 66719312,
+            "max": 66719312
+          }
+        }
+      },
+      "samples": [
+        {
+          "variant": "before",
+          "repetition": 0,
+          "started_epoch": 1791276158.492696,
+          "finished_epoch": 1791276161.7766342,
+          "load": [
+            2.39404296875,
+            2.5908203125,
+            2.16845703125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "18810f6be7950bdcfc301486fac67b069a4381c8b5a2aeb6ddfa2cc48e3ad61e",
+          "write_seconds": 2.736945801,
+          "sync_seconds": 0.035112723,
+          "close_seconds": 0.05443519,
+          "write_sync_seconds": 2.772058524,
+          "all_phases_seconds": 3.08042452,
+          "body_seconds": 0.87217813,
+          "admission_seconds": 1.309803214,
+          "commit_seconds": 0.534251609,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 18,
+          "worker_wal_sync_seconds": 0.855064469,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 0,
+          "started_epoch": 1791276162.876542,
+          "finished_epoch": 1791276166.0110679,
+          "load": [
+            2.3623046875,
+            2.58056640625,
+            2.16748046875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "c5becf98691b009db917185297dc9b2b36ba4116c61c0f9230475c3f1daa42b6",
+          "write_seconds": 2.548521005,
+          "sync_seconds": 0.034891013,
+          "close_seconds": 0.057208026,
+          "write_sync_seconds": 2.583412018,
+          "all_phases_seconds": 2.952262464,
+          "body_seconds": 0.391436319,
+          "admission_seconds": 1.577103859,
+          "commit_seconds": 0.556757716,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 15,
+          "worker_wal_sync_seconds": 0.802554687,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 1,
+          "started_epoch": 1791276167.0652313,
+          "finished_epoch": 1791276170.208422,
+          "load": [
+            2.81396484375,
+            2.6708984375,
+            2.19921875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "cb0708e11a5d43d35d8019e311ad338894bc67859d42f3ecaa4627a29e71b68a",
+          "write_seconds": 2.537773049,
+          "sync_seconds": 0.034200877,
+          "close_seconds": 0.091098048,
+          "write_sync_seconds": 2.571973926,
+          "all_phases_seconds": 2.9594391950000003,
+          "body_seconds": 0.438470197,
+          "admission_seconds": 1.45504647,
+          "commit_seconds": 0.619275304,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 15,
+          "worker_wal_sync_seconds": 0.835740904,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 1,
+          "started_epoch": 1791276171.2768207,
+          "finished_epoch": 1791276174.6273155,
+          "load": [
+            2.8291015625,
+            2.6767578125,
+            2.20361328125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "c584d9adc547e97bfb3624baaf2a2c3854d39c496817d98833e9dc1bf74a236e",
+          "write_seconds": 2.749283019,
+          "sync_seconds": 0.064646038,
+          "close_seconds": 0.063820397,
+          "write_sync_seconds": 2.8139290569999997,
+          "all_phases_seconds": 3.154755054,
+          "body_seconds": 0.955327771,
+          "admission_seconds": 1.211448617,
+          "commit_seconds": 0.560904951,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 20,
+          "worker_wal_sync_seconds": 0.833694905,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 2,
+          "started_epoch": 1791276175.6935763,
+          "finished_epoch": 1791276184.415095,
+          "load": [
+            3.150390625,
+            2.7529296875,
+            2.23388671875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "63523b3cc3faf62dc87672d03bee5df725fd65853f1c887ebe949bf1fd39a223",
+          "write_seconds": 7.79437662,
+          "sync_seconds": 0.034961651,
+          "close_seconds": 0.057581969,
+          "write_sync_seconds": 7.829338271,
+          "all_phases_seconds": 8.519844791,
+          "body_seconds": 0.951613211,
+          "admission_seconds": 6.240629424,
+          "commit_seconds": 0.579468984,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 18,
+          "worker_wal_sync_seconds": 4.508291327,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 2,
+          "started_epoch": 1791276185.5193243,
+          "finished_epoch": 1791276188.860136,
+          "load": [
+            3.150390625,
+            2.7529296875,
+            2.23388671875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "69070c23869efc6b75e9e7b7c317b0c6669b1728d0a102a049c1b689e3da8024",
+          "write_seconds": 2.724282756,
+          "sync_seconds": 0.041982335,
+          "close_seconds": 0.060380482,
+          "write_sync_seconds": 2.766265091,
+          "all_phases_seconds": 3.13592481,
+          "body_seconds": 0.428661171,
+          "admission_seconds": 1.656484572,
+          "commit_seconds": 0.614499683,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 15,
+          "worker_wal_sync_seconds": 0.915138447,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 3,
+          "started_epoch": 1791276189.9786363,
+          "finished_epoch": 1791276198.3583832,
+          "load": [
+            3.30029296875,
+            2.794921875,
+            2.2529296875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "6cbc545a86939da4ddb7b4744ad33db7c75380073cc4cf7c1cf406080dd5c4bc",
+          "write_seconds": 7.361019704,
+          "sync_seconds": 0.034522452,
+          "close_seconds": 0.057257,
+          "write_sync_seconds": 7.395542156,
+          "all_phases_seconds": 8.179282966,
+          "body_seconds": 0.462152462,
+          "admission_seconds": 6.231731736,
+          "commit_seconds": 0.64017237,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 14,
+          "worker_wal_sync_seconds": 4.424508406,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 3,
+          "started_epoch": 1791276199.4705129,
+          "finished_epoch": 1791276203.0345871,
+          "load": [
+            3.11572265625,
+            2.7646484375,
+            2.24609375
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "23f4d55d69db42b285418d4a1d810da7f98f6c03ecb3d4321ffc70c636cc70e2",
+          "write_seconds": 3.013857433,
+          "sync_seconds": 0.03439084,
+          "close_seconds": 0.056596496,
+          "write_sync_seconds": 3.048248273,
+          "all_phases_seconds": 3.363033655,
+          "body_seconds": 0.869918264,
+          "admission_seconds": 1.581864275,
+          "commit_seconds": 0.541760515,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 19,
+          "worker_wal_sync_seconds": 0.813906078,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 4,
+          "started_epoch": 1791276204.1198778,
+          "finished_epoch": 1791276208.4489222,
+          "load": [
+            3.1064453125,
+            2.76904296875,
+            2.25048828125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "49c72c4c83b4b65dab5262d9c1d7033686c8414bfb36d99c81d252ac8b4b555c",
+          "write_seconds": 2.733834444,
+          "sync_seconds": 0.040974515,
+          "close_seconds": 1.111287442,
+          "write_sync_seconds": 2.774808959,
+          "all_phases_seconds": 4.156944677,
+          "body_seconds": 0.873716193,
+          "admission_seconds": 1.300303755,
+          "commit_seconds": 0.539456568,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 19,
+          "worker_wal_sync_seconds": 0.870828682,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 4,
+          "started_epoch": 1791276209.5116022,
+          "finished_epoch": 1791276217.0197835,
+          "load": [
+            3.45849609375,
+            2.8583984375,
+            2.28564453125
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "89763cfbad4849a857e627a770ef06c60fbb4c24bc5ff68dd797f2e975272fb7",
+          "write_seconds": 6.492985345,
+          "sync_seconds": 0.035455643,
+          "close_seconds": 0.056841622,
+          "write_sync_seconds": 6.528440988,
+          "all_phases_seconds": 7.333732562,
+          "body_seconds": 0.451985793,
+          "admission_seconds": 5.377694373,
+          "commit_seconds": 0.637293024,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 14,
+          "worker_wal_sync_seconds": 4.560421598,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "after",
+          "repetition": 5,
+          "started_epoch": 1791276218.0838687,
+          "finished_epoch": 1791276221.1927974,
+          "load": [
+            3.34130859375,
+            2.84375,
+            2.28369140625
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "d28d7659cbae4ed845ffc602164a9cc69c5e67db8c3bd28ac8a670e35ab50d0e",
+          "write_seconds": 2.521777352,
+          "sync_seconds": 0.034396615,
+          "close_seconds": 0.058581317,
+          "write_sync_seconds": 2.556173967,
+          "all_phases_seconds": 2.905750869,
+          "body_seconds": 0.414797171,
+          "admission_seconds": 1.492990351,
+          "commit_seconds": 0.590416293,
+          "sql_steps": 10496,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 15,
+          "worker_wal_sync_seconds": 0.819855853,
+          "max_sampled_wal_bytes": 66719312
+        },
+        {
+          "variant": "before",
+          "repetition": 5,
+          "started_epoch": 1791276222.2917783,
+          "finished_epoch": 1791276225.529011,
+          "load": [
+            3.39453125,
+            2.86328125,
+            2.29296875
+          ],
+          "validated_bytes": 268435456,
+          "quick_check": [
+            [
+              "ok"
+            ]
+          ],
+          "log_sha256": "77d9439ef1ad5ff3f51e15ebe6cb083c79071891e5d9a3196a3d0413434a3453",
+          "write_seconds": 2.683335829,
+          "sync_seconds": 0.048222555,
+          "close_seconds": 0.06908667,
+          "write_sync_seconds": 2.731558384,
+          "all_phases_seconds": 3.068509872,
+          "body_seconds": 0.837149136,
+          "admission_seconds": 1.324087676,
+          "commit_seconds": 0.502805699,
+          "sql_steps": 270336,
+          "write_commits": 512,
+          "wal_write_bytes": 354859880,
+          "worker_wal_sync_calls": 16,
+          "worker_wal_sync_seconds": 0.888031645,
+          "max_sampled_wal_bytes": 66719312
+        }
+      ],
+      "cleanup": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-_qf05iag",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-_qf05iag/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-_qf05iag/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "617ac8fb0d1acd5106c045b4934b94b53c6c0ae32c4ea30e333a2f7ce5b9cec2"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-_qf05iag/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-683t9k_1",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-683t9k_1/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-683t9k_1/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "da99fcda29f2a049c66a0f104108afede367d34f2682a87fd3fca33f1d922192"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-683t9k_1/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-4wfwwrv7",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-4wfwwrv7/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-4wfwwrv7/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "732065ce8d480b9b5738b6611800e723d781d0feb300f457d6257e0346ed3b10"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-4wfwwrv7/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-v_hvwd44",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-v_hvwd44/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-v_hvwd44/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "720ad3f3b94bf59871dfa18fc2032ff4a6b47f298d356a512d78c6ab11b936e2"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-v_hvwd44/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-iykij1jq",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-iykij1jq/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-iykij1jq/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "e52f42a585e50a5259a5bfefee813e6fd7a9435c38b4d827fed869e0f5a6fa72"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-iykij1jq/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-a3f8cdhv",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-a3f8cdhv/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-a3f8cdhv/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "bf38046e9dd1d29785c922a649bd28a3e7c4bdc1270b0ce02cb737ea4f9edb82"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-a3f8cdhv/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-fvdwyxqy",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-fvdwyxqy/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-fvdwyxqy/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "0eabe638283da4fe9623b1bbbc2da0f1dea6fc88b7847e4d38ea6752586b314f"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-fvdwyxqy/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-ro9idhst",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-ro9idhst/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-ro9idhst/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "c57023d3609a156ca62163f68c4fa81b4e210618e929ac80770a2eccfa02a702"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-ro9idhst/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-5pp59t7m",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-5pp59t7m/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-5pp59t7m/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "1774025ba72992bacd4c614852229f04f2f7148b6d7f41ad68cec44bbe2198da"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-5pp59t7m/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-gep8pbek",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-gep8pbek/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-gep8pbek/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "a6abab8e1a3754bbd4c161ffc0062a9763921c05cace28b706dd1a97caeae37e"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-gep8pbek/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-oy2h1gni",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-oy2h1gni/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-oy2h1gni/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "d0a26b296a293f74b8adfc15536617798851332d406b999a75aaff6e62553a1a"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-oy2h1gni/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-3kmai879",
+          "removed": true,
+          "files": [
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-3kmai879/workspace.sqlite-shm",
+              "bytes": 32768,
+              "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-3kmai879/workspace.sqlite",
+              "bytes": 321044480,
+              "sha256": "9a1faccc11fafdac20a33be1bf8c14bca431877611f541458b55981257541998"
+            },
+            {
+              "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/vane-bulk-owned-3kmai879/workspace.sqlite-wal",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "fuse": {
+    "config": {
+      "rounds": 6,
+      "mib": 256,
+      "application_write_bytes": 1048576,
+      "durability": "fsync",
+      "worker_start_mib": 16,
+      "admission_mib": 64,
+      "retained_wal_mib": 16,
+      "global_drop_caches": false,
+      "fuse": "live direct_io with writeback disabled; unchanged production mount adapter"
+    },
+    "summary": {
+      "before": {
+        "seconds": {
+          "median": 3.718485919991508,
+          "min": 2.9253452839911915,
+          "max": 5.362645231012721
+        },
+        "mib_per_second": {
+          "median": 71.87963183127096,
+          "min": 47.73763487458131,
+          "max": 87.51103721018761
+        },
+        "fsync_seconds": {
+          "median": 0.037080092006362975,
+          "min": 0.034648012020625174,
+          "max": 0.06502578500658274
+        },
+        "close_seconds": {
+          "median": 0.00012419649283401668,
+          "min": 0.0001035790191963315,
+          "max": 0.00015949102817103267
+        },
+        "unmount_seconds": {
+          "median": 0.11761013200157322,
+          "min": 0.06746353500057012,
+          "max": 0.9698902310337871
+        }
+      },
+      "after": {
+        "seconds": {
+          "median": 3.866582912974991,
+          "min": 2.695879613980651,
+          "max": 14.895101066038478
+        },
+        "mib_per_second": {
+          "median": 71.25849235409008,
+          "min": 17.18685887829871,
+          "max": 94.95972990500064
+        },
+        "fsync_seconds": {
+          "median": 0.03591392299858853,
+          "min": 0.03427727200323716,
+          "max": 0.05057700100587681
+        },
+        "close_seconds": {
+          "median": 0.00010861697955988348,
+          "min": 8.362199878320098e-05,
+          "max": 0.000144232006277889
+        },
+        "unmount_seconds": {
+          "median": 0.4933297534880694,
+          "min": 0.11721329001011327,
+          "max": 0.9691115460009314
+        }
+      }
+    },
+    "samples": [
+      {
+        "variant": "before",
+        "repetition": 0,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276247.9607997,
+        "load_before": [
+          2.56005859375,
+          2.70849609375,
+          2.25341796875
+        ],
+        "seconds": 2.9253452839911915,
+        "mib_per_second": 87.51103721018761,
+        "fsync_seconds": 0.06502578500658274,
+        "close_seconds": 0.00011942500714212656,
+        "ended_epoch": 1791276250.886163,
+        "load_after": [
+          2.595703125,
+          2.71337890625,
+          2.2578125
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.06746353500057012,
+        "process_returncode": 0,
+        "log_sha256": "9f46d28c2c1b37f712e57b66fa496f17927696bce98e27968e7917e4545d6ef9",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.835265814268496,
+        "max_write_seconds": 0.25147924601333216,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 0,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276254.4096673,
+        "load_before": [
+          2.3876953125,
+          2.66796875,
+          2.24560546875
+        ],
+        "seconds": 2.8372362649533898,
+        "mib_per_second": 90.22865073388789,
+        "fsync_seconds": 0.05057700100587681,
+        "close_seconds": 0.000144232006277889,
+        "ended_epoch": 1791276257.2469225,
+        "load_after": [
+          2.3876953125,
+          2.66796875,
+          2.24560546875
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.8693872360163368,
+        "process_returncode": 0,
+        "log_sha256": "5e28d5f74b0bd195fccd77a7b0be3e85ae7280d18dde1288de47367b37cb69d2",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.7611471943673678,
+        "max_write_seconds": 0.34449831099482253,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 1,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276262.1824322,
+        "load_before": [
+          2.67724609375,
+          2.7236328125,
+          2.26611328125
+        ],
+        "seconds": 4.895929560996592,
+        "mib_per_second": 52.28833397429228,
+        "fsync_seconds": 0.037589229992590845,
+        "close_seconds": 8.362199878320098e-05,
+        "ended_epoch": 1791276267.0783768,
+        "load_after": [
+          2.703125,
+          2.728515625,
+          2.2705078125
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.11789934698026627,
+        "process_returncode": 0,
+        "log_sha256": "9deeee4fe2b21ce37c9c1e5773502c85d345e1ae30f8235b12342a0ea5dbe320",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 4.833852530806325,
+        "max_write_seconds": 2.456920603988692,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "before",
+        "repetition": 1,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276270.867693,
+        "load_before": [
+          2.56640625,
+          2.69970703125,
+          2.263671875
+        ],
+        "seconds": 2.932093381008599,
+        "mib_per_second": 87.30963401716066,
+        "fsync_seconds": 0.04692772898124531,
+        "close_seconds": 0.00015949102817103267,
+        "ended_epoch": 1791276273.799803,
+        "load_after": [
+          2.56640625,
+          2.69970703125,
+          2.263671875
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.9698902310337871,
+        "process_returncode": 0,
+        "log_sha256": "afe8e3d2309c7ea3b528731ab359eab7a2d0c13751c734f9b49fe31b41b864fd",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.8598756385035813,
+        "max_write_seconds": 0.24883169500390068,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "before",
+        "repetition": 2,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276278.9396775,
+        "load_before": [
+          2.44091796875,
+          2.67138671875,
+          2.2568359375
+        ],
+        "seconds": 4.8687960029928945,
+        "mib_per_second": 52.579734259277735,
+        "fsync_seconds": 0.034648012020625174,
+        "close_seconds": 0.0001289679785259068,
+        "ended_epoch": 1791276283.8084931,
+        "load_after": [
+          2.48583984375,
+          2.67724609375,
+          2.26123046875
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.11745535797672346,
+        "process_returncode": 0,
+        "log_sha256": "cf973ecb99b120d7535d603d6388b62197c0838e8e4610c6acf9ba8912767846",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 4.810058815404773,
+        "max_write_seconds": 2.207466088992078,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 2,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276287.5960295,
+        "load_before": [
+          2.44677734375,
+          2.66552734375,
+          2.259765625
+        ],
+        "seconds": 2.761751529003959,
+        "mib_per_second": 92.6947979611793,
+        "fsync_seconds": 0.03471381199778989,
+        "close_seconds": 0.00012614199658855796,
+        "ended_epoch": 1791276290.3577962,
+        "load_after": [
+          2.41064453125,
+          2.654296875,
+          2.25830078125
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.8687601599958725,
+        "process_returncode": 0,
+        "log_sha256": "b668ce9058849ded1b69df32e6e6f1abfc68c007723d43175e8f3cbade6b5320",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.703015006845817,
+        "max_write_seconds": 0.3177177300094627,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 3,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276295.1740797,
+        "load_before": [
+          2.37744140625,
+          2.64306640625,
+          2.2568359375
+        ],
+        "seconds": 11.628467766975518,
+        "mib_per_second": 22.0149382644403,
+        "fsync_seconds": 0.037114033999387175,
+        "close_seconds": 8.992798393592238e-05,
+        "ended_epoch": 1791276306.8025637,
+        "load_after": [
+          2.7265625,
+          2.70556640625,
+          2.28125
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.1173867069883272,
+        "process_returncode": 0,
+        "log_sha256": "9b88db41ff68dde35d8334c023a180202f69472cd1b7143eedb6277fb1020fdf",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 11.567507504951209,
+        "max_write_seconds": 6.278904815961141,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "before",
+        "repetition": 3,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276310.3348238,
+        "load_before": [
+          3.22900390625,
+          2.810546875,
+          2.3173828125
+        ],
+        "seconds": 2.95447402598802,
+        "mib_per_second": 86.64824863856767,
+        "fsync_seconds": 0.035247557039838284,
+        "close_seconds": 0.00010974996257573366,
+        "ended_epoch": 1791276313.2893162,
+        "load_after": [
+          3.22900390625,
+          2.810546875,
+          2.3173828125
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.9696698049665429,
+        "process_returncode": 0,
+        "log_sha256": "f187450280c3a6e745a2e77c9baa6443e29f7c50c789d51fb31eddd88ca0088e",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.894569356518332,
+        "max_write_seconds": 0.2832350099924952,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "before",
+        "repetition": 4,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276318.7984872,
+        "load_before": [
+          3.21044921875,
+          2.81396484375,
+          2.3212890625
+        ],
+        "seconds": 4.482497813994996,
+        "mib_per_second": 57.11101502397426,
+        "fsync_seconds": 0.035112540994305164,
+        "close_seconds": 0.00013615499483421445,
+        "ended_epoch": 1791276323.2810018,
+        "load_after": [
+          3.11328125,
+          2.80029296875,
+          2.3193359375
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.11776490602642298,
+        "process_returncode": 0,
+        "log_sha256": "7cb127d3480af3f2e92d33ec139a9dced43b2a357ba61f189ba5b35f94f5d976",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 4.423027089156676,
+        "max_write_seconds": 1.808255130017642,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 4,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276327.0670733,
+        "load_before": [
+          2.94384765625,
+          2.77001953125,
+          2.31201171875
+        ],
+        "seconds": 14.895101066038478,
+        "mib_per_second": 17.18685887829871,
+        "fsync_seconds": 0.03427727200323716,
+        "close_seconds": 0.00010146497515961528,
+        "ended_epoch": 1791276341.9621906,
+        "load_after": [
+          2.95703125,
+          2.78173828125,
+          2.32373046875
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.11721329001011327,
+        "process_returncode": 0,
+        "log_sha256": "1b56bf407c6273fc1dd1f8bcbb5ac47e420b27461f62a4ddc266cb2cb06fdfe7",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 14.837864109722432,
+        "max_write_seconds": 6.497630308032967,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "after",
+        "repetition": 5,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/after-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276345.6497111,
+        "load_before": [
+          2.9609375,
+          2.78564453125,
+          2.32763671875
+        ],
+        "seconds": 2.695879613980651,
+        "mib_per_second": 94.95972990500064,
+        "fsync_seconds": 0.034641991020180285,
+        "close_seconds": 0.00011576898396015167,
+        "ended_epoch": 1791276348.3456073,
+        "load_after": [
+          2.9609375,
+          2.78564453125,
+          2.32763671875
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.9691115460009314,
+        "process_returncode": 0,
+        "log_sha256": "e38c24c7fa69ee46e8db89d5ec9cb1008be778ca4c80f41bb42b700b4e807798",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 2.637727367808111,
+        "max_write_seconds": 0.29786306695314124,
+        "max_sampled_wal_bytes": 66719312
+      },
+      {
+        "variant": "before",
+        "repetition": 5,
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/before-mount",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m/workspace.sqlite",
+          "--branch",
+          "main",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m/mount",
+          "--durability=fsync"
+        ],
+        "started_epoch": 1791276353.3780196,
+        "load_before": [
+          2.8037109375,
+          2.755859375,
+          2.3203125
+        ],
+        "seconds": 5.362645231012721,
+        "mib_per_second": 47.73763487458131,
+        "fsync_seconds": 0.038912626972887665,
+        "close_seconds": 0.0001035790191963315,
+        "ended_epoch": 1791276358.7406797,
+        "load_after": [
+          2.89990234375,
+          2.77685546875,
+          2.32958984375
+        ],
+        "validation": {
+          "bytes": 268435456,
+          "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+        },
+        "unmount_seconds": 0.11712009401526302,
+        "process_returncode": 0,
+        "log_sha256": "8c5a933f7139671b083a83ba7cb582879a38236556b60373c93d824f73f47061",
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "block_payload_rows": 65792,
+        "block_version_rows": 65536,
+        "write_seconds": 5.2992139143752865,
+        "max_write_seconds": 2.7356414729729295,
+        "max_sampled_wal_bytes": 66719312
+      }
+    ],
+    "cleanup": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "e3c8c15194374d3912c004b61598a12e16a9cf9a79619623b4149d1970deb167"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2zgah3sq/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1629589,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "200765b93838e46165f2da2a927dd39b3e9f5948c3104714a0b863fe4b505314"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-zcm_r65p/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1629803,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "125917fbef9413472af2d3c908db19f4866236da5f10dec7d0c60512110f3310"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-g_iwl9yg/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1629931,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "26032f5affe4a617a1d7dfab7f0f3743af9dc7cbfbcc65751566e2f52971316d"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-o6fovw1b/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1630147,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "dca8bf485af58f6028b490d5d41e872add96cdcd3879c5d394558dc1b3acf072"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-bm4s8bpx/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1630442,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "eaf1e488c9b2f314b6ec4de622a0f6ab53ce7aa7eddcbe362d92a0ea858486d1"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-3rrcu4i6/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1630590,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "6832b2f28fb5ba1e3f5520f086b519e6a7a49356c20f80255e7a05f409322aac"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-qaltde09/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1630804,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "e478233a0272e63d09fbbae1306b77d420f8f9f1428d86b88de4fbe88ee2f3ed"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-jhwrq682/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1631200,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "a2643dec6e531f1449a739e68824497d29f4eaeb9fc5e4ebca2969c4b0aca8cf"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-48jjz333/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1631455,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "0cc1a92439896fb3e06627704061c7a3f57c1655fefc71cc1a76a2d926d029aa"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-devim69h/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1631551,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "f77f8c653c8a51313a079a0445ccfa427ad476863427b030fe57357c9f72bdbb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-4xahe6ix/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1632102,
+        "process_stopped": true
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m",
+        "removed": true,
+        "files": [
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m/workspace.sqlite-shm",
+            "bytes": 32768,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m/workspace.sqlite",
+            "bytes": 321044480,
+            "sha256": "b81cfbebac46e638a005a00665b29897e33e8486ccb480a381491f4f5d9dbaeb"
+          },
+          {
+            "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z/owned-fuse-2mc9x21m/workspace.sqlite-wal",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "pid": 1632242,
+        "process_stopped": true
+      }
+    ]
+  },
+  "host_telemetry": {
+    "tmpfs": {
+      "seconds": 40.15827488899231,
+      "cpu_idle_percent": 93.16953385320654,
+      "cpu_iowait_percent": 0.3686879578165325,
+      "load_1m_range": [
+        2.23046875,
+        2.6806640625
+      ]
+    },
+    "ext4": {
+      "seconds": 77.21998524665833,
+      "cpu_idle_percent": 92.38878675140057,
+      "cpu_iowait_percent": 1.8247224192591092,
+      "load_1m_range": [
+        2.10888671875,
+        3.49853515625
+      ]
+    },
+    "fuse": {
+      "seconds": 123.6888358592987,
+      "cpu_idle_percent": 92.477120195241,
+      "cpu_iowait_percent": 1.8480103043861433,
+      "load_1m_range": [
+        2.26708984375,
+        3.22900390625
+      ]
+    }
+  },
+  "raw_artifacts": "/home/kaka/astrovela_vane-fs/vane_fs/build/bulk-write-20261006T082600Z",
+  "validation": {
+    "component_python_tests": 132,
+    "native_release_tests": 5,
+    "native_asan_ubsan_tests": 5,
+    "selected_fuse_sanitizer_tests": 13,
+    "native_full_content_checks": 24,
+    "fuse_full_sha256_checks": 12,
+    "database_quick_checks": 36
+  },
+  "interpretation": [
+    "The tmpfs result isolates reduced SQL and block-processing work; it is not a physical durability measurement.",
+    "The query/batch optimization leaves payload layout, WAL volume, request commits and checkpoint budget unchanged.",
+    "All physical-disk samples are retained; SQLite sync/checkpoint I/O still causes long stalls. Do not attribute every median difference to the SQL change.",
+    "Fault-injection tests initially mixed Python SQLite 3.45.1 and the private SQLite 3.53.2 in one process. The same failure reproduces on baseline. Both raw inspection and DDL now run in a subprocess; native fault tests use the single bundled SQLite. See https://www.sqlite.org/howtocorrupt.html#multiple_copies_of_sqlite_linked_into_the_same_application"
+  ],
+  "production_sources": {
+    "vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+  }
+}

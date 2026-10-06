@@ -106,12 +106,60 @@ static void CheckDirectoryEntries(const std::string &path) {
 	workspace.ReleaseMount("main");
 }
 
+static void CheckLargeWrites(const std::string &path, Durability durability) {
+	Workspace workspace(path, 5000, durability);
+	auto main = workspace.Checkout();
+	std::string data;
+	for (int i = 0; i < 193; ++i) {
+		data += std::string(4096, i % 5 ? char(i) : '\0');
+	}
+	data += "tail";
+	main->WriteFile("/large", "");
+	main->Write("/large", data, 4095);
+	auto expected = std::string(4095, '\0') + data;
+	Require(main->Read("/large") == expected, "Large sparse write mapped blocks incorrectly");
+	auto frozen = workspace.OpenSnapshot(workspace.Snapshot());
+	auto child = workspace.Checkout(workspace.Fork("main", "child").id);
+	child->Truncate("/large", 17);
+	child->Write("/large", data, 4095);
+	Require(child->Read("/large") == expected, "Large write mishandled truncated versions");
+	Require(frozen->Read("/large") == expected, "Large child write changed a snapshot");
+	Require(main->Read("/large") == expected, "Large child write changed its parent");
+	frozen->Close();
+	main->WriteFile("/atomic", "");
+	for (const auto &table : {"block_payloads", "block_versions"}) {
+		auto generation = workspace.GetBranch().generation;
+		SQL(path, "CREATE TABLE fault_counter AS SELECT 0 AS writes; CREATE TRIGGER fail_batch BEFORE INSERT ON " +
+		              std::string(table) +
+		              " BEGIN UPDATE fault_counter SET writes=writes+1;"
+		              "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
+		              "THEN RAISE(ABORT,'injected batch failure') END; END");
+		Expect(ErrorCode::Storage, [&] { main->Write("/atomic", std::string(193 * 4096, 'x')); });
+		SQL(path, "DROP TRIGGER fail_batch; DROP TABLE fault_counter");
+		Require(main->Read("/atomic").empty(), "Failed batch left visible bytes");
+		Require(workspace.GetBranch().generation == generation, "Failed batch changed the branch generation");
+	}
+	main->Write("/atomic", data);
+	Require(main->Read("/atomic") == data, "Failed batch poisoned retry");
+	// Exhausting a consecutive ID range must retain automatic SQLite rowids.
+	SQL(path, "INSERT INTO block_payloads(id,data) VALUES(9223372036854775807,zeroblob(4096))");
+	main->WriteFile("/rowids", data);
+	Require(main->Read("/rowids") == data, "Payload rowid limit broke a large write");
+	workspace.Sync();
+	workspace.Close();
+	Workspace reopened(path);
+	Require(reopened.Checkout()->Read("/large") == expected, "Reopen lost a large write");
+	Require(reopened.Checkout()->Read("/rowids") == data, "Reopen lost automatically allocated payloads");
+}
+
 int main() {
 	auto root = std::filesystem::temp_directory_path() /
 	            ("vane-fs-native-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	try {
 		std::filesystem::create_directory(root);
 		CheckDirectoryEntries((root / "directories.sqlite").string());
+		CheckLargeWrites((root / "large-strict.sqlite").string(), Durability::Strict);
+		CheckLargeWrites((root / "large-fsync.sqlite").string(), Durability::Fsync);
 		auto path = (root / "workspace.sqlite").string();
 		{
 			Workspace workspace(path);

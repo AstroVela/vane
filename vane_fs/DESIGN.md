@@ -104,6 +104,21 @@ PLAN`; a constant-size visibility predicate does not imply constant-time I/O.
 Payloads are separate from version rows so splitting an inherited block's
 interval does not duplicate its bytes. Payload deduplication is deferred;
 semantic comparisons inspect bytes when payload IDs differ.
+Writes of at least 8 KiB check whether any block version intersects both the
+written block range and the replacement visibility interval. Only an entirely
+vacant range uses batches of up to 64 nonzero blocks, with one payload insert
+and one version insert per batch. The check includes tombstones and versions
+beyond the current read point; occupied ranges retain the usual interval
+splitting and unchanged-payload handling. Partial blocks in a vacant range are
+zero-filled, and all-zero blocks remain sparse.
+
+The enclosing `BEGIN IMMEDIATE` transaction serializes allocation of consecutive
+payload IDs above the current maximum. If the integer range cannot fit the
+write, the existing SQLite rowid allocation path is used. Every batch, inode
+update and branch-generation update commits or rolls back together. The batch
+holds at most 256 KiB of content before SQLite's binding copies; it does not
+change the format, 4 KiB logical blocks, checkpoint policy or durability mode.
+
 Allocate inode IDs across the entire workspace, including all branches.
 An index on `block_versions(payload)` supports GC reference checks; without
 it the correlated payload check scanned all block versions for each payload.

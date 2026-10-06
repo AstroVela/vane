@@ -538,6 +538,38 @@ void StoreBlock(sqlite3 *db, int64_t inode, int64_t block, const std::string &da
 	Put(db, BLOCKS, key, {sqlite3_last_insert_rowid(db)}, view);
 }
 
+void InsertNewBlocks(sqlite3 *db, int64_t inode, std::vector<std::pair<int64_t, std::string>> &blocks,
+                     int64_t &last_payload, const View &view) {
+	if (blocks.empty()) {
+		return;
+	}
+	std::string payload_sql = "INSERT INTO block_payloads(id,data) VALUES ";
+	std::string version_sql = "INSERT INTO block_versions(inode,block,low,high,writer,deleted,payload) VALUES ";
+	for (size_t i = 0; i < blocks.size(); ++i) {
+		if (i) {
+			payload_sql += ',';
+			version_sql += ',';
+		}
+		payload_sql += "(?,?)";
+		version_sql += "(?1,?" + std::to_string(5 + 2 * i) + ",?2,?3,?4,0,?" + std::to_string(6 + 2 * i) + ")";
+	}
+	Statement payloads(db, payload_sql), versions(db, version_sql);
+	versions.Bind(1, inode);
+	versions.Bind(2, view.point);
+	versions.Bind(3, view.high);
+	versions.Bind(4, view.writer);
+	for (size_t i = 0; i < blocks.size(); ++i) {
+		auto payload = ++last_payload;
+		payloads.Bind(int(1 + 2 * i), payload);
+		payloads.BindBytes(int(2 + 2 * i), blocks[i].second);
+		versions.Bind(int(5 + 2 * i), blocks[i].first);
+		versions.Bind(int(6 + 2 * i), payload);
+	}
+	payloads.Step();
+	versions.Step();
+	blocks.clear();
+}
+
 void RequireFile(const Record &node) {
 	if (node.fields[0]) {
 		Fail(ErrorCode::IsDirectory, "Path is a directory");
@@ -574,6 +606,36 @@ void WriteBytes(sqlite3 *db, Record &node, const std::string &data, int64_t offs
 	if (data.empty()) {
 		return;
 	}
+	bool vacant = false;
+	int64_t last_payload = 0;
+	if (data.size() >= 2 * BLOCK_SIZE) {
+		// Check the entire replacement interval, including tombstones and
+		// versions beyond the current view point, before bypassing Put.
+		Statement occupied(db, "SELECT 1 FROM block_versions WHERE inode=? AND block>=? AND block<=? "
+		                       "AND low<? AND high>? LIMIT 1");
+		auto first = offset / BLOCK_SIZE;
+		auto last = (offset + int64_t(data.size()) - 1) / BLOCK_SIZE;
+		occupied.Bind(1, node.key.inode);
+		occupied.Bind(2, first);
+		occupied.Bind(3, last);
+		occupied.Bind(4, view.high);
+		occupied.Bind(5, view.point);
+		vacant = !occupied.Step();
+		if (vacant) {
+			// The enclosing IMMEDIATE transaction serializes payload allocation.
+			// Explicit IDs keep batches mapped without relying on RETURNING order.
+			Statement maximum(db, "SELECT coalesce(max(id),0) FROM block_payloads");
+			maximum.Step();
+			last_payload = std::max<int64_t>(0, maximum.Integer(0));
+			// Preserve SQLite's automatic rowid allocation at the integer limit.
+			vacant = last - first + 1 <= std::numeric_limits<int64_t>::max() - last_payload;
+		}
+	}
+	constexpr size_t BATCH_BLOCKS = 64;
+	std::vector<std::pair<int64_t, std::string>> new_blocks;
+	if (vacant) {
+		new_blocks.reserve(BATCH_BLOCKS);
+	}
 	size_t consumed = 0;
 	while (consumed < data.size()) {
 		int64_t position = offset + int64_t(consumed);
@@ -582,12 +644,22 @@ void WriteBytes(sqlite3 *db, Record &node, const std::string &data, int64_t offs
 		if (amount == BLOCK_SIZE) {
 			bytes.assign(data.data() + consumed, amount);
 		} else {
-			bytes = Block(db, node.key.inode, position / BLOCK_SIZE, view);
+			bytes = vacant ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, position / BLOCK_SIZE, view);
 			bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
 		}
-		StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
+		if (vacant) {
+			if (!std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == 0; })) {
+				new_blocks.emplace_back(position / BLOCK_SIZE, std::move(bytes));
+				if (new_blocks.size() == BATCH_BLOCKS) {
+					InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
+				}
+			}
+		} else {
+			StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
+		}
 		consumed += amount;
 	}
+	InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
 	node.fields[1] = std::max<int64_t>(node.fields[1], offset + data.size());
 	node.fields[3] = Now();
 	Put(db, INODES, node.key, node.fields, view);
