@@ -340,6 +340,11 @@ public:
 				}
 			}
 			if (IsParquetScan(get.function.name)) {
+				// Late materialization introduces a second scan joined on file_index,
+				// which is not stable after assigning files to fragment partitions.
+				// Change only this bound scan's capability, not the shared catalog or
+				// session optimizer settings; native TopN can still be distributed.
+				get.function.late_materialization = false;
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
 				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
@@ -771,6 +776,14 @@ private:
 			// MIN/MAX(x, n) return the n extreme values as a list. Applying
 			// unary MIN/MAX to partial lists compares whole lists, not elements.
 			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
+				split = false;
+			}
+			// A DECIMAL SUM accumulator uses the full signed 128-bit domain. A
+			// partition's subtotal can exceed DECIMAL(38,s) even when cancellation
+			// across partitions leaves a valid final result. Exchange original rows
+			// and finalize complete groups instead of transporting that subtotal as
+			// a SQL DECIMAL value with insufficient precision.
+			if ((name == "sum" || name == "sum_no_overflow") && aggregate.return_type.id() == LogicalTypeId::DECIMAL) {
 				split = false;
 			}
 			// Native integer/decimal AVG divides an exact accumulator in long

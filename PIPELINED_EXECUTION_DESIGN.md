@@ -289,9 +289,9 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 | 算子 | 分布与执行规则 |
 | --- | --- |
-| COUNT、SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
+| COUNT、非 DECIMAL SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
 | FLOAT/DOUBLE AVG | partial SUM 与 COUNT，final 合并后计算商；FILTER 在两项中一致传播；NULL 与空组保持 native 语义 |
-| DISTINCT、带排序的聚合、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n) | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
+| DISTINCT、带排序的聚合、DECIMAL SUM、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n) | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
 | BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
@@ -299,6 +299,8 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
 
 整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。包含这类 AVG 的聚合节点按完整 group 执行；跨节点的类型与最终精度仍由 native 决定。
+
+DECIMAL SUM 的原生累加器可以保存 39 位的 signed 128-bit 中间值，而其返回类型声明为 `DECIMAL(38,s)`。例如三个 `4×10³⁷` 和三个 `−3×10³⁷` 的总和合法，但前一个分区的部分和 `1.2×10³⁸` 不能作为 38 位 Arrow decimal 传输。包含 DECIMAL SUM 的整个聚合节点因此采用完整分组策略，保留 FILTER、NULL、scale 及同节点其他聚合的语义；代价是交换原始行，无法提前缩减为部分和。公开 DECIMAL 的 Arrow schema 继续使用声明的精度与 scale。
 
 聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。没有引入兼容旧分布式聚合拆分器的接口。
 
@@ -311,6 +313,8 @@ range 的扫描 split 由 table function 的 native 回调规划；Parquet 从�
 编译器在优化前的 logical validation 中捕获每个 Parquet bind 的完整文件集合，作为最终根 fragment 的 `source_dependencies`。所有 worker 的提交准备都会校验这些查询级依赖。统计信息可把扫描优化成空结果，hive/file pruning 也可移除部分文件，但这些优化仍依赖原始文件。依赖使用同一 native 文件 codec，随扫描节点的移除继续保留；实际 split 分配与并行度仍由优化后的 `sources` 决定。纯空结果的 source fragment 只执行一次，HASH/GATHER 下游不携带源文件分配。
 
 当前 Parquet split 未携带原始文件序号，因此明确拒绝虚拟列 `file_index`。编译器在优化前检查 native 虚拟列 ID，覆盖投影和仅用于过滤的引用，物理计划导出与加载也检查同一限制；普通数据列使用相同名称仍可执行。未来开放该虚拟列时，split 和 scan bind 必须保留绑定时的原始文件索引，不能使用 task 内重新编号的文件列表代替。
+
+Parquet 的 late materialization 会为 TopN/LIMIT 引入依赖 `file_index` 的双扫描回查。fragment 编译在优化前关闭每个绑定 Parquet scan 的 `late_materialization` 能力，继续使用普通扫描和 native TopN，再按上述规则分布执行。此能力只属于本次逻辑计划中的 TableFunction 副本，不修改共享 catalog、`disabled_optimizers` 或 local 查询；编译成功和失败均不影响后续原生优化。用户显式引用虚拟 `file_index` 时仍在优化前拒绝。
 
 [native 编译测试](tests/fast/test_native_fragment_compiler.py) 使用有限数据的物化测试设施执行反序列化后的 fragment，并对照原生 SQL；它不接入公开 local 查询，也不作为 Ray 流水调度器。P1.2 的 TaskRuntime 通过独立的原生直接通道推进 fragment；跨进程 exchange 与根结果服务继续按 P2 实现。
 

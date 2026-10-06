@@ -218,7 +218,7 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 ## P4 分析与混跑
 
-- [x] P4.1：COUNT/SUM/MIN/MAX 与浮点 AVG partial/final 聚合；DISTINCT、整数/decimal/时间 AVG 按完整 group 执行；FILTER 与空输入保持原生语义。
+- [x] P4.1：COUNT、非 DECIMAL SUM、MIN/MAX 与浮点 AVG partial/final 聚合；DECIMAL SUM、DISTINCT、整数/decimal/时间 AVG 按完整 group 执行；FILTER 与空输入保持原生语义。
 - [x] P4.2：等值 hash join、自动小 build 广播、native BuildReady、多个消费者独立关闭。
 - [x] P4.3：全局 LIMIT/OFFSET、单根 ORDER BY、partial/final TopN 与确定排序语义。
 - [x] P4.4：decimal、时间、二进制、LIST/STRUCT/MAP/ARRAY 的 native 帧及 Flight/物化传输。
@@ -460,3 +460,11 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - 新增回归覆盖微秒正负极限、月/日极限、午夜结束边界、NULL、空 schema、LIST/STRUCT/MAP/ARRAY、恶意输入、准入超时和排队中断，以及过期回调与执行启动的交接。审查者提供的 5 个真实 Ray 复现用例在旧版本全部失败，修复后全部通过。
 - 本轮新增 51 项长期回归。相关验证分批去重合计 **911 passed：843 个非 Ray、63 个仓库 Ray、5 个审查脚本用例**。两个既有取消竞态用例继续断言 FIFO 清空，后续查询的准入期限调整为覆盖新结果 actor 启动，并定向重跑通过。未运行完整 release/fast 套件。
 - 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:d8cd56a3a0d20563320ef07e6ce7c4a9fae17656972842ac0078240bd98ca769`。root 格式、Ruff、mypy、pre-commit、源码版权清单、文档链接和 diff 检查通过。
+
+### P4 Parquet TopN 与 DECIMAL 部分和修正（基于 `db99aeb4`）
+
+- fragment 在优化前关闭绑定 Parquet scan 的 late materialization 能力，避免 TopN/LIMIT 引入依赖虚拟 `file_index` 的回查 join。修改仅作用于本次计划的 TableFunction 副本；成功和失败之后，原连接与 sibling cursor 的优化器设置、原生 EXPLAIN 结果均保持一致。显式虚拟列限制继续执行。
+- DECIMAL SUM 改为完整分组聚合，避免合法最终结果因 39 位分区部分和无法进入 `decimal128(38,s)` 而失败。原始行按 group key 分区，保留 FILTER、NULL、scale 与同节点其他聚合；代价是交换行数增加，公开 Arrow DECIMAL schema 不变。
+- 新增 47 项长期回归：43 个 native 用例覆盖多文件、空分区、TopN/OFFSET、连接设置隔离、正负部分和、带 scale 的数值、分组与空输入；4 个公开 Ray 用例分别验证两种模式。4 个 Ray 用例在旧版本全部失败，修复后全部通过。
+- 本轮相关验证去重合计 **587 passed：573 个非 Ray、14 个真实 Ray**。包括 native/分析编译器、提交与源快照校验、分析类型交换、FTE 生成文件列限制，以及公开 Ray 分析 SQL/类型回归。未运行完整 release/fast 套件。
+- C++ 已用 `build/python-release` 增量 Release 编译并非 editable 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:4301d09c42a8f8968382355c4ef454c6a5bf4efb6a97c45a7c93a6806b213959`。root 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过；未修改 DuckDB 子树或 Arrow 传输 profile。

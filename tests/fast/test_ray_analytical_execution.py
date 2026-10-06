@@ -18,7 +18,12 @@ from tests.fast.test_analytical_exchange import (
     TEMPORAL_VALUES,
     exchange_expected,
 )
-from tests.fast.test_analytical_fragment_compiler import TOP_N_AGGREGATES
+from tests.fast.test_analytical_fragment_compiler import (
+    DECIMAL_SUM_QUERIES,
+    PARQUET_TOP_N_TAILS,
+    TOP_N_AGGREGATES,
+    parquet_top_n_source,
+)
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -89,6 +94,36 @@ def test_public_min_max_overloads(tmp_path, mode):
             expected = local.execute(sql).to_arrow_table().to_pylist()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_parquet_top_n_with_default_optimizers(tmp_path, mode):
+    with (
+        vane.connect(backend="local") as local,
+        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+    ):
+        source = parquet_top_n_source(local, tmp_path)
+        for tail in PARQUET_TOP_N_TAILS:
+            sql = f"select k, v from {source} {tail}"
+            expected = local.execute(sql).to_arrow_table()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().equals(expected)
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_decimal_sum_keeps_native_precision(tmp_path, mode):
+    with (
+        vane.connect(backend="local") as local,
+        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+    ):
+        for sql in DECIMAL_SUM_QUERIES:
+            expected = local.execute(sql).to_arrow_table()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                table.validate(full=True)
+                assert table.equals(expected)
             assert_idle(connection)
 
 

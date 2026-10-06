@@ -45,6 +45,82 @@ TOP_N_AGGREGATES = [
     "select min([range]), max([range]) from range(9)",
 ]
 
+PARQUET_TOP_N_TAILS = [
+    "order by k limit 5",
+    "where k % 2 = 1 order by k desc limit 5 offset 3",
+    "order by k nulls first limit 5",
+    "order by k limit 5 offset 100",
+]
+
+DECIMAL_INPUT = (
+    "select range, case when range < 3 then '40000000000000000000000000000000000000'::decimal(38,0) "
+    "else '-30000000000000000000000000000000000000'::decimal(38,0) end v from range(6)"
+)
+DECIMAL_SUM_QUERIES = [
+    f"select sum(v) from ({DECIMAL_INPUT})",
+    f"select sum(v)::varchar from ({DECIMAL_INPUT})",
+    f"select sum(-v) from ({DECIMAL_INPUT})",
+    "select sum(case when range < 3 then '400000000000000000000000000000000.00000'::decimal(38,5) "
+    "else '-300000000000000000000000000000000.00000'::decimal(38,5) end) from range(6)",
+    "select range % 2 k, sum(v) filter(where range % 8 < 6) s, count(*) filter(where range % 3 = 0), min(v) "
+    "from (select range, case when range % 8 >= 6 then null "
+    "when range < 8 then '40000000000000000000000000000000000000'::decimal(38,0) "
+    "else '-30000000000000000000000000000000000000'::decimal(38,0) end v from range(16)) "
+    "group by k having sum(v) > 0 order by k",
+    f"select sum(distinct v) from ({DECIMAL_INPUT})",
+    "select sum(null::decimal(38,0)) from range(6)",
+    "select sum(range::decimal(38,5)) from range(0)",
+    "select sum(range::decimal(4,1)), count(*) from range(6)",
+]
+
+
+def parquet_top_n_source(connection, directory):
+    for index in range(2):
+        path = directory / f"part{index}.parquet"
+        connection.execute(
+            f"copy (select case when range=11 then null else range end k, range::varchar v "
+            f"from range({index * 20}, {(index + 1) * 20})) to '{path}' (format parquet)"
+        )
+    return f"read_parquet('{directory}/*.parquet')"
+
+
+@pytest.mark.parametrize("tail", PARQUET_TOP_N_TAILS)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+def test_parquet_top_n_with_default_optimizers(tmp_path, tail, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        source = parquet_top_n_source(connection, tmp_path)
+        sql = f"select k, v from {source} {tail}"
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
+
+@pytest.mark.parametrize("disabled", ["", "in_clause", "late_materialization", "top_n"])
+def test_fragment_parquet_capabilities_do_not_change_local_optimization(tmp_path, disabled):
+    with vane.connect(backend="local", config={"threads": 1}) as connection, connection.cursor() as sibling:
+        connection.execute(f"set disabled_optimizers='{disabled}'")
+        source = parquet_top_n_source(connection, tmp_path)
+        sql = f"select k, v from {source} order by k limit 5"
+        plan = connection.execute("explain " + sql).fetchall()
+        if disabled in ("", "in_clause"):
+            assert "file_index" in plan[0][1]
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, 2)) == expected
+        # Failure after optimization must also leave both connection settings
+        # and the catalog's shared Parquet capability intact.
+        with pytest.raises(vane.InvalidInputException, match="HASH columns"):
+            compile_sql(connection, sql, 2, hash_columns=(20,))
+        for target in (connection, sibling):
+            assert target.execute("select current_setting('disabled_optimizers')").fetchone() == (disabled,)
+            assert target.execute("explain " + sql).fetchall() == plan
+
+
+@pytest.mark.parametrize("sql", DECIMAL_SUM_QUERIES)
+@pytest.mark.parametrize("partitions", [1, 2, 7])
+def test_decimal_sum_keeps_native_precision(sql, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
 
 @pytest.mark.parametrize("partitions", [1, 2, 7])
 @pytest.mark.parametrize("sql", TOP_N_AGGREGATES)
