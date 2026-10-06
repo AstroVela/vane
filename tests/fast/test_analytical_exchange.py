@@ -18,6 +18,9 @@ EXPRESSIONS = [
     "range::decimal(4,1)",
     "range::decimal(15,2)",
     "range::decimal(38,5)",
+    "[range::decimal(38,5), null]",
+    "{'d': range::decimal(20,2), 'a': [range::decimal(38,5), null]::decimal(38,5)[2]}",
+    "map([range::decimal(19,0)], [range::decimal(38,5)])",
     "(range + 9223372036854775807::hugeint)::hugeint",
     "date '2026-01-01' + range::integer",
     "time '13:42:06.123456'",
@@ -118,7 +121,16 @@ def exchange_expected(table):
     return table
 
 
-def exchange_table(connection, sql, flight, materialized_path=None):
+def exchange_table(connection, sql, flight, materialized_path=None, *, rows=False):
+    def consume(batch):
+        if rows:
+            actual.extend(batch.to_rows())
+        else:
+            record = batch.to_arrow(["range", "v"])
+            record.validate(full=True)
+            actual.append(record)
+        batch.close()
+
     spec = submission(connection, sql, partitions=3)
     with InProcessTaskService(connection, spec, LIMITS) as service:
         service.start()
@@ -153,10 +165,7 @@ def exchange_table(connection, sql, flight, materialized_path=None):
                     state, batch = eventually(lambda: target.poll("client"), lambda value: value[0] != "blocked")
                     if state == "end":
                         break
-                    record = batch.to_arrow(["range", "v"])
-                    record.validate(full=True)
-                    actual.append(record)
-                    batch.close()
+                    consume(batch)
             finally:
                 reader.close()
         elif not flight:
@@ -165,10 +174,7 @@ def exchange_table(connection, sql, flight, materialized_path=None):
                 state, batch = next_batch(service)
                 if state == "end":
                     break
-                record = batch.to_arrow(["range", "v"])
-                record.validate(full=True)
-                actual.append(record)
-                batch.close()
+                consume(batch)
         else:
             source = service.result
             target = native.DirectChannel(spec.result_schema, native.DirectLimits(4096, 1024, 3, 2), 1, ["client"])
@@ -191,15 +197,57 @@ def exchange_table(connection, sql, flight, materialized_path=None):
                     state, batch = eventually(poll, lambda item: item[0] != "blocked")
                     if state == "end":
                         break
-                    record = batch.to_arrow(["range", "v"])
-                    record.validate(full=True)
-                    actual.append(record)
-                    batch.close()
+                    consume(batch)
             finally:
                 receiver.close()
                 sender.close()
-        table = pa.Table.from_batches(actual, schema=native.arrow_schema(spec.result_schema, ["range", "v"]))
-        return table
+        return (
+            actual
+            if rows
+            else pa.Table.from_batches(actual, schema=native.arrow_schema(spec.result_schema, ["range", "v"]))
+        )
+
+
+@pytest.mark.parametrize("scale", [0, 5])
+@pytest.mark.parametrize("transport", ["direct", "flight", "materialized"])
+@pytest.mark.parametrize(
+    "expression",
+    ["s", "[s, null]", "[{'value': s}, null]", "[s, null]::decimal(38,{scale})[2]", "map([k], [s])", "map([s], [k])"],
+)
+def test_decimal_intermediates_keep_native_range(tmp_path, scale, transport, expression):
+    from tests.fast.test_analytical_fragment_compiler import scaled_wide_value
+
+    value = scaled_wide_value(4 * 10**37, scale)
+    expression = expression.replace("{scale}", str(scale))
+    sql = (
+        f"select k as range, case when k%4=0 then null else {expression} end v "
+        f"from (select range//3 k, sum(case when range%6<3 then '{value}'::decimal(38,{scale}) "
+        f"else '-{value}'::decimal(38,{scale}) end) s from range(42) group by k) order by k desc"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        actual = exchange_table(
+            connection,
+            sql,
+            transport == "flight",
+            tmp_path / "decimal.mat" if transport == "materialized" else None,
+            rows=True,
+        )
+    # Each non-null SUM has a 39-digit coefficient. These are intermediate
+    # native values; the public decimal128 result schema need not accept them.
+    assert actual == expected
+
+
+@pytest.mark.parametrize("transport", ["flight", "materialized"])
+@pytest.mark.parametrize("expression", [expr for expr in EXPRESSIONS if "decimal" in expr])
+def test_empty_decimal_result_preserves_declared_schema(tmp_path, transport, expression):
+    sql = f"select range, {expression} v from range(0)"
+    with vane.connect(backend="local") as connection:
+        expected = connection.execute(sql).to_arrow_table()
+        actual = exchange_table(
+            connection, sql, transport == "flight", tmp_path / "empty.mat" if transport == "materialized" else None
+        )
+    assert actual.equals(expected)
 
 
 @pytest.mark.parametrize("expression,value", TEMPORAL_VALUES)

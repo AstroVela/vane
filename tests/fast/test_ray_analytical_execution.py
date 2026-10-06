@@ -28,6 +28,7 @@ from tests.fast.test_analytical_fragment_compiler import (
     TOP_N_AGGREGATES,
     WIDE_AGGREGATE_TYPES,
     parquet_top_n_source,
+    scaled_wide_value,
     wide_aggregate_queries,
 )
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -147,6 +148,37 @@ def test_public_decimal_sum_keeps_native_precision(tmp_path, mode):
                 table.validate(full=True)
                 assert table.equals(expected)
             assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("scale", [0, 5, 38])
+def test_public_nested_decimal_aggregation(tmp_path, mode, scale):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+    ):
+        for sign in [1, -1]:
+            positive = scaled_wide_value(sign * 4 * 10**37, scale)
+            negative = scaled_wide_value(-sign * 3 * 10**37, scale)
+            groups = (
+                "select range%2 k, sum(case when range%2=0 "
+                f"then '{positive}'::decimal(38,{scale}) else '{negative}'::decimal(38,{scale}) end) s "
+                "from range(6) group by k"
+            )
+            queries = [
+                f"select sum(s) total from ({groups})",
+                # Carry the same 39-digit intermediate through another
+                # aggregate stage before cancellation produces a legal result.
+                f"select sum(s) total from (select k, max(s) s from ({groups}) group by k)",
+            ]
+            for sql in queries:
+                expected = local.execute(sql).to_arrow_table()
+                expected.validate(full=True)
+                with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                    table = result.collect()
+                    table.validate(full=True)
+                    assert table.equals(expected), sql
+                assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

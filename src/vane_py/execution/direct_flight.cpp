@@ -427,11 +427,11 @@ void DirectFlight::ExportSchema(const vector<LogicalType> &types, const vector<s
 	if (types.size() != names.size()) {
 		throw InvalidInputException("direct Flight schema name count mismatch");
 	}
-	Check(arrow::ExportSchema(*ArrowSchemaFor(types, names), out));
+	Check(arrow::ExportSchema(*ResultSchemaFor(types, names), out));
 }
 
 void DirectFlight::ExportBatch(DataChunk &chunk, const vector<string> &names, ArrowArray *array, ArrowSchema *schema) {
-	Check(arrow::ExportRecordBatch(*Encode(chunk, ArrowSchemaFor(chunk.GetTypes(), names)), array, schema));
+	Check(arrow::ExportRecordBatch(*Encode(chunk, ResultSchemaFor(chunk.GetTypes(), names)), array, schema));
 }
 
 DirectFlight::DirectFlight(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame)

@@ -162,7 +162,7 @@ py::dict CompilerCapabilities(DuckDBPyConnection &connection) {
 	py::dict result;
 	result["engine_identity"] = EngineIdentity();
 	result["protocol_version"] = 1;
-	result["type_profile"] = "vane.analytical-types:3";
+	result["type_profile"] = "vane.analytical-types:4";
 	result["connection_profile"] = "vane.builtin-session:1";
 	result["distributions"] = vector<string> {"gather", "hash", "broadcast"};
 	result["scans"] = scans;

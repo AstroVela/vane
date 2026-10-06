@@ -484,3 +484,11 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - 到达顺序回归显式先启动正数或负数 producer，在单线程、四线程下验证 SUM/AVG；另外覆盖 scale 0/5/38、恒定/变化输入、跨批次累加、排序、DISTINCT、FILTER、分组、空输入、精确抵消和真正的最终溢出。
 - 新增 182 项回归。本轮相关验证去重合计 **608 passed、2 skipped：584 个非 Ray、24 个真实 Ray 通过**；跳过项为原生 Arrow 测试中已有的 CI FIXME。公开嵌套 ARRAY 用例在修复前两种 Ray 模式均失败，修复后通过。未运行完整 release/fast 套件。
 - 已完成非 editable 增量 Release 安装及最终产物的 124 项定向复测（不重复计入总数）；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `a971e0b82e:fragment:51c8a77b708bcdd01f1a16ae73bc0a4e236b4d03b69a61ed38b7e9a356ac4968`。root/DuckDB 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。
+
+### P4 多层 DECIMAL 聚合交换修正（基于 `80e775470c`）
+
+- Arrow codec 区分 native 导入、内部交换与公开结果 schema。128 位 DECIMAL 在 Flight/物化交换中使用 `decimal256(39,scale)`，无损保留 signed 128-bit 系数；公开结果继续按声明的 `decimal128(width,scale)` 导出。更小存储的 DECIMAL 保持原有交换表示，新增宽化副本沿用 staging 预算。
+- 宽化与还原递归覆盖 LIST、STRUCT、MAP 键/值和 ARRAY，保留 scale、NULL 和空 schema。解码拒绝超出 native signed 128-bit 范围的系数。Python 提交和 native worker 的类型 profile 同步升为 4，旧交换 profile 无法混用。
+- 增加多层 SUM/MAX 回归：内层产生 `1.2×10³⁸` 和 `−9×10³⁷`，经过两层或三层聚合后返回合法结果。两种 Ray 模式覆盖正负系数与 scale 0/5/38，并精确比较最终 Arrow schema。原生/Flight/物化回归覆盖 39 位容器子值、完整 native 系数边界、越界拒绝和空结果精度。
+- 本轮新增 66 项长期回归；相关验证分批去重合计 **943 passed：910 个仓库非 Ray、30 个仓库真实 Ray、3 个审查脚本用例**。审查脚本在修复前 1 项通过、两种 Ray 模式失败，修复后全部通过。未运行完整 release/fast 套件。
+- 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `a971e0b82e:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`。root 格式、Ruff、mypy、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。

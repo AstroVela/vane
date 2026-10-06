@@ -97,7 +97,9 @@ Vector StorageVector(Vector &source, idx_t count, const LogicalType &storage_typ
 	return result;
 }
 
-std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool native_layout = false) {
+enum class ArrowLayout { NATIVE, EXCHANGE, RESULT };
+
+std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayout layout) {
 	CheckExchangeType(type);
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
@@ -129,7 +131,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool nati
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
 	case LogicalTypeId::HUGEINT:
-		return native_layout ? arrow::decimal128(38, 0) : arrow::decimal256(39, 0);
+		return layout == ArrowLayout::NATIVE ? arrow::decimal128(38, 0) : arrow::decimal256(39, 0);
 	case LogicalTypeId::DATE:
 		return arrow::date32();
 	case LogicalTypeId::TIME:
@@ -145,24 +147,28 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool nati
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return arrow::timestamp(arrow::TimeUnit::MICRO, "UTC");
 	case LogicalTypeId::INTERVAL:
-		return ArrowTypeFor(StorageTypeFor(type), native_layout);
+		return ArrowTypeFor(StorageTypeFor(type), layout);
 	case LogicalTypeId::DECIMAL:
+		// Native aggregate results can use all 128 coefficient bits, including
+		// 39-digit intermediates consumed by a subsequent aggregate. Preserve
+		// them on exchanges without changing the public result's SQL precision.
+		if (layout == ArrowLayout::EXCHANGE && type.InternalType() == PhysicalType::INT128) {
+			return arrow::decimal256(39, DecimalType::GetScale(type));
+		}
 		return arrow::decimal128(DecimalType::GetWidth(type), DecimalType::GetScale(type));
 	case LogicalTypeId::STRUCT: {
 		std::vector<std::shared_ptr<arrow::Field>> fields;
 		for (auto &child : StructType::GetChildTypes(type)) {
-			fields.push_back(arrow::field(child.first, ArrowTypeFor(child.second, native_layout)));
+			fields.push_back(arrow::field(child.first, ArrowTypeFor(child.second, layout)));
 		}
 		return arrow::struct_(std::move(fields));
 	}
 	case LogicalTypeId::LIST:
-		return arrow::list(arrow::field("l", ArrowTypeFor(ListType::GetChildType(type), native_layout)));
+		return arrow::list(arrow::field("l", ArrowTypeFor(ListType::GetChildType(type), layout)));
 	case LogicalTypeId::MAP:
-		return arrow::map(ArrowTypeFor(MapType::KeyType(type), native_layout),
-		                  ArrowTypeFor(MapType::ValueType(type), native_layout));
+		return arrow::map(ArrowTypeFor(MapType::KeyType(type), layout), ArrowTypeFor(MapType::ValueType(type), layout));
 	case LogicalTypeId::ARRAY:
-		return arrow::fixed_size_list(ArrowTypeFor(ArrayType::GetChildType(type), native_layout),
-		                              ArrayType::GetSize(type));
+		return arrow::fixed_size_list(ArrowTypeFor(ArrayType::GetChildType(type), layout), ArrayType::GetSize(type));
 	default:
 		throw NotImplementedException("unsupported exchange Arrow type: %s", type.ToString());
 	}
@@ -174,15 +180,15 @@ void CheckArrow(const arrow::Status &status) {
 	}
 }
 
-std::shared_ptr<arrow::ArrayData> WidenHugeInts(const std::shared_ptr<arrow::ArrayData> &data,
+std::shared_ptr<arrow::ArrayData> WidenDecimals(const std::shared_ptr<arrow::ArrayData> &data,
                                                 const std::shared_ptr<arrow::DataType> &type) {
 	if (data->type->Equals(type)) {
 		return data;
 	}
 	if (type->id() == arrow::Type::DECIMAL256) {
 		// The native exporter owns a signed 128-bit buffer. Its decimal128(38)
-		// schema cannot describe the entire HUGEINT domain. Widen the values,
-		// including nested ones, before publishing a valid Arrow batch.
+		// schema cannot describe the entire HUGEINT/DECIMAL intermediate domain.
+		// Widen nested values as well before publishing a valid Arrow batch.
 		arrow::Decimal128Array values(data);
 		arrow::Decimal256Builder builder(type);
 		CheckArrow(builder.Reserve(values.length()));
@@ -200,18 +206,39 @@ std::shared_ptr<arrow::ArrayData> WidenHugeInts(const std::shared_ptr<arrow::Arr
 	auto result = data->Copy();
 	result->type = type;
 	for (idx_t i = 0; i < data->child_data.size(); i++) {
-		result->child_data[i] = WidenHugeInts(data->child_data[i], type->field(i)->type());
+		result->child_data[i] = WidenDecimals(data->child_data[i], type->field(i)->type());
 	}
 	return result;
+}
+
+std::shared_ptr<arrow::Schema> SchemaFor(const vector<LogicalType> &types, const vector<string> &names,
+                                         ArrowLayout layout) {
+	std::vector<std::shared_ptr<arrow::Field>> fields;
+	for (idx_t i = 0; i < types.size(); i++) {
+		fields.push_back(
+		    arrow::field(names.empty() ? "c" + std::to_string(i) : names[i], ArrowTypeFor(types[i], layout)));
+	}
+	return arrow::schema(std::move(fields));
+}
+
+hugeint_t DecodeInt128(const arrow::Array &source, idx_t row, const char *domain) {
+	auto &values = static_cast<const arrow::Decimal256Array &>(source);
+	arrow::Decimal256 value(values.GetValue(row));
+	auto words = value.little_endian_array();
+	hugeint_t native(int64_t(words[1]), words[0]);
+	if (value != arrow::Decimal256(arrow::Decimal128(native.upper, native.lower))) {
+		throw IOException("exchange value is outside the %s range", domain);
+	}
+	return native;
 }
 } // namespace
 
 std::shared_ptr<arrow::Schema> ArrowSchemaFor(const vector<LogicalType> &types, const vector<string> &names) {
-	std::vector<std::shared_ptr<arrow::Field>> fields;
-	for (idx_t i = 0; i < types.size(); i++) {
-		fields.push_back(arrow::field(names.empty() ? "c" + std::to_string(i) : names[i], ArrowTypeFor(types[i])));
-	}
-	return arrow::schema(std::move(fields));
+	return SchemaFor(types, names, ArrowLayout::EXCHANGE);
+}
+
+std::shared_ptr<arrow::Schema> ResultSchemaFor(const vector<LogicalType> &types, const vector<string> &names) {
+	return SchemaFor(types, names, ArrowLayout::RESULT);
 }
 
 std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_ptr<arrow::Schema> &schema) {
@@ -239,7 +266,7 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 	ArrowConverter::ToArrowArray(storage, &array, properties, extensions);
 	std::vector<std::shared_ptr<arrow::Field>> native_fields;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(storage_types[i], true)));
+		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(storage_types[i], ArrowLayout::NATIVE)));
 	}
 	auto result = arrow::ImportRecordBatch(&array, arrow::schema(std::move(native_fields)));
 	if (!result.ok()) {
@@ -248,7 +275,7 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 	auto native = std::move(result).ValueOrDie();
 	std::vector<std::shared_ptr<arrow::Array>> columns;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		columns.push_back(arrow::MakeArray(WidenHugeInts(native->column(i)->data(), schema->field(i)->type())));
+		columns.push_back(arrow::MakeArray(WidenDecimals(native->column(i)->data(), schema->field(i)->type())));
 	}
 	return arrow::RecordBatch::Make(schema, chunk.size(), std::move(columns));
 }
@@ -323,27 +350,24 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 		DecodePrimitive<arrow::TimestampArray, int64_t>(source, target, count);
 		break;
 	case LogicalTypeId::HUGEINT: {
-		auto &values = static_cast<const arrow::Decimal256Array &>(source);
 		for (idx_t row = 0; row < count; row++) {
 			if (source.IsNull(row)) {
 				continue;
 			}
-			arrow::Decimal256 value(values.GetValue(row));
-			auto words = value.little_endian_array();
-			hugeint_t native(int64_t(words[1]), words[0]);
-			if (value != arrow::Decimal256(arrow::Decimal128(native.upper, native.lower))) {
-				throw IOException("exchange value is outside the HUGEINT range");
-			}
-			FlatVector::GetData<hugeint_t>(target)[row] = native;
+			FlatVector::GetData<hugeint_t>(target)[row] = DecodeInt128(source, row, "HUGEINT");
 		}
 		break;
 	}
 	case LogicalTypeId::DECIMAL: {
-		auto &values = static_cast<const arrow::Decimal128Array &>(source);
 		for (idx_t row = 0; row < count; row++) {
 			if (source.IsNull(row)) {
 				continue;
 			}
+			if (type.InternalType() == PhysicalType::INT128) {
+				FlatVector::GetData<hugeint_t>(target)[row] = DecodeInt128(source, row, "DECIMAL storage");
+				continue;
+			}
+			auto &values = static_cast<const arrow::Decimal128Array &>(source);
 			arrow::Decimal128 value(values.GetValue(row));
 			hugeint_t native(value.high_bits(), value.low_bits());
 			switch (type.InternalType()) {
