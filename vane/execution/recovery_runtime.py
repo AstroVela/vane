@@ -221,15 +221,17 @@ class RecoveryScheduler:
     def _dispatch(self, index: int, partition: int, binding: TaskBinding, upstream: dict[str, StageManifest]) -> bool:
         assert self.coordinator is not None and self.lease is not None
         token = f"fte/{self.spec.query_id}/{binding.task.task_id}/{index}"
-        if not self.pool.admission.try_acquire(
-            token, self.spec.query_id, {index: materialized_demand(self.resources, binding)}
-        ):
-            return False
-        try:
-            with self.lock:
-                self.context.check()
-                if self.stop.is_set():
-                    raise RuntimeError("query canceled before materialized task dispatch")
+        with self.lock:
+            self.context.check()
+            if self.stop.is_set():
+                raise RuntimeError("query canceled before materialized task dispatch")
+            # Enqueue and cancellation share the lock: after cancel_waiting()
+            # clears this query, no dispatch may leave a new orphan FIFO head.
+            if not self.pool.admission.try_acquire(
+                token, self.spec.query_id, {index: materialized_demand(self.resources, binding)}
+            ):
+                return False
+            try:
                 worker, epoch = self.pool.workers[index], self.pool.epochs[index]
                 reserved = self.coordinator.begin(
                     binding.task.task_id, epoch, object_bytes=self.store.config.object_bytes
@@ -247,11 +249,11 @@ class RecoveryScheduler:
                     self.lease.to_dict(),
                     self.resources.exchange.frame_rows,
                 )
-            return True
-        except BaseException:
-            if index not in self.active:
-                self.pool.admission.release(token)
-            raise
+                return True
+            except BaseException:
+                if index not in self.active:
+                    self.pool.admission.release(token)
+                raise
 
     def _release(self, attempt: RunningAttempt) -> None:
         import ray

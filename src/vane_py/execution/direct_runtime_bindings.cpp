@@ -72,13 +72,10 @@ struct DirectBatchView {
 		}
 		ArrowArray array;
 		array.Init();
-		ClientProperties properties;
 		ArrowSchema schema;
 		schema.Init();
 		try {
-			DirectFlight::ExportSchema(chunk.GetTypes(), names, &schema);
-			unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
-			ArrowConverter::ToArrowArray(chunk, &array, properties, extensions);
+			DirectFlight::ExportBatch(chunk, names, &array, &schema);
 			return py::module_::import("pyarrow")
 			    .attr("RecordBatch")
 			    .attr("_import_from_c")(reinterpret_cast<uintptr_t>(&array), reinterpret_cast<uintptr_t>(&schema));

@@ -89,9 +89,11 @@ target_include_directories(
 # as DuckDB's SourceID. Vane-only native edits must invalidate old plan bytes
 # too.
 set(_fragment_identity "")
-foreach(_fragment_file
-        execution/fragment_plan.hpp execution/fragment_plan.cpp
-        execution/fragment_plan_bindings.cpp execution/exchange_types.hpp)
+foreach(
+  _fragment_file
+  execution/fragment_plan.hpp execution/fragment_plan.cpp
+  execution/fragment_plan_bindings.cpp execution/exchange_types.hpp
+  execution/arrow_frame.hpp execution/arrow_frame.cpp)
   set_property(
     DIRECTORY
     APPEND

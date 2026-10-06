@@ -444,3 +444,11 @@ P2 退出条件已满足；后续 P3 已在同一 FragmentGraph、worker 身份�
 - 新测试已加入 release launcher 和源码包清单；root 格式、Ruff、mypy、适用的 pre-commit、源码版权清单、文档本地链接及 diff 检查通过。没有修改 DuckDB 子树或引入新依赖。验证平台为 Linux，其他平台由 CI 验证。
 
 P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PIPELINED_EXECUTION_DESIGN.md#native-编译与加载)。FTE 仍按每个对象的声明上限预留存储，多阶段分析计划需要为保留对象及重试留足 query_bytes；不会通过少计配额获得成功。下一阶段为 P5：旧路径删除、支持矩阵及发布/性能验收。
+
+### P4 PR #970 审查修正（2026 年 10 月 6 日）
+
+- 双参数 `MIN/MAX(x,n)` 改为完整分组聚合，保留极值列表、FILTER、NULL、空输入和同节点其他聚合的原生语义；单参数 LIST 输入仍支持 partial/final 合并。
+- FTE 取消检查、入队与 attempt 发布统一使用调度锁，取消清除等待项后不会再留下孤立队首。确定性回归在旧实现上分别复现 `close()` 和 `interrupt()` 的遗留等待项；修复后验证共享池归还及后续 `SELECT 7` 成功。
+- HUGEINT 在 Flight、物化 I/O 和 Ray 结果导出中统一使用 `decimal256(39,0)`，递归处理 LIST/STRUCT/MAP/ARRAY，覆盖正负边界和中间 SUM；解码拒绝超出 signed 128-bit 范围的值。类型 profile 升为 2，Arrow codec 纳入 fragment build identity。
+- 修正 CI 纳秒时间戳测试对可选 pandas 的隐式依赖，改为直接比较 Arrow 数据。在禁止 pandas 导入的进程中，两个定向用例均通过。
+- 本轮新增 42 项回归；非 editable 增量 Release 安装上 **748 个非 Ray + 58 个真实 Ray，共 806 项相关测试通过**，未运行完整 release/fast 套件。格式、Ruff、mypy、pre-commit、源码版权清单、文档链接及 diff 检查通过；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:7b2c9dea48426d648a0a4d09ef8f2b9643c2c95909095e51ea162513128e70ff`。

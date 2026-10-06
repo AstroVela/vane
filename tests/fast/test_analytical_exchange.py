@@ -5,6 +5,7 @@
 
 import gc
 
+import pyarrow as pa
 import pytest
 
 import vane
@@ -34,10 +35,23 @@ EXPRESSIONS = [
     "[range, null, range+1]::bigint[3]",
     "[{'x': range}, null, {'x': range+1}]",
 ]
+
+HUGEINT_VALUES = [-(2**127), -(10**38), -(2**64), 0, 2**64, 10**38, 2**127 - 1]
+HUGEINT_VALUE_SQL = (
+    "case range % 7 " + " ".join(f"when {i} then '{value}'::hugeint" for i, value in enumerate(HUGEINT_VALUES)) + " end"
+)
+HUGEINT_EXPRESSIONS = [
+    HUGEINT_VALUE_SQL,
+    f"[{HUGEINT_VALUE_SQL}, null]",
+    f"[{{'value': {HUGEINT_VALUE_SQL}}}, null]",
+    f"[{HUGEINT_VALUE_SQL}, null]::hugeint[2]",
+    f"map([range], [{HUGEINT_VALUE_SQL}])",
+    f"map([{HUGEINT_VALUE_SQL}], [range])",
+]
 LIMITS = DirectExchangeLimits(window_bytes=4096, frame_bytes=1024, frame_rows=3, frame_slots=2)
 
 
-@pytest.mark.parametrize("expression", EXPRESSIONS)
+@pytest.mark.parametrize("expression", EXPRESSIONS + HUGEINT_EXPRESSIONS)
 @pytest.mark.parametrize("flight", [False, True])
 def test_analytical_values_and_nulls(expression, flight):
     sql = (
@@ -45,7 +59,7 @@ def test_analytical_values_and_nulls(expression, flight):
         "from range(19) where range % 3 <> 0 order by range desc"
     )
     with vane.connect(backend="local", config={"threads": 1}) as connection:
-        expected = connection.execute(sql).to_arrow_table().to_pylist()
+        expected = connection.execute(sql).to_arrow_table()
         spec = submission(connection, sql, partitions=3)
         with InProcessTaskService(connection, spec, LIMITS) as service:
             service.start()
@@ -55,7 +69,9 @@ def test_analytical_values_and_nulls(expression, flight):
                     state, batch = next_batch(service)
                     if state == "end":
                         break
-                    actual.extend(batch.to_arrow(["range", "v"]).to_pylist())
+                    record = batch.to_arrow(["range", "v"])
+                    record.validate(full=True)
+                    actual.append(record)
                     batch.close()
             else:
                 source = service.result
@@ -79,12 +95,17 @@ def test_analytical_values_and_nulls(expression, flight):
                         state, batch = eventually(poll, lambda item: item[0] != "blocked")
                         if state == "end":
                             break
-                        actual.extend(batch.to_arrow(["range", "v"]).to_pylist())
+                        record = batch.to_arrow(["range", "v"])
+                        record.validate(full=True)
+                        actual.append(record)
                         batch.close()
                 finally:
                     receiver.close()
                     sender.close()
-            assert actual == expected
+            table = pa.Table.from_batches(actual)
+            # Compare Arrow values directly: Python datetime cannot preserve
+            # nanoseconds without the optional pandas dependency.
+            assert table.equals(expected.cast(table.schema))
 
 
 def test_nested_borrowed_slice_keeps_entire_frame_accounted():

@@ -176,6 +176,36 @@ def test_invalid_ack_and_duplicate_stream():
         sender.close()
 
 
+@pytest.mark.parametrize("value", [-(2**127) - 1, 2**127])
+def test_decimal256_outside_hugeint_range_is_rejected(value):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    schema = pa.schema([("c0", pa.decimal256(39, 0))])
+    record = pa.RecordBatch.from_arrays([pa.array([value], type=schema.field(0).type)], schema=schema)
+    record.validate(full=True)
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            return flight.GeneratorStream(schema, [(record, b"D:1")])
+
+        def do_action(self, context, action):
+            yield flight.Result(b"open")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection, "select null::hugeint")
+    sender = Sender(("127.0.0.1", 0))
+    receiver = service()
+    try:
+        receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "hugeint", target, "producer", 10)
+        error = eventually(lambda: target.snapshot()["error"], bool)
+        assert "outside the HUGEINT range" in error
+        assert target.snapshot()["bytes"] == 0
+    finally:
+        receiver.close()
+        sender.shutdown()
+
+
 def test_schema_mismatch_is_failure():
     with vane.connect(backend="local") as connection:
         source = make_channel(connection)

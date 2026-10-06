@@ -11,7 +11,8 @@ from dataclasses import replace
 import pytest
 
 import vane
-from tests.fast.test_analytical_exchange import EXPRESSIONS
+from tests.fast.test_analytical_exchange import EXPRESSIONS, HUGEINT_EXPRESSIONS, HUGEINT_VALUE_SQL
+from tests.fast.test_analytical_fragment_compiler import TOP_N_AGGREGATES
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -64,10 +65,131 @@ def test_public_analytical_type_roundtrip(tmp_path, mode):
     sql = f"select range, {columns} from range(13) order by range desc"
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
     with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
-        expected = local.execute(sql).to_arrow_table().to_pylist()
+        expected = local.execute(sql).to_arrow_table()
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
-            assert result.collect().to_pylist() == expected
+            table = result.collect()
+            table.validate(full=True)
+            assert table.equals(expected.cast(table.schema))
         assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_min_max_overloads(tmp_path, mode):
+    with (
+        vane.connect(backend="local") as local,
+        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+    ):
+        for sql in TOP_N_AGGREGATES:
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_hugeint_full_range(tmp_path, mode):
+    columns = ", ".join(f"{expr} c{i}" for i, expr in enumerate(HUGEINT_EXPRESSIONS))
+    queries = [
+        f"select range, {columns} from range(9) order by range desc",
+        "select sum(case when range=0 then '100000000000000000000000000000000000000'::hugeint "
+        "else 0::hugeint end)::varchar from range(4)",
+        f"select {HUGEINT_VALUE_SQL} v, count(*) from range(9) group by v order by v",
+        "select null::hugeint v where false",
+    ]
+    limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
+    with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
+        for sql in queries:
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                table.validate(full=True)
+                assert table.to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("cancel", ["close", "interrupt"])
+def test_fte_cancel_racing_with_admission_cannot_leave_waiter(tmp_path, monkeypatch, cancel):
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    entered, enqueue, cancellation_progress = [threading.Event() for _ in range(3)]
+    cancel_thread = []
+    schedulers = []
+
+    class ObservedLock:
+        """Release the race barrier once cancellation blocks or clears waiters."""
+
+        def __init__(self):
+            self.lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.get_ident() in cancel_thread and not self.lock.acquire(blocking=False):
+                cancellation_progress.set()
+                self.lock.acquire()
+            elif threading.get_ident() not in cancel_thread:
+                self.lock.acquire()
+
+        def __exit__(self, *args):
+            self.lock.release()
+
+    initialize = RecoveryScheduler.__init__
+
+    def observe_lock(owner, *args):
+        initialize(owner, *args)
+        owner.lock = ObservedLock()
+        schedulers.append(owner)
+
+    monkeypatch.setattr(RecoveryScheduler, "__init__", observe_lock)
+    limits = resources(tmp_path, worker_count=1, partitions=1)
+    with vane.connect(backend="ray", resources=limits) as connection:
+        assert connection.query("select 1").collect().column(0).to_pylist() == [1]
+        manager = connection.query_runtime.pool.admission
+        pressure = {name: 0 for name in manager.capacity}
+        pressure["contexts"] = limits.task_contexts_per_worker
+        assert manager.try_acquire("pressure", "pressure", {0: pressure})
+        acquire, cancel_waiting = manager.try_acquire, manager.cancel_waiting
+
+        def pause_enqueue(token, *args):
+            if token.startswith("fte/"):
+                entered.set()
+                assert enqueue.wait(10)
+            return acquire(token, *args)
+
+        def observe_cleared(query):
+            cancel_waiting(query)
+            # QueryResult may cancel before scheduler.close(). Wait for the
+            # final cancellation immediately before joining the dispatch thread.
+            if any(owner.context.query_id == query and owner.cleanup_lock.locked() for owner in schedulers):
+                cancellation_progress.set()
+
+        monkeypatch.setattr(manager, "try_acquire", pause_enqueue)
+        monkeypatch.setattr(manager, "cancel_waiting", observe_cleared)
+        result = connection.query("select range from range(9)", options=options(execution=60))
+
+        def stop():
+            cancel_thread.append(threading.get_ident())
+            if cancel == "interrupt":
+                connection.interrupt()
+            result.close()
+
+        try:
+            with ThreadPoolExecutor() as executor:
+                try:
+                    assert entered.wait(10)
+                    closing = executor.submit(stop)
+                    assert cancellation_progress.wait(5)
+                finally:
+                    enqueue.set()
+                closing.result(15)
+            assert manager.snapshot()["waiting"] == []
+            manager.release("pressure")
+            next_options = vane.QueryExecutionOptions(vane.RayExecution("pipelined"), 1, 30, 30)
+            with connection.query("select 7", options=next_options) as next_result:
+                assert next_result.collect().column(0).to_pylist() == [7]
+            assert_idle(connection)
+        finally:
+            enqueue.set()
+            result.close()
+            manager.release("pressure")
 
 
 def test_waiting_pipelined_graph_precedes_next_fte_attempt(tmp_path, monkeypatch):

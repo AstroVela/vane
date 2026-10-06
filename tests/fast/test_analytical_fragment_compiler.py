@@ -35,6 +35,24 @@ AGGREGATES = [
     "select range % 4 k, count(distinct range % 7) filter(where range % 3 = 0) from range(103) group by k",
 ]
 
+TOP_N_AGGREGATES = [
+    "select min(range, 3), max(range, 3) from range(4)",
+    "select min(range, 10), max(range, 10), sum(range) from range(4)",
+    "select range % 3 k, min(range, 4) filter(where range % 2=0), max(range, 4), count(*) "
+    "from range(31) group by k order by k",
+    "select min(x, 3), max(x, 3) from (select null::bigint x from range(9)) t",
+    "select min(range, 3), max(range, 3) from range(0)",
+    "select min([range]), max([range]) from range(9)",
+]
+
+
+@pytest.mark.parametrize("partitions", [1, 2, 7])
+@pytest.mark.parametrize("sql", TOP_N_AGGREGATES)
+def test_min_max_overloads(sql, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
 
 @pytest.mark.parametrize("partitions", [1, 3, 7])
 @pytest.mark.parametrize("sql", AGGREGATES)

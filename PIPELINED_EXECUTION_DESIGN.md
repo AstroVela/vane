@@ -289,9 +289,9 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 | 算子 | 分布与执行规则 |
 | --- | --- |
-| COUNT、SUM、MIN、MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
+| COUNT、SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
 | FLOAT/DOUBLE AVG | partial SUM 与 COUNT，final 合并后计算商；FILTER 在两项中一致传播；NULL 与空组保持 native 语义 |
-| DISTINCT、带排序的聚合、整数/decimal/时间 AVG | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，避免跨分区 DISTINCT 去重或 AVG 精度/舍入出错 |
+| DISTINCT、带排序的聚合、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n) | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
 | BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
@@ -746,6 +746,8 @@ producer_owned_bytes
 
 排队采用 FIFO。单个需求超过 worker 硬限时立即拒绝；只是被其他查询占用时进入可取消队列，不保留部分预留。Pipelined 在准入期限内等待，成功后的预留持续到所有 worker 确认清理。FTE 每个 attempt 清理完后归还容量，再以新的队列位置申请下一批，不能不断抢在已经等待的 pipelined 图前面。重试保持已排队 task 的身份和次序；取消只移除等待项，尚存活的 owner 必须完成清理才能退还容量。第一版不抢占已运行任务；FIFO 可能牺牲一部分利用率来保证先来的图获得完整容量。
 
+FTE 的取消检查、入队和 attempt 发布与取消共享同一调度锁；取消移除等待项后，调度线程不得再次为该查询入队。`close()` 等待调度线程退出后再完成资源回收，后续查询不受已取消查询的队首等待项阻塞。
+
 FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。高优先级也不能突破硬内存上限。CPU、公平性、native 内存和慢结果消费均纳入混跑验证。
 
 ## 统一结果交付
@@ -836,9 +838,9 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | Python、AI 与 GPU UDF | 明确拒绝 | 按 backend 验证资源、取消、类型及 FTE 重放能力 |
 | COPY、DataSink、DML 与扩展写入 | 明确拒绝 | 独立定义写入提交和副作用语义 |
 
-P4 使用 `vane.analytical-types:1`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
+P4 使用 `vane.analytical-types:2`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 
-DirectFlight 与 MaterializedIO 共用递归 Arrow 编解码，decimal 按 decimal128 传输，timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant，interval 保留 months/days/microseconds。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；计算过程的输入向量和有界测量临时空间属于 operator/staging 域。
+DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow 编码。DECIMAL 按 decimal128 传输；HUGEINT 使用 `decimal256(39,0)`，覆盖 `[-2^127, 2^127-1]`，包括嵌套子值。编码将原生 128 位缓冲符号扩展为 256 位，解码检查 signed 128-bit 边界后才恢复 native 值。旧 profile 不再接受，Arrow codec 源码也纳入 fragment build identity。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant，interval 保留 months/days/microseconds。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；计算过程的输入向量和有界测量临时空间属于 operator/staging 域。
 
 算子检查依据实际物理函数、scan 和 owned subplan，不能只看 SELECT 关键字。阻塞聚合、sort 和 join 可以合法等待完整输入；pipelined 只承诺允许的执行重叠，不承诺每条 SQL 都早产出。
 

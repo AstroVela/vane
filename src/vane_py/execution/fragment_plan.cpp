@@ -768,6 +768,11 @@ private:
 				throw NotImplementedException("unsupported distributed aggregate %s", name);
 			}
 			split = split && !aggregate.IsDistinct() && !aggregate.order_bys;
+			// MIN/MAX(x, n) return the n extreme values as a list. Applying
+			// unary MIN/MAX to partial lists compares whole lists, not elements.
+			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
+				split = false;
+			}
 			// Native integer/decimal AVG divides an exact accumulator in long
 			// double; a scalar DOUBLE SUM/COUNT would round too early. Temporal
 			// AVG also has native rounding rules. Keep complete groups for those
@@ -783,8 +788,8 @@ private:
 			return child;
 		}
 		if (!split) {
-			// DISTINCT needs complete input for each group; repartition original
-			// rows and let the native aggregate enforce its own SQL semantics.
+			// These overloads need complete input for each group; repartition
+			// original rows and let the native aggregate enforce SQL semantics.
 			auto keys = ProjectKeys(child, groups);
 			child =
 			    Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);

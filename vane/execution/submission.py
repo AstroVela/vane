@@ -31,7 +31,7 @@ from vane.execution.query_options import DistributedMode, QueryExecutionOptions,
 from vane.execution.resource_demand import ResourceDemand
 
 SUBMISSION_PROTOCOL_VERSION = 1
-TYPE_PROFILE = "vane.analytical-types:1"
+TYPE_PROFILE = "vane.analytical-types:2"
 CONNECTION_PROFILE = "vane.builtin-session:1"
 
 

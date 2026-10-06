@@ -430,6 +430,10 @@ void DirectFlight::ExportSchema(const vector<LogicalType> &types, const vector<s
 	Check(arrow::ExportSchema(*ArrowSchemaFor(types, names), out));
 }
 
+void DirectFlight::ExportBatch(DataChunk &chunk, const vector<string> &names, ArrowArray *array, ArrowSchema *schema) {
+	Check(arrow::ExportRecordBatch(*Encode(chunk, ArrowSchemaFor(chunk.GetTypes(), names)), array, schema));
+}
+
 DirectFlight::DirectFlight(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame)
     : impl(make_uniq<Impl>(host, advertise, maximum, staging, frame)) {
 }

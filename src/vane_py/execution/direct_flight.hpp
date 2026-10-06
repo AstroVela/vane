@@ -6,6 +6,7 @@
 #include "direct_exchange.hpp"
 
 struct ArrowSchema;
+struct ArrowArray;
 
 namespace duckdb {
 namespace vane_execution {
@@ -29,6 +30,7 @@ public:
 	bool Ready() const;
 	static idx_t StagingPerLink(idx_t frame_bytes);
 	static void ExportSchema(const vector<LogicalType> &types, const vector<string> &names, ArrowSchema *out);
+	static void ExportBatch(DataChunk &chunk, const vector<string> &names, ArrowArray *array, ArrowSchema *schema);
 
 private:
 	struct Impl;

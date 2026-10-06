@@ -12,7 +12,7 @@
 namespace duckdb {
 namespace vane_execution {
 namespace {
-std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type) {
+std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool native_layout = false) {
 	CheckExchangeType(type);
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
@@ -44,7 +44,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type) {
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
 	case LogicalTypeId::HUGEINT:
-		return arrow::decimal128(38, 0);
+		return native_layout ? arrow::decimal128(38, 0) : arrow::decimal256(39, 0);
 	case LogicalTypeId::DATE:
 		return arrow::date32();
 	case LogicalTypeId::TIME:
@@ -66,19 +66,58 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type) {
 	case LogicalTypeId::STRUCT: {
 		std::vector<std::shared_ptr<arrow::Field>> fields;
 		for (auto &child : StructType::GetChildTypes(type)) {
-			fields.push_back(arrow::field(child.first, ArrowTypeFor(child.second)));
+			fields.push_back(arrow::field(child.first, ArrowTypeFor(child.second, native_layout)));
 		}
 		return arrow::struct_(std::move(fields));
 	}
 	case LogicalTypeId::LIST:
-		return arrow::list(arrow::field("l", ArrowTypeFor(ListType::GetChildType(type))));
+		return arrow::list(arrow::field("l", ArrowTypeFor(ListType::GetChildType(type), native_layout)));
 	case LogicalTypeId::MAP:
-		return arrow::map(ArrowTypeFor(MapType::KeyType(type)), ArrowTypeFor(MapType::ValueType(type)));
+		return arrow::map(ArrowTypeFor(MapType::KeyType(type), native_layout),
+		                  ArrowTypeFor(MapType::ValueType(type), native_layout));
 	case LogicalTypeId::ARRAY:
-		return arrow::fixed_size_list(ArrowTypeFor(ArrayType::GetChildType(type)), ArrayType::GetSize(type));
+		return arrow::fixed_size_list(ArrowTypeFor(ArrayType::GetChildType(type), native_layout),
+		                              ArrayType::GetSize(type));
 	default:
 		throw NotImplementedException("unsupported exchange Arrow type: %s", type.ToString());
 	}
+}
+
+void CheckArrow(const arrow::Status &status) {
+	if (!status.ok()) {
+		throw IOException("native Arrow frame: %s", status.ToString());
+	}
+}
+
+std::shared_ptr<arrow::ArrayData> WidenHugeInts(const std::shared_ptr<arrow::ArrayData> &data,
+                                                const std::shared_ptr<arrow::DataType> &type) {
+	if (data->type->Equals(type)) {
+		return data;
+	}
+	if (type->id() == arrow::Type::DECIMAL256) {
+		// The native exporter owns a signed 128-bit buffer. Its decimal128(38)
+		// schema cannot describe the entire HUGEINT domain. Widen the values,
+		// including nested ones, before publishing a valid Arrow batch.
+		arrow::Decimal128Array values(data);
+		arrow::Decimal256Builder builder(type);
+		CheckArrow(builder.Reserve(values.length()));
+		for (int64_t row = 0; row < values.length(); row++) {
+			if (values.IsNull(row)) {
+				builder.UnsafeAppendNull();
+			} else {
+				builder.UnsafeAppend(arrow::Decimal256(arrow::Decimal128(values.GetValue(row))));
+			}
+		}
+		std::shared_ptr<arrow::Array> result;
+		CheckArrow(builder.Finish(&result));
+		return result->data();
+	}
+	auto result = data->Copy();
+	result->type = type;
+	for (idx_t i = 0; i < data->child_data.size(); i++) {
+		result->child_data[i] = WidenHugeInts(data->child_data[i], type->field(i)->type());
+	}
+	return result;
 }
 } // namespace
 
@@ -96,11 +135,20 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 	array.Init();
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
 	ArrowConverter::ToArrowArray(chunk, &array, properties, extensions);
-	auto result = arrow::ImportRecordBatch(&array, schema);
+	std::vector<std::shared_ptr<arrow::Field>> native_fields;
+	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(chunk.data[i].GetType(), true)));
+	}
+	auto result = arrow::ImportRecordBatch(&array, arrow::schema(std::move(native_fields)));
 	if (!result.ok()) {
 		throw IOException("native Arrow frame: %s", result.status().ToString());
 	}
-	return std::move(result).ValueOrDie();
+	auto native = std::move(result).ValueOrDie();
+	std::vector<std::shared_ptr<arrow::Array>> columns;
+	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+		columns.push_back(arrow::MakeArray(WidenHugeInts(native->column(i)->data(), schema->field(i)->type())));
+	}
+	return arrow::RecordBatch::Make(schema, chunk.size(), std::move(columns));
 }
 
 template <class Array, class T>
@@ -165,7 +213,22 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 	case LogicalTypeId::TIMESTAMP_TZ:
 		DecodePrimitive<arrow::TimestampArray, int64_t>(source, target, count);
 		break;
-	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::HUGEINT: {
+		auto &values = static_cast<const arrow::Decimal256Array &>(source);
+		for (idx_t row = 0; row < count; row++) {
+			if (source.IsNull(row)) {
+				continue;
+			}
+			arrow::Decimal256 value(values.GetValue(row));
+			auto words = value.little_endian_array();
+			hugeint_t native(int64_t(words[1]), words[0]);
+			if (value != arrow::Decimal256(arrow::Decimal128(native.upper, native.lower))) {
+				throw IOException("exchange value is outside the HUGEINT range");
+			}
+			FlatVector::GetData<hugeint_t>(target)[row] = native;
+		}
+		break;
+	}
 	case LogicalTypeId::DECIMAL: {
 		auto &values = static_cast<const arrow::Decimal128Array &>(source);
 		for (idx_t row = 0; row < count; row++) {
