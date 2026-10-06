@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "core_functions/aggregate/distributive_functions.hpp"
 #include "core_functions/aggregate/sum_helpers.hpp"
 #include "duckdb/common/exception.hpp"
@@ -5,6 +11,8 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/function/aggregate/hugeint_sum.hpp"
 
 namespace duckdb {
 
@@ -72,6 +80,81 @@ struct HugeintSumOperation : public BaseSumOperation<SumSetOperation, HugeintAdd
 		}
 	}
 };
+
+// Three unsigned limbs hold a signed 192-bit sum without signed arithmetic
+// overflow. This covers idx_t (64-bit) rows of signed 128-bit input, regardless
+// of the order in which distributed producers deliver their rows.
+struct WideHugeintSumState {
+	bool isset;
+	uint64_t lower, middle, upper;
+
+	void Initialize() {
+		isset = false;
+		lower = middle = upper = 0;
+	}
+	void Add(uint64_t low, uint64_t mid, uint64_t high) {
+		auto old_lower = lower;
+		lower += low;
+		auto carry = uint64_t(lower < old_lower);
+		auto old_middle = middle;
+		middle += mid;
+		upper += high + uint64_t(middle < old_middle);
+		old_middle = middle;
+		middle += carry;
+		upper += uint64_t(middle < old_middle);
+	}
+	void Combine(const WideHugeintSumState &other) {
+		isset = isset || other.isset;
+		Add(other.lower, other.middle, other.upper);
+	}
+};
+
+struct WideHugeintSumOperation {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.Initialize();
+	}
+	template <class STATE, class OP>
+	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
+		target.Combine(source);
+	}
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void Operation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &) {
+		state.isset = true;
+		state.Add(value.lower, uint64_t(value.upper), value.upper < 0 ? NumericLimits<uint64_t>::Maximum() : 0);
+	}
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void ConstantOperation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &input, idx_t count) {
+		for (idx_t row = 0; row < count; row++) {
+			Operation<INPUT_TYPE, STATE, OP>(state, value, input);
+		}
+	}
+	static bool IgnoreNull() {
+		return true;
+	}
+	template <class T, class STATE>
+	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+		if (!state.isset) {
+			finalize_data.ReturnNull();
+			return;
+		}
+		const auto sign_extension = state.middle >> 63 ? NumericLimits<uint64_t>::Maximum() : 0;
+		if (state.upper != sign_extension) {
+			throw OutOfRangeException("Overflow in HUGEINT sum");
+		}
+		target = hugeint_t(int64_t(state.middle), state.lower);
+	}
+};
+
+void HugeintSumSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+	serializer.WriteProperty(1, "wide_accumulator", false);
+}
+
+void WideHugeintSumSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+	serializer.WriteProperty(1, "wide_accumulator", true);
+}
+
+unique_ptr<FunctionData> HugeintSumDeserialize(Deserializer &deserializer, AggregateFunction &function);
 
 unique_ptr<FunctionData> SumNoOverflowBind(ClientContext &context, AggregateFunction &function,
                                            vector<unique_ptr<Expression>> &arguments) {
@@ -194,11 +277,31 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		    AggregateFunction::UnaryAggregate<SumState<hugeint_t>, hugeint_t, hugeint_t, HugeintSumOperation>(
 		        LogicalType::HUGEINT, LogicalType::HUGEINT);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+		function.SetSerializeCallback(HugeintSumSerialize);
+		function.SetDeserializeCallback(HugeintSumDeserialize);
 		return function;
 	}
 	default:
 		throw InternalException("Unimplemented sum aggregate");
 	}
+}
+
+unique_ptr<FunctionData> HugeintSumDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+	const auto wide = deserializer.ReadProperty<bool>(1, "wide_accumulator");
+	auto arguments = function.arguments;
+	auto original_arguments = function.original_arguments;
+	auto name = function.name;
+	auto return_type = deserializer.Get<const LogicalType &>();
+	if (arguments.size() != 1 ||
+	    (wide && (arguments[0] != LogicalType::HUGEINT || return_type != LogicalType::HUGEINT))) {
+		throw SerializationException("invalid HUGEINT sum accumulator signature");
+	}
+	function = wide ? WideHugeintSumFunction() : GetSumAggregate(arguments[0].InternalType());
+	function.arguments = std::move(arguments);
+	function.original_arguments = std::move(original_arguments);
+	function.name = std::move(name);
+	function.SetReturnType(return_type);
+	return nullptr;
 }
 
 unique_ptr<FunctionData> BindDecimalSum(ClientContext &context, AggregateFunction &function,
@@ -269,12 +372,26 @@ struct BignumOperation {
 
 } // namespace
 
+AggregateFunction WideHugeintSumFunction() {
+	auto function =
+	    AggregateFunction::UnaryAggregate<WideHugeintSumState, hugeint_t, hugeint_t, WideHugeintSumOperation>(
+	        LogicalType::HUGEINT, LogicalType::HUGEINT);
+	function.name = "sum";
+	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	function.SetSerializeCallback(WideHugeintSumSerialize);
+	function.SetDeserializeCallback(HugeintSumDeserialize);
+	return function;
+}
+
 AggregateFunctionSet SumFun::GetFunctions() {
 	AggregateFunctionSet sum;
 	// decimal
-	sum.AddFunction(AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr,
-	                                  nullptr, nullptr, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
-	                                  BindDecimalSum));
+	auto decimal =
+	    AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr, nullptr, nullptr,
+	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr, BindDecimalSum);
+	decimal.SetSerializeCallback(HugeintSumSerialize);
+	decimal.SetDeserializeCallback(HugeintSumDeserialize);
+	sum.AddFunction(decimal);
 	sum.AddFunction(GetSumAggregate(PhysicalType::BOOL));
 	sum.AddFunction(GetSumAggregate(PhysicalType::INT16));
 	sum.AddFunction(GetSumAggregate(PhysicalType::INT32));

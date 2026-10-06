@@ -73,6 +73,134 @@ DECIMAL_SUM_QUERIES = [
     "select sum(range::decimal(4,1)), count(*) from range(6)",
 ]
 
+ORDERED_INPUT = "select range, case when range=0 then 1e16 when range=2 then -1e16 else 1::double end v from range(4)"
+ORDERED_AGGREGATES = [
+    f"select sum(v order by range) from ({ORDERED_INPUT})",
+    "select avg(range::double order by range) from range(4)",
+    f"select sum(v order by v), avg(v order by v desc) from ({ORDERED_INPUT})",
+    f"select sum(v order by range desc), count(*), min(v), max(v) from ({ORDERED_INPUT})",
+    "select range % 2 k, sum(v order by range) filter(where range < 8), "
+    "avg(v order by range desc), count(*) from (select range, "
+    "case when range // 2=0 then 1e16 when range // 2=2 then -1e16 else 1::double end v from range(8)) "
+    "group by k order by k",
+    "select sum(v order by k nulls first, range desc) filter(where range % 3<>0), "
+    "avg(v order by k nulls last, range) from (select range, "
+    "case when range % 4=0 then null else range::double end v, "
+    "case when range % 5=0 then null else range % 7 end k from range(19))",
+    "select sum(distinct range::double order by range::double desc) filter(where range % 3<>0) from range(9)",
+    "select sum(null::double order by range), avg(null::double order by range) from range(9)",
+    "select sum(range::double order by range), avg(range::double order by range) from range(0)",
+]
+
+INTERNAL_AGGREGATE_REWRITES = [
+    "select k, count(*) n from (select case when range%2=0 then interval '1 month' "
+    "else interval '30 days' end k from range(20)) group by k",
+    "select interval '1 day' * (range % 3) k, count(*), sum(range) from range(19) group by k order by k",
+    "select case when range % 3=0 then null else interval '1 day' end k, count(*) "
+    "from range(19) group by k order by k nulls last",
+    "select min(x), max(x) from (select case when range%2=0 then 'A' else 'a' end collate nocase x from range(20))",
+    "select min(x), max(x) from (select case when range % 3=0 then null "
+    "when range % 3=1 then 'a' else 'B' end collate nocase x from range(19))",
+    "select range % 2 k, min(x) filter(where range<15), max(x), count(*) from (select range, "
+    "case when range % 3=0 then null when range % 3=1 then 'a' else 'B' end collate nocase x "
+    "from range(19)) group by k order by k",
+    "select min(x order by range desc), max(x order by range) from (select range, "
+    "case when range%2=0 then 'A' else 'a' end collate nocase x from range(20))",
+    "select min(x), max(x) from (select 'a' collate nocase x from range(0))",
+]
+
+HUGEINT_SUM_INPUT = (
+    "select range, case when range<3 then '-40000000000000000000000000000000000000'::hugeint "
+    "else '60000000000000000000000000000000000000'::hugeint end v from range(6)"
+)
+HUGEINT_SUM_QUERIES = [
+    f"select sum(v) from ({HUGEINT_SUM_INPUT})",
+    f"select sum(v)::varchar from ({HUGEINT_SUM_INPUT})",
+    f"select sum(-v) from ({HUGEINT_SUM_INPUT})",
+    f"select sum(v order by range), avg(v), count(v) from ({HUGEINT_SUM_INPUT})",
+    "select range % 2 k, sum(v) filter(where range<12), count(*), min(v), max(v) from (select range, "
+    "case when range<6 then '-40000000000000000000000000000000000000'::hugeint "
+    "else '60000000000000000000000000000000000000'::hugeint end v from range(12)) group by k order by k",
+    "select sum(null::hugeint) from range(7)",
+    "select sum(range::hugeint) from range(0)",
+]
+
+
+@pytest.mark.parametrize("sql", ORDERED_AGGREGATES)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("optimizer", [True, False])
+def test_ordered_aggregates_keep_complete_groups(sql, partitions, optimizer):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        if not optimizer:
+            connection.execute("pragma disable_optimizer")
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
+
+@pytest.mark.parametrize("sql", INTERNAL_AGGREGATE_REWRITES + HUGEINT_SUM_QUERIES)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+def test_native_aggregate_rewrites_and_accumulator_bounds(sql, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
+
+@pytest.mark.parametrize("call", ["first(range)", "arg_min(range, range)", "arg_max(range, range)"])
+def test_internal_aggregate_rewrites_do_not_expand_parsed_sql_subset(call):
+    with vane.connect(backend="local") as connection:
+        with pytest.raises(vane.NotImplementedException, match="does not support function"):
+            compile_sql(connection, f"select {call} from range(3)")
+
+
+@pytest.mark.parametrize("value", [10**38, -(10**38)])
+def test_hugeint_sum_still_rejects_native_overflow(value):
+    sql = f"select sum('{value}'::hugeint) from range(2)"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        with pytest.raises(vane.OutOfRangeException, match="[Oo]verflow"):
+            connection.execute(sql).fetchall()
+        with pytest.raises(vane.OutOfRangeException, match="[Oo]verflow"):
+            execute_graph(connection, compile_sql(connection, sql, 2))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize(
+    "values",
+    [
+        [2**127 - 1, 2**127 - 1, -(2**127 - 1)],
+        [-(2**127), -(2**127), 2**127 - 1, 1],
+        [2**64 - 1, 1, -(2**64)],
+        [-(2**127), 2**127 - 1, None, 1],
+    ],
+)
+def test_hugeint_complete_sum_uses_exact_wide_state(values, grouped, threads):
+    cases = " ".join(f"when {i} then '{value}'::hugeint" for i, value in enumerate(values) if value is not None)
+    value = f"case range // 3 {cases} end"
+    projection = "range % 3 k, " if grouped else ""
+    tail = " group by k order by k" if grouped else ""
+    sql = f"select {projection}sum({value}) from range({len(values) * 3}){tail}"
+    # Wider state also covers prefixes which exceed HUGEINT before canceling.
+    # Python integers provide an exact reference independent of native overflow.
+    expected = sum(v for v in values if v is not None)
+    if not grouped:
+        # Repeat each value with zeros, preserving a legal final result.
+        value = f"case when range % 3=0 then {value} else 0::hugeint end"
+        sql = f"select sum({value}) from range({len(values) * 3})"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        actual = execute_graph(connection, compile_sql(connection, sql, 2))
+    assert actual == ([(k, expected) for k in range(3)] if grouped else [(expected,)])
+
+
+def test_collated_aggregate_rebinding_preserves_physical_inputs():
+    sql = (
+        "select range % 2 k, min(x), max(x) from (select range, "
+        "case when range % 3=0 then null when range % 3=1 then 'a' else 'B' end x from range(19)) "
+        "group by k order by k"
+    )
+    with vane.connect(backend="local", config={"threads": 1, "default_collation": "nocase"}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, 2)) == expected
+
 
 def parquet_top_n_source(connection, directory):
     for index in range(2):

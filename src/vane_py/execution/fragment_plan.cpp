@@ -14,6 +14,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/aggregate/hugeint_sum.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -630,16 +631,17 @@ public:
 				throw NotImplementedException("distributed grouping sets are not supported");
 			}
 			return Aggregate(op, std::move(child), aggregate.grouped_aggregate_data.groups,
-			                 InputAggregates(aggregate.grouped_aggregate_data.aggregates, aggregate.filter_indexes));
+			                 InputAggregates(aggregate.grouped_aggregate_data.aggregates, &aggregate.filter_indexes));
 		}
 		case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
 			auto &aggregate = op.Cast<PhysicalPerfectHashAggregate>();
 			return Aggregate(op, std::move(child), aggregate.groups,
-			                 InputAggregates(aggregate.aggregates, aggregate.filter_indexes));
+			                 InputAggregates(aggregate.aggregates, &aggregate.filter_indexes));
 		}
 		case PhysicalOperatorType::UNGROUPED_AGGREGATE: {
 			vector<unique_ptr<Expression>> groups;
-			return Aggregate(op, std::move(child), groups, op.Cast<PhysicalUngroupedAggregate>().aggregates);
+			return Aggregate(op, std::move(child), groups,
+			                 InputAggregates(op.Cast<PhysicalUngroupedAggregate>().aggregates));
 		}
 		case PhysicalOperatorType::TOP_N: {
 			auto &top = op.Cast<PhysicalTopN>();
@@ -707,14 +709,18 @@ private:
 		return result;
 	}
 	vector<unique_ptr<Expression>> InputAggregates(const vector<unique_ptr<Expression>> &expressions,
-	                                               const unordered_map<Expression *, size_t> &filters) {
-		auto result = Copy(expressions);
-		for (idx_t i = 0; i < expressions.size(); i++) {
-			auto &original = expressions[i]->Cast<BoundAggregateExpression>();
-			if (original.filter) {
-				result[i]->Cast<BoundAggregateExpression>().filter->Cast<BoundReferenceExpression>().index =
-				    filters.at(original.filter.get());
+	                                               const unordered_map<Expression *, size_t> *filters = nullptr) {
+		vector<unique_ptr<Expression>> result;
+		for (auto &expression : expressions) {
+			auto &original = expression->Cast<BoundAggregateExpression>();
+			// Physical planning wraps ordered aggregates and clears order_bys.
+			// Restore the logical arguments/order keys before deciding whether a
+			// partial result can be merged, just as native serialization does.
+			auto aggregate = FunctionBinder::UnbindSortedAggregate(original);
+			if (filters && original.filter) {
+				aggregate->filter->Cast<BoundReferenceExpression>().index = filters->at(original.filter.get());
 			}
+			result.push_back(std::move(aggregate));
 		}
 		return result;
 	}
@@ -765,14 +771,19 @@ private:
 	                             const vector<unique_ptr<Expression>> &groups,
 	                             const vector<unique_ptr<Expression>> &aggregates) {
 		bool split = !aggregates.empty();
+		bool wide_sum = false;
 		for (auto &expression : aggregates) {
 			auto &aggregate = expression->Cast<BoundAggregateExpression>();
 			auto name = aggregate.function.name;
+			// Binder uses FIRST to retain an interval/collated group value, and
+			// ARG_MIN/MAX for collated MIN/MAX. Parsed SQL still admits only the
+			// public aggregate subset. Keep these native rewrites as complete groups.
+			const bool internal_rewrite = name == "first" || name == "arg_min" || name == "arg_max";
 			if (name != "count" && name != "count_star" && name != "sum" && name != "sum_no_overflow" &&
-			    name != "avg" && name != "min" && name != "max") {
+			    name != "avg" && name != "min" && name != "max" && !internal_rewrite) {
 				throw NotImplementedException("unsupported distributed aggregate %s", name);
 			}
-			split = split && !aggregate.IsDistinct() && !aggregate.order_bys;
+			split = split && !aggregate.IsDistinct() && !aggregate.order_bys && !internal_rewrite;
 			// MIN/MAX(x, n) return the n extreme values as a list. Applying
 			// unary MIN/MAX to partial lists compares whole lists, not elements.
 			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
@@ -782,9 +793,19 @@ private:
 			// partition's subtotal can exceed DECIMAL(38,s) even when cancellation
 			// across partitions leaves a valid final result. Exchange original rows
 			// and finalize complete groups instead of transporting that subtotal as
-			// a SQL DECIMAL value with insufficient precision.
-			if ((name == "sum" || name == "sum_no_overflow") && aggregate.return_type.id() == LogicalTypeId::DECIMAL) {
+			// a SQL DECIMAL value with insufficient precision. HUGEINT input can
+			// also overflow a partition accumulator despite a valid complete sum.
+			// Check the input type, so ordinary BIGINT SUM can still be split.
+			if ((name == "sum" || name == "sum_no_overflow") &&
+			    (aggregate.return_type.id() == LogicalTypeId::DECIMAL ||
+			     aggregate.children[0]->return_type.id() == LogicalTypeId::HUGEINT)) {
 				split = false;
+				if (aggregate.return_type == LogicalType::HUGEINT) {
+					// Whole-group input can still arrive with all positive values
+					// first. Widen the private state and check range at finalization.
+					aggregate.function = WideHugeintSumFunction();
+					wide_sum = true;
+				}
 			}
 			// Native integer/decimal AVG divides an exact accumulator in long
 			// double; a scalar DOUBLE SUM/COUNT would round too early. Temporal
@@ -797,7 +818,12 @@ private:
 			}
 		}
 		if (child.fragment.partition_count == 1) {
-			Wrap(op, child);
+			if (wide_sum) {
+				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
+				Wrap(aggregate, child);
+			} else {
+				Wrap(op, child);
+			}
 			return child;
 		}
 		if (!split) {

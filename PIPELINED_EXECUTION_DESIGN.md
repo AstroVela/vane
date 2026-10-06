@@ -289,9 +289,9 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 | 算子 | 分布与执行规则 |
 | --- | --- |
-| COUNT、非 DECIMAL SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
+| COUNT、非 DECIMAL/HUGEINT 输入的 SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
 | FLOAT/DOUBLE AVG | partial SUM 与 COUNT，final 合并后计算商；FILTER 在两项中一致传播；NULL 与空组保持 native 语义 |
-| DISTINCT、带排序的聚合、DECIMAL SUM、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n) | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
+| DISTINCT、带排序的聚合、DECIMAL/HUGEINT SUM、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n)、Binder 内部聚合改写 | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
 | BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
@@ -301,6 +301,12 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。包含这类 AVG 的聚合节点按完整 group 执行；跨节点的类型与最终精度仍由 native 决定。
 
 DECIMAL SUM 的原生累加器可以保存 39 位的 signed 128-bit 中间值，而其返回类型声明为 `DECIMAL(38,s)`。例如三个 `4×10³⁷` 和三个 `−3×10³⁷` 的总和合法，但前一个分区的部分和 `1.2×10³⁸` 不能作为 38 位 Arrow decimal 传输。包含 DECIMAL SUM 的整个聚合节点因此采用完整分组策略，保留 FILTER、NULL、scale 及同节点其他聚合的语义；代价是交换原始行，无法提前缩减为部分和。公开 DECIMAL 的 Arrow schema 继续使用声明的精度与 scale。
+
+HUGEINT 输入的 SUM 同样交换完整组。仅取消 partial 仍不足以避免溢出：异步输入可能让三个 `6×10³⁷` 先于三个 `−4×10³⁷` 到达。fragment 为这种 SUM 选择原生 signed 192-bit 私有累加状态，以三个 unsigned 64-bit limb 实现加法与 combine，足以覆盖最多 64-bit 行数的 signed 128-bit 输入。组完成后才检查最终结果是否超出 HUGEINT；NULL、空输入、FILTER、DISTINCT 和排序仍由原生聚合执行器处理。普通本地 SQL 继续使用既有 SUM，BIGINT 输入的 SUM 仍可拆分，最终 HUGEINT 类型与 Arrow profile 不变。函数序列化显式记录累加器选择，重放恢复相同实现。
+
+DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `order_bys`。fragment 在拆分判断前调用原生 `UnbindSortedAggregate`，恢复原始参数和排序键；带排序的 SUM/AVG 等聚合随后按完整组执行，避免把排序键当作普通函数参数或改变浮点运算顺序。Binder 为 INTERVAL 分组键生成的 `first`、为带 collation 的 MIN/MAX 生成的 `arg_min`/`arg_max` 也走完整组。解析阶段的公开函数集合不变，不因此开放直接调用这些内部聚合。
+
+物理计划反序列化时，聚合参数已指向计算好的输入列。重新绑定函数数据使用这些表达式的副本，保留原参数，避免 collation 绑定器重复包装输入列。该规则由物理反序列化作用域标记控制；逻辑表达式反序列化继续保留绑定器的参数改写。
 
 聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。没有引入兼容旧分布式聚合拆分器的接口。
 

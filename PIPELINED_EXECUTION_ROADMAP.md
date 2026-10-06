@@ -218,7 +218,7 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 ## P4 分析与混跑
 
-- [x] P4.1：COUNT、非 DECIMAL SUM、MIN/MAX 与浮点 AVG partial/final 聚合；DECIMAL SUM、DISTINCT、整数/decimal/时间 AVG 按完整 group 执行；FILTER 与空输入保持原生语义。
+- [x] P4.1：COUNT、非 DECIMAL/HUGEINT 输入的 SUM、MIN/MAX 与浮点 AVG partial/final 聚合；DECIMAL/HUGEINT SUM、DISTINCT、排序聚合、Binder 内部改写、整数/decimal/时间 AVG 按完整 group 执行；FILTER 与空输入保持原生语义。
 - [x] P4.2：等值 hash join、自动小 build 广播、native BuildReady、多个消费者独立关闭。
 - [x] P4.3：全局 LIMIT/OFFSET、单根 ORDER BY、partial/final TopN 与确定排序语义。
 - [x] P4.4：decimal、时间、二进制、LIST/STRUCT/MAP/ARRAY 的 native 帧及 Flight/物化传输。
@@ -468,3 +468,11 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - 新增 47 项长期回归：43 个 native 用例覆盖多文件、空分区、TopN/OFFSET、连接设置隔离、正负部分和、带 scale 的数值、分组与空输入；4 个公开 Ray 用例分别验证两种模式。4 个 Ray 用例在旧版本全部失败，修复后全部通过。
 - 本轮相关验证去重合计 **587 passed：573 个非 Ray、14 个真实 Ray**。包括 native/分析编译器、提交与源快照校验、分析类型交换、FTE 生成文件列限制，以及公开 Ray 分析 SQL/类型回归。未运行完整 release/fast 套件。
 - C++ 已用 `build/python-release` 增量 Release 编译并非 editable 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:4301d09c42a8f8968382355c4ef454c6a5bf4efb6a97c45a7c93a6806b213959`。root 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过；未修改 DuckDB 子树或 Arrow 传输 profile。
+
+### P4 排序聚合、内部改写与 HUGEINT 累加修正（基于 `8ab28102`）
+
+- fragment 在决定拆分前使用 `UnbindSortedAggregate` 恢复被 native 包装的原始参数和 ORDER BY，排序聚合按完整组执行。覆盖敏感浮点顺序、不同类型排序键的 AVG、FILTER、DISTINCT、NULL、空输入及关闭优化器的情况。
+- 允许 Binder 为 INTERVAL 分组键生成的 `first`、为 collated MIN/MAX 生成的 `arg_min`/`arg_max`，统一按完整组执行；公开 SQL 的函数集合不变。物理计划反序列化时对参数副本重新绑定函数数据，避免再次包装已计算的 collation 输入列；逻辑反序列化保持原行为。
+- HUGEINT 输入的 SUM 改为完整组并使用私有 signed 192-bit 原生累加器，保留最终 HUGEINT 类型，完成后检查范围。确定性验证分别让正数、负数分区先到达，避免只取消 partial 后仍因输入顺序发生 128-bit 中间溢出。普通本地 SUM 与 BIGINT partial/final 策略保持原有选择，Arrow profile 仍为 3。
+- 本轮新增 135 项长期回归，相关验证合计 **412 passed：382 个非 Ray、20 个仓库真实 Ray、10 个审查脚本用例**。审查脚本在修复前 10 项全部失败，修复后全部通过。未运行完整 release/fast 套件。
+- 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `14394740e9:fragment:483580233978e529e45be8a5f6728929a5f020bc7c3ae0d7f89919cdded42b70`。root 与 DuckDB 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。

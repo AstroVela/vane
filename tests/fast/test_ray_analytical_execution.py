@@ -20,6 +20,9 @@ from tests.fast.test_analytical_exchange import (
 )
 from tests.fast.test_analytical_fragment_compiler import (
     DECIMAL_SUM_QUERIES,
+    HUGEINT_SUM_QUERIES,
+    INTERNAL_AGGREGATE_REWRITES,
+    ORDERED_AGGREGATES,
     PARQUET_TOP_N_TAILS,
     TOP_N_AGGREGATES,
     parquet_top_n_source,
@@ -124,6 +127,26 @@ def test_public_decimal_sum_keeps_native_precision(tmp_path, mode):
                 table = result.collect()
                 table.validate(full=True)
                 assert table.equals(expected)
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize(
+    "queries",
+    [ORDERED_AGGREGATES, INTERNAL_AGGREGATE_REWRITES, HUGEINT_SUM_QUERIES],
+    ids=["ordered", "rewrites", "hugeint"],
+)
+def test_public_native_aggregate_semantics(tmp_path, mode, queries):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+    ):
+        for sql in queries:
+            expected = exchange_expected(local.execute(sql).to_arrow_table())
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                table.validate(full=True)
+                assert table.equals(expected.cast(table.schema)), sql
             assert_idle(connection)
 
 

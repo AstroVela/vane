@@ -213,6 +213,31 @@ def test_empty_temporal_flight_preserves_lossless_schema(expression, kind):
     assert table.schema.field("v").type == kind
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("first_partition", [0, 1])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_hugeint_sum_does_not_depend_on_producer_arrival(threads, first_partition, sign):
+    from tests.fast.test_analytical_fragment_compiler import HUGEINT_SUM_INPUT
+    from tests.fast.test_direct_exchange import until
+
+    sql = f"select sum(v * {sign}) from ({HUGEINT_SUM_INPUT})"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection, sql, partitions=2)
+        with InProcessTaskService(connection, spec, DirectExchangeLimits(4096, 1024, 8, 4)) as service:
+            producer = service.task_id(spec.graph.fragments[0].fragment_id, first_partition)
+            # Queue a complete signed half before allowing the other producer
+            # or aggregate to run. A plain 128-bit complete SUM still overflows.
+            service.start(producer)
+            until(
+                service,
+                lambda: any(
+                    t["task_id"] == producer and t["state"] == "OUTPUT_PENDING" for t in service.snapshot()["tasks"]
+                ),
+            )
+            service.start()
+            assert collect(service) == [(sign * 6 * 10**37,)]
+
+
 def test_nested_borrowed_slice_keeps_entire_frame_accounted():
     with vane.connect(backend="local", config={"threads": 1}) as connection:
         spec = submission(
