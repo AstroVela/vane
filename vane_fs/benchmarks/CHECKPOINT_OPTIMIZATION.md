@@ -200,7 +200,11 @@ command again reports a warning while its mount and process do stop; the raw
 records retain it. Frozen sources, binaries, logs, host telemetry and complete
 cleanup manifests remain in the artifact directories referenced by the JSON.
 
-The next useful experiment is a larger immutable payload extent stored inside
-the SQLite transaction, measuring both write amplification and 4 KiB random
-reads before changing the persistent format. An external payload store would
-also require an explicit crash-consistency protocol between content and metadata.
+The subsequent [immutable payload extent experiment](payload_extents/README.md)
+tests 64 KiB and 256 KiB BLOBs inside the existing SQLite transaction. Six-round
+FUSE measurements improve 256 MiB writes by 13.3% and 16.8%, but random reads
+regress by 17.1% and 48.9%, with additional retention of partially live extents.
+Neither prototype changes the production format. The experiment retains its
+source patches, measurements, read-amplification diagnosis and GC-space checks.
+An external payload store would also require an explicit crash-consistency
+protocol between content and metadata.
