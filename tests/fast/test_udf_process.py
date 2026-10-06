@@ -336,6 +336,17 @@ def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_streaming_output_capacity_survives_early_event_consumption(monkeypatch):
+    """An early consumer's restored capacity must survive the publisher resuming."""
+    monkeypatch.setenv("VANE_ENABLE_UDF_TEST_HOOKS", "1")
+    # The native probe publishes a COMPLETE event for an already-consumed
+    # output, then joins a consumer thread at the queue-unlock boundary.
+    # No sleeps or scheduling luck are needed to exercise the stale-clear race.
+    rows, byte_capacity, item_capacity, queued, completed = vane._native._test_streaming_output_capacity_publication()
+    assert (queued, completed) == (0, 1)
+    assert (rows, byte_capacity, item_capacity) == (1, 4096, 4096)
+
+
 def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
     """Finalize must keep output-event progress alive after a stale source callback."""
     import os
