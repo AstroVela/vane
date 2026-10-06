@@ -139,7 +139,7 @@ def make_consumer(config):
             assert self.task_id is not None
             return compute(batch, self.task_id)
 
-        def close(self):
+        def _vane_close(self):
             from vane.execution.udf_actor_callable import ActorCallableRuntime
 
             ActorCallableRuntime.__call__ = self.original_invoke
