@@ -1,0 +1,76 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -549,0 +550,67 @@
++}
++
++// Called only after unreachable versions have been removed, inside the GC write
++// transaction. Repack every distinct surviving slice, including references from
++// snapshots and other branches. Publish new immutable payloads atomically; WAL
++// readers keep their original view. Memory is bounded by one extent (256 KiB).
++int64_t CompactPayloads(sqlite3 *db) {
++	int64_t last = 0, ceiling = 0, removed = 0;
++	{
++		Statement maximum(db, "SELECT coalesce(max(id),0) FROM block_payloads");
++		maximum.Step();
++		ceiling = maximum.Integer(0);
++	}
++	while (last < ceiling) {
++		int64_t id;
++		{
++			Statement candidate(db, "SELECT p.id FROM block_payloads p WHERE p.id>? AND p.id<=? "
++			                        "AND length(p.data)>4096 AND (SELECT count(DISTINCT v.payload_offset) "
++			                        "FROM block_versions v WHERE v.payload=p.id)<length(p.data)/4096 "
++			                        "ORDER BY p.id LIMIT 1");
++			candidate.Bind(1, last);
++			candidate.Bind(2, ceiling);
++			if (!candidate.Step())
++				break;
++			id = candidate.Integer(0);
++		}
++		last = id;
++		std::vector<int64_t> offsets;
++		std::string packed;
++		{
++			Statement slices(db, "SELECT DISTINCT payload_offset FROM block_versions WHERE payload=? "
++			                     "ORDER BY payload_offset");
++			slices.Bind(1, id);
++			PayloadReader reader(db);
++			while (slices.Step()) {
++				auto offset = slices.Integer(0);
++				auto start = packed.size();
++				packed.resize(start + BLOCK_SIZE);
++				reader.Read(id, offset, 0, BLOCK_SIZE, &packed[start]);
++				offsets.push_back(offset);
++			}
++		}
++		// Entirely dead payloads were already deleted by the caller.
++		if (offsets.empty())
++			Fail(ErrorCode::Storage, "Unreferenced compaction candidate");
++		int64_t replacement;
++		{
++			Statement insert(db, "INSERT INTO block_payloads(data) VALUES(?)");
++			insert.BindBytes(1, packed);
++			insert.Step();
++			replacement = sqlite3_last_insert_rowid(db);
++		}
++		for (size_t i = 0; i < offsets.size(); i++) {
++			Statement remap(db, "UPDATE block_versions SET payload=?,payload_offset=? "
++			                    "WHERE payload=? AND payload_offset=?");
++			remap.Bind(1, replacement);
++			remap.Bind(2, int64_t(i) * BLOCK_SIZE);
++			remap.Bind(3, id);
++			remap.Bind(4, offsets[i]);
++			remap.Step();
++		}
++		Statement erase(db, "DELETE FROM block_payloads WHERE id=?");
++		erase.Bind(1, id);
++		erase.Step();
++		removed += sqlite3_changes64(db);
++	}
++	return removed;
+@@ -801,0 +869,3 @@
++			// Pointer maps let SQLite skip consecutive overflow pages during slice reads.
++			// INCREMENTAL never moves pages automatically at commit.
++			Exec(db, "PRAGMA auto_vacuum=INCREMENTAL");
+@@ -1808,0 +1879 @@
++	result.payloads += CompactPayloads(database->db);

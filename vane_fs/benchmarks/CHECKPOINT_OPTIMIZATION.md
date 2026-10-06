@@ -208,3 +208,11 @@ Neither prototype changes the production format. The experiment retains its
 source patches, measurements, read-amplification diagnosis and GC-space checks.
 An external payload store would also require an explicit crash-consistency
 protocol between content and metadata.
+
+The [slice lookup and GC follow-up](payload_extents/slice_gc/README.md) enables
+SQLite pointer maps and atomically repacks surviving slices in isolated
+prototypes. Fresh-allocation random reads approach the baseline, and the sparse
+case now retains only its 128 KiB of live content. Fragmented page reuse still
+amplifies random reads, while reclaiming 512 KiB from mostly live extents makes
+GC about 14 times slower in the 8 MiB fixture. Both candidates remain outside
+the production format; all measurements and failure/recovery checks are retained.

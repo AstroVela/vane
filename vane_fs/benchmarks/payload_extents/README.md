@@ -6,6 +6,12 @@ adopted into the production format. The patch and preparation script are
 research artifacts; the normal component build still uses `src/workspace.cpp`
 with 4 KiB payloads.
 
+The [2026-10-07 slice lookup and GC follow-up](slice_gc/README.md) reclaims dead
+slices and improves random reads on fresh allocation. It also demonstrates
+that fragmented free-page reuse restores read amplification and that aggressive
+compaction makes mostly live GC substantially slower. The candidates remain
+experimental; the original measurements below are preserved.
+
 ## Design
 
 The baseline is `82ce177d10`, whose production storage code is `7cccaf814f`.
