@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small shim for expression helper classes used in runners."""
+"""Expression helpers."""
 
 from __future__ import annotations
 

@@ -81,7 +81,7 @@ def test_vane_adbc_public_exports_are_explicit():
 
 
 def test_vane_lazily_exposes_owned_public_submodules():
-    for name in ("ai", "runners", "sqltypes", "udf"):
+    for name in ("ai", "sqltypes", "udf"):
         assert getattr(vane, name) is importlib.import_module(f"vane.{name}")
         assert name in dir(vane)
 
@@ -267,27 +267,12 @@ def test_vane_distribution_declares_inline_types():
 
 def test_vane_distribution_owns_only_the_vane_import_namespace():
     files = {str(path).replace("\\", "/") for path in distribution("vane-ai").files or []}
-    removed_runner_compatibility_modules = {
-        "vane/runners/ray/_fte_compat.py",
-        "vane/runners/ray/fte.py",
-        "vane/runners/ray/fte_attempts.py",
-        "vane/runners/ray/fte_config.py",
-        "vane/runners/ray/fte_descriptor.py",
-        "vane/runners/ray/fte_events.py",
-        "vane/runners/ray/fte_exchange.py",
-        "vane/runners/ray/fte_execution.py",
-        "vane/runners/ray/fte_failures.py",
-        "vane/runners/ray/fte_scheduler.py",
-        "vane/runners/ray/fte_split_assigner.py",
-        "vane/runners/ray/fte_state.py",
-        "vane/runners/ray/fte_types.py",
-        "vane/runners/ray/fte_update_batch.py",
-        "vane/runners/ray/fte_worker_runtime.py",
-    }
+    removed_modules = {"vane/_ray_cxx.py", "vane/_native/ray_cxx.pyi", "vane/datasource/_memory.py"}
 
     assert any(path.startswith("vane/_native.") and path.endswith((".so", ".pyd")) for path in files)
     assert not any(path == "duckdb" or path.startswith(("duckdb/", "_duckdb", "adbc_driver_duckdb/")) for path in files)
-    assert files.isdisjoint(removed_runner_compatibility_modules)
+    assert not any(path.startswith("vane/runners/") for path in files)
+    assert files.isdisjoint(removed_modules)
 
 
 def _requirements_for_extra(extra):

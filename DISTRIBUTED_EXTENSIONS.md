@@ -1,6 +1,16 @@
 # Distributed DuckDB extension architecture
 
-## Scope
+## Current execution support
+
+P5.1 removes the old PlanRunner and Ray extension scheduler. The engine-level
+contracts below remain reference material for future extension integration.
+Public Ray `query()` currently supports the built-in scan/type/operator subset
+in the [execution design](PIPELINED_EXECUTION_DESIGN.md#native-编译与加载);
+provider-backed scans, media expressions and distributed writes are not wired
+into that entry point. Native local extension loading and provider identity
+validation remain available.
+
+## Scope of the extension contract
 
 This document defines the explicit contracts that let a DuckDB extension
 participate in Vane's Ray distributed execution. The engine owns scheduling,
@@ -452,17 +462,10 @@ contract before translation, task selection, preparation, or artifact creation.
 There is no mode inference: the physical shape must exactly match the declared
 mode.
 
-Python relation INSERT, UPDATE, DELETE, MERGE, and CTAS mutations follow the selected
-backend strictly. This includes `insert_into`, row-value `insert`, `update`,
-`delete`, `merge_into`, and `create`/`to_table`. An unset, empty, or explicit
-`VANE_RUNNER=ray` dispatches the mutation to Ray and requires the target to
-translate to a registered distributed extension write; an ordinary DuckDB
-table target therefore reports an unsupported distributed operator instead of
-executing locally. For MERGE, the target catalog's `PlanMergeInto` implementation
-must likewise return an extension physical root with an
-`ExtensionWriteTaskProvider`. `VANE_RUNNER=local-fast` selects native DuckDB execution as
-a separate backend. Other runner values are not mutation backends, and neither
-backend falls back to the other.
+Public Python Relation mutations (`insert_into`, `insert`, `update`, `delete`,
+`merge_into`, and `create`/`to_table`) now require a local connection. The Ray
+query entry does not yet implement the distributed write contract described
+here. Backend selection is explicit on the connection.
 
 ### File-artifact mode
 

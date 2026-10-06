@@ -22,7 +22,7 @@ import vane
 import vane.datasink as datasink
 import vane.datasink.doris as doris
 from vane import DorisStreamLoadSink, EnvironmentSecret
-from vane.datasink import BoundDataSink, DataSinkExecutionOptions, DataSinkWriteError, WriteContext, WriteOutcome
+from vane.datasink import BoundDataSink, WriteContext, WriteOutcome
 
 _REAL_LOAD_AIOHTTP = doris._load_aiohttp
 _REAL_OPEN_HTTP_TRANSPORT = doris._open_http_transport
@@ -295,33 +295,9 @@ def _stream_load_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, 
         thread.join(timeout=5)
 
 
-@pytest.fixture(params=["local-fast", "local", pytest.param("ray", marks=pytest.mark.real_ray)])
-def _doris_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-
-    runner_type = request.param
-    runner = None
-    if runner_type == "ray":
-        request.getfixturevalue("ray_local")
-        from vane.runners.ray.runner import RayRunner
-
-        runner = RayRunner(address=None, max_task_backlog=None)
-    elif runner_type == "local":
-        from vane.runners.local.runner import LocalRunner
-
-        # LocalRunner writes these settings too; retain pytest's environment cleanup.
-        monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
-        monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
-        runner = LocalRunner(num_workers=2)
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-    if runner is not None:
-        factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
-        monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
-    try:
-        yield runner_type
-    finally:
-        if runner_type == "ray":
-            assert runner is not None
-            runner.close()
+@pytest.fixture
+def _doris_runner() -> str:
+    return "local"
 
 
 @pytest.mark.parametrize("column_name", ["title", "embedding"])
@@ -416,7 +392,6 @@ def test_doris_sink_live_input_is_distributable(
     assert pa.concat_tables(batches).sort_by("id").equals(expected)
 
 
-@pytest.mark.parametrize("_doris_runner", ["local-fast", "local"], indirect=True)
 def test_doris_sink_public_write_from_running_event_loop(
     _stream_load_server: tuple[str, list[_Call]], _doris_runner: str
 ) -> None:
@@ -1566,51 +1541,6 @@ def test_doris_sink_cancellation_after_async_body_upload_keeps_the_label(monkeyp
         worker.close()
     assert aiohttp.session.closed
     assert transport._loop.is_closed()
-
-
-@pytest.mark.parametrize("error_type", [KeyboardInterrupt, asyncio.CancelledError])
-def test_doris_sink_interruption_keeps_the_label_in_the_public_error(
-    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
-) -> None:
-
-    interruption = error_type("planned write interruption")
-    _Transport.responses = [interruption, _success]
-    operation_id = "doris-interruption-no-retry"
-
-    class FakeRunner:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def run_datasink(self, _relation: object) -> None:
-            self.calls += 1
-            runtime = datasink._SinkBatchRuntime(_bound(), WriteContext(operation_id), None)
-            try:
-                runtime(_table())
-            finally:
-                runtime.close()
-
-    runner = FakeRunner()
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
-    # Fault-inject a retry budget: cancellation must stay terminal even when
-    # the framework would otherwise replay an UNKNOWN outcome.
-    monkeypatch.setattr(
-        doris._BoundDorisStreamLoadSink,
-        "execution_options",
-        property(lambda _self: DataSinkExecutionOptions(max_retries=3)),
-    )
-    with vane.connect() as connection, pytest.raises(DataSinkWriteError) as exc_info:
-        _live_input_relation(connection).write_datasink(_sink(), operation_id=operation_id)
-
-    assert runner.calls == 1
-    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert exc_info.value.__cause__ is interruption
-    assert exc_info.value.summary.results == ()
-    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
-    transport = _Transport.instances[0]
-    assert len(transport.calls) == len(_Transport.responses) == transport.close_calls == 1
-    assert f"label {transport.calls[0].headers['label']!r}" in exc_info.value.detail
-    assert "inspect that label" in exc_info.value.detail
 
 
 def test_doris_sink_treats_publish_timeout_as_applied_with_warning() -> None:

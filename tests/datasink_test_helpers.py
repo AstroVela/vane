@@ -18,33 +18,10 @@ from vane import DuckDBPyRelation
 from vane.datasink import BoundKeyedUpsertSink, DataSink, DataSinkExecutionOptions, DataSinkWorker, WriteContext
 
 
-@pytest.fixture(params=["local-fast", "local", pytest.param("ray", marks=pytest.mark.real_ray)])
-def datasink_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    import vane
-
-    runner_type = request.param
-    runner = None
-    if runner_type == "ray":
-        request.getfixturevalue("ray_local")
-        from vane.runners.ray.runner import RayRunner
-
-        runner = RayRunner(address=None, max_task_backlog=None)
-    elif runner_type == "local":
-        from vane.runners.local.runner import LocalRunner
-
-        monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
-        monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
-        runner = LocalRunner(num_workers=2)
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-    if runner is not None:
-        factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
-        monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
-    try:
-        yield runner_type
-    finally:
-        if runner_type == "ray":
-            assert runner is not None
-            runner.close()
+@pytest.fixture
+def datasink_runner() -> Iterator[str]:
+    """DataSink writes use the local native Relation executor."""
+    yield "local"
 
 
 def recording_sdk_sink(

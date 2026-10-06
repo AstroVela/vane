@@ -129,9 +129,6 @@ def _assert_both(python: Path, first: str, second: str, *, cwd: Path) -> None:
         duckdb_adbc = importlib.import_module("adbc_driver_duckdb.dbapi")
         vane_udf = importlib.import_module("vane.udf")
         duckdb_func = importlib.import_module("duckdb.func")
-        # This validation executes through the raw connection, without a
-        # distributed query context that could supply a Ray query_id.
-        vane.configure(runner="local")
         vane_connection = vane.connect()
         duckdb_connection = duckdb.connect()
 
@@ -221,14 +218,6 @@ def _assert_both(python: Path, first: str, second: str, *, cwd: Path) -> None:
 
         vane_relation = vane_connection.sql("SELECT 1 AS value")
         duckdb_relation = duckdb_connection.sql("SELECT 1 AS value")
-        assert_rejected(
-            TypeError,
-            lambda: vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                duckdb_relation,
-                "reject-official-relation",
-            ),
-            "Vane DuckDBPyRelation",
-        )
         assert_rejected(
             vane.InvalidInputException,
             lambda: vane_connection.execute(duckdb.extract_statements("SELECT 1")[0]),

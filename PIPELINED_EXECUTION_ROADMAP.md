@@ -2,7 +2,7 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果，已通过 PR #963 合入 a69e60ca43d9。P4 从该合入提交切出独立的 feat/analytical-execution 分支。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果，已通过 PR #963 合入 a69e60ca43d9。P4 已通过 PR #970 合入 integration/pipelined-execution，提交为 5d41a675e6。P5.1 从该提交切出 refactor/execution-cutover。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则
 
@@ -22,7 +22,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
+| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1 已实现并完成相关验收；P5.2/P5.3 待开始 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -230,12 +230,30 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 ## P5 删除与发布
 
-- [ ] 删除已被接管的旧 runner 分流、计划执行耦合、FTE manager、结果包装和配置别名。
-- [ ] 所有受支持调用方、文档与测试改用新契约。
-- [ ] 验证新入口没有依赖旧执行路径，也没有自动 fallback。
-- [ ] 完成冷启动、预热、首批、吞吐、混跑、慢客户端及故障恢复基准。
-- [ ] 根据实测确定容量默认值，公布支持范围和失败边界。
-- [ ] 完成受影响测试、native 验证与仓库 release gate。
+### P5.1 入口切换与旧执行路径删除
+
+- [x] 默认连接为 local；`query()` 惰性创建会话共有的 QueryRuntime，独立 cursor 共享一次准入计费。
+- [x] Ray 只通过 `query()` 执行声明支持的 SELECT；native SQL/Relation 执行拒绝 Ray 连接。
+- [x] 删除 Python runners、旧 FTE manager、原生 Ray plan/task/worker 绑定、全局 runner 设置及旧 Arrow 分区结果适配。
+- [x] 删除 `VANE_RUNNER` 和 `configure(runner=...)` 的选择作用；连接参数决定 backend，查询参数决定 Ray 策略。
+- [x] 保留独立模型服务；模型注册直接读取原生 UDF 元数据，资源图直接观察原生算子，不借用旧分布式计划或执行器。
+- [x] 迁移受支持调用方、类型声明、文档、release gate 和 sdist 清单；历史 GPU 基准标明需要改用注册模型。
+- [x] 完成相关测试、非 editable native 构建及安装内容校验。
+
+本步不引入兼容适配或自动 fallback。旧计划对象和 runner 内部接口的测试退出；有效的 SQL、schema、取消、资源计费和结果所有权场景通过公开 query、SQL/Relation 和模型接口验收。
+
+### P5.2 差分与性能验收
+
+- [ ] 系统化比较 local、Ray pipelined、Ray FTE 的支持子集，扩展边界 SQL/type 差分样本。
+- [ ] 测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。
+- [ ] 根据实测调整容量默认值，并给出数值依据。
+
+### P5.3 发布验收
+
+- [ ] 固定支持矩阵和失败边界，完成跨平台 CI 与 release gate。
+- [ ] 更新发布文档与版本，按验收结果发布。
+
+P5.1 本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 和 P5.3 未完成前不宣称 P5 整体完成。
 
 ## 增量验收记录
 
@@ -492,3 +510,16 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - 增加多层 SUM/MAX 回归：内层产生 `1.2×10³⁸` 和 `−9×10³⁷`，经过两层或三层聚合后返回合法结果。两种 Ray 模式覆盖正负系数与 scale 0/5/38，并精确比较最终 Arrow schema。原生/Flight/物化回归覆盖 39 位容器子值、完整 native 系数边界、越界拒绝和空结果精度。
 - 本轮新增 66 项长期回归；相关验证分批去重合计 **943 passed：910 个仓库非 Ray、30 个仓库真实 Ray、3 个审查脚本用例**。审查脚本在修复前 1 项通过、两种 Ray 模式失败，修复后全部通过。未运行完整 release/fast 套件。
 - 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `a971e0b82e:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`。root 格式、Ruff、mypy、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。
+
+### P5.1 入口切换与旧路径删除（2026 年 10 月 7 日）
+
+- 从 P4 合入提交 `5d41a675e6` 切出 `refactor/execution-cutover`，目标为 `integration/pipelined-execution`。默认连接使用 native local；首次 query 在会话锁内只发布一个 QueryRuntime，独立 cursor 共享准入计费。Ray 连接通过 query 使用 pipelined/FTE，native SQL/Relation 终端明确拒绝 Ray。
+- 删除 Python runners、旧 FTE 调度器、native Ray 计划/任务/worker 绑定、全局配置接口和旧分区结果适配。独立 UDF 服务需要的环境、等待和资源协议移入 execution；模型注册和资源图直接读取原生计划。
+- 保留参数、事务、模型复用、取消和结果所有权语义的相关回归，迁移原生 UDF byte-wait 的 146 项算子用例。旧协议专用测试随实现删除。媒体 provider 的跨节点身份测试继续使用独立原生连接验证快照，不再构造旧分布式计划，也不宣称 Ray query 支持媒体 SQL。
+- 迁移示例、分析基准、类型声明、包清单及 CI 选择器；移除空的 release cluster-owner 分组，独立制品测试仍由对应 CI/fast 分组执行。Ray 模型 UDF、媒体 SQL、分布式写入和未迁移的历史 GPU 基准不在本轮支持范围内。删除依赖旧默认 Ray runner 的 Cosmos GPU 端到端用例，保留 provider/SQL 绑定回归；其 GPU 验收仍需迁移到注册模型接口。
+- 最终非 Ray 定向集合为 **1,795 passed、28 skipped**：初次运行 1,793 项通过，两个 Cosmos 旧执行预期修正后，该模块 20 项全部通过。覆盖编译与提交、分析交换、直接通道/Flight、QueryResult、公开入口、类型与包契约、模型/AI 调用方、GPU 模型准入的 CPU 用例及本地服务验收。另已运行调用方迁移回归和原生 UDF 所有权完整矩阵（146 项通过）。跳过项需要可选 ADBC 依赖或 native_media 制品；未运行 CUDA 硬件验收。
+- 真实 Ray 三个相关模块首轮为 **82 passed、1 failed**；失败为慢查询的 Flight 超时，独立复跑成功与超时两个对照用例均通过（**2 passed**）。最终 wheel 的公开入口、分析 SQL 和慢查询/超时复核 **6 passed**。该次超时暂未稳定复现，不据此宣称已完成性能或 release 验收。
+- 增量 Release 构建、非 editable 安装、202 个 Python/类型文件及 native 构建产物一致性校验通过。当前 engine identity 为 `cf29aa2922:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`；DuckDB 子树仅更新两条过时 GPU 错误提示。
+- root/DuckDB 格式、Ruff、全包 mypy、安装后的类型用例、适用 pre-commit、源码版权清单、文档本地链接、源码包校验和安装后 Quickstart 通过。fast 全树仅做收集及夹具依赖检查，未执行完整 release/fast 套件。本地平台为 Linux/Python 3.12；跨平台及硬件/制品 CI 仍需验收。
+
+P5.1 实现进入审查；下一步为 P5.2 的 SQL/type 差分和可复现性能验收，之后再进行 P5.3 发布资格验证。

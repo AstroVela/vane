@@ -15,9 +15,6 @@ from pathlib import Path
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-# Vane's import can create its default connection. Set the test policy before
-# that import; later environment changes do not change an existing connection.
-os.environ.setdefault("VANE_RUNNER", "local-fast")
 vane = import_module("vane")
 
 try:
@@ -39,14 +36,6 @@ def _get_pandas_ge_3():
 
 
 PANDAS_GE_3 = _get_pandas_ge_3()
-
-
-@pytest.fixture(autouse=True)
-def default_vane_runner_for_tests(monkeypatch):
-    """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
-    # Record the current value even when it is already set. Runner-selection
-    # APIs mutate the environment directly and must not leak to later tests.
-    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
 
 
 def is_string_dtype(dtype):
@@ -76,12 +65,9 @@ _REAL_RAY_FIXTURES = frozenset(
     {
         "_ray_local_cluster",
         "ray_local",
-        "ray_runner",
-        "ray_runner_local_cluster",
         "ray_subprocess_env",
     }
 )
-_RAY_CLUSTER_OWNER_FIXTURES = frozenset({"ray_runner_local_cluster"})
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -90,8 +76,6 @@ def pytest_collection_modifyitems(config, items):
         fixture_names = set(item.fixturenames)
         if fixture_names & _REAL_RAY_FIXTURES:
             item.add_marker(pytest.mark.real_ray)
-        if fixture_names & _RAY_CLUSTER_OWNER_FIXTURES:
-            item.add_marker(pytest.mark.ray_cluster_owner)
 
     tests_to_skip = config.getoption("--skiplist")
     if not tests_to_skip:
@@ -342,18 +326,6 @@ def ray_local(_ray_local_cluster):
     try:
         yield
     finally:
-        try:
-            vane_mod = vane
-            if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
-                vane_mod.teardown_runner()
-        except Exception as e:
-            print(f"WARNING: Exception during Vane runner teardown: {e}", file=sys.stderr)
-        try:
-            from vane.runners.ray import driver as ray_driver
-
-            ray_driver.shutdown_background_event_loop()
-        except Exception:
-            pass
         prev_handler = None
         alarm_set = False
         try:

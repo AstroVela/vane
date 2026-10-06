@@ -406,12 +406,12 @@ def test_expression_udf_callable_pickle_survives_live_function_gc():
     assert out.fetchall() == [(1,), (2,), (3,)]
 
 
-def test_vane_function_scalar_map_expression_ray_backend_explain():
+def test_vane_function_scalar_map_expression_ignores_runner_environment():
     import vane
 
     old_runner = os.environ.get("VANE_RUNNER")
     try:
-        vane.configure(runner="ray")
+        os.environ["VANE_RUNNER"] = "ray"
 
         @vane.func(return_dtype="INTEGER")
         def add_one(value):
@@ -422,7 +422,7 @@ def test_vane_function_scalar_map_expression_ray_backend_explain():
         plan = rel.select(add_one(vane.col("x")).alias("y")).explain()
 
         assert "execution_backend:" in plan
-        assert "ray_task" in plan
+        assert "subprocess_task" in plan
     finally:
         if old_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -430,7 +430,7 @@ def test_vane_function_scalar_map_expression_ray_backend_explain():
             os.environ["VANE_RUNNER"] = old_runner
 
 
-def test_vane_function_scalar_map_uses_ray_runner_from_env(monkeypatch):
+def test_vane_function_scalar_map_ignores_ray_runner_environment(monkeypatch):
     import vane
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
@@ -445,5 +445,5 @@ def test_vane_function_scalar_map_uses_ray_runner_from_env(monkeypatch):
     plan = rel.select(expr).explain()
 
     assert "execution_backend:" in plan
-    assert "ray_task" in plan
-    assert "subprocess_task" not in plan
+    assert "subprocess_task" in plan
+    assert "ray_task" not in plan

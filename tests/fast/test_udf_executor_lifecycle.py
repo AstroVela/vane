@@ -271,80 +271,6 @@ def _make_subprocess_actor_executor(
     return executor, pool
 
 
-def test_ray_get_uses_query_deadline_timeout(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            return "resolved"
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    future = FakeFuture()
-    monkeypatch.setattr(safe_get.time, "time", lambda: 100.0)
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
-
-    assert safe_get.resolve_object_refs_blocking(FakeRef(future), timeout=300.0) == "resolved"
-    assert future.calls == [pytest.approx(1.0)]
-
-
-@pytest.mark.parametrize(
-    "raw",
-    ["nan", "inf", "-inf", "-1", "invalid"],
-)
-@pytest.mark.parametrize(
-    "env_name",
-    [
-        "VANE_QUERY_DEADLINE_EPOCH_S",
-        "VANE_RAY_OBJECT_GET_TIMEOUT_S",
-        "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
-        "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
-        "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
-        "VANE_UDF_STREAM_CLEANUP_TIMEOUT_S",
-        "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
-    ],
-)
-def test_timeout_env_parsers_reject_non_finite_negative_and_invalid(monkeypatch, env_name, raw):
-    from vane.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
-    from vane.runners.ray import safe_get
-
-    for name in (
-        "VANE_QUERY_DEADLINE_EPOCH_S",
-        "VANE_RAY_OBJECT_GET_TIMEOUT_S",
-        "VANE_RAY_ACTOR_INIT_TIMEOUT_S",
-        "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S",
-        "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S",
-        "VANE_UDF_STREAM_CLEANUP_TIMEOUT_S",
-        "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(env_name, raw)
-
-    with pytest.raises(ValueError):
-        if env_name in {"VANE_QUERY_DEADLINE_EPOCH_S", "VANE_RAY_OBJECT_GET_TIMEOUT_S"}:
-            safe_get.configured_ray_get_timeout_s()
-        elif env_name == "VANE_RAY_ACTOR_INIT_TIMEOUT_S":
-            udf_ray_actor_pool._actor_init_timeout_s()
-        elif env_name == "VANE_UDF_SUBPROCESS_CONTROL_TIMEOUT_S":
-            udf_subprocess._subprocess_control_timeout_s()
-        elif env_name == "VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S":
-            udf_subprocess._subprocess_shutdown_grace_s()
-        elif env_name in {
-            "VANE_UDF_STREAM_CLEANUP_TIMEOUT_S",
-            "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
-        }:
-            udf_stream_result_collector.UDFStreamResultCollector(ray_module=object())
-
-
 @pytest.mark.parametrize(
     "env_name",
     [
@@ -382,314 +308,6 @@ def test_positive_timeout_env_parsers_reject_zero(monkeypatch, env_name):
             "VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S",
         }:
             udf_stream_result_collector.UDFStreamResultCollector(ray_module=object())
-
-
-@pytest.mark.parametrize(
-    "env_name",
-    [
-        "VANE_QUERY_DEADLINE_EPOCH_S",
-        "VANE_RAY_OBJECT_GET_TIMEOUT_S",
-    ],
-)
-def test_ray_safe_get_timeout_envs_preserve_zero(monkeypatch, env_name):
-    from vane.runners.ray import safe_get
-
-    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    monkeypatch.setenv(env_name, "0")
-
-    if env_name == "VANE_QUERY_DEADLINE_EPOCH_S":
-        with pytest.raises(safe_get.QueryDeadlineExceeded):
-            safe_get.configured_ray_get_timeout_s()
-    else:
-        assert safe_get.configured_ray_get_timeout_s() == 0.0
-
-
-def test_ray_get_explicit_timeout_can_ignore_global_wait_limits(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            return "resolved"
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "0")
-    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0")
-    future = FakeFuture()
-
-    assert (
-        safe_get.resolve_object_refs_blocking(
-            FakeRef(future),
-            timeout=2.5,
-            honor_query_deadline=False,
-            honor_object_get_timeout=False,
-        )
-        == "resolved"
-    )
-    assert future.calls == [2.5]
-
-
-def test_ray_get_in_async_actor_background_thread_uses_object_ref_future(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            return "resolved"
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    future = FakeFuture()
-
-    assert safe_get.resolve_object_refs_blocking(FakeRef(future)) == "resolved"
-    assert future.calls == [None]
-
-
-def test_ray_get_heartbeat_runs_between_bounded_waits(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-            self.remaining_timeouts = 2
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            if self.remaining_timeouts:
-                self.remaining_timeouts -= 1
-                raise TimeoutError
-            return "resolved"
-
-        def done(self):
-            return False
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    heartbeats = []
-    future = FakeFuture()
-
-    result = safe_get.resolve_object_refs_blocking(
-        FakeRef(future),
-        on_wait=lambda: heartbeats.append("tick"),
-        wait_interval_s=0.25,
-    )
-
-    assert result == "resolved"
-    assert future.calls == [0.25, 0.25, 0.25]
-    assert heartbeats == ["tick", "tick"]
-
-
-def test_ray_get_heartbeat_preserves_one_total_timeout(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    clock = [10.0]
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            clock[0] += float(timeout)
-            raise TimeoutError
-
-        def done(self):
-            return False
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    monkeypatch.setattr(safe_get.time, "monotonic", lambda: clock[0])
-    heartbeats = []
-    future = FakeFuture()
-
-    with pytest.raises(TimeoutError):
-        safe_get.resolve_object_refs_blocking(
-            FakeRef(future),
-            timeout=1.0,
-            on_wait=lambda: heartbeats.append("tick"),
-            wait_interval_s=0.4,
-        )
-
-    assert future.calls == [pytest.approx(0.4), pytest.approx(0.4), pytest.approx(0.2)]
-    assert heartbeats == ["tick", "tick"]
-
-
-def test_ray_get_preserves_query_deadline_expiry_without_heartbeat(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            raise TimeoutError
-
-        def done(self):
-            return False
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.setattr(safe_get.time, "time", lambda: 100.0)
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    future = FakeFuture()
-
-    with pytest.raises(safe_get.QueryDeadlineExceeded, match="query deadline expired"):
-        safe_get.resolve_object_refs_blocking(FakeRef(future))
-
-    assert future.calls == [pytest.approx(1.0)]
-
-
-def test_ray_get_does_not_relabel_completed_future_timeout_as_query_deadline(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.setattr(safe_get.time, "time", lambda: 100.0)
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    future = Future()
-    future.set_exception(TimeoutError("remote task timeout"))
-
-    with pytest.raises(TimeoutError, match="remote task timeout") as exc_info:
-        safe_get.resolve_object_refs_blocking(FakeRef(future))
-
-    assert type(exc_info.value) is TimeoutError
-
-
-def test_ray_get_preserves_shorter_object_timeout_before_query_deadline(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            raise TimeoutError("object get timeout")
-
-        def done(self):
-            return False
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.setattr(safe_get.time, "time", lambda: 100.0)
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
-    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.25")
-    future = FakeFuture()
-
-    with pytest.raises(TimeoutError, match="object get timeout") as exc_info:
-        safe_get.resolve_object_refs_blocking(FakeRef(future))
-
-    assert type(exc_info.value) is TimeoutError
-    assert future.calls == [0.25]
-
-
-def test_ray_get_heartbeat_preserves_query_deadline_expiry(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    clock = [10.0]
-
-    class FakeFuture:
-        def __init__(self):
-            self.calls = []
-
-        def result(self, timeout=None):
-            self.calls.append(timeout)
-            clock[0] += float(timeout)
-            raise TimeoutError
-
-        def done(self):
-            return False
-
-    class FakeRef:
-        def __init__(self, future):
-            self._future = future
-
-        def future(self):
-            return self._future
-
-    monkeypatch.setattr(safe_get.time, "time", lambda: 100.0)
-    monkeypatch.setattr(safe_get.time, "monotonic", lambda: clock[0])
-    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
-    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
-    heartbeats = []
-    future = FakeFuture()
-
-    with pytest.raises(safe_get.QueryDeadlineExceeded, match="query deadline expired"):
-        safe_get.resolve_object_refs_blocking(
-            FakeRef(future),
-            on_wait=lambda: heartbeats.append("tick"),
-            wait_interval_s=0.4,
-        )
-
-    assert future.calls == [pytest.approx(0.4), pytest.approx(0.4), pytest.approx(0.2)]
-    assert heartbeats == ["tick", "tick"]
-
-
-def test_ray_get_in_async_actor_event_loop_rejects_sync_wait(monkeypatch):
-    from vane.runners.ray import safe_get
-
-    class AwaitableRef:
-        def __await__(self):
-            async def _resolve():
-                return "resolved"
-
-            return _resolve().__await__()
-
-    async def _invoke():
-        with pytest.raises(RuntimeError, match="cannot run on an event loop"):
-            safe_get.resolve_object_refs_blocking(AwaitableRef())
-
-    asyncio.run(_invoke())
 
 
 def test_udf_actor_pool_init_timeout_kills_owned_actors(monkeypatch):
@@ -1088,8 +706,6 @@ def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish()
 
     executor.finished_executor("exec-a")
 
-    import asyncio
-
     assert asyncio.run(executor.wait_for_result("exec-a")) is False
 
 
@@ -1367,7 +983,7 @@ def test_vllm_router_completion_never_finishes_shared_actors_globally():
 
 def test_vllm_query_owned_actors_receive_explicit_session_environment(monkeypatch):
     import vane.execution.vllm as vllm
-    from vane.runners.ray.ray_env import build_session_runtime_env_vars
+    from vane.execution.session_environment import build_session_runtime_env_vars
 
     creations = []
 
@@ -1731,7 +1347,7 @@ def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypat
     import os
 
     import vane.execution.udf_ray as udf_ray
-    from vane.runners.ray.ray_env import build_session_runtime_env_vars
+    from vane.execution.session_environment import build_session_runtime_env_vars
 
     stale_key = "AWS_ISSUE75_STALE_TASK_SECRET"
     session_key = "AWS_ISSUE75_CURRENT_TASK_SECRET"
@@ -1805,7 +1421,7 @@ def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
 
     monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
-    with pytest.raises(RuntimeError, match="initialized RayRunner runtime"):
+    with pytest.raises(RuntimeError, match="explicit Ray resource allocation"):
         vllm.build_executor("model", _packed_native_vllm_options({"use_ray": True}))
 
 

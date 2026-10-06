@@ -13,8 +13,20 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
+from vane.execution.ray_wait import resolve_object_refs_blocking
+from vane.execution.session_environment import install_explicit_session_runtime_env
 from vane.execution.udf_ray_config import (
     eager_actor_warm_up_enabled as _eager_actor_warm_up_enabled,
+)
+from vane.execution.udf_ray_protocol import (
+    RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+    RAY_ACTOR_INDEX_ENV,
+    RAY_ACTOR_POOL_NONCE_ENV,
+    RAY_ACTOR_QUERY_ID_ENV,
+    RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+    RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
+    query_runtime_actor_name,
+    ray_runtime_job_id,
 )
 from vane.execution.udf_ray_ref_bundle import (
     apply_ref_bundle_slices as _apply_ref_bundle_slices,
@@ -29,18 +41,6 @@ from vane.execution.udf_ray_stream_protocol import (
     make_stream_error_pair,
 )
 from vane.execution.udf_threading import configure_ray_actor_loaded_torch_threads
-from vane.runners.ray.query_runtime_protocol import (
-    RAY_ACTOR_GENERATION_CAPABILITY_ENV,
-    RAY_ACTOR_INDEX_ENV,
-    RAY_ACTOR_POOL_NONCE_ENV,
-    RAY_ACTOR_QUERY_ID_ENV,
-    RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
-    RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
-    query_runtime_actor_name,
-    ray_runtime_job_id,
-)
-from vane.runners.ray.ray_env import install_explicit_session_runtime_env
-from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 
 def _debug_enabled() -> bool:

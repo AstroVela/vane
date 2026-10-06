@@ -14,6 +14,9 @@ class ClientContext;
 class ClientContextState;
 class PythonUDFActorResourceState;
 class PreparedStatementData;
+class PhysicalOperator;
+
+pybind11::list CollectNativeUDFNodes(ClientContext &context, PhysicalOperator &root);
 
 //! Read native topology through the common metadata collector without taking plan ownership.
 pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared);

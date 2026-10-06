@@ -1,0 +1,43 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "vane_python/pybind11/pybind_wrapper.hpp"
+#include "vane_python/pyresult.hpp"
+
+namespace duckdb {
+
+class SelectStatement;
+
+//! Direct SHOW/DESCRIBE and PRAGMA commands use native statement execution.
+//! Composed queries are classified from their bound data sources instead.
+vector<unique_ptr<SQLStatement>> ExtractVaneStatements(ClientContext &context, const string &query);
+vector<unique_ptr<SQLStatement>> PreprocessVaneStatement(ClientContext &context, unique_ptr<SQLStatement> statement);
+bool IsDirectClientCommand(SQLStatement &statement);
+bool IsDirectClientCommand(Relation &relation);
+shared_ptr<Relation> CreateVaneQueryRelation(const shared_ptr<ClientContext> &context,
+                                             unique_ptr<SelectStatement> statement, const string &alias,
+                                             const string &query = "");
+
+struct NativeExecutionResult {
+	unique_ptr<QueryResult> native_result;
+	py::object managed_result = py::none();
+	StatementReturnType return_type = StatementReturnType::NOTHING;
+
+	shared_ptr<DuckDBPyResult> TakeResult();
+};
+
+//! Both SQL statements and Relation terminals enter here. Exactly one input is set.
+NativeExecutionResult ExecuteNativeQuery(const shared_ptr<ClientContext> &context, unique_ptr<SQLStatement> statement,
+                                         const shared_ptr<Relation> &relation,
+                                         case_insensitive_map_t<BoundParameterData> parameters,
+                                         const py::object &connection_owner, const py::object &interrupt_check,
+                                         bool stream_result = false, vector<string> *cleanup_warnings = nullptr,
+                                         optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache = nullptr,
+                                         const py::object *delivery_timeout = nullptr, idx_t result_batch_size = 2048);
+
+} // namespace duckdb

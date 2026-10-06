@@ -66,40 +66,6 @@ def test_vane_cls_rejects_empty_explicit_name_without_defaulting():
                 return text
 
 
-def test_vane_cls_physical_payload_supports_multiple_independent_actors(monkeypatch):
-    import uuid
-
-    import vane
-
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-
-    @vane.cls(actor_number=2, return_dtype="INTEGER", name="replicated_model")
-    class Counter:
-        def __call__(self, value):
-            return value
-
-    con = vane.connect()
-    try:
-        relation = con.sql("select 1::INTEGER as value").select(Counter()(vane.col("value")).alias("out"))
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-            relation,
-            str(uuid.uuid4()),
-        ).to_physical_plan(con)
-        nodes = plan.collect_udf_nodes(conn=con)
-    finally:
-        con.close()
-
-    assert len(nodes) == 1
-    payload = nodes[0]["payload"]
-    assert payload["udf_name"] == "replicated_model"
-    assert "stateful" not in payload
-    assert "side_effects" not in payload
-    assert payload["actor_number"] == 2
-    assert nodes[0]["actor_pool_size"] == 2
-    assert payload["expression_id"]
-    assert "state_scope" not in payload
-
-
 def test_vane_cls_immediate_call_reuses_eager_instance():
     import vane
 

@@ -39,7 +39,7 @@ Vane Data is a high-performance, multimodal-native data engine for AI workloads.
 - **Python and SQL interfaces** — Build data and AI pipelines with DuckDB SQL or the Python Relation API.
 - **Built-in AI operations** — Invoke LLMs, generate embeddings, and run batch inference through OpenAI and Anthropic APIs or native vLLM integration. Prefix-aware bucketing improves vLLM prefix-cache hit rates and inference throughput.
 - **Heterogeneous execution** — Overlap CPU, GPU, I/O, and model inference workloads through asynchronous scheduling.
-- **Local-to-cloud execution** — Run the same pipeline locally or across distributed Ray clusters, with a foundation for future edge-cloud coordination.
+- **Local-to-cloud execution** — Run native pipelines locally and supported analytical SELECTs across Ray clusters.
 - **Designed for production AI workloads** — Build multimodal training-data preprocessing pipelines and enterprise-scale batch inference workflows.
 
 ---
@@ -65,6 +65,25 @@ For encoded video intervals with synchronized audio and source timestamps, see
 the [video clipping example](examples/video_clip.py). It covers `VideoFile.clip`,
 the `video_clip` Python/SQL expression, output codecs, and resource limits.
 
+### Execution backends
+
+Connections run locally by default. Use `query()` for managed, streaming SELECT results:
+
+```python
+import vane
+
+with vane.connect() as connection:
+    with connection.query("SELECT range AS value FROM range(10)") as result:
+        print(result.collect())
+```
+
+For distributed analytical SELECTs, initialize Ray and create a connection with
+`backend="ray"`. Ray queries support pipelined execution and FTE with a registered
+shared exchange store. Local SQL, Relation, model and DataSink APIs remain local.
+See the [execution design and support matrix](PIPELINED_EXECUTION_DESIGN.md) for
+configuration, ownership and unsupported operations. Global runner selection has
+been removed; unsupported distributed queries fail explicitly.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
@@ -80,7 +99,7 @@ We use the [Ray Data benchmark suite](https://www.anyscale.com/blog/ray-data-daf
 
 ![Multimodal inference benchmark comparing Vane Data, Ray Data, and Daft](assets/benchmark.png)
 
-The Ray runner targets distributed workloads. The current results are single-node only; validation on the multi-node environments used in the Ray Data benchmarks is still pending.
+These historical benchmark results predate the execution cutover and describe single-node workloads. Performance acceptance for the new query runtimes is tracked in the [execution roadmap](PIPELINED_EXECUTION_ROADMAP.md).
 
 See the [benchmarking page](https://vane.astrovela.ai/benchmarks) for detailed results.
 

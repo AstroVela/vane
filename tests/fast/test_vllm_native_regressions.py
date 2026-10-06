@@ -504,42 +504,6 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
     }
 
 
-def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
-    import vane
-
-    con = vane.connect()
-    try:
-        explicit_pool_name = "explicit-shared-vllm-pool"
-        options = _packed_native_vllm_options({"use_ray": True, "ray_actor_pool_name": explicit_pool_name})
-
-        def collect_node(query_id):
-            source = con.sql("SELECT prompt FROM (VALUES ('hello')) input(prompt)")
-            generated = vane.FunctionExpression(
-                "vllm",
-                vane.ColumnExpression("prompt"),
-                vane.ConstantExpression("model"),
-                vane.ConstantExpression(options),
-            ).alias("generated")
-            relation = source.select(generated)
-            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, query_id).to_physical_plan(con)
-            nodes = plan.collect_vllm_nodes(conn=con)
-            assert len(nodes) == 1
-            return nodes[0]
-
-        # These IDs have the same readable sanitized form. Their raw-ID hash
-        # must still keep independently configured actor pools isolated.
-        first = collect_node("query/a")
-        second = collect_node("query?a")
-
-        assert first["pool_name"] != explicit_pool_name
-        assert second["pool_name"] != explicit_pool_name
-        assert first["pool_name"] != second["pool_name"]
-        assert first["options"]["ray_actor_pool_name"] == first["pool_name"]
-        assert second["options"]["ray_actor_pool_name"] == second["pool_name"]
-    finally:
-        con.close()
-
-
 def test_native_vllm_rejects_bare_json_options_at_bind_time():
     import vane
 
@@ -562,31 +526,6 @@ def test_native_vllm_rejects_missing_or_null_options_at_bind_time():
             con.execute("SELECT vllm('hello', 'model', NULL)")
     finally:
         con.close()
-
-
-def test_distributed_collection_preserves_the_versioned_envelope():
-    import vane
-    from vane.execution.vllm import normalize_options
-
-    con = vane.connect()
-    try:
-        relation = con.sql(
-            f"SELECT vllm(prompt, 'model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}) FROM (VALUES ('hello')) input(prompt)"
-        )
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "default-options").to_physical_plan(con)
-        nodes = plan.collect_vllm_nodes(conn=con)
-    finally:
-        con.close()
-
-    assert len(nodes) == 1
-    options = nodes[0]["options"]
-    assert options["__vane_vllm_payload_version"] == 1
-    assert options["__vane_vllm_public_options_json"] == "{}"
-    assert options["__vane_vllm_secret_payload"] == b'{"payload_version":1,"values":[]}'
-    normalized = normalize_options(options)
-    assert normalized["use_ray"] is True
-    assert normalized["ray_worker_only"] is True
-    assert normalized["ray_actor_pool_name"] == nodes[0]["pool_name"]
 
 
 @pytest.mark.parametrize(

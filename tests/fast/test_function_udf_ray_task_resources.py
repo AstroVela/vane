@@ -126,7 +126,7 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
 
 def test_ray_task_remote_keeps_regular_ray_remote_options_available():
     import vane.execution.udf_ray as fur
-    from vane.runners.ray.ray_env import build_session_runtime_env_vars
+    from vane.execution.session_environment import build_session_runtime_env_vars
 
     for builder in (
         fur._build_bundle_stream_remote,
@@ -144,7 +144,7 @@ def test_ray_task_executor_requires_runner_owned_ray_runtime(monkeypatch):
 
     monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
-    with pytest.raises(RuntimeError, match="initialized RayRunner runtime"):
+    with pytest.raises(RuntimeError, match="explicit Ray resource allocation"):
         fur._build_ray_task_executor(_distributed_payload(), {})
 
 
@@ -582,7 +582,7 @@ def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
 
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):
     from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
-    from vane.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
+    from vane.execution.udf_ray_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
     init_calls = []
@@ -770,7 +770,7 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
 
 def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
     from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
-    from vane.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
+    from vane.execution.udf_ray_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
 

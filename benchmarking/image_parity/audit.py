@@ -11,7 +11,6 @@ import hashlib
 import importlib.metadata
 import io
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -417,7 +416,6 @@ if __name__ == "__main__":
     parser.add_argument("--engine", choices=["vane-python", "vane-native", "daft"])
     parser.add_argument("--artifact", type=Path)
     args = parser.parse_args()
-    os.environ.setdefault("VANE_RUNNER", "local-fast")
     root = args.root.resolve()
     if args.command == "generate":
         generate(root)

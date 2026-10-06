@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_local_model import LocalModelRuntime
@@ -115,16 +114,6 @@ def test_exclusive_reservation_survives_partial_initialization_cleanup_failure()
         pool.fail_close = False
         registry.close()
     assert not registry.resource_snapshot()["exclusive_resources"]
-
-
-def test_shared_resources_preserve_ray_type_identity_and_pickle_compatibility():
-    from vane.runners.ray.query_resource_graph import ResourceVector as RayResourceVector
-
-    assert RayResourceVector is ResourceVector
-    # A protocol-zero reference written before the class moved still resolves.
-    assert vane_pickle.loads(b"cvane.runners.ray.query_resource_graph\nResourceVector\n.") is ResourceVector
-    value = ResourceVector(cpu=0.25, heap_bytes=123)
-    assert vane_pickle.loads(vane_pickle.dumps(value)) == value
 
 
 @pytest.mark.parametrize(

@@ -1067,7 +1067,7 @@ def test_qdrant_sink_runner_accepts_worker_arrow_types(
                    {secondary}
             FROM range(8) AS t(i)
         """)
-        assert relation._get_runner_type() == datasink_runner
+        assert relation.backend == datasink_runner
         assert relation._arrow_schema().field("attributes").type.field("label").type == pa.string()
         summary = relation.write_datasink(
             recording_sdk_sink(
@@ -1105,8 +1105,8 @@ def test_qdrant_sink_runner_accepts_worker_arrow_types(
     ]
     worker_schemas = [pa.ipc.read_schema(pa.BufferReader(path.read_bytes())) for path in tmp_path.glob("*.schema")]
     assert len(worker_schemas) == len(batches)
-    string_type = pa.string() if datasink_runner == "local-fast" else pa.large_string()
-    list_type = pa.list_ if datasink_runner == "local-fast" else pa.large_list
+    string_type = pa.string()
+    list_type = pa.list_
     for schema in worker_schemas:
         assert schema.field("id").type == (string_type if point_kind == "uuid" else pa.uint64())
         assert schema.field("embedding").type == (

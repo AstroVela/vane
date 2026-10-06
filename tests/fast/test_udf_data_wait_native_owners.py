@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import gc
-import uuid
 
 import pyarrow as pa
 import pytest
@@ -13,13 +12,11 @@ import vane
 from vane.execution import ref_bundle, udf_subprocess
 from vane.execution.request_admission import RequestAdmissionLimits
 from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
-from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
 
 @pytest.fixture
 def native_environment(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     gc.collect()
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -211,67 +208,63 @@ def _plan(connection, shape):
         min_task_batch_size=minimum,
         task_input_max_bytes=140_000,
     )
-    return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+    return relation
 
 
 def _execute(connection, manager, *, shape, limited, waiting):
     plan = _plan(connection, shape)
-    with LocalModelRuntime(
-        session_id=plan.session_id(),
-        session_config=plan.session_config(),
+    runtime = connection.configure_local_runtime(
         request_limit=RequestAdmissionLimits(1, 1),
         task_limit=TaskAdmissionLimits(1, 8) if limited else None,
         data_limit=DataAdmissionLimits(
             420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(8, 15) if waiting else None
         ),
-    ) as runtime:
-        result = runtime.request().execute(plan, {}, conn=connection)
-        values = [value for table in result.partition_payloads for value in table.column(0).to_pylist()]
-        if shape == "unnest_many":
-            assert sorted(values) == sorted(-1 if i == 2048 else x * 10_000 + i for x in range(4) for i in range(2051))
-        elif shape == "unnest_empty":
-            assert values == []
-        elif shape.startswith("unnest"):
-            assert sorted(values) == [0, 1, 2, 3]
-        elif shape.startswith("sort"):
-            assert values == [3, 2, 1, 0]
-        else:
-            expected = {
-                "topn": [1, 2, 3],
-                "topn_rejected": [3],
-                "ungrouped_min": [0],
-                "filtered_min": [0],
-                "hash_min": [0, 1],
-                "filtered_hash_min": [0, 1],
-                "grouping_sets": [0, 0, 1],
-                "perfect_hash_min": [0, 1],
-                "count_distinct": [2],
-                "distinct": [0, 1, 2, 3],
-                "window": [0, 1, 2],
-                "partitioned_window": [0, 1, 2, 3],
-                "lag": [0, 2, 3],
-                "lead": [0, 1, 2],
-                "running_min": [0, 0, 0, 3],
-                "join_build": [0, 1, 2, 3],
-                "join_probe": [0, 1, 2, 3],
-                "nested_join_build": [0, 1, 2, 3],
-                "nested_join_probe": [0, 1, 2, 3],
-                "merge_join_build": [0, 1, 2, 3],
-                "merge_join_probe": [0, 1, 2, 3],
-                "ie_join_build": [0, 1, 2, 3],
-                "ie_join_probe": [0, 1, 2, 3],
-                "blockwise_inner": [0, 1, 2, 3],
-                "blockwise_semi": [0, 1, 2, 3],
-                "asof_build": [0, 1, 2, 3],
-                "asof_probe": [0, 1, 2, 3],
-                "left_delim": [0, 1, 2, 3],
-                "right_delim": [0, 1, 2, 3],
-            }
-            assert sorted(values) == expected[shape]
-        del result
-        # Keeping the plan alive must not keep consumed native input charged.
-        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
-        assert manager.snapshot()["usage_bytes"] == 0
+    )
+    values = [row[0] for row in plan.fetchall()]
+    if shape == "unnest_many":
+        assert sorted(values) == sorted(-1 if i == 2048 else x * 10_000 + i for x in range(4) for i in range(2051))
+    elif shape == "unnest_empty":
+        assert values == []
+    elif shape.startswith("unnest"):
+        assert sorted(values) == [0, 1, 2, 3]
+    elif shape.startswith("sort"):
+        assert values == [3, 2, 1, 0]
+    else:
+        expected = {
+            "topn": [1, 2, 3],
+            "topn_rejected": [3],
+            "ungrouped_min": [0],
+            "filtered_min": [0],
+            "hash_min": [0, 1],
+            "filtered_hash_min": [0, 1],
+            "grouping_sets": [0, 0, 1],
+            "perfect_hash_min": [0, 1],
+            "count_distinct": [2],
+            "distinct": [0, 1, 2, 3],
+            "window": [0, 1, 2],
+            "partitioned_window": [0, 1, 2, 3],
+            "lag": [0, 2, 3],
+            "lead": [0, 1, 2],
+            "running_min": [0, 0, 0, 3],
+            "join_build": [0, 1, 2, 3],
+            "join_probe": [0, 1, 2, 3],
+            "nested_join_build": [0, 1, 2, 3],
+            "nested_join_probe": [0, 1, 2, 3],
+            "merge_join_build": [0, 1, 2, 3],
+            "merge_join_probe": [0, 1, 2, 3],
+            "ie_join_build": [0, 1, 2, 3],
+            "ie_join_probe": [0, 1, 2, 3],
+            "blockwise_inner": [0, 1, 2, 3],
+            "blockwise_semi": [0, 1, 2, 3],
+            "asof_build": [0, 1, 2, 3],
+            "asof_probe": [0, 1, 2, 3],
+            "left_delim": [0, 1, 2, 3],
+            "right_delim": [0, 1, 2, 3],
+        }
+        assert sorted(values) == expected[shape]
+    # Keeping the relation alive must not keep consumed native input charged.
+    assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
 @pytest.mark.parametrize("waiting", [False, True])

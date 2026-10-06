@@ -6,15 +6,11 @@
 from __future__ import annotations
 
 import json
-import os
-import pickle
-import uuid
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 
 import numpy as np
-import pyarrow as pa
 import pytest
 
 import vane
@@ -213,36 +209,6 @@ def mock_ai_provider(monkeypatch):
         "mock_ai_sql",
         lambda name=None: MockProvider(),
     )
-
-
-def _round_trip_ai_plan(relation):
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
-    serialized = pickle.dumps(logical)
-    restored = pickle.loads(serialized)
-    previous_runner = os.environ.get("VANE_RUNNER")
-    try:
-        os.environ["VANE_RUNNER"] = "local-fast"
-        target = vane.connect()
-        physical = restored.to_physical_plan(target)
-    finally:
-        if previous_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = previous_runner
-    return target, physical, serialized
-
-
-def _execute_ai_physical_plan(target, physical):
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
-
-    pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
-    try:
-        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
-        payloads = list(result.partition_payloads)
-        return pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
-    finally:
-        for pool in pools:
-            pool.shutdown(kill=True)
 
 
 @pytest.mark.parametrize("function", ["ai_prompt", "ai_embed"])
@@ -1257,13 +1223,11 @@ def test_ai_prompt_sql_null_prompt_is_null_even_with_an_image():
 
 
 def test_ai_prompt_sql_literal_null_has_varchar_type_and_no_udf_operator():
-    conn = vane.connect()
-    relation = conn.sql("SELECT ai_prompt(NULL, provider := 'mock_ai_sql') AS response")
-
-    assert [str(value) for value in relation.types] == ["VARCHAR"]
-    assert relation.fetchall() == [(None,)]
-    _, physical, _ = _round_trip_ai_plan(relation)
-    assert physical.collect_udf_nodes() == []
+    with vane.connect() as conn:
+        relation = conn.sql("SELECT ai_prompt(NULL, provider := 'mock_ai_sql') AS response")
+        assert [str(value) for value in relation.types] == ["VARCHAR"]
+        assert relation._collect_udf_metadata() == []
+        assert relation.fetchall() == [(None,)]
 
 
 def test_ai_prompt_sql_result_is_nullable_varchar():
@@ -1275,92 +1239,6 @@ def test_ai_prompt_sql_result_is_nullable_varchar():
 
     assert [str(value) for value in relation.types] == ["VARCHAR"]
     assert relation.fetchall() == [("topic:alpha",), (None,)]
-
-
-def test_ai_prompt_sql_expression_udf_survives_plan_round_trip():
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            prompt,
-            image,
-            provider := 'mock_ai_sql',
-            model := 'round-trip',
-            options := struct_pack(actor_number := 1)
-        ) AS response
-        FROM (VALUES ('alpha', from_hex('89504e47'))) AS source(prompt, image)
-    """)
-
-    target, physical, serialized = _round_trip_ai_plan(relation)
-    node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert table.column(0).to_pylist() == ["round-trip:alpha:89504e47"]
-    assert node["payload"]["input_names"] == ["message_0", "message_1"]
-    assert node["payload"]["ai_provider"] == "mock_ai_sql"
-    assert node["payload"]["ai_model"] == "round-trip"
-    assert node["payload"]["ai_return_type"] == "VARCHAR"
-    assert 0 < len(serialized) < 1_000_000
-
-
-def test_ai_prompt_sql_file_materialization_boundary_survives_plan_round_trip(tmp_path):
-    path = tmp_path / "round-trip.bin"
-    path.write_bytes(b"prefix-media-suffix")
-    path_sql = str(path).replace("'", "''")
-    source = vane.connect()
-    relation = source.sql(f"""
-        SELECT ai_prompt(
-            'describe',
-            file('{path_sql}', 'image/png', 7, 5, NULL),
-            provider := 'mock_ai_sql',
-            model := 'round-trip-file',
-            options := struct_pack(actor_number := 1)
-        ) AS response
-    """)
-
-    target, physical, serialized = _round_trip_ai_plan(relation)
-    node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert table.column(0).to_pylist() == ["round-trip-file:describe:image/png=6d65646961"]
-    assert node["payload"]["input_names"] == ["__vane_prompt_messages"]
-    assert node["payload"]["input_types"] == [
-        'STRUCT(message_0 VARCHAR, message_1 STRUCT(content_type VARCHAR, "data" BLOB, "error" VARCHAR))'
-    ]
-    assert node["payload"]["input_contract_types"] == [None]
-    assert b"prefix-media-suffix" not in serialized
-    assert 0 < len(serialized) < 1_000_000
-
-
-def test_ai_prompt_sql_structured_type_survives_plan_round_trip():
-    schema = json.dumps(
-        {
-            "type": "object",
-            "properties": {
-                "answer": {"type": "string"},
-                "score": {"type": "integer"},
-            },
-            "required": ["answer", "score"],
-            "additionalProperties": False,
-        }
-    )
-    relation = vane.connect().sql(f"""
-        SELECT ai_prompt(
-            concat('line1', chr(10), 'line2', chr(9), chr(1)),
-            return_format := json '{schema}',
-            provider := 'mock_ai_sql',
-            model := 'structured',
-            options := struct_pack(actor_number := 1)
-        ) AS response
-    """)
-
-    target, physical, _ = _round_trip_ai_plan(relation)
-    node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-
-    answer = "structured:line1\nline2\t\x01"
-    assert table.schema.field(0).type == pa.struct([pa.field("answer", pa.string()), pa.field("score", pa.int64())])
-    assert table.column(0).to_pylist() == [{"answer": answer, "score": len(answer)}]
-    assert node["payload"]["ai_return_type"] == 'STRUCT("answer" VARCHAR, "score" BIGINT)'
 
 
 @pytest.mark.parametrize(
@@ -1644,32 +1522,6 @@ def test_ai_prompt_sql_rejects_anthropic_zero_tokens_with_structured_output():
         """)
 
 
-def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypatch):
-    import vane.execution.vllm as vllm_executor
-
-    executor = RecordingNativeVLLMExecutor()
-    monkeypatch.setattr(vllm_executor, "build_executor", lambda model, options: executor)
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_prompt(
-            prompt,
-            provider := 'vllm',
-            model := 'round-trip-vllm',
-            options := struct_pack(batch_size := 1, do_prefix_routing := false)
-        ) AS response
-        FROM (VALUES ('alpha'), ('beta')) AS source(prompt)
-    """)
-
-    target, physical, serialized = _round_trip_ai_plan(relation)
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert physical.collect_udf_nodes() == []
-    assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]
-    assert executor.finished_count == 1
-    assert executor.shutdown_count == 1
-    assert 0 < len(serialized) < 10_000
-
-
 def test_ai_sql_helper_builds_prompt_specs_without_execution():
     from vane.ai._sql import build_ai_prompt_sql_spec
 
@@ -1778,29 +1630,6 @@ def test_ai_embed_sql_fixed_dimensions_and_null_contract_are_preserved():
     rows = relation.fetchall()
     assert list(rows[0][0]) == [3.0, 3.0, 3.0, 3.0]
     assert rows[1][0] is None
-
-
-def test_ai_embed_sql_survives_plan_round_trip():
-    source = vane.connect()
-    relation = source.sql("""
-        SELECT ai_embed(
-            'abc',
-            provider := 'mock_ai_sql',
-            model := 'round-trip-embed',
-            dimensions := 4,
-            options := struct_pack(actor_number := 1, normalize := true)
-        ) AS embedding
-    """)
-
-    target, physical, _ = _round_trip_ai_plan(relation)
-    node = physical.collect_udf_nodes()[0]
-    table = _execute_ai_physical_plan(target, physical)
-
-    assert node["payload"]["ai_provider"] == "mock_ai_sql"
-    assert node["payload"]["ai_model"] == "round-trip-embed"
-    assert node["payload"]["ai_dimensions"] == 4
-    assert table.schema.field(0).type.list_size == 4
-    assert np.linalg.norm(table.column(0).to_pylist()[0]) == pytest.approx(1.0)
 
 
 def test_ai_embed_sql_keeps_closed_options_contract():

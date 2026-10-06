@@ -146,16 +146,10 @@ def test_input_contract_is_not_silenced_by_ignore(value):
         drive(array([value]), "must_not_load")
 
 
-@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
 @pytest.mark.parametrize("entry", ["expression", "relation", "method", "sql"])
 @pytest.mark.parametrize("nulls", [False, True])
 @pytest.mark.parametrize("fixed", [False, True])
-def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, nulls, fixed):
-    if runner == "ray":
-        request.getfixturevalue("ray_local")
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_public_audio_embedding(provider, entry, nulls, fixed):
     model = "must_not_load" if nulls else "normal"
     samples = array([audio(), None, None, None] if nulls else [audio(), None, audio(), audio(0.5)], fixed=fixed).slice(
         1
@@ -176,8 +170,6 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
                 f"model => '{model}', options => {{batch_size: 2, max_retries: 0}}) AS embedding FROM clips"
             )
         assert result.types[-1] == vane.array_type(vane.sqltypes.FLOAT, 3)
-        if runner == "ray":
-            assert "ray_actor" in result.explain()
         expected = (
             [(0, None), (1, None), (2, None)] if nulls else [(0, None), (1, (0.25, 3, 48000)), (2, (0.5, 3, 48000))]
         )

@@ -256,13 +256,11 @@ def test_image_pixels_must_be_rgb_uint8(sdk, shape, dtype):
     assert not sdk.calls
 
 
-@pytest.mark.real_ray
 @pytest.mark.parametrize("entry", ["expression", "relation", "sql"])
-def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local, monkeypatch, entry):
+def test_cosmos_image_binding_accepts_precision_without_loading_models(monkeypatch, entry):
     import vane
     from vane.ai import embed_image
 
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
     monkeypatch.setitem(sys.modules, "torch", None)
     monkeypatch.setitem(sys.modules, "transformers", None)
     options = descriptor().get_options()
@@ -279,10 +277,14 @@ def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local
                 params=["a" * 40],
             )
         assert str(result.types[result.columns.index("embedding")]) == "FLOAT[256]"
-        result.explain()
+        if entry == "sql":
+            # A literal NULL is folded before GPU resources are needed.
+            assert result.fetchall() == [(None,)]
+        else:
+            with pytest.raises(vane.InvalidInputException, match="registered local GPU model"):
+                result.explain()
 
 
-@pytest.mark.real_ray
 @pytest.mark.parametrize(
     "kind,value",
     [
@@ -295,7 +297,7 @@ def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local
         ),
     ],
 )
-def test_cosmos_sql_gpu_resources_require_a_ray_plan(ray_local, monkeypatch, kind, value):
+def test_cosmos_sql_gpu_resources_require_registered_local_model(monkeypatch, kind, value):
     import vane
 
     monkeypatch.setitem(sys.modules, "torch", None)
@@ -304,14 +306,8 @@ def test_cosmos_sql_gpu_resources_require_a_ray_plan(ray_local, monkeypatch, kin
         f"SELECT ai_embed{kind}({value}, provider => 'transformers', model => 'nvidia/Cosmos-Embed1-224p', "
         "options => {revision: $1, trust_remote_code: true, device: 'cuda', dtype: 'float16'}) AS embedding"
     )
-    for runner in ("ray", "local-fast"):
-        monkeypatch.setenv("VANE_RUNNER", runner)
-        with vane.connect() as conn:
-            result = conn.sql(query, params=["a" * 40])
-            assert result.types == [vane.array_type(vane.sqltypes.FLOAT, 256)]
-            if runner == "ray":
-                plan = result.explain()
-                assert "ray_actor" in plan
-            else:
-                with pytest.raises(vane.InvalidInputException, match="GPU resources require VANE_RUNNER=ray"):
-                    result.explain()
+    with vane.connect() as conn:
+        result = conn.sql(query, params=["a" * 40])
+        assert result.types == [vane.array_type(vane.sqltypes.FLOAT, 256)]
+        with pytest.raises(vane.InvalidInputException, match="registered local GPU model"):
+            result.explain()

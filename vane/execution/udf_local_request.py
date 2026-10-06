@@ -11,7 +11,6 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.local_resource_graph import PreparedLocalResourceGraph
-from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.request_admission import RequestCancellationReason, RequestTicket, _timeout
 from vane.execution.request_deadline import RequestExecutionDeadline
 from vane.execution.result_delivery import QueryResult, ResultDeliveryFull
@@ -21,18 +20,6 @@ from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 if TYPE_CHECKING:
     from vane.execution.udf_local_model import LocalModelRuntime
-
-
-def _execute_native(conn: Any, plan: Any, *, cancellation: ExecutionCancellationScope) -> Any:
-    from vane._ray_cxx import require_ray_cxx_attr
-
-    binding = NativeQueryCancellation(cancellation)
-    try:
-        return require_ray_cxx_attr("DistributedPhysicalPlanRunner")().execute_native(
-            conn, plan, native_execution_started=binding.started
-        )
-    finally:
-        binding.close()
 
 
 def _shutdown_resource(resource: Any, *, kill: bool) -> None:
@@ -147,27 +134,6 @@ class LocalModelRequest:
             else:
                 self._cancel_finished.wait()
 
-    def execute(
-        self, plan: Any, bindings: Mapping[str, str], *, conn: Any, execution_timeout: float | None = None
-    ) -> Any:
-        """Admit, prepare and execute a bound plan; retain returned output owners."""
-        return self._execute(plan, bindings, conn=conn, execution_timeout=execution_timeout)
-
-    def _execute(
-        self,
-        plan: Any,
-        bindings: Mapping[str, str],
-        *,
-        conn: Any,
-        execution_timeout: float | None = None,
-        before_claim: Callable[[], None] | None = None,
-    ) -> Any:
-        def execute_plan() -> Any:
-            self._prepare_execution(plan, bindings, conn=conn)
-            return _execute_native(conn, plan, cancellation=self._cancellation)
-
-        return self._run_execution(execute_plan, execution_timeout=execution_timeout, before_claim=before_claim)
-
     def _check_cancelled(self) -> None:
         self._expire_deadline()
         # Cancellation is recorded before its scope is signalled. Honor that
@@ -260,29 +226,6 @@ class LocalModelRequest:
                 raise self._ticket.cancellation_error()
             self.shutdown()
             return result
-
-    def execute_result(
-        self,
-        plan: Any,
-        bindings: Mapping[str, str],
-        *,
-        conn: Any,
-        execution_timeout: float | None = None,
-        delivery_timeout: float | None = None,
-    ) -> QueryResult:
-        """Execute once and return a separately bounded, explicitly owned result."""
-        from vane.execution.local_result_delivery import prepare_local_result
-
-        def execute_plan() -> Any:
-            self._prepare_execution(plan, bindings, conn=conn)
-            return _execute_native(conn, plan, cancellation=self._cancellation)
-
-        return self._run_managed_result(
-            execute_plan,
-            prepare_local_result,
-            execution_timeout=execution_timeout,
-            delivery_timeout=delivery_timeout,
-        )
 
     def _run_managed_result(
         self,

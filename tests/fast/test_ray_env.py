@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 import os
-import warnings
 
-import pytest
-
-from vane.runners.ray.ray_env import (
+from vane.execution.session_environment import (
     build_explicit_session_process_env,
     build_session_runtime_env_vars,
     collect_vane_env_overrides,
@@ -16,19 +13,6 @@ from vane.runners.ray.ray_env import (
     scrub_shared_runtime_session_env,
     session_environment_overrides,
 )
-from vane.runners.ray.runner import (
-    _configure_scan_split_backlog_env,
-)
-
-
-def test_ray_runner_does_not_inject_udf_stage_count_env(monkeypatch):
-    monkeypatch.delenv("VANE_UDF_RAY_TASK_AUTO_STAGE_COUNT", raising=False)
-    monkeypatch.delenv("VANE_UDF_RAY_TASK_OUTSTANDING_SCALE", raising=False)
-
-    _configure_scan_split_backlog_env(None)
-
-    assert "VANE_UDF_RAY_TASK_AUTO_STAGE_COUNT" not in os.environ
-    assert "VANE_UDF_RAY_TASK_OUTSTANDING_SCALE" not in os.environ
 
 
 def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
@@ -60,7 +44,7 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
 
     for key in app_env_keys:
         assert key not in overrides
-    assert overrides["VANE_RUNNER"] == "ray"
+    assert "VANE_RUNNER" not in overrides
     assert "VANE_OPENAI_API_KEY" not in overrides
     assert "VANE_PRIVATE_KEY_PATH" not in overrides
     assert "VANE_AUTH_HEADER" not in overrides
@@ -72,84 +56,6 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
     assert "DUCKDB_ISSUE75_SESSION_SECRET" not in overrides
     assert "AWS_ENDPOINT_URL" not in overrides
     assert "RAY_ADDRESS" not in overrides
-
-
-@pytest.mark.usefixtures("ray_local")
-@pytest.mark.parametrize("env_key", ["VANE_FLIGHT_ADVERTISE_HOST", "VANE_NATIVE_MEDIA_RUNTIME"])
-def test_node_local_environment_is_not_inherited_from_query_driver(monkeypatch, env_key):
-    import ray
-
-    from vane.runners.ray.worker_pool import _persistent_worker_runtime_env
-
-    driver_host = "driver.example.internal"
-    monkeypatch.setenv(env_key, driver_host)
-    parent_env = collect_vane_env_overrides()
-    child_runtime_env = _persistent_worker_runtime_env({env_key: driver_host})
-
-    @ray.remote
-    class _ChildEnvProbe:
-        @staticmethod
-        def flight_host():
-            import os
-
-            return os.environ.get(env_key)
-
-    @ray.remote
-    class _ParentEnvProbe:
-        @staticmethod
-        def child_flight_host(runtime_env):
-            import ray
-
-            child = _ChildEnvProbe.options(runtime_env=runtime_env).remote()
-            try:
-                return ray.get(child.flight_host.remote())
-            finally:
-                ray.kill(child, no_restart=True)
-
-    parent = _ParentEnvProbe.options(runtime_env={"env_vars": parent_env}).remote()
-    try:
-        observed_host = ray.get(parent.child_flight_host.remote(child_runtime_env))
-    finally:
-        ray.kill(parent, no_restart=True)
-
-    # The target node may provide its own host; only the driver's value is invalid.
-    assert observed_host != driver_host
-    assert env_key not in parent_env
-    assert env_key not in child_runtime_env["env_vars"]
-
-
-@pytest.mark.real_ray
-@pytest.mark.ray_cluster_owner
-@pytest.mark.parametrize("env_key", ["VANE_FLIGHT_ADVERTISE_HOST", "VANE_NATIVE_MEDIA_RUNTIME"])
-def test_query_driver_rejects_node_local_setting_in_ray_job_runtime_env(env_key):
-    import ray
-    from ray_test_profile import ray_test_object_store_options
-
-    from vane.runners.ray.driver import RayQueryDriverClient
-
-    ray.shutdown()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
-        ray.init(
-            address="local",
-            include_dashboard=False,
-            log_to_driver=False,
-            num_cpus=1,
-            **ray_test_object_store_options(),
-            runtime_env={
-                "env_vars": {
-                    env_key: "job-driver.example.internal",
-                },
-            },
-        )
-    try:
-        with pytest.raises(
-            RuntimeError,
-            match=rf"{env_key} is node-local.*Ray Job or actor runtime_env",
-        ):
-            RayQueryDriverClient()
-    finally:
-        ray.shutdown()
 
 
 def test_shared_runtime_setup_scrubs_inherited_session_environment(monkeypatch):

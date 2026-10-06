@@ -1523,31 +1523,3 @@ def test_audio_metadata_sql_preflights_dependency_before_opening_file(duckdb_cur
 
     with pytest.raises(vane.InvalidInputException, match=r"install vane-ai\[audio\]"):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [missing]).fetchone()
-
-
-@pytest.mark.usefixtures("ray_local")
-def test_audio_resample_executes_and_materializes_on_ray(monkeypatch, tmp_path):
-    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=32, channels=2)
-    path = tmp_path / "ray-resample.wav"
-    path.write_bytes(payload)
-    path_sql = str(path).replace("'", "''")
-
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    vane.teardown_runner()
-    vane.set_runner_ray(noop_if_initialized=True)
-    connection = vane.connect()
-    try:
-        rows = connection.sql(
-            f"""
-            SELECT i, resample(audio_file('{path_sql}'), 4000) AS audio
-            FROM range(2) AS values(i)
-            ORDER BY i
-            """
-        ).fetchall()
-    finally:
-        connection.close()
-
-    assert [row[0] for row in rows] == [0, 1]
-    for _, audio in rows:
-        assert audio.dtype == np.float64
-        assert audio.shape == (16, 2)

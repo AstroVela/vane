@@ -25,8 +25,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.ray_wait import QueryDeadlineExceeded
 from vane.execution.udf_lifecycle import ExecutionCancelledError
-from vane.runners.common import QueryDeadlineExceeded
 
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -322,15 +322,7 @@ class DataSinkExecutionOptions:
                 raise ValueError(f"{name} must be a finite non-negative number or None")
             object.__setattr__(self, name, normalized)
 
-    def map_batches_kwargs(self, runner_type: str) -> dict[str, Any]:
-        normalized_runner = str(runner_type).strip().lower()
-        if normalized_runner == "ray":
-            execution_backend = "ray_actor"
-        elif normalized_runner in {"local", "local-fast"}:
-            execution_backend = "subprocess_actor"
-        else:
-            raise ValueError(f"unsupported DataSink runner type: {runner_type!r}")
-
+    def map_batches_kwargs(self) -> dict[str, Any]:
         options: dict[str, Any] = {
             name: value
             for name in (
@@ -343,7 +335,7 @@ class DataSinkExecutionOptions:
             )
             if (value := getattr(self, name)) is not None
         }
-        options["execution_backend"] = execution_backend
+        options["execution_backend"] = "subprocess_actor"
         options["actor_number"] = self.worker_count
         return options
 
@@ -927,58 +919,15 @@ def _write_result_from_mapping(operation_id: str, payload: Mapping[str, Any]) ->
     )
 
 
-def _results_from_native(operation_id: str, payload: Mapping[str, Any]) -> tuple[WriteResult, ...]:
-    native_operation_id = payload.get("operation_id")
-    outcome_unknown = payload.get("outcome_unknown")
-    if not isinstance(outcome_unknown, bool):
-        raise TypeError("native DataSink outcome_unknown must be a boolean")
-    outcome_aborted = payload.get("outcome_aborted")
-    if not isinstance(outcome_aborted, bool):
-        raise TypeError("native DataSink outcome_aborted must be a boolean")
-    outcome_cancelled = payload.get("outcome_cancelled")
-    if not isinstance(outcome_cancelled, bool):
-        raise TypeError("native DataSink outcome_cancelled must be a boolean")
-    if outcome_unknown and outcome_aborted:
-        raise RuntimeError("native DataSink result cannot be both aborted and unknown")
-    if outcome_cancelled and not outcome_unknown:
-        raise RuntimeError("cancelled DataSink outcome must be unknown")
-    if native_operation_id != operation_id and not (outcome_unknown and native_operation_id == ""):
-        raise RuntimeError(
-            f"native DataSink operation_id mismatch: expected {operation_id!r}, got {native_operation_id!r}"
-        )
-    raw_results = payload.get("write_results")
-    if not isinstance(raw_results, list):
-        raise TypeError("native DataSink result must contain a write_results list")
-    if len(raw_results) > _MAX_WRITE_RESULTS:
-        raise ValueError("native DataSink result exceeds the write-result limit")
-    results: list[WriteResult] = []
-    total_bytes = 0
-    for item in raw_results:
-        if not isinstance(item, Mapping):
-            raise TypeError("native DataSink write results must be mappings")
-        result = _write_result_from_mapping(operation_id, item)
-        total_bytes += _result_wire_bytes(operation_id, result)
-        if total_bytes > _MAX_TOTAL_RESULT_BYTES:
-            raise ValueError("native DataSink result exceeds the 64 MiB coordinator payload limit")
-        results.append(result)
-    states = {result.state for result in results}
-    if not outcome_unknown:
-        if outcome_aborted and states != {WriteState.ABORTED}:
-            raise RuntimeError("known aborted DataSink outcome requires one or more aborted worker results")
-        if not outcome_aborted and WriteState.ABORTED in states:
-            raise RuntimeError("known applied DataSink outcome must not contain aborted worker results")
-    return tuple(results)
-
-
 def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult, ...]:
     import pyarrow as pa
 
     if not isinstance(table, pa.Table):
-        raise TypeError(f"local-fast DataSink returned {type(table).__name__}, expected pyarrow.Table")
+        raise TypeError(f"local DataSink returned {type(table).__name__}, expected pyarrow.Table")
     if tuple(table.column_names) != _WIRE_COLUMNS:
-        raise RuntimeError("local-fast DataSink returned an invalid worker result schema")
+        raise RuntimeError("local DataSink returned an invalid worker result schema")
     if table.num_rows > _MAX_WRITE_RESULTS:
-        raise ValueError("local-fast DataSink result exceeds the write-result limit")
+        raise ValueError("local DataSink result exceeds the write-result limit")
     results: list[WriteResult] = []
     total_bytes = 0
     # Converting the entire bounded Arrow table at once would still create up
@@ -1019,7 +968,7 @@ def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult
             )
             total_bytes += _result_wire_bytes(operation_id, result)
             if total_bytes > _MAX_TOTAL_RESULT_BYTES:
-                raise ValueError("local-fast DataSink result exceeds the 64 MiB coordinator payload limit")
+                raise ValueError("local DataSink result exceeds the 64 MiB coordinator payload limit")
             results.append(result)
     return tuple(results)
 
@@ -1032,16 +981,15 @@ def _cleanup_warnings(payload: Mapping[str, Any]) -> tuple[str, ...]:
         if not isinstance(raw, (list, tuple)):
             raise TypeError("native DataSink cleanup warnings must be a sequence of strings")
         warnings: tuple[str, ...] = ()
-        # Inspect at most one item beyond the public limit. Runner boundaries
-        # cap this payload too, but a malformed custom Runner must not force an
-        # unbounded validation pass here.
+        # Inspect at most one item beyond the public limit, even if a custom
+        # worker supplies malformed diagnostics.
         for item in raw[: _MAX_SUMMARY_WARNINGS + 1]:
             if not isinstance(item, str):
                 raise TypeError("native DataSink cleanup warnings must be a sequence of strings")
             warnings = _append_warning(warnings, item, limit=_MAX_SUMMARY_WARNINGS)
         return warnings
     except BaseException:
-        # Cleanup warnings are diagnostic-only. Once the runner has returned a
+        # Cleanup warnings are diagnostic-only. Once execution has returned a
         # terminal result, a malformed custom diagnostic payload must not turn
         # a known applied/aborted write into an ambiguous outcome.
         return ("DataSink cleanup diagnostics were malformed and ignored",)
@@ -1170,69 +1118,46 @@ def _execute_datasink_once(
     batch_actor: type[Any],
     context: WriteContext,
     options: DataSinkExecutionOptions,
-    runner_type: str,
 ) -> WriteSummary:
     """Execute one attempt without any implicit task or fragment replay."""
 
     mapped = prepared_relation.map_batches(
         batch_actor,
         schema=_wire_output_schema(),
-        **options.map_batches_kwargs(runner_type),
+        **options.map_batches_kwargs(),
     )
     terminal = mapped._mark_datasink(context.operation_id)
 
     results: tuple[WriteResult, ...] = ()
     warnings: tuple[str, ...] = ()
     try:
-        if runner_type == "local-fast":
+        try:
+            table = terminal.to_arrow_table()
+        finally:
             try:
-                table = terminal.to_arrow_table()
-            finally:
-                try:
-                    raw_cleanup_warnings = terminal._take_udf_actor_cleanup_warnings()
-                    warnings = _cleanup_warnings({"data_sink_cleanup_warnings": raw_cleanup_warnings})
-                except BaseException as cleanup_error:
-                    # Query completion has already established the write
-                    # outcome. A diagnostic getter failure must neither mask
-                    # the execution error nor turn a successful write into an
-                    # ambiguous one.
-                    warnings = _append_warning(
-                        warnings,
-                        f"DataSink actor cleanup diagnostics failed: {_safe_error_summary(cleanup_error)}",
-                        limit=_MAX_SUMMARY_WARNINGS,
-                    )
-            results = _results_from_arrow(context.operation_id, table)
-            states = {result.state for result in results}
-            if states == {WriteState.ABORTED}:
-                raise _aborted_error(
-                    context,
-                    results,
-                    "keyed DataSink input validation rejected the operation before workers opened",
+                raw_cleanup_warnings = terminal._take_udf_actor_cleanup_warnings()
+                warnings = _cleanup_warnings({"data_sink_cleanup_warnings": raw_cleanup_warnings})
+            except BaseException as cleanup_error:
+                # Query completion has already established the write
+                # outcome. A diagnostic getter failure must neither mask
+                # the execution error nor turn a successful write into an
+                # ambiguous one.
+                warnings = _append_warning(
                     warnings,
+                    f"DataSink actor cleanup diagnostics failed: {_safe_error_summary(cleanup_error)}",
+                    limit=_MAX_SUMMARY_WARNINGS,
                 )
-            if WriteState.ABORTED in states:
-                raise _unknown_error(context, results, "DataSink results mixed applied and aborted states", warnings)
-            return _summary(context, WriteOutcome.APPLIED, results, warnings)
-        native_result = terminal._run_datasink()
-        if not isinstance(native_result, Mapping):
-            raise TypeError(f"Runner.run_datasink() returned {type(native_result).__name__}, expected a mapping")
-        warnings = _cleanup_warnings(native_result)
-        results = _results_from_native(context.operation_id, native_result)
-        if native_result["outcome_unknown"]:
-            detail = native_result.get("outcome_error")
-            if not isinstance(detail, str) or not detail:
-                detail = "distributed execution may have applied external writes"
-            if native_result["outcome_cancelled"]:
-                raise _InterruptedDataSinkWriteError(
-                    _summary(context, WriteOutcome.UNKNOWN, results, warnings),
-                    detail,
-                )
-            raise _unknown_error(context, results, detail, warnings)
-        if native_result["outcome_aborted"]:
-            detail = native_result.get("outcome_error")
-            if not isinstance(detail, str) or not detail:
-                detail = "DataSink input was rejected before workers opened"
-            raise _aborted_error(context, results, detail, warnings)
+        results = _results_from_arrow(context.operation_id, table)
+        states = {result.state for result in results}
+        if states == {WriteState.ABORTED}:
+            raise _aborted_error(
+                context,
+                results,
+                "keyed DataSink input validation rejected the operation before workers opened",
+                warnings,
+            )
+        if WriteState.ABORTED in states:
+            raise _unknown_error(context, results, "DataSink results mixed applied and aborted states", warnings)
         return _summary(context, WriteOutcome.APPLIED, results, warnings)
     except DataSinkWriteError:
         raise
@@ -1270,6 +1195,8 @@ def write_datasink(
         raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
     if not isinstance(sink, DataSink):
         raise TypeError(f"sink must be DataSink, got {type(sink).__name__}")
+    if relation.backend != "local":
+        raise NotImplementedError("DataSink writes require backend='local'")
     relation._validate_datasink_transaction()
     context = WriteContext(str(uuid.uuid4()) if operation_id is None else operation_id)
     bound = sink.bind(_relation_arrow_schema(relation))
@@ -1292,7 +1219,6 @@ def write_datasink(
     key_validation = None
     if isinstance(bound, BoundKeyedUpsertSink):
         prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
-    runner_type = prepared_relation._get_runner_type()
     batch_actor = _make_batch_actor(bound, context, key_validation)
     try:
         cloudpickle.dumps(batch_actor)
@@ -1308,7 +1234,6 @@ def write_datasink(
                     batch_actor,
                     context,
                     options,
-                    runner_type,
                 )
             except DataSinkWriteError as error:
                 interrupted = isinstance(error, _InterruptedDataSinkWriteError)

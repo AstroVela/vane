@@ -23,6 +23,8 @@
 #include <pybind11/pybind11.h>
 #include <sstream>
 #include <unordered_set>
+#include <unordered_map>
+#include "duckdb/common/types/uuid.hpp"
 
 namespace duckdb {
 
@@ -261,6 +263,65 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 
 } // namespace
 
+pybind11::list CollectNativeUDFNodes(ClientContext &context, PhysicalOperator &root) {
+	vector<UDFFunctionData *> nodes;
+	CollectMutableUDFBindDataRecursive(root, nodes);
+	pybind11::list result;
+	for (idx_t i = 0; i < nodes.size(); i++) {
+		result.append(BuildUDFNode(i, *nodes[i], context));
+	}
+	return result;
+}
+
+pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared) {
+	if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
+		throw InternalException("local runtime graph requires a prepared physical plan");
+	}
+	// Observe native topology directly. This collector neither translates a
+	// distributed plan nor changes scan identities, payloads or scheduling.
+	vector<PhysicalOperator *> operators;
+	std::unordered_map<const PhysicalOperator *, idx_t> ids;
+	VisitPhysicalExecutionGraph(prepared.physical_plan->Root(), [&](PhysicalOperator &op) {
+		ids.emplace(&op, operators.size());
+		operators.push_back(&op);
+	});
+	pybind11::list nodes;
+	pybind11::dict udf_node_ids;
+	idx_t udf_id = 0;
+	for (auto *op : operators) {
+		pybind11::dict node;
+		auto id = std::to_string(ids.at(op));
+		node["node_id"] = id;
+		node["node_name"] = op->GetName();
+		pybind11::list inputs;
+		for (auto &child : op->GetChildren()) {
+			inputs.append(std::to_string(ids.at(&child.get())));
+		}
+		node["input_node_ids"] = inputs;
+		node["is_sink"] = op->IsSink();
+		const bool barrier = op->type == PhysicalOperatorType::ORDER_BY || op->type == PhysicalOperatorType::TOP_N;
+		node["is_materialization_barrier"] = barrier;
+		node["materialized_input_node_ids"] = barrier ? inputs : pybind11::list();
+		node["num_partitions"] = 1;
+		auto *udf = TryGetMutableUDFBindData(*op);
+		node["udf_payload"] =
+		    udf ? PythonObject::FromValue(udf->payload, udf->payload.type(), context.GetClientProperties())
+		        : pybind11::none();
+		if (udf) {
+			udf_node_ids[pybind11::str(id)] = std::to_string(udf_id++);
+		}
+		nodes.append(std::move(node));
+	}
+	pybind11::dict result;
+	result["query_id"] = UUID::ToString(UUID::GenerateRandomUUID());
+	result["nodes"] = nodes;
+	pybind11::list terminals;
+	terminals.append("0");
+	result["terminal_node_ids"] = terminals;
+	result["udf_node_ids"] = udf_node_ids;
+	return result;
+}
+
 class PythonUDFActorResourceState : public ClientContextState {
 public:
 	void EnableLocalRuntimeInputPolicy() {
@@ -484,7 +545,7 @@ private:
 			} else if (backend == "ray_actor" && !bind_data->actor_handles) {
 				throw InvalidInputException("ray_actor UDF execution requires driver-precreated actor handles from a "
 				                            "registered query allocation; "
-				                            "execute the relation through RayRunner");
+				                            "Ray UDF execution is not supported by the query runtime");
 			}
 		}
 		if (pybind11::len(subprocess_nodes) == 0) {

@@ -8,11 +8,13 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from local_request_helpers import _native_operation, run_request
 
-from vane.execution import request_admission, request_deadline, udf_local_request
+from vane.execution import request_admission, request_deadline
 from vane.execution.request_admission import (
     RequestAdmissionLimits,
     RequestCancelled,
@@ -28,7 +30,7 @@ def runtime(monkeypatch, active=1):
         session_id="deadlines", session_config={}, request_limit=RequestAdmissionLimits(active, 2)
     )
     monkeypatch.setattr(model_runtime, "_prepare", lambda *args, **kwargs: [])
-    monkeypatch.setattr(udf_local_request, "_execute_native", lambda conn, plan, **kwargs: plan)
+    monkeypatch.setattr(_native_operation, "execute", lambda conn, plan, **kwargs: plan)
     return model_runtime
 
 
@@ -37,9 +39,9 @@ def test_invalid_execution_timeout_does_not_consume_request(monkeypatch, timeout
     with runtime(monkeypatch) as models:
         request = models.request()
         with pytest.raises(ValueError, match="execution_timeout"):
-            request.execute("result", {}, conn=object(), execution_timeout=timeout)
+            run_request(request, "result", {}, conn=object(), execution_timeout=timeout)
         assert request.state == "ready"
-        assert request.execute("result", {}, conn=object()) == "result"
+        assert run_request(request, "result", {}, conn=object()) == "result"
 
 
 def test_zero_execution_timeout_expires_before_preparation(monkeypatch):
@@ -48,7 +50,7 @@ def test_zero_execution_timeout_expires_before_preparation(monkeypatch):
         monkeypatch.setattr(models, "_prepare", lambda *args, **kwargs: prepared.append(True))
         request, queued = models.request(), models.request()
         with pytest.raises(RequestExecutionTimeout):
-            request.execute("result", {}, conn=object(), execution_timeout=0)
+            run_request(request, "result", {}, conn=object(), execution_timeout=0)
         assert not prepared
         assert request.state == "execution_timed_out"
         assert request.cancellation_reason == "execution_timeout"
@@ -74,9 +76,9 @@ def test_completion_checks_deadline_when_watcher_is_delayed(monkeypatch):
             now[0] = 102.0
             return "overdue result"
 
-        monkeypatch.setattr(udf_local_request, "_execute_native", execute)
+        monkeypatch.setattr(_native_operation, "execute", execute)
         with pytest.raises(RequestExecutionTimeout):
-            request.execute("result", {}, conn=object(), execution_timeout=1)
+            run_request(request, "result", {}, conn=object(), execution_timeout=1)
         assert request.state == "execution_timed_out"
 
 
@@ -100,10 +102,10 @@ def test_delayed_watcher_cannot_start_native_work_after_expiry(monkeypatch, stag
             return [SimpleNamespace(shutdown=lambda **k: cleaned.append(True), cleanup_pending=lambda: False)]
 
         monkeypatch.setattr(models, "_prepare", prepare)
-        monkeypatch.setattr(udf_local_request, "_execute_native", lambda *a, **k: native_calls.append(True))
+        monkeypatch.setattr(_native_operation, "execute", lambda *a, **k: native_calls.append(True))
         request = models.request()
         with pytest.raises(RequestExecutionTimeout):
-            request.execute("result", {}, conn=object(), execution_timeout=1)
+            run_request(request, "result", {}, conn=object(), execution_timeout=1)
         assert not native_calls
         assert cleaned == ([True] if stage == "prepare" else [])
 
@@ -118,10 +120,10 @@ def test_failure_before_deadline_preserves_primary_error_and_stops_watcher(monke
         if stage == "prepare":
             monkeypatch.setattr(models, "_prepare", fail)
         else:
-            monkeypatch.setattr(udf_local_request, "_execute_native", fail)
+            monkeypatch.setattr(_native_operation, "execute", fail)
         request = models.request()
         with pytest.raises(ValueError, match="original execution failure"):
-            request.execute("result", {}, conn=object(), execution_timeout=60)
+            run_request(request, "result", {}, conn=object(), execution_timeout=60)
         assert request.cancellation_reason is None and request.state == "finished"
         assert request._deadline._stopped.is_set()
         assert request._deadline._callback is None
@@ -131,7 +133,7 @@ def test_queue_wait_does_not_spend_execution_timeout(monkeypatch):
     with runtime(monkeypatch) as models, ThreadPoolExecutor(max_workers=1) as threads:
         holder = models.request()._ticket.take()
         request = models.request()
-        future = threads.submit(request.execute, "result", {}, conn=object(), execution_timeout=0.1)
+        future = threads.submit(partial(run_request, request), "result", {}, conn=object(), execution_timeout=0.1)
         try:
             time.sleep(0.15)
             assert request.state == "queued" and request._deadline is None
@@ -147,7 +149,7 @@ def test_queue_expiration_does_not_start_execution_deadline(monkeypatch):
         request = models.request(queue_timeout=0.02)
         try:
             with pytest.raises(RequestQueueTimeout):
-                request.execute("result", {}, conn=object(), execution_timeout=0.001)
+                run_request(request, "result", {}, conn=object(), execution_timeout=0.001)
             assert request.state == "timed_out" and request._deadline is None
             state = models.resource_snapshot()["request_admission"]
             assert state["timed_out_requests"] == 1 and state["execution_timed_out_requests"] == 0
@@ -169,7 +171,7 @@ def test_slow_cleanup_is_outside_execution_deadline(monkeypatch):
     with runtime(monkeypatch) as models, ThreadPoolExecutor(max_workers=1) as threads:
         monkeypatch.setattr(models, "_prepare", lambda *a, **k: [Cleanup()])
         request, queued = models.request(), models.request()
-        future = threads.submit(request.execute, "result", {}, conn=object(), execution_timeout=0.1)
+        future = threads.submit(partial(run_request, request), "result", {}, conn=object(), execution_timeout=0.1)
         try:
             assert entered.wait(3)
             time.sleep(0.15)
@@ -198,10 +200,10 @@ def test_slow_cancellation_cannot_delay_another_deadline(monkeypatch):
             assert cancellation._event.wait(3)
             return "too late"
 
-        monkeypatch.setattr(udf_local_request, "_execute_native", execute)
+        monkeypatch.setattr(_native_operation, "execute", execute)
         first, second = models.request(), models.request()
-        slow = threads.submit(first.execute, "slow", {}, conn=object(), execution_timeout=0.1)
-        fast = threads.submit(second.execute, "fast", {}, conn=object(), execution_timeout=0.1)
+        slow = threads.submit(partial(run_request, first), "slow", {}, conn=object(), execution_timeout=0.1)
+        fast = threads.submit(partial(run_request, second), "fast", {}, conn=object(), execution_timeout=0.1)
         try:
             assert blocked.wait(3)
             assert other_cancelled.wait(3)
@@ -223,12 +225,12 @@ def test_copied_deadline_callback_is_fenced_after_completion(monkeypatch):
     monkeypatch.setattr(RequestExecutionDeadline, "expired", lambda self: expired[0])
     with runtime(monkeypatch) as models:
         request = models.request()
-        assert request.execute("first", {}, conn=object(), execution_timeout=1) == "first"
+        assert run_request(request, "first", {}, conn=object(), execution_timeout=1) == "first"
         expired[0] = True
         callbacks[0]()  # The watcher copied this before close removed it.
         assert request.state == "finished" and request.cancellation_reason is None
         assert not request._cancellation.is_set()
-        assert models.request().execute("next", {}, conn=object()) == "next"
+        assert run_request(models.request(), "next", {}, conn=object()) == "next"
 
 
 @pytest.mark.parametrize("timeout_first", [False, True])
@@ -250,9 +252,9 @@ def test_first_accepted_cancellation_cause_wins(monkeypatch, timeout_first):
                 request._expire_deadline()
             return "cancelled result"
 
-        monkeypatch.setattr(udf_local_request, "_execute_native", execute)
+        monkeypatch.setattr(_native_operation, "execute", execute)
         with pytest.raises(RequestExecutionTimeout if timeout_first else RequestCancelled):
-            request.execute("result", {}, conn=object(), execution_timeout=1)
+            run_request(request, "result", {}, conn=object(), execution_timeout=1)
         assert request.state == ("execution_timed_out" if timeout_first else "cancelled")
 
 
@@ -265,7 +267,7 @@ def test_deadline_start_failure_preserves_error_and_releases_request(monkeypatch
         request = models.request()
         ref = weakref.ref(request)
         with pytest.raises(RuntimeError, match="watcher startup failure"):
-            request.execute("result", {}, conn=object(), execution_timeout=60)
+            run_request(request, "result", {}, conn=object(), execution_timeout=60)
         assert models.resource_snapshot()["request_admission"]["active_requests"] == 0
         del request
         gc.collect()

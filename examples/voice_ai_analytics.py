@@ -125,17 +125,8 @@ def relation_from_dicts(
 
 
 def collect_relation(rel: Any) -> pa.Table:
-    """Materialize a relation through the configured default runner."""
-    tables = list(
-        vane.runners.get_or_create_runner().run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None))
-    )
-    if not tables:
-        return pa.table({column: pa.array([]) for column in rel.columns})
-    table = pa.concat_tables(tables)
-    expected_columns = list(rel.columns)
-    if table.column_names != expected_columns:
-        table = table.rename_columns(expected_columns)
-    return table
+    """Materialize a local native relation, preserving its Arrow schema."""
+    return rel.to_arrow_table()
 
 
 def sample_relation(conn: Any, limit: int) -> Any:

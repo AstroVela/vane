@@ -4,16 +4,13 @@
 from __future__ import annotations
 
 import pickle
-import threading
-from typing import Any
 
 import pytest
 
 import vane
 import vane._ray_errors as ray_errors
 from vane._ray_errors import RemoteRayException
-from vane.runners.ray import driver
-from vane.runners.ray.safe_get import resolve_object_refs_blocking
+from vane.execution.ray_wait import resolve_object_refs_blocking
 
 
 def _chained_error(label: str) -> RuntimeError:
@@ -41,32 +38,6 @@ def test_remote_ray_exception_pickle_round_trip_restores_cause_chain():
 
     assert isinstance(restored, RuntimeError)
     _assert_restored_chain(restored, "pickle")
-
-
-def test_remote_ray_exception_preserves_unknown_copy_recovery_context():
-    from vane.runners import CopyOutcomeUnknownError
-
-    original = CopyOutcomeUnknownError(
-        "copy-operation",
-        "s3://bucket/out",
-        "run-unknown",
-        "s3://bucket/out.duckdb_commit/run-unknown/manifest.txt",
-        "s3://bucket/out.duckdb_commit/run-unknown/committed",
-        "marker readback unavailable",
-        ("teardown warning",),
-    )
-
-    restored = pickle.loads(pickle.dumps(RemoteRayException.from_exception(original))).restore()
-
-    assert type(restored) is CopyOutcomeUnknownError
-    assert restored.operation_id == original.operation_id
-    assert restored.base_path == original.base_path
-    assert restored.run_id == original.run_id
-    assert restored.manifest_path == original.manifest_path
-    assert restored.committed_marker_path == original.committed_marker_path
-    assert restored.detail == original.detail
-    assert restored.cleanup_warnings == original.cleanup_warnings
-    assert restored.safe_to_retry is False
 
 
 @pytest.mark.parametrize(
@@ -286,99 +257,3 @@ def test_real_ray_preserves_implicit_context_and_constructor_state(ray_local):
         resolve_object_refs_blocking(fail_with_structured_exception.remote())
     assert structured_info.value.errno == 2
     assert structured_info.value.filename == "/tmp/input.parquet"
-
-
-def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, monkeypatch):
-    import ray
-
-    @ray.remote
-    def fail_with_chain(label: str) -> None:
-        import vane as remote_vane
-        from vane._ray_errors import remote_ray_exception as build_remote_ray_exception
-
-        try:
-            raise remote_vane.NotImplementedException(f"{label} original")
-        except remote_vane.NotImplementedException as cause:
-            raise build_remote_ray_exception(f"{label} outer", cause) from cause
-
-    @ray.remote
-    def succeed(value: Any = None) -> Any:
-        return value
-
-    @ray.remote
-    def recover_failure_with_chain(label: str, operation_id: str) -> Any:
-        import vane as remote_vane
-        from vane._ray_errors import remote_ray_exception as build_remote_ray_exception
-        from vane.runners.ray.driver import CopyPlanRecovery
-
-        try:
-            raise remote_vane.NotImplementedException(f"{label} original")
-        except remote_vane.NotImplementedException as cause:
-            return CopyPlanRecovery(
-                operation_id=operation_id,
-                error=build_remote_ray_exception(f"{label} outer", cause),
-            )
-
-    class SuccessMethod:
-        def __init__(self, value: Any = None) -> None:
-            self.value = value
-
-        def remote(self, *_args, **_kwargs):
-            return succeed.remote(self.value)
-
-    class FailureMethod:
-        def __init__(self, label: str) -> None:
-            self.label = label
-
-        def remote(self, *_args, **_kwargs):
-            return fail_with_chain.remote(self.label)
-
-    class RecoveryFailureMethod:
-        def __init__(self, label: str) -> None:
-            self.label = label
-
-        def remote(self, *_args):
-            return recover_failure_with_chain.remote(self.label, str(_args[-1]))
-
-    class Plan:
-        def idx(self) -> str:
-            return "remote-error-plan"
-
-        def session_id(self) -> str:
-            return "remote-error-session"
-
-        def session_config(self) -> dict[str, str]:
-            return {}
-
-    class Runner:
-        close_plan = SuccessMethod()
-        progress_snapshot = SuccessMethod()
-
-        def __init__(self, failure_path: str) -> None:
-            self.run_plan = FailureMethod("preflight") if failure_path == "preflight" else SuccessMethod()
-            self.get_next_partition = FailureMethod("stream") if failure_path == "stream" else SuccessMethod(None)
-            self.run_copy_plan = FailureMethod("copy") if failure_path == "copy" else SuccessMethod()
-            self.recover_copy_plan = RecoveryFailureMethod("copy") if failure_path == "copy" else SuccessMethod()
-
-    monkeypatch.setattr(driver, "_collect_vane_env_overrides", dict)
-    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
-
-    for failure_path in ("preflight", "stream", "copy"):
-        client = object.__new__(driver.RayQueryDriverClient)
-        client._owner_id = "remote-error-owner"
-        client._opened_sessions = {"remote-error-session": {}}
-        client._uncertain_sessions = {}
-        client._opening_session_ids = set()
-        client._closing_session_ids = set()
-        client._closed_session_ids = driver.BoundedReplayMap(capacity=65_536)
-        client._session_closes_in_progress = set()
-        client._session_condition = threading.Condition()
-        client._client_closing = False
-        client._client_close_in_progress = False
-        client.runner = Runner(failure_path)
-        with pytest.raises(RuntimeError) as exc_info:
-            if failure_path == "copy":
-                client.run_copy_plan(Plan())
-            else:
-                list(client.stream_plan(Plan()))
-        _assert_restored_chain(exc_info.value, failure_path)

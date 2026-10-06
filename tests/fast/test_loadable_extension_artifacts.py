@@ -73,7 +73,9 @@ def test_direct_tpch_pragma_keeps_native_data_execution(
     def forbid_initialization(*_args, **_kwargs):
         raise AssertionError("an unchanged native pragma must not initialize Ray")
 
-    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    from vane.execution.pipelined_runtime import RayQueryRuntime
+
+    monkeypatch.setattr(RayQueryRuntime, "__init__", forbid_initialization)
     with vane.connect(database, config=config) as connection:
         connection.load_extension(str(loadable_extension_path))
         if transaction:
@@ -81,11 +83,7 @@ def test_direct_tpch_pragma_keeps_native_data_execution(
         assert getattr(connection, entry)("PRAGMA tpch(1)").fetchall() == []
         if transaction:
             connection.commit()
-        # Completed rows pass source admission, but this unsigned fixture was
-        # loaded directly and cannot enter a distributed connection snapshot.
-        result = connection.sql("PRAGMA tpch(1)")
-        with pytest.raises(ValueError, match="not loaded through vane.DynamicExtensionResolver: tpch"):
-            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(result.project("*"), None)
+        assert connection.sql("PRAGMA tpch(1)").fetchall() == []
 
 
 def test_staged_httpfs_extension_loads_without_static_linkage(loadable_httpfs_extension_path: Path):

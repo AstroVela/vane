@@ -129,7 +129,6 @@ def main():
     if min(args.height, args.width, args.threads, args.repetitions) < 1 or args.idx < 0:
         parser.error("dimensions, threads and repetitions must be positive; idx must be nonnegative")
     source, artifact = args.input.resolve(strict=True), args.extension.resolve(strict=True)
-    os.environ["VANE_RUNNER"] = "local-fast"
     import vane
 
     timings = {}

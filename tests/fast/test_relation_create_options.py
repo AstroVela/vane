@@ -3,15 +3,12 @@
 
 from __future__ import annotations
 
-import pickle
-
 import pytest
 
 import vane
 
 
-def test_create_preserves_qualified_catalog_target(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_create_preserves_qualified_catalog_target():
     con = vane.connect()
     con.execute("ATTACH ':memory:' AS target_catalog")
 
@@ -23,8 +20,7 @@ def test_create_preserves_qualified_catalog_target(monkeypatch):
     ).fetchall() == [("target_catalog",)]
 
 
-def test_create_passes_structured_options_to_native_catalog(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_create_passes_structured_options_to_native_catalog():
     con = vane.connect()
     source = con.sql("SELECT 1 AS id, 'north' AS region")
 
@@ -45,101 +41,17 @@ def test_create_passes_structured_options_to_native_catalog(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("runner_value", [None, "", "ray"])
-def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, runner_value):
-    if runner_value is None:
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", runner_value)
-
-    captured = []
-    logical_plans = []
-
-    class CapturingRunner:
-        def run_write(self, relation):
-            captured.append(relation)
-            logical_plan = relation
-            logical_plans.append(pickle.loads(pickle.dumps(logical_plan)))
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
-    con = vane.connect()
-    con.sql("SELECT 1 AS id, 'north' AS region").create(
-        "ray_target",
-        properties={"location": "s3://warehouse/ray_target"},
-        partition_by=["bucket(16, id)"],
-    )
-
-    assert len(captured) == 1 and isinstance(captured[0], vane.ray_cxx.PyLogicalPlan)
-    assert logical_plans[0].idx() == captured[0].idx()
-    assert logical_plans[0].to_physical_plan(con) is not None
-    with pytest.raises(vane.CatalogException, match="ray_target"):
-        con.table("ray_target")
-
-
-def test_create_rejects_local_fte_runner(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    con = vane.connect()
-
-    with pytest.raises(
-        vane.InvalidInputException,
-        match="CTAS requires a ray or local-fast connection",
-    ):
-        con.sql("SELECT 1 AS id").create("local_fte_target", properties={"format-version": 2})
-
-    assert con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'local_fte_target'"
-    ).fetchone() == (0,)
-
-
-def test_ray_create_rejects_explicit_transaction(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-
-    def unexpected_runner(*_args, **_kwargs):
-        pytest.fail("transaction rejection must happen before Ray initialization")
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", unexpected_runner)
-    con = vane.connect()
-    source = con.sql("SELECT 1 AS id")
-    con.execute("BEGIN")
-    try:
-        with pytest.raises(
-            vane.BinderException,
-            match="requires DuckDB auto-commit mode.*explicit transaction",
-        ):
-            source.create("transaction_target")
-    finally:
-        con.execute("ROLLBACK")
-        con.close()
-
-
-def test_ray_create_failure_never_executes_locally(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    successful_calls = []
-
-    class FailingRunner:
-        def run_write(self, relation):
-            raise RuntimeError("injected distributed CTAS failure")
-
-    class CapturingRunner:
-        def run_write(self, relation):
-            successful_calls.append(relation)
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRunner())
-    con = vane.connect()
-
-    with pytest.raises(RuntimeError, match="injected distributed CTAS failure"):
-        con.sql("SELECT 1 AS id").create("failed_ray_target")
-
-    with pytest.raises(vane.CatalogException, match="failed_ray_target"):
-        con.table("failed_ray_target")
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
-    con.sql("SELECT 2 AS id").create("retry_ray_target")
-    assert len(successful_calls) == 1 and isinstance(successful_calls[0], vane.ray_cxx.PyLogicalPlan)
-    with pytest.raises(vane.CatalogException, match="retry_ray_target"):
-        con.table("retry_ray_target")
+def test_create_rejects_ray_backend(tmp_path):
+    database = str(tmp_path / "native.duckdb")
+    with vane.connect(database, backend="ray") as connection:
+        source = connection.table_function("range", [1])
+        with pytest.raises(vane.NotImplementedException, match="require backend='local'"):
+            source.create("ray_target")
+        assert connection.query_runtime.pool.workers == []
+    with vane.connect(database) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'ray_target'"
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize(
@@ -157,8 +69,7 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
         ({"partition_by": ["id, region"]}, "exactly one expression"),
     ],
 )
-def test_create_validates_structured_arguments(monkeypatch, kwargs, message):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_create_validates_structured_arguments(kwargs, message):
     con = vane.connect()
 
     with pytest.raises(vane.InvalidInputException, match=message):

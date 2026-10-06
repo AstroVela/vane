@@ -7,7 +7,7 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 6 日（P4 分析执行更新） |
+| 日期 | 2026 年 10 月 7 日（P5.1 执行入口切换） |
 | 开发分支 | feat/analytical-execution |
 | 基础分支 | integration/pipelined-execution |
 | Vane 参考提交 | a69e60ca43d9（PR #963 合入） |
@@ -166,7 +166,7 @@ with vane.connect(backend="local", resources=limits) as local:
         assert result.execution_state == "SUCCEEDED"
 ~~~
 
-local.query 只接受自动提交下的单条只读 SELECT；命令使用 execute。支持位置/具名参数、原生算子与批次输出，模型 UDF 尚未接入。query 不读取 VANE_RUNNER，不构建 FragmentGraph，也不创建 LocalModelRequest。local 的 connect/query 拒绝任何 execution override，包括显式 None。未指定 backend 的既有连接尚未切换；它们调用 query 会报错，惰性 Relation 使用 sql 或 from_query，不保留旧 query 别名。P2 接通下述 Ray pipelined 入口。
+local.query 只接受自动提交下的单条只读 SELECT；命令使用 execute。支持位置/具名参数、原生算子与批次输出，模型 UDF 尚未接入。query 不读取 VANE_RUNNER，不构建 FragmentGraph，也不创建 LocalModelRequest。local 的 connect/query 拒绝任何 execution override，包括显式 None。未指定 backend 时使用 local；第一次 query 惰性建立会话共享的 QueryRuntime，并在会话锁内保证只发布一次。显式 resources 也默认选择 local。惰性 Relation 使用 sql 或 from_query。Ray 支持下述 pipelined 入口。
 
 QueryResult 暴露 schema（Arrow schema）、query_id、context、read_batch/迭代、collect、cancel、close、execution_state 和交付 state。read_batch 返回 RecordBatch，正常 EOF 抛出 StopIteration，部分交付后的 native 错误继续抛出。collect 只收集剩余行，逐批复制到调用方内存并释放传输 lease。关闭结果或连接后，已经导出的 Arrow 切片、NumPy 零拷贝视图仍可读取并持续占用预算，直到最后一个视图释放。
 
@@ -912,10 +912,10 @@ Python 管理查询和放置，C++ 负责 fragment、exchange 和数据所有权
 | 当前实现位置 | 新职责接管方式 |
 | --- | --- |
 | [PlanRunner](external/duckdb/src/include/duckdb/execution/distributed/plan/runner.hpp) 与产生 task stream 的编排 | FragmentGraph builder 只构图，scheduler 单独执行；删除构图中执行查询的路径 |
-| [FTE backend](vane/runners/fte/backend.py) 与旧 FTE 控制结构 | TaskService 和 RecoveryScheduler 直接接管，不留下调用旧 manager 的包装器 |
-| [LocalRunner](vane/runners/local/runner.py) 与 [LocalQueryRuntime](vane/execution/local_query.py) 的查询分流 | 统一 local backend 与 QueryContext；模型服务另行拥有模型生命周期 |
-| [Ray driver](vane/runners/ray/driver.py) 与 [worker](vane/runners/ray/worker.py) 中耦合执行模式的部分 | Coordinator、scheduler 和 Ray backend 分担职责；worker 数据执行进入共同 native runtime |
-| [Ray 结果包装](vane/runners/ray/partition_metadata.py) 与 [Python 结果源](src/vane_py/pyresult_source.cpp) | QueryResult 和 native ResultService 接管公开结果链路 |
+| `vane/runners/fte/backend.py`（已删除） 与旧 FTE 控制结构 | TaskService 和 RecoveryScheduler 直接接管，不留下调用旧 manager 的包装器 |
+| `vane/runners/local/runner.py`（已删除） 与 [LocalQueryRuntime](vane/execution/local_query.py) 的查询分流 | 统一 local backend 与 QueryContext；模型服务另行拥有模型生命周期 |
+| `vane/runners/ray/driver.py`（已删除） 与 `vane/runners/ray/worker.py`（已删除） 中耦合执行模式的部分 | Coordinator、scheduler 和 Ray backend 分担职责；worker 数据执行进入共同 native runtime |
+| `vane/runners/ray/partition_metadata.py`（已删除） 与 [Python 结果源](src/vane_py/pyresult_source.cpp) | QueryResult 和 native ResultService 接管公开结果链路 |
 | [result_delivery](vane/execution/result_delivery.py) 与 [local_result_delivery](vane/execution/local_result_delivery.py) 的查询专用包装 | 将有用的 ownership 实现迁入 BatchLease；删除旧查询入口，不继承 LocalModelRequest |
 | [ResourceGraph](vane/execution/resource_graph.py) 与 [ResourceVector](vane/execution/resources.py) 的执行关联 | 资源需求进入 FragmentGraph，预算重新定义；保留与查询无关的实用代码需有独立职责 |
 | [Flight server](external/duckdb/src/execution/distributed/exchange/flight_server.cpp) 的旧 ticket 分支 | 使用新协议服务 direct 通道；物化读取由新的存储实现负责 |
@@ -971,6 +971,20 @@ P3 不能通过委托旧 FTE 引擎完成。新的任务服务、计划格式、
 各阶段按新能力组织可审阅的变更。开发期间尚未删除的旧源码只能作为参考，不能成为新实现的执行依赖；阶段性原型不代表完整双模式已经交付。正式发布以新架构和声明的能力范围验收，不以旧接口继续可用为条件。
 
 分支仍基于 feature/local-runtime，使用其中可取的实现经验和代码。基础分支合入 main 后再调整分支基线；继承提交历史不产生 API 或模块结构的兼容承诺。
+
+### P5.1 公开入口与删除边界
+
+| 入口 | local（默认） | ray |
+| --- | --- | --- |
+| `connect()` / `connect(resources=...)` | 本地原生连接；query 运行时按需建立 | 显式 `backend="ray"` |
+| `query(SELECT, ...)` | QueryContext/QueryResult，原生流式结果 | 新 fragment compiler 和 pipelined/FTE runtime |
+| `execute` / `executemany` / `sql` / `from_query` | 原生 SQL、命令及 Relation | 在执行或绑定前明确拒绝，使用 query |
+| Relation 终端、DataSink | 原生本地执行，保留参数、事务和模型生命周期 | 当前分布式支持范围不包含此入口 |
+| `configure_local_runtime` / `register_model` | 独立的本地模型服务；与普通 query runtime 互斥 | 拒绝 |
+
+删除全局 runner 单例、Python `vane.runners`、`ray_cxx` 计划执行对象和旧结果分区桥接。UDF 共用的环境隔离、远程等待和资源协议位于 `vane.execution`，不导入旧 scheduler。模型原生图观察不改变 UDF payload 或 scan identity。
+
+`VANE_RUNNER` 不再决定连接或查询行为，`configure(runner=...)` 等旧执行配置不再接受。`connect(":default:")` 只能获取已有连接；任何显式 backend/resources/execution 配置均拒绝，避免重置会话计费。Ray 的 SQL 参数、模型 UDF、媒体类型及写入仍在当前支持范围之外；失败不会转交其他后端。
 
 ## 验证计划
 
@@ -1063,7 +1077,7 @@ Trino 的[配置文档][trino-docs]仍指出同集群模式切换未测试，并
 
 [RemoteExchangeSink](external/duckdb/src/execution/operator/exchange/physical_remote_exchange_sink.cpp) 和 [RemoteExchangeSource](external/duckdb/src/execution/operator/exchange/physical_remote_exchange_source.cpp) 存在同步 WaitUnblocked；[FteSplitQueue](external/duckdb/src/include/duckdb/execution/distributed/plan/fte_split_queue.hpp) 与 [pipeline executor](external/duckdb/src/parallel/pipeline_executor.cpp) 可用于研究正确的 native 阻塞和唤醒边界。
 
-local-runtime 的 [资源图](LOCAL_MODEL_RUNTIME.md#shared-resource-graph-and-local-execution-identity) 是 structural_only，不能直接执行；[managed native streams](LOCAL_MODEL_RUNTIME.md#managed-native-result-streams) 提供了结果借用、预算和清理经验。这些证据说明需要哪些能力，不要求新引擎继承原有类、接口或分流方式。
+local-runtime 的 [资源图](LOCAL_MODEL_RUNTIME.md#native-resource-graph) 是 structural_only，不能直接执行；[managed native streams](LOCAL_MODEL_RUNTIME.md#managed-native-result-streams) 提供了结果借用、预算和清理经验。这些证据说明需要哪些能力，不要求新引擎继承原有类、接口或分流方式。
 
 ## 第一版之后
 

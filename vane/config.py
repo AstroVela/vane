@@ -9,8 +9,7 @@ Instead of setting environment variables manually, users can call
     import vane
 
     vane.configure(
-        runner="ray",
-        ray_scan_split_min_count=16,
+        udf_parallel=True,
     )
 
 Under the hood this writes to ``os.environ`` — env vars remain the
@@ -22,7 +21,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any
 
-from vane._env import _PUBLIC_RUNNER_ERROR, _PUBLIC_RUNNER_VALUES, EnvRegistry, _Var, env
+from vane._env import EnvRegistry, _Var, env
 
 # Dynamically build the dataclass fields from the registry descriptors
 # so we don't have to duplicate the list of variables.
@@ -63,10 +62,6 @@ if TYPE_CHECKING:
 
         local_exchange_buffer: str = "32MB"
         ndjson_max_split_bytes: int = 256 * 1024 * 1024
-        ray_init_sql: str = ""
-        ray_max_task_backlog: int = 0
-        ray_scan_split_min_count: int = 0
-        runner: str = "ray"
         udf_arrow_fastpath: bool = True
         udf_parallel: bool = False
 
@@ -82,19 +77,14 @@ def configure(**kw: Any) -> VaneConfig:
 
     Example::
 
-        cfg = vane.configure(runner="ray", ray_scan_split_min_count=16)
-        print(cfg.runner)  # "ray"
+        cfg = vane.configure(udf_parallel=True)
+        print(cfg.udf_parallel)  # True
     """
     for key in kw:
         if key not in _FIELD_NAMES:
             raise AttributeError(
                 f"Unknown config field: {key!r}. Use current_config().__dict__.keys() to see available names."
             )
-    if "runner" in kw:
-        runner = str(kw["runner"] or "").strip().lower() or "ray"
-        if runner not in _PUBLIC_RUNNER_VALUES:
-            raise ValueError(_PUBLIC_RUNNER_ERROR)
-        kw["runner"] = runner
     cfg = VaneConfig(**kw)
     # Apply only the explicitly passed keys (not defaults)
     env.set(**kw)

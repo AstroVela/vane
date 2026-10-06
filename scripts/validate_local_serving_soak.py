@@ -496,7 +496,6 @@ def main():
         args.gpu_device = "GPU-" + args.gpu_device[4:].lower()
     directory = args.output.resolve()
     if args.worker:
-        os.environ["VANE_RUNNER"] = "local-fast"
         # Process-owned descriptor: keep both it and the handlers alive after
         # main returns, through thread joins, atexit hooks and finalizers. The OS
         # closes it at exit; a file object's destruction could close it too soon.

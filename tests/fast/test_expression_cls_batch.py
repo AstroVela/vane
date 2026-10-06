@@ -205,39 +205,6 @@ def test_vane_cls_batch_struct_unnest_executes_one_actor_udf():
     assert selected.fetchall() == [(0, 0, "value=0"), (1, 1, "value=1")]
 
 
-def test_vane_cls_batch_physical_payload_supports_multiple_independent_actors(monkeypatch):
-    import uuid
-
-    import pyarrow as pa
-
-    import vane
-
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-
-    @vane.cls.batch(actor_number=3, return_dtype=pa.int32(), batch_size=2, gpus=0)
-    class Identity:
-        def __call__(self, values):
-            return values
-
-    con = vane.connect()
-    try:
-        relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(Identity()(vane.col("x")))
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(con)
-        nodes = plan.collect_udf_nodes(conn=con)
-    finally:
-        con.close()
-
-    assert len(nodes) == 1
-    payload = nodes[0]["payload"]
-    assert payload["execution_backend"] == "subprocess_actor"
-    assert payload["actor_number"] == 3
-    assert "stateful" not in payload
-    assert "side_effects" not in payload
-    assert payload["row_preserving"] is True
-    assert payload["call_mode"] == "map_batches_rows"
-    assert payload["expression_id"]
-
-
 def test_vane_cls_batch_return_dtype_pyarrow_int64_expression_round_trip():
     import pyarrow as pa
 

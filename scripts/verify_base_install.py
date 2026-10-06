@@ -3,8 +3,6 @@
 
 """Smoke-test the public Quickstart against a base Vane installation."""
 
-import ray
-
 import vane
 
 
@@ -46,7 +44,6 @@ def main() -> None:
     finally:
         vane.detach_function("review_status_sql", connection=con)
         con.close()
-        ray.shutdown()
 
 
 if __name__ == "__main__":

@@ -7,16 +7,11 @@ Usage::
 
     from vane._env import env
 
-    # Read (always live from os.environ)
-    print(env.runner)  # "ray" or "local"
-    print(env.ray_scan_split_min_count)  # 0
+    env.udf_parallel = True
+    settings = env.as_dict()
 
-    # Write (sets os.environ immediately)
-    env.runner = "ray"
-    env.ray_scan_split_min_count = 16
-
-    # Bulk snapshot
-    d = env.as_dict()  # {"runner": "ray", ...}
+Execution configuration belongs to ``vane.connect(backend=..., resources=...)``
+and per-query options.
 
 Each variable is declared as a class-level ``_Var`` descriptor so that
 attribute access on the singleton *env* object reads/writes ``os.environ``
@@ -29,8 +24,6 @@ import os
 from typing import Any, Generic, TypeVar, overload
 
 T = TypeVar("T")
-_PUBLIC_RUNNER_VALUES = frozenset({"local", "ray"})
-_PUBLIC_RUNNER_ERROR = "runner must be 'local' or 'ray'"
 
 # ---------------------------------------------------------------------------
 # Descriptor
@@ -92,19 +85,6 @@ class _Var(Generic[T]):
         return raw  # type: ignore[return-value]
 
 
-class _RunnerVar(_Var[str]):
-    """Runner variable with the same normalization as the C++ resolver."""
-
-    def _parse(self, raw: str) -> str:
-        return raw.strip().lower() or self.default
-
-    def __set__(self, obj: Any, value: str) -> None:
-        normalized = self._parse(str(value))
-        if normalized not in _PUBLIC_RUNNER_VALUES:
-            raise ValueError(_PUBLIC_RUNNER_ERROR)
-        super().__set__(obj, normalized)
-
-
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -118,30 +98,6 @@ class EnvRegistry:
     variables may still be read directly by their subsystem.
     """
 
-    # -- Runner selection ---------------------------------------------------
-
-    runner = _RunnerVar(
-        "VANE_RUNNER",
-        str,
-        "ray",
-        "Execution backend. Unset, empty, or 'ray' = Ray distributed; 'local' = Vane local FTE runner.",
-    )
-
-    # -- Ray runner ---------------------------------------------------------
-
-    ray_max_task_backlog = _Var(
-        "VANE_RAY_MAX_TASK_BACKLOG",
-        int,
-        0,
-        "Max pending tasks before back-pressure. 0 = unlimited.",
-    )
-    ray_scan_split_min_count = _Var(
-        "VANE_RAY_SCAN_SPLIT_MIN_COUNT",
-        int,
-        0,
-        "Minimum split-planning hint passed to distributed table functions. "
-        "0 = use the available worker slots. FTE remains responsible for grouping splits into tasks.",
-    )
     ndjson_max_split_bytes = _Var(
         "VANE_NDJSON_MAX_SPLIT_BYTES",
         int,
@@ -149,15 +105,6 @@ class EnvRegistry:
         "Maximum nominal distributed NDJSON range size in bytes (minimum 2 MiB). "
         "Read during coordinator planning; line alignment can extend ranges beyond this size.",
     )
-    ray_init_sql = _Var(
-        "VANE_RAY_INIT_SQL",
-        str,
-        "",
-        "SQL to execute on each Ray worker at startup.",
-    )
-
-    # -- Fault-tolerant execution ------------------------------------------
-
     # -- UDF ----------------------------------------------------------
 
     udf_parallel = _Var(
@@ -198,7 +145,7 @@ class EnvRegistry:
 
         Example::
 
-            env.set(runner="ray", ray_scan_split_min_count=16)
+            env.set(udf_parallel=True)
         """
         for key, value in kw.items():
             descriptor = getattr(type(self), key, None)

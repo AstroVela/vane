@@ -28,10 +28,10 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 			throw py::value_error("connections do not accept unknown query options");
 		}
 	}
-	if (!options.contains("backend") || !py::isinstance<py::str>(options["backend"])) {
+	if (options.contains("backend") && !py::isinstance<py::str>(options["backend"])) {
 		throw py::value_error("the query API requires backend='local' or backend='ray'");
 	}
-	auto backend = py::cast<string>(options["backend"]);
+	auto backend = options.contains("backend") ? py::cast<string>(options["backend"]) : string("local");
 	if (backend != "local" && backend != "ray") {
 		throw py::value_error("backend must be 'local' or 'ray'");
 	}
@@ -48,7 +48,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 	} else {
 		runtime = py::module_::import("vane.execution.query_runtime").attr("QueryRuntime")(resources);
 	}
-	auto connection = ConnectWithRunner(database, read_only, config, "local-fast");
+	auto connection = ConnectQuerySession(database, read_only, config);
 	EnableLocalRuntimeInputPolicy(*connection->con.GetConnection().context);
 	connection->vane_session->query_runtime = std::move(runtime);
 	return connection;
@@ -63,6 +63,19 @@ py::object DuckDBPyConnection::GetQueryRuntime() const {
 	return vane_session->query_runtime;
 }
 
+string DuckDBPyConnection::GetExecutionBackend() const {
+	auto runtime = GetQueryRuntime();
+	return runtime.is_none() ? "local" : runtime.attr("backend").cast<string>();
+}
+
+void DuckDBPyConnection::RequireLocalExecution() const {
+	CheckCallbackEntry();
+	if (GetExecutionBackend() != "local") {
+		throw NotImplementedException(
+		    "Ray connections execute SELECT through query(); native SQL and Relation APIs require backend='local'");
+	}
+}
+
 py::object DuckDBPyConnection::Query(const py::object &sql, const py::object &parameters, const py::object &options,
                                      const py::object &rows_per_batch, const py::kwargs &overrides) {
 	auto lock = LockForQuery();
@@ -72,7 +85,23 @@ py::object DuckDBPyConnection::Query(const py::object &sql, const py::object &pa
 	const auto generation = InterruptGeneration();
 	auto runtime = GetQueryRuntime();
 	if (runtime.is_none()) {
-		throw InvalidInputException("query() requires a connection created with backend='local' or backend='ray'");
+		if (!GetLocalQueryRuntime().is_none()) {
+			throw InvalidInputException("query() cannot share a session with the local model runtime");
+		}
+		auto candidate = py::module_::import("vane.execution.query_runtime").attr("QueryRuntime")();
+		lock_guard<mutex> guard(vane_session->lock);
+		if (!vane_session_attached || vane_session->local_runtime_closing) {
+			throw ConnectionException("Connection is closing");
+		}
+		if (!vane_session->local_query_runtime.is_none()) {
+			throw InvalidInputException("query() cannot share a session with the local model runtime");
+		}
+		// Imports may release the GIL; another cursor may already own the
+		// session runtime. Publish once so all cursors share admission.
+		if (vane_session->query_runtime.is_none()) {
+			vane_session->query_runtime = std::move(candidate);
+		}
+		runtime = vane_session->query_runtime;
 	}
 	if (local_query_closing) {
 		throw ConnectionException("Connection is closing");

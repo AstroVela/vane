@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vane.execution.data_lifecycle import OutputBlockLeaseOwner
 from vane.execution.udf_data_lease import DataAllocation, RuntimeDataLedger, current_data_task
 
 
@@ -191,67 +190,20 @@ def test_concurrent_view_forks_preserve_allocation_until_last_release(data_scope
     assert ledger.snapshot()["retained_bytes"] == 0
 
 
-@pytest.fixture(params=["local", "ray"])
-def output_owner(request):
-    if request.param == "local":
-        ledger = RuntimeDataLedger()
-        query = ledger.open_query()
-        task = query.open_task()
-        owner = task.own_output(DataAllocation("local_shm", "output", 80))
+@pytest.fixture
+def output_owner():
+    ledger = RuntimeDataLedger()
+    query = ledger.open_query()
+    task = query.open_task()
+    owner = task.own_output(DataAllocation("local_shm", "output", 80))
 
-        def finish():
-            task.finish()
-            query.shutdown()
-            ledger.close()
-
-        def retained():
-            return ledger.snapshot()["retained_bytes"]
-    else:
-        from vane.execution.resources import ResourceVector
-        from vane.runners.ray.query_resource_graph import QueryAllocation, QueryResourceGraph, ResourceUnitSpec
-        from vane.runners.ray.query_resource_manager import (
-            OutputBlockLeaseOwner as RayOutputBlockLeaseOwner,
-        )
-        from vane.runners.ray.query_resource_manager import (
-            OutputBlockRequest,
-            RayQueryResourceManager,
-            TaskRequest,
-        )
-
-        assert RayOutputBlockLeaseOwner is OutputBlockLeaseOwner
-        unit = ResourceUnitSpec(
-            query_id="q",
-            resource_unit_id="resource:q:node",
-            physical_node_id="node",
-            unit_kind="ray_task_udf",
-            backend="ray_task",
-            input_unit_ids=(),
-            per_task=ResourceVector(cpu=1),
-            target_output_block_bytes=80,
-            generator_buffer_blocks=1,
-            max_concurrency=None,
-        )
-        graph = QueryResourceGraph("q", "sha256:ownership-test", (unit,), (unit.resource_unit_id,))
-        manager = RayQueryResourceManager(
-            graph, QueryAllocation(resources=ResourceVector(cpu=1, object_store_bytes=1000), generation=1)
-        )
-        manager.update_unit_state(unit.resource_unit_id, runnable=True)
-        task = manager.try_acquire_task(TaskRequest("q", unit.resource_unit_id, "task:0", "0", None))
-        assert task.granted
-        output = manager.try_acquire_output_block(
-            OutputBlockRequest("q", unit.resource_unit_id, task.lease.lease_id, "0", "out", 80)
-        )
-        assert output.granted
-        owner = RayOutputBlockLeaseOwner(manager, output.lease)
-
-        def finish():
-            manager.release_task_lease(task.lease.lease_id, attempt_id="0")
-
-        def retained():
-            return manager.snapshot()["usage"]["object_store_bytes"]
+    def finish():
+        task.finish()
+        query.shutdown()
+        ledger.close()
 
     try:
-        yield owner, finish, retained
+        yield owner, finish, lambda: ledger.snapshot()["retained_bytes"]
     finally:
         finish()
         owner.release()
@@ -294,10 +246,8 @@ def test_shared_owner_keeps_accounting_until_a_failed_release_is_retried(output_
         raise OSError("injected output release failure")
 
     with monkeypatch.context() as fault:
-        # Local publishes owner retirement under the ledger lock before its
-        # reentrant byte wakeups; Ray retires through the manager RPC contract.
-        method = "_release_locked" if isinstance(owner._manager, RuntimeDataLedger) else "release_output_block"
-        fault.setattr(owner._manager, method, fail)
+        # Publish owner retirement under the ledger lock before byte wakeups.
+        fault.setattr(owner._manager, "_release_locked", fail)
         with pytest.raises(OSError, match="release failure"):
             owner.release()
         assert owner.state != "released"

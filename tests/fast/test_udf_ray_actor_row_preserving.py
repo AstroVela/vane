@@ -128,7 +128,7 @@ def fake_ray(monkeypatch: pytest.MonkeyPatch) -> _FakeRayModule:
     # Load the actor runtime and its runner dependencies against real Ray.
     # The fake only needs to replace Ray while the actor class itself runs.
     import vane.execution.udf_ray_actor_runtime  # noqa: F401
-    from vane.runners.ray.ray_env import build_session_runtime_env_vars
+    from vane.execution.session_environment import build_session_runtime_env_vars
 
     module = _FakeRayModule()
     monkeypatch.setitem(sys.modules, "ray", module)
@@ -293,7 +293,7 @@ def test_actor_close_executor_retains_failed_executor_for_retry(fake_ray):
 
 
 def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):
-    from vane.runners.ray.query_runtime_protocol import (
+    from vane.execution.udf_ray_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,
         RAY_ACTOR_INDEX_ENV,
         RAY_ACTOR_POOL_NONCE_ENV,
@@ -329,7 +329,7 @@ def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monk
 
 def test_reconstructed_actor_reconciles_new_node_before_ref_bundle_materialization(fake_ray, monkeypatch):
     import vane.execution.udf_ray_actor_runtime as actor_runtime
-    from vane.runners.ray.query_runtime_protocol import (
+    from vane.execution.udf_ray_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,
         RAY_ACTOR_INDEX_ENV,
         RAY_ACTOR_POOL_NONCE_ENV,

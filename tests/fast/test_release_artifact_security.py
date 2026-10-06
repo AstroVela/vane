@@ -32,7 +32,6 @@ REQUIRED_WHEEL_PATHS = (
     "vane/_native/__init__.pyi",
     "vane/_native/_func.pyi",
     "vane/_native/_sqltypes.pyi",
-    "vane/_native/ray_cxx.pyi",
     "vane/sqltypes/__init__.pyi",
     "vane/udf.pyi",
     f"{TEST_LAYOUT.dist_info_root}/METADATA",

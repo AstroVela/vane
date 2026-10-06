@@ -8,7 +8,7 @@ This is the native counterpart of `run_tpch_vane_ray_relapi.py`.
 
 Key differences vs `run_tpch_vane.py`:
   - Uses the Relation API (`con.sql(sql)`) instead of `con.execute(sql)`.
-  - Executes via `vane.runners.NativeRunner` by iterating
+  - Executes via `native local Relation execution` by iterating
     `runner.run_iter_tables(relation)`, which yields PyArrow tables.
   - Each query runs in a subprocess (spawn) to enforce a hard timeout and to
     isolate hangs/crashes.
@@ -72,18 +72,7 @@ def _run_query_native_in_subprocess(
         # Users can override by exporting SKBUILD_EDITABLE_VERBOSE=1.
         os.environ.setdefault("SKBUILD_EDITABLE_VERBOSE", "0")
 
-        # Force runner type. This does not change Vane's normal local execution
-        # by itself; we explicitly call into vane.runners below.
-        os.environ["VANE_RUNNER"] = "native"
-
         import vane
-        import vane.runners
-
-        # Instantiate NativeRunner with optional thread hint.
-        # Note: set_runner_native() can only be called once per process.
-        runner = vane.runners.set_runner_native(threads)
-        if getattr(runner, "name", None) != "native":
-            raise RuntimeError(f"Expected native runner but got {getattr(runner, 'name', None)!r}")
 
         con = vane.connect()
         if threads:
@@ -99,8 +88,9 @@ def _run_query_native_in_subprocess(
 
         t0 = time.time()
         row_count = 0
-        for table in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
-            row_count += table.num_rows
+        with rel.to_arrow_reader() as reader:
+            for batch in reader:
+                row_count += batch.num_rows
         elapsed = time.time() - t0
 
         con.close()
@@ -191,7 +181,7 @@ if __name__ == "__main__":
 
     print(f"Vane version: {vane.__version__}")
     print(f"DuckDB engine version: {vane.__engine_version__}")
-    print("Runner: native (Relation API via vane.runners.NativeRunner)")
+    print("Runner: local native Relation")
     print(f"  Subprocess timeout: {args.timeout}s")
     print(f"  Verify: {'enabled' if args.verify else 'disabled'}")
     print(f"  Iterations: {args.iterations}")

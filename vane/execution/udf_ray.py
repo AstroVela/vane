@@ -18,6 +18,12 @@ from vane.execution._common import callable_cache_enabled as _callable_cache_ena
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ray_stream_adapter import TaskLeaseObjectRefGenerator
+from vane.execution.ray_wait import resolve_object_refs_blocking
+from vane.execution.session_environment import (
+    build_session_runtime_env_vars,
+    install_explicit_session_runtime_env,
+    scrub_shared_runtime_session_env,
+)
 from vane.execution.udf_ray_actor_pool import (
     UDFActorPoolBase as _UDFActorPoolBase,
 )
@@ -105,12 +111,6 @@ from vane.execution.udf_task_admission import (
 )
 from vane.execution.udf_threading import configure_loaded_torch_threads
 from vane.execution.unified_executor import UDFExecutor
-from vane.runners.ray.ray_env import (
-    build_session_runtime_env_vars,
-    install_explicit_session_runtime_env,
-    scrub_shared_runtime_session_env,
-)
-from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 DEFAULT_UDF_OUTPUT_TARGET_MAX_BYTES = 128 * 1024 * 1024
 DEFAULT_GENERATOR_BACKPRESSURE_NUM_OBJECTS = RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS
@@ -1092,7 +1092,7 @@ def _build_ray_task_executor(payload: dict[str, Any], options: dict[str, Any]) -
     # Reject standalone execution before starting or attaching to a Ray cluster.
     _ray_payload_requires_block_stream(payload)
     if not ray.is_initialized():
-        raise RuntimeError("Ray task UDF execution requires an initialized RayRunner runtime")
+        raise RuntimeError("Ray task UDF execution requires an explicit Ray resource allocation")
     query_driver_handle = options.get("query_driver_handle")
     if query_driver_handle is None:
         raise RuntimeError("Ray task UDF executor requires an explicit query driver handle")

@@ -126,8 +126,8 @@ def test_module_query_uses_the_same_result_contract():
             vane.query("SELECT 1", connection=connection, execution="pipelined")
         idle(connection.query_runtime)
     with vane.connect() as unselected:
-        with pytest.raises(vane.InvalidInputException, match="backend='local'"):
-            unselected.query("SELECT 1")
+        with unselected.query("SELECT 1") as result:
+            assert result.collect().column(0).to_pylist() == [1]
 
 
 @pytest.mark.parametrize("database", [":default:", ":DeFaUlT:", Path(":default:"), Path(":DeFaUlT:")])
