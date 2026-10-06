@@ -15,6 +15,7 @@ from tests.fast.test_analytical_exchange import (
     EXPRESSIONS,
     HUGEINT_EXPRESSIONS,
     HUGEINT_VALUE_SQL,
+    NESTED_ARRAY_EXPRESSIONS,
     TEMPORAL_VALUES,
     exchange_expected,
 )
@@ -25,7 +26,9 @@ from tests.fast.test_analytical_fragment_compiler import (
     ORDERED_AGGREGATES,
     PARQUET_TOP_N_TAILS,
     TOP_N_AGGREGATES,
+    WIDE_AGGREGATE_TYPES,
     parquet_top_n_source,
+    wide_aggregate_queries,
 )
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
@@ -80,6 +83,22 @@ def test_public_analytical_type_roundtrip(tmp_path, mode):
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
     with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
         expected = exchange_expected(local.execute(sql).to_arrow_table())
+        with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+            table = result.collect()
+            table.validate(full=True)
+            assert table.equals(expected.cast(table.schema))
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_nested_arrays(tmp_path, mode):
+    columns = ", ".join(
+        f"case when range % 4=0 then null else {expr} end c{i}" for i, expr in enumerate(NESTED_ARRAY_EXPRESSIONS)
+    )
+    sql = f"select range, {columns} from range(13) order by range desc"
+    limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 3, 2))
+    with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
+        expected = local.execute(sql).to_arrow_table()
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
             table = result.collect()
             table.validate(full=True)
@@ -148,6 +167,22 @@ def test_public_native_aggregate_semantics(tmp_path, mode, queries):
                 table.validate(full=True)
                 assert table.equals(expected.cast(table.schema)), sql
             assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_wide_numeric_aggregates(tmp_path, mode):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+    ):
+        for kind, scale in WIDE_AGGREGATE_TYPES:
+            for sql in wide_aggregate_queries(kind, scale):
+                expected = local.execute(sql).to_arrow_table()
+                with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                    table = result.collect()
+                    table.validate(full=True)
+                    assert table.equals(expected.cast(table.schema)), sql
+                assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

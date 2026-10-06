@@ -4,6 +4,7 @@
 """Distributed analytical SQL compared with the native engine."""
 
 from collections import Counter
+from fractions import Fraction
 
 import pytest
 
@@ -124,6 +125,80 @@ HUGEINT_SUM_QUERIES = [
     "select sum(null::hugeint) from range(7)",
     "select sum(range::hugeint) from range(0)",
 ]
+
+WIDE_AGGREGATE_TYPES = [("hugeint", 0), ("decimal(38,0)", 0), ("decimal(38,5)", 5), ("decimal(38,38)", 38)]
+
+
+def scaled_wide_value(value, scale):
+    digits = str(abs(value)).zfill(scale + 1)
+    text = digits if not scale else f"{digits[:-scale]}.{digits[-scale:]}"
+    return f"-{text}" if value < 0 else text
+
+
+def wide_aggregate_queries(kind, scale):
+    negative = scaled_wide_value(-4 * 10**37, scale)
+    positive = scaled_wide_value(6 * 10**37, scale)
+    source = f"select range, case when range<3 then '{negative}'::{kind} else '{positive}'::{kind} end v from range(6)"
+    return [
+        f"select sum(v), avg(v), count(v), min(v), max(v) from ({source})",
+        f"select sum(distinct v), avg(distinct v) from ({source})",
+        f"select sum(v) filter(where range % 3<>2), avg(v) filter(where range % 3<>2) from ({source})",
+        f"select sum(v), avg(v) from ({source}) where range>10",
+        f"select sum(null::{kind}), avg(null::{kind}) from range(7)",
+        "select range % 2 k, sum(v), avg(v), count(v) from (select range, "
+        f"case when range>=12 then null when range<6 then '{negative}'::{kind} "
+        f"else '{positive}'::{kind} end v from range(14)) group by k order by k",
+    ]
+
+
+@pytest.mark.parametrize("kind,scale", WIDE_AGGREGATE_TYPES)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+def test_wide_numeric_aggregates_preserve_native_semantics(kind, scale, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        for sql in wide_aggregate_queries(kind, scale):
+            expected = connection.execute(sql).fetchall()
+            assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
+
+
+@pytest.mark.parametrize("kind,scale", WIDE_AGGREGATE_TYPES)
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("constant", [True, False])
+@pytest.mark.parametrize("threads", [1, 4])
+def test_wide_avg_accepts_total_outside_hugeint(kind, scale, sign, constant, threads):
+    first = sign * 6 * 10**37
+    second = first if constant else sign * 5 * 10**37
+    value = f"'{scaled_wide_value(first, scale)}'::{kind}"
+    if not constant:
+        value = f"case when range % 2=0 then {value} else '{scaled_wide_value(second, scale)}'::{kind} end"
+    rows = 8193
+    expected = float(Fraction(((rows + 1) // 2) * first + (rows // 2) * second, rows * 10**scale))
+    sql = f"select avg({value}) from range({rows})"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        actual = execute_graph(connection, compile_sql(connection, sql, 2))
+    assert actual[0][0] == pytest.approx(expected, rel=4e-16)
+
+
+@pytest.mark.parametrize("kind,scale", WIDE_AGGREGATE_TYPES)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+def test_wide_average_retains_small_remainder_after_cancellation(kind, scale, partitions):
+    values = [9 * 10**37, 9 * 10**37, -9 * 10**37, -9 * 10**37, 1]
+    cases = " ".join(f"when {i} then '{scaled_wide_value(v, scale)}'::{kind}" for i, v in enumerate(values))
+    sql = f"select avg(case range {cases} end order by range desc) from range(5)"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        actual = execute_graph(connection, compile_sql(connection, sql, partitions))
+    assert actual[0][0] == pytest.approx(float(Fraction(1, 5 * 10**scale)), rel=4e-16, abs=0)
+
+
+@pytest.mark.parametrize("kind,scale", WIDE_AGGREGATE_TYPES[1:])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_wide_decimal_sum_still_rejects_final_overflow(kind, scale, sign):
+    value = scaled_wide_value(sign * 9 * 10**37, scale)
+    sql = f"select sum('{value}'::{kind}) from range(2)"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        with pytest.raises(vane.OutOfRangeException, match="[Oo]verflow"):
+            connection.execute(sql).fetchall()
+        with pytest.raises(vane.OutOfRangeException, match="[Oo]verflow"):
+            execute_graph(connection, compile_sql(connection, sql, 2))
 
 
 @pytest.mark.parametrize("sql", ORDERED_AGGREGATES)

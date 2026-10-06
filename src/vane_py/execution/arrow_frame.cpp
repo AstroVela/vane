@@ -4,6 +4,7 @@
 #include "arrow_frame.hpp"
 #include "exchange_types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/vector_buffer.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -414,6 +415,10 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 	case LogicalTypeId::ARRAY: {
 		auto &values = static_cast<const arrow::FixedSizeListArray &>(source);
 		auto size = ArrayType::GetSize(type);
+		// Parent container capacity may exceed the decoded element count.
+		// Publish this ARRAY's actual length, rather than the record batch's
+		// cardinality, before recursively decoding its child values.
+		target.GetAuxiliary()->Cast<VectorArrayBuffer>().SetSize(count);
 		DecodeVector(*values.values()->Slice(values.value_offset(0), count * size), ArrayVector::GetEntry(target));
 		break;
 	}

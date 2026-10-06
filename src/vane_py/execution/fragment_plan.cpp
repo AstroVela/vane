@@ -14,7 +14,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
-#include "duckdb/function/aggregate/hugeint_sum.hpp"
+#include "duckdb/function/aggregate/wide_integer.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -771,7 +771,7 @@ private:
 	                             const vector<unique_ptr<Expression>> &groups,
 	                             const vector<unique_ptr<Expression>> &aggregates) {
 		bool split = !aggregates.empty();
-		bool wide_sum = false;
+		bool wide_aggregate = false;
 		for (auto &expression : aggregates) {
 			auto &aggregate = expression->Cast<BoundAggregateExpression>();
 			auto name = aggregate.function.name;
@@ -800,11 +800,11 @@ private:
 			    (aggregate.return_type.id() == LogicalTypeId::DECIMAL ||
 			     aggregate.children[0]->return_type.id() == LogicalTypeId::HUGEINT)) {
 				split = false;
-				if (aggregate.return_type == LogicalType::HUGEINT) {
+				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
 					// Whole-group input can still arrive with all positive values
 					// first. Widen the private state and check range at finalization.
-					aggregate.function = WideHugeintSumFunction();
-					wide_sum = true;
+					aggregate.function = WideIntegerSumFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
 				}
 			}
 			// Native integer/decimal AVG divides an exact accumulator in long
@@ -815,10 +815,14 @@ private:
 			                      (aggregate.children[0]->return_type.id() != LogicalTypeId::FLOAT &&
 			                       aggregate.children[0]->return_type.id() != LogicalTypeId::DOUBLE))) {
 				split = false;
+				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
+					aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
+				}
 			}
 		}
 		if (child.fragment.partition_count == 1) {
-			if (wide_sum) {
+			if (wide_aggregate) {
 				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
 				Wrap(aggregate, child);
 			} else {

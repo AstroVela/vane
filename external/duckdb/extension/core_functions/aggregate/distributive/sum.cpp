@@ -6,13 +6,14 @@
 
 #include "core_functions/aggregate/distributive_functions.hpp"
 #include "core_functions/aggregate/sum_helpers.hpp"
+#include "core_functions/aggregate/wide_integer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/bignum.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/function/aggregate/hugeint_sum.hpp"
+#include "duckdb/function/aggregate/wide_integer.hpp"
 
 namespace duckdb {
 
@@ -81,68 +82,16 @@ struct HugeintSumOperation : public BaseSumOperation<SumSetOperation, HugeintAdd
 	}
 };
 
-// Three unsigned limbs hold a signed 192-bit sum without signed arithmetic
-// overflow. This covers idx_t (64-bit) rows of signed 128-bit input, regardless
-// of the order in which distributed producers deliver their rows.
-struct WideHugeintSumState {
-	bool isset;
-	uint64_t lower, middle, upper;
-
-	void Initialize() {
-		isset = false;
-		lower = middle = upper = 0;
-	}
-	void Add(uint64_t low, uint64_t mid, uint64_t high) {
-		auto old_lower = lower;
-		lower += low;
-		auto carry = uint64_t(lower < old_lower);
-		auto old_middle = middle;
-		middle += mid;
-		upper += high + uint64_t(middle < old_middle);
-		old_middle = middle;
-		middle += carry;
-		upper += uint64_t(middle < old_middle);
-	}
-	void Combine(const WideHugeintSumState &other) {
-		isset = isset || other.isset;
-		Add(other.lower, other.middle, other.upper);
-	}
-};
-
-struct WideHugeintSumOperation {
-	template <class STATE>
-	static void Initialize(STATE &state) {
-		state.Initialize();
-	}
-	template <class STATE, class OP>
-	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
-		target.Combine(source);
-	}
-	template <class INPUT_TYPE, class STATE, class OP>
-	static void Operation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &) {
-		state.isset = true;
-		state.Add(value.lower, uint64_t(value.upper), value.upper < 0 ? NumericLimits<uint64_t>::Maximum() : 0);
-	}
-	template <class INPUT_TYPE, class STATE, class OP>
-	static void ConstantOperation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &input, idx_t count) {
-		for (idx_t row = 0; row < count; row++) {
-			Operation<INPUT_TYPE, STATE, OP>(state, value, input);
-		}
-	}
-	static bool IgnoreNull() {
-		return true;
-	}
+struct WideIntegerSumOperation : public WideIntegerOperation {
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
-		if (!state.isset) {
+		if (!state.count) {
 			finalize_data.ReturnNull();
 			return;
 		}
-		const auto sign_extension = state.middle >> 63 ? NumericLimits<uint64_t>::Maximum() : 0;
-		if (state.upper != sign_extension) {
+		if (!state.value.TryGetHugeint(target)) {
 			throw OutOfRangeException("Overflow in HUGEINT sum");
 		}
-		target = hugeint_t(int64_t(state.middle), state.lower);
 	}
 };
 
@@ -292,11 +241,13 @@ unique_ptr<FunctionData> HugeintSumDeserialize(Deserializer &deserializer, Aggre
 	auto original_arguments = function.original_arguments;
 	auto name = function.name;
 	auto return_type = deserializer.Get<const LogicalType &>();
-	if (arguments.size() != 1 ||
-	    (wide && (arguments[0] != LogicalType::HUGEINT || return_type != LogicalType::HUGEINT))) {
+	if (arguments.size() != 1) {
 		throw SerializationException("invalid HUGEINT sum accumulator signature");
 	}
-	function = wide ? WideHugeintSumFunction() : GetSumAggregate(arguments[0].InternalType());
+	function = wide ? WideIntegerSumFunction(arguments[0]) : GetSumAggregate(arguments[0].InternalType());
+	if (wide && function.GetReturnType() != return_type) {
+		throw SerializationException("invalid wide sum return type");
+	}
 	function.arguments = std::move(arguments);
 	function.original_arguments = std::move(original_arguments);
 	function.name = std::move(name);
@@ -372,10 +323,13 @@ struct BignumOperation {
 
 } // namespace
 
-AggregateFunction WideHugeintSumFunction() {
-	auto function =
-	    AggregateFunction::UnaryAggregate<WideHugeintSumState, hugeint_t, hugeint_t, WideHugeintSumOperation>(
-	        LogicalType::HUGEINT, LogicalType::HUGEINT);
+AggregateFunction WideIntegerSumFunction(const LogicalType &input_type) {
+	ValidateWideIntegerInput(input_type);
+	auto return_type = input_type.id() == LogicalTypeId::DECIMAL
+	                       ? LogicalType::DECIMAL(Decimal::MAX_WIDTH_DECIMAL, DecimalType::GetScale(input_type))
+	                       : LogicalType::HUGEINT;
+	auto function = AggregateFunction::UnaryAggregate<WideIntegerState, hugeint_t, hugeint_t, WideIntegerSumOperation>(
+	    input_type, return_type);
 	function.name = "sum";
 	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	function.SetSerializeCallback(WideHugeintSumSerialize);

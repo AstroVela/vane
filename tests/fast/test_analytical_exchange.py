@@ -36,6 +36,20 @@ EXPRESSIONS = [
     "[{'x': range}, null, {'x': range+1}]",
 ]
 
+ARRAY_PAIR = "[[range, null]::bigint[2], [range+1, range+2]::bigint[2]]"
+NESTED_ARRAY_EXPRESSIONS = [
+    ARRAY_PAIR,
+    f"{{'arrays': {ARRAY_PAIR}}}",
+    "[{'a': [range, null]::bigint[2]}, {'a': [range+1, range+2]::bigint[2]}]",
+    f"map([range, range+1], {ARRAY_PAIR})",
+    f"map([range, range+1], [{ARRAY_PAIR}, {ARRAY_PAIR}])",
+    f"[{ARRAY_PAIR}, [], {ARRAY_PAIR}]",
+    f"[{ARRAY_PAIR}::bigint[2][2], {ARRAY_PAIR}::bigint[2][2]]",
+    "[[range, null]::bigint[2], null, [range+1, range+2]::bigint[2]]",
+    "[['long string value 中文', null]::varchar[2], ['another long string', range::varchar]::varchar[2]]",
+    f"case when range % 3=0 then [] else {ARRAY_PAIR} end",
+]
+
 HUGEINT_VALUES = [-(2**127), -(10**38), -(2**64), 0, 2**64, 10**38, 2**127 - 1]
 HUGEINT_VALUE_SQL = (
     "case range % 7 " + " ".join(f"when {i} then '{value}'::hugeint" for i, value in enumerate(HUGEINT_VALUES)) + " end"
@@ -214,14 +228,41 @@ def test_empty_temporal_flight_preserves_lossless_schema(expression, kind):
 
 
 @pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("transport", ["direct", "flight", "materialized"])
+@pytest.mark.parametrize("expression", NESTED_ARRAY_EXPRESSIONS)
+def test_nested_arrays_beyond_batch_cardinality(tmp_path, threads, transport, expression):
+    sql = (
+        f"select range, case when range % 5=0 then null else {expression} end v "
+        "from range(23) where range % 4<>0 order by range desc"
+    )
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).to_arrow_table()
+        table = exchange_table(
+            connection, sql, transport == "flight", tmp_path / "arrays.mat" if transport == "materialized" else None
+        )
+    table.validate(full=True)
+    assert table.equals(expected.cast(table.schema))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("first_partition", [0, 1])
 @pytest.mark.parametrize("sign", [1, -1])
-def test_hugeint_sum_does_not_depend_on_producer_arrival(threads, first_partition, sign):
-    from tests.fast.test_analytical_fragment_compiler import HUGEINT_SUM_INPUT
+@pytest.mark.parametrize(
+    "kind,scale", [("hugeint", 0), ("decimal(38,0)", 0), ("decimal(38,5)", 5), ("decimal(38,38)", 38)]
+)
+@pytest.mark.parametrize("aggregate", ["sum", "avg"])
+def test_wide_aggregate_does_not_depend_on_producer_arrival(threads, first_partition, sign, kind, scale, aggregate):
+    from tests.fast.test_analytical_fragment_compiler import scaled_wide_value
     from tests.fast.test_direct_exchange import until
 
-    sql = f"select sum(v * {sign}) from ({HUGEINT_SUM_INPUT})"
+    negative = scaled_wide_value(-4 * 10**37, scale)
+    positive = scaled_wide_value(6 * 10**37, scale)
+    sql = (
+        f"select {aggregate}(v * {sign}) from (select case when range<3 then '{negative}'::{kind} "
+        f"else '{positive}'::{kind} end v from range(6))"
+    )
     with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
         spec = submission(connection, sql, partitions=2)
         with InProcessTaskService(connection, spec, DirectExchangeLimits(4096, 1024, 8, 4)) as service:
             producer = service.task_id(spec.graph.fragments[0].fragment_id, first_partition)
@@ -235,7 +276,7 @@ def test_hugeint_sum_does_not_depend_on_producer_arrival(threads, first_partitio
                 ),
             )
             service.start()
-            assert collect(service) == [(sign * 6 * 10**37,)]
+            assert collect(service) == expected
 
 
 def test_nested_borrowed_slice_keeps_entire_frame_accounted():

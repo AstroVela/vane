@@ -430,6 +430,13 @@ void Vector::Resize(idx_t current_size, idx_t new_size) {
 		// Resize the validity mask.
 		auto new_validity_size = new_size * resize_info_entry.multiplier;
 		resize_info_entry.vec.validity.Resize(new_validity_size);
+		// Container growth also grows ordinary ARRAY child storage. Keep the
+		// declared child length in sync, including ARRAYs inside STRUCT/ARRAY.
+		// Deferred Image/Tensor storage is reserved separately by each writer.
+		if (resize_info_entry.vec.GetType().InternalType() == PhysicalType::ARRAY &&
+		    !ArrayVector::UsesDeferredStorage(resize_info_entry.vec.GetType())) {
+			resize_info_entry.vec.auxiliary->Cast<VectorArrayBuffer>().SetSize(new_validity_size);
+		}
 
 		// For nested data types, we only need to resize the validity mask.
 		if (!resize_info_entry.data) {

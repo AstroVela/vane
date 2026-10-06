@@ -302,7 +302,9 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 DECIMAL SUM 的原生累加器可以保存 39 位的 signed 128-bit 中间值，而其返回类型声明为 `DECIMAL(38,s)`。例如三个 `4×10³⁷` 和三个 `−3×10³⁷` 的总和合法，但前一个分区的部分和 `1.2×10³⁸` 不能作为 38 位 Arrow decimal 传输。包含 DECIMAL SUM 的整个聚合节点因此采用完整分组策略，保留 FILTER、NULL、scale 及同节点其他聚合的语义；代价是交换原始行，无法提前缩减为部分和。公开 DECIMAL 的 Arrow schema 继续使用声明的精度与 scale。
 
-HUGEINT 输入的 SUM 同样交换完整组。仅取消 partial 仍不足以避免溢出：异步输入可能让三个 `6×10³⁷` 先于三个 `−4×10³⁷` 到达。fragment 为这种 SUM 选择原生 signed 192-bit 私有累加状态，以三个 unsigned 64-bit limb 实现加法与 combine，足以覆盖最多 64-bit 行数的 signed 128-bit 输入。组完成后才检查最终结果是否超出 HUGEINT；NULL、空输入、FILTER、DISTINCT 和排序仍由原生聚合执行器处理。普通本地 SQL 继续使用既有 SUM，BIGINT 输入的 SUM 仍可拆分，最终 HUGEINT 类型与 Arrow profile 不变。函数序列化显式记录累加器选择，重放恢复相同实现。
+仅取消 partial 仍不足以避免溢出：异步输入可能让三个 `6×10³⁷` 先于三个 `−4×10³⁷` 到达。因此，对使用 128 位存储的 HUGEINT/DECIMAL 输入，fragment 的 SUM 与 AVG 共用 signed 192-bit 私有累加状态，以三个 unsigned 64-bit limb 实现精确加法与 combine，并维护非 NULL 行数。状态覆盖最多 64-bit 行数的 signed 128-bit 输入。SUM 在组完成后检查返回值的 128 位范围，保留 HUGEINT 或 DECIMAL 的 SQL 类型与 scale；AVG 允许总和超出 128 位，在完整组上除以行数及 DECIMAL scale。总和落在原生范围内时，AVG 继续使用原生 HUGEINT 到 long double 的转换，避免改变既有舍入；超出时从宽整数直接转换，保留正负抵消后的有效数位。
+
+NULL、空输入、FILTER、DISTINCT 和排序仍由原生聚合执行器处理。普通本地 SQL 继续使用既有累加器，BIGINT 输入的 SUM 仍可拆分，Arrow profile 不变。函数序列化显式记录宽累加器选择，AVG 从输入类型恢复 DECIMAL scale，使 worker 与重放使用相同实现。
 
 DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `order_bys`。fragment 在拆分判断前调用原生 `UnbindSortedAggregate`，恢复原始参数和排序键；带排序的 SUM/AVG 等聚合随后按完整组执行，避免把排序键当作普通函数参数或改变浮点运算顺序。Binder 为 INTERVAL 分组键生成的 `first`、为带 collation 的 MIN/MAX 生成的 `arg_min`/`arg_max` 也走完整组。解析阶段的公开函数集合不变，不因此开放直接调用这些内部聚合。
 
@@ -631,6 +633,8 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 [direct_exchange.cpp](src/vane_py/execution/direct_exchange.cpp) 实现固定 schema 的有界 native channel，消费窗口包含队列中的帧和已借出的帧。DirectLimits 定义每个消费者的 window_bytes、每帧 frame_bytes/frame_rows 与未释放帧数 frame_slots。窗口至少容纳一行的固定布局，否则准备时拒绝；运行时遇到超出单帧容量的变长行则明确报错，不创建超额缓冲。
 
 每帧分配一个独立缓冲，包含对齐后的有效性位图、定长值、长字符串/二进制数据，以及 P4 嵌套值的全部子向量。列表按选中元素紧凑复制；NULL 列表的未定义 offset 不参与寻址。写入先测量并检查额度，再复制和发布；暂时无法写入时不分配 payload。原生输入由执行器持有，通道不引用瞬时 Sink 参数。读取构造借用该帧的 Vector，每层 Vector auxiliary 均持有 lease，嵌套字段、切片及字符串引用继续保留整个帧的所有权。最后一个引用释放后归还窗口。广播共享一次物理分配，每个消费者独立计费；关闭一个消费者释放其队列，已经借出的视图继续有效并保持计费。
+
+嵌套 ARRAY 的长度按其所在层维护，不能沿用最外层批次行数。Arrow 解码在递归写入每个 ARRAY 前设置实际数组数量；原生 LIST/MAP/STRUCT 扩容时同步更新普通 ARRAY 的子元素长度。固定 Image/Tensor 的延迟存储仍由写入器单独预留，不随父容器扩容而分配像素或张量元素。
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 

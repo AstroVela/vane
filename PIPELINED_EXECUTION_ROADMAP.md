@@ -476,3 +476,11 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - HUGEINT 输入的 SUM 改为完整组并使用私有 signed 192-bit 原生累加器，保留最终 HUGEINT 类型，完成后检查范围。确定性验证分别让正数、负数分区先到达，避免只取消 partial 后仍因输入顺序发生 128-bit 中间溢出。普通本地 SUM 与 BIGINT partial/final 策略保持原有选择，Arrow profile 仍为 3。
 - 本轮新增 135 项长期回归，相关验证合计 **412 passed：382 个非 Ray、20 个仓库真实 Ray、10 个审查脚本用例**。审查脚本在修复前 10 项全部失败，修复后全部通过。未运行完整 release/fast 套件。
 - 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `14394740e9:fragment:483580233978e529e45be8a5f6728929a5f020bc7c3ae0d7f89919cdded42b70`。root 与 DuckDB 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。
+
+### P4 嵌套 ARRAY 与宽数值聚合修正（基于 `5d1428cf`）
+
+- Arrow 递归解码按每一层实际数组数量更新 ARRAY 长度，原生容器扩容同步更新普通 ARRAY 的长度元数据。覆盖 LIST、MAP、STRUCT、多维 ARRAY、NULL、空列表及字符串叶子；Image/Tensor 的延迟分配规则保持独立。
+- 将 192-bit 累加逻辑抽为 SUM/AVG 共用的原生状态，对 HUGEINT 及使用 128 位存储的 DECIMAL 输入统一启用。DECIMAL SUM 保留 scale 与最终范围检查；AVG 支持总和超过 128 位但平均值合法的情况，并沿用原生 long double 与 scale 处理。宽状态选择和 DECIMAL 输入类型随物理计划序列化。
+- 到达顺序回归显式先启动正数或负数 producer，在单线程、四线程下验证 SUM/AVG；另外覆盖 scale 0/5/38、恒定/变化输入、跨批次累加、排序、DISTINCT、FILTER、分组、空输入、精确抵消和真正的最终溢出。
+- 新增 182 项回归。本轮相关验证去重合计 **608 passed、2 skipped：584 个非 Ray、24 个真实 Ray 通过**；跳过项为原生 Arrow 测试中已有的 CI FIXME。公开嵌套 ARRAY 用例在修复前两种 Ray 模式均失败，修复后通过。未运行完整 release/fast 套件。
+- 已完成非 editable 增量 Release 安装及最终产物的 124 项定向复测（不重复计入总数）；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `a971e0b82e:fragment:51c8a77b708bcdd01f1a16ae73bc0a4e236b4d03b69a61ed38b7e9a356ac4968`。root/DuckDB 格式、Ruff、适用的 pre-commit、源码版权清单、文档本地链接和 diff 检查通过。
