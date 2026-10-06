@@ -6520,22 +6520,21 @@ class RayQueryDriverActor:
                 if self._plan_connections.get(plan_key) is not query_connection:
                     raise RuntimeError(f"query plan connection identity changed before teardown: {plan_key}")
             lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
-            with lifecycle_lock:
-                if force_udf_actor_cleanup:
-                    cleanup_diagnostics = self._teardown_plan_resources_once(
-                        lifecycle,
-                        query_id,
-                        query_connection,
-                        drop_fragments=drop_fragments,
-                        force_udf_actor_cleanup=True,
-                    )
-                else:
-                    cleanup_diagnostics = self._teardown_plan_resources_once(
-                        lifecycle,
-                        query_id,
-                        query_connection,
-                        drop_fragments=drop_fragments,
-                    )
+            if force_udf_actor_cleanup:
+                cleanup_diagnostics = self._teardown_plan_resources_once(
+                    lifecycle,
+                    query_id,
+                    query_connection,
+                    drop_fragments=drop_fragments,
+                    force_udf_actor_cleanup=True,
+                )
+            else:
+                cleanup_diagnostics = self._teardown_plan_resources_once(
+                    lifecycle,
+                    query_id,
+                    query_connection,
+                    drop_fragments=drop_fragments,
+                )
             with self._session_lock:
                 if self._plan_lifecycles.get(plan_key) is lifecycle:
                     raise RuntimeError(f"query plan teardown returned without releasing its lifecycle: {plan_key}")
@@ -6566,60 +6565,64 @@ class RayQueryDriverActor:
     ) -> list[BaseException]:
         plan_id = lifecycle.plan_id
         errors: list[BaseException] = []
-        with self._session_lock:
-            stored_cleanup_diagnostics = tuple(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
         cleanup_diagnostics: list[BaseException] = []
-        for diagnostic in stored_cleanup_diagnostics:
-            _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
         execution_owner_failed = False
-        self.curr_plans.pop(plan_id, None)
-        self.curr_streams.pop(plan_id, None)
-        async_streams = getattr(self, "_async_result_streams", None)
-        if async_streams is not None:
-            async_streams.pop(str(plan_id), None)
-        with self._plan_teardown_condition:
-            leased_refs = getattr(self, "_leased_result_partition_refs", None)
-            records = {} if leased_refs is None else dict(leased_refs.get(str(plan_id), {}))
-        if records:
-            for release_token, record in records.items():
-                _, output_lease_owner = record
-                try:
-                    output_lease_owner.release()
-                except BaseException as exc:
-                    _append_query_cleanup_error(errors, exc)
-                    execution_owner_failed = True
-                else:
-                    with self._plan_teardown_condition:
-                        current_refs = self._leased_result_partition_refs.get(str(plan_id))
-                        if current_refs is not None and current_refs.get(release_token) is record:
-                            current_refs.pop(release_token, None)
-                            if not current_refs:
-                                self._leased_result_partition_refs.pop(str(plan_id), None)
-        with self._plan_teardown_condition:
-            leased_refs = getattr(self, "_leased_result_partition_refs", None)
-            remaining_refs = None if leased_refs is None else leased_refs.get(str(plan_id))
-            if not remaining_refs:
-                counters = getattr(self, "_result_partition_ref_counters", None)
-                if counters is not None:
-                    counters.pop(str(plan_id), None)
-        try:
-            if force_udf_actor_cleanup:
-                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(
-                    str(plan_id),
-                    force=True,
-                )
-            else:
-                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(str(plan_id))
-            for diagnostic in actor_cleanup_diagnostics:
+        # Serialize physical owner cleanup with phase retirement and activation.
+        # Release this lock before the admission fence waits for the phase pump,
+        # which may itself be waiting to acquire the same lifecycle lock.
+        with _query_udf_actor_lifecycle_lock(self, str(plan_id)):
+            with self._session_lock:
+                stored_cleanup_diagnostics = tuple(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
+            for diagnostic in stored_cleanup_diagnostics:
                 _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
-        except BaseException as exc:
-            _append_query_cleanup_error(errors, exc)
-            execution_owner_failed = True
-        try:
-            self._cleanup_vllm_actor_pools(str(plan_id))
-        except BaseException as exc:
-            _append_query_cleanup_error(errors, exc)
-            execution_owner_failed = True
+            self.curr_plans.pop(plan_id, None)
+            self.curr_streams.pop(plan_id, None)
+            async_streams = getattr(self, "_async_result_streams", None)
+            if async_streams is not None:
+                async_streams.pop(str(plan_id), None)
+            with self._plan_teardown_condition:
+                leased_refs = getattr(self, "_leased_result_partition_refs", None)
+                records = {} if leased_refs is None else dict(leased_refs.get(str(plan_id), {}))
+            if records:
+                for release_token, record in records.items():
+                    _, output_lease_owner = record
+                    try:
+                        output_lease_owner.release()
+                    except BaseException as exc:
+                        _append_query_cleanup_error(errors, exc)
+                        execution_owner_failed = True
+                    else:
+                        with self._plan_teardown_condition:
+                            current_refs = self._leased_result_partition_refs.get(str(plan_id))
+                            if current_refs is not None and current_refs.get(release_token) is record:
+                                current_refs.pop(release_token, None)
+                                if not current_refs:
+                                    self._leased_result_partition_refs.pop(str(plan_id), None)
+            with self._plan_teardown_condition:
+                leased_refs = getattr(self, "_leased_result_partition_refs", None)
+                remaining_refs = None if leased_refs is None else leased_refs.get(str(plan_id))
+                if not remaining_refs:
+                    counters = getattr(self, "_result_partition_ref_counters", None)
+                    if counters is not None:
+                        counters.pop(str(plan_id), None)
+            try:
+                if force_udf_actor_cleanup:
+                    actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(
+                        str(plan_id),
+                        force=True,
+                    )
+                else:
+                    actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(str(plan_id))
+                for diagnostic in actor_cleanup_diagnostics:
+                    _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
+            except BaseException as exc:
+                _append_query_cleanup_error(errors, exc)
+                execution_owner_failed = True
+            try:
+                self._cleanup_vllm_actor_pools(str(plan_id))
+            except BaseException as exc:
+                _append_query_cleanup_error(errors, exc)
+                execution_owner_failed = True
         query_key = str(query_id or "").strip()
         if query_key:
             try:
