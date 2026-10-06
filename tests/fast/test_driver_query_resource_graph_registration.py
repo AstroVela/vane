@@ -1156,7 +1156,7 @@ def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier(live_actor):
         per_task=ResourceVector() if live_actor else ResourceVector(cpu=1, heap_bytes=10),
         resident_per_actor=ResourceVector(cpu=1, heap_bytes=10) if live_actor else ResourceVector(),
         actor_pool_size=1 if live_actor else 0,
-        actor_prefetch_depth=2,
+        actor_prefetch_depth=2 if live_actor else 1,
         target_output_block_bytes=0,
         generator_buffer_blocks=0,
         max_concurrency=None,
