@@ -318,6 +318,15 @@ class QueryResult:
                 )
             }
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Observe query, task, channel and cleanup ownership without advancing execution."""
+        return {
+            **(self.context.diagnostics() if self.context is not None else {}),
+            "result_id": self.result_id,
+            "delivery_state": self.state,
+            "timing": self.timing_snapshot(),
+        }
+
     def _finish_locked(self, outcome: str) -> bool:
         if self._outcome is not None:
             return False

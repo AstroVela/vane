@@ -72,13 +72,10 @@ struct DirectBatchView {
 		}
 		ArrowArray array;
 		array.Init();
-		ClientProperties properties;
 		ArrowSchema schema;
 		schema.Init();
 		try {
-			DirectFlight::ExportSchema(chunk.GetTypes(), names, &schema);
-			unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
-			ArrowConverter::ToArrowArray(chunk, &array, properties, extensions);
+			DirectFlight::ExportBatch(chunk, names, &array, &schema);
 			return py::module_::import("pyarrow")
 			    .attr("RecordBatch")
 			    .attr("_import_from_c")(reinterpret_cast<uintptr_t>(&array), reinterpret_cast<uintptr_t>(&schema));
@@ -443,6 +440,28 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 			         item["state"] = value.state;
 			         item["error"] = value.error;
 			         item["released"] = value.released;
+			         result.append(std::move(item));
+		         }
+		         return result;
+	         })
+	    .def("diagnostics",
+	         [](DirectTaskService &service) {
+		         TaskEntry entry;
+		         vector<DirectTaskStatus> values;
+		         {
+			         py::gil_scoped_release release;
+			         values = service.Diagnostics();
+		         }
+		         py::list result;
+		         for (auto &value : values) {
+			         py::dict item;
+			         item["task_id"] = value.task_id;
+			         item["state"] = value.state;
+			         item["error"] = value.error;
+			         item["released"] = value.released;
+			         item["blocked_on"] = value.blocked_on;
+			         item["builds_total"] = value.builds_total;
+			         item["builds_ready"] = value.builds_ready;
 			         result.append(std::move(item));
 		         }
 		         return result;

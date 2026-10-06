@@ -20,6 +20,7 @@ from vane.execution.query_options import DistributedMode, FteOptions, QueryExecu
 from vane.execution.query_runtime import QueryContext, QueryRuntime
 from vane.execution.resource_demand import MemoryDemand, ResourceDemand
 from vane.execution.submission import prepare_ray_query
+from vane.execution.worker_resources import WorkerResourceManager, pipelined_demand, worker_capacity
 
 
 def _get(reference: Any, context: QueryContext | None = None, timeout: float = 30) -> Any:
@@ -48,6 +49,10 @@ class PipelinedContext(QueryContext):
         self.deadline_probe: Callable[[], bool] | None = None
         self._expiry_lock = threading.RLock()
 
+    def begin(self, *, defer_execution: bool = False) -> Any:
+        assert isinstance(self.options.target, RayExecution)
+        return super().begin(defer_execution=self.options.target.mode is DistributedMode.PIPELINED)
+
     def produced(self) -> None:
         with self._lock:
             self.production_done = True
@@ -59,6 +64,9 @@ class PipelinedContext(QueryContext):
         if self.failure or self._ticket.cancellation_reason is not None or self._done:
             return
         deadline = self._deadline
+        if self._admission_deadline is not None:
+            super()._expire()
+            return
         if bool(self.production_done) or deadline is None or not deadline.expired():
             return
         with self._expiry_lock:
@@ -99,6 +107,7 @@ class PipelinedContext(QueryContext):
 class WorkerPool:
     def __init__(self, resources: RayResources) -> None:
         self.resources = resources
+        self.admission = WorkerResourceManager(worker_capacity(resources), resources.worker_count)
         self.lock = threading.Lock()
         self.workers: list[Any] = []
         self.epochs: list[str] = []
@@ -146,6 +155,7 @@ class WorkerPool:
 
         with self.lock:
             self.closed = True
+            self.admission.close()
             if ray.is_initialized():
                 for worker in self.workers:
                     ray.kill(worker, no_restart=True)
@@ -207,6 +217,7 @@ class PipelinedScheduler:
         self.failure = ""
         self.schema: Any = None
         self.result_endpoint: dict[str, str] = {}
+        self.reservation = f"pipelined/{spec.query_id}"
 
     def prepare(self) -> None:
         import ray
@@ -224,6 +235,18 @@ class PipelinedScheduler:
         ).remote(resources)
         self.relay_epoch = _get(self.relay.describe.remote(), self.context)
         assignments, routes = placement(self.spec, self.pool.epochs, self.relay_epoch)
+        demands = {
+            index: pipelined_demand(resources, index, [t for t, host in assignments.items() if host == index], routes)
+            for index in sorted(set(assignments.values()))
+        }
+        self.pool.admission.acquire(
+            self.reservation,
+            self.spec.query_id,
+            demands,
+            self.context.check,
+            max(0.0, self.context._ticket.admission_deadline - time.monotonic()),
+        )
+        self.context.start_execution()
         client_epoch = uuid.uuid4().hex
         ticket = DirectTicket(
             self.spec.query_id,
@@ -282,7 +305,6 @@ class PipelinedScheduler:
         )
         self.client.subscribe(location, ticket, self.channel, "result-service", timeout)
         self.schema = native.arrow_schema(self.spec.result_schema, list(self.spec.result_names))
-        ready_deadline = time.monotonic() + self.spec.options.admission_timeout
         while True:
             self.context.check()
             ready = [
@@ -295,8 +317,6 @@ class PipelinedScheduler:
                 raise RuntimeError(error)
             if all(ready) and relay_status["ready"] and self.client.ready:
                 break
-            if time.monotonic() >= ready_deadline:
-                raise TimeoutError("native Flight consumers did not become ready before admission timeout")
             self.stop.wait(0.01)
         self.context.deadline_probe = self.production_status
         # Every context, input and endpoint now exists. Start consumers before
@@ -373,6 +393,7 @@ class PipelinedScheduler:
                 return
             self.failure = self.failure or reason
             self.stop.set()
+            self.pool.admission.cancel_waiting(self.spec.query_id)
             if self.client is not None:
                 self.client.cancel(reason)
             if not ray.is_initialized():
@@ -381,6 +402,34 @@ class PipelinedScheduler:
                 self.pool.workers[index].cancel.remote(self.pool.epochs[index], self.spec.query_id, reason)
             if self.relay is not None:
                 self.relay.cancel.remote(reason)
+
+    def diagnostics(self) -> dict[str, Any]:
+        calls: dict[int, Any] = {}
+        workers: dict[int, Any] = {}
+        with self.lock:
+            if not self.closed:
+                for index in sorted(self.prepared):
+                    try:
+                        calls[index] = self.pool.workers[index].status.remote(
+                            self.pool.epochs[index], self.spec.query_id
+                        )
+                    except Exception as error:
+                        workers[index] = {"unavailable": str(error)}
+        deadline = time.monotonic() + 2
+        for index, reference in calls.items():
+            try:
+                workers[index] = _get(reference, timeout=max(0.001, deadline - time.monotonic()))
+            except Exception as error:
+                # Diagnostics are observational; a delayed or lost probe must
+                # never change a query's execution outcome.
+                workers[index] = {"unavailable": str(error)}
+        return {
+            "mode": "pipelined",
+            "workers": workers,
+            "result_channel": self.channel.snapshot() if self.channel is not None else None,
+            "resources": self.pool.admission.snapshot(),
+            "cleanup_complete": self.closed,
+        }
 
     def close(self) -> None:
         import ray
@@ -397,6 +446,7 @@ class PipelinedScheduler:
             if self.client is not None:
                 self.client.close()
             if not ray.is_initialized():
+                self.pool.admission.release(self.reservation)
                 self.closed = True
                 return
             # Do not release a reservation before its prepare call has settled.
@@ -425,6 +475,7 @@ class PipelinedScheduler:
                     ray.kill(self.relay, no_restart=True)
             if errors:
                 raise RuntimeError("worker release failed; retry result.close()") from errors[0]
+            self.pool.admission.release(self.reservation)
             self.closed = True
 
 
@@ -459,6 +510,9 @@ class RayQueryRuntime(QueryRuntime):
             if name not in self.stores:
                 self.stores[name] = StorePool(config)
             return self.stores[name]
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        return {**super().resource_snapshot(), "workers": self.pool.admission.snapshot()}
 
     def submit(
         self,

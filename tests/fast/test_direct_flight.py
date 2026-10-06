@@ -176,6 +176,52 @@ def test_invalid_ack_and_duplicate_stream():
         sender.close()
 
 
+@pytest.mark.parametrize(
+    "sql_type,value,error",
+    [
+        ("hugeint", -(2**127) - 1, "outside the HUGEINT range"),
+        ("hugeint", 2**127, "outside the HUGEINT range"),
+        ("decimal(38,0)", -(2**127) - 1, "outside the DECIMAL storage range"),
+        ("decimal(38,0)", 2**127, "outside the DECIMAL storage range"),
+        ("time", -1, "outside the TIME range"),
+        ("time", 86_400_000_001, "outside the TIME range"),
+        ("interval", dict(months=1, days=2, micros=None), "INTERVAL has a null component"),
+    ],
+)
+def test_values_outside_native_domain_are_rejected(sql_type, value, error):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    kinds = {
+        "hugeint": pa.decimal256(39, 0),
+        "decimal(38,0)": pa.decimal256(39, 0),
+        "time": pa.int64(),
+        "interval": pa.struct([("months", pa.int32()), ("days", pa.int32()), ("micros", pa.int64())]),
+    }
+    schema = pa.schema([("c0", kinds[sql_type])])
+    record = pa.RecordBatch.from_arrays([pa.array([value], type=schema.field(0).type)], schema=schema)
+    record.validate(full=True)
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            return flight.GeneratorStream(schema, [(record, b"D:1"), (record.slice(0, 0), b"F:1")])
+
+        def do_action(self, context, action):
+            yield flight.Result(b"open")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection, f"select null::{sql_type}")
+    sender = Sender(("127.0.0.1", 0))
+    receiver = service()
+    try:
+        receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "hugeint", target, "producer", 10)
+        assert error in eventually(lambda: target.snapshot()["error"], bool)
+        assert target.snapshot()["bytes"] == 0
+    finally:
+        receiver.close()
+        sender.shutdown()
+
+
 def test_schema_mismatch_is_failure():
     with vane.connect(backend="local") as connection:
         source = make_channel(connection)
@@ -189,6 +235,48 @@ def test_schema_mismatch_is_failure():
     finally:
         receiver.close()
         sender.close()
+
+
+@pytest.mark.parametrize("width,scale", [(19, 0), (38, 0), (38, 5), (38, 38)])
+def test_decimal_exchange_accepts_entire_native_coefficient_range(width, scale):
+    from decimal import Decimal
+
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    from tests.fast.test_analytical_fragment_compiler import scaled_wide_value
+
+    values = [Decimal(scaled_wide_value(value, scale)) for value in [-(2**127), 2**127 - 1]] + [None]
+    schema = pa.schema([("c0", pa.decimal256(39, scale))])
+    record = pa.RecordBatch.from_arrays([pa.array(values, type=schema.field(0).type)], schema=schema)
+    record.validate(full=True)
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            return flight.GeneratorStream(schema, [(record, b"D:1"), (record.slice(0, 0), b"F:1")])
+
+        def do_action(self, context, action):
+            yield flight.Result(b"open")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection, f"select null::decimal({width},{scale})")
+    sender = Sender(("127.0.0.1", 0))
+    receiver = service()
+    try:
+        receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "decimal", target, "producer", 10)
+        _, batch = eventually(lambda: target.poll("consumer"), lambda result: result[0] == "data")
+        column = batch.to_arrow(["value"]).column(0)
+        assert column.type == pa.decimal128(width, scale)
+        # Inspect intermediates before SQL finalization in a wide Arrow view;
+        # they need not fit the declared result precision or Python formatter.
+        wide = column.cast(pa.decimal256(39, scale))
+        wide.validate(full=True)
+        assert wide.to_pylist() == values
+        batch.close()
+        eventually(lambda: target.poll("consumer"), lambda result: result[0] == "end")
+    finally:
+        receiver.close()
+        sender.shutdown()
 
 
 @pytest.mark.parametrize("threads", [1, 4])

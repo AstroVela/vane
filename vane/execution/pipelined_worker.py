@@ -183,16 +183,18 @@ class _Query:
             self.cancel(str(error))
 
     def snapshot(self) -> dict[str, Any]:
-        tasks = self.service.status()
+        tasks = self.service.diagnostics()
         production = self.service.production_status()
-        channels = [channel.snapshot() for channel in self.channels.values()]
-        error = self.error or self.flight.error or next((c["error"] for c in channels if c["error"]), "")
+        channels = {name: channel.snapshot() for name, channel in self.channels.items()}
+        error = self.error or self.flight.error or next((c["error"] for c in channels.values() if c["error"]), "")
         return {
             "tasks": tasks,
             "error": error,
             "production_done": production["finished"] and not production["error"],
             "active_contexts": sum(not t["released"] for t in tasks),
-            "owned_bytes": sum(c["bytes"] for c in channels),
+            "owned_bytes": sum(c["bytes"] for c in channels.values()),
+            "channels": channels,
+            "cleanup_complete": self.closed,
         }
 
     def cancel(self, reason: str) -> None:
@@ -260,27 +262,15 @@ class PipelinedWorker:
         routes: list[dict[str, Any]],
         frame_rows: int,
     ) -> str:
-        from vane._native import execution_runtime as native
 
         self._check(epoch)
         spec = RayQuerySpec.from_dict(encoded, expected_engine_identity=self.engine)
         if spec.requires_replay:
             raise ValueError("pipelined worker does not accept FTE submissions")
-        links = sum((r["source_worker"] == index) + (r["target_worker"] == index) for r in routes)
-        reservation = {
-            "contexts": len(tasks),
-            "exchange": links * self.resources.exchange.window_bytes,
-            "staging": links * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
-            "io": links,
-            "operator": self.resources.operator_memory_bytes // self.resources.max_active_queries,
-        }
-        capacity = {
-            "contexts": self.resources.task_contexts_per_worker,
-            "exchange": self.resources.exchange_buffer_bytes,
-            "staging": self.resources.staging_buffer_bytes,
-            "io": self.resources.io_concurrency,
-            "operator": self.resources.operator_memory_bytes,
-        }
+        from vane.execution.worker_resources import pipelined_demand, worker_capacity
+
+        reservation = pipelined_demand(self.resources, index, tasks, routes)
+        capacity = worker_capacity(self.resources)
         with self.lock:
             if spec.query_id in self.reservations:
                 raise ValueError("query already prepared")
@@ -372,7 +362,6 @@ class PipelinedWorker:
     ) -> None:
         from pathlib import Path
 
-        from vane._native import execution_runtime as native
         from vane.execution.fte_plan import bind_task
         from vane.execution.fte_worker import MaterializedAttempt
         from vane.execution.materialized_exchange import StageManifest
@@ -408,21 +397,10 @@ class PipelinedWorker:
             raise ValueError("attempt output partitions differ from the fragment graph")
         if type(frame_rows) is not int or not 0 < frame_rows <= self.resources.exchange.frame_rows:
             raise ValueError("invalid materialized frame row capacity")
-        links = sum(len(o) for o in binding.inputs.values()) + len(binding.task.outputs)
-        demand = {
-            "contexts": 1,
-            "exchange": links * self.resources.exchange.window_bytes,
-            "staging": links * native.MaterializedIO.staging_bytes(self.resources.exchange.frame_bytes),
-            "io": links,
-            "operator": self.resources.operator_memory_bytes // self.resources.max_active_queries,
-        }
-        capacity = {
-            "contexts": self.resources.task_contexts_per_worker,
-            "exchange": self.resources.exchange_buffer_bytes,
-            "staging": self.resources.staging_buffer_bytes,
-            "io": self.resources.io_concurrency,
-            "operator": self.resources.operator_memory_bytes,
-        }
+        from vane.execution.worker_resources import materialized_demand, worker_capacity
+
+        demand = materialized_demand(self.resources, binding)
+        capacity = worker_capacity(self.resources)
         key = f"fte/{spec.query_id}/{token.fence}"
         resources = replace(self.resources, exchange=replace(self.resources.exchange, frame_rows=frame_rows))
 

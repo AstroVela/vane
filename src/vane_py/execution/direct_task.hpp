@@ -30,6 +30,17 @@ struct DirectTaskStatus {
 	string state;
 	string error;
 	bool released = false;
+	string blocked_on;
+	idx_t builds_total = 0;
+	idx_t builds_ready = 0;
+};
+
+struct DirectTaskProgress {
+	atomic<bool> started {false};
+	atomic<bool> released {false};
+	atomic<bool> output_blocked {false};
+	vector<shared_ptr<atomic<bool>>> input_blocked;
+	vector<shared_ptr<atomic<bool>>> builds_ready;
 };
 
 // One query's in-process TaskService. Control is serialized separately from
@@ -48,6 +59,7 @@ public:
 	bool Expire();
 	void Release();
 	vector<DirectTaskStatus> Status();
+	vector<DirectTaskStatus> Diagnostics();
 	DirectProducerStatus ProductionStatus();
 
 private:
@@ -67,6 +79,7 @@ private:
 		// Published/read under registry_lock, independently of the operation lock.
 		shared_ptr<TaskErrorManager> execution_errors;
 		string failure_reason;
+		shared_ptr<DirectTaskProgress> progress = make_shared_ptr<DirectTaskProgress>();
 	};
 	void CheckCanceled() const;
 	void Refresh(Task &task);

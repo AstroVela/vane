@@ -52,7 +52,7 @@ class RequestExecutionTimeout(TimeoutError):
     """A claimed request exceeded its execution deadline."""
 
 
-RequestCancellationReason = Literal["cancelled", "execution_timeout"]
+RequestCancellationReason = Literal["cancelled", "admission_timeout", "execution_timeout"]
 
 
 class RuntimeRequestAdmission:
@@ -152,7 +152,10 @@ class RuntimeRequestAdmission:
             ticket._released_at = now
             assert ticket._execution_finished_at is not None
             self._cleanup_seconds += max(0.0, now - ticket._execution_finished_at)
-            if ticket._cancel_reason == "execution_timeout":
+            if ticket._cancel_reason == "admission_timeout":
+                ticket._state = "timed_out"
+                self._timed_out += 1
+            elif ticket._cancel_reason == "execution_timeout":
                 ticket._state = "execution_timed_out"
                 self._execution_timed_out += 1
             elif ticket._cancel_reason is not None:
@@ -227,11 +230,22 @@ class RequestTicket:
         self._admitted_at: float | None = None
         self._execution_finished_at: float | None = None
         self._released_at: float | None = None
+        self._deferred_admission = False
+
+    def _finish_admission_locked(self, now: float) -> None:
+        if self._deferred_admission:
+            waited = max(0.0, now - self._created)
+            self._runtime._queue_wait_seconds += waited - self._queue_wait
+            self._queue_wait = waited
+            self._deferred_admission = False
 
     def _finish_execution_locked(self, now: float, *, failed: bool) -> None:
-        if self._claimed_at is None or self._execution_finished_at is not None:
+        if self._execution_finished_at is not None or (self._claimed_at is None and not self._deferred_admission):
             return
+        self._finish_admission_locked(now)
         self._execution_finished_at = now
+        if self._claimed_at is None:
+            return
         self._runtime._executed += 1
         self._runtime._failed_executions += int(failed)
         self._runtime._execution_seconds += max(0.0, now - self._claimed_at)
@@ -277,19 +291,41 @@ class RequestTicket:
             return self._claimed_at
 
     @property
+    def admission_deadline(self) -> float:
+        return self._deadline
+
+    def start_execution(self) -> float:
+        """Start execution after the adapter obtains its worker reservation."""
+        with self._runtime._condition:
+            if self._cancel_reason is not None:
+                raise self.cancellation_error()
+            if self._state != "running" or self._execution_finished_at is not None:
+                raise RuntimeError("request has no live execution lease")
+            if self._claimed_at is None:
+                now = time.monotonic()
+                if now >= self._deadline:
+                    self._cancel_reason = "admission_timeout"
+                    raise RequestQueueTimeout("worker resource admission deadline exceeded")
+                self._finish_admission_locked(now)
+                self._claimed_at = now
+            return self._claimed_at
+
+    @property
     def cancellation_reason(self) -> RequestCancellationReason | None:
         with self._runtime._condition:
             return self._cancel_reason
 
-    def cancellation_error(self) -> RequestCancelled | RequestExecutionTimeout:
+    def cancellation_error(self) -> RequestCancelled | RequestQueueTimeout | RequestExecutionTimeout:
         with self._runtime._condition:
+            if self._cancel_reason == "admission_timeout":
+                return RequestQueueTimeout("worker resource admission deadline exceeded")
             if self._cancel_reason == "execution_timeout":
                 return RequestExecutionTimeout("request execution deadline exceeded")
             return RequestCancelled("request execution cancelled")
 
     def cancel_running(self, *, reason: RequestCancellationReason = "cancelled") -> bool:
         """Record cancellation without returning the execution's cleanup lease."""
-        if reason not in {"cancelled", "execution_timeout"}:
+        if reason not in {"cancelled", "admission_timeout", "execution_timeout"}:
             raise ValueError("unknown request cancellation reason")
         with self._runtime._condition:
             if self._state != "running" or self._cancel_reason is not None:
@@ -297,7 +333,7 @@ class RequestTicket:
             self._cancel_reason = reason
             return True
 
-    def take(self, *, before_claim: Callable[[], None] | None = None) -> AdmissionLease:
+    def take(self, *, before_claim: Callable[[], None] | None = None, defer_execution: bool = False) -> AdmissionLease:
         """Wait for this ticket, then transfer its slot to one execution.
 
         An optional metadata reservation runs under the admission lock only
@@ -318,7 +354,9 @@ class RequestTicket:
                     if before_claim is not None:
                         before_claim()
                     self._state = "running"
-                    self._claimed_at = time.monotonic()
+                    self._deferred_admission = defer_execution
+                    if not defer_execution:
+                        self._claimed_at = time.monotonic()
                     return lease
                 if self._state == "timed_out":
                     raise RequestQueueTimeout("request queue deadline expired")

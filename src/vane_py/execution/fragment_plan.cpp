@@ -3,6 +3,19 @@
 
 #include "fragment_plan.hpp"
 #include "file_snapshot.hpp"
+#include "exchange_types.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/helper/physical_limit.hpp"
+#include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/order/physical_top_n.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/aggregate/wide_integer.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -55,24 +68,7 @@ void CheckPartitions(idx_t partitions) {
 
 void CheckTypes(const vector<LogicalType> &types) {
 	for (auto &type : types) {
-		switch (type.id()) {
-		case LogicalTypeId::BOOLEAN:
-		case LogicalTypeId::TINYINT:
-		case LogicalTypeId::SMALLINT:
-		case LogicalTypeId::INTEGER:
-		case LogicalTypeId::BIGINT:
-		case LogicalTypeId::UTINYINT:
-		case LogicalTypeId::USMALLINT:
-		case LogicalTypeId::UINTEGER:
-		case LogicalTypeId::UBIGINT:
-		case LogicalTypeId::FLOAT:
-		case LogicalTypeId::DOUBLE:
-		case LogicalTypeId::VARCHAR:
-		case LogicalTypeId::SQLNULL:
-			break;
-		default:
-			throw NotImplementedException("fragment compiler does not support type %s", type.ToString());
-		}
+		CheckExchangeType(type);
 	}
 }
 
@@ -269,17 +265,41 @@ void CheckFunctionOrigin(CatalogEntry &entry) {
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
-		static const std::set<string> scalar_functions = {"+",      "-",    "*",           "/",        "//",
-		                                                  "%",      "||",   "abs",         "lower",    "upper",
-		                                                  "length", "hash", "starts_with", "contains", "list_value"};
+		static const std::set<string> scalar_functions = {"+",
+		                                                  "-",
+		                                                  "*",
+		                                                  "/",
+		                                                  "//",
+		                                                  "%",
+		                                                  "||",
+		                                                  "abs",
+		                                                  "lower",
+		                                                  "upper",
+		                                                  "length",
+		                                                  "hash",
+		                                                  "starts_with",
+		                                                  "contains",
+		                                                  "list_value",
+		                                                  "struct_pack",
+		                                                  "struct_extract",
+		                                                  "list_extract",
+		                                                  "map",
+		                                                  "array_value",
+		                                                  "date_part",
+		                                                  "date_trunc",
+		                                                  "extract"};
+		static const std::set<string> aggregates = {"count", "count_star", "sum", "avg", "min", "max"};
 		const auto name = StringUtil::Lower(function.function_name);
 		const bool scan = SupportedScan(name);
-		if (!scan && !scalar_functions.count(name)) {
+		const bool aggregate = aggregates.count(name);
+		if (!scan && !aggregate && !scalar_functions.count(name)) {
 			throw NotImplementedException("fragment compiler does not support function %s", name);
 		}
-		auto &entry =
-		    Catalog::GetEntry(context, scan ? CatalogType::TABLE_FUNCTION_ENTRY : CatalogType::SCALAR_FUNCTION_ENTRY,
-		                      function.catalog, function.schema, name);
+		auto &entry = Catalog::GetEntry(context,
+		                                scan        ? CatalogType::TABLE_FUNCTION_ENTRY
+		                                : aggregate ? CatalogType::AGGREGATE_FUNCTION_ENTRY
+		                                            : CatalogType::SCALAR_FUNCTION_ENTRY,
+		                                function.catalog, function.schema, name);
 		CheckFunctionOrigin(entry);
 	}
 	// A subquery expression can hide functions from ordinary expression traversal.
@@ -321,6 +341,11 @@ public:
 				}
 			}
 			if (IsParquetScan(get.function.name)) {
+				// Late materialization introduces a second scan joined on file_index,
+				// which is not stable after assigning files to fragment partitions.
+				// Change only this bound scan's capability, not the shared catalog or
+				// session optimizer settings; native TopN can still be distributed.
+				get.function.late_materialization = false;
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
 				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
@@ -334,6 +359,11 @@ public:
 		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 		case LogicalOperatorType::LOGICAL_CHUNK_GET:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+		case LogicalOperatorType::LOGICAL_LIMIT:
 			break;
 		default:
 			throw NotImplementedException("fragment compiler does not support logical operator %s", op.GetName());
@@ -358,8 +388,26 @@ void CheckOperator(PhysicalOperator &op, idx_t children) {
 	case PhysicalOperatorType::PROJECTION:
 	case PhysicalOperatorType::FILTER:
 	case PhysicalOperatorType::EXPRESSION_SCAN:
+	case PhysicalOperatorType::HASH_GROUP_BY:
+	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY:
+	case PhysicalOperatorType::UNGROUPED_AGGREGATE:
+	case PhysicalOperatorType::ORDER_BY:
+	case PhysicalOperatorType::TOP_N:
+	case PhysicalOperatorType::STREAMING_LIMIT:
+	case PhysicalOperatorType::LIMIT:
 		if (children == 1) {
 			return;
+		}
+		break;
+	case PhysicalOperatorType::HASH_JOIN:
+		if (children == 2) {
+			auto &join = op.Cast<PhysicalHashJoin>();
+			if (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
+			    join.join_type == JoinType::RIGHT || join.join_type == JoinType::OUTER ||
+			    join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI ||
+			    join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+				return;
+			}
 		}
 		break;
 	case PhysicalOperatorType::DUMMY_SCAN:
@@ -495,17 +543,6 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 	return node;
 }
 
-FragmentSpec InputFragment(const string &id, idx_t partitions, const vector<string> &names,
-                           const vector<LogicalType> &types) {
-	FragmentSpec fragment;
-	fragment.fragment_id = id;
-	fragment.partition_count = partitions;
-	fragment.names = names;
-	fragment.root.input_port = "in";
-	fragment.root.types = types;
-	return fragment;
-}
-
 string HashExpression(const vector<LogicalType> &types, const vector<idx_t> &columns) {
 	vector<unique_ptr<Expression>> expressions;
 	std::set<idx_t> seen;
@@ -525,6 +562,377 @@ string HashExpression(const vector<LogicalType> &types, const vector<idx_t> &col
 } // namespace
 
 namespace {
+// A subtree keeps its native operators together until a distribution boundary.
+// Incoming edges are attached when the owning fragment receives its identity.
+struct DistributedSubtree {
+	FragmentSpec fragment;
+	vector<ExchangeSpec> incoming;
+};
+
+class AnalyticalPlanner {
+public:
+	AnalyticalPlanner(ClientContext &context, PhysicalPlan &plan, FragmentGraph &graph, idx_t partitions)
+	    : context(context), plan(plan), graph(graph), partitions(partitions) {
+	}
+
+	string Finish(DistributedSubtree subtree, const vector<string> &names = {}) {
+		auto &fragment = subtree.fragment;
+		fragment.fragment_id = "fragment" + std::to_string(graph.fragments.size());
+		fragment.names = names;
+		if (fragment.names.empty()) {
+			for (idx_t col = 0; col < fragment.root.types.size(); col++) {
+				fragment.names.push_back("c" + std::to_string(col));
+			}
+		}
+		for (auto &edge : subtree.incoming) {
+			edge.consumer = fragment.fragment_id;
+			graph.exchanges.push_back(std::move(edge));
+		}
+		auto id = fragment.fragment_id;
+		graph.fragments.push_back(std::move(fragment));
+		return id;
+	}
+
+	DistributedSubtree Exchange(DistributedSubtree child, const string &distribution, idx_t count,
+	                            const vector<idx_t> &keys = {}) {
+		ExchangeSpec edge;
+		edge.exchange_id = "exchange" + std::to_string(next_exchange++);
+		edge.consumer_port = edge.exchange_id;
+		edge.distribution = distribution;
+		auto types = child.fragment.root.types;
+		if (distribution == "hash") {
+			edge.partitioning = HashExpression(types, keys);
+		}
+		edge.producer = Finish(std::move(child));
+		DistributedSubtree result;
+		result.fragment.partition_count = count;
+		result.fragment.root.input_port = edge.consumer_port;
+		result.fragment.root.types = std::move(types);
+		result.incoming.push_back(std::move(edge));
+		return result;
+	}
+
+	DistributedSubtree Build(PhysicalOperator &op) {
+		CheckOperator(op, op.children.size());
+		if (op.children.empty()) {
+			DistributedSubtree result;
+			result.fragment.root = EncodeNode(context, op, result.fragment, partitions);
+			result.fragment.partition_count = result.fragment.sources.empty() ? 1 : partitions;
+			return result;
+		}
+		if (op.type == PhysicalOperatorType::HASH_JOIN) {
+			return Join(op.Cast<PhysicalHashJoin>());
+		}
+		auto child = Build(op.children[0]);
+		switch (op.type) {
+		case PhysicalOperatorType::HASH_GROUP_BY: {
+			auto &aggregate = op.Cast<PhysicalHashAggregate>();
+			if (aggregate.grouping_sets.size() != 1 || !aggregate.grouped_aggregate_data.grouping_functions.empty()) {
+				throw NotImplementedException("distributed grouping sets are not supported");
+			}
+			return Aggregate(op, std::move(child), aggregate.grouped_aggregate_data.groups,
+			                 InputAggregates(aggregate.grouped_aggregate_data.aggregates, &aggregate.filter_indexes));
+		}
+		case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
+			auto &aggregate = op.Cast<PhysicalPerfectHashAggregate>();
+			return Aggregate(op, std::move(child), aggregate.groups,
+			                 InputAggregates(aggregate.aggregates, &aggregate.filter_indexes));
+		}
+		case PhysicalOperatorType::UNGROUPED_AGGREGATE: {
+			vector<unique_ptr<Expression>> groups;
+			return Aggregate(op, std::move(child), groups,
+			                 InputAggregates(op.Cast<PhysicalUngroupedAggregate>().aggregates));
+		}
+		case PhysicalOperatorType::TOP_N: {
+			auto &top = op.Cast<PhysicalTopN>();
+			top.dynamic_filter.reset();
+			if (child.fragment.partition_count > 1) {
+				if (top.limit > NumericLimits<idx_t>::Maximum() - top.offset) {
+					throw InvalidInputException("TopN limit plus offset overflows");
+				}
+				vector<BoundOrderByNode> orders;
+				for (auto &order : top.orders) {
+					orders.push_back(order.Copy());
+				}
+				auto &partial = plan.Make<PhysicalTopN>(op.types, std::move(orders), top.limit + top.offset, 0, nullptr,
+				                                        op.estimated_cardinality);
+				Wrap(partial, child);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		if (op.type == PhysicalOperatorType::ORDER_BY || op.type == PhysicalOperatorType::TOP_N ||
+		    op.type == PhysicalOperatorType::LIMIT || op.type == PhysicalOperatorType::STREAMING_LIMIT) {
+			if (child.fragment.partition_count > 1) {
+				child = Exchange(std::move(child), "gather", 1);
+			}
+		}
+		if (op.type == PhysicalOperatorType::LIMIT) {
+			auto &limit = op.Cast<PhysicalLimit>();
+			auto &streaming = plan.Make<PhysicalStreamingLimit>(
+			    op.types, std::move(limit.limit_val), std::move(limit.offset_val), op.estimated_cardinality, false);
+			Wrap(streaming, child);
+		} else {
+			if (op.type == PhysicalOperatorType::STREAMING_LIMIT) {
+				op.Cast<PhysicalStreamingLimit>().parallel = false;
+			}
+			Wrap(op, child);
+		}
+		return child;
+	}
+
+private:
+	ClientContext &context;
+	PhysicalPlan &plan;
+	FragmentGraph &graph;
+	idx_t partitions;
+	idx_t next_exchange = 0;
+
+	PlanNode Node(PhysicalOperator &op) {
+		PlanNode node;
+		node.types = op.types;
+		node.native_operator = Encode([&](Serializer &serializer) { op.SerializeNode(serializer); });
+		return node;
+	}
+	void Wrap(PhysicalOperator &op, DistributedSubtree &child) {
+		auto node = Node(op);
+		node.children.push_back(std::move(child.fragment.root));
+		child.fragment.root = std::move(node);
+	}
+	vector<unique_ptr<Expression>> Copy(const vector<unique_ptr<Expression>> &expressions) {
+		vector<unique_ptr<Expression>> result;
+		for (auto &expression : expressions) {
+			result.push_back(expression->Copy());
+		}
+		return result;
+	}
+	vector<unique_ptr<Expression>> InputAggregates(const vector<unique_ptr<Expression>> &expressions,
+	                                               const unordered_map<Expression *, size_t> *filters = nullptr) {
+		vector<unique_ptr<Expression>> result;
+		for (auto &expression : expressions) {
+			auto &original = expression->Cast<BoundAggregateExpression>();
+			// Physical planning wraps ordered aggregates and clears order_bys.
+			// Restore the logical arguments/order keys before deciding whether a
+			// partial result can be merged, just as native serialization does.
+			auto aggregate = FunctionBinder::UnbindSortedAggregate(original);
+			if (filters && original.filter) {
+				aggregate->filter->Cast<BoundReferenceExpression>().index = filters->at(original.filter.get());
+			}
+			result.push_back(std::move(aggregate));
+		}
+		return result;
+	}
+	vector<idx_t> ProjectKeys(DistributedSubtree &child, const vector<unique_ptr<Expression>> &keys) {
+		auto types = child.fragment.root.types;
+		vector<unique_ptr<Expression>> expressions;
+		vector<idx_t> columns;
+		for (idx_t col = 0; col < types.size(); col++) {
+			expressions.push_back(make_uniq<BoundReferenceExpression>(types[col], col));
+		}
+		for (auto &key : keys) {
+			columns.push_back(types.size());
+			types.push_back(key->return_type);
+			expressions.push_back(key->Copy());
+		}
+		auto &projection = plan.Make<PhysicalProjection>(types, std::move(expressions), 0);
+		Wrap(projection, child);
+		return columns;
+	}
+	unique_ptr<Expression> BindAggregate(const string &name, vector<unique_ptr<Expression>> children,
+	                                     unique_ptr<Expression> filter = nullptr) {
+		auto &entry = Catalog::GetEntry<AggregateFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, name);
+		CheckFunctionOrigin(entry);
+		FunctionBinder binder(context);
+		ErrorData error;
+		auto index = binder.BindFunction(name, entry.functions, children, error);
+		if (!index.IsValid()) {
+			error.Throw();
+		}
+		return binder.BindAggregateFunction(entry.functions.GetFunctionByOffset(index.GetIndex()), std::move(children),
+		                                    std::move(filter));
+	}
+	PhysicalOperator &MakeAggregate(vector<unique_ptr<Expression>> groups, vector<unique_ptr<Expression>> aggregates) {
+		vector<LogicalType> types;
+		for (auto &group : groups) {
+			types.push_back(group->return_type);
+		}
+		for (auto &aggregate : aggregates) {
+			types.push_back(aggregate->return_type);
+		}
+		if (groups.empty()) {
+			return plan.Make<PhysicalUngroupedAggregate>(types, std::move(aggregates), 1,
+			                                             TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+		}
+		return plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 0);
+	}
+	DistributedSubtree Aggregate(PhysicalOperator &op, DistributedSubtree child,
+	                             const vector<unique_ptr<Expression>> &groups,
+	                             const vector<unique_ptr<Expression>> &aggregates) {
+		bool split = !aggregates.empty();
+		bool wide_aggregate = false;
+		for (auto &expression : aggregates) {
+			auto &aggregate = expression->Cast<BoundAggregateExpression>();
+			auto name = aggregate.function.name;
+			// Binder uses FIRST to retain an interval/collated group value, and
+			// ARG_MIN/MAX for collated MIN/MAX. Parsed SQL still admits only the
+			// public aggregate subset. Keep these native rewrites as complete groups.
+			const bool internal_rewrite = name == "first" || name == "arg_min" || name == "arg_max";
+			if (name != "count" && name != "count_star" && name != "sum" && name != "sum_no_overflow" &&
+			    name != "avg" && name != "min" && name != "max" && !internal_rewrite) {
+				throw NotImplementedException("unsupported distributed aggregate %s", name);
+			}
+			split = split && !aggregate.IsDistinct() && !aggregate.order_bys && !internal_rewrite;
+			// MIN/MAX(x, n) return the n extreme values as a list. Applying
+			// unary MIN/MAX to partial lists compares whole lists, not elements.
+			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
+				split = false;
+			}
+			// A DECIMAL SUM accumulator uses the full signed 128-bit domain. A
+			// partition's subtotal can exceed DECIMAL(38,s) even when cancellation
+			// across partitions leaves a valid final result. Exchange original rows
+			// and finalize complete groups instead of transporting that subtotal as
+			// a SQL DECIMAL value with insufficient precision. HUGEINT input can
+			// also overflow a partition accumulator despite a valid complete sum.
+			// Check the input type, so ordinary BIGINT SUM can still be split.
+			if ((name == "sum" || name == "sum_no_overflow") &&
+			    (aggregate.return_type.id() == LogicalTypeId::DECIMAL ||
+			     aggregate.children[0]->return_type.id() == LogicalTypeId::HUGEINT)) {
+				split = false;
+				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
+					// Whole-group input can still arrive with all positive values
+					// first. Widen the private state and check range at finalization.
+					aggregate.function = WideIntegerSumFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
+				}
+			}
+			// Native integer/decimal AVG divides an exact accumulator in long
+			// double; a scalar DOUBLE SUM/COUNT would round too early. Temporal
+			// AVG also has native rounding rules. Keep complete groups for those
+			// overloads instead of approximating their finalization.
+			if (name == "avg" && (aggregate.return_type != LogicalType::DOUBLE ||
+			                      (aggregate.children[0]->return_type.id() != LogicalTypeId::FLOAT &&
+			                       aggregate.children[0]->return_type.id() != LogicalTypeId::DOUBLE))) {
+				split = false;
+				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
+					aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
+				}
+			}
+		}
+		if (child.fragment.partition_count == 1) {
+			if (wide_aggregate) {
+				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
+				Wrap(aggregate, child);
+			} else {
+				Wrap(op, child);
+			}
+			return child;
+		}
+		if (!split) {
+			// These overloads need complete input for each group; repartition
+			// original rows and let the native aggregate enforce SQL semantics.
+			auto keys = ProjectKeys(child, groups);
+			child =
+			    Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);
+			auto &final = MakeAggregate(Copy(groups), Copy(aggregates));
+			Wrap(final, child);
+			return child;
+		}
+		vector<unique_ptr<Expression>> partials, finals, output;
+		vector<unique_ptr<Expression>> final_groups;
+		vector<idx_t> keys;
+		for (idx_t i = 0; i < groups.size(); i++) {
+			keys.push_back(i);
+			final_groups.push_back(make_uniq<BoundReferenceExpression>(groups[i]->return_type, i));
+			output.push_back(make_uniq<BoundReferenceExpression>(groups[i]->return_type, i));
+		}
+		auto add = [&](unique_ptr<Expression> partial, const string &merge) -> unique_ptr<Expression> {
+			vector<unique_ptr<Expression>> input;
+			input.push_back(make_uniq<BoundReferenceExpression>(partial->return_type, groups.size() + partials.size()));
+			partials.push_back(std::move(partial));
+			auto final = BindAggregate(merge, std::move(input));
+			auto reference = make_uniq<BoundReferenceExpression>(final->return_type, groups.size() + finals.size());
+			finals.push_back(std::move(final));
+			return std::move(reference);
+		};
+		for (auto &expression : aggregates) {
+			auto &aggregate = expression->Cast<BoundAggregateExpression>();
+			auto name = aggregate.function.name;
+			unique_ptr<Expression> result;
+			if (name == "avg") {
+				auto sum = add(BindAggregate("sum", Copy(aggregate.children),
+				                             aggregate.filter ? aggregate.filter->Copy() : nullptr),
+				               "sum");
+				auto count = add(BindAggregate("count", Copy(aggregate.children),
+				                               aggregate.filter ? aggregate.filter->Copy() : nullptr),
+				                 "sum");
+				vector<unique_ptr<Expression>> args;
+				args.push_back(BoundCastExpression::AddCastToType(context, std::move(sum), LogicalType::DOUBLE));
+				args.push_back(BoundCastExpression::AddCastToType(context, std::move(count), LogicalType::DOUBLE));
+				ErrorData error;
+				result = FunctionBinder(context).BindScalarFunction(DEFAULT_SCHEMA, "/", std::move(args), error);
+				if (!result) {
+					error.Throw();
+				}
+			} else {
+				result = add(aggregate.Copy(), name == "min" || name == "max" ? name : "sum");
+			}
+			output.push_back(BoundCastExpression::AddCastToType(context, std::move(result), aggregate.return_type));
+		}
+		auto &partial = MakeAggregate(Copy(groups), std::move(partials));
+		Wrap(partial, child);
+		child = Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);
+		auto &final = MakeAggregate(std::move(final_groups), std::move(finals));
+		Wrap(final, child);
+		auto &projection = plan.Make<PhysicalProjection>(op.types, std::move(output), op.estimated_cardinality);
+		Wrap(projection, child);
+		return child;
+	}
+	DistributedSubtree Join(PhysicalHashJoin &join) {
+		auto left = Build(join.children[0]);
+		auto right = Build(join.children[1]);
+		vector<unique_ptr<Expression>> left_keys, right_keys;
+		for (auto &condition : join.conditions) {
+			if (condition.comparison == ExpressionType::COMPARE_EQUAL ||
+			    condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+				if (condition.left->return_type != condition.right->return_type) {
+					throw NotImplementedException("hash join keys require identical types");
+				}
+				left_keys.push_back(condition.left->Copy());
+				right_keys.push_back(condition.right->Copy());
+			}
+		}
+		if (left_keys.empty() || !join.delim_types.empty()) {
+			throw NotImplementedException("distributed hash join requires uncorrelated equality keys");
+		}
+		const bool broadcast = join.children[1].get().estimated_cardinality <= 32 &&
+		                       (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
+		                        join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI);
+		auto lk = ProjectKeys(left, left_keys);
+		left = Exchange(std::move(left), "hash", partitions, lk);
+		if (broadcast) {
+			right = Exchange(std::move(right), "broadcast", partitions);
+		} else {
+			auto rk = ProjectKeys(right, right_keys);
+			right = Exchange(std::move(right), "hash", partitions, rk);
+		}
+		// Runtime filters contain coordinator operator references. Each worker
+		// builds its own hash table and uses native build/probe event dependencies.
+		join.filter_pushdown.reset();
+		join.join_stats.clear();
+		auto node = Node(join);
+		node.children.push_back(std::move(left.fragment.root));
+		node.children.push_back(std::move(right.fragment.root));
+		left.fragment.root = std::move(node);
+		for (auto &edge : right.incoming) {
+			left.incoming.push_back(std::move(edge));
+		}
+		return left;
+	}
+};
+
 void FilePatterns(ParsedExpression &expression, vector<string> &patterns, bool allow_list = true) {
 	if (expression.GetExpressionClass() == ExpressionClass::CONSTANT) {
 		auto &value = expression.Cast<ConstantExpression>().value;
@@ -668,7 +1076,8 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		    [&](unique_ptr<ParsedExpression> &expression) { CheckParsedExpression(context, *expression); },
 		    [](TableRef &ref) {
 			    if (ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::TABLE_FUNCTION &&
-			        ref.type != TableReferenceType::SUBQUERY && ref.type != TableReferenceType::EXPRESSION_LIST) {
+			        ref.type != TableReferenceType::SUBQUERY && ref.type != TableReferenceType::EXPRESSION_LIST &&
+			        ref.type != TableReferenceType::JOIN) {
 				    throw NotImplementedException("fragment compiler requires explicit range or Parquet sources");
 			    }
 		    });
@@ -694,34 +1103,16 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		}
 		PhysicalPlanGenerator physical_planner(context);
 		auto physical = physical_planner.Plan(std::move(planner.plan));
-		FragmentSpec source;
-		source.fragment_id = "fragment0";
-		source.names = planner.names;
-		source.source_dependencies = std::move(validator.source_dependencies);
-		source.root = EncodeNode(context, physical->Root(), source, partitions);
-		// Constants execute once. Parallelism comes only from independently
-		// assignable scan splits, not from duplicating a complete local query.
-		source.partition_count = source.sources.empty() ? 1 : partitions;
-		graph.fragments.push_back(std::move(source));
+		AnalyticalPlanner distributed(context, *physical, graph, partitions);
+		auto root = distributed.Build(physical->Root());
 		if (!hash_columns.empty()) {
-			ExchangeSpec hash;
-			hash.exchange_id = "exchange0";
-			hash.producer = "fragment0";
-			hash.consumer = "fragment1";
-			hash.distribution = "hash";
-			hash.partitioning = HashExpression(planner.types, hash_columns);
-			graph.exchanges.push_back(std::move(hash));
-			graph.fragments.push_back(InputFragment("fragment1", partitions, planner.names, planner.types));
+			root = distributed.Exchange(std::move(root), "hash", partitions, hash_columns);
 		}
-		if (graph.fragments.back().partition_count != 1) {
-			ExchangeSpec gather;
-			gather.exchange_id = "exchange" + std::to_string(graph.exchanges.size());
-			gather.producer = graph.fragments.back().fragment_id;
-			gather.consumer = "fragment" + std::to_string(graph.fragments.size());
-			gather.distribution = "gather";
-			graph.fragments.push_back(InputFragment(gather.consumer, 1, planner.names, planner.types));
-			graph.exchanges.push_back(std::move(gather));
+		if (root.fragment.partition_count != 1) {
+			root = distributed.Exchange(std::move(root), "gather", 1);
 		}
+		root.fragment.source_dependencies = std::move(validator.source_dependencies);
+		distributed.Finish(std::move(root), planner.names);
 	});
 	if (!snapshot_directory.empty()) {
 		for (auto &fragment : graph.fragments) {

@@ -79,6 +79,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serialization_data.hpp"
 #include "duckdb/execution/dynamic_filter_serialization.hpp"
+#include "duckdb/execution/physical_plan_deserialization.hpp"
 
 namespace duckdb {
 
@@ -768,6 +769,7 @@ void PhysicalOperator::SerializeOperatorData(Serializer &serializer) const {
 unique_ptr<PhysicalOperator> PhysicalOperator::Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan) {
 	auto &data = deserializer.GetSerializationData();
 	DynamicFilterSerializationGuard guard(data);
+	PhysicalPlanDeserializationState physical_inputs(data);
 
 	// Read common fields
 	auto op_type = deserializer.ReadProperty<PhysicalOperatorType>(100, "type");

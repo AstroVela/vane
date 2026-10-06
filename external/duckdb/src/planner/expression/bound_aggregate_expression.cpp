@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 
@@ -5,6 +11,7 @@
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/function/function_serialization.hpp"
+#include "duckdb/execution/physical_plan_deserialization.hpp"
 
 namespace duckdb {
 
@@ -93,8 +100,20 @@ void BoundAggregateExpression::Serialize(Serializer &serializer) const {
 unique_ptr<Expression> BoundAggregateExpression::Deserialize(Deserializer &deserializer) {
 	auto return_type = deserializer.ReadProperty<LogicalType>(200, "return_type");
 	auto children = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(201, "children");
+	vector<unique_ptr<Expression>> bind_children;
+	const bool physical_inputs =
+	    bool(deserializer.GetSerializationData().TryGetCustom<PhysicalPlanDeserializationState>());
+	if (physical_inputs) {
+		// ARG_MIN/MAX binding can push a collation expression onto its key.
+		// A physical plan has already materialized that expression; applying it
+		// again both changes semantics and violates grouped aggregates' BOUND_REF
+		// input contract. Bind function data against private copies instead.
+		for (auto &child : children) {
+			bind_children.push_back(child->Copy());
+		}
+	}
 	auto entry = FunctionSerializer::Deserialize<AggregateFunction, AggregateFunctionCatalogEntry>(
-	    deserializer, CatalogType::AGGREGATE_FUNCTION_ENTRY, children, return_type);
+	    deserializer, CatalogType::AGGREGATE_FUNCTION_ENTRY, physical_inputs ? bind_children : children, return_type);
 	auto aggregate_type = deserializer.ReadProperty<AggregateType>(203, "aggregate_type");
 	auto filter =
 	    deserializer.ReadPropertyWithExplicitDefault<unique_ptr<Expression>>(204, "filter", unique_ptr<Expression>());

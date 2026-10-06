@@ -289,11 +289,14 @@ def test_worker_loss_replays_only_the_uncommitted_task(tmp_path, monkeypatch, st
     killed = []
 
     def lose_worker(owner, index, partition, binding, upstream):
-        dispatch(owner, index, partition, binding, upstream)
+        admitted = dispatch(owner, index, partition, binding, upstream)
+        if not admitted:
+            return False
         if not killed and binding.task.stage_id == stage_id:
             attempt = owner.active[index]
             killed.append(attempt.reservation.token)
             ray.kill(attempt.worker, no_restart=True)
+        return True
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_worker)
     with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
@@ -337,10 +340,13 @@ def test_attempt_exhaustion_exposes_no_rows_and_releases_storage(tmp_path, monke
     captured = []
 
     def lose_every_attempt(owner, index, partition, binding, upstream):
-        dispatch(owner, index, partition, binding, upstream)
+        admitted = dispatch(owner, index, partition, binding, upstream)
+        if not admitted:
+            return False
         if binding.task.task_id == "fragment0/0":
             captured.append(owner.active[index].reservation.token)
             ray.kill(owner.active[index].worker, no_restart=True)
+        return True
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_every_attempt)
     with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
@@ -368,10 +374,13 @@ def test_retry_backoff_uses_the_original_execution_deadline(tmp_path, monkeypatc
     killed = []
 
     def lose_first_attempt(owner, index, partition, binding, upstream):
-        dispatch(owner, index, partition, binding, upstream)
+        admitted = dispatch(owner, index, partition, binding, upstream)
+        if not admitted:
+            return False
         if not killed:
             killed.append(owner.active[index].reservation.token)
             ray.kill(owner.active[index].worker, no_restart=True)
+        return True
 
     with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
         connection.query("select 1", options=options()).collect()

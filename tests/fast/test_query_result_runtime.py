@@ -597,6 +597,29 @@ def test_allocation_and_watcher_failures_keep_cleanup_owner(monkeypatch, failure
         assert connection.query("SELECT 2 AS x").collect().to_pylist() == [{"x": 2}]
 
 
+def test_late_admission_callback_cannot_cancel_started_execution():
+    from vane.execution.pipelined_runtime import PipelinedContext
+    from vane.execution.query_runtime import QueryRuntime
+
+    runtime = QueryRuntime()
+    ticket = runtime._admission.request(queue_timeout=30)
+    context = PipelinedContext(runtime, ticket, vane.QueryExecutionOptions(vane.RayExecution(), 30, 60, 30))
+    result = context.begin()
+    try:
+        admission = context._admission_deadline
+        callback = admission._callback
+        context.start_execution()
+        result.ready(delivery_timeout=30)
+        admission.expires_at = 0
+        callback()
+        context.check()
+        assert context.state == "RUNNING"
+        assert ticket.cancellation_reason is None
+    finally:
+        result.close()
+        runtime.close()
+
+
 def test_result_cancel_is_idempotent_and_preserves_retained_batch():
     with vane.connect(backend="local", resources=limits()) as connection:
         result = connection.query("SELECT i FROM range(10000) t(i)")
@@ -688,3 +711,17 @@ def test_query_requires_single_read_only_select_and_auto_commit():
             connection.query("SELECT 1")
         connection.execute("ROLLBACK")
         idle(connection.query_runtime)
+
+
+def test_query_diagnostics_observe_execution_and_retain_cleanup_state():
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        with connection.query("select range as value from range(7)", rows_per_batch=2) as result:
+            before = result.diagnostics()
+            assert before["query_id"] == result.query_id
+            assert before["execution"]["mode"] == "local"
+            assert not before["cleanup"]["complete"]
+            assert result.collect().column("value").to_pylist() == list(range(7))
+            after = result.diagnostics()
+            assert after["execution_state"] == "SUCCEEDED"
+            assert all(after["cleanup"].values())
+            assert after["session_resources"]["request_admission"]["active_requests"] == 0

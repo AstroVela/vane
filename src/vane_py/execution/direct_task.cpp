@@ -41,8 +41,10 @@ public:
 
 class DirectSource : public PhysicalOperator {
 public:
-	DirectSource(PhysicalPlan &plan, const vector<LogicalType> &types, vector<DirectInput> inputs_p)
-	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, types, 0), inputs(std::move(inputs_p)) {
+	DirectSource(PhysicalPlan &plan, const vector<LogicalType> &types, vector<DirectInput> inputs_p,
+	             shared_ptr<atomic<bool>> blocked_p)
+	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, types, 0), inputs(std::move(inputs_p)),
+	      blocked(std::move(blocked_p)) {
 		if (inputs.empty()) {
 			throw InvalidInputException("direct source needs at least one input");
 		}
@@ -66,6 +68,13 @@ public:
 		return make_uniq<DirectSourceState>();
 	}
 	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
+		// DuckDB schedules the probe pipeline only after its build dependencies
+		// (including asynchronous finalization) are ready. Observe that event at
+		// the native probe source, without inspecting mutable hash-table state.
+		for (auto &ready : builds_ready) {
+			ready->store(true);
+		}
+		blocked->store(false);
 		auto &state = input.global_state.Cast<DirectSourceState>();
 		idx_t ended = 0;
 		for (idx_t step = 0; step < inputs.size(); step++) {
@@ -81,10 +90,33 @@ public:
 			}
 			ended += result == DirectRead::END || result == DirectRead::CLOSED;
 		}
+		blocked->store(ended != inputs.size());
 		return ended == inputs.size() ? SourceResultType::FINISHED : SourceResultType::BLOCKED;
 	}
 	const vector<DirectInput> inputs;
+	shared_ptr<atomic<bool>> blocked;
+	vector<shared_ptr<atomic<bool>>> builds_ready;
 };
+
+void ObserveProbe(PhysicalOperator &op, const shared_ptr<atomic<bool>> &ready) {
+	if (auto source = dynamic_cast<DirectSource *>(&op)) {
+		source->builds_ready.push_back(ready);
+	}
+	for (auto &child : op.children) {
+		ObserveProbe(child, ready);
+	}
+}
+
+void ObserveBuilds(PhysicalOperator &op, DirectTaskProgress &progress) {
+	if (op.type == PhysicalOperatorType::HASH_JOIN) {
+		auto ready = make_shared_ptr<atomic<bool>>(false);
+		progress.builds_ready.push_back(ready);
+		ObserveProbe(op.children[0], ready);
+	}
+	for (auto &child : op.children) {
+		ObserveBuilds(child, progress);
+	}
+}
 
 class DirectSinkLocal : public LocalSinkState {
 public:
@@ -110,9 +142,9 @@ public:
 class DirectCollector : public PhysicalResultCollector {
 public:
 	DirectCollector(PreparedStatementData &data, std::map<string, vector<DirectInput>> inputs_p,
-	                vector<DirectOutput> outputs_p)
+	                vector<DirectOutput> outputs_p, shared_ptr<DirectTaskProgress> progress_p)
 	    : PhysicalResultCollector(*data.physical_plan, data), inputs(std::move(inputs_p)),
-	      outputs(std::move(outputs_p)) {
+	      outputs(std::move(outputs_p)), progress(std::move(progress_p)) {
 	}
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
@@ -124,6 +156,7 @@ public:
 		return make_uniq<DirectSinkLocal>();
 	}
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		progress->output_blocked.store(false);
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
 		bool live = false;
 		for (auto &output : outputs) {
@@ -171,6 +204,7 @@ public:
 					auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk,
 					                               rows, state.offset, count, Wakeup(input.interrupt_state));
 					if (result == DirectWrite::BLOCKED) {
+						progress->output_blocked.store(true);
 						return SinkResultType::BLOCKED;
 					}
 					if (result == DirectWrite::CLOSED) {
@@ -186,6 +220,10 @@ public:
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &) const override {
+		progress->output_blocked.store(false);
+		for (auto &ready : progress->builds_ready) {
+			ready->store(true);
+		}
 		// An early sink stop may bypass the source's next poll. Check every
 		// input, including drained ones, before publishing native completion.
 		auto error = InputError(inputs);
@@ -208,6 +246,7 @@ public:
 	}
 	const std::map<string, vector<DirectInput>> inputs;
 	const vector<DirectOutput> outputs;
+	shared_ptr<DirectTaskProgress> progress;
 };
 
 } // namespace
@@ -282,9 +321,12 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 			    throw InvalidInputException("missing direct input port %s", port);
 		    }
 		    used.insert(port);
-		    return owner.Make<DirectSource>(types, input->second);
+		    auto blocked = make_shared_ptr<atomic<bool>>(false);
+		    task->progress->input_blocked.push_back(blocked);
+		    return owner.Make<DirectSource>(types, input->second, blocked);
 	    },
 	    assignments);
+	ObserveBuilds(plan->Root(), *task->progress);
 	if (used.size() != inputs.size() || outputs.empty()) {
 		throw InvalidInputException("unexpected direct input port or missing output");
 	}
@@ -349,6 +391,7 @@ void DirectTaskService::Start(const string &id, const string &token) {
 		}
 		started = true;
 		task->token = token;
+		task->progress->started.store(true);
 		try {
 			auto &context = *task->connection->context;
 			ValidateSources(context, task->fragment, task->source_snapshot, false);
@@ -364,7 +407,7 @@ void DirectTaskService::Start(const string &id, const string &token) {
 				lock_guard<mutex> registry(registry_lock);
 				CheckCanceled();
 				target->execution_errors = context.GetExecutor().GetErrorManager();
-				return make_uniq<DirectCollector>(data, inputs, outputs);
+				return make_uniq<DirectCollector>(data, inputs, outputs, target->progress);
 			};
 			task->pending =
 			    context.PendingQueryPreparedStatementNoRebind("direct fragment task", task->prepared, parameters);
@@ -474,6 +517,7 @@ void DirectTaskService::Cleanup(Task &task) {
 		}
 	}
 	task.released = true;
+	task.progress->released.store(true);
 }
 
 void DirectTaskService::Fail(Task &task, const string &message) {
@@ -534,6 +578,60 @@ void DirectTaskService::Cancel(const string &reason) {
 
 bool DirectTaskService::Expire() {
 	return Stop("execution deadline exceeded", true);
+}
+
+vector<DirectTaskStatus> DirectTaskService::Diagnostics() {
+	lock_guard<mutex> registry(registry_lock);
+	vector<DirectTaskStatus> result;
+	for (auto &task : tasks) {
+		DirectTaskStatus value;
+		value.task_id = task->id;
+		value.error = task->failure_reason;
+		if (value.error.empty() && task->execution_errors && task->execution_errors->HasError()) {
+			value.error = task->execution_errors->GetError().Message();
+		}
+		if (value.error.empty()) {
+			value.error = InputError(task->inputs);
+		}
+		bool finished = true, drained = true;
+		for (auto &output : task->outputs) {
+			for (auto &channel : output.channels) {
+				auto state = channel->ProducerStatus(output.producer);
+				finished = finished && state.finished;
+				drained = drained && state.drained;
+				if (value.error.empty()) {
+					value.error = state.error;
+				}
+			}
+		}
+		auto &progress = *task->progress;
+		value.released = progress.released.load();
+		value.builds_total = progress.builds_ready.size();
+		for (auto &ready : progress.builds_ready) {
+			value.builds_ready += ready->load();
+		}
+		value.state = !value.error.empty()       ? "FAILED"
+		              : canceled.load()          ? "CANCELED"
+		              : !progress.started.load() ? "PREPARED"
+		              : !finished                ? "RUNNING"
+		              : !drained                 ? "OUTPUT_PENDING"
+		                                         : "FINISHED";
+		if (value.state == "RUNNING") {
+			if (progress.output_blocked.load()) {
+				value.blocked_on = "output_credit";
+			} else {
+				for (auto &blocked : progress.input_blocked) {
+					if (blocked->load()) {
+						value.blocked_on = value.builds_ready < value.builds_total ? "build_input" : "input";
+					}
+				}
+			}
+		} else if (value.state == "OUTPUT_PENDING") {
+			value.blocked_on = "result_lease";
+		}
+		result.push_back(std::move(value));
+	}
+	return result;
 }
 
 DirectProducerStatus DirectTaskService::ProductionStatus() {

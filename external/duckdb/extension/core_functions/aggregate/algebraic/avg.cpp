@@ -1,10 +1,20 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "core_functions/aggregate/algebraic_functions.hpp"
 #include "core_functions/aggregate/sum_helpers.hpp"
+#include "core_functions/aggregate/wide_integer.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/function/aggregate/wide_integer.hpp"
 
 namespace duckdb {
 
@@ -149,6 +159,28 @@ struct HugeintAverageOperation : public BaseSumOperation<AverageSetOperation, Hu
 	}
 };
 
+struct WideIntegerAverageOperation : public WideIntegerOperation {
+	template <class T, class STATE>
+	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+		if (state.count == 0) {
+			finalize_data.ReturnNull();
+		} else {
+			auto divident = GetAverageDivident<long double>(state.count, finalize_data.input.bind_data);
+			target = state.value.ToLongDouble() / divident;
+		}
+	}
+};
+
+void HugeintAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+	serializer.WriteProperty(1, "wide_accumulator", false);
+}
+
+void WideIntegerAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+	serializer.WriteProperty(1, "wide_accumulator", true);
+}
+
+unique_ptr<FunctionData> HugeintAvgDeserialize(Deserializer &deserializer, AggregateFunction &function);
+
 struct NumericAverageOperation : public BaseSumOperation<AverageSetOperation, RegularAdd> {
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
@@ -254,8 +286,12 @@ AggregateFunction GetAverageAggregate(PhysicalType type) {
 		    LogicalType::BIGINT, LogicalType::DOUBLE);
 	}
 	case PhysicalType::INT128: {
-		return AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, hugeint_t, double, HugeintAverageOperation>(
-		    LogicalType::HUGEINT, LogicalType::DOUBLE);
+		auto function =
+		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, hugeint_t, double, HugeintAverageOperation>(
+		        LogicalType::HUGEINT, LogicalType::DOUBLE);
+		function.SetSerializeCallback(HugeintAvgSerialize);
+		function.SetDeserializeCallback(HugeintAvgDeserialize);
+		return function;
 	}
 	case PhysicalType::INTERVAL: {
 		return AggregateFunction::UnaryAggregate<IntervalAvgState, interval_t, interval_t, IntervalAverageOperation>(
@@ -266,6 +302,29 @@ AggregateFunction GetAverageAggregate(PhysicalType type) {
 	}
 }
 
+unique_ptr<FunctionData> DecimalAverageBindData(const LogicalType &input_type) {
+	if (input_type.id() != LogicalTypeId::DECIMAL) {
+		return nullptr;
+	}
+	return make_uniq<AverageDecimalBindData>(
+	    Hugeint::Cast<double>(Hugeint::POWERS_OF_TEN[DecimalType::GetScale(input_type)]));
+}
+
+unique_ptr<FunctionData> HugeintAvgDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+	const auto wide = deserializer.ReadProperty<bool>(1, "wide_accumulator");
+	auto arguments = function.arguments;
+	auto original_arguments = function.original_arguments;
+	auto name = function.name;
+	if (arguments.size() != 1 || deserializer.Get<const LogicalType &>() != LogicalType::DOUBLE) {
+		throw SerializationException("invalid wide average signature");
+	}
+	function = wide ? WideIntegerAvgFunction(arguments[0]) : GetAverageAggregate(arguments[0].InternalType());
+	function.arguments = arguments;
+	function.original_arguments = std::move(original_arguments);
+	function.name = std::move(name);
+	return DecimalAverageBindData(arguments[0]);
+}
+
 unique_ptr<FunctionData> BindDecimalAvg(ClientContext &context, AggregateFunction &function,
                                         vector<unique_ptr<Expression>> &arguments) {
 	auto decimal_type = arguments[0]->return_type;
@@ -273,18 +332,31 @@ unique_ptr<FunctionData> BindDecimalAvg(ClientContext &context, AggregateFunctio
 	function.name = "avg";
 	function.arguments[0] = decimal_type;
 	function.SetReturnType(LogicalType::DOUBLE);
-	return make_uniq<AverageDecimalBindData>(
-	    Hugeint::Cast<double>(Hugeint::POWERS_OF_TEN[DecimalType::GetScale(decimal_type)]));
+	return DecimalAverageBindData(decimal_type);
 }
 
 } // namespace
 
+AggregateFunction WideIntegerAvgFunction(const LogicalType &input_type) {
+	ValidateWideIntegerInput(input_type);
+	auto function = AggregateFunction::UnaryAggregate<WideIntegerState, hugeint_t, double, WideIntegerAverageOperation>(
+	    input_type, LogicalType::DOUBLE);
+	function.name = "avg";
+	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	function.SetSerializeCallback(WideIntegerAvgSerialize);
+	function.SetDeserializeCallback(HugeintAvgDeserialize);
+	return function;
+}
+
 AggregateFunctionSet AvgFun::GetFunctions() {
 	AggregateFunctionSet avg;
 
-	avg.AddFunction(AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr,
-	                                  nullptr, nullptr, FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr,
-	                                  BindDecimalAvg));
+	auto decimal =
+	    AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr, nullptr, nullptr,
+	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr, BindDecimalAvg);
+	decimal.SetSerializeCallback(HugeintAvgSerialize);
+	decimal.SetDeserializeCallback(HugeintAvgDeserialize);
+	avg.AddFunction(decimal);
 	avg.AddFunction(GetAverageAggregate(PhysicalType::INT16));
 	avg.AddFunction(GetAverageAggregate(PhysicalType::INT32));
 	avg.AddFunction(GetAverageAggregate(PhysicalType::INT64));

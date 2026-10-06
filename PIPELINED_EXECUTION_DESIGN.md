@@ -7,10 +7,10 @@ local 直接使用 DuckDB 原生执行，不选择 pipelined 或 FTE。ray 的�
 | 项目 | 基线 |
 | --- | --- |
 | 状态 | 目标设计；实现与验收进度见实施 roadmap |
-| 日期 | 2026 年 10 月 5 日（P3 完整实现更新） |
-| 开发分支 | feat/materialized-exchange |
+| 日期 | 2026 年 10 月 6 日（P4 分析执行更新） |
+| 开发分支 | feat/analytical-execution |
 | 基础分支 | integration/pipelined-execution |
-| Vane 参考提交 | 68b5407a4ca4（PR #962 合入） |
+| Vane 参考提交 | a69e60ca43d9（PR #963 合入） |
 | Trino 参考提交 | [6ead7e6c2f04c0bcfe5caf8e938dc1f5d3344f31][trino-revision]，调研时的 master，提交时间为 2026 年 10 月 2 日 02:30:56 UTC |
 | 兼容策略 | 不保留旧 API、旧协议、旧默认行为或旧执行入口 |
 | 实施记录 | [PIPELINED_EXECUTION_ROADMAP.md](PIPELINED_EXECUTION_ROADMAP.md) |
@@ -269,13 +269,13 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 构图是无执行副作用的过程。远程 exchange 边界切分 fragment，扫描器产生可执行 source 描述。资源需求附着在同一图上，诊断图从它派生，不另行维护可能失真的可执行 ResourceGraph。
 
-同一查询内使用一致的哈希、类型、NULL、排序和 collation 规则；分区函数由 native 实现提供。不能在 Python 与 C++ 分别计算近似分区规则。排序要求需要进入端口和结果描述，异步到达顺序不构成 SQL 顺序保证。
+同一查询内使用一致的哈希、类型、NULL、排序和 collation 规则；分区函数由 native 实现提供。不能在 Python 与 C++ 分别计算近似分区规则。P4 将全局排序表达式保存在单分区 fragment 的 native 载荷中，排序后的根结果只有一个 producer。普通 exchange 的异步到达顺序不构成 SQL 顺序保证；没有 ORDER BY 的 LIMIT 只保证全局行数与 OFFSET。
 
-### Native 编译与加载的第一步
+### Native 编译与加载
 
 内部入口 compile_fragment_graph 接收连接、SQL、query_id 和不可变 FragmentCompileOptions。选项只有分区数及可选的 HASH 输出列位置，不包含执行策略、worker 地址或 exchange store。连接锁覆盖读取绑定与优化设置的过程；编译器直接调用 Parser、Planner/Binder、Optimizer 和 PhysicalPlanGenerator，不创建 executor 或提交 task。需要准备提交时使用 prepare_ray_query，它在同一连接锁内完成快照与构图。
 
-[native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 的首个子集为单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter 和 projection。标量函数先按已验收的内置函数集合检查，用户函数在常量折叠前拒绝；聚合、连接、排序、LIMIT、相关子查询及扩展类型按后续阶段实现。普通本地查询继续由原生查询入口处理，不调用该编译器。
+[native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 支持单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter、projection，以及 P4 的聚合、等值 hash join、ORDER BY/TopN 和全局 LIMIT。标量与聚合函数先按已验收的内置集合检查，用户函数在常量折叠前拒绝；相关子查询、窗口及媒体扩展类型仍拒绝。普通本地查询继续由原生查询入口处理，不调用该编译器。
 
 解析树检查之后，编译器通过当前 Planner 的 catalog lookup callback 校验实际解析到的函数和宏必须为内置项。`current_user` 等 SQL value function 在解析时可能是列引用，绑定时才转为函数；这一检查发生在宏展开、表函数参数求值之前，并由子 Binder 继承，覆盖限定名、嵌套表达式和表子查询。内置宏间接解析到的用户函数同样被拒绝，不能依赖最终的只读属性检查或事务回滚来撤销 `nextval()` 等副作用。普通列和别名按 Binder 的实际解析结果处理，允许与被覆盖的函数同名；检查只属于这次规划，不改变后续原生查询行为。
 
@@ -283,7 +283,34 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 优化器入口遵循原生查询路径：仅当连接的 `enable_optimizer` 为真且逻辑计划要求优化时调用 `Optimizer::Optimize()`；启用时继续遵循 `disabled_optimizers` 的逐项设置。`PRAGMA disable_optimizer` 因而保留可直接执行的 `IN` 表达式。优化前的表达式、扫描列和数据源依赖校验始终执行。提交快照冻结这一连接选项，worker 准备和每次重放都恢复相同设置。
 
-扫描、过滤和投影先合并到一个 source fragment。并行输出通过 GATHER 进入单分区根结果；显式指定 hash_columns 时，native 按结果列类型绑定 BoundReferenceExpression，生成 HASH 边，再按需要 GATHER。hash_columns 是内部物理分区请求，尚不表示已实现 aggregate/join 的自动分布式规划。HASH 求值和 NULL、多列键合并均使用 DuckDB 原生表达式执行与 DataChunk.Hash。
+扫描、过滤和投影先合并到一个 source fragment。并行输出通过 GATHER 进入单分区根结果；显式指定 hash_columns 时，native 按结果列类型绑定 BoundReferenceExpression，生成 HASH 边，再按需要 GATHER。hash_columns 仍是内部结果分区请求；分析算子的分区由以下 native planner 自动生成。HASH 求值和 NULL、多列键合并均使用 DuckDB 原生表达式执行与 DataChunk.Hash。
+
+P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯一端口与 fragment，不生成 SQL 字符串或 Python 行计算。具体规则如下：
+
+| 算子 | 分布与执行规则 |
+| --- | --- |
+| COUNT、非 DECIMAL/HUGEINT 输入的 SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
+| FLOAT/DOUBLE AVG | partial SUM 与 COUNT，final 合并后计算商；FILTER 在两项中一致传播；NULL 与空组保持 native 语义 |
+| DISTINCT、带排序的聚合、DECIMAL/HUGEINT SUM、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n)、Binder 内部聚合改写 | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
+| 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
+| BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
+| ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
+| TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
+| LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
+
+整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。包含这类 AVG 的聚合节点按完整 group 执行；跨节点的类型与最终精度仍由 native 决定。
+
+DECIMAL SUM 的原生累加器可以保存 39 位的 signed 128-bit 中间值，而其返回类型声明为 `DECIMAL(38,s)`。例如三个 `4×10³⁷` 和三个 `−3×10³⁷` 的总和合法，但前一个分区的部分和 `1.2×10³⁸` 不能作为 38 位 Arrow decimal 传输。包含 DECIMAL SUM 的整个聚合节点因此采用完整分组策略，保留 FILTER、NULL、scale 及同节点其他聚合的语义；代价是交换原始行，无法提前缩减为部分和。公开 DECIMAL 的 Arrow schema 继续使用声明的精度与 scale。
+
+仅取消 partial 仍不足以避免溢出：异步输入可能让三个 `6×10³⁷` 先于三个 `−4×10³⁷` 到达。因此，对使用 128 位存储的 HUGEINT/DECIMAL 输入，fragment 的 SUM 与 AVG 共用 signed 192-bit 私有累加状态，以三个 unsigned 64-bit limb 实现精确加法与 combine，并维护非 NULL 行数。状态覆盖最多 64-bit 行数的 signed 128-bit 输入。SUM 在组完成后检查返回值的 128 位范围，保留 HUGEINT 或 DECIMAL 的 SQL 类型与 scale；AVG 允许总和超出 128 位，在完整组上除以行数及 DECIMAL scale。总和落在原生范围内时，AVG 继续使用原生 HUGEINT 到 long double 的转换，避免改变既有舍入；超出时从宽整数直接转换，保留正负抵消后的有效数位。
+
+NULL、空输入、FILTER、DISTINCT 和排序仍由原生聚合执行器处理。普通本地 SQL 继续使用既有累加器，BIGINT 输入的 SUM 仍可拆分，Arrow profile 不变。函数序列化显式记录宽累加器选择，AVG 从输入类型恢复 DECIMAL scale，使 worker 与重放使用相同实现。
+
+DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `order_bys`。fragment 在拆分判断前调用原生 `UnbindSortedAggregate`，恢复原始参数和排序键；带排序的 SUM/AVG 等聚合随后按完整组执行，避免把排序键当作普通函数参数或改变浮点运算顺序。Binder 为 INTERVAL 分组键生成的 `first`、为带 collation 的 MIN/MAX 生成的 `arg_min`/`arg_max` 也走完整组。解析阶段的公开函数集合不变，不因此开放直接调用这些内部聚合。
+
+物理计划反序列化时，聚合参数已指向计算好的输入列。重新绑定函数数据使用这些表达式的副本，保留原参数，避免 collation 绑定器重复包装输入列。该规则由物理反序列化作用域标记控制；逻辑表达式反序列化继续保留绑定器的参数改写。
+
+聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。没有引入兼容旧分布式聚合拆分器的接口。
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
 
@@ -291,9 +318,11 @@ engine identity 同时包含 DuckDB SourceID 与 Vane 编译器/加载器源码�
 
 range 的扫描 split 由 table function 的 native 回调规划；Parquet 从绑定后的 MultiFileList 枚举文件，使用独立的文件 split codec，不依赖旧 FTE 的 split 管理器。载荷带稳定 split_id、能力和 codec 身份。worker bind 独立持有可移植状态，加载时必须显式提供所分配的 split；空列表代表空任务，未知或重复 split_id 被拒绝。无扫描的常量查询只执行一次，不因请求多个分区而复制结果。Parquet 的 requires_snapshot 标记为真：固定文件列表只封闭了枚举，提交层还必须检查访问条件与回放保证。
 
-编译器在优化前的 logical validation 中捕获每个 Parquet bind 的完整文件集合，作为 source fragment 的 `source_dependencies`。统计信息可把扫描优化成空结果，hive/file pruning 也可移除部分文件，但这些优化仍依赖原始文件。依赖使用同一 native 文件 codec，随扫描节点的移除继续保留；实际 split 分配与并行度仍由优化后的 `sources` 决定。纯空结果的 source fragment 只执行一次，HASH/GATHER 下游不携带源文件分配。
+编译器在优化前的 logical validation 中捕获每个 Parquet bind 的完整文件集合，作为最终根 fragment 的 `source_dependencies`。所有 worker 的提交准备都会校验这些查询级依赖。统计信息可把扫描优化成空结果，hive/file pruning 也可移除部分文件，但这些优化仍依赖原始文件。依赖使用同一 native 文件 codec，随扫描节点的移除继续保留；实际 split 分配与并行度仍由优化后的 `sources` 决定。纯空结果的 source fragment 只执行一次，HASH/GATHER 下游不携带源文件分配。
 
 当前 Parquet split 未携带原始文件序号，因此明确拒绝虚拟列 `file_index`。编译器在优化前检查 native 虚拟列 ID，覆盖投影和仅用于过滤的引用，物理计划导出与加载也检查同一限制；普通数据列使用相同名称仍可执行。未来开放该虚拟列时，split 和 scan bind 必须保留绑定时的原始文件索引，不能使用 task 内重新编号的文件列表代替。
+
+Parquet 的 late materialization 会为 TopN/LIMIT 引入依赖 `file_index` 的双扫描回查。fragment 编译在优化前关闭每个绑定 Parquet scan 的 `late_materialization` 能力，继续使用普通扫描和 native TopN，再按上述规则分布执行。此能力只属于本次逻辑计划中的 TableFunction 副本，不修改共享 catalog、`disabled_optimizers` 或 local 查询；编译成功和失败均不影响后续原生优化。用户显式引用虚拟 `file_index` 时仍在优化前拒绝。
 
 [native 编译测试](tests/fast/test_native_fragment_compiler.py) 使用有限数据的物化测试设施执行反序列化后的 fragment，并对照原生 SQL；它不接入公开 local 查询，也不作为 Ray 流水调度器。P1.2 的 TaskRuntime 通过独立的原生直接通道推进 fragment；跨进程 exchange 与根结果服务继续按 P2 实现。
 
@@ -462,7 +491,7 @@ AttemptManifest 包含分区对象、长度、校验值、schema、输入身份�
 
 ### P3.1 物化 I/O 与提交基础
 
-实现位于 [native MaterializedIO](src/vane_py/execution/materialized_exchange.cpp)、[不可变 manifest](vane/execution/materialized_exchange.py) 与 [共享目录和提交账本](vane/execution/materialized_store.py)。native 读写与 Flight 共用 [Arrow frame codec](src/vane_py/execution/arrow_frame.cpp)，类型范围保持 basic types。没有新增执行器或调用旧 FTE manager。
+实现位于 [native MaterializedIO](src/vane_py/execution/materialized_exchange.cpp)、[不可变 manifest](vane/execution/materialized_exchange.py) 与 [共享目录和提交账本](vane/execution/materialized_store.py)。native 读写与 Flight 共用 [Arrow frame codec](src/vane_py/execution/arrow_frame.cpp)，类型范围由 P4 的 analytical-types profile 统一扩展。没有新增执行器或调用旧 FTE manager。
 
 MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel 与现有 TaskRuntime 的 source/sink 连接。该 channel 是任务内部缓冲，不发布 Flight ticket，不把存储对象伪装成远程直接通道。Python 只处理身份、路径、长度、哈希和 manifest，数据批次不经过 Python 或 Ray ObjectRef。
 
@@ -603,7 +632,9 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 
 [direct_exchange.cpp](src/vane_py/execution/direct_exchange.cpp) 实现固定 schema 的有界 native channel，消费窗口包含队列中的帧和已借出的帧。DirectLimits 定义每个消费者的 window_bytes、每帧 frame_bytes/frame_rows 与未释放帧数 frame_slots。窗口至少容纳一行的固定布局，否则准备时拒绝；运行时遇到超出单帧容量的变长行则明确报错，不创建超额缓冲。
 
-每帧分配一个独立缓冲，包含对齐后的有效性位图、定长值及长字符串数据，覆盖 P0 的 basic-types profile。写入先测量并检查额度，再复制和发布；暂时无法写入时不分配 payload。原生输入由执行器持有，通道不引用瞬时 Sink 参数。读取构造借用该帧的 Vector，Vector auxiliary 持有 lease，切片及字符串引用继续保留所有权。最后一个引用释放后归还窗口。广播共享一次物理分配，每个消费者独立计费；关闭一个消费者释放其队列，已经借出的视图继续有效并保持计费。
+每帧分配一个独立缓冲，包含对齐后的有效性位图、定长值、长字符串/二进制数据，以及 P4 嵌套值的全部子向量。列表按选中元素紧凑复制；NULL 列表的未定义 offset 不参与寻址。写入先测量并检查额度，再复制和发布；暂时无法写入时不分配 payload。原生输入由执行器持有，通道不引用瞬时 Sink 参数。读取构造借用该帧的 Vector，每层 Vector auxiliary 均持有 lease，嵌套字段、切片及字符串引用继续保留整个帧的所有权。最后一个引用释放后归还窗口。广播共享一次物理分配，每个消费者独立计费；关闭一个消费者释放其队列，已经借出的视图继续有效并保持计费。
+
+嵌套 ARRAY 的长度按其所在层维护，不能沿用最外层批次行数。Arrow 解码在递归写入每个 ARRAY 前设置实际数组数量；原生 LIST/MAP/STRUCT 扩容时同步更新普通 ARRAY 的子元素长度。固定 Image/Tensor 的延迟存储仍由写入器单独预留，不随父容器扩容而分配像素或张量元素。
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 
@@ -629,7 +660,7 @@ P1.2 的预算保证限定为通道拥有的实际值缓冲；operator 输入/�
 
 DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流第一版只允许一个未确认帧；服务端保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，并 ACK 上游，所有权由发送窗口转入接收窗口。
 
-每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 basic-types 的 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
+每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
 
 数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 
@@ -725,7 +756,13 @@ producer_owned_bytes
 
 ### 混跑
 
-两种调度器使用同一个 ResourceManager。FTE 的阶段任务可以逐批准入，pipelined 的活动组需要整组推进容量。公平排队控制两类工作；第一版不引入运行中任务抢占。
+两种调度器共用会话内的 [WorkerResourceManager](vane/execution/worker_resources.py)。它以 contexts、operator bytes、exchange bytes、staging bytes 和 I/O links 为维度，一次预留一个图的全部 worker，或一个 FTE attempt 的目标 worker。actor 独立核对相同需求及容量，作为实际资源所有者的第二层校验。
+
+排队采用 FIFO。单个需求超过 worker 硬限时立即拒绝；只是被其他查询占用时进入可取消队列，不保留部分预留。Pipelined 在准入期限内等待，成功后的预留持续到所有 worker 确认清理。FTE 每个 attempt 清理完后归还容量，再以新的队列位置申请下一批，不能不断抢在已经等待的 pipelined 图前面。重试保持已排队 task 的身份和次序；取消只移除等待项，尚存活的 owner 必须完成清理才能退还容量。第一版不抢占已运行任务；FIFO 可能牺牲一部分利用率来保证先来的图获得完整容量。
+
+Pipelined 的会话名额与整图 worker 资源分两步取得。取得会话名额后仍保持 `ADMISSION_WAIT`，编译、池准备及 worker 排队共用从请求创建时开始的准入期限，不在第二个队列重置期限。整图 worker 预留成功后才进入 `RUNNING` 并启动执行期限，随后 task/Flight 准备属于执行时间。排队超时返回 `RequestQueueTimeout`；执行超时返回 `RequestExecutionTimeout`。计时统计把 worker 等待计入 queue_wait，尚未执行就退出的请求不生成 execution sample；复制出来的旧准入定时器回调不能取消已经开始的执行。FTE 按查询名额启动冻结及阶段执行，已运行查询的 attempt 排队和重试继续计入其执行期限。
+
+FTE 的取消检查、入队和 attempt 发布与取消共享同一调度锁；取消移除等待项后，调度线程不得再次为该查询入队。`close()` 等待调度线程退出后再完成资源回收，后续查询不受已取消查询的队首等待项阻塞。
 
 FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。高优先级也不能突破硬内存上限。CPU、公平性、native 内存和慢结果消费均纳入混跑验证。
 
@@ -808,16 +845,22 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | 常量、空输入、range、文件扫描 | 可在目标 worker 执行的子集 | 扩展扫描与快照能力；FTE 额外要求重放 |
 | filter、projection、GATHER、HASH | 两种模式共同支持 | 扩展类型与分区规则 |
 | UNION ALL | 基础图完成后加入 | 多输入公平消费和独立结束 |
-| 分组聚合、hash join | 基础闭环之后实现 | NULL、倾斜、build/probe readiness 和重试对照 |
-| BROADCAST | 基础闭环之后实现 | 多消费者、共享所有权和独立关闭 |
-| LIMIT | 无序单根输出的提前结束 | 全局计数、多个消费者及取消竞争 |
-| ORDER BY、TopN | 分析算子阶段实现 | 全局顺序、内存预算与 native spill |
+| 分组聚合、hash join | P4 支持，具体函数/连接类型见上表 | 扩展 grouping sets、其他聚合及非等值连接 |
+| BROADCAST | P4 自动选择小 build 广播；消费者独立关闭 | 基于实测调整代价模型 |
+| LIMIT | P4 全局 LIMIT/OFFSET，支持提前关闭 | 分布式 LIMIT pushdown 优化 |
+| ORDER BY、TopN | P4 单根全局排序及 partial/final TopN | 排序性能和 spill 基准 |
 | window、ASOF、MARK、delim 等复杂算子 | 明确拒绝 | 按语义和分布式计划逐项扩展 |
 | 递归 CTE 与迭代反馈 | 明确拒绝 | 需要独立的反馈执行设计 |
 | Python、AI 与 GPU UDF | 明确拒绝 | 按 backend 验证资源、取消、类型及 FTE 重放能力 |
 | COPY、DataSink、DML 与扩展写入 | 明确拒绝 | 独立定义写入提交和副作用语义 |
 
-最小类型集合从布尔、整数、浮点和字符串开始，同时支持 NULL、空批次和 schema-only 结果。decimal、时间、嵌套类型、tensor、FILE 和媒体扩展逐项验收。能够序列化不等于类型和算子语义已经一致。
+P4 使用 `vane.analytical-types:4`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
+
+DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow codec，由用途决定 schema。使用 128 位存储的 DECIMAL 在内部交换中使用 `decimal256(39,scale)`，保留原生系数的完整 signed 128-bit 范围；例如内层 SUM 的 39 位结果可供外层 SUM 抵消，不能因声明精度只有 38 位而在中途拒绝。使用更小原生存储的 DECIMAL 仍按 `decimal128(width,scale)` 交换。公开结果中的所有 DECIMAL 保留 SQL 声明的 `decimal128(width,scale)`，包括嵌套字段和空结果。HUGEINT 在交换及公开结果中均使用 `decimal256(39,0)`。宽化通过符号扩展完成，解码先检查 signed 128-bit 边界，保留 scale、NULL 及 LIST/STRUCT/MAP/ARRAY 内的子值；额外缓冲计入既有 staging 预留。
+
+TIME 使用 `int64` 微秒，允许闭区间 `[0, 86400000000]`，因此保留合法的 `24:00:00`。INTERVAL 使用 `struct<months:int32, days:int32, micros:int64>`，在 native Arrow exporter 之前转换，避免微秒乘 1000 溢出；非 NULL interval 的三个分量均不得为 NULL。两种存储表示同样用于公开 Ray Arrow 结果和嵌套子值，调用方可在 SQL 中转为 VARCHAR 获得时间文本。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant。
+
+旧 profile 不再接受，Arrow codec 源码纳入 fragment build identity。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
 
 算子检查依据实际物理函数、scan 和 owned subplan，不能只看 SELECT 关键字。阻塞聚合、sort 和 join 可以合法等待完整输入；pipelined 只承诺允许的执行重叠，不承诺每条 SQL 都早产出。
 
@@ -913,7 +956,9 @@ P3 不能通过委托旧 FTE 引擎完成。新的任务服务、计划格式、
 
 ### P4 分析能力与混跑
 
-增加 aggregate、join、broadcast、全局 LIMIT、排序及相应类型，分别验证两种执行模式。完善 BuildReady、资源公平性和状态诊断。
+实现按四部分落地：native partial/final 聚合；等值 hash join 与广播及 BuildReady；全局排序、TopN 和 LIMIT；递归类型传输、共享 FIFO worker 准入与诊断。两种 Ray 策略执行同一份图，验收覆盖与 native SQL 对照、空输入/NULL/倾斜、小窗口、重复执行以及 FTE worker 故障重放。
+
+`QueryResult.diagnostics()` 返回 query_id、执行与交付状态、清理阶段、session 容量及执行模式。Pipelined 报告各 worker 的 task、BuildReady、输入/输出等待原因及每条 channel 的队列/借用计费；FTE 报告 attempt/fence、提交历史、存储配额、task/channel 状态。独立的 native `TaskService.diagnostics()` 不取得执行锁；诊断 RPC 失败仅记录 unavailable，不能触发查询取消。结果关闭后保留最终诊断，活动查询与结果 lease 的共享预算仍可从 session snapshot 查看。
 
 退出条件：SQL 对照、空输入、NULL、倾斜、低容量活性、多消费者及两种模式混跑通过。AI/GPU UDF 按独立 backend 矩阵扩展，不作为纯 SQL 闭环的隐含前提。
 

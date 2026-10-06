@@ -64,6 +64,7 @@ class QueryContext:
         self._cursor_retired = False
         self._lease: AdmissionLease | None = None
         self._deadline: MonotonicDeadline | None = None
+        self._admission_deadline: MonotonicDeadline | None = None
         self._cancellation = ExecutionCancellationScope(self.query_id, 1)
         self._binding = NativeQueryCancellation(self._cancellation)
         self._result: QueryResult | None = None
@@ -71,13 +72,31 @@ class QueryContext:
         self._read_native: Callable[[], Any] | None = None
         self._close_native: Callable[[bool], None] | None = None
         self._guard_native: Callable[[], None] | None = None
+        self._execution_diagnostics: dict[str, Any] = {"mode": runtime.backend}
 
     @property
     def state(self) -> str:
         with self._lock:
             return self._state
 
-    def begin(self) -> QueryResult:
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            reader = self._reader
+            value: dict[str, Any] = {
+                "query_id": self.query_id,
+                "execution_state": self._state,
+                "cleanup": {
+                    "native_closed": self._native_closed,
+                    "cursor_retired": self._cursor_retired,
+                    "complete": self._done,
+                },
+            }
+        probe = getattr(reader, "diagnostics", None)
+        value["execution"] = probe() if probe is not None else self._execution_diagnostics
+        value["session_resources"] = self._runtime.resource_snapshot()
+        return value
+
+    def begin(self, *, defer_execution: bool = False) -> QueryResult:
         def reserve() -> None:
             try:
                 result = self._runtime._delivery.begin()
@@ -94,15 +113,35 @@ class QueryContext:
 
             result._cancellation.register_cancel_wakeup(cancel)
 
-        self._lease = self._ticket.take(before_claim=reserve)
-        with self._lock:
-            if self._state == "ADMISSION_WAIT":
-                self._state = "RUNNING"
-            self._deadline = MonotonicDeadline(self._ticket.claimed_at, self.options.execution_timeout, self._expire)
-        self._deadline.start()
+        self._lease = self._ticket.take(before_claim=reserve, defer_execution=defer_execution)
+        if defer_execution:
+            with self._lock:
+                self._admission_deadline = MonotonicDeadline(
+                    self._ticket.admission_deadline - self.options.admission_timeout,
+                    self.options.admission_timeout,
+                    self._expire,
+                    timeout_name="admission_timeout",
+                )
+            self._admission_deadline.start()
+        else:
+            self.start_execution()
         self.check()
         assert self._result is not None
         return self._result
+
+    def start_execution(self) -> None:
+        self.check()
+        with self._lock:
+            if self._state != "ADMISSION_WAIT":
+                return
+            started = self._ticket.start_execution()
+            if self._admission_deadline is not None:
+                self._admission_deadline.close()
+                self._admission_deadline = None
+            self._state = "RUNNING"
+            self._deadline = MonotonicDeadline(started, self.options.execution_timeout, self._expire)
+        self._deadline.start()
+        self.check()
 
     def prepare(self, nodes: list[Any], graph: Any) -> dict[str, Any]:
         if nodes:
@@ -129,6 +168,10 @@ class QueryContext:
         with self._lock:
             if self._done:
                 return False
+            if reason == "admission_timeout" and (
+                self._admission_deadline is None or not self._admission_deadline.expired()
+            ):
+                return False
             accepted = self._ticket.cancel() if reason == "cancelled" else False
             if not accepted:
                 accepted = self._ticket.cancel_running(reason=reason)
@@ -145,6 +188,10 @@ class QueryContext:
         return self._cancel("cancelled")
 
     def _expire(self) -> None:
+        # _cancel arbitrates a copied admission callback against execution
+        # start under the state lock, then dispatches wakeups outside that lock.
+        if self._admission_deadline is not None:
+            self._cancel("admission_timeout")
         if self._deadline is not None and self._deadline.expired():
             self._cancel("execution_timeout")
 
@@ -218,6 +265,12 @@ class QueryContext:
                 self._close_native(False)
             if self._reader is not None:
                 self._reader.close()
+                probe = getattr(self._reader, "diagnostics", None)
+                if probe is not None:
+                    try:
+                        self._execution_diagnostics = probe()
+                    except Exception as error:
+                        self._execution_diagnostics = {"unavailable": str(error)}
             self._reader = None
             self._read_native = None
             self._native_closed = True
@@ -230,6 +283,8 @@ class QueryContext:
                 self._done = True
                 if self._deadline is not None:
                     self._deadline.close()
+                if self._admission_deadline is not None:
+                    self._admission_deadline.close()
                 self._cancellation.finish()
         if not self._cursor_retired:
             if self._close_native is not None:
