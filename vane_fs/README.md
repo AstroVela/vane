@@ -124,10 +124,23 @@ The Python Workspace API continues to use strict mode. The optional barrier
 table is compatible with existing format-2 databases and does not change file
 content storage, branch intervals, or snapshot isolation.
 
-Automatic WAL checkpoints trigger at 4,096 pages (16 MiB with default pages).
-This amortizes checkpoint syncs in both durability modes.
-The threshold is not a WAL size limit; active readers can delay checkpoint
-progress, and closing a connection may need to complete remaining work.
+Strict mode retains automatic checkpoints at 4,096 pages. In fsync mode, each
+Workspace uses a separate connection and thread for passive checkpoints,
+woken by commits once the current WAL reaches 16 MiB. This moves routine
+database-page copying and checkpoint syncs out of the write request.
+
+Before another mutation, a fsync-mode connection checks actual WAL frame
+counts. At 64 MiB it waits for a restart checkpoint, using `timeout_ms`; a
+long SQLite read transaction can cause a retryable `Busy` error before any
+changes. `Sync()` and explicit `Close()` still synchronize prior commits under
+this backpressure. Application snapshots do not hold long SQLite transactions.
+The timeout limits SQLite lock contention; actual disk writes and syncs,
+including waiting for this connection's running checkpoint, may take longer.
+This is an admission budget, not a file quota: one atomic operation can exceed
+it, and writes from strict-mode or external SQLite connections are not limited
+by this policy. After restart, the writer reduces retained WAL allocation to
+16 MiB. Background storage errors reach the next mutation, barrier or explicit
+close; a failed close leaves the connection and worker available for retry.
 
 The first inode reference persists a pin; intermediate opens and releases update
 exact counts in a connection-private in-memory SQLite table. The final release
@@ -467,3 +480,8 @@ The [optional fsync measurements](benchmarks/FSYNC_OPTIMIZATION.md) compare the
 strict default with immediate NORMAL commits and explicit FULL barriers. They
 include sync-failure injection, recovery from synchronized file images, actual
 write-plus-fsync timing, read regression checks and shutdown results.
+
+The [background checkpoint measurements](benchmarks/CHECKPOINT_OPTIMIZATION.md)
+record fsync-mode checkpoints at 16 MiB, write admission at 64 MiB, and the
+before/after throughput and WAL tradeoffs. They include reader backpressure,
+background I/O failures, slow storage, crash recovery and monitored reruns.

@@ -203,15 +203,15 @@ underlying serialization; the application must still enforce this ordering.
 The implementation configures WAL, `synchronous=FULL`, foreign-key checks and a
 bounded busy timeout on each connection, and verifies that WAL was enabled.
 Lock contention beyond the timeout raises `Busy`; other SQLite failures raise
-`Storage`. Apart from deferred pin cleanup, there is no additional application
-retry or cancellation mechanism.
+`Storage`. Deferred pin cleanup and background checkpoints retry maintenance;
+filesystem operations are not automatically replayed.
 Callers may retry complete operations, never an arbitrary suffix of a failed
 split. Keep SQL read transactions short; application snapshots and pins provide
 longer retention without holding a SQLite transaction for an entire query.
 The [synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous)
 describes the durability tradeoff; weakening it must be an explicit option.
 
-Each connection triggers a passive WAL checkpoint at 4,096 pages (16 MiB with
+Strict connections trigger a passive WAL checkpoint at 4,096 pages (16 MiB with
 the default 4 KiB pages), amortizing checkpoint syncs across more commits than
 SQLite's default 1,000-page threshold. Every mutation still synchronizes its
 WAL commit before returning. The threshold is not a size limit: a transaction
@@ -219,6 +219,36 @@ can exceed it and active readers can delay checkpoint progress. Larger WALs
 also increase recovery/closing work and can affect reads; see the
 [checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) and SQLite's
 [checkpoint documentation](https://www.sqlite.org/wal.html#checkpointing).
+
+Fsync-mode connections replace the automatic checkpoint hook with a notification
+to a per-connection worker. It runs passive checkpoints on a separate SQLite
+connection at a 16 MiB WAL threshold and retries incomplete work at 20 ms
+intervals. An idle, fully checkpointed database needs no polling. The hook
+always returns success: the triggering transaction has already committed, so
+checkpoint failures must not masquerade as a rolled-back write. Worker errors
+are latched until a mutation, barrier or explicit close reports them.
+
+Write admission queries `SQLITE_CHECKPOINT_NOOP` for current WAL frames. If
+another checkpointer holds its status lock, WAL file length provides a
+conservative upper bound. At 64 MiB, admission waits for a restart checkpoint
+before opening the write transaction, bounded by the connection's busy timeout.
+Waiting for this connection's in-flight checkpoint I/O is outside that lock
+timeout, just as foreground SQLite writes and syncs are. A slow disk alone
+must not turn a single connection's ongoing checkpoint into a Busy error.
+This also handles a fully backfilled log whose readers still prevent reuse.
+The budget accounts for page size and WAL frame headers; it does not mistake
+reusable file allocation for uncheckpointed data. `journal_size_limit` reduces
+retained allocation to 16 MiB on reuse. A transaction admitted below the budget
+can exceed it, and other connections may write in the interval before admission
+acquires the writer lock. Strict/external writers retain their own policies.
+
+FULL `Sync()` barriers bypass admission so callers can persist acknowledged
+writes even with a pinned WAL reader. Synchronous handle writes still undergo
+admission. Close joins the worker before its final FULL owner-retirement commit,
+reports pending checkpoint errors and restarts the worker if close fails.
+Inherited worker state is abandoned along with inherited SQLite handles after
+`fork()`; it must never be joined or reused in the child. No file format or
+snapshot visibility changes are involved.
 
 The native build and runtime require SQLite 3.51.3 or later. The pinned build
 uses 3.53.2, independent of the Python runtime's SQLite version. See the

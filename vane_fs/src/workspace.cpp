@@ -3,6 +3,7 @@
 
 #include "vane_fs/workspace.hpp"
 #include "owner_lock.hpp"
+#include "checkpoint.hpp"
 
 #include <sqlite3.h>
 
@@ -667,6 +668,7 @@ public:
 	OwnerLock owner_lock;
 	int64_t process = OwnerLock::Process();
 	const Durability durability;
+	std::unique_ptr<Checkpointer> checkpointer;
 
 	explicit Database(const std::string &path, int timeout_ms, Durability durability) : durability(durability) {
 		if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos || timeout_ms < 0) {
@@ -678,6 +680,7 @@ public:
 		int code = sqlite3_open_v2(
 		    path.c_str(), &db,
 		    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, nullptr);
+		bool owner_committed = false;
 		try {
 			Check(db, code);
 			Check(db, sqlite3_busy_timeout(db, timeout_ms));
@@ -730,15 +733,30 @@ UPDATE format SET version=2;
 				insert.Step();
 			}
 			Exec(db, "COMMIT");
-			if (durability == Durability::Fsync)
+			owner_committed = true;
+			if (durability == Durability::Fsync) {
 				Exec(db, "PRAGMA synchronous=NORMAL");
+				// Reuse a modest WAL allocation after restart, including after a
+				// single transaction temporarily exceeds the admission budget.
+				Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
+				Statement pages(db, "PRAGMA page_size");
+				pages.Step();
+				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
+				sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+			}
 		} catch (...) {
+			checkpointer.reset();
 			if (db) {
 				statements.Clear();
 				sqlite3_close_v2(db);
 				db = nullptr;
 			}
-			owner_lock.Remove();
+			// Worker creation can fail after registration committed. Preserve
+			// its unlocked file so RecoverOwners can retire that durable row.
+			if (owner_committed)
+				owner_lock.Close();
+			else
+				owner_lock.Remove();
 			throw;
 		}
 	}
@@ -746,6 +764,9 @@ UPDATE format SET version=2;
 		try {
 			Close();
 		} catch (...) {
+			if (db)
+				sqlite3_wal_hook(db, nullptr, nullptr);
+			checkpointer.reset();
 			if (db) {
 				statements.Clear();
 				sqlite3_close_v2(db);
@@ -774,7 +795,7 @@ UPDATE format SET version=2;
 namespace {
 class Transaction {
 public:
-	Transaction(Database &database, bool write, bool synchronous = false)
+	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false)
 	    : database(database), lock(database.mutex, std::defer_lock),
 	      restore_normal(write && synchronous && database.durability == Durability::Fsync) {
 		if (database.process != OwnerLock::Process()) {
@@ -783,6 +804,12 @@ public:
 		lock.lock();
 		if (!database.db) {
 			Fail(ErrorCode::Closed, "Workspace is closed");
+		}
+		if (write && database.checkpointer) {
+			if (barrier)
+				database.checkpointer->CheckError();
+			else
+				database.checkpointer->BeforeWrite(database.db);
 		}
 		// SQLite requires changing synchronous outside a transaction. On failure
 		// leave FULL enabled until a subsequent successful synchronous commit.
@@ -996,7 +1023,9 @@ void Workspace::Close() {
 	database->Close();
 }
 void Workspace::Sync() {
-	Transaction tx(*database, true, true);
+	// Even under WAL backpressure, callers must be able to persist writes
+	// that have already committed. Only this small barrier bypasses admission.
+	Transaction tx(*database, true, true, true);
 	// An empty transaction need not write or synchronize the WAL. Changing
 	// this page forces a FULL commit, covering every earlier WAL commit, even
 	// when another connection used NORMAL and this connection uses Strict.
@@ -1031,6 +1060,8 @@ void Session::Close() {
 		return;
 	}
 	if (database->db && pin) {
+		if (database->checkpointer)
+			database->checkpointer->BeforeWrite(database->db);
 		Statement remove(database->db, "DELETE FROM pins WHERE id=?");
 		remove.Bind(1, pin->id);
 		remove.Step();
@@ -1771,6 +1802,9 @@ void Database::Close() {
 		// SQLite connections and C++ mutexes must not be reused across fork.
 		statements.idle.clear(); // Abandon inherited statements without calling SQLite.
 		db = nullptr;
+		// The worker and its locks belong to vanished parent threads. As with
+		// inherited SQLite handles, abandon them without joining or destroying.
+		checkpointer.release();
 		owner_lock.Close();
 		return;
 	}
@@ -1778,27 +1812,39 @@ void Database::Close() {
 	if (!db) {
 		return;
 	}
-	if (durability == Durability::Fsync)
-		Exec(db, "PRAGMA synchronous=FULL");
-	Exec(db, "BEGIN IMMEDIATE");
+	if (checkpointer)
+		checkpointer->Stop();
 	try {
-		RetireOwner(db, owner);
-		Exec(db, "COMMIT");
+		if (checkpointer)
+			checkpointer->CheckError();
+		if (durability == Durability::Fsync)
+			Exec(db, "PRAGMA synchronous=FULL");
+		Exec(db, "BEGIN IMMEDIATE");
+		try {
+			RetireOwner(db, owner);
+			Exec(db, "COMMIT");
+		} catch (...) {
+			sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+			throw;
+		}
+		{
+			auto &registry = Pins();
+			std::lock_guard<std::mutex> guard(registry.mutex);
+			registry.pins.erase(std::remove_if(registry.pins.begin(), registry.pins.end(),
+			                                   [&](const auto &pin) { return pin->owner == owner; }),
+			                    registry.pins.end());
+		}
+		statements.Clear();
+		sqlite3_wal_hook(db, nullptr, nullptr);
+		checkpointer.reset();
+		Check(db, sqlite3_close(db));
+		db = nullptr;
+		owner_lock.Remove();
 	} catch (...) {
-		sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+		if (checkpointer)
+			checkpointer->Start();
 		throw;
 	}
-	{
-		auto &registry = Pins();
-		std::lock_guard<std::mutex> guard(registry.mutex);
-		registry.pins.erase(std::remove_if(registry.pins.begin(), registry.pins.end(),
-		                                   [&](const auto &pin) { return pin->owner == owner; }),
-		                    registry.pins.end());
-	}
-	statements.Clear();
-	Check(db, sqlite3_close(db));
-	db = nullptr;
-	owner_lock.Remove();
 }
 
 RecoveryResult Workspace::RecoverOwners() {

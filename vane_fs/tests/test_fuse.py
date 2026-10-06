@@ -500,7 +500,8 @@ def test_mount_rejects_database_inside_mountpoint(tmp_path):
 @pytest.mark.parametrize("barrier", ["fsync", "fdatasync", "directory", "sync_write", "dsync_write"])
 def test_fsync_mode_barriers_and_recovery(tmp_path, barrier):
     database = tmp_path / "workspace.sqlite"
-    payload = bytes(range(256)) * (1024 * 16)
+    # Cross the background checkpoint threshold before exercising each barrier.
+    payload = bytes(range(256)) * (1024 * 128)
     with Workspace(database) as workspace:
         reader = workspace.checkout()
         with mount_workspace(tmp_path, database, "branch", "main", "--durability=fsync") as (point, process):
