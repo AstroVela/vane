@@ -1219,6 +1219,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	atomic<idx_t> output_capacity_bytes_snapshot {0};
 	atomic<idx_t> output_capacity_item_bytes_snapshot {0};
 	mutex output_event_lock;
+	bool output_events_closed = false; // Protected by output_event_lock.
 	std::deque<UDFOutputEvent> pending_output_events;
 	atomic<idx_t> sink_calls {0};
 	atomic<idx_t> source_calls {0};
@@ -1380,6 +1381,8 @@ struct StreamingUDFLocalSinkState : public LocalSinkState {
 	bool consumed_blocked_input = false;
 };
 
+static void StopStreamingConsumer(StreamingUDFState &state);
+
 struct StreamingUDFGlobalSourceState : public GlobalSourceState {
 	explicit StreamingUDFGlobalSourceState(std::shared_ptr<StreamingUDFState> state_p) : state(std::move(state_p)) {
 	}
@@ -1391,6 +1394,12 @@ struct StreamingUDFGlobalSourceState : public GlobalSourceState {
 		// one drain task; stage/slot parallelism remains independent.
 		state->resolved_source_threads.store(1, std::memory_order_relaxed);
 		return 1;
+	}
+
+	void OnConsumerFinished() override {
+		// This source has exactly one drain task, so no other consumer still
+		// needs rows when its downstream operator finishes early.
+		StopStreamingConsumer(*state);
 	}
 
 	std::shared_ptr<StreamingUDFState> state;
@@ -1600,6 +1609,11 @@ static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &&event) {
 	{
 		unique_lock<mutex> event_guard(state.output_event_lock);
+		if (state.output_events_closed) {
+			event_guard.unlock();
+			event.output_lease.Release();
+			return;
+		}
 		state.pending_output_events.push_back(std::move(event));
 		state.queued_output_events.fetch_add(1, std::memory_order_relaxed);
 		// A consumer can drain the event as soon as this lock is released.
@@ -1895,6 +1909,7 @@ static void ReleaseQueuedStreamingEvents(StreamingUDFState &state) {
 	std::deque<UDFOutputEvent> events;
 	{
 		lock_guard<mutex> event_guard(state.output_event_lock);
+		state.output_events_closed = true;
 		events.swap(state.pending_output_events);
 		state.queued_output_events.store(0, std::memory_order_relaxed);
 	}
@@ -1915,6 +1930,9 @@ static void AbortStreamingInflightSubmitsLocked(StreamingUDFState &state, const 
 
 static void SetStreamingErrorLocked(StreamingUDFState &state, unique_lock<mutex> &guard, const string &msg) {
 	state.VerifyLock(guard);
+	if (state.source_finished) {
+		return;
+	}
 	if (!state.has_error) {
 		AbortStreamingInflightSubmitsLocked(state, guard);
 		ReleaseQueuedStreamingOutputsLocked(state, guard);
@@ -1931,6 +1949,33 @@ static void SetStreamingErrorLocked(StreamingUDFState &state, unique_lock<mutex>
 static void SetStreamingError(StreamingUDFState &state, const string &msg) {
 	auto guard = state.Lock();
 	SetStreamingErrorLocked(state, guard, msg);
+}
+
+static void StopStreamingConsumer(StreamingUDFState &state) {
+	auto guard = state.Lock();
+	if (state.source_finished) {
+		return;
+	}
+	state.source_finished = true;
+	AbortStreamingInflightSubmitsLocked(state, guard);
+	ReleaseQueuedStreamingOutputsLocked(state, guard);
+	ReleaseQueuedStreamingEvents(state);
+	state.pending_inputs.clear();
+	state.pending_lazy_inputs.clear();
+	state.planned_submit.Clear();
+	state.pending_rows = 0;
+	state.pending_bytes = 0;
+	RefreshStreamingOutputCapacitySnapshotLocked(state, guard);
+	PreventStreamingBlocking(state, guard);
+	WakeAllStreamingSources(state, guard);
+	WakeStreamingUDFTasks(state, guard);
+	auto executor = state.op ? state.op->executor.get() : nullptr;
+	guard.unlock();
+	// The dispatcher may be delivering a callback that needs the state lock.
+	// Retire it only after releasing that lock, without destroying its wrapper.
+	if (executor) {
+		executor->Cancel();
+	}
 }
 
 static void NotifyStreamingDispatcherFinished(StreamingUDFState &state) {
@@ -2893,6 +2938,9 @@ static void DriveStreamingMaterializedSubmits(ExecutionContext &context, Streami
 static void DriveStreamingSubmits(ExecutionContext &context, StreamingUDFState &state, const unique_lock<mutex> &guard,
                                   bool flush_tail) {
 	state.VerifyLock(guard);
+	if (state.source_finished) {
+		return;
+	}
 	ThrowIfStreamingError(state);
 	if (state.planned_submit.HasValue()) {
 		const bool submitted = state.planned_submit.IsLazy()
@@ -3044,6 +3092,9 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	auto incoming_bytes = EstimateStreamingChunkBytes(chunk);
 
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		return SinkResultType::FINISHED;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, false);
@@ -3086,6 +3137,9 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	state.reserved_rows = state.reserved_rows >= incoming_rows ? state.reserved_rows - incoming_rows : 0;
 	state.reserved_bytes = state.reserved_bytes >= incoming_bytes ? state.reserved_bytes - incoming_bytes : 0;
 
+	if (state.source_finished) {
+		return SinkResultType::FINISHED;
+	}
 	StreamingPendingInputPiece piece;
 	piece.bytes = buffered_bytes;
 	piece.chunk = std::move(buffered);
@@ -3138,6 +3192,10 @@ SinkResultType PhysicalStreamingUDF::SinkBatch(ExecutionContext &context, Execut
 	auto incoming_bytes = batch.lazy->EstimatedBytes();
 
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		batch = ExecutionBatch();
+		return SinkResultType::FINISHED;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, false);
@@ -3188,6 +3246,10 @@ SinkFinalizeType PhysicalStreamingUDF::Finalize(Pipeline &pipeline, Event &, Cli
 	ThreadContext thread_context(context);
 	ExecutionContext execution_context(context, thread_context, &pipeline);
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		state.sink_finished = true;
+		return SinkFinalizeType::READY;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	state.sink_finished = true;
@@ -3288,6 +3350,9 @@ SourceResultType PhysicalStreamingUDF::GetDataBatch(ExecutionContext &context, E
 	state.source_calls.fetch_add(1);
 
 	auto drive_locked = [&](unique_lock<mutex> &guard) {
+		if (state.source_finished) {
+			return;
+		}
 		DrainStreamingOutputEventsLocked(state, guard);
 		DriveStreamingSubmits(context, state, guard, false);
 		ThrowIfStreamingError(state);
