@@ -127,3 +127,80 @@ Full raw samples, host counters, frozen binaries, runner sources, logs, failed
 attempts and cleanup manifests remain in ignored build directories. Generated
 databases and service data are removed only after validation and all owned
 processes stop. No source dataset or unrelated host service is removed.
+
+## Follow-up diagnosis: 2026-10-06
+
+The production baseline is now `7cccaf814f`, including new-block batching.
+Two isolated candidates tested whether WAL allocation reuse or fewer background
+checkpoints could reduce the remaining write cost. Neither was adopted.
+Both retained the 16 MiB wake threshold, 64 MiB admission budget, per-request
+transactions, and FULL synchronization barriers. Each native diagnostic used
+three alternating pairs, fresh databases and a 256 MiB file on ext4, written as
+256 pairs of 1,048,528 and 48 bytes. Instrumentation and all samples are retained
+in [wal-diagnosis-20261006.json](wal-diagnosis-20261006.json).
+
+| Candidate | Baseline write + Sync, seconds | Candidate, seconds | Result |
+| --- | ---: | ---: | --- |
+| Retain 64 MiB WAL allocation instead of 16 MiB | 2.605 (2.588–8.107) | 2.570 (2.558–2.662) | Only 1.4% lower median, overlapping ranges |
+| Coalesce checkpoint requests for 20 ms | 2.638 (2.528–2.880) | 2.805 (2.756–7.986) | 6.3% higher median despite fewer checkpoints |
+
+The retention candidate lowers foreground truncation time, but WAL traffic
+remains 338.421 MiB in the write phase. Coalescing reduces the worker's passive
+checkpoints from 15 to 10 in these samples without improving throughput. The
+slow samples remain in the results. These small experiments do not justify a
+production tuning change.
+
+Page inspection makes the storage cost more concrete. The split writes allocate
+65,792 payloads, including 256 superseded partial blocks: 257 MiB of 4 KiB block
+contents occupy about 289.19 MiB in the payload table. SQLite record headers and
+[overflow pages](https://www.sqlite.org/fileformat2.html#b_tree_pages) prevent
+each payload from fitting in one 4 KiB database page. Version tables and indexes
+bring the database to 306.17 MiB. One baseline sample submits 338.64 MiB of WAL
+writes and 307.94 MiB of database writes across setup, writes, Sync, readback and
+close, about 2.53 times the application payload. These are VFS-submitted bytes,
+not physical SSD writes. Background and foreground timings overlap.
+
+The unchanged production binary was also remeasured in two independent
+three-round FUSE batches, alternating with a separate reference filesystem.
+Across six rounds, each system runs first three times. Each batch starts with
+fresh workspaces and services; fixtures are deleted between samples, without GC or
+global cache eviction. Writes time create, one-MiB application writes, fsync
+and close. The read workloads retain their existing hot-cache preparation.
+
+| Latest VaneFS workload | Median MiB/s | Complete range |
+| --- | ---: | ---: |
+| 64 MiB sequential write + fsync + close | 101.58 | 85.68–105.08 |
+| 256 MiB sequential write + fsync + close | 92.71 | 31.74–96.92 |
+| Warm 64 MiB sequential read | 754.85 | 703.25–835.54 |
+| Warm 4 KiB random read | 67.85 | 67.39–69.00 |
+
+These results describe the latest build in a new measurement window; comparing
+them directly with the earlier batching A/B would not establish another speedup.
+The 256 MiB writes still include an 8.07-second sample. Baseline CPU idle is
+95.6–95.8%; during measurement it is 86.4–86.7%, with 2.4–3.0% I/O wait.
+The host is shared, so those counters cannot identify the cause of a stall.
+Minimum sampled headroom above the unchanged reference cache guard is 4.56 GiB.
+
+A separate debug-log experiment found that the reference's two-second cache
+bypass can change its read path between warmup and measurement. Its initial
+DIRECT_IO read issues 129 FUSE READ requests, the subsequent KEEP_CACHE read
+populates kernel pages with 512 requests, and later reads issue zero requests.
+VaneFS issues 129 requests on every pass. Thus a "hot" label alone does not
+establish an equivalent cache state, and the mixed-path read medians are not
+stable storage-speed ratios. The debug experiment is separate from the six
+uninstrumented rounds; it does not establish which path every earlier sample
+took. The artifact retains both systems' samples and this diagnostic evidence.
+
+All 12 native content comparisons, 50 FUSE file hashes, 25 additional remote
+hash checks, and 15 SQLite quick checks pass. No production source changed, so
+the previously validated component binaries were reused and unrelated tests
+were not rerun. All owned processes, monitors, mounts, containers and generated
+data were independently checked absent after cleanup. The reference unmount
+command again reports a warning while its mount and process do stop; the raw
+records retain it. Frozen sources, binaries, logs, host telemetry and complete
+cleanup manifests remain in the artifact directories referenced by the JSON.
+
+The next useful experiment is a larger immutable payload extent stored inside
+the SQLite transaction, measuring both write amplification and 4 KiB random
+reads before changing the persistent format. An external payload store would
+also require an explicit crash-consistency protocol between content and metadata.
