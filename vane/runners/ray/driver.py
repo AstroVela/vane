@@ -3318,10 +3318,6 @@ class RayQueryDriverActor:
         query_id: str,
         done: threading.Event,
     ) -> None:
-        from vane.runners.ray.fte_fragment_scheduler import (
-            drain_fte_resource_admission_change,
-        )
-
         query_key = str(query_id)
         current = asyncio.current_task()
         try:
@@ -3331,7 +3327,7 @@ class RayQueryDriverActor:
             ):
                 self._query_fte_admission_dirty_queries.discard(query_key)
                 await asyncio.to_thread(
-                    drain_fte_resource_admission_change,
+                    self._drain_query_execution_phase_and_fte,
                     query_key,
                 )
         except asyncio.CancelledError:
@@ -3362,6 +3358,23 @@ class RayQueryDriverActor:
                 and query_key not in self._query_resource_closing_queries
             ):
                 self._schedule_query_fte_admission_pump(query_key)
+
+    def _drain_query_execution_phase_and_fte(self, query_id: str) -> None:
+        from vane.runners.ray.fte_fragment_scheduler import drain_fte_resource_admission_change
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        try:
+            manager = get_query_resource_manager(query_id)
+        except KeyError:
+            manager = None
+        if manager is not None:
+            frontier = manager.pending_allocation_frontier()
+            if frontier is not None:
+                # Task completion and prefetch cancellation publish resource
+                # changes. Retry the fenced phase on those edges, outside the
+                # actor event loop, so lease acknowledgements can keep running.
+                self._transition_query_execution_phase(query_id, *frontier)
+        drain_fte_resource_admission_change(query_id)
 
     def _wait_for_query_fte_admission_pump(
         self,
@@ -5484,7 +5497,13 @@ class RayQueryDriverActor:
             # Validate before touching physical actors. Each retirement target
             # is checked atomically against the current eligible set, and the
             # complete frontier token is checked again before allocation.
-            if (eligible, fence_epoch) != manager.current_allocation_frontier():
+            if (eligible, fence_epoch) != manager.pending_allocation_frontier():
+                return
+            if manager.has_actor_leases_outside_phase():
+                # LIMIT can finish the native fragment after transferring
+                # cancelled invocations to driver-owned completion waiters.
+                # Preserve their actor reservation and the closed phase fence
+                # until the final lease release wakes the admission pump.
                 return
             self._retire_udf_actor_pools_outside_phase(query_key, eligible)
 

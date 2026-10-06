@@ -612,6 +612,29 @@ class RayQueryResourceManager:
         with self._lock:
             return self._eligible_resource_unit_ids_locked(), int(self._allocation_fence_epoch)
 
+    def pending_allocation_frontier(self) -> tuple[tuple[str, ...], int] | None:
+        """Return a phase transition that still owns a closed admission fence."""
+        with self._lock:
+            if (
+                self._allocation_admission_open
+                or not self._allocation_fence_epoch
+                or self._allocation_admission_closed
+                or self._failed
+                or self._cancelled
+            ):
+                return None
+            return self._eligible_resource_unit_ids_locked(), int(self._allocation_fence_epoch)
+
+    def has_actor_leases_outside_phase(self) -> bool:
+        """Keep completed-phase actors charged until cancelled calls terminate."""
+        with self._lock:
+            eligible = set(self._eligible_resource_unit_ids_locked())
+            return any(
+                lease.resource_unit_id not in eligible
+                and self._units[lease.resource_unit_id].spec.backend == "ray_actor"
+                for lease in self._task_leases.values()
+            )
+
     def _eligible_resource_unit_ids_locked(self) -> tuple[str, ...]:
         if self._cancelled:
             return ()
