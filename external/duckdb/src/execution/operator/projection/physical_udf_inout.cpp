@@ -937,6 +937,10 @@ struct StreamingUDFConfig {
 	// complete upstream blocks and coalesce only undersized blocks until this
 	// row count is reached. EOS and byte pressure may still submit a short tail.
 	idx_t min_task_batch_rows = 0;
+	// Transport size is independent of the user-visible compute batch. Only
+	// ordinary synchronous Ray actor batches use the automatic byte target.
+	bool auto_task_batching = false;
+	idx_t actor_pool_size = 1;
 	idx_t task_input_max_bytes = 0;
 	idx_t output_target_bytes = 0;
 };
@@ -1438,6 +1442,17 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 		throw InvalidInputException("streaming UDF requires positive udf_task_input_max_bytes");
 	}
 	config.task_input_max_bytes = task_input_max_bytes.second;
+	auto call_mode = GetStructStringField(payload, "call_mode");
+	auto prebatched_input = GetStructBoolField(payload, "prebatched_input");
+	auto row_preserving = GetStructBoolField(payload, "row_preserving");
+	config.auto_task_batching =
+	    execution_backend.second == "ray_actor" && call_mode.first && call_mode.second == "map_batches" &&
+	    config.compute_batch_rows > 0 && config.min_task_batch_rows == 0 &&
+	    !(prebatched_input.first && prebatched_input.second) && !(row_preserving.first && row_preserving.second);
+	auto actor_number = GetStructIntField(payload, "actor_number");
+	if (actor_number.first && actor_number.second > 0) {
+		config.actor_pool_size = actor_number.second;
+	}
 	auto output_target_max_bytes = GetStructIntField(payload, "udf_output_target_max_bytes");
 	if (!output_target_max_bytes.first || output_target_max_bytes.second <= 0) {
 		throw InvalidInputException("streaming UDF requires positive udf_output_target_max_bytes");
@@ -2010,6 +2025,39 @@ static StreamingSubmitPlan StreamingIncompleteSubmitPlan(const StreamingUDFState
 	return plan;
 }
 
+static StreamingSubmitPlan PlanStreamingAutoSubmit(const StreamingUDFState &state, bool flush_tail) {
+	StreamingSubmitPlan plan;
+	const auto compute_rows = state.config.compute_batch_rows;
+	// This estimates a target, not an admission limit. TakeStreaming* still
+	// applies the existing byte-bounded slicing and oversized-row rules.
+	const auto bytes_per_row = MaxValue<idx_t>(1, state.pending_bytes / state.pending_rows +
+	                                                  (state.pending_bytes % state.pending_rows != 0 ? 1 : 0));
+	const auto byte_rows = state.config.task_input_max_bytes / bytes_per_row;
+	const auto target_rows = MaxValue<idx_t>(compute_rows, byte_rows - byte_rows % compute_rows);
+	if (state.pending_rows >= target_rows) {
+		plan.target_rows = target_rows;
+		return plan;
+	}
+	if (flush_tail || state.pending_bytes >= state.config.task_input_max_bytes) {
+		// flush_tail also means "drain before accepting another input". Keep
+		// complete compute batches aligned under pressure; only the final
+		// sub-batch (or a byte-forced split in TakeStreaming*) may be short.
+		plan.target_rows = state.pending_rows - state.pending_rows % compute_rows;
+		if (plan.target_rows == 0) {
+			return StreamingIncompleteSubmitPlan(state, flush_tail);
+		}
+		return plan;
+	}
+	// Never wait for aggregation while an actor could start ready work. In
+	// particular, COMPLETE wakes the source to drain a short pending task if
+	// upstream is waiting for the output leases held by that input. No timer,
+	// extra prefetch queue or additional actor credit is needed.
+	if (state.inflight_batches.size() < state.config.actor_pool_size) {
+		plan.target_rows = state.pending_rows - state.pending_rows % compute_rows;
+	}
+	return plan;
+}
+
 // A deque entry is one upstream work unit. Preserve complete upstream blocks
 // while coalescing undersized blocks to the configured soft minimum; without
 // one, submit a compute-batch-aligned prefix.
@@ -2017,6 +2065,10 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 	StreamingSubmitPlan plan;
 	if (state.pending_rows == 0 || state.pending_lazy_inputs.empty()) {
 		return plan;
+	}
+	// Mixed channels retain the existing progress and head-of-line rules.
+	if (state.config.auto_task_batching && state.pending_inputs.empty()) {
+		return PlanStreamingAutoSubmit(state, flush_tail);
 	}
 	idx_t rows_through_boundary = 0;
 	for (const auto &entry : state.pending_lazy_inputs) {
@@ -2056,6 +2108,9 @@ static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFSta
 	StreamingSubmitPlan plan;
 	if (state.pending_rows == 0 || state.pending_inputs.empty()) {
 		return plan;
+	}
+	if (state.config.auto_task_batching && state.pending_lazy_inputs.empty()) {
+		return PlanStreamingAutoSubmit(state, flush_tail);
 	}
 	idx_t rows_through_boundary = 0;
 	for (const auto &entry : state.pending_inputs) {
