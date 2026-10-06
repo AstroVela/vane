@@ -465,6 +465,46 @@ def test_driver_resource_change_event_drives_fte_owner_without_polling(monkeypat
     asyncio.run(scenario())
 
 
+def test_resource_release_resumes_phase_off_the_driver_event_loop(monkeypatch):
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.query_resource_manager import TaskRequest
+
+    async def scenario():
+        query_id = "query-phase-completion-wake"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_resource_graph(graph, _allocation())
+        unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(unit_id, runnable=True)
+        grant = manager.try_acquire_task(TaskRequest(query_id, unit_id, "task", "attempt", None))
+        assert grant.granted
+        # Model the closed frontier after downstream LIMIT completion. Only
+        # releasing the live lease below emits the wakeup exercised here.
+        manager.update_unit_state(unit_id, runnable=False, completed=True)
+        frontier = manager.pending_allocation_frontier()
+        assert frontier is not None
+        loop_thread = threading.get_ident()
+        resumed = threading.Event()
+        calls = []
+
+        def transition(actual_query_id, eligible, epoch):
+            assert threading.get_ident() != loop_thread
+            assert not manager.snapshot()["task_leases"]
+            calls.append((actual_query_id, eligible, epoch))
+            resumed.set()
+
+        runner._transition_query_execution_phase = transition
+        monkeypatch.setattr(fte_scheduler, "drain_fte_resource_admission_change", lambda _query_id: None)
+        manager._on_change = lambda: runner_cls._signal_query_resource_change(runner, query_id)
+        assert manager.release_task_lease(grant.lease.lease_id, attempt_id=grant.lease.attempt_id)
+        assert await asyncio.to_thread(resumed.wait, 2)
+        for task in tuple(runner._query_fte_admission_pumps.values()):
+            await task
+        assert calls == [(query_id, *frontier)]
+
+    asyncio.run(scenario())
+
+
 def test_fte_state_lock_does_not_block_driver_lease_admission_or_release(monkeypatch):
     import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
     from vane.runners.fte.fte_execution import FteFragmentExecution

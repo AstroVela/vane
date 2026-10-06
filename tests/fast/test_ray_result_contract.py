@@ -4302,6 +4302,130 @@ def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
         release_query_resource_manager(query_id, reason="test_complete")
 
 
+@pytest.mark.parametrize(
+    "drop_fragments,fail_actor_cleanup",
+    [(True, False), (False, False), (True, True)],
+    ids=["running-query", "before-fragment-start", "actor-cleanup-retry"],
+)
+def test_plan_teardown_releases_actor_lock_before_waiting_for_phase_pump(
+    monkeypatch, drop_fragments, fail_actor_cleanup
+):
+    from vane.runners.ray import fte_fragment_scheduler
+    from vane.runners.ray.query_resource_runtime import (
+        clear_query_resource_managers,
+        get_query_resource_manager,
+    )
+
+    async def scenario():
+        query_id = "phase-pump-during-plan-teardown"
+        cls, runner = _make_local_query_driver_actor()
+        loop = asyncio.get_running_loop()
+        runner._query_resource_admission_loop = loop
+        runner._ensure_query_resource_admission_state()
+        runner._query_resource_lock = threading.RLock()
+        runner._synchronize_query_allocations = lambda: ()
+        manager = _bind_test_query_resource_owner(runner, query_id)
+        unit_id = manager.graph.units[0].resource_unit_id
+        manager.update_unit_state(unit_id, runnable=False, completed=True)
+        assert manager.pending_allocation_frontier() is not None
+        if not drop_fragments:
+            lifecycle = driver._PlanLifecycle(query_id, _TEST_SESSION_ID, "query")
+            lifecycle.set_query_id(query_id)
+            assert lifecycle.begin_startup()
+            assert lifecycle.finish_setup(succeeded=False)
+            runner._plan_lifecycles[query_id] = lifecycle
+
+        phase_entered = threading.Event()
+        phase_returned = threading.Event()
+        fte_drained = threading.Event()
+        original_transition = runner._transition_query_execution_phase
+
+        def transition(*args):
+            phase_entered.set()
+            original_transition(*args)
+            phase_returned.set()
+
+        runner._transition_query_execution_phase = transition
+
+        class _Pool:
+            def __init__(self):
+                self.actors = [object()]
+                self.shutdown_calls = 0
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+                assert query_id in runner._plan_teardowns_in_progress
+                if self.shutdown_calls == 1:
+                    # Enter the real phase transition while actor cleanup owns
+                    # the lifecycle lock, then let teardown reach its pump wait.
+                    loop.call_soon_threadsafe(runner._schedule_query_fte_admission_pump, query_id)
+                    assert phase_entered.wait(2.0)
+                    assert not phase_returned.is_set()
+                    if fail_actor_cleanup:
+                        raise RuntimeError("planned actor cleanup failure")
+                self.actors.clear()
+
+        pool = _Pool()
+        runner._active_udf_actors = [pool]
+        runner._active_udf_actors_by_plan[query_id] = [pool]
+        runner._active_udf_actor_by_unit[query_id] = {unit_id: pool}
+
+        def drain(actual_query_id):
+            assert actual_query_id == query_id
+            assert phase_returned.is_set()
+            fte_drained.set()
+
+        monkeypatch.setattr(fte_fragment_scheduler, "drain_fte_resource_admission_change", drain)
+        runner._wait_for_query_fte_admission_pump = lambda qid: cls._wait_for_query_fte_admission_pump(
+            runner, qid, timeout_s=2.0
+        )
+        fragment_releases = []
+
+        def drop_after_fence(actual_query_id, *, release_resources):
+            runner._fence_query_resource_admission_for_teardown(actual_query_id)
+            assert fte_drained.is_set()
+            fragment_releases.append(release_resources)
+            if release_resources:
+                runner._release_query_resources(
+                    actual_query_id,
+                    reason="test_fragments_dropped",
+                    admission_fenced=True,
+                    execution_quiesced=True,
+                )
+
+        # Use a native-free fragment drop while retaining the production
+        # teardown, actor cleanup, phase transition, admission fence and wait.
+        runner._drop_query_fragments_after_admission_fence_sync = drop_after_fence
+        if fail_actor_cleanup:
+            with pytest.raises(RuntimeError, match="planned actor cleanup failure") as exc_info:
+                await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+            assert "timed out" not in str(exc_info.value)
+            assert get_query_resource_manager(query_id) is manager
+            assert query_id in runner._plan_lifecycles
+            assert runner._active_udf_actors_by_plan[query_id] == [pool]
+            assert runner._query_fte_admission_pumps == {}
+
+        await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+        assert phase_returned.is_set()
+        assert fte_drained.is_set()
+        assert fragment_releases == ([False, True] if fail_actor_cleanup else [True] if drop_fragments else [])
+        assert pool.shutdown_calls == (2 if fail_actor_cleanup else 1)
+        assert runner._active_udf_actors == []
+        assert runner._query_fte_admission_pumps == {}
+        assert runner._query_fte_admission_done_events == {}
+        assert runner._query_udf_actor_lifecycle_locks == {}
+        assert query_id not in runner._plan_session_ids
+        assert query_id not in runner._plan_lifecycles
+        assert query_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+        with pytest.raises(KeyError):
+            get_query_resource_manager(query_id)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        clear_query_resource_managers()
+
+
 def test_concurrent_plan_teardown_runs_owned_cleanup_once(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "concurrent-teardown"

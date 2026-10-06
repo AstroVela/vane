@@ -1074,6 +1074,20 @@ def test_actor_ready_slot_cannot_disappear_while_it_owns_prefetched_work():
     manager.set_ready_actor_slots(actor.resource_unit_id, {})
 
 
+@pytest.mark.parametrize("terminal", ["close_admission", "fail", "cancel"])
+def test_pending_phase_frontier_does_not_reopen_terminal_manager(terminal):
+    unit = _unit("resource:f:completed")
+    manager = _manager(unit)
+    assert manager.pending_allocation_frontier() is None
+    manager.update_unit_state(unit.resource_unit_id, runnable=False, completed=True)
+    assert manager.pending_allocation_frontier() == manager.current_allocation_frontier()
+    if terminal == "close_admission":
+        manager.close_admission()
+    else:
+        getattr(manager, terminal)("query ended")
+    assert manager.pending_allocation_frontier() is None
+
+
 def test_actor_pool_retirement_is_phase_fenced_and_charged_until_shutdown():
     actor = _unit(
         "resource:f:actor-before-barrier",

@@ -241,6 +241,15 @@ insertion-order preservation for this write because DuckDB requires it when
 `ROW_GROUP_SIZE_BYTES` is set; output row order is not part of this
 benchmark's result contract.
 
+Ray Actor transport can group several compute batches within the existing
+input byte budget. `BATCH_SIZE` continues to control each model call. For
+640x640 RGB uint8 frames, batch32 and a 128 MiB input budget usually allow
+96-frame transport tasks; this target is estimated from input bytes, not a
+fixed row count. Ready Actors can start smaller complete batches immediately.
+Input end and byte pressure drain tails. Task retries may replay several model
+calls, so UDF side effects must remain idempotent. Measure the complete query
+with identical model batches and pixels when comparing transport changes.
+
 ## Batch-size sweep
 
 Start with the batch size shown above and repeatedly double it. Keep the input data, model cache, GPU count, and all other settings unchanged. Stop when doubling no longer improves throughput or causes unacceptable GPU memory pressure. Run each setting at least three times and compare the median runtime.
