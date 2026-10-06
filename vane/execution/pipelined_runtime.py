@@ -49,6 +49,10 @@ class PipelinedContext(QueryContext):
         self.deadline_probe: Callable[[], bool] | None = None
         self._expiry_lock = threading.RLock()
 
+    def begin(self, *, defer_execution: bool = False) -> Any:
+        assert isinstance(self.options.target, RayExecution)
+        return super().begin(defer_execution=self.options.target.mode is DistributedMode.PIPELINED)
+
     def produced(self) -> None:
         with self._lock:
             self.production_done = True
@@ -60,6 +64,9 @@ class PipelinedContext(QueryContext):
         if self.failure or self._ticket.cancellation_reason is not None or self._done:
             return
         deadline = self._deadline
+        if self._admission_deadline is not None:
+            super()._expire()
+            return
         if bool(self.production_done) or deadline is None or not deadline.expired():
             return
         with self._expiry_lock:
@@ -233,8 +240,13 @@ class PipelinedScheduler:
             for index in sorted(set(assignments.values()))
         }
         self.pool.admission.acquire(
-            self.reservation, self.spec.query_id, demands, self.context.check, self.spec.options.admission_timeout
+            self.reservation,
+            self.spec.query_id,
+            demands,
+            self.context.check,
+            max(0.0, self.context._ticket.admission_deadline - time.monotonic()),
         )
+        self.context.start_execution()
         client_epoch = uuid.uuid4().hex
         ticket = DirectTicket(
             self.spec.query_id,
@@ -293,7 +305,6 @@ class PipelinedScheduler:
         )
         self.client.subscribe(location, ticket, self.channel, "result-service", timeout)
         self.schema = native.arrow_schema(self.spec.result_schema, list(self.spec.result_names))
-        ready_deadline = time.monotonic() + self.spec.options.admission_timeout
         while True:
             self.context.check()
             ready = [
@@ -306,8 +317,6 @@ class PipelinedScheduler:
                 raise RuntimeError(error)
             if all(ready) and relay_status["ready"] and self.client.ready:
                 break
-            if time.monotonic() >= ready_deadline:
-                raise TimeoutError("native Flight consumers did not become ready before admission timeout")
             self.stop.wait(0.01)
         self.context.deadline_probe = self.production_status
         # Every context, input and endpoint now exists. Start consumers before

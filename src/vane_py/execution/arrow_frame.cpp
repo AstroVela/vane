@@ -4,6 +4,7 @@
 #include "arrow_frame.hpp"
 #include "exchange_types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_properties.hpp"
@@ -12,6 +13,89 @@
 namespace duckdb {
 namespace vane_execution {
 namespace {
+LogicalType StorageTypeFor(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TIME:
+		return LogicalType::BIGINT;
+	case LogicalTypeId::INTERVAL:
+		return LogicalType::STRUCT(
+		    {{"months", LogicalType::INTEGER}, {"days", LogicalType::INTEGER}, {"micros", LogicalType::BIGINT}});
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		for (auto &child : StructType::GetChildTypes(type)) {
+			children.emplace_back(child.first, StorageTypeFor(child.second));
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	case LogicalTypeId::LIST:
+		return LogicalType::LIST(StorageTypeFor(ListType::GetChildType(type)));
+	case LogicalTypeId::MAP:
+		return LogicalType::MAP(StorageTypeFor(MapType::KeyType(type)), StorageTypeFor(MapType::ValueType(type)));
+	case LogicalTypeId::ARRAY:
+		return LogicalType::ARRAY(StorageTypeFor(ArrayType::GetChildType(type)), ArrayType::GetSize(type));
+	default:
+		return type;
+	}
+}
+
+// Work on a private, compact flat vector. In particular INTERVAL must be
+// transformed before the native Arrow exporter multiplies micros by 1000.
+Vector StorageVector(Vector &source, idx_t count, const LogicalType &storage_type) {
+	if (source.GetType() == storage_type) {
+		return Vector(source);
+	}
+	Vector result(storage_type, count);
+	FlatVector::SetValidity(result, FlatVector::Validity(source));
+	switch (source.GetType().id()) {
+	case LogicalTypeId::TIME:
+		result.Reinterpret(source);
+		break;
+	case LogicalTypeId::INTERVAL: {
+		auto data = FlatVector::GetData<interval_t>(source);
+		auto &children = StructVector::GetEntries(result);
+		for (idx_t row = 0; row < count; row++) {
+			auto value = FlatVector::Validity(source).RowIsValid(row) ? data[row] : interval_t {0, 0, 0};
+			FlatVector::GetData<int32_t>(*children[0])[row] = value.months;
+			FlatVector::GetData<int32_t>(*children[1])[row] = value.days;
+			FlatVector::GetData<int64_t>(*children[2])[row] = value.micros;
+		}
+		break;
+	}
+	case LogicalTypeId::STRUCT: {
+		auto &inputs = StructVector::GetEntries(source);
+		auto &outputs = StructVector::GetEntries(result);
+		for (idx_t i = 0; i < inputs.size(); i++) {
+			auto child = StorageVector(*inputs[i], count, outputs[i]->GetType());
+			outputs[i]->Reference(child);
+		}
+		break;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto child_count = ListVector::GetListSize(source);
+		ListVector::Reserve(result, child_count);
+		auto child = StorageVector(ListVector::GetEntry(source), child_count, ListVector::GetEntry(result).GetType());
+		ListVector::GetEntry(result).Reference(child);
+		ListVector::SetListSize(result, child_count);
+		auto entries = FlatVector::GetData<list_entry_t>(source);
+		for (idx_t row = 0; row < count; row++) {
+			FlatVector::GetData<list_entry_t>(result)[row] =
+			    FlatVector::Validity(source).RowIsValid(row) ? entries[row] : list_entry_t {0, 0};
+		}
+		break;
+	}
+	case LogicalTypeId::ARRAY: {
+		auto child = StorageVector(ArrayVector::GetEntry(source), count * ArrayType::GetSize(source.GetType()),
+		                           ArrayVector::GetEntry(result).GetType());
+		ArrayVector::GetEntry(result).Reference(child);
+		break;
+	}
+	default:
+		throw InternalException("unexpected exchange storage type");
+	}
+	return result;
+}
+
 std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool native_layout = false) {
 	CheckExchangeType(type);
 	switch (type.id()) {
@@ -48,7 +132,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool nati
 	case LogicalTypeId::DATE:
 		return arrow::date32();
 	case LogicalTypeId::TIME:
-		return arrow::time64(arrow::TimeUnit::MICRO);
+		return arrow::int64(); // Microseconds since midnight, including 24:00:00.
 	case LogicalTypeId::TIMESTAMP:
 		return arrow::timestamp(arrow::TimeUnit::MICRO);
 	case LogicalTypeId::TIMESTAMP_SEC:
@@ -60,7 +144,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, bool nati
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return arrow::timestamp(arrow::TimeUnit::MICRO, "UTC");
 	case LogicalTypeId::INTERVAL:
-		return arrow::month_day_nano_interval();
+		return ArrowTypeFor(StorageTypeFor(type), native_layout);
 	case LogicalTypeId::DECIMAL:
 		return arrow::decimal128(DecimalType::GetWidth(type), DecimalType::GetScale(type));
 	case LogicalTypeId::STRUCT: {
@@ -130,14 +214,31 @@ std::shared_ptr<arrow::Schema> ArrowSchemaFor(const vector<LogicalType> &types, 
 }
 
 std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_ptr<arrow::Schema> &schema) {
+	DataChunk storage;
+	vector<LogicalType> storage_types;
+	for (auto &column : chunk.data) {
+		storage_types.push_back(StorageTypeFor(column.GetType()));
+	}
+	storage.InitializeEmpty(storage_types);
+	storage.SetCardinality(chunk.size());
+	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+		if (storage_types[i] == chunk.data[i].GetType()) {
+			storage.data[i].Reference(chunk.data[i]);
+		} else {
+			Vector flat(chunk.data[i].GetType(), chunk.size());
+			VectorOperations::Copy(chunk.data[i], flat, chunk.size(), 0, 0);
+			auto converted = StorageVector(flat, chunk.size(), storage_types[i]);
+			storage.data[i].Reference(converted);
+		}
+	}
 	ClientProperties properties;
 	ArrowArray array;
 	array.Init();
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
-	ArrowConverter::ToArrowArray(chunk, &array, properties, extensions);
+	ArrowConverter::ToArrowArray(storage, &array, properties, extensions);
 	std::vector<std::shared_ptr<arrow::Field>> native_fields;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(chunk.data[i].GetType(), true)));
+		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(storage_types[i], true)));
 	}
 	auto result = arrow::ImportRecordBatch(&array, arrow::schema(std::move(native_fields)));
 	if (!result.ok()) {
@@ -203,9 +304,16 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 	case LogicalTypeId::DATE:
 		DecodePrimitive<arrow::Date32Array, int32_t>(source, target, count);
 		break;
-	case LogicalTypeId::TIME:
-		DecodePrimitive<arrow::Time64Array, int64_t>(source, target, count);
+	case LogicalTypeId::TIME: {
+		auto &values = static_cast<const arrow::Int64Array &>(source);
+		for (idx_t row = 0; row < count; row++) {
+			if (!source.IsNull(row) && (values.Value(row) < 0 || values.Value(row) > Interval::MICROS_PER_DAY)) {
+				throw IOException("exchange value is outside the TIME range");
+			}
+		}
+		DecodePrimitive<arrow::Int64Array, int64_t>(source, target, count);
 		break;
+	}
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
@@ -255,14 +363,19 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 		break;
 	}
 	case LogicalTypeId::INTERVAL: {
-		auto &values = static_cast<const arrow::MonthDayNanoIntervalArray &>(source);
+		auto &values = static_cast<const arrow::StructArray &>(source);
+		auto &months = static_cast<const arrow::Int32Array &>(*values.field(0));
+		auto &days = static_cast<const arrow::Int32Array &>(*values.field(1));
+		auto &micros = static_cast<const arrow::Int64Array &>(*values.field(2));
 		auto data = FlatVector::GetData<interval_t>(target);
 		for (idx_t row = 0; row < count; row++) {
-			auto value = values.Value(row);
-			if (!source.IsNull(row) && value.nanoseconds % 1000) {
-				throw IOException("exchange interval loses microsecond precision");
+			if (source.IsNull(row)) {
+				continue;
 			}
-			data[row] = {value.months, value.days, value.nanoseconds / 1000};
+			if (months.IsNull(row) || days.IsNull(row) || micros.IsNull(row)) {
+				throw IOException("exchange INTERVAL has a null component");
+			}
+			data[row] = {months.Value(row), days.Value(row), micros.Value(row)};
 		}
 		break;
 	}

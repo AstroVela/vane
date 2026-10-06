@@ -452,3 +452,11 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - HUGEINT 在 Flight、物化 I/O 和 Ray 结果导出中统一使用 `decimal256(39,0)`，递归处理 LIST/STRUCT/MAP/ARRAY，覆盖正负边界和中间 SUM；解码拒绝超出 signed 128-bit 范围的值。类型 profile 升为 2，Arrow codec 纳入 fragment build identity。
 - 修正 CI 纳秒时间戳测试对可选 pandas 的隐式依赖，改为直接比较 Arrow 数据。在禁止 pandas 导入的进程中，两个定向用例均通过。
 - 本轮新增 42 项回归；非 editable 增量 Release 安装上 **748 个非 Ray + 58 个真实 Ray，共 806 项相关测试通过**，未运行完整 release/fast 套件。格式、Ruff、mypy、pre-commit、源码版权清单、文档链接及 diff 检查通过；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:7b2c9dea48426d648a0a4d09ef8f2b9643c2c95909095e51ea162513128e70ff`。
+
+### P4 时间类型与准入期限修正（基于 `ed28974`）
+
+- INTERVAL 在进入 native Arrow exporter 前转换为月份、天数和原生微秒三个分量，避免微秒乘 1000 溢出；TIME 使用微秒整数，保留 `24:00:00`。两种编码统一覆盖 Flight、物化 I/O、公开 Ray 结果及嵌套子值，类型 profile 升为 3。解码拒绝越界 TIME 和有效 INTERVAL 内的 NULL 分量。
+- Pipelined 取得会话名额后保持 `ADMISSION_WAIT`，从请求创建起共用一个准入期限；整图 worker 预留成功才启动执行期限。排队超时保留 `RequestQueueTimeout` 类型，worker 等待计入 queue_wait，未执行的请求不生成 execution sample。旧准入定时器回调与执行启动在状态锁内裁决，取消回调在锁外派发。
+- 新增回归覆盖微秒正负极限、月/日极限、午夜结束边界、NULL、空 schema、LIST/STRUCT/MAP/ARRAY、恶意输入、准入超时和排队中断，以及过期回调与执行启动的交接。审查者提供的 5 个真实 Ray 复现用例在旧版本全部失败，修复后全部通过。
+- 本轮新增 51 项长期回归。相关验证分批去重合计 **911 passed：843 个非 Ray、63 个仓库 Ray、5 个审查脚本用例**。两个既有取消竞态用例继续断言 FIFO 清空，后续查询的准入期限调整为覆盖新结果 actor 启动，并定向重跑通过。未运行完整 release/fast 套件。
+- 已完成非 editable 增量 Release 安装；282 个 Python/类型文件与 checkout 一致，native 与构建产物一致。engine identity 为 `7fc33f6daf:fragment:d8cd56a3a0d20563320ef07e6ce7c4a9fae17656972842ac0078240bd98ca769`。root 格式、Ruff、mypy、pre-commit、源码版权清单、文档链接和 diff 检查通过。

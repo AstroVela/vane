@@ -52,6 +52,63 @@ def test_execution_and_cleanup_timings_are_separate_and_counted_once(monkeypatch
     assert queued.timing_snapshot() == dict(queue_wait_seconds=7, execution_seconds=1, cleanup_seconds=0)
 
 
+def test_worker_admission_defers_execution_and_includes_session_wait(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    first = runtime.request().take()
+    ticket = runtime.request(queue_timeout=10)
+    now[0] = 12.0
+    first.release()
+    lease = ticket.take(defer_execution=True)
+    assert ticket.admission_deadline == 20
+    with pytest.raises(RuntimeError, match="has not been claimed"):
+        _ = ticket.claimed_at
+    now[0] = 16.0
+    assert ticket.start_execution() == 16
+    now[0] = 17.0
+    assert ticket.start_execution() == 16
+    ticket.finish_execution()
+    now[0] = 18.0
+    lease.release()
+    assert ticket.timing_snapshot() == dict(queue_wait_seconds=6, execution_seconds=1, cleanup_seconds=1)
+    assert runtime.snapshot()["queue_wait_seconds"] == 6
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "admission_timeout"])
+def test_deferred_execution_termination_keeps_cleanup_lease(monkeypatch, reason):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ticket = runtime.request(queue_timeout=3)
+    lease = ticket.take(defer_execution=True)
+    now[0] = 13.0
+    assert ticket.cancel_running(reason=reason)
+    with pytest.raises(RequestCancelled if reason == "cancelled" else RequestQueueTimeout):
+        ticket.start_execution()
+    ticket.finish_execution(failed=True)
+    assert runtime.snapshot()["active_requests"] == 1
+    now[0] = 15.0
+    lease.release()
+    assert ticket.timing_snapshot() == dict(queue_wait_seconds=3, execution_seconds=None, cleanup_seconds=2)
+    assert runtime.snapshot()["executed_requests"] == 0
+    assert runtime.snapshot()["active_requests"] == 0
+
+
+def test_deferred_execution_cannot_start_after_original_admission_deadline(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ticket = runtime.request(queue_timeout=3)
+    lease = ticket.take(defer_execution=True)
+    now[0] = 13.0
+    with pytest.raises(RequestQueueTimeout):
+        ticket.start_execution()
+    lease.release()
+    assert runtime.snapshot()["timed_out_requests"] == 1
+    assert runtime.snapshot()["executed_requests"] == 0
+
+
 @pytest.mark.parametrize("termination", ["cancel", "drain", "timeout"])
 def test_unclaimed_terminal_requests_have_no_execution_sample(monkeypatch, termination):
     now = [10.0]

@@ -11,7 +11,13 @@ from dataclasses import replace
 import pytest
 
 import vane
-from tests.fast.test_analytical_exchange import EXPRESSIONS, HUGEINT_EXPRESSIONS, HUGEINT_VALUE_SQL
+from tests.fast.test_analytical_exchange import (
+    EXPRESSIONS,
+    HUGEINT_EXPRESSIONS,
+    HUGEINT_VALUE_SQL,
+    TEMPORAL_VALUES,
+    exchange_expected,
+)
 from tests.fast.test_analytical_fragment_compiler import TOP_N_AGGREGATES
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
@@ -65,7 +71,7 @@ def test_public_analytical_type_roundtrip(tmp_path, mode):
     sql = f"select range, {columns} from range(13) order by range desc"
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
     with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
-        expected = local.execute(sql).to_arrow_table()
+        expected = exchange_expected(local.execute(sql).to_arrow_table())
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
             table = result.collect()
             table.validate(full=True)
@@ -182,7 +188,9 @@ def test_fte_cancel_racing_with_admission_cannot_leave_waiter(tmp_path, monkeypa
                 closing.result(15)
             assert manager.snapshot()["waiting"] == []
             manager.release("pressure")
-            next_options = vane.QueryExecutionOptions(vane.RayExecution("pipelined"), 1, 30, 30)
+            # Admission includes planning and a fresh result actor's startup.
+            # The empty FIFO assertion above detects leaked queue ownership.
+            next_options = vane.QueryExecutionOptions(vane.RayExecution("pipelined"), 10, 30, 30)
             with connection.query("select 7", options=next_options) as next_result:
                 assert next_result.collect().column(0).to_pylist() == [7]
             assert_idle(connection)
@@ -190,6 +198,71 @@ def test_fte_cancel_racing_with_admission_cannot_leave_waiter(tmp_path, monkeypa
             enqueue.set()
             result.close()
             manager.release("pressure")
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_temporal_domain_across_aggregate_stages(tmp_path, mode):
+    with (
+        vane.connect(backend="local") as local,
+        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+    ):
+        for expression, value in TEMPORAL_VALUES:
+            sql = f"select min(v)::varchar, max(v)::varchar from (select case when range % 3=0 then null else {expression} end v from range(13))"
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            sql = f"select {expression} v from range(2)"
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                table.validate(full=True)
+                assert table.to_pylist() == [dict(v=value)] * 2
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("outcome", ["admitted", "timeout", "cancelled"])
+def test_worker_admission_has_its_own_clock(tmp_path, outcome):
+    from vane.execution.request_admission import RequestCancelled, RequestQueueTimeout
+
+    limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=1)
+    with vane.connect(backend="ray", resources=limits) as connection, connection.cursor() as sibling:
+        connection.query("select 0").collect()
+        held = connection.query("select 1")
+        manager = connection.query_runtime.pool.admission
+        opts = vane.QueryExecutionOptions(vane.RayExecution(), 4 if outcome == "timeout" else 15, 2, 30)
+        try:
+            with ThreadPoolExecutor() as executor:
+                try:
+                    pending = executor.submit(sibling.query, "select 2", options=opts)
+                    deadline = time.monotonic() + 10
+                    while not manager.snapshot()["waiting"]:
+                        assert not pending.done(), pending.exception() if pending.done() else None
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+                    query_id = manager.snapshot()["waiting"][0]["query_id"]
+                    context = connection.query_runtime._contexts[query_id]
+                    assert context.state == "ADMISSION_WAIT"
+                    if outcome == "admitted":
+                        time.sleep(2.2)
+                        assert not pending.done()
+                        held.collect()
+                        with pending.result(10) as result:
+                            assert result.collect().column(0).to_pylist() == [2]
+                            timing = result.context._ticket.timing_snapshot()
+                            assert timing["queue_wait_seconds"] >= 2.2
+                            assert timing["execution_seconds"] < 2
+                    else:
+                        if outcome == "cancelled":
+                            sibling.interrupt()
+                        with pytest.raises(RequestCancelled if outcome == "cancelled" else RequestQueueTimeout):
+                            pending.result(10)
+                        assert context._ticket.timing_snapshot()["execution_seconds"] is None
+                    assert manager.snapshot()["waiting"] == []
+                finally:
+                    held.close()
+        finally:
+            held.close()
+        assert connection.query("select 7").collect().column(0).to_pylist() == [7]
+        assert_idle(connection)
 
 
 def test_waiting_pipelined_graph_precedes_next_fte_attempt(tmp_path, monkeypatch):

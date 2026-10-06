@@ -597,6 +597,29 @@ def test_allocation_and_watcher_failures_keep_cleanup_owner(monkeypatch, failure
         assert connection.query("SELECT 2 AS x").collect().to_pylist() == [{"x": 2}]
 
 
+def test_late_admission_callback_cannot_cancel_started_execution():
+    from vane.execution.pipelined_runtime import PipelinedContext
+    from vane.execution.query_runtime import QueryRuntime
+
+    runtime = QueryRuntime()
+    ticket = runtime._admission.request(queue_timeout=30)
+    context = PipelinedContext(runtime, ticket, vane.QueryExecutionOptions(vane.RayExecution(), 30, 60, 30))
+    result = context.begin()
+    try:
+        admission = context._admission_deadline
+        callback = admission._callback
+        context.start_execution()
+        result.ready(delivery_timeout=30)
+        admission.expires_at = 0
+        callback()
+        context.check()
+        assert context.state == "RUNNING"
+        assert ticket.cancellation_reason is None
+    finally:
+        result.close()
+        runtime.close()
+
+
 def test_result_cancel_is_idempotent_and_preserves_retained_batch():
     with vane.connect(backend="local", resources=limits()) as connection:
         result = connection.query("SELECT i FROM range(10000) t(i)")

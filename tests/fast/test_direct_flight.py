@@ -176,12 +176,26 @@ def test_invalid_ack_and_duplicate_stream():
         sender.close()
 
 
-@pytest.mark.parametrize("value", [-(2**127) - 1, 2**127])
-def test_decimal256_outside_hugeint_range_is_rejected(value):
+@pytest.mark.parametrize(
+    "sql_type,value,error",
+    [
+        ("hugeint", -(2**127) - 1, "outside the HUGEINT range"),
+        ("hugeint", 2**127, "outside the HUGEINT range"),
+        ("time", -1, "outside the TIME range"),
+        ("time", 86_400_000_001, "outside the TIME range"),
+        ("interval", dict(months=1, days=2, micros=None), "INTERVAL has a null component"),
+    ],
+)
+def test_values_outside_native_domain_are_rejected(sql_type, value, error):
     import pyarrow as pa
     import pyarrow.flight as flight
 
-    schema = pa.schema([("c0", pa.decimal256(39, 0))])
+    kinds = {
+        "hugeint": pa.decimal256(39, 0),
+        "time": pa.int64(),
+        "interval": pa.struct([("months", pa.int32()), ("days", pa.int32()), ("micros", pa.int64())]),
+    }
+    schema = pa.schema([("c0", kinds[sql_type])])
     record = pa.RecordBatch.from_arrays([pa.array([value], type=schema.field(0).type)], schema=schema)
     record.validate(full=True)
 
@@ -193,13 +207,12 @@ def test_decimal256_outside_hugeint_range_is_rejected(value):
             yield flight.Result(b"open")
 
     with vane.connect(backend="local") as connection:
-        target = make_channel(connection, "select null::hugeint")
+        target = make_channel(connection, f"select null::{sql_type}")
     sender = Sender(("127.0.0.1", 0))
     receiver = service()
     try:
         receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "hugeint", target, "producer", 10)
-        error = eventually(lambda: target.snapshot()["error"], bool)
-        assert "outside the HUGEINT range" in error
+        assert error in eventually(lambda: target.snapshot()["error"], bool)
         assert target.snapshot()["bytes"] == 0
     finally:
         receiver.close()

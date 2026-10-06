@@ -48,6 +48,31 @@ HUGEINT_EXPRESSIONS = [
     f"map([range], [{HUGEINT_VALUE_SQL}])",
     f"map([{HUGEINT_VALUE_SQL}], [range])",
 ]
+LARGE_INTERVAL = "interval '2305843009213693952 microseconds'"
+LARGE_INTERVAL_VALUE = dict(months=0, days=0, micros=2305843009213693952)
+TEMPORAL_VALUES = [
+    ("time '00:00:00'", 0),
+    ("time '23:59:59.999999'", 86_399_999_999),
+    ("time '24:00:00'", 86_400_000_000),
+    (LARGE_INTERVAL, LARGE_INTERVAL_VALUE),
+    (f"-{LARGE_INTERVAL}", dict(months=0, days=0, micros=-2305843009213693952)),
+    (
+        "interval '2147483647 months 2147483647 days 9223372036854775807 microseconds'",
+        dict(months=2**31 - 1, days=2**31 - 1, micros=2**63 - 1),
+    ),
+    (
+        "(interval '-2147483648 months -2147483648 days -9223372036854775807 microseconds' - interval '1 microsecond')",
+        dict(months=-(2**31), days=-(2**31), micros=-(2**63)),
+    ),
+    (f"[{LARGE_INTERVAL}, null]", [LARGE_INTERVAL_VALUE, None]),
+    (f"[{LARGE_INTERVAL}, null]::interval[2]", [LARGE_INTERVAL_VALUE, None]),
+    (
+        f"[{{'span': {LARGE_INTERVAL}, 'at': time '24:00:00'}}, null]",
+        [dict(span=LARGE_INTERVAL_VALUE, at=86_400_000_000), None],
+    ),
+    ("[time '24:00:00', null]::time[2]", [86_400_000_000, None]),
+    (f"map([time '24:00:00'], [{LARGE_INTERVAL}])", [(86_400_000_000, LARGE_INTERVAL_VALUE)]),
+]
 LIMITS = DirectExchangeLimits(window_bytes=4096, frame_bytes=1024, frame_rows=3, frame_slots=2)
 
 
@@ -60,52 +85,132 @@ def test_analytical_values_and_nulls(expression, flight):
     )
     with vane.connect(backend="local", config={"threads": 1}) as connection:
         expected = connection.execute(sql).to_arrow_table()
-        spec = submission(connection, sql, partitions=3)
-        with InProcessTaskService(connection, spec, LIMITS) as service:
-            service.start()
-            if not flight:
-                actual = []
+        expected = exchange_expected(expected)
+        table = exchange_table(connection, sql, flight)
+        assert table.equals(expected.cast(table.schema))
+
+
+def exchange_expected(table):
+    # Native Arrow stores ordinary intervals in nanoseconds. The exchange
+    # preserves native microseconds and separate month/day components.
+    for index, field in enumerate(table.schema):
+        if field.type == pa.month_day_nano_interval():
+            values = [
+                None if value is None else dict(months=value.months, days=value.days, micros=value.nanoseconds // 1000)
+                for value in table.column(index).to_pylist()
+            ]
+            kind = pa.struct([("months", pa.int32()), ("days", pa.int32()), ("micros", pa.int64())])
+            table = table.set_column(index, field.name, pa.array(values, type=kind))
+    return table
+
+
+def exchange_table(connection, sql, flight, materialized_path=None):
+    spec = submission(connection, sql, partitions=3)
+    with InProcessTaskService(connection, spec, LIMITS) as service:
+        service.start()
+        if materialized_path is not None:
+            writer = native.MaterializedIO.write(
+                str(materialized_path), service.result, "client", 1 << 20, native.MaterializedIO.staging_bytes(1024)
+            )
+            try:
+
+                def write_status():
+                    service.pump(len(service.task_ids))
+                    return writer.status()
+
+                status = eventually(write_status, lambda value: value["done"])
+                assert status["error"] == ""
+            finally:
+                writer.close()
+            target = native.DirectChannel(spec.result_schema, native.DirectLimits(4096, 1024, 3, 2), 1, ["client"])
+            target.add_producer("reader")
+            target.seal_producers()
+            reader = native.MaterializedIO.read(
+                str(materialized_path),
+                target,
+                "reader",
+                1 << 20,
+                native.MaterializedIO.staging_bytes(1024),
+                status["object"],
+            )
+            actual = []
+            try:
                 while True:
-                    state, batch = next_batch(service)
+                    state, batch = eventually(lambda: target.poll("client"), lambda value: value[0] != "blocked")
                     if state == "end":
                         break
                     record = batch.to_arrow(["range", "v"])
                     record.validate(full=True)
                     actual.append(record)
                     batch.close()
-            else:
-                source = service.result
-                target = native.DirectChannel(spec.result_schema, native.DirectLimits(4096, 1024, 3, 2), 1, ["client"])
-                target.add_producer("flight")
-                target.seal_producers()
-                sender, receiver = [
-                    native.DirectFlight("127.0.0.1", "127.0.0.1", 1, native.DirectFlight.staging_per_link(1024), 1024)
-                    for _ in range(2)
-                ]
-                actual = []
-                try:
-                    sender.publish("analytical", source, "client")
-                    receiver.subscribe(sender.location, "analytical", target, "flight", 10)
+            finally:
+                reader.close()
+        elif not flight:
+            actual = []
+            while True:
+                state, batch = next_batch(service)
+                if state == "end":
+                    break
+                record = batch.to_arrow(["range", "v"])
+                record.validate(full=True)
+                actual.append(record)
+                batch.close()
+        else:
+            source = service.result
+            target = native.DirectChannel(spec.result_schema, native.DirectLimits(4096, 1024, 3, 2), 1, ["client"])
+            target.add_producer("flight")
+            target.seal_producers()
+            sender, receiver = [
+                native.DirectFlight("127.0.0.1", "127.0.0.1", 1, native.DirectFlight.staging_per_link(1024), 1024)
+                for _ in range(2)
+            ]
+            actual = []
+            try:
+                sender.publish("analytical", source, "client")
+                receiver.subscribe(sender.location, "analytical", target, "flight", 10)
 
-                    def poll():
-                        service.pump(len(service.task_ids))
-                        return target.poll("client")
+                def poll():
+                    service.pump(len(service.task_ids))
+                    return target.poll("client")
 
-                    while True:
-                        state, batch = eventually(poll, lambda item: item[0] != "blocked")
-                        if state == "end":
-                            break
-                        record = batch.to_arrow(["range", "v"])
-                        record.validate(full=True)
-                        actual.append(record)
-                        batch.close()
-                finally:
-                    receiver.close()
-                    sender.close()
-            table = pa.Table.from_batches(actual)
-            # Compare Arrow values directly: Python datetime cannot preserve
-            # nanoseconds without the optional pandas dependency.
-            assert table.equals(expected.cast(table.schema))
+                while True:
+                    state, batch = eventually(poll, lambda item: item[0] != "blocked")
+                    if state == "end":
+                        break
+                    record = batch.to_arrow(["range", "v"])
+                    record.validate(full=True)
+                    actual.append(record)
+                    batch.close()
+            finally:
+                receiver.close()
+                sender.close()
+        table = pa.Table.from_batches(actual, schema=native.arrow_schema(spec.result_schema, ["range", "v"]))
+        return table
+
+
+@pytest.mark.parametrize("expression,value", TEMPORAL_VALUES)
+@pytest.mark.parametrize("transport", ["direct", "flight", "materialized"])
+def test_lossless_temporal_values(tmp_path, expression, value, transport):
+    sql = f"select range, case when range % 3=0 then null else {expression} end v from range(13) order by range desc"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        table = exchange_table(
+            connection, sql, transport == "flight", tmp_path / "temporal.mat" if transport == "materialized" else None
+        )
+    assert table.to_pylist() == [dict(range=i, v=None if i % 3 == 0 else value) for i in reversed(range(13))]
+
+
+@pytest.mark.parametrize(
+    "expression,kind",
+    [
+        ("time '24:00:00'", pa.int64()),
+        (LARGE_INTERVAL, pa.struct([("months", pa.int32()), ("days", pa.int32()), ("micros", pa.int64())])),
+    ],
+)
+def test_empty_temporal_flight_preserves_lossless_schema(expression, kind):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        table = exchange_table(connection, f"select range, {expression} v from range(0)", True)
+    assert table.num_rows == 0
+    assert table.schema.field("v").type == kind
 
 
 def test_nested_borrowed_slice_keeps_entire_frame_accounted():

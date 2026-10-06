@@ -746,6 +746,8 @@ producer_owned_bytes
 
 排队采用 FIFO。单个需求超过 worker 硬限时立即拒绝；只是被其他查询占用时进入可取消队列，不保留部分预留。Pipelined 在准入期限内等待，成功后的预留持续到所有 worker 确认清理。FTE 每个 attempt 清理完后归还容量，再以新的队列位置申请下一批，不能不断抢在已经等待的 pipelined 图前面。重试保持已排队 task 的身份和次序；取消只移除等待项，尚存活的 owner 必须完成清理才能退还容量。第一版不抢占已运行任务；FIFO 可能牺牲一部分利用率来保证先来的图获得完整容量。
 
+Pipelined 的会话名额与整图 worker 资源分两步取得。取得会话名额后仍保持 `ADMISSION_WAIT`，编译、池准备及 worker 排队共用从请求创建时开始的准入期限，不在第二个队列重置期限。整图 worker 预留成功后才进入 `RUNNING` 并启动执行期限，随后 task/Flight 准备属于执行时间。排队超时返回 `RequestQueueTimeout`；执行超时返回 `RequestExecutionTimeout`。计时统计把 worker 等待计入 queue_wait，尚未执行就退出的请求不生成 execution sample；复制出来的旧准入定时器回调不能取消已经开始的执行。FTE 按查询名额启动冻结及阶段执行，已运行查询的 attempt 排队和重试继续计入其执行期限。
+
 FTE 的取消检查、入队和 attempt 发布与取消共享同一调度锁；取消移除等待项后，调度线程不得再次为该查询入队。`close()` 等待调度线程退出后再完成资源回收，后续查询不受已取消查询的队首等待项阻塞。
 
 FTE 重试同样消耗准入和预算，不能成为不受限的额外任务。高优先级也不能突破硬内存上限。CPU、公平性、native 内存和慢结果消费均纳入混跑验证。
@@ -838,9 +840,11 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | Python、AI 与 GPU UDF | 明确拒绝 | 按 backend 验证资源、取消、类型及 FTE 重放能力 |
 | COPY、DataSink、DML 与扩展写入 | 明确拒绝 | 独立定义写入提交和副作用语义 |
 
-P4 使用 `vane.analytical-types:2`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
+P4 使用 `vane.analytical-types:3`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 
-DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow 编码。DECIMAL 按 decimal128 传输；HUGEINT 使用 `decimal256(39,0)`，覆盖 `[-2^127, 2^127-1]`，包括嵌套子值。编码将原生 128 位缓冲符号扩展为 256 位，解码检查 signed 128-bit 边界后才恢复 native 值。旧 profile 不再接受，Arrow codec 源码也纳入 fragment build identity。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant，interval 保留 months/days/microseconds。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；计算过程的输入向量和有界测量临时空间属于 operator/staging 域。
+DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow 编码。DECIMAL 按 decimal128 传输；HUGEINT 使用 `decimal256(39,0)`，覆盖 `[-2^127, 2^127-1]`，包括嵌套子值。编码将原生 128 位缓冲符号扩展为 256 位，解码检查 signed 128-bit 边界后才恢复 native 值。TIME 使用 `int64` 微秒，允许闭区间 `[0, 86400000000]`，因此保留合法的 `24:00:00`。INTERVAL 使用 `struct<months:int32, days:int32, micros:int64>`，在 native Arrow exporter 之前转换，避免微秒乘 1000 溢出；非 NULL interval 的三个分量均不得为 NULL。两种存储表示同样用于公开 Ray Arrow 结果和嵌套子值，调用方可在 SQL 中转为 VARCHAR 获得时间文本。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant。
+
+旧 profile 不再接受，Arrow codec 源码纳入 fragment build identity。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
 
 算子检查依据实际物理函数、scan 和 owned subplan，不能只看 SELECT 关键字。阻塞聚合、sort 和 join 可以合法等待完整输入；pipelined 只承诺允许的执行重叠，不承诺每条 SQL 都早产出。
 
