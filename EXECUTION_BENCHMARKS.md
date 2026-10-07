@@ -142,3 +142,68 @@ scales and concurrency patterns, without new admission, memory, delivery or
 recovery failures. A single machine's small-input timings are not sufficient to
 change global defaults. Cross-platform, multi-node, GPU/model UDF and production
 storage qualification remain separate work.
+
+## Initial measurements (2026-10-07)
+
+The runner at `0abbe6dfb6` completed two runs on Linux x86-64, an Intel Xeon
+E5-2686 v4 host, Python 3.12.14, Ray 2.59.0 and PyArrow 25.0.1. Each cluster
+exposed two CPUs to Ray; local queries used two native threads. The installed
+non-editable native artifact had SHA-256
+`ccde6aecab29338254421295c23b340743ddfb69936f8e14a8fbbf646ed961f4`.
+Both runs used seed 970, three repetitions and one warmup per workload/mode.
+
+- 100000 rows: all scenarios, `default` then `compact`; 134 samples including
+  20 warmups, 20 full-result validations and six injected worker losses.
+- 1000000 rows: `--profiles compact default --scenarios warm`; 80 samples
+  including 20 warmups and 20 full-result validations.
+
+All samples succeeded and ownership checks passed. Input generation and
+correctness checks had already warmed filesystem caches. Ray's object store
+used `/tmp` on this host; result data travelled through Vane's Flight/store
+paths. These are single-host development measurements, with three observations
+per cell, rather than hardware-normalized or production tail-latency claims.
+
+Median end-to-end times in milliseconds for the 100000-row run:
+
+| Mode, default capacities | Cold tiny | Warm tiny | Scan | Aggregate | Join + TopN |
+|---|---:|---:|---:|---:|---:|
+| Local | 2.07 | 1.30 | 31.03 | 7.72 | 13.18 |
+| Ray pipelined | 1898.42 | 976.68 | 1121.57 | 1075.48 | 1119.87 |
+| Ray FTE | 1960.07 | 1052.37 | 1757.57 | 1426.55 | 1582.42 |
+
+Cold tiny excludes connection construction and the separate 4.15-second Ray
+startup in this run. For warm tiny, the pipelined median `query()` return was
+953.60 ms and its first batch 956.63 ms; FTE returned at 938.79 ms and delivered
+its first batch at 1033.54 ms. This locates most small-query latency before
+`query()` returns. These measurements do not distinguish planning, actor
+creation, RPC preparation and transport setup within that interval.
+
+Scan medians across both data scales:
+
+| Mode / profile | 100000 rows, ms | 1000000 rows, ms | 1000000 rows, output MiB/s |
+|---|---:|---:|---:|
+| Local | 31.03 | 253.14 | 142.49 |
+| Pipelined / default | 1121.57 | 2410.93 | 14.96 |
+| Pipelined / compact | 1317.68 | 4492.06 | 8.03 |
+| FTE / default | 1757.57 | 5536.41 | 6.51 |
+| FTE / compact | 2254.52 | 10972.05 | 3.29 |
+
+For 100000 rows at 50000 consumer rows/second, default pipelined/FTE scans took
+2890.74/3429.23 ms. During mixed execution, the pipelined scan took 2874.75 ms
+and the FTE aggregate 1409.39 ms; both completed without starving admission.
+Default FTE recovery took 2519.40 ms versus a 1421.31 ms control median. The
+median paired additional time was 1104.46 ms. Every injected failure retried
+the affected task exactly once with a fixed input identity and a new fence.
+
+The retained-batch scan snapshot reserved 5 MiB of worker exchange capacity and
+6.25 MiB of staging with defaults, versus 320 KiB and 2.5 MiB for `compact`.
+Operator reservations were 128 MiB in both cases. This is a reservation
+comparison, not a process-memory saving measurement.
+
+**Capacity decision:** retain the current defaults (1 MiB channel window,
+64 KiB frame, 1024 frame rows, 16 slots). The compact profile reduced buffer
+reservations but made the 1-million-row scan about 1.86 times slower in
+pipelined mode and 1.98 times slower in FTE. It did not show a consistent latency
+benefit on smaller queries. No global capacity or timeout values changed.
+The next performance investigation should break down the roughly one-second
+warm Ray submission interval before choosing an optimization.
