@@ -263,6 +263,8 @@ def test_slow_cleanup_keeps_renewal_admission_and_quota_independent(tmp_path, mo
                 started = time.monotonic()
                 live.renew()
                 other.collect_expired()  # A second pool cannot steal cleanup.
+                if cleanup == "orphan":
+                    assert not victim.directory.exists()  # Deletion alone does not retire its allocation.
                 extra = other.reserve("new")
                 assert other.snapshot() == {"queries": 3, "reserved_bytes": 6144}
                 with pytest.raises(RuntimeError, match="capacity"):
