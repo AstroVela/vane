@@ -549,21 +549,21 @@ def test_real_sdk_through_vane_worker(server, api, backend):
         assert all(body["questions"] == QUESTIONS for _, body, _ in calls)
 
 
-@pytest.mark.real_ray
-@pytest.mark.parametrize("backend", [None, "ray_task"])
-def test_ray_transports_json_text_and_application_credentials(ray_local, server, monkeypatch, backend):
+@pytest.mark.parametrize("backend", [None, "subprocess_task"])
+def test_native_workers_preserve_json_text_and_application_credentials(server, monkeypatch, backend):
     url, calls = server
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
     with vane.connect() as connection:
         source = connection.sql("SELECT * FROM (VALUES (1, 'first'), (2, NULL), (3, 'second')) AS t(id, text)")
         result = source.jev(
             vane.col("text"), questions=QUESTIONS, base_url=url, batch_size=2, max_retries=0, execution_backend=backend
         )
-        assert ("ray_actor" if backend is None else backend) in result.explain()
-        # Node workers were started by ray_local before this server fixture
-        # configured credentials. The expression must carry its own snapshot.
+        assert ("subprocess_actor" if backend is None else backend) in result.explain()
+        assert calls == []
+        # Workers inherit the changed environment at execution time. The
+        # expression must carry the credentials captured when it was built.
         monkeypatch.setenv("TYPESAFE_API_KEY", "changed-after-binding")
         rows = result.order("id").fetchall()
+        assert [row[0] for row in rows] == [1, 2, 3]
         assert [json.loads(row[-1]) if row[-1] else None for row in rows] == [_response(), None, _response()]
         assert all(auth == "Bearer local-jev-test" for _, _, auth in calls)
         assert len(calls) == 2
@@ -807,45 +807,47 @@ def test_sql_rejects_invalid_model_and_error_policy(argument):
             connection.sql(f"SELECT ai_jev(NULL, {_SQL_QUESTIONS}, {argument})")
 
 
-def test_sql_plan_round_trip_preserves_client_configuration(server, monkeypatch):
-    from tests.ai.test_expression_ai_sql import _execute_ai_physical_plan, _round_trip_ai_plan
-
+def test_sql_native_metadata_and_execution_preserve_client_configuration(server, monkeypatch):
     url, calls = server
     with vane.connect() as connection:
-        result = connection.sql(
-            f"""SELECT id, ai_jev(struct_pack(text := text, id := id), {_SQL_QUESTIONS}, model := 'jev-test',
+        sql = f"""SELECT id, ai_jev(struct_pack(text := text, id := id), {_SQL_QUESTIONS}, model := 'jev-test',
                        options := struct_pack(base_url := '{url}', batch_size := 2, max_retries := 0)) AS judgment
                 FROM (VALUES (1, 'first'), (2, 'second')) t(id, text)"""
-        )
-        target, physical, serialized = _round_trip_ai_plan(result)
-        try:
-            monkeypatch.setenv("TYPESAFE_API_KEY", "changed-after-binding")
-            monkeypatch.setenv("TYPESAFE_BASE_URL", "https://unreachable.invalid")
-            node = physical.collect_udf_nodes()[0]
-            payload = node["payload"]
-            assert payload["input_names"] == ["state"]
-            assert payload["ai_provider"] == "typesafe"
-            assert payload["ai_model"] == "jev-test"
-            assert payload["ai_return_type"] == "VARCHAR"
-            assert payload["batch_size"] == 2
-            table = _execute_ai_physical_plan(target, physical)
-            assert [json.loads(value) for value in table.column(1).to_pylist()] == [_response(), _response()]
-            assert 0 < len(serialized) < 1_000_000
-        finally:
-            target.close()
+        nodes = connection.sql(sql)._collect_udf_metadata()
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert node["execution_backend"] == "subprocess_actor"
+        payload = node["payload"]
+        assert payload["input_names"] == ["state"]
+        assert payload["ai_provider"] == "typesafe"
+        assert payload["ai_model"] == "jev-test"
+        assert payload["ai_return_type"] == "VARCHAR"
+        assert payload["batch_size"] == 2
+        assert calls == []
+        # Metadata inspection may bind a separate plan. Freeze configuration
+        # for this execution before changing the application's environment.
+        connection.execute(sql)
+        monkeypatch.setenv("TYPESAFE_API_KEY", "changed-after-binding")
+        monkeypatch.setenv("TYPESAFE_BASE_URL", "https://unreachable.invalid")
+        rows = sorted(connection.fetchall())
+        assert [row[0] for row in rows] == [1, 2]
+        assert [json.loads(row[1]) for row in rows] == [_response(), _response()]
     assert sorted(body["state"]["id"] for _, body, _ in calls) == [1, 2]
+    assert all(body["model"] == "jev-test" for _, body, _ in calls)
     assert all(auth == "Bearer local-jev-test" for _, _, auth in calls)
 
 
-@pytest.mark.real_ray
-def test_sql_ray_actor_preserves_rows_and_application_credentials(ray_local, server, monkeypatch):
+def test_sql_native_actor_preserves_rows_and_application_credentials(server, monkeypatch):
     url, calls = server
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
     with vane.connect() as connection:
         sql = f"""SELECT id, ai_jev(state, {_SQL_QUESTIONS}, options := struct_pack(
                     base_url := '{url}', batch_size := 2, actor_number := 2, max_retries := 0)) AS judgment
                 FROM (VALUES (1, 'first'), (2, NULL), (3, 'second')) t(id, state) ORDER BY id"""
-        assert "ray_actor" in connection.sql(sql).explain()
+        nodes = connection.sql(sql)._collect_udf_metadata()
+        assert len(nodes) == 1
+        assert nodes[0]["execution_backend"] == "subprocess_actor"
+        assert nodes[0]["payload"]["actor_number"] == 2
+        assert calls == []
         # execute binds once before returning a result; a lazy Relation may be
         # rebound when composing it or asking for another physical plan.
         connection.execute(sql)
