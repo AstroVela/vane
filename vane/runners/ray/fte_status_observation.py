@@ -74,8 +74,8 @@ class FteStatusObservationRuntime:
                 watcher._settled.set()
 
     async def dispatch(self, function: Any, *args: Any) -> Any:
-        # Status callbacks retain their observation slot. Failure callbacks
-        # also pass this gate, so neither path can grow the executor queue.
+        # Bound executor submissions until the callback actually returns,
+        # including after an observation has passed its own event barrier.
         async with self.dispatch_slots:
             return await self.loop.run_in_executor(self.executor, function, *args)
 
@@ -139,6 +139,7 @@ class FteAttemptStatusWatcher:
         self._started = False
         self._pending_wait: asyncio.Task[Any] | None = None
         self._slot_owned = False
+        self._drains: set[asyncio.Task[None]] = set()
 
     def start(self) -> bool:
         if not callable(getattr(self.worker, "fte_wait_task_status_async", None)):
@@ -182,22 +183,35 @@ class FteAttemptStatusWatcher:
     def shutdown_timeout_s(self) -> float:
         return max(5.0, self.wait_timeout_s + 5.0)
 
-    def _enqueue_and_drain(self, event: FteEvent) -> Future[None]:
+    def _enqueue_and_drain(self, event: FteEvent, barrier_ready: Future[Future[None]]) -> None:
         try:
             self.scheduler.enqueue(event)
             completion = self.scheduler.enqueue_drain_barrier()
+            barrier_ready.set_result(completion)
             self.scheduler.drain()
-            return completion
         except Exception as exc:
             self.scheduler.fail(f"FTE status watcher failed while handling {event.event_type}: {exc}")
             raise
 
-    async def _publish(self, event: FteEvent) -> None:
+    async def _dispatch(self, event: FteEvent, barrier_ready: Future[Future[None]]) -> None:
         assert self._runtime is not None
-        completion = await self._runtime.dispatch(self._enqueue_and_drain, event)
-        # drain() returns immediately if another thread owns it. Keep the
-        # observation slot and terminal payload until that drainer processes
-        # this event, without occupying an executor thread while it does so.
+        try:
+            await self._runtime.dispatch(self._enqueue_and_drain, event, barrier_ready)
+        except BaseException as exc:
+            if not barrier_ready.done():
+                barrier_ready.set_exception(exc)
+            # Scheduler drain failures settle pending barriers and fail the
+            # scheduler. A failure after this barrier cannot revoke a status
+            # that has already been delivered.
+
+    async def _publish(self, event: FteEvent) -> None:
+        barrier_ready: Future[Future[None]] = Future()
+        drain = asyncio.create_task(self._dispatch(event, barrier_ready))
+        self._drains.add(drain)
+        drain.add_done_callback(self._drains.discard)
+        completion = await asyncio.wrap_future(barrier_ready)
+        # Follow this event's causal barrier, even when our own drain keeps
+        # processing later events. Retain that drain separately for teardown.
         await asyncio.wrap_future(completion)
 
     @staticmethod
@@ -224,7 +238,9 @@ class FteAttemptStatusWatcher:
 
         budget = configured_ray_get_timeout_s(None)
         try:
-            if budget is None:
+            # Semaphore.acquire() does not suspend when capacity is available.
+            # wait_for(..., 0) would cancel it before even trying to acquire.
+            if budget is None or not self._runtime.slots.locked():
                 await acquire()
             else:
                 await asyncio.wait_for(acquire(), timeout=budget)
@@ -311,3 +327,5 @@ class FteAttemptStatusWatcher:
         finally:
             if not self.completion.done():
                 self.completion.set_exception(InterruptedError("FTE status observation stopped"))
+            if self._drains:
+                await asyncio.gather(*self._drains)

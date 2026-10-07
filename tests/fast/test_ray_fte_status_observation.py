@@ -228,6 +228,83 @@ def test_stop_does_not_abandon_terminal_dispatch_or_shared_completion(observatio
     assert watcher.completion.result()["stats"] == [42]
 
 
+@pytest.mark.parametrize("later_event_fails", [False, True])
+def test_own_drainer_publishes_terminal_before_later_events_finish(observations, later_event_fails):
+    terminal_entered = threading.Event()
+    release_terminal = threading.Event()
+    later_entered = threading.Event()
+    release_later = threading.Event()
+    next_wait_entered = threading.Event()
+    release_next_wait = Future()
+    exited = threading.Event()
+
+    class Worker(_Worker):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
+            if task_id["partition_id"] == 1:
+                next_wait_entered.set()
+                await asyncio.shield(asyncio.wrap_future(release_next_wait))
+            return {"task_id": task_id, "state": "FINISHED", "version": 1, "stats": [42]}
+
+    def status_changed(event):
+        if event.attempt_id.partition_id == 0:
+            terminal_entered.set()
+            assert release_terminal.wait(5.0)
+        elif event.attempt_id.partition_id == 99:
+            later_entered.set()
+            assert release_later.wait(5.0)
+            if later_event_fails:
+                raise RuntimeError("later unrelated event failed")
+
+    scheduler = FteQueryScheduler("status-query")
+    scheduler.set_handlers(FteEventHandlers(on_task_status_changed=status_changed))
+    runtime = FteStatusObservationRuntime(capacity=1, dispatch_workers=1)
+    watcher = observations(Worker(), runtime=runtime, scheduler=scheduler)
+    watcher.on_exit = lambda _watcher: exited.set()
+    second = None
+    watcher.start()
+    try:
+        assert terminal_entered.wait(1.0)
+        # Enqueue from outside the drainer so this event is not a synchronous
+        # descendant of the terminal event covered by its existing barrier.
+        later = FteTaskAttemptId(FteTaskId("status-query", 0, 99), 0)
+        scheduler.enqueue(
+            TaskStatusChanged.from_status("status-query", later, {"task_id": later.to_dict(), "state": "RUNNING"})
+        )
+        release_terminal.set()
+        assert later_entered.wait(1.0)
+        assert watcher.completion.result(timeout=1.0)["stats"] == [42]
+
+        watcher.stop()
+        watcher.join(0.05)
+        assert watcher.is_alive()
+        assert not exited.is_set()
+        with pytest.raises(RuntimeError, match="live watchers"):
+            runtime.close()
+
+        async def capacity():
+            return runtime.slots.locked(), runtime.dispatch_slots.locked()
+
+        assert asyncio.run_coroutine_threadsafe(capacity(), runtime.loop).result(timeout=1.0) == (False, True)
+        if not later_event_fails:
+            second = observations(Worker(), partition=1, runtime=runtime, scheduler=scheduler)
+            second.start()
+            assert next_wait_entered.wait(1.0)
+    finally:
+        release_terminal.set()
+        release_later.set()
+        release_next_wait.set_result(None)
+    watcher.join(2.0)
+    assert not watcher.is_alive()
+    assert exited.is_set()
+    assert watcher.completion.result()["state"] == "FINISHED"
+    if later_event_fails:
+        assert scheduler.stats().state == "FAILED"
+        assert "later unrelated event failed" in str(scheduler.stats().failure_reason)
+    else:
+        assert second is not None
+        assert second.completion.result(timeout=2.0)["state"] == "FINISHED"
+
+
 @pytest.mark.parametrize("drainer_fails", [False, True])
 def test_external_scheduler_drainer_keeps_status_pending_and_capacity_owned(observations, drainer_fails):
     drainer_entered = threading.Event()
@@ -320,6 +397,92 @@ def test_external_scheduler_drainer_keeps_status_pending_and_capacity_owned(obse
         assert second.completion.result()["state"] == "FINISHED"
         assert worker.calls == seen == [0, 1]
         assert drainer_errors == failures == []
+
+
+@pytest.mark.parametrize("initially_full", [False, True])
+def test_zero_timeout_observes_status_when_capacity_becomes_available(observations, monkeypatch, initially_full):
+    from vane.runners.ray import fte_status_observation
+
+    budget_checked = threading.Event()
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0")
+    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
+    original_budget = fte_status_observation.configured_ray_get_timeout_s
+
+    def checked_budget(timeout):
+        budget = original_budget(timeout)
+        budget_checked.set()
+        return budget
+
+    monkeypatch.setattr(fte_status_observation, "configured_ray_get_timeout_s", checked_budget)
+
+    class Worker(_Worker):
+        calls = 0
+
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
+            self.calls += 1
+            return {"task_id": task_id, "state": "FINISHED", "version": 1}
+
+    runtime = FteStatusObservationRuntime(capacity=1, dispatch_workers=1)
+    worker = Worker()
+    watcher = observations(worker, runtime=runtime)
+    held = initially_full
+    if held:
+        asyncio.run_coroutine_threadsafe(runtime.slots.acquire(), runtime.loop).result(timeout=1.0)
+    try:
+        watcher.start()
+        assert budget_checked.wait(1.0)
+        if held:
+            assert worker.calls == 0
+            assert not watcher.completion.done()
+            runtime.loop.call_soon_threadsafe(runtime.slots.release)
+            held = False
+        assert watcher.completion.result(timeout=2.0)["state"] == "FINISHED"
+        watcher.join(1.0)
+        assert not watcher.is_alive()
+        assert worker.calls == 1
+    finally:
+        if held:
+            runtime.loop.call_soon_threadsafe(runtime.slots.release)
+
+
+@pytest.mark.parametrize("stop_wait", [False, True])
+def test_zero_timeout_capacity_wait_honors_deadline_and_stop(observations, monkeypatch, stop_wait):
+    from vane.runners.ray import fte_status_observation
+
+    budget_checked = threading.Event()
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0")
+    if stop_wait:
+        monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
+    original_budget = fte_status_observation.configured_ray_get_timeout_s
+
+    def checked_budget(timeout):
+        budget = original_budget(timeout)
+        budget_checked.set()
+        return budget
+
+    monkeypatch.setattr(fte_status_observation, "configured_ray_get_timeout_s", checked_budget)
+
+    class Worker(_Worker):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
+            pytest.fail("status RPC must not start while observation capacity is full")
+
+    runtime = FteStatusObservationRuntime(capacity=1, dispatch_workers=1)
+    watcher = observations(Worker(), runtime=runtime)
+    asyncio.run_coroutine_threadsafe(runtime.slots.acquire(), runtime.loop).result(timeout=1.0)
+    try:
+        if not stop_wait:
+            monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() + 0.1))
+        watcher.start()
+        assert budget_checked.wait(1.0)
+        if stop_wait:
+            watcher.stop()
+        expected_error = InterruptedError if stop_wait else QueryDeadlineExceeded
+        with pytest.raises(expected_error):
+            watcher.completion.result(timeout=2.0)
+        watcher.join(1.0)
+        assert not watcher.is_alive()
+    finally:
+        runtime.loop.call_soon_threadsafe(runtime.slots.release)
 
 
 def test_soft_status_timeout_retries_without_reporting_worker_loss(observations):
