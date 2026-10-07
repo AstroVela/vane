@@ -240,14 +240,35 @@ def compare(workload, expected, actual):
         raise AssertionError(f"{workload.name}: values, order or duplicate counts differ")
 
 
-def measure(connection, workload, config, mode, expected, *, paced=False, ready=None):
+def consumer_pause(result, seconds, deadline, stop):
+    """Retain the batch without hiding a failed query or delaying mixed teardown."""
+    from vane.execution.result_delivery import ResultDeliveryTimeout
+
+    until = time.monotonic() + seconds
+    while True:
+        result.check_preparation()
+        if stop.is_set():
+            raise InterruptedError("benchmark consumption canceled")
+        now = time.monotonic()
+        if now >= deadline:
+            raise ResultDeliveryTimeout("benchmark result delivery deadline exceeded")
+        result.context.check()
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return
+        stop.wait(min(remaining, max(0, deadline - time.monotonic()), 0.05))
+
+
+def measure(connection, workload, config, mode, expected, *, paced=False, ready=None, stop=None):
     """Time public query/read/close; no diagnostic RPCs or full-table comparison."""
     result, batch = None, None
     captured = []
+    stop = threading.Event() if stop is None else stop
     start = time.perf_counter()
     try:
         result = connection.query(workload.sql, options=options(config, mode), rows_per_batch=config.batch_rows)
         returned = time.perf_counter()
+        delivery_deadline = time.monotonic() + config.deadline
         first = None
         rows = byte_count = batches = 0
         pause_seconds = 0.0
@@ -272,7 +293,7 @@ def measure(connection, workload, config, mode, expected, *, paced=False, ready=
                 captured.extend(batch.to_pylist())
             if paced:
                 before_pause = time.perf_counter()
-                time.sleep(batch.num_rows / config.consumer_rows_per_second)
+                consumer_pause(result, batch.num_rows / config.consumer_rows_per_second, delivery_deadline, stop)
                 pause_seconds += time.perf_counter() - before_pause
             batch = None
         drained = time.perf_counter()
@@ -286,6 +307,7 @@ def measure(connection, workload, config, mode, expected, *, paced=False, ready=
             raise AssertionError(f"query did not succeed: {result.execution_state}")
         seconds = ended - start
         return {
+            "query_id": result.query_id,
             "started_at_monotonic": start,
             "query_return_seconds": returned - start,
             "first_batch_seconds": first - start if first is not None else None,
@@ -305,6 +327,61 @@ def measure(connection, workload, config, mode, expected, *, paced=False, ready=
         batch = None
         if result is not None:
             close_result(result)
+
+
+@contextmanager
+def worker_occupancy(connection, intervals):
+    """Observe charged worker capacity, not query submission or queue wait.
+
+    Both hooks run under the admission condition, so another thread cannot
+    release or reacquire a token between its ledger change and the timestamp.
+    No worker RPCs or polling are added to the measured queries.
+    """
+    manager = connection.query_runtime.pool.admission
+    acquire, release = manager.try_acquire, manager.release
+    active = {}
+
+    def observed_acquire(token, query, demands):
+        with manager.condition:
+            admitted = acquire(token, query, demands)
+            if admitted and token not in active:
+                value = {
+                    "token": token,
+                    "query_id": query,
+                    "workers": {index: dict(demand) for index, demand in demands.items()},
+                    "acquired_at_monotonic": time.perf_counter(),
+                    "released_at_monotonic": None,
+                }
+                active[token] = value
+                intervals.append(value)
+            return admitted
+
+    def observed_release(token):
+        with manager.condition:
+            if token in active:
+                active.pop(token)["released_at_monotonic"] = time.perf_counter()
+            release(token)
+
+    with patch.object(manager, "try_acquire", observed_acquire), patch.object(manager, "release", observed_release):
+        yield
+
+
+def mixed_overlap(intervals, pipeline_query_id, fte_query_id):
+    """Longest proven overlap of reservations on at least one shared worker."""
+    by_query = [[v for v in intervals if v["query_id"] == query] for query in (pipeline_query_id, fte_query_id)]
+    if any(not values for values in by_query) or any(v["released_at_monotonic"] is None for v in intervals):
+        raise AssertionError("mixed worker reservation evidence is incomplete")
+    overlap = max(
+        (
+            min(left["released_at_monotonic"], right["released_at_monotonic"])
+            - max(left["acquired_at_monotonic"], right["acquired_at_monotonic"])
+            for left in by_query[0]
+            for right in by_query[1]
+            if left["workers"].keys() & right["workers"].keys()
+        ),
+        default=0,
+    )
+    return max(0, overlap)
 
 
 @contextmanager
@@ -548,8 +625,16 @@ def profile_samples(connection, config, profile, modes, workloads, expected, rec
                 idle(connection)
     if "mixed" in config.scenarios and profile != "local":
         for iteration in range(config.repetitions):
-            with connection.cursor() as pipeline, connection.cursor() as recovery, ThreadPoolExecutor(2) as executor:
+            evidence = {"profile": profile, "iteration": iteration, "worker_reservations": []}
+            report.setdefault("mixed_pairs", []).append(evidence)
+            with (
+                worker_occupancy(connection, evidence["worker_reservations"]),
+                connection.cursor() as pipeline,
+                connection.cursor() as recovery,
+                ThreadPoolExecutor(2) as executor,
+            ):
                 ready = threading.Event()
+                stop = threading.Event()
                 long_query = executor.submit(
                     recorder.sample,
                     pipeline,
@@ -561,6 +646,7 @@ def profile_samples(connection, config, profile, modes, workloads, expected, rec
                     expected["scan"],
                     paced=True,
                     ready=ready,
+                    stop=stop,
                 )
                 try:
                     deadline = time.monotonic() + config.deadline
@@ -569,16 +655,20 @@ def profile_samples(connection, config, profile, modes, workloads, expected, rec
                             long_query.result()
                         if time.monotonic() >= deadline:
                             raise TimeoutError("mixed scan did not deliver its first batch")
-                    short, _ = recorder.sample(
+                    _, short_result = recorder.sample(
                         recovery, cases["aggregate"], "fte", profile, "mixed", iteration, expected["aggregate"]
                     )
-                    long_value, _ = long_query.result(timeout=config.deadline)
-                    if (
-                        short["started_at_monotonic"]
-                        >= long_value["started_at_monotonic"] + long_value["total_seconds"]
-                    ):
-                        raise AssertionError("mixed queries did not overlap; use more rows or a slower consumer")
+                    _, long_result = long_query.result(timeout=config.deadline)
+                    evidence.update(pipelined_query_id=long_result.query_id, fte_query_id=short_result.query_id)
+                    evidence["max_shared_worker_overlap_seconds"] = mixed_overlap(
+                        evidence["worker_reservations"], long_result.query_id, short_result.query_id
+                    )
+                    if evidence["max_shared_worker_overlap_seconds"] <= 0:
+                        raise AssertionError(
+                            "mixed queries did not overlap in worker reservations; use more rows or a slower consumer"
+                        )
                 finally:
+                    stop.set()
                     pipeline.interrupt()
                     recovery.interrupt()
             idle(connection)

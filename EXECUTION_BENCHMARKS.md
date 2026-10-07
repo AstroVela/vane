@@ -84,11 +84,20 @@ response to a failure.
 - **Slow client:** the streaming scan retains each batch while sleeping for
   `batch_rows / consumer_rows_per_second`. This is a row-rate limit independent
   of frame boundaries. Requested and actual sleep are reported. The default is
-  50000 rows/second; consumer pauses remain part of end-to-end latency.
+  50000 rows/second; consumer pauses remain part of end-to-end latency. Pauses
+  check query/delivery failures and the delivery deadline at most every 50 ms;
+  canceling a mixed run wakes a sleeping consumer immediately. Resource cleanup
+  is still included in failure-report latency.
 - **Mixed:** a paced pipelined scan delivers its first batch, then a sibling
-  cursor submits an FTE aggregate to the same pool. The runner checks that the
-  executions overlap and reports each query independently. A run with too few
-  rows to overlap fails rather than reporting sequential execution as mixed.
+  cursor submits an FTE aggregate to the same pool. The runner records successful
+  worker-capacity reservations and releases under the admission lock, including
+  query IDs, worker IDs, demands and monotonic timestamps in `mixed_pairs`.
+  `max_shared_worker_overlap_seconds` must be positive: it is the longest overlap
+  of one reservation from each query on a shared worker. Submission and queue
+  wait do not count. This proves concurrent charged worker capacity, including
+  retained pipelined output; it does not measure simultaneous CPU execution.
+  A run with too few rows to overlap fails with its reservation evidence saved.
+  The hooks add local timestamp recording to mixed samples, without worker RPCs.
 - **Recovery:** an FTE aggregate is paired with an otherwise identical query
   whose first dispatched downstream worker is killed before commit. Control and
   fault order alternate. The result must match, and the affected task must retry
@@ -189,8 +198,10 @@ Scan medians across both data scales:
 | FTE / compact | 2254.52 | 10972.05 | 3.29 |
 
 For 100000 rows at 50000 consumer rows/second, default pipelined/FTE scans took
-2890.74/3429.23 ms. During mixed execution, the pipelined scan took 2874.75 ms
-and the FTE aggregate 1409.39 ms; both completed without starving admission.
+2890.74/3429.23 ms. The historical mixed samples recorded 2874.75 ms for the
+pipelined scan and 1409.39 ms for the FTE aggregate. Their runner checked only
+submission overlap, so these timings do not establish concurrent worker use;
+rerun with `mixed_pairs` evidence before treating them as mixed acceptance.
 Default FTE recovery took 2519.40 ms versus a 1421.31 ms control median. The
 median paired additional time was 1104.46 ms. Every injected failure retried
 the affected task exactly once with a fixed input identity and a new fence.
