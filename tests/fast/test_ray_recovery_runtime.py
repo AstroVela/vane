@@ -643,9 +643,19 @@ def test_expired_coordinator_lease_cancels_real_worker_and_reclaims_orphans(tmp_
         while ray.get(worker.resources_snapshot.remote())["reservations"]:
             assert time.monotonic() < deadline
             time.sleep(0.02)
-        store.collect_expired()
+        # The worker drops its native reservation before collecting the
+        # orphan. A competing collector can still hold the query lock after
+        # deleting the data directory, until it retires the external quota.
+        # A collection pass skips that owner; wait for the persisted outcome.
+        while True:
+            store.collect_expired()
+            remaining = store.snapshot()
+            if remaining == {"queries": 0, "reserved_bytes": 0}:
+                break
+            assert time.monotonic() < deadline, remaining
+            time.sleep(0.02)
         assert not lease.directory.exists()
-        assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+        assert not lease.lock_path.exists()
     finally:
         ray.kill(worker, no_restart=True)
         lease.guard.close()
