@@ -19,9 +19,9 @@ if TYPE_CHECKING:
     import ray
 
     from vane.runners.fte import FteFragmentExecution, SplitAssigner
-    from vane.runners.fte.fte_scheduler import FteAttemptStatusWatcher
     from vane.runners.ray.fragment_worker_client import RayWorkerActorHandle
     from vane.runners.ray.fte_fragment_scheduler import FteWorkerReservationFuture
+    from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
 
 _PressureKey = TypeVar("_PressureKey")
