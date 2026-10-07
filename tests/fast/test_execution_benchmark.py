@@ -6,8 +6,12 @@
 import json
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -177,3 +181,124 @@ def test_empty_stream_has_no_first_batch_and_releases_ownership(tmp_path):
         assert sample["rows"] == sample["batches"] == sample["output_rows_per_second"] == 0
         assert result.execution_state == "SUCCEEDED"
         benchmark.idle(connection)
+
+
+@pytest.mark.parametrize("outcome", ["deadline", "query_cancel", "delivery_cancel", "stop"])
+def test_consumer_pause_checks_deadline_and_cancellation_without_reading_ahead(monkeypatch, outcome):
+    from vane.execution.request_admission import RequestCancelled
+    from vane.execution.result_delivery import ResultDeliveryCancelled, ResultDeliveryTimeout
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(benchmark.time, "monotonic", lambda: clock.now)
+
+    def check_query():
+        if outcome == "query_cancel" and clock.now >= 0.05:
+            raise RequestCancelled("query canceled")
+
+    def check_delivery():
+        if outcome == "delivery_cancel" and clock.now >= 0.05:
+            raise ResultDeliveryCancelled("delivery canceled")
+
+    def wait(seconds):
+        clock.now += seconds
+
+    result = SimpleNamespace(context=SimpleNamespace(check=check_query), check_preparation=check_delivery)
+    stop = SimpleNamespace(is_set=lambda: outcome == "stop" and clock.now >= 0.05, wait=wait)
+    error = {
+        "deadline": ResultDeliveryTimeout,
+        "query_cancel": RequestCancelled,
+        "delivery_cancel": ResultDeliveryCancelled,
+        "stop": InterruptedError,
+    }[outcome]
+    with pytest.raises(error):
+        benchmark.consumer_pause(result, 2048, 0.1, stop)
+    assert clock.now <= 0.1
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("outcome", ["deadline", "interrupt", "cancel", "stop"])
+def test_paced_native_query_releases_batch_promptly_on_timeout_or_cancellation(tmp_path, outcome):
+    from vane.execution.request_admission import RequestCancelled, RequestExecutionTimeout
+    from vane.execution.result_delivery import ResultDeliveryCancelled, ResultDeliveryTimeout
+
+    config = benchmark.Configuration(
+        tmp_path,
+        modes=("local",),
+        scenarios=("slow",),
+        deadline=0.1 if outcome == "deadline" else 60,
+        consumer_rows_per_second=1,
+    )
+    workload = benchmark.Workload("scan", "select range from range(20)", ("range",), streaming=True)
+    ready, stop = threading.Event(), threading.Event()
+    with benchmark.connect(config, "local") as connection, ThreadPoolExecutor(1) as executor:
+        expected = connection.execute(workload.sql).to_arrow_table()
+        started = time.monotonic()
+        future = executor.submit(
+            benchmark.measure, connection, workload, config, "local", expected, paced=True, ready=ready, stop=stop
+        )
+        try:
+            assert ready.wait(2)
+            if outcome == "interrupt":
+                connection.interrupt()
+            elif outcome == "cancel":
+                # Cancel the handle independently of connection.interrupt().
+                with connection.query_runtime._delivery._condition:
+                    result = next(iter(connection.query_runtime._delivery._results.values()))
+                result.cancel()
+            elif outcome == "stop":
+                stop.set()
+            errors = {
+                "deadline": (RequestExecutionTimeout, ResultDeliveryTimeout),
+                "interrupt": RequestCancelled,
+                "cancel": (RequestCancelled, ResultDeliveryCancelled),
+                "stop": InterruptedError,
+            }[outcome]
+            with pytest.raises(errors):
+                future.result(timeout=2)
+            assert time.monotonic() - started < 3
+            benchmark.idle(connection)
+        finally:
+            stop.set()
+            connection.interrupt()
+
+
+@pytest.mark.parametrize("case", ["overlap", "queued", "different_worker"])
+def test_mixed_evidence_requires_shared_worker_reservations(monkeypatch, case):
+    from vane.execution.worker_resources import WorkerResourceManager
+
+    manager = WorkerResourceManager({"contexts": 2}, 2)
+    connection = SimpleNamespace(query_runtime=SimpleNamespace(pool=SimpleNamespace(admission=manager)))
+    clock = SimpleNamespace(now=1.0)
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: clock.now)
+    intervals = []
+    demand = {0: {"contexts": 2 if case == "queued" else 1}}
+    fte_demand = {1 if case == "different_worker" else 0: {"contexts": 1}}
+    with benchmark.worker_occupancy(connection, intervals):
+        assert manager.try_acquire("pipelined/scan", "scan", demand)
+        # An idempotent acquisition must not move the start or add an interval.
+        clock.now = 2.0
+        assert manager.try_acquire("pipelined/scan", "scan", demand)
+        if case == "queued":
+            assert not manager.try_acquire("fte/aggregate/task/0", "aggregate", fte_demand)
+            assert len(intervals) == 1
+            clock.now = 3.0
+            manager.release("pipelined/scan")
+        assert manager.try_acquire("fte/aggregate/task/0", "aggregate", fte_demand)
+        clock.now = 4.0
+        manager.release("fte/aggregate/task/0")
+        clock.now = 5.0
+        manager.release("pipelined/scan")
+    assert len(intervals) == 2
+    assert intervals[0]["acquired_at_monotonic"] == 1
+    assert benchmark.mixed_overlap(intervals, "scan", "aggregate") == (2 if case == "overlap" else 0)
+    assert manager.snapshot()["reservations"] == {}
+    assert manager.snapshot()["waiting"] == []
+
+
+def test_mixed_evidence_rejects_missing_or_unreleased_reservations():
+    with pytest.raises(AssertionError, match="evidence is incomplete"):
+        benchmark.mixed_overlap([], "scan", "aggregate")
+    with pytest.raises(AssertionError, match="evidence is incomplete"):
+        benchmark.mixed_overlap(
+            [{"query_id": query, "released_at_monotonic": None} for query in ("scan", "aggregate")], "scan", "aggregate"
+        )
