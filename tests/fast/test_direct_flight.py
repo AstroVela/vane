@@ -6,6 +6,7 @@
 import json
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -94,6 +95,51 @@ def test_lost_server_is_failure(pair):
     eventually(lambda: target.snapshot()["error"], bool)
     with pytest.raises(Exception):
         target.poll("consumer")
+
+
+@pytest.mark.parametrize("operation", ["status", "ack", "data"])
+def test_timeout_identifies_the_flight_operation(operation):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    entered, release = threading.Event(), threading.Event()
+    schema = pa.schema([("c0", pa.int64())])
+    record = pa.record_batch([[7]], schema=schema)
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            def batches():
+                if operation == "ack":
+                    yield record, b"D:1"
+                if operation == "data":
+                    entered.set()
+                assert release.wait(10)
+                yield record.slice(0, 0), b"F:0"
+
+            return flight.GeneratorStream(schema, batches())
+
+        def do_action(self, context, action):
+            if action.type == f"vane.direct.{operation}":
+                entered.set()
+                assert release.wait(10)
+            yield flight.Result(b"running")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection)
+    sender = Sender(("127.0.0.1", 0))
+    receiver = service()
+    try:
+        receiver.subscribe(
+            f"grpc://127.0.0.1:{sender.port}", "timeout-probe", target, "producer", 1 if operation == "data" else 20
+        )
+        assert entered.wait(5)
+        error = eventually(lambda: target.snapshot()["error"], bool)
+        assert ("direct Flight data next" if operation == "data" else f"direct Flight control {operation}") in error
+        assert "timeout" in error.lower() or "deadline" in error.lower()
+    finally:
+        release.set()
+        receiver.close()
+        sender.shutdown()
 
 
 def test_ticket_fencing():

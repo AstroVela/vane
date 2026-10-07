@@ -28,15 +28,15 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-void Check(const arrow::Status &status) {
+void Check(const arrow::Status &status, const string &operation = "") {
 	if (!status.ok()) {
-		throw IOException("direct Flight: %s", status.ToString());
+		throw IOException("direct Flight%s: %s", operation.empty() ? "" : " " + operation, status.ToString());
 	}
 }
 
 template <class T>
-T Unwrap(arrow::Result<T> value) {
-	Check(value.status());
+T Unwrap(arrow::Result<T> value, const string &operation = "") {
+	Check(value.status(), operation);
 	return std::move(value).ValueOrDie();
 }
 
@@ -272,13 +272,14 @@ struct Link {
 		arrow::flight::FlightCallOptions options;
 		options.timeout = arrow::flight::TimeoutDuration(2);
 		arrow::flight::Action action {"vane.direct." + name, arrow::Buffer::FromString(argument + "\n" + ticket)};
-		auto response = Unwrap(control->DoAction(options, action));
-		auto item = Unwrap(response->Next());
+		const auto operation = "control " + name;
+		auto response = Unwrap(control->DoAction(options, action), operation);
+		auto item = Unwrap(response->Next(), operation);
 		if (!item || !item->body) {
 			throw IOException("direct Flight control reply is missing");
 		}
 		auto value = item->body->ToString();
-		Check(response->Drain());
+		Check(response->Drain(), operation);
 		return value;
 	}
 	void Stop() {
@@ -295,8 +296,8 @@ struct Link {
 			arrow::flight::FlightCallOptions options;
 			options.timeout = arrow::flight::TimeoutDuration(timeout);
 			options.stop_token = stop.token();
-			auto input = Unwrap(data->DoGet(options, arrow::flight::Ticket {ticket}));
-			auto schema = Unwrap(input->GetSchema());
+			auto input = Unwrap(data->DoGet(options, arrow::flight::Ticket {ticket}), "data open");
+			auto schema = Unwrap(input->GetSchema(), "data schema");
 			if (!schema->Equals(*ArrowSchemaFor(channel->types))) {
 				throw IOException("direct Flight schema mismatch");
 			}
@@ -304,7 +305,7 @@ struct Link {
 			idx_t sequence = 0;
 			bool finished = false;
 			while (!done) {
-				auto message = Unwrap(input->Next());
+				auto message = Unwrap(input->Next(), "data next");
 				if (!message.data) {
 					if (!finished || message.app_metadata) {
 						throw IOException("direct Flight EOF without FINISH");

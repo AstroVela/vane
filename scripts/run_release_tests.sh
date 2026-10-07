@@ -40,6 +40,8 @@ release_tests=(
   "$project_root/tests/fast/test_execution_fragment_graph.py"
   "$project_root/tests/fast/test_execution_submission.py"
   "$project_root/tests/fast/test_execution_cutover.py"
+  "$project_root/tests/fast/test_execution_acceptance.py"
+  "$project_root/tests/fast/test_ray_execution_acceptance.py"
   "$project_root/tests/fast/test_milvus_datasink.py"
   "$project_root/tests/fast/test_native_fragment_compiler.py"
   "$project_root/tests/fast/test_analytical_fragment_compiler.py"
