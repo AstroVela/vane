@@ -244,7 +244,8 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 ### P5.2 差分与性能验收
 
-- [ ] 系统化比较 local、Ray pipelined、Ray FTE 的支持子集，扩展边界 SQL/type 差分样本。
+- [x] P5.2.1：系统化比较 native local、Ray pipelined、Ray FTE，加入可重放的种子/分区/线程矩阵、确定到达顺序和重复故障/清理验收。实现与运行方法见[执行验收](EXECUTION_ACCEPTANCE.md)。
+- [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。P5.2.1 已加入数据/控制操作归因、重复长查询及失败现场保存；本轮未复现，根因仍未确认。
 - [ ] 测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。
 - [ ] 根据实测调整容量默认值，并给出数值依据。
 
@@ -522,4 +523,14 @@ P4 退出条件已满足。能力范围与聚合精度策略见[详细设计](PI
 - 增量 Release 构建、非 editable 安装、202 个 Python/类型文件及 native 构建产物一致性校验通过。当前 engine identity 为 `cf29aa2922:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`；DuckDB 子树仅更新两条过时 GPU 错误提示。
 - root/DuckDB 格式、Ruff、全包 mypy、安装后的类型用例、适用 pre-commit、源码版权清单、文档本地链接、源码包校验和安装后 Quickstart 通过。fast 全树仅做收集及夹具依赖检查，未执行完整 release/fast 套件。本地平台为 Linux/Python 3.12；跨平台及硬件/制品 CI 仍需验收。
 
-P5.1 实现进入审查；下一步为 P5.2 的 SQL/type 差分和可复现性能验收，之后再进行 P5.3 发布资格验证。
+P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c363e8d`。最终 Required CI、AI、六个 fast 分组、Linux Python 3.10–3.14、macOS、Windows 及媒体构建检查通过。P5.2.1 从此基线切出 `test/execution-acceptance`，先完成 SQL/type 差分与重复生命周期验收；性能基准及默认容量调整作为下一 PR，之后进行 P5.3 发布资格验证。
+
+### P5.2.1 差分与稳定性验收（2026 年 10 月 7 日）
+
+- 加入 14 类 SQL/type 样本；两个确定 seed、三组分区/线程配置、两种 Ray 模式共完成 **168 次**公开 API 与 native local 对照。覆盖重复文件引用、NULL/空输入、排序/浮点聚合、join/TopN、嵌套 ARRAY、完整 HUGEINT/TIME/INTERVAL 边界及多层 DECIMAL 中间值。
+- 12 项原生测试控制 HUGEINT/DECIMAL 生产分片的全部到达排列。真实 Ray 验收重复混跑、保留 Arrow 视图、关闭/取消、排队取消、不支持查询拒绝和两次 worker 丢失，逐步检查结果与资源所有权归零。
+- 两种模式各执行两轮长查询成功与两轮执行超时取消，保留 native pump、状态监控和 Flight。本轮历史超时未复现；原生错误现在记录具体数据或控制操作，三个故意延迟服务端的用例验证 `status`、`ack`、数据读取超时归因，未调整超时或失败语义。
+- 验收保存 seed、文件顺序与哈希、重放 SQL、版本/engine identity、完成记录及失败现场。新模块已加入 release 清单和 sdist，CI 沿用现有诊断制品上传。
+- 最终非 editable Release wheel 上：差分辅助/到达顺序与 Direct Flight **59 passed**，真实 Ray **15 passed**，合计 **74 passed**。本轮仅执行相关测试，未运行完整 release/fast 套件。
+- Linux/Python 3.12.14、Ray 2.59.0、PyArrow 25.0.1；202 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `cf29aa2922:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`。
+- root 格式、适用 pre-commit、源码版权清单、diff 和源码包校验通过。性能测量、默认容量调整、历史 Flight 超时根因及 P5.3 发布资格仍待完成。
