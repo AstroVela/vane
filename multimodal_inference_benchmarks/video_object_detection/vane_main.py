@@ -158,7 +158,7 @@ def main() -> None:
                 width=FRAME_WIDTH,
             ),
             con=con,
-        )
+        ).project("frame_index, frame")
         rel = rel.map_batches(
             YOLODetector,
             schema={
