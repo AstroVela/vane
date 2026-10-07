@@ -107,7 +107,10 @@ can select one runtime; start a new process to change it. Direct SQL `LOAD` of
 an already prepared directory uses ordinary native loading and does not repeat
 manifest verification. Keep that directory intact and protected from edits.
 
-## Deploy the replacement to Ray
+## Deploy the replacement to Ray nodes
+
+These instructions cover provider identity checks and native local execution
+inside a Ray actor. The new Ray query runtime does not yet support media SQL.
 
 Install the exact base and combined provider wheels on the coordinator
 and every Ray node. Deploy the complete replacement directory, including its
@@ -127,7 +130,7 @@ In a fresh coordinator process, opt in explicitly before loading media:
 import vane
 
 vane.use_native_media_runtime("/coordinator/path/to/my-runtime", allow_distributed=True)
-# Load native_media and submit queries with your normal Ray runner configuration.
+# Load native_media on a native local connection in each actor.
 ```
 
 Do not put `VANE_NATIVE_MEDIA_RUNTIME` in a Ray Job or actor `runtime_env`.

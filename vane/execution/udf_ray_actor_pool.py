@@ -13,28 +13,28 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.ray_wait import (
+    configured_ray_get_timeout_s,
+    resolve_object_refs_blocking,
+)
+from vane.execution.session_environment import build_session_runtime_env_vars
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError, rollback_actor_pools
 from vane.execution.udf_ray_config import (
     MAX_ACTOR_RESTARTS,
     MAX_ACTOR_TASK_RETRIES,
     payload_max_task_retries,
 )
-from vane.execution.udf_threading import (
-    RAY_ACTOR_THREAD_POLICY_ENV,
-    ray_actor_thread_env,
-    ray_actor_thread_policy,
-)
-from vane.runners.ray.query_runtime_protocol import (
+from vane.execution.udf_ray_protocol import (
     RAY_ACTOR_GENERATION_CAPABILITY_ENV,
     RAY_ACTOR_INDEX_ENV,
     RAY_ACTOR_POOL_NONCE_ENV,
     RAY_ACTOR_QUERY_ID_ENV,
     RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
 )
-from vane.runners.ray.ray_env import build_session_runtime_env_vars
-from vane.runners.ray.safe_get import (
-    configured_ray_get_timeout_s,
-    resolve_object_refs_blocking,
+from vane.execution.udf_threading import (
+    RAY_ACTOR_THREAD_POLICY_ENV,
+    ray_actor_thread_env,
+    ray_actor_thread_policy,
 )
 
 _ACTOR_CLOSE_TIMEOUT_S = 5.0
@@ -712,7 +712,7 @@ def _create_actor_pools_for_nodes(
     import ray
 
     if not ray.is_initialized():
-        raise RuntimeError("Ray actor UDF creation requires an initialized RayRunner runtime")
+        raise RuntimeError("Ray actor UDF creation requires an explicit Ray resource allocation")
 
     created: list[UDFActorPoolBase] = []
     actor_handles_map: dict[str, Any] = {}

@@ -52,7 +52,7 @@ body:
         Python:
         Vane:
         Ray:
-        VANE_RUNNER:
+        Connection backend and query execution mode:
     validations:
       required: true
 

@@ -489,7 +489,7 @@ jobs:
 
       - name: Run the public smoke test outside a source checkout
         working-directory: ${{ runner.temp }}
-        run: env -u VANE_RUNNER python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+        run: python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
 
   publish-pypi:
     name: Publish to PyPI
@@ -584,7 +584,7 @@ jobs:
 
       - name: Run the public smoke test outside a source checkout
         working-directory: ${{ runner.temp }}
-        run: env -u VANE_RUNNER python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+        run: python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
 
   publish-github-release:
     name: Publish the draft GitHub Release

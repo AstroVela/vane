@@ -100,12 +100,8 @@ from vane._video_file import (
 
 if _typing.TYPE_CHECKING:
     from vane import ai as ai
-    from vane import runners as runners
     from vane import sqltypes as sqltypes
     from vane import udf as udf
-    from vane.runners.runner import Runner as _Runner
-else:
-    _Runner = _typing.Any
 from vane._native import (
     AudioFile,
     BinderException,
@@ -211,10 +207,7 @@ from vane._native import (
     from_df,
     from_parquet,
     from_query,
-    get_or_create_runner,
-    get_or_infer_runner_type,
     get_profiling_information,
-    get_runner,
     get_table_names,
     image_type,
     install_extension,
@@ -231,7 +224,6 @@ from vane._native import (
     query,
     query_df,
     query_progress,
-    ray_cxx,
     read_csv,
     read_json,
     read_parquet,
@@ -248,7 +240,6 @@ from vane._native import (
     struct_type,
     table,
     table_function,
-    teardown_runner,
     tensor_type,
     tf,
     threadsafety,
@@ -362,33 +353,6 @@ def use_native_media_runtime(directory: str, *, allow_distributed: bool = False)
     select_runtime(directory, allow_distributed=allow_distributed)
 
 
-def set_runner_local(
-    num_workers: int | None = 1,
-    *,
-    max_running_tasks: _typing.Any = None,
-    execution_mode: str | None = "in_process",
-) -> "_Runner":
-    """Configure Vane to execute through the local FTE runner."""
-    from vane.runners.local import set_runner_local as _set_runner_local
-
-    return _set_runner_local(
-        num_workers,
-        max_running_tasks=max_running_tasks,
-        execution_mode=execution_mode,
-    )
-
-
-def set_runner_ray(
-    address: str | None = None,
-    noop_if_initialized: bool = False,
-    max_task_backlog: int | None = None,
-) -> "_Runner":
-    """Configure Vane to execute through the Ray runner."""
-    from vane.runners.ray import set_runner_ray as _set_runner_ray
-
-    return _set_runner_ray(address, noop_if_initialized, max_task_backlog)
-
-
 # Short public aliases for the native classes.
 Connection = DuckDBPyConnection
 Relation = DuckDBPyRelation
@@ -408,7 +372,6 @@ _VANE_SUBMODULES = frozenset(
         "expressions",
         "filesystem",
         "query_graph",
-        "runners",
         "sqltypes",
         "udf",
         "value",
@@ -655,10 +618,7 @@ __all__: list[str] = [
     "from_files",
     "from_parquet",
     "from_query",
-    "get_or_create_runner",
-    "get_or_infer_runner_type",
     "get_profiling_information",
-    "get_runner",
     "get_table_names",
     "guess_mime_type",
     "image_file",
@@ -691,7 +651,6 @@ __all__: list[str] = [
     "query",
     "query_df",
     "query_progress",
-    "ray_cxx",
     "read_csv",
     "read_json",
     "read_parquet",
@@ -703,15 +662,12 @@ __all__: list[str] = [
     "rowcount",
     "set_default_connection",
     "use_native_media_runtime",
-    "set_runner_local",
-    "set_runner_ray",
     "sql",
     "sqltype",
     "string_type",
     "struct_type",
     "table",
     "table_function",
-    "teardown_runner",
     "tensor_type",
     "tensor",
     "tensor_array",

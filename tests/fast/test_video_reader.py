@@ -919,32 +919,6 @@ def test_empty_video_frame_source_preserves_output_schema(duckdb_cursor):
     assert relation.fetchall() == []
 
 
-def test_video_frame_source_executes_ranged_videofile_on_real_ray(ray_local, monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    vane.teardown_runner()
-    vane.set_runner_ray(noop_if_initialized=True)
-    value = _ranged_video(tmp_path, frame_count=4)
-    connection = vane.connect()
-    try:
-        relation = read_datasource(
-            VideoFrameSource(
-                [value],
-                height=6,
-                width=8,
-                frame_limit=2,
-                buffer_size=64,
-                max_pixels=1000,
-            ),
-            con=connection,
-        )
-        assert str(relation.types[0]) == "VIDEOFILE"
-        rows = relation.select("file", "frame_index", "frame_pts").fetchall()
-    finally:
-        connection.close()
-
-    assert rows == [(value, 0, 0), (value, 1, 4096)]
-
-
 def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_file(
     monkeypatch,
     duckdb_cursor,

@@ -644,7 +644,6 @@ def _write_minimal_base_wheel(
         "vane/_native/__init__.pyi": b"",
         "vane/_native/_func.pyi": b"",
         "vane/_native/_sqltypes.pyi": b"",
-        "vane/_native/ray_cxx.pyi": b"",
         "vane/sqltypes/__init__.pyi": b"",
         "vane/udf.pyi": b"",
         f"{dist_info}/METADATA": metadata.encode("utf-8"),

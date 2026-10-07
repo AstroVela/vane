@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Provider identity survives serialization into an existing Ray runtime."""
+"""Provider identity survives serialization and conflicting worker settings."""
 
 from __future__ import annotations
 
@@ -9,13 +9,10 @@ import asyncio
 import json
 import os
 import pickle
-import subprocess
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 
@@ -459,144 +456,3 @@ def test_vertex_requests_use_captured_oauth_credentials_and_project(monkeypatch,
     assert headers["authorization"] == "Bearer application-oauth-token"
     assert "x-goog-api-key" not in headers
     assert "projects/application-project/locations/us-central1/" in path
-
-
-@pytest.mark.real_ray
-@pytest.mark.ray_cluster_owner
-@pytest.mark.parametrize("conflicting_workers", [False, True])
-def test_default_ray_existing_cluster_uses_application_clients(conflicting_workers):
-    for sdk in ("ray", "openai", "google.genai", "anthropic"):
-        pytest.importorskip(sdk)
-    # Vane relation destructors can outlive ray.shutdown(). A separate driver
-    # process per scenario keeps cluster startup and worker environments exact.
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import runpy, sys; sys.path.append(sys.argv[1]); runpy.run_path(sys.argv[2], run_name='__main__')",
-            str(Path(__file__).resolve().parents[1]),
-            __file__,
-            str(conflicting_workers),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=240,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-
-
-def _run_existing_cluster_case(monkeypatch, conflicting_workers):
-    ray = pytest.importorskip("ray")
-    for sdk in ("openai", "google.genai", "anthropic"):
-        pytest.importorskip(sdk)
-    from ray_test_profile import ray_test_object_store_options
-
-    import vane
-
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
-    try:
-        # Start Ray before the application has any provider credentials.
-        with monkeypatch.context() as worker_environment:
-            if conflicting_workers:
-                for key, value in WORKER_ENV.items():
-                    worker_environment.setenv(key, value)
-            ray.init(address="local", num_cpus=2, include_dashboard=False, **ray_test_object_store_options())
-            initial = ray.get(ray.remote(_worker_environment).remote())
-            assert initial["GOOGLE_API_KEY"] == ("worker-google-key" if conflicting_workers else None)
-        with _model_server() as (endpoint, requests):
-            for family in ("openai", "google", "anthropic"):
-                monkeypatch.setenv(f"{family.upper()}_API_KEY", f"application-{family}-key")
-            monkeypatch.setenv("OPENAI_BASE_URL", endpoint + "/v1")
-            monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", endpoint)
-            monkeypatch.setenv("ANTHROPIC_BASE_URL", endpoint)
-            with vane.connect() as connection:
-                for backend in ("subprocess_task", "subprocess_actor", "ray_task", "ray_actor"):
-                    for family, operation in CASES:
-                        source = connection.sql("SELECT 'hello' AS text")
-                        if operation == "embed":
-                            result = vane.ai.embed(
-                                source,
-                                vane.col("text"),
-                                output_column="result",
-                                provider=family,
-                                dimensions=2 if family == "openai" else 128,
-                                execution_backend=backend,
-                                max_retries=0,
-                            )
-                        else:
-                            result = vane.ai.prompt(
-                                source,
-                                vane.col("text"),
-                                output_column="result",
-                                provider=family,
-                                model={"openai": "gpt-4.1", "google": "gemini-2.5-flash", "anthropic": "claude-test"}[
-                                    family
-                                ],
-                                execution_backend=backend,
-                                max_retries=0,
-                                **({"max_tokens": 32} if family == "anthropic" else {}),
-                            )
-                        value = result.select("result").fetchone()[0]
-                        if operation == "prompt":
-                            assert value == "ok"
-                        else:
-                            assert len(value) == (2 if family == "openai" else 128)
-                # SQL binds credentials on the application just like expressions.
-                assert connection.sql("""
-                    SELECT ai_prompt('hello', provider := 'google', model := 'gemini-2.5-flash',
-                        options := {'max_retries': 0})
-                """).fetchone() == ("ok",)
-                assert (
-                    len(
-                        connection.sql("""
-                    SELECT ai_embed('hello', provider := 'openai', dimensions := 2,
-                        options := {'max_retries': 0})
-                """).fetchone()[0]
-                    )
-                    == 2
-                )
-                # Explicit providers retain separate identities from each other and the environment.
-                for account in ("a", "b"):
-                    provider = load_provider(
-                        "openai",
-                        api_key=f"account-{account}-key",
-                        base_url=endpoint + "/v1",
-                        organization=f"org-{account}",
-                        project=f"proj-{account}",
-                    )
-                    result = connection.sql("SELECT 'hello' AS text").select(
-                        vane.ai.prompt(
-                            vane.col("text"),
-                            provider=provider,
-                            model="gpt-4.1",
-                            max_retries=0,
-                        )
-                    )
-                    assert result.fetchone() == ("ok",)
-            assert len(requests) == 24
-            for path, headers, body in requests:
-                headers = {key.lower(): value for key, value in headers.items()}
-                assert "worker" not in repr(headers)
-                if "models/" in path:
-                    assert headers["x-goog-api-key"] == "application-google-key"
-                    assert "projects/" not in path
-                elif "messages" in path:
-                    assert headers["x-api-key"] == "application-anthropic-key"
-                    assert "authorization" not in headers
-                else:
-                    if headers["authorization"].startswith("Bearer account-"):
-                        account = headers["authorization"].split("-")[1]
-                        assert headers["openai-project"] == f"proj-{account}"
-                        assert headers["openai-organization"] == f"org-{account}"
-                    else:
-                        assert headers["authorization"] == "Bearer application-openai-key"
-                        assert "openai-project" not in headers
-                        assert "openai-organization" not in headers
-    finally:
-        vane.teardown_runner()
-        ray.shutdown()
-
-
-if __name__ == "__main__":
-    with pytest.MonkeyPatch.context() as patch:
-        _run_existing_cluster_case(patch, sys.argv[-1] == "True")

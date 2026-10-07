@@ -79,7 +79,7 @@ class _NativeQuery:
 
 
 class LocalQueryRuntime:
-    """Admission shared by a local-fast connection and all its cursors.
+    """Admission shared by a local connection and all its cursors.
 
     Create through ``connection.configure_local_runtime``. Configuration is
     fixed for the session. Ordinary results retain native materialization;

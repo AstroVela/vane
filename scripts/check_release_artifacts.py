@@ -835,7 +835,6 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "vane/_native/__init__.pyi",
         "vane/_native/_func.pyi",
         "vane/_native/_sqltypes.pyi",
-        "vane/_native/ray_cxx.pyi",
         "vane/sqltypes/__init__.pyi",
         "vane/udf.pyi",
     )
@@ -976,7 +975,6 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
         "vane/_native/__init__.pyi",
         "vane/_native/_func.pyi",
         "vane/_native/_sqltypes.pyi",
-        "vane/_native/ray_cxx.pyi",
         "vane/sqltypes/__init__.pyi",
         "vane/udf.pyi",
         f"{layout.dist_info_root}/METADATA",

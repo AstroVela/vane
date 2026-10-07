@@ -779,7 +779,7 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
     datasink_runner: str, tmp_path: Path, primary_kind: str, fixed_vector: bool
 ) -> None:
     # Serialize the SDK recorder with the bound sink so it also reaches Local
-    # subprocesses and real Ray actors. Binding and worker validation remain
+    # subprocesses. Binding and worker validation remain
     # the production Milvus implementation, with no external service required.
     description = json.loads(
         json.dumps(_description(primary_type=_DataType.VARCHAR if primary_kind == "string" else _DataType.INT64))
@@ -811,7 +811,7 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
                    ('row-' || i::VARCHAR)::VARCHAR AS title
             FROM range(8) AS t(i)
         """)
-        assert relation._get_runner_type() == datasink_runner
+        assert relation.backend == datasink_runner
         bound_schema = relation._arrow_schema()
         assert bound_schema.field("title").type == pa.string()
         bound_vector_type = pa.list_(pa.float32(), 3) if fixed_vector else pa.list_(pa.float32())
@@ -844,12 +844,8 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
     worker_schemas = [pa.ipc.read_schema(pa.BufferReader(path.read_bytes())) for path in tmp_path.glob("*.schema")]
     assert len(worker_schemas) == len(batches)
     for schema in worker_schemas:
-        string_type = pa.string() if datasink_runner == "local-fast" else pa.large_string()
-        vector_type = (
-            pa.list_(pa.float32(), 3)
-            if fixed_vector
-            else (pa.list_(pa.float32()) if datasink_runner == "local-fast" else pa.large_list(pa.float32()))
-        )
+        string_type = pa.string()
+        vector_type = pa.list_(pa.float32(), 3) if fixed_vector else pa.list_(pa.float32())
         assert schema.field("title").type == string_type
         assert schema.field("id").type == (string_type if primary_kind == "string" else pa.int64())
         assert schema.field("embedding").type == vector_type

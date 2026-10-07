@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise public local-fast SQL/Relation serving against an installed wheel.
+"""Exercise public local SQL/Relation serving against an installed wheel.
 
 This is a deterministic text/RGB feature fixture, not a learned embedding model
 or a network server. See LOCAL_SERVING_ACCEPTANCE.md for the measurement scope.
@@ -800,7 +800,6 @@ def main():
         parser.error("requests must be >= 2; concurrency must be between 1 and 4")
     report_path = args.report.resolve()
     original_directory = Path.cwd()
-    os.environ["VANE_RUNNER"] = "local-fast"
     with TemporaryDirectory(prefix="vane-serving-acceptance-") as directory:
         try:
             # Worker -m imports must resolve the installed package as well.

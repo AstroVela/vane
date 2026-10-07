@@ -187,9 +187,7 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_connection>
   $<TARGET_OBJECTS:python_expression>
   $<TARGET_OBJECTS:python_relation>
-  $<TARGET_OBJECTS:python_type>
-  $<TARGET_OBJECTS:python_ray>
-  $<TARGET_OBJECTS:python_vane_runners>)
+  $<TARGET_OBJECTS:python_type>)
 # Add Vane's Python and engine dependencies.
 target_link_libraries(_native PRIVATE vane_python_dependencies)
 if(WIN32)

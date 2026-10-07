@@ -98,29 +98,17 @@ def _run_relation_benchmark(script_name: str, rel, *, distributed: bool = False)
     print("Running benchmark...")
     start_time = time.perf_counter()
     if distributed:
-        from vane.runners import get_or_create_runner
-
-        runner = get_or_create_runner()
-        tables = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)))
-        combined = pa.concat_tables(tables)
-        rows = combined.to_pydict()
-        row_count = combined.num_rows
-        print(f"Distributed execution: {len(tables)} partitions, {row_count} rows")
-    else:
-        rows = rel.fetchall()
+        raise NotImplementedError("Ray query() does not support model UDFs")
+    rows = rel.fetchall()
     end_time = time.perf_counter()
     print("Benchmark completed!")
-    if not distributed:
-        print_preview_rows(rows)
+    print_preview_rows(rows)
     print_benchmark_results(script_name, start_time, end_time)
 
 
 def _prepare_gpu_input_relation(rel, *, distributed: bool = False):
     if distributed:
-        # In distributed mode the RayRunner handles partitioning via scan
-        # ranges.  local_exchange is a process-local operator and has no effect
-        # across distributed tasks — skip it entirely.
-        return rel
+        raise NotImplementedError("Ray query() does not support model UDFs")
 
     # Use enough partitions to keep GPU actors fed with minimal idle gaps.
     # With only actor_count partitions (typically 2), DuckDB creates too few
@@ -134,11 +122,8 @@ def _prepare_gpu_input_relation(rel, *, distributed: bool = False):
 
 def run_vane_naive_benchmark(script_name: str, *, sorted_by_prompt: bool, distributed: bool = False) -> None:
     print("Starting benchmark...")
-    if distributed and INPUT_LIMIT > 0:
-        print(
-            f"WARNING: INPUT_LIMIT={INPUT_LIMIT} applies per-task in distributed mode. "
-            "Total rows processed will be up to num_tasks × LIMIT."
-        )
+    if distributed:
+        raise NotImplementedError("Ray query() does not support model UDFs")
     con = connect_vane()
     actor_count = get_vane_naive_actor_count()
     rel = con.sql(build_input_sql(sorted_by_prompt=sorted_by_prompt))
@@ -149,7 +134,7 @@ def run_vane_naive_benchmark(script_name: str, *, sorted_by_prompt: bool, distri
     rel = rel.map_batches(
         NaiveVLLM,
         schema=NAIVE_VLLM_SCHEMA,
-        execution_backend="ray_actor",
+        execution_backend="subprocess_actor",
         gpus=1,
         batch_size=NAIVE_BATCH_SIZE,
         actor_number=actor_count,
@@ -165,6 +150,8 @@ def run_vane_native_vllm_benchmark(
     distributed: bool = False,
 ) -> None:
     print("Starting benchmark...")
+    if distributed:
+        raise NotImplementedError("Ray query() does not support model UDFs")
     con = connect_vane()
     rel = _native_vllm_relation(
         con,

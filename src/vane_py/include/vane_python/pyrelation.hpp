@@ -69,7 +69,6 @@ public:
 	void ValidateDataSinkTransaction();
 	void ValidateDataSinkRetryInput();
 	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
-	py::object RunDataSink();
 	py::object ExecuteResult(const py::object &delivery_timeout, bool stream, idx_t rows_per_batch);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
@@ -313,13 +312,13 @@ public:
 	py::object GetConnectionOwner() const;
 	// Copy ownership into plans/results without promoting a weak reference.
 	py::object GetConnectionOwnerReference() const;
-	string GetRunnerType() const;
+	string GetExecutionBackend() const;
+	py::list CollectUDFMetadata();
 	shared_ptr<DuckDBPyResult> ExecuteForConnection(const py::object &interrupt_check);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 
 private:
-	bool TryPrintDistributed(const BoxRendererConfig &config);
 	string ToStringInternal(const BoxRendererConfig &config, bool invalidate_cache = false);
 	string GenerateExpressionList(const string &function_name, const string &aggregated_columns,
 	                              const string &groups = "", const string &function_parameter = "",

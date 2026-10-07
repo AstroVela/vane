@@ -6,7 +6,10 @@ set -euo pipefail
 
 bison_version="3.8.2"
 bison_sha256="06c9e13bdf7eb24d4ceb6b59205a4f67c2c7e7213119644430fe82fbd14a0abb"
-bison_url="https://ftp.gnu.org/gnu/bison/bison-${bison_version}.tar.gz"
+bison_urls=(
+  "https://ftp.gnu.org/gnu/bison/bison-${bison_version}.tar.gz"
+  "https://mirrors.kernel.org/gnu/bison/bison-${bison_version}.tar.gz"
+)
 install_prefix="${VANE_BISON_INSTALL_PREFIX:-/usr/local}"
 build_root="${VANE_BUILD_TOOLS_DIR:-/tmp/vane-build-tools}"
 archive="${build_root}/bison-${bison_version}.tar.gz"
@@ -26,9 +29,20 @@ if [[ -f "$archive" ]] \
 fi
 
 if [[ ! -f "$archive" ]]; then
-  curl --fail --location --retry 5 --retry-delay 2 \
-    --output "${archive}.part" "$bison_url"
-  mv "${archive}.part" "$archive"
+  for bison_url in "${bison_urls[@]}"; do
+    # manylinux_2_28 ships curl 7.61; use flags supported by that baseline.
+    if curl --fail --location --retry 2 --retry-delay 2 \
+      --connect-timeout 15 --max-time 120 --output "${archive}.part" "$bison_url" \
+      && echo "${bison_sha256}  ${archive}.part" | sha256sum --check; then
+      mv "${archive}.part" "$archive"
+      break
+    fi
+    rm -f "${archive}.part"
+  done
+  if [[ ! -f "$archive" ]]; then
+    echo "Failed to download verified GNU Bison ${bison_version} from all mirrors" >&2
+    exit 1
+  fi
 fi
 echo "${bison_sha256}  ${archive}" | sha256sum --check
 

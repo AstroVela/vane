@@ -145,7 +145,6 @@ def versions() -> dict[str, Any]:
 
 
 def run(root: Path, engine: str, label: str, artifact: Path | None) -> None:
-    os.environ.setdefault("VANE_RUNNER", "local-fast")
     os.environ.setdefault("DO_NOT_TRACK", "1")
     import librosa
 

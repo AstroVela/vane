@@ -65,6 +65,7 @@ from vane.execution.ref_bundle import (
     transition_local_shm_output,
     wake_local_shm_ref_budget_waiters,
 )
+from vane.execution.session_environment import build_explicit_session_process_env
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
     actor_pool_cleanup_pending,
@@ -94,7 +95,6 @@ from vane.execution.udf_threading import (
 )
 from vane.execution.udf_worker_metrics import WorkerLifecycle, WorkerMetrics, WorkerOutcome
 from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
-from vane.runners.ray.ray_env import build_explicit_session_process_env
 
 _active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
 

@@ -5,7 +5,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +14,6 @@ parser.add_argument("--engine", choices=["vane-python", "vane-native", "daft"], 
 parser.add_argument("--artifact", type=Path)
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
-os.environ.setdefault("VANE_RUNNER", "local-fast")
 pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
 results = {}
 

@@ -845,11 +845,9 @@ def test_owner_close_cancels_running_and_queued_children(native_environment, tmp
             connection.close()
 
 
-@pytest.mark.parametrize("runner", ["ray", "local"])
-def test_configuration_rejects_other_runners(monkeypatch, runner):
-    monkeypatch.setenv("VANE_RUNNER", runner)
-    with vane.connect() as connection:
-        with pytest.raises(vane.InvalidInputException, match="local-fast"):
+def test_configuration_rejects_ray_backend():
+    with vane.connect(backend="ray") as connection:
+        with pytest.raises(vane.InvalidInputException, match="local"):
             connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
 
 

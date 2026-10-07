@@ -1135,14 +1135,6 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	RegisterExpectedResultType(m);
 	PythonDataSourceExecutionContext::Initialize(m);
 
-	// Expose experimental Ray bindings as ``vane._native.ray_cxx``.
-	extern void register_ray_bindings(py::module_ & m);
-	register_ray_bindings(m);
-
-	// Expose runner lifecycle functions directly on ``vane._native``.
-	extern void register_vane_runners(py::module_ & m);
-	register_vane_runners(m);
-
 	py::enum_<duckdb::PythonCSVLineTerminator::Type>(m, "CSVLineTerminator", py::module_local())
 	    .value("LINE_FEED", duckdb::PythonCSVLineTerminator::Type::LINE_FEED)
 	    .value("CARRIAGE_RETURN_LINE_FEED", duckdb::PythonCSVLineTerminator::Type::CARRIAGE_RETURN_LINE_FEED)
@@ -1214,12 +1206,6 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	      "Create a DuckDB database instance. Can take a database file name to read/write persistent data and a "
 	      "read_only flag if no changes are desired",
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));
-	m.def(
-	    "_connect_with_runner",
-	    [](const string &runner_type) {
-		    return DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, py::dict(), runner_type);
-	    },
-	    py::arg("runner_type"));
 	m.def("tokenize", PyTokenize,
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",

@@ -392,10 +392,11 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1, 'im
     varying = con.sql('SELECT i, resize($1,i%3+1,1) FROM range(4099) t(i)', params=[value])
     vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmSize:'))) * 1024
     old, hard = resource.getrlimit(resource.RLIMIT_AS)
-    # Generic IMAGE uses Float32 canonical storage plus pixel conversion buffers.
-    # Budget that working set independently of fixed UInt8 images and allocator
-    # leftovers from binding. Broadcasting 2048 images still needs hundreds of GiB.
-    limit = vm + (640 if input_layout == 'generic' else 224) * 1024**2
+    # Include native rebinding, pixel conversion and allocator headroom for both
+    # layouts; those working sets vary across Python/NumPy builds. A batch
+    # expansion still needs at least 2048 * pixels.nbytes (63 GiB), far beyond
+    # this hard 640 MiB cap, independent of reusable allocations left by binding.
+    limit = vm + 640 * 1024**2
     resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
     try:
         assert constant.fetchone() == (3840 * 4099,)

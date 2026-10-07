@@ -324,12 +324,8 @@ def test_relation_backends_replace_output_column(provider, backend):
         assert result.select("embedding").fetchall() == [((97, 1, 1),)]
 
 
-@pytest.mark.real_ray
 @pytest.mark.parametrize("fixed", [False, True])
-def test_image_embedding_through_ray_actor(ray_local, provider, fixed, monkeypatch):
-    # Bind on the Ray connection: binding on local-fast intentionally rewrites
-    # actor UDFs to local subprocess execution before a plan is serialized.
-    monkeypatch.setenv("VANE_RUNNER", "ray")
+def test_image_embedding_through_local_actor(provider, fixed):
     declared = "IMAGE('RGB', 1, 1)" if fixed else "IMAGE"
     with vane.connect() as conn:
         rel = conn.sql(
@@ -341,6 +337,8 @@ def test_image_embedding_through_ray_actor(ray_local, provider, fixed, monkeypat
                 "SELECT i, ai_embed_image(image, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
             )
         else:
-            result = rel.embed_image(vane.col("image"), provider=provider, execution_backend="ray_actor", batch_size=2)
-        assert "ray_actor" in result.explain()
+            result = rel.embed_image(
+                vane.col("image"), provider=provider, execution_backend="subprocess_actor", batch_size=2
+            )
+        assert "subprocess_actor" in result.explain()
         assert result.select("i", "embedding").order("i").fetchall() == [(0, (97, 1, 1)), (1, None), (2, (97, 1, 1))]

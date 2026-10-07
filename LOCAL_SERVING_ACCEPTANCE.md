@@ -1,6 +1,6 @@
 # Local serving acceptance
 
-This scenario validates the public local-fast SQL and Relation lifecycle in
+This scenario validates the public local SQL and Relation lifecycle in
 [LOCAL_MODEL_RUNTIME.md](LOCAL_MODEL_RUNTIME.md), continuing
 [#843](https://github.com/AstroVela/vane/issues/843) under
 [#838](https://github.com/AstroVela/vane/issues/838). It combines model reuse,
@@ -32,7 +32,7 @@ python -I scripts/validate_local_serving.py \
   --requests 20 --concurrency 4 --report build/local-serving-report.json
 ```
 
-The CLI sets `VANE_RUNNER=local-fast` in its own process and starts workers from
+The CLI uses native local connections and starts workers from
 a temporary directory so that the source package cannot shadow the installed
 native extension. It removes its generated fixtures after cleanup. The report
 path is relative to the original working directory. No downloaded weights,
@@ -452,12 +452,12 @@ returned to zero. CUDA used RTX 2080 Ti, PyTorch 2.7.0+cu126 and CUDA 12.6.
 The final-head two-round regressions above validate the later cleanup fix;
 the 20-round timings are not measurements of the final head.
 
-Supported scope is configured, auto-commit, read-only local-fast SQL/Relation
+Supported scope is configured, auto-commit, read-only local SQL/Relation
 execution with explicitly registered CPU or fixed-device GPU models, native
 materialized results and opt-in managed streams. Stateful reuse remains
 explicit and session-owned. Input callbacks reject connection reentry;
 unsupported asynchronous input paths are rejected as documented in the
-[runtime guide](LOCAL_MODEL_RUNTIME.md#shared-runtime-for-ordinary-local-fast-queries).
+[runtime guide](LOCAL_MODEL_RUNTIME.md#shared-runtime-for-ordinary-local-queries).
 Ray keeps its query/generation authorization and object-store/liveness policy;
 shared contract tests do not enable a persistent Ray model registry.
 
@@ -498,7 +498,7 @@ reproduction result, not a timeout fix or a latency guarantee.
 
 The same native test now retains per-query progress milestones with its
 pre-cleanup diagnostics, as described in the
-[runtime guide](LOCAL_MODEL_RUNTIME.md#backpressure-acceptance-gate).
+[runtime guide](LOCAL_MODEL_RUNTIME.md#request-and-resource-ownership).
 Controlled stops before preparation returns and before an upstream output
 grant confirm that different progress states and still-held resources survive
 in the artifacts. Those controls validate evidence capture; they do not

@@ -320,23 +320,6 @@ def test_sliced_chunked_empty_and_all_null_tensors():
             assert result.to_arrow_table().column(0).type == source.type
 
 
-def test_ray_partition_materialization_releases_gil_for_arrow_tensor_callbacks(tmp_path):
-    # A subprocess deadline also detects a native GIL deadlock, which cannot be
-    # interrupted by pytest's Python signal handler in the same process.
-    code = """
-import numpy as np
-import pyarrow as pa
-import vane
-
-dtype = vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))
-table = pa.table({'wave': vane.tensor_array([np.ones((2, 1)), np.empty((0, 2)), None], dtype)})
-partition = vane.ray_cxx._RayBackedResultPartitionForTest(table)
-assert partition.materialize() == 3
-assert partition.materialize() == 3
-"""
-    subprocess.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout=30, check=True, capture_output=True)
-
-
 @pytest.mark.parametrize("container", ["list", "array", "struct", "dictionary"])
 def test_inactive_tensor_payloads_are_not_validated(container):
     dtype = VariableShapeTensorType(pa.float64(), (None, None))
@@ -490,33 +473,6 @@ def test_nested_tensors_and_nonfinite_values():
 
         row = source.select(identity(vane.col("values"))).fetchone()[0]
         _assert_rows(row, [value, None])
-
-
-@pytest.mark.real_ray
-@pytest.mark.usefixtures("ray_local")
-def test_ray_tensor_udf_and_flight_shuffle(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    vane.teardown_runner()
-    vane.set_runner_ray(noop_if_initialized=True)
-    dtype = _dtype()
-
-    @vane.func(return_dtype=dtype)
-    def reverse_frames(value):
-        assert isinstance(value, np.ndarray)
-        return value[::-1].copy()
-
-    with vane.connect() as connection:
-        source = connection.sql(
-            """SELECT i, tensor(range(i % 3)::DOUBLE[], [i % 3,1]::INTEGER[2]) AS value
-               FROM range(32) t(i)"""
-        )
-        result = source.select(vane.col("i"), reverse_frames(vane.col("value")).alias("value")).order("i")
-        assert result.types[1] == dtype
-        rows = result.fetchall()
-        assert len(rows) == 32
-        for index, value in rows:
-            np.testing.assert_array_equal(value, np.arange(index % 3, dtype=np.float64)[::-1].reshape(-1, 1))
-    vane.teardown_runner()
 
 
 def test_tensor_values_survive_more_than_one_vector_and_hash_join():

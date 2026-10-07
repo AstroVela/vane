@@ -144,7 +144,7 @@ A limited audio shard or video directory can be run directly by all three system
 
 ## Run locally on one machine
 
-Run commands from the corresponding benchmark directory. `NUM_GPU_NODES=1` uses one GPU actor. `VANE_RUNNER=ray` explicitly selects Vane's local Ray runner.
+Run commands from the corresponding benchmark directory. `NUM_GPU_NODES=1` uses one GPU actor. The Vane GPU scripts are historical: their model calls must be migrated to explicitly registered local GPU models before use with P5.1. Ray query execution does not yet support model UDFs; see the [local model guide](../LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).
 
 Before running:
 
@@ -163,7 +163,7 @@ export NUM_GPU_NODES=1
   export INPUT_PATH=/data/multimodal_inference_benchmarks/common_voice_17/parquet
   export BATCH_SIZE=128
 
-  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_audio_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/vane_audio_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_audio_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_audio_$RUN_ID" python daft_main.py
 )
@@ -179,7 +179,7 @@ export NUM_GPU_NODES=1
   export LOCAL_PDF_ROOT=/data/multimodal_inference_benchmarks/digitalcorpora/pdf_dump
   export BATCH_SIZE=10
 
-  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_document_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/vane_document_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_document_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_document_$RUN_ID" python daft_main.py
 )
@@ -195,7 +195,7 @@ export NUM_GPU_NODES=1
   export LOCAL_IMAGE_ROOT=/data/multimodal_inference_benchmarks/imagenet/train
   export BATCH_SIZE=100
 
-  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_image_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/vane_image_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_image_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_image_$RUN_ID" python daft_main.py
 )
@@ -220,7 +220,7 @@ the current Vane engine.
   export PARQUET_ROW_GROUP_SIZE=122880
   export PARQUET_ROW_GROUP_SIZE_BYTES=256MB
 
-  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_video_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/vane_video_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_video_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_video_$RUN_ID" python daft_main.py
 )

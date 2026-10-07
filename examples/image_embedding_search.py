@@ -38,7 +38,6 @@ def main() -> None:
 
     # Workers should import the installed package when launched from a checkout.
     os.environ["PYTHONSAFEPATH"] = "1"
-    vane.set_runner_local()
     with vane.connect(config={"image_backend": "python"}) as conn:
         source = conn.sql("SELECT unnest(?::VARCHAR[]) AS path", params=[paths])
         source.create_view("image_paths")

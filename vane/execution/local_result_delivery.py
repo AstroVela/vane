@@ -174,21 +174,6 @@ class _ArrowResultPayload:
         return self._buffer is not None or self._owner is not None
 
 
-def prepare_local_result(result: QueryResult, native: Any) -> None:
-    """Build exact-size delivery buffers from an already materialized result.
-
-    Native collection and its peak memory precede this budget. Encoding creates
-    one IPC copy per native partition; consumers then receive zero-copy views.
-    """
-    result.result_schema = native.result_schema
-    result.schema = native.arrow_schema
-    result.completion_status = getattr(native, "completion_status", None)
-    result.stats = getattr(native, "stats", None)
-    result.task_stats = getattr(native, "task_stats", None)
-    for table in native.partition_payloads:
-        _prepare_table(result, table)
-
-
 def prepare_native_query_result(result: QueryResult, table: pa.Table, schema: dict[str, Any]) -> None:
     """Adapt an ordinary, fully materialized native query without another request."""
     result.result_schema = schema

@@ -311,40 +311,7 @@ def test_vane_function_batch_allows_multiple_and_nested_udfs():
     ]
 
 
-def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monkeypatch):
-    import uuid
-
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    import vane
-
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-
-    @vane.func.batch(return_dtype=pa.int32())
-    def add_one(values):
-        return pc.add(values, 1)
-
-    con = vane.connect()
-    try:
-        relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(add_one(vane.col("x")))
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(con)
-        nodes = plan.collect_udf_nodes(conn=con)
-    finally:
-        con.close()
-
-    assert len(nodes) == 1
-    payload = nodes[0]["payload"]
-    assert payload["execution_backend"] == "subprocess_task"
-    assert payload["produce_ray_block_stream"] is False
-    assert payload["produce_ref_bundle_output"] is True
-    assert payload["streaming_output_mode"] == "local_shm_ref_bundle"
-    assert payload["call_mode"] == "map_batches_rows"
-    assert payload["row_preserving"] is True
-    assert payload["expression_id"]
-
-
-def test_vane_function_batch_ray_backend_explain():
+def test_vane_function_batch_ignores_runner_environment():
     import pyarrow as pa
     import pyarrow.compute as pc
 
@@ -352,7 +319,7 @@ def test_vane_function_batch_ray_backend_explain():
 
     old_runner = os.environ.get("VANE_RUNNER")
     try:
-        vane.configure(runner="ray")
+        os.environ["VANE_RUNNER"] = "ray"
 
         @vane.func.batch(return_dtype=pa.int32())
         def add_one(values):
@@ -363,9 +330,7 @@ def test_vane_function_batch_ray_backend_explain():
         plan = rel.select(add_one(vane.col("x"))).explain()
 
         assert "execution_backend:" in plan
-        assert "ray_task" in plan
-        assert "ray_block_stream_output:" in plan
-        assert "direct_block_metadata_pair" in plan
+        assert "subprocess_task" in plan
     finally:
         if old_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -381,7 +346,7 @@ def test_vane_function_batch_batch_size_is_backend_independent():
     old_runner = os.environ.get("VANE_RUNNER")
     con = None
     try:
-        vane.configure(runner="local")
+        os.environ["VANE_RUNNER"] = "local"
 
         @vane.func.batch(return_dtype=pa.int64(), batch_size=4096)
         def record_batch_size(values):
@@ -414,7 +379,7 @@ def test_vane_function_batch_gpu_zero_stays_streaming():
 
     old_runner = os.environ.get("VANE_RUNNER")
     try:
-        vane.configure(runner="ray")
+        os.environ["VANE_RUNNER"] = "ray"
 
         @vane.func.batch(return_dtype=pa.int32(), gpus=0)
         def identity(values):
@@ -425,7 +390,6 @@ def test_vane_function_batch_gpu_zero_stays_streaming():
         plan = rel.select(vane.col("x"), identity(vane.col("x"))).explain()
 
         assert "STREAMING_UDF" in plan
-        assert "ray_block_stream_output:" in plan
     finally:
         if old_runner is None:
             os.environ.pop("VANE_RUNNER", None)

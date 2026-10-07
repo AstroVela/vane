@@ -403,13 +403,10 @@ def test_optimized_parquet_dependencies_do_not_create_scan_tasks(connection, tmp
 
 
 def test_compiling_does_not_enter_old_runner_or_execute_a_query(connection, monkeypatch):
-    from vane import _ray_cxx, runners
+    import sys
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("compiler entered an execution path")
-
-    monkeypatch.setattr(runners, "get_or_create_runner", forbidden)
-    monkeypatch.setattr(_ray_cxx, "validate_plan_serialization_for_submission", forbidden)
+    monkeypatch.setitem(sys.modules, "vane.runners", None)
+    monkeypatch.setitem(sys.modules, "vane._ray_cxx", None)
     first = compile_sql(connection, "select range * 3 from range(11)")
     monkeypatch.setenv("VANE_RUNNER", "not-a-runner")
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "not-an-exchange")

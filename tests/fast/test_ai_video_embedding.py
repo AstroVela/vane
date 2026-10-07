@@ -249,15 +249,9 @@ def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
         ]
 
 
-@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
 @pytest.mark.parametrize("entry", ["expression", "sql"])
 @pytest.mark.parametrize("field_names", CLIP_FIELD_NAMES[1:])
-def test_assembled_clip_fields_are_case_insensitive(request, provider, monkeypatch, runner, entry, field_names):
-    if runner == "ray":
-        request.getfixturevalue("ray_local")
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_assembled_clip_fields_are_case_insensitive(provider, entry, field_names):
     with vane.connect() as conn:
         conn.register("clip_inputs", pa.table({"id": range(4), "frames": clip_array([None, None, clip(), clip(8, 9)])}))
         fields = ", ".join(f"{name} := frame.{name.casefold()}" for name in field_names)
@@ -274,26 +268,16 @@ def test_assembled_clip_fields_are_case_insensitive(request, provider, monkeypat
             result = rel.select(
                 vane.col("id"), embed_video(vane.col("frames"), provider=provider, batch_size=2).alias("embedding")
             )
-        if runner == "ray":
-            assert "ray_actor" in result.explain()
         assert result.order("id").fetchall() == [(0, None), (1, None), (2, (3, 7, 1.25)), (3, (8, 9, 1.25))]
 
 
-@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
 @pytest.mark.parametrize("source", ["typed_nulls", "decode_errors"])
 @pytest.mark.parametrize("entry", ["expression", "sql"])
 @pytest.mark.parametrize("on_error", ["raise", "ignore"])
-def test_all_null_clip_columns_execute_without_loading_models(
-    request, provider, monkeypatch, tmp_path, runner, source, entry, on_error
-):
+def test_all_null_clip_columns_execute_without_loading_models(provider, tmp_path, source, entry, on_error):
     if source == "decode_errors":
         pytest.importorskip("av")
         pytest.importorskip("psutil")
-    if runner == "ray":
-        request.getfixturevalue("ray_local")
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(config={"video_backend": "python"}) as conn:
         if source == "typed_nulls":
             # Keep BIGINT/DOUBLE metadata from a populated child array. A table
@@ -324,8 +308,6 @@ def test_all_null_clip_columns_execute_without_loading_models(
                     max_retries=0,
                 ).alias("embedding"),
             )
-        if runner == "ray":
-            assert "ray_actor" in result.explain()
         assert result.types == [vane.sqltypes.BIGINT, vane.array_type(vane.sqltypes.FLOAT, 3)]
         assert result.order("id").fetchall() == [(index, None) for index in range(4)]
 
@@ -421,31 +403,3 @@ def test_no_provider_or_model_fallback():
                 max_chunk_chars=300,
                 **COSMOS_OPTIONS,
             )
-
-
-@pytest.mark.real_ray
-@pytest.mark.parametrize("entry", ["sql", "relation"])
-def test_default_ray_transports_ordered_nested_images(ray_local, provider, monkeypatch, entry):
-    # Exercise the default runner without VANE_RUNNER or set_runner_*.
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
-    with vane.connect() as conn:
-        conn.register(
-            "clips",
-            pa.table(
-                {"id": range(5), "frames": clip_array([None, None, clip(), None, clip(8, 9)], "IMAGE('RGB', 2, 4)")}
-            ),
-        )
-        if entry == "sql":
-            result = conn.sql(
-                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
-            )
-        else:
-            result = conn.table("clips").embed_video(vane.col("frames"), provider=provider, batch_size=2)
-        assert "ray_actor" in result.explain()
-        assert result.select("id", "embedding").order("id").fetchall() == [
-            (0, None),
-            (1, None),
-            (2, (3, 7, 1.25)),
-            (3, None),
-            (4, (8, 9, 1.25)),
-        ]

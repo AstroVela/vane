@@ -15,7 +15,6 @@ import hashlib
 import importlib.metadata
 import json
 import multiprocessing
-import os
 import platform
 import resource
 import statistics
@@ -24,7 +23,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -242,8 +240,6 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--backend", choices=("both", "python", "native"), default="both")
-    parser.add_argument("--runner", choices=("local", "ray"), default="local")
-    parser.add_argument("--ray-cpus", type=int, default=4)
     parser.add_argument("--transport", choices=("local", "http"), default="local")
     parser.add_argument("--http-delay-ms", type=float, default=0)
     parser.add_argument("--sample-rate", type=int, default=16000)
@@ -255,8 +251,8 @@ def main() -> None:
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--allow-unsigned-development-artifact", action="store_true")
     args = parser.parse_args()
-    if min(args.rows, args.repetitions, args.threads, args.concurrency, args.ray_cpus, args.sample_rate) < 1:
-        parser.error("rows, repetitions, threads, concurrency, CPUs, and sample rate must be positive")
+    if min(args.rows, args.repetitions, args.threads, args.concurrency, args.sample_rate) < 1:
+        parser.error("rows, repetitions, threads, concurrency, and sample rate must be positive")
     if args.http_delay_ms < 0 or not args.http_delay_ms < float("inf"):
         parser.error("HTTP delay must be finite and nonnegative")
     if (args.position is None) != (args.size is None) or (
@@ -267,35 +263,18 @@ def main() -> None:
         parser.error("native execution requires --extension or --installed-provider")
     if args.extension and args.installed_provider:
         parser.error("choose an artifact or an installed provider")
-    if args.runner == "ray" and args.backend != "python" and not args.installed_provider:
-        parser.error("Ray native execution requires signed installed providers")
-    if args.runner == "ray" and args.diagnostics:
-        parser.error("spool and phase diagnostics are local; run Ray throughput separately")
     paths = [path.resolve(strict=True) for path in args.input]
     artifact = args.extension.resolve(strict=True) if args.extension else None
     identities = [{"name": path.name, "bytes": path.stat().st_size, "sha256": _digest(path)} for path in paths]
     domain = OPERATIONS[args.operation]
     backends = ("python", "native") if args.backend == "both" else (args.backend,)
-    os.environ["VANE_RUNNER"] = "local-fast"
     timings = {backend: [] for backend in backends}
     diagnostics = {}
     descriptors = []
     with ExitStack() as stack:
         urls, http = stack.enter_context(_sources(paths, args.transport, args.http_delay_ms / 1000))
-        if args.runner == "ray":
-            # Ray Workers do not inherit the driver's -I flag. Start them away
-            # from the source checkout so they import the installed package.
-            original_directory = Path.cwd()
-            run_directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="vane-media-benchmark-"))
-            os.chdir(run_directory)
-            stack.callback(os.chdir, original_directory)
         import vane
 
-        if args.runner == "ray":
-            import ray
-
-            ray.init(address="local", num_cpus=args.ray_cpus, include_dashboard=False, log_to_driver=False)
-            stack.callback(ray.shutdown)
         groups = {}
         engine = None
         for backend in backends:
@@ -325,19 +304,13 @@ def main() -> None:
                 inputs = f"(SELECT ({vane.ConstantExpression(urls)})[(range % {len(urls)})+1] AS url FROM range({args.rows})) inputs"
                 expression = _expression(args)
                 query = f"SELECT {expression} FROM {inputs}" if expression else None
-                runner = None
-                if args.runner == "ray":
-                    from vane.runners.ray.runner import RayRunner
-
-                    runner = RayRunner(address=None, max_task_backlog=None)
-                    stack.callback(runner.close)
-                group.append((con, query, inputs, runner))
+                group.append((con, query, inputs))
             groups[backend] = group
-        # Drain query threads before closing the connections and Ray runners.
+        # Drain query threads before closing the connections.
         executor = stack.enter_context(ThreadPoolExecutor(max_workers=args.concurrency))
 
         def run(item):
-            con, query, _, runner = item
+            con, query, _ = item
             if query:
                 relation = con.sql(query)
             else:
@@ -348,31 +321,13 @@ def main() -> None:
                 relation = vane.read_video_frames(
                     files, 90, 160, start_time=args.start_time, end_time=args.end_time, connection=con
                 ).aggregate("count(*), sum(frame_index)")
-            if runner is None:
-                return relation.fetchone()
-            import pyarrow as pa
-
-            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
-            if not parts:
-                raise RuntimeError("Ray benchmark aggregate returned no partitions")
-            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
-            if table.num_rows != 1:
-                raise RuntimeError("benchmark aggregate did not return one row")
-            values = [column[0].as_py() for column in table.columns]
-            # Arrow represents HUGEINT count/sum results as Decimal. Preserve
-            # their exact integer values in the JSON report.
-            for index, value in enumerate(values):
-                if isinstance(value, Decimal):
-                    if not value.is_finite() or value != value.to_integral_value():
-                        raise RuntimeError("benchmark aggregate returned a non-integral count")
-                    values[index] = int(value)
-            return tuple(values)
+            return relation.fetchone()
 
         def run_group(backend):
             try:
                 return list(executor.map(run, groups[backend]))
             except BaseException:
-                for con, _, _, _ in groups[backend]:
+                for con, _, _ in groups[backend]:
                     con.interrupt()
                 raise
 
@@ -405,7 +360,7 @@ def main() -> None:
                 diagnostics[backend] = {"python_temporary_files": temporary}
                 if backend == "native" and args.operation == "audio_resample":
                     profiles = []
-                    for con, _, inputs, _ in groups[backend]:
+                    for con, _, inputs in groups[backend]:
                         profiles.extend(
                             row[0]
                             for row in con.execute(
@@ -428,8 +383,7 @@ def main() -> None:
         "rows_per_query": args.rows,
         "threads_per_connection": args.threads,
         "concurrency": args.concurrency,
-        "runner": args.runner,
-        "ray_cpus": args.ray_cpus if args.runner == "ray" else None,
+        "execution_backend": "local",
         "backends": backends,
         "repetitions": args.repetitions,
         "transport": args.transport,

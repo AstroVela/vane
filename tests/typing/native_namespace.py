@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import types
+from typing import Literal
 
 import numpy as np
 from typing_extensions import assert_type
@@ -12,8 +13,7 @@ import vane
 import vane.sqltypes as public_sqltypes
 import vane.udf as public_udf
 from vane import _native
-from vane._native import _func, _sqltypes, ray_cxx
-from vane._ray_cxx import require_ray_cxx_attr
+from vane._native import _func, _sqltypes
 
 statement_members: tuple[_native.StatementType, ...] = (
     _native.StatementType.INVALID,
@@ -87,7 +87,6 @@ null_handling_members: tuple[_func.FunctionNullHandling, ...] = (
 
 assert_type(public_udf.NATIVE, public_udf.PythonUDFType)
 assert_type(public_sqltypes.INTEGER, public_sqltypes.DuckDBPyType)
-assert_type(vane.runners.get_or_create_runner(), vane.runners.runner.Runner)
 assert_type(vane.sqltypes.FLOAT, public_sqltypes.DuckDBPyType)
 assert_type(_func.NATIVE, _func.PythonUDFType)
 assert_type(_sqltypes.INTEGER, _sqltypes.DuckDBPyType)
@@ -98,6 +97,8 @@ public_type: public_sqltypes.DuckDBPyType = private_type
 assert_type(public_type, public_sqltypes.DuckDBPyType)
 
 connection = vane.connect()
+assert_type(connection.backend, Literal["local", "ray"])
+assert_type(connection.sql("SELECT 1").backend, Literal["local", "ray"])
 assert_type(connection.sql("SELECT 1").repartition(4, "1"), vane.DuckDBPyRelation)
 assert_type(connection.sql("SELECT 1").repartition("1", num_partitions=4), vane.DuckDBPyRelation)
 assert_type(
@@ -170,19 +171,3 @@ assert_type(vane.col("file").url, vane.Expression)
 
 assert_type(_native._func, types.ModuleType)
 assert_type(_native._sqltypes, types.ModuleType)
-assert_type(_native.ray_cxx, types.ModuleType)
-assert_type(vane.ray_cxx.PyLogicalPlan, type[ray_cxx.PyLogicalPlan])
-assert_type(require_ray_cxx_attr("PyLogicalPlan"), type[ray_cxx.PyLogicalPlan])
-assert_type(require_ray_cxx_attr("RayTaskResult"), type[ray_cxx.RayTaskResult])
-cleanup_flight_shuffle = require_ray_cxx_attr("cleanup_flight_shuffle_for_query")
-assert_type(cleanup_flight_shuffle("typing-query"), dict[str, int | str])
-assert_type(ray_cxx.merge_scan_split_batches([b"batch"]), bytes)
-assert_type(ray_cxx.split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
-split_scan_split_batch = require_ray_cxx_attr("split_scan_split_batch")
-assert_type(split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
-assert_type(
-    ray_cxx.split_exchange_source_task_by_partition(b"descriptor"),
-    list[tuple[int, bytes, int, int, bool]],
-)
-assert_type(ray_cxx.RayTaskResult.no_output(), ray_cxx.RayTaskResult)
-assert_type(ray_cxx.FteSplitQueue(), ray_cxx.FteSplitQueue)

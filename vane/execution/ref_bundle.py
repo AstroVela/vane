@@ -2053,7 +2053,7 @@ def _is_ray_object_ref(ref: Any) -> bool:
 
 
 def _resolve_ray_object_ref_blocks(refs: list[Any]) -> list[Any]:
-    from vane.runners.ray.safe_get import resolve_object_refs_blocking
+    from vane.execution.ray_wait import resolve_object_refs_blocking
 
     resolved = resolve_object_refs_blocking(refs)
     if not isinstance(resolved, list | tuple):

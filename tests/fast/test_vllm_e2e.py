@@ -5,9 +5,8 @@ import importlib
 import os
 
 import pytest
-from ray_test_profile import ray_test_object_store_options
 
-pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner, pytest.mark.gpu]
+pytestmark = pytest.mark.gpu
 
 
 def _assert_explain_contains(explain_text, keyword):
@@ -17,10 +16,6 @@ def _assert_explain_contains(explain_text, keyword):
 def test_vllm_e2e_basic():
     pytest.importorskip("pyarrow")
 
-    try:
-        import ray
-    except Exception as exc:
-        pytest.skip(f"ray unavailable: {exc}")
     try:
         importlib.import_module("vllm")
     except Exception as exc:
@@ -32,12 +27,6 @@ def test_vllm_e2e_basic():
 
     if not torch.cuda.is_available():
         pytest.skip("vllm requires CUDA")
-
-    ray.init(
-        address="local",
-        include_dashboard=False,
-        **ray_test_object_store_options(),
-    )
 
     import vane
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -52,7 +41,7 @@ def test_vllm_e2e_basic():
 
     model = os.getenv("VLLM_E2E_MODEL", "Qwen/Qwen3-1.7B")
     options = {
-        "use_ray": True,
+        "use_ray": False,
         "concurrency": 1,
         "gpus_per_actor": 1,
         "do_prefix_routing": False,
@@ -107,7 +96,3 @@ def test_vllm_e2e_basic():
         assert all(isinstance(row[2], str) and row[2] for row in rows)
     finally:
         con.close()
-        try:
-            ray.shutdown()
-        except Exception:
-            pass

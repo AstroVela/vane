@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 from vane.execution import local_result_delivery, request_admission, request_deadline, result_delivery
-from vane.execution.local_result_delivery import prepare_local_result
+from vane.execution.local_result_delivery import prepare_native_query_result
 from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestQueueTimeout
 from vane.execution.request_deadline import MonotonicDeadline
 from vane.execution.result_delivery import (
@@ -77,12 +77,7 @@ def test_stream_cancellation_captures_request_outcome_outside_the_result_lock():
     assert runtime.snapshot()["active_results"] == runtime.snapshot()["usage_bytes"] == 0
 
 
-def native(*tables):
-    return SimpleNamespace(
-        result_schema={"names": ["x"], "types": ["BIGINT"]},
-        arrow_schema=pa.schema([("x", pa.int64())]),
-        partition_payloads=list(tables),
-    )
+NATIVE_SCHEMA = {"names": ["x"], "types": ["BIGINT"]}
 
 
 def clock(monkeypatch):
@@ -195,7 +190,7 @@ def test_cleanup_failures_retain_owners_and_capacity_for_retry(operation):
 def test_exported_arrow_views_retain_capacity_after_handle_and_runtime_close(view):
     runtime = registry()
     result = runtime.begin()
-    prepare_local_result(result, native(pa.table({"x": [1, 2, 3]})))
+    prepare_native_query_result(result, pa.table({"x": [1, 2, 3]}), NATIVE_SCHEMA)
     result.ready(delivery_timeout=None)
     before = runtime.snapshot()["usage_bytes"]
     assert before > 24
@@ -227,7 +222,7 @@ def test_result_buffers_are_checked_before_allocation(monkeypatch):
         local_result_delivery.pa, "allocate_buffer", lambda *a, **k: pytest.fail("over-budget allocation")
     )
     with pytest.raises(ResultDeliveryFull):
-        prepare_local_result(result, native(pa.table({"x": [1]})))
+        prepare_native_query_result(result, pa.table({"x": [1]}), NATIVE_SCHEMA)
     result.abort_preparation()
     assert runtime.snapshot()["usage_bytes"] == runtime.snapshot()["active_results"] == 0
 
@@ -236,7 +231,8 @@ def test_partial_preparation_failure_releases_already_encoded_partitions():
     runtime = registry(size=400)
     result = runtime.begin()
     with pytest.raises(ResultDeliveryFull):
-        prepare_local_result(result, native(pa.table({"x": [1]}), pa.table({"x": [2]})))
+        prepare_native_query_result(result, pa.table({"x": [1]}), NATIVE_SCHEMA)
+        prepare_native_query_result(result, pa.table({"x": [2]}), NATIVE_SCHEMA)
     assert runtime.snapshot()["usage_bytes"] > 0
     result.abort_preparation()
     assert runtime.snapshot()["usage_bytes"] == 0
@@ -245,16 +241,16 @@ def test_partial_preparation_failure_releases_already_encoded_partitions():
 def test_consumed_views_block_new_buffers_without_holding_result_slots():
     runtime = registry(results=1, size=400)
     result = runtime.begin()
-    prepare_local_result(result, native(pa.table({"x": [1]})))
+    prepare_native_query_result(result, pa.table({"x": [1]}), NATIVE_SCHEMA)
     result.ready(delivery_timeout=None)
     table = result.take()
     second = runtime.begin()
     with pytest.raises(ResultDeliveryFull):
-        prepare_local_result(second, native(pa.table({"x": [2]})))
+        prepare_native_query_result(second, pa.table({"x": [2]}), NATIVE_SCHEMA)
     second.abort_preparation()
     del table
     third = runtime.begin()
-    prepare_local_result(third, native(pa.table({"x": [3]})))
+    prepare_native_query_result(third, pa.table({"x": [3]}), NATIVE_SCHEMA)
     third.ready(delivery_timeout=None)
     assert third.take().column(0).to_pylist() == [3]
     runtime.close()
@@ -524,7 +520,7 @@ def test_invalid_timeouts_do_not_consume_a_request_or_result_slot(name, value):
     ) as models:
         request = models.request()
         with pytest.raises(ValueError, match=name):
-            request.execute_result(None, {}, conn=None, **{name: value})
+            request._run_managed_result(lambda: None, lambda *_: None, **{name: value})
         assert request.state == "ready" and not request._used
         assert models.resource_snapshot()["result_delivery"]["active_results"] == 0
 
@@ -537,7 +533,7 @@ def test_managed_result_configuration_is_explicit():
     ) as models:
         request = models.request()
         with pytest.raises(RuntimeError, match="result_limit"):
-            request.execute_result(None, {}, conn=None)
+            request._run_managed_result(lambda: None, lambda *_: None)
         assert request.state == "ready" and not request._used
 
 
@@ -550,7 +546,7 @@ def test_failed_buffer_build_keeps_its_owner_until_cleanup(monkeypatch):
     runtime = registry()
     result = runtime.begin()
     with pytest.raises(OSError, match="encoding failure"):
-        prepare_local_result(result, native(pa.table({"x": [1]})))
+        prepare_native_query_result(result, pa.table({"x": [1]}), NATIVE_SCHEMA)
     assert runtime.snapshot()["usage_bytes"] > 0
     result.abort_preparation()
     assert runtime.snapshot()["usage_bytes"] == runtime.snapshot()["active_results"] == 0
@@ -643,26 +639,24 @@ def test_cleanup_handoff_retries_when_consumer_and_cancellation_both_saw_busy(mo
 def test_native_completion_metadata_is_preserved():
     runtime = registry()
     result = runtime.begin()
-    source = native(pa.table({"x": [1]}))
-    source.completion_status = "status-from-native"
-    source.stats = [10, 20]
-    source.task_stats = {"task": "details"}
-    prepare_local_result(result, source)
+    table = pa.table({"x": [1]})
+    prepare_native_query_result(result, table, NATIVE_SCHEMA)
     result.ready(delivery_timeout=None)
-    assert result.completion_status == source.completion_status
-    assert result.schema == source.arrow_schema
-    assert result.stats == source.stats and result.task_stats == source.task_stats
+    assert result.completion_status == "ok"
+    assert result.schema == table.schema
+    assert result.result_schema == NATIVE_SCHEMA
     runtime.close()
 
 
 def test_empty_native_result_collect_keeps_schema_without_charging_data():
     runtime = registry()
     result = runtime.begin()
-    source = native()
-    prepare_local_result(result, source)
+    table = pa.Table.from_batches([], schema=pa.schema([("x", pa.int64())]))
+    prepare_native_query_result(result, table, NATIVE_SCHEMA)
     result.ready(delivery_timeout=None)
-    assert result.schema == source.arrow_schema
-    assert result.collect() == pa.Table.from_batches([], schema=source.arrow_schema)
+    assert result.schema == table.schema
+    assert result.collect() == table
+    assert result.completion_status == "empty"
     assert result.state == "delivered"
     assert runtime.snapshot()["active_results"] == runtime.snapshot()["usage_bytes"] == 0
     runtime.close()
@@ -738,7 +732,7 @@ def test_iterator_exhaustion_releases_consumed_buffers_without_cyclic_gc():
     try:
         for _ in range(3):
             result = runtime.begin()
-            prepare_local_result(result, native(pa.table({"x": [1, 2]})))
+            prepare_native_query_result(result, pa.table({"x": [1, 2]}), NATIVE_SCHEMA)
             result.ready(delivery_timeout=None)
             assert sum(table.num_rows for table in result) == 2
             assert runtime.snapshot()["usage_bytes"] == runtime.snapshot()["active_results"] == 0
@@ -802,12 +796,12 @@ def test_queued_request_termination_and_duplicate_calls_never_reserve_result_cap
 
         monkeypatch.setattr(condition, "wait", wait)
         with ThreadPoolExecutor(max_workers=1) as threads:
-            future = threads.submit(queued.execute_result, None, {}, conn=None)
+            future = threads.submit(queued._run_managed_result, lambda: None, lambda *_: None)
             try:
                 assert waiting.wait(3)
                 assert models.resource_snapshot()["result_delivery"]["active_results"] == 0
                 with pytest.raises(RuntimeError, match="only execute once"):
-                    queued.execute_result(None, {}, conn=None)
+                    queued._run_managed_result(lambda: None, lambda *_: None)
                 if operation == "cancel":
                     assert queued.cancel()
                 elif operation == "drain":

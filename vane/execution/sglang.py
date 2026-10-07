@@ -22,7 +22,7 @@ from vane.ai.provider import (
 )
 from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor, RayActorExecutorMixin
 from vane.execution._vllm_options_protocol import _unpack_native_options_envelope
-from vane.runners.ray.ray_env import install_explicit_session_runtime_env
+from vane.execution.session_environment import install_explicit_session_runtime_env
 
 
 class SGLangExecutor(LLMExecutor):
@@ -194,7 +194,7 @@ def build_executor(model: str, options: Any | None) -> LLMExecutor:
         import ray
 
         if not ray.is_initialized():
-            raise RuntimeError("Ray SGLang execution requires an initialized RayRunner runtime")
+            raise RuntimeError("Ray SGLang execution requires an explicit Ray resource allocation")
         pool_name = opts.get("ray_actor_pool_name")
         if pool_name:
             from vane.execution.vllm import LLMActors

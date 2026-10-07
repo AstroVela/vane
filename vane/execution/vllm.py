@@ -34,8 +34,8 @@ from vane.execution._vllm_options_protocol import (
     _load_vllm_protocol_json,
     _unpack_native_options_envelope,
 )
-from vane.runners.ray.ray_env import build_session_runtime_env_vars, install_explicit_session_runtime_env
-from vane.runners.ray.safe_get import configured_ray_get_timeout_s, resolve_object_refs_blocking
+from vane.execution.ray_wait import configured_ray_get_timeout_s, resolve_object_refs_blocking
+from vane.execution.session_environment import build_session_runtime_env_vars, install_explicit_session_runtime_env
 
 
 def _positive_float_env(name: str, default: float | None = None) -> float | None:
@@ -1721,7 +1721,7 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
     options = _unpack_native_options_envelope(options)
 
     if options.get("ray_address") is not None:
-        raise ValueError("vLLM ray_address has been removed; configure RayRunner instead")
+        raise ValueError("vLLM ray_address has been removed; configure an explicit Ray runtime instead")
 
     unknown = sorted(str(name) for name in options if not isinstance(name, str) or name not in _ALLOWED_VLLM_OPTIONS)
     if unknown:
@@ -1807,7 +1807,7 @@ def ensure_named_vllm_pools_for_plan(
     import ray
 
     if not ray.is_initialized():
-        raise RuntimeError("Ray vLLM actor creation requires an initialized RayRunner runtime")
+        raise RuntimeError("Ray vLLM actor creation requires an explicit Ray resource allocation")
 
     normalized_session_config = {str(key): str(value) for key, value in session_config.items()}
     created: list[LLMActors] = []
@@ -1912,7 +1912,7 @@ def build_executor(model: str, options: Any | None) -> LLMExecutor:
         import ray
 
         if not ray.is_initialized():
-            raise RuntimeError("Ray vLLM execution requires an initialized RayRunner runtime")
+            raise RuntimeError("Ray vLLM execution requires an explicit Ray resource allocation")
         if pool_name:
             llm_actors = LLMActors.lookup_named(
                 concurrency=opts["concurrency"],

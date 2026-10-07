@@ -69,7 +69,9 @@ non-editable package so the test environment receives them. Changes below
 For `native_media`, first prepare its separate SDK and shared libraries using
 [the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
-shared-cluster tests with the signed provider fixture; it owns two-node clusters.
+shared-cluster tests with the signed provider fixture; it owns two-node clusters
+and verifies provider identity using native connections on each node. The Ray
+query runtime does not yet support media expressions.
 
 `VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
 `.duckdb_extension` artifacts without linking them into `vane._native`. The
@@ -227,7 +229,7 @@ scripts/run_release_tests.sh
 
 The gate includes native local-runtime backpressure acceptance: small-budget
 progress, concurrent model reuse, retained results, cancellation/cleanup retry,
-and final UDF statistics. See [coverage and failure diagnostics](LOCAL_MODEL_RUNTIME.md#backpressure-acceptance-gate).
+and final UDF statistics. See [coverage and failure diagnostics](LOCAL_MODEL_RUNTIME.md#request-and-resource-ownership).
 Real-Ray release tests run in a separate process; the full local parameter
 matrices remain in the fast-test shards.
 
@@ -279,14 +281,11 @@ endpoint or credentials.
 Cosmos image queries reuse the video model's visual encoder with one frame.
 `tests/fast/test_cosmos_embed1.py` checks preprocessing, precision, RGB validation,
 NULL batches and planning without model downloads. The image/video embedding
-contract tests cover the common Python and SQL paths. The opt-in
-`tests/ai/test_cosmos_video_embedding.py` exercises paired image/video/text vectors
-on default Ray using cached weights and reviewed media. Set `HF_HUB_OFFLINE=1`,
-`VANE_TEST_COSMOS_CACHE` and `VANE_TEST_COSMOS_VIDEO` for that GPU check.
-Single-frame support follows the upstream processor's explicit
-[`num_video_frames` override](https://huggingface.co/nvidia/Cosmos-Embed1-224p/blob/787e0b996f5260a71ad474a283c90539a2e12986/preprocessing_embed1.py).
-This execution check does not establish image-to-video retrieval quality on a
-representative corpus; keep that acceptance separate from the CPU release gate.
+contract tests cover the common Python and SQL paths.
+GPU inference requires registered local models; the Cosmos GPU
+end-to-end acceptance has not yet been migrated to that API. The independent
+local GPU runtime checks are documented in
+[Local model runtime](LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).
 
 ## Formatting and static checks
 

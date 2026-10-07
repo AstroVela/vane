@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import pickle
-import uuid
 
 import pytest
 
@@ -16,23 +15,6 @@ def _assert_sql_alias_absent(conn, alias):
         "SELECT count(*) FROM duckdb_functions() WHERE function_name = ?",
         [alias],
     ).fetchone() == (0,)
-
-
-def _fresh_physical_udf_payload(relation):
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        relation,
-        str(uuid.uuid4()),
-    )
-    restored = pickle.loads(pickle.dumps(logical))
-    target = vane.connect()
-    try:
-        physical = restored.to_physical_plan(target)
-        nodes = physical.collect_udf_nodes()
-    finally:
-        target.close()
-
-    assert len(nodes) == 1
-    return nodes[0]["payload"]
 
 
 def _attach_binary_batch(conn, alias, fn):
@@ -876,7 +858,7 @@ def test_vane_cls_sql_batch_size_override_reaches_fresh_physical_payload_and_exe
     )
     relation = conn.sql("SELECT row_class_batch_size_override_sql(i::INTEGER) AS result FROM range(5) t(i) ORDER BY i")
 
-    payload = _fresh_physical_udf_payload(relation)
+    payload = relation._collect_udf_metadata()[0]["payload"]
     assert payload["batch_size"] == 2
     assert payload["output_schema"] == [
         {

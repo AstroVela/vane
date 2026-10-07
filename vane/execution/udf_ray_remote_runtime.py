@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vane.runners.ray.safe_get import resolve_object_refs_blocking
+from vane.execution.ray_wait import resolve_object_refs_blocking
 
 
 class RemoteUDFRuntimeMixin:

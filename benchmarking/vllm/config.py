@@ -36,7 +36,6 @@ def _build_pythonpath() -> str:
     return os.pathsep.join(entries)
 
 
-os.environ["VANE_RUNNER"] = os.getenv("VANE_RUNNER", "").strip() or "ray"
 os.environ.setdefault(
     "AWS_ENDPOINT_URL",
     "http://127.0.0.1:9000",
@@ -70,7 +69,7 @@ def _quote_sql(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _build_vane_ray_init_sql() -> str:
+def _build_vane_init_sql() -> str:
     endpoint_url = os.environ["AWS_ENDPOINT_URL"].strip()
     if "://" not in endpoint_url:
         endpoint_url = f"http://{endpoint_url}"
@@ -96,9 +95,6 @@ def _build_vane_ray_init_sql() -> str:
     return "; ".join(sqls)
 
 
-os.environ.setdefault("VANE_RAY_INIT_SQL", _build_vane_ray_init_sql())
-
-
 def get_runtime_env_vars() -> dict[str, str]:
     env_vars = {
         "AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT_URL"],
@@ -108,8 +104,6 @@ def get_runtime_env_vars() -> dict[str, str]:
         "AWS_DEFAULT_REGION": os.environ["AWS_DEFAULT_REGION"],
         "HF_HUB_OFFLINE": os.environ["HF_HUB_OFFLINE"],
         "TRANSFORMERS_OFFLINE": os.environ["TRANSFORMERS_OFFLINE"],
-        "VANE_RUNNER": os.environ["VANE_RUNNER"],
-        "VANE_RAY_INIT_SQL": os.environ["VANE_RAY_INIT_SQL"],
         "VANE_UDF_RAY_READY_TIMEOUT_SECS": os.environ["VANE_UDF_RAY_READY_TIMEOUT_SECS"],
         "PYTHONPATH": os.environ["PYTHONPATH"],
     }
@@ -150,13 +144,6 @@ def init_daft_ray() -> None:
     daft.set_runner_ray()
 
 
-def init_vane_runtime() -> None:
-    import vane
-
-    init_ray_runtime()
-    vane.configure(runner="ray")
-
-
 def get_cluster_gpu_count() -> int:
     import ray
 
@@ -167,7 +154,6 @@ def get_cluster_gpu_count() -> int:
 def connect_vane():
     import vane
 
-    init_vane_runtime()
     con = vane.connect()
     configure_vane_connection(con)
     return con
@@ -183,7 +169,7 @@ def configure_vane_connection(con) -> None:
         except Exception:
             pass
 
-    for stmt in os.environ["VANE_RAY_INIT_SQL"].split("; "):
+    for stmt in _build_vane_init_sql().split("; "):
         if stmt:
             con.execute(stmt)
 
@@ -223,12 +209,21 @@ def get_vllm_engine_args() -> dict[str, object]:
     return engine_args
 
 
+def get_local_gpu_count() -> int:
+    import torch
+
+    count = torch.cuda.device_count()
+    if count == 0:
+        raise RuntimeError("Vane model benchmarks require a local CUDA GPU")
+    return count
+
+
 def get_vane_native_actor_count() -> int:
-    return VLLM_ACTOR_COUNT or get_cluster_gpu_count()
+    return VLLM_ACTOR_COUNT or get_local_gpu_count()
 
 
 def get_vane_naive_actor_count() -> int:
-    return NAIVE_ACTOR_COUNT or get_cluster_gpu_count()
+    return NAIVE_ACTOR_COUNT or get_local_gpu_count()
 
 
 def get_vane_naive_partition_count() -> int:
@@ -248,7 +243,7 @@ def build_vane_native_vllm_options(
     batch_size: int | None = VLLM_BATCH_SIZE,
 ) -> dict[str, object]:
     return {
-        "use_ray": True,
+        "use_ray": False,
         "concurrency": get_vane_native_actor_count(),
         "gpus_per_actor": 1,
         "do_prefix_routing": do_prefix_routing,

@@ -18,13 +18,11 @@ add_subdirectory(pyconnection)
 add_subdirectory(common)
 add_subdirectory(pandas)
 add_subdirectory(arrow)
-add_subdirectory(ray)
-add_subdirectory(vane-runners)
 
 add_library(
   python_src OBJECT
   dataframe.cpp
-  bound_plan.cpp
+  native_query.cpp
   query_parameters.cpp
   dynamic_extension.cpp
   execution/fragment_plan.cpp

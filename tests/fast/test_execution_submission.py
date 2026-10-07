@@ -721,13 +721,10 @@ def test_local_execution_never_enters_submission_protocol(connection, monkeypatc
 
 
 def test_preparation_does_not_invoke_legacy_runner_or_environment_configuration(connection, monkeypatch):
-    from vane import _ray_cxx, runners
+    import sys
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("submission entered legacy execution")
-
-    monkeypatch.setattr(runners, "get_or_create_runner", forbidden)
-    monkeypatch.setattr(_ray_cxx, "validate_plan_serialization_for_submission", forbidden)
+    monkeypatch.setitem(sys.modules, "vane.runners", None)
+    monkeypatch.setitem(sys.modules, "vane._ray_cxx", None)
     original = prepare(connection)
     monkeypatch.setenv("VANE_RUNNER", "invalid-runner")
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "invalid-exchange")

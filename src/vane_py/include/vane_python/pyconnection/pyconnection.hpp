@@ -174,7 +174,6 @@ struct VaneSessionContext {
 	vector<string> dynamic_extension_snapshot_entries;
 	mutex lock;
 	idx_t connection_count = 1;
-	bool ray_session_opened = false;
 	py::object local_query_runtime = py::none();
 	py::object query_runtime = py::none();
 	bool local_runtime_closing = false;
@@ -406,19 +405,18 @@ public:
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
 	static shared_ptr<DuckDBPyConnection> ConnectQuery(const py::object &database, bool read_only,
 	                                                   const py::dict &config, const py::kwargs &options);
-	static shared_ptr<DuckDBPyConnection> ConnectWithRunner(const py::object &database, bool read_only,
-	                                                        const py::dict &config, const string &runner_type,
-	                                                        bool use_instance_cache = true);
+	static shared_ptr<DuckDBPyConnection> ConnectQuerySession(const py::object &database, bool read_only,
+	                                                          const py::dict &config);
 	static shared_ptr<DuckDBPyConnection> ConnectUncached(const py::object &database, bool read_only,
 	                                                      const py::dict &config);
 	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
 	py::dict ExportConnectionBootstrapConfig() const;
 	void InitializeVaneSession();
-	string GetRunnerType() const;
+	string GetExecutionBackend() const;
+	void RequireLocalExecution() const;
 	void InheritVaneSession(const DuckDBPyConnection &owner);
 	const string &GetVaneSessionId() const;
 	py::dict ExportVaneSessionConfig() const;
-	void MarkVaneRaySessionOpened();
 	bool CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries, const string &entry);
 	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();

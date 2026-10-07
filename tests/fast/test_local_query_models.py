@@ -193,19 +193,6 @@ def test_registration_cannot_be_borrowed_by_another_session(tmp_path, configured
         _assert_idle(runtime)
 
 
-@pytest.mark.parametrize("runner", ["local", "ray"])
-def test_registered_models_reject_other_runners_before_worker_start(tmp_path, monkeypatch, runner):
-    with vane.connect() as owner:
-        runtime = _runtime(owner)
-        model = _register(runtime, _class_model(tmp_path))
-        monkeypatch.setenv("VANE_RUNNER", runner)
-        with vane.connect() as other:
-            relation = other.sql("SELECT 1 AS x").project(model(vane.col("x")))
-            with pytest.raises(Exception, match="registered local models require VANE_RUNNER=local-fast"):
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "foreign-runner").to_physical_plan(other)
-        assert _initializations(tmp_path) == []
-
-
 def test_retained_model_does_not_keep_its_owner_connection_alive(tmp_path):
     connection = vane.connect()
     runtime = _runtime(connection)

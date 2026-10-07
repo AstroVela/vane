@@ -1151,71 +1151,6 @@ def test_map_batches_accepts_byte_batching_params():
     assert "udf_output_target_max_bytes48" in compact_plan
 
 
-def test_map_batches_accepts_ray_memory_bytes():
-    import pyarrow as pa
-
-    import vane
-
-    def identity(table):
-        return pa.table({"x": table.column("x")})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
-        identity,
-        schema={"x": vane.sqltypes.INTEGER},
-        execution_backend="ray_task",
-        memory_bytes=536870912,
-    )
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-memory-bytes")
-    physical = logical.to_physical_plan(con)
-    payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
-
-    assert payload["memory_bytes"] == 536870912
-
-
-def test_flat_map_accepts_ray_memory_bytes():
-    import vane
-
-    def duplicate(row):
-        return [row, row]
-
-    con = vane.connect()
-    rel = con.sql("select 1::INTEGER as x").flat_map(
-        duplicate,
-        schema={"x": vane.sqltypes.INTEGER},
-        execution_backend="ray_task",
-        memory_bytes=268435456,
-    )
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "flat-map-memory-bytes")
-    physical = logical.to_physical_plan(con)
-    payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
-
-    assert payload["memory_bytes"] == 268435456
-
-
-def test_map_batches_accepts_ray_actor_memory_bytes():
-    import vane
-
-    class Identity:
-        def __call__(self, table):
-            return table
-
-    con = vane.connect()
-    rel = con.sql("select 1::INTEGER as x").map_batches(
-        Identity,
-        schema={"x": vane.sqltypes.INTEGER},
-        execution_backend="ray_actor",
-        actor_number=1,
-        gpus=0.0,
-        memory_bytes=1073741824,
-    )
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "map-batches-actor-memory-bytes")
-    physical = logical.to_physical_plan(con)
-    payload = physical.collect_udf_nodes(conn=con)[0]["payload"]
-
-    assert payload["memory_bytes"] == 1073741824
-
-
 @pytest.mark.parametrize("backend", ["ray_task", "subprocess_actor"])
 @pytest.mark.parametrize("memory_bytes", [0, -1, 1.5, True])
 def test_map_batches_rejects_invalid_memory_bytes(backend, memory_bytes):
@@ -2633,7 +2568,7 @@ def test_map_batches_callable_class_subprocess_actor_backend():
     assert sorted(out.fetchall()) == [(101,), (102,)]
 
 
-def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch):
+def test_map_batches_default_backend_uses_local_callable_shape(monkeypatch):
     import vane
 
     def identity(table):
@@ -2648,7 +2583,7 @@ def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch)
 
     task_rel = con.sql("select 1 as x").map_batches(identity, schema={"x": vane.sqltypes.INTEGER})
     task_plan = task_rel.explain()
-    assert "ray_task" in task_plan
+    assert "subprocess_task" in task_plan
 
     actor_rel = con.sql("select 1 as x").map_batches(
         Identity,
@@ -2657,7 +2592,7 @@ def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch)
         gpus=0.0,
     )
     actor_plan = actor_rel.explain()
-    assert "ray_actor" in actor_plan
+    assert "subprocess_actor" in actor_plan
     assert "actor_number" in actor_plan
 
 

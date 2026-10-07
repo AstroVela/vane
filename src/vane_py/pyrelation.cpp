@@ -4,10 +4,12 @@
 //
 // Modified by Vane contributors.
 
-#include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pyrelation.hpp"
-#include "vane_python/bound_plan.hpp"
+#include "vane_python/native_query.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/statement/relation_statement.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pytype.hpp"
@@ -1057,278 +1059,47 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::FetchRecordBatchReader(idx_
 	return result->FetchRecordBatchReader(rows_per_batch);
 }
 
-string DuckDBPyRelation::GetRunnerType() const {
+string DuckDBPyRelation::GetExecutionBackend() const {
 	auto query_lock = AssertRelation();
-	return RunnerClientState::Get(*rel->context->GetContext());
+	auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
+	return owner.is_none() ? "local" : owner.cast<shared_ptr<DuckDBPyConnection>>()->GetExecutionBackend();
 }
 
-static void ValidateDistributedResultType(const LogicalType &type, bool arrow_lossless_conversion) {
-	if (type.id() == LogicalTypeId::ENUM || type.id() == LogicalTypeId::AGGREGATE_STATE ||
-	    type.id() == LogicalTypeId::VARIANT) {
-		throw NotImplementedException(
-		    "Distributed execution cannot preserve result type %s through the Arrow transport", type.ToString());
-	}
-	if (!arrow_lossless_conversion && (type.id() == LogicalTypeId::HUGEINT || type.id() == LogicalTypeId::UHUGEINT ||
-	                                   type.id() == LogicalTypeId::UUID || type.id() == LogicalTypeId::BIT ||
-	                                   type.id() == LogicalTypeId::TIME_TZ || type.IsJSONType())) {
-		throw NotImplementedException(
-		    "Distributed execution cannot preserve result type %s while arrow_lossless_conversion is false",
-		    type.ToString());
-	}
-
-	switch (type.id()) {
-	case LogicalTypeId::LIST:
-		ValidateDistributedResultType(ListType::GetChildType(type), arrow_lossless_conversion);
-		break;
-	case LogicalTypeId::ARRAY:
-		ValidateDistributedResultType(ArrayType::GetChildType(type), arrow_lossless_conversion);
-		break;
-	case LogicalTypeId::MAP:
-		ValidateDistributedResultType(MapType::KeyType(type), arrow_lossless_conversion);
-		ValidateDistributedResultType(MapType::ValueType(type), arrow_lossless_conversion);
-		break;
-	case LogicalTypeId::STRUCT:
-		for (const auto &child : StructType::GetChildTypes(type)) {
-			ValidateDistributedResultType(child.second, arrow_lossless_conversion);
-		}
-		break;
-	case LogicalTypeId::UNION:
-		for (idx_t child_idx = 0; child_idx < UnionType::GetMemberCount(type); child_idx++) {
-			ValidateDistributedResultType(UnionType::GetMemberType(type, child_idx), arrow_lossless_conversion);
-		}
-		break;
-	default:
-		break;
-	}
-}
-
-static void ValidateDistributedResultTypes(const vector<LogicalType> &types, ClientContext &context) {
-	const auto client_properties = context.GetClientProperties();
-	for (const auto &type : types) {
-		ValidateDistributedResultType(type, client_properties.arrow_lossless_conversion);
-	}
-}
-
-// ── Per-database runner instances ──────────────────────────────────────
-// Each DatabaseInstance gets its own runner (created lazily).
-// Replaces the global VANE_RUNNER_PTR singleton for write dispatch.
-static std::mutex per_db_runner_mutex;
-
-static bool PyRelationRuntimeUsableForTeardown() {
-	if (!Py_IsInitialized()) {
-		return false;
-	}
-	if (PythonIsFinalizing()) {
-		return false;
-	}
-	return true;
-}
-
-struct SafeRelationPyObject {
-	bool has_value = false;
-	py::object obj;
-
-	SafeRelationPyObject() = default;
-	explicit SafeRelationPyObject(py::object value) : has_value(true), obj(std::move(value)) {
-	}
-
-	SafeRelationPyObject(const SafeRelationPyObject &other) : has_value(false), obj() {
-		if (other.has_value && other.obj.ptr() && PyRelationRuntimeUsableForTeardown()) {
-			PythonGILWrapper gil;
-			obj = py::reinterpret_borrow<py::object>(other.obj);
-			has_value = true;
-		}
-	}
-
-	SafeRelationPyObject &operator=(const SafeRelationPyObject &other) {
-		if (this == &other) {
-			return *this;
-		}
-		Reset();
-		if (other.has_value && other.obj.ptr() && PyRelationRuntimeUsableForTeardown()) {
-			PythonGILWrapper gil;
-			obj = py::reinterpret_borrow<py::object>(other.obj);
-			has_value = true;
-		}
-		return *this;
-	}
-
-	SafeRelationPyObject(SafeRelationPyObject &&other) noexcept
-	    : has_value(other.has_value), obj(std::move(other.obj)) {
-		other.has_value = false;
-	}
-
-	SafeRelationPyObject &operator=(SafeRelationPyObject &&other) noexcept {
-		if (this == &other) {
-			return *this;
-		}
-		Reset();
-		has_value = other.has_value;
-		obj = std::move(other.obj);
-		other.has_value = false;
-		return *this;
-	}
-
-	~SafeRelationPyObject() noexcept {
-		Reset();
-	}
-
-	void Reset() noexcept {
-		try {
-			if (!obj.ptr()) {
-				has_value = false;
-				return;
-			}
-			if (!PyRelationRuntimeUsableForTeardown()) {
-				obj.release();
-				has_value = false;
-				return;
-			}
-			PythonGILWrapper gil;
-			auto *ptr = obj.release().ptr();
-			Py_DECREF(ptr);
-			has_value = false;
-		} catch (...) {
-			obj.release();
-			has_value = false;
-		}
-	}
-
-	py::object Get() const {
-		if (!has_value || !obj.ptr()) {
-			return py::none();
-		}
-		return obj;
-	}
-};
-
-struct CachedRunnerForDatabase {
-	string runner_type;
-	SafeRelationPyObject runner;
-};
-
-static unordered_map<DatabaseInstance *, CachedRunnerForDatabase> per_db_runners;
-
-static void ForgetRunnerForDB(DatabaseInstance *db_ptr) noexcept {
-	if (!db_ptr) {
-		return;
-	}
-	try {
-		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-		per_db_runners.erase(db_ptr);
-	} catch (...) {
-		// Cleanup must not mask a runner exception or terminate unwinding.
-	}
-}
-
-class PerDBRunnerCleanupGuard {
-public:
-	explicit PerDBRunnerCleanupGuard(DatabaseInstance *db_ptr_p) noexcept : db_ptr(db_ptr_p) {
-	}
-
-	~PerDBRunnerCleanupGuard() noexcept {
-		ForgetRunnerForDB(db_ptr);
-	}
-
-	PerDBRunnerCleanupGuard(const PerDBRunnerCleanupGuard &) = delete;
-	PerDBRunnerCleanupGuard &operator=(const PerDBRunnerCleanupGuard &) = delete;
-
-private:
-	DatabaseInstance *db_ptr;
-};
-
-struct RunnerForDatabase {
-	DatabaseInstance *db_ptr;
-	py::object runner;
-};
-
-static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<ClientContext> &context, const string &runner_type) {
-	auto *db_ptr = context ? context->db.get() : nullptr;
-	if (!db_ptr) {
-		throw InternalException("Cannot resolve runner: relation has no database");
-	}
-
-	{
-		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-		auto it = per_db_runners.find(db_ptr);
-		if (it != per_db_runners.end() && it->second.runner_type == runner_type) {
-			auto runner = it->second.runner.Get();
-			if (!runner.is_none()) {
-				return {db_ptr, std::move(runner)};
-			}
-		}
-	}
-
-	// Create runner outside the lock (Python calls may be slow)
-	auto runners_mod = py::module::import("vane._native");
-	py::object runner;
-	if (runner_type == "ray") {
-		// noop_if_initialized=true: reuse existing Ray runner if one was
-		// already created by another database instance in this process.
-		auto set_fn = runners_mod.attr("set_runner_ray");
-		runner = set_fn(py::none(), /*noop_if_initialized=*/true);
-	} else if (runner_type == "local") {
-		auto set_fn = runners_mod.attr("set_runner_local");
-		runner = set_fn();
-	} else {
-		throw InternalException("Cannot create unsupported runner type '%s'", runner_type);
-	}
-
-	{
-		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-		per_db_runners[db_ptr] = CachedRunnerForDatabase {runner_type, SafeRelationPyObject(runner)};
-	}
-	return {db_ptr, std::move(runner)};
-}
-
-py::object DuckDBPyRelation::RunDataSink() {
+py::list DuckDBPyRelation::CollectUDFMetadata() {
 	auto query_lock = AssertRelation();
-	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object());
-	return std::move(execution.write_outcome);
-}
-
-static unique_ptr<QueryResult> MakeRunnerWriteResult(const RunnerBoundPlan &plan, const py::object &outcome) {
-	auto error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
-	string operation_id;
-	py::tuple cleanup_warnings;
-	try {
-		auto receipt = outcome.cast<py::dict>();
-		operation_id = receipt["copy_operation_id"].cast<string>();
-		if (receipt.contains("copy_cleanup_warnings")) {
-			cleanup_warnings = py::tuple(receipt["copy_cleanup_warnings"]);
-		}
-		auto rows = receipt["rows_copied"].cast<int64_t>();
-		if (rows < 0) {
-			throw InternalException("Runner write returned a negative row count");
-		}
-		auto collection = make_uniq<ColumnDataCollection>(Allocator::Get(*plan.context), plan.types);
-		DataChunk chunk;
-		chunk.Initialize(Allocator::Get(*plan.context), plan.types);
-		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(rows));
-		collection->Append(chunk);
-		return make_uniq<MaterializedQueryResult>(plan.statement_type, plan.properties, plan.names,
-		                                          std::move(collection), plan.context->GetClientProperties());
-	} catch (const std::exception &error) {
-		auto value = error_type(operation_id, plan.operation + " result handling failed after commit: " + error.what(),
-		                        cleanup_warnings);
-		PyErr_SetObject(error_type.ptr(), value.ptr());
-		throw py::error_already_set();
+	auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
+	if (!owner.is_none()) {
+		owner.cast<shared_ptr<DuckDBPyConnection>>()->RequireLocalExecution();
 	}
+	auto context = rel->context->GetContext();
+	py::list result;
+	context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*context);
+		Planner planner(*context);
+		planner.CreatePlan(make_uniq<RelationStatement>(rel, *binder));
+		if (ClientConfig::GetConfig(*context).enable_optimizer && planner.plan->RequireOptimizer()) {
+			Optimizer optimizer(*planner.binder, *context);
+			planner.plan = optimizer.Optimize(std::move(planner.plan));
+		}
+		PhysicalPlanGenerator generator(*context);
+		auto physical = generator.Plan(std::move(planner.plan));
+		result = CollectNativeUDFNodes(*context, physical->Root());
+	});
+	return result;
 }
 
-RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context, unique_ptr<SQLStatement> statement,
-                                        const shared_ptr<Relation> &relation,
-                                        case_insensitive_map_t<BoundParameterData> parameters,
-                                        const py::object &connection_owner, const py::object &interrupt_check,
-                                        bool stream_result, vector<string> *cleanup_warnings,
-                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache,
-                                        const py::object *delivery_timeout, idx_t result_batch_size) {
+NativeExecutionResult ExecuteNativeQuery(const shared_ptr<ClientContext> &context, unique_ptr<SQLStatement> statement,
+                                         const shared_ptr<Relation> &relation,
+                                         case_insensitive_map_t<BoundParameterData> parameters,
+                                         const py::object &connection_owner, const py::object &interrupt_check,
+                                         bool stream_result, vector<string> *cleanup_warnings,
+                                         optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache,
+                                         const py::object *delivery_timeout, idx_t result_batch_size) {
 	if (!context || bool(statement) == bool(relation)) {
-		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
+		throw InternalException("Native execution requires one SQL statement or relation and its connection");
 	}
-	if (native_prepared_cache && (!statement || RunnerClientState::Get(*context) != "local-fast")) {
-		throw InternalException("Native prepared execution requires a local-fast SQL statement");
+	if (native_prepared_cache && !statement) {
+		throw InternalException("Native prepared execution requires a SQL statement");
 	}
 	if (cleanup_warnings) {
 		cleanup_warnings->clear();
@@ -1338,6 +1109,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	unique_lock<std::recursive_mutex> query_lock;
 	if (!owner.is_none()) {
 		source_connection = owner.cast<shared_ptr<DuckDBPyConnection>>();
+		source_connection->RequireLocalExecution();
 		query_lock = source_connection->LockForQuery();
 	}
 	auto check = interrupt_check;
@@ -1355,7 +1127,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		py::gil_scoped_release release;
 		execution_lock = DuckDBPyConnection::LockConnection(source_connection->py_connection_lock);
 	}
-	RunnerExecutionResult execution;
+	NativeExecutionResult execution;
 	auto local_runtime = source_connection ? source_connection->GetLocalQueryRuntime() : py::none();
 	py::object validated_delivery_timeout = py::none();
 	if (delivery_timeout) {
@@ -1513,33 +1285,10 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		execution.return_type = execution.native_result->properties.return_type;
 		return execution;
 	}
-	unique_ptr<RunnerBoundPlan> bound;
-	struct BindingQueryGuard {
-		const shared_ptr<ClientContext> &context;
-		const unique_ptr<RunnerBoundPlan> &bound;
-		~BindingQueryGuard() {
-			if (bound) {
-				py::gil_scoped_release release;
-				try {
-					context->CancelBoundPlan(bound->query_number);
-				} catch (...) {
-					// Preserve the execution failure; cancellation has already
-					// released the binding transaction before reporting cleanup errors.
-				}
-			}
-		}
-	} binding_guard {context, bound};
 	PendingQueryParameters pending_parameters;
 	pending_parameters.parameters = parameters;
 	pending_parameters.query_parameters = stream_result;
-	const bool direct_client_command = statement ? IsDirectClientCommand(*statement) : IsDirectClientCommand(*relation);
-	if (RunnerClientState::Get(*context) != "local-fast" && !direct_client_command) {
-		pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
-		                                            PreparedStatementData &prepared) {
-			bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
-			return bool(bound);
-		};
-	}
+
 	{
 		if (source_connection) {
 			if (source_connection->con.GetConnection().context != context) {
@@ -1548,11 +1297,6 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		}
 		if (!check.is_none()) {
 			check();
-		}
-		if (statement && RunnerClientState::Get(*context) != "local-fast") {
-			// Even binding can execute scalar table-function arguments. Reject
-			// unsupported wrappers before starting the native query lifecycle.
-			ValidateRunnerStatement(*statement);
 		}
 		ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
 		try {
@@ -1608,88 +1352,17 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			throw;
 		}
 	}
-	if (execution.native_result) {
-		execution.return_type = execution.native_result->properties.return_type;
-		return execution;
+	if (!execution.native_result) {
+		throw InternalException("Native execution produced no result");
 	}
-	if (!bound) {
-		throw InternalException("Execution produced neither a native result nor a bound runner plan");
-	}
-	execution.return_type = bound->properties.return_type;
-	if (!check.is_none()) {
-		check();
-	}
-	if (bound->kind == RunnerPlanKind::READ) {
-		ValidateDistributedResultTypes(bound->types, *context);
-	}
-	auto &client_config = ClientConfig::GetConfig(*context);
-	auto result_collector = client_config.get_result_collector;
-	ScopedConfigSetting collector_scope(
-	    client_config, [](ClientConfig &config) { config.get_result_collector = nullptr; },
-	    [&result_collector](ClientConfig &config) { config.get_result_collector = std::move(result_collector); });
-	auto runner_for_db = GetOrCreateRunnerForDB(context, RunnerClientState::Get(*context));
-	PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
-	auto transport = SerializeRunnerBoundPlan(*bound, connection_owner);
-	if (!check.is_none()) {
-		check();
-	}
-	if (bound->kind == RunnerPlanKind::DATA_SINK) {
-		execution.write_outcome = runner_for_db.runner.attr("run_datasink")(transport);
-		return execution;
-	}
-	if (bound->kind != RunnerPlanKind::READ) {
-		execution.write_outcome = py::module_::import("vane._query_interrupt")
-		                              .attr("run_write_with_interrupt_check")(runner_for_db.runner, transport, check);
-		execution.native_result = MakeRunnerWriteResult(*bound, execution.write_outcome);
-		return execution;
-	}
-	py::object iterator;
-	try {
-		iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(transport));
-		py::object source_owner = py::none();
-		if (relation) {
-			// DataSource dependencies belong to the active stream, not the
-			// transport retained by the driver. Keep only the native Relation;
-			// retaining its Python wrapper could cycle through a connection cursor.
-			auto retained_source = make_uniq<shared_ptr<Relation>>(relation);
-			source_owner = py::capsule(retained_source.get(),
-			                           [](void *source) { delete static_cast<shared_ptr<Relation> *>(source); });
-			retained_source.release();
-		}
-		iterator = py::module_::import("vane._query_interrupt")
-		               .attr("QueryResultIterator")(iterator, check, std::move(source_owner));
-		py::object first_partition;
-		bool has_first_partition = false;
-		bool exhausted = false;
-		PyObject *next = PyIter_Next(iterator.ptr());
-		if (next) {
-			first_partition = py::reinterpret_steal<py::object>(next);
-			has_first_partition = true;
-		} else if (PyErr_Occurred()) {
-			throw py::error_already_set();
-		} else {
-			exhausted = true;
-		}
-		execution.distributed_result = make_shared_ptr<DuckDBPyResult>(
-		    MakeDistributedArrowPyResultSource(std::move(iterator), std::move(first_partition), has_first_partition,
-		                                       exhausted, bound->names, bound->types, context, connection_owner));
-		return execution;
-	} catch (...) {
-		if (iterator && py::hasattr(iterator, "close")) {
-			try {
-				iterator.attr("close")();
-			} catch (py::error_already_set &error) {
-				error.discard_as_unraisable("closing distributed result iterator after startup failure");
-			}
-		}
-		throw;
-	}
+	execution.return_type = execution.native_result->properties.return_type;
+	return execution;
 }
 
 unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 	this->executed = true;
-	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
-	                                   stream_result, &udf_actor_cleanup_warnings);
+	auto execution = ExecuteNativeQuery(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
+	                                    stream_result, &udf_actor_cleanup_warnings);
 	if (!execution.native_result) {
 		throw InternalException("Native result consumer received a distributed stream");
 	}
@@ -1704,8 +1377,8 @@ vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, const py::object &interrupt_check) {
 	this->executed = true;
-	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, interrupt_check,
-	                                   stream_result, &udf_actor_cleanup_warnings);
+	auto execution = ExecuteNativeQuery(rel->context->GetContext(), nullptr, rel, {}, connection_owner, interrupt_check,
+	                                    stream_result, &udf_actor_cleanup_warnings);
 	result = execution.TakeResult();
 	if (!result) {
 		throw InternalException("ExecuteOrThrow - no query available to execute");
@@ -2362,7 +2035,8 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
 	}
 
 	auto write_parquet = rel->WriteParquetRel(filename, std::move(options));
-	ExecuteWithRunner(write_parquet->context->GetContext(), nullptr, write_parquet, {}, connection_owner, py::object());
+	ExecuteNativeQuery(write_parquet->context->GetContext(), nullptr, write_parquet, {}, connection_owner,
+	                   py::object());
 }
 
 void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, const py::object &na_rep,
@@ -2510,7 +2184,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 	}
 
 	auto write_csv = rel->WriteCSVRel(filename, std::move(options));
-	ExecuteWithRunner(write_csv->context->GetContext(), nullptr, write_csv, {}, connection_owner, py::object());
+	ExecuteNativeQuery(write_csv->context->GetContext(), nullptr, write_csv, {}, connection_owner, py::object());
 }
 
 void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
@@ -2519,7 +2193,7 @@ void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
 		throw InvalidInputException("write_file requires a non-empty format");
 	}
 	auto write_file = rel->WriteFileRel(filename, format);
-	ExecuteWithRunner(write_file->context->GetContext(), nullptr, write_file, {}, connection_owner, py::object());
+	ExecuteNativeQuery(write_file->context->GetContext(), nullptr, write_file, {}, connection_owner, py::object());
 }
 
 // should this return a rel with the new view?
@@ -2560,8 +2234,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_name, co
 		auto query = PragmaShow(view_name);
 		return Query(view_name, query);
 	}
-	auto execution = ExecuteWithRunner(rel->context->GetContext(), std::move(parser.statements[0]), nullptr, {},
-	                                   connection_owner, py::object());
+	auto execution = ExecuteNativeQuery(rel->context->GetContext(), std::move(parser.statements[0]), nullptr, {},
+	                                    connection_owner, py::object());
 	// query() exposes a Relation only for SELECT. Finish any immediate result
 	// before discarding it, including a distributed table-function result.
 	auto result = execution.TakeResult();
@@ -2596,8 +2270,8 @@ py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout, b
 	// Close must not implicitly execute again, even after admission refusal or
 	// a delivery failure following UDF side effects.
 	executed = true;
-	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
-	                                   stream, nullptr, nullptr, &delivery_timeout, rows_per_batch);
+	auto execution = ExecuteNativeQuery(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
+	                                    stream, nullptr, nullptr, &delivery_timeout, rows_per_batch);
 	return std::move(execution.managed_result);
 }
 
@@ -2605,7 +2279,7 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 	auto query_lock = AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
-	ExecuteWithRunner(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
+	ExecuteNativeQuery(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
 }
 
 void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) {
@@ -2658,7 +2332,7 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 	auto update = make_shared_ptr<UpdateRelation>(rel->context, std::move(condition), table.description->database,
 	                                              table.description->schema, table.description->table, std::move(names),
 	                                              std::move(expressions));
-	ExecuteWithRunner(update->context->GetContext(), nullptr, update, {}, connection_owner, py::object());
+	ExecuteNativeQuery(update->context->GetContext(), nullptr, update, {}, connection_owner, py::object());
 }
 
 void DuckDBPyRelation::Delete(const py::object &where) {
@@ -2679,8 +2353,8 @@ void DuckDBPyRelation::Delete(const py::object &where) {
 	auto delete_relation =
 	    make_shared_ptr<DeleteRelation>(rel->context, std::move(condition), table.description->database,
 	                                    table.description->schema, table.description->table);
-	ExecuteWithRunner(delete_relation->context->GetContext(), nullptr, delete_relation, {}, connection_owner,
-	                  py::object());
+	ExecuteNativeQuery(delete_relation->context->GetContext(), nullptr, delete_relation, {}, connection_owner,
+	                   py::object());
 }
 
 static string MergeConditionToSQL(const py::object &condition) {
@@ -2780,7 +2454,7 @@ void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &c
 	auto statement = unique_ptr_cast<SQLStatement, MergeIntoStatement>(std::move(statements[0]));
 	auto source = rel->Alias(source_alias);
 	auto merge = make_shared_ptr<MergeRelation>(std::move(source), std::move(statement));
-	ExecuteWithRunner(merge->context->GetContext(), nullptr, merge, {}, connection_owner, py::object());
+	ExecuteNativeQuery(merge->context->GetContext(), nullptr, merge, {}, connection_owner, py::object());
 }
 
 void DuckDBPyRelation::Insert(const py::object &params) const {
@@ -2795,7 +2469,7 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 	auto &table = rel->Cast<TableRelation>();
 	auto insert =
 	    values_relation->InsertRel(table.description->database, table.description->schema, table.description->table);
-	ExecuteWithRunner(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
+	ExecuteNativeQuery(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
 }
 
 static unique_ptr<ParsedExpression> TransformCreateTablePropertyValue(const py::handle &value) {
@@ -2873,7 +2547,7 @@ void DuckDBPyRelation::Create(const string &table, const py::object &properties,
 	auto create =
 	    rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false,
 	                   OnCreateConflict::ERROR_ON_CONFLICT, std::move(table_options), std::move(partition_keys));
-	ExecuteWithRunner(create->context->GetContext(), nullptr, create, {}, connection_owner, py::object());
+	ExecuteNativeQuery(create->context->GetContext(), nullptr, create, {}, connection_owner, py::object());
 }
 
 static bool IsPythonClassCallable(const py::object &fun) {
@@ -2928,7 +2602,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
                                                    const Optional<py::object> &execution_backend,
                                                    const Optional<py::object> &actor_number) {
 	auto query_lock = AssertRelation();
-	auto runner_type = GetRunnerType();
+	auto runner_type = GetExecutionBackend();
 	Value payload;
 	{
 		PythonInputCallbackScope callback(nullptr);
@@ -2994,7 +2668,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
     const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
     const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
-	auto runner_type = GetRunnerType();
+	auto runner_type = GetExecutionBackend();
 	Value payload;
 	vector<string> output_names;
 	{
@@ -3124,7 +2798,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
     const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
-	auto runner_type = GetRunnerType();
+	auto runner_type = GetExecutionBackend();
 	Value payload;
 	vector<string> output_names;
 	{
@@ -3241,25 +2915,8 @@ string DuckDBPyRelation::ToStringInternal(const BoxRendererConfig &config, bool 
 		BoxRenderer renderer(config);
 		auto limit = Limit(config.limit, 0);
 		auto context = rel->context->GetContext();
-		if (GetRunnerType() == "ray") {
-			limit->ExecuteOrThrow(true);
-			ColumnDataCollection collection(*context, types);
-			while (true) {
-				unique_ptr<DataChunk> chunk;
-				{
-					py::gil_scoped_release release;
-					chunk = limit->result->FetchChunk();
-				}
-				if (!chunk || chunk->size() == 0) {
-					break;
-				}
-				collection.Append(*chunk);
-			}
-			rendered_result = renderer.ToString(*context, names, collection);
-		} else {
-			auto res = limit->ExecuteInternal();
-			rendered_result = res->ToBox(*context, config);
-		}
+		auto res = limit->ExecuteInternal();
+		rendered_result = res->ToBox(*context, config);
 	}
 	return rendered_result;
 }
@@ -3276,15 +2933,6 @@ string DuckDBPyRelation::ToString() {
 static idx_t IndexFromPyInt(const py::object &object) {
 	auto index = py::cast<idx_t>(object);
 	return index;
-}
-
-bool DuckDBPyRelation::TryPrintDistributed(const BoxRendererConfig &config) {
-	auto query_lock = AssertRelation();
-	if (GetRunnerType() != "ray") {
-		return false;
-	}
-	py::print(py::str(ToStringInternal(config, true)));
-	return true;
 }
 
 void DuckDBPyRelation::Print(const Optional<py::int_> &max_width, const Optional<py::int_> &max_rows,
@@ -3320,9 +2968,6 @@ void DuckDBPyRelation::Print(const Optional<py::int_> &max_width, const Optional
 		}
 	}
 
-	if (TryPrintDistributed(config)) {
-		return;
-	}
 	py::print(py::str(ToStringInternal(config, invalidate_cache)));
 }
 

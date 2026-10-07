@@ -306,35 +306,6 @@ def test_decode_image_file_preflights_dependency_before_opening_file(duckdb_curs
         duckdb_cursor.execute("SELECT decode_image_file($1)", [missing]).fetchone()
 
 
-@pytest.mark.usefixtures("ray_local")
-def test_decode_image_file_executes_and_materializes_on_ray(monkeypatch, tmp_path):
-    path = tmp_path / "ray-image.png"
-    path.write_bytes(_encoded_image("PNG", size=(2, 1), color="blue"))
-    path_sql = str(path).replace("'", "''")
-
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    vane.teardown_runner()
-    vane.set_runner_ray(noop_if_initialized=True)
-    connection = vane.connect()
-    try:
-        rows = connection.sql(
-            f"""
-            SELECT i, decode_image_file(image_file('{path_sql}')) AS image
-            FROM range(2) AS values(i)
-            """
-        ).fetchall()
-    finally:
-        connection.close()
-
-    assert_image_equal(
-        sorted(rows),
-        [
-            (0, make_image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
-            (1, make_image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
-        ],
-    )
-
-
 def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):
     buffer = io.BytesIO()
     image = Image.new("L", (3, 2), 100)

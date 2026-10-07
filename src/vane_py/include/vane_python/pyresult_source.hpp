@@ -16,11 +16,7 @@ struct DuckDBPyResultMetadata {
 	ClientProperties client_properties;
 };
 
-//! A backend-neutral source consumed by DuckDBPyResult.
-//!
-//! Local execution wraps DuckDB's QueryResult. Distributed execution exposes
-//! the runner's Arrow partition stream through the same chunk/Arrow surfaces,
-//! so Python result conversion and cursor state remain shared.
+//! Native result ownership shared by local cursor and Relation conversions.
 class DuckDBPyResultSource {
 public:
 	virtual ~DuckDBPyResultSource() = default;
@@ -36,11 +32,5 @@ public:
 };
 
 unique_ptr<DuckDBPyResultSource> MakeLocalPyResultSource(unique_ptr<QueryResult> result);
-
-unique_ptr<DuckDBPyResultSource>
-MakeDistributedArrowPyResultSource(py::object table_iterator, py::object prefetched_partition,
-                                   bool has_prefetched_partition, bool iterator_exhausted, vector<string> names,
-                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context,
-                                   py::object connection_owner);
 
 } // namespace duckdb
