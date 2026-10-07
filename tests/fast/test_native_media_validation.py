@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import math
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -222,7 +224,12 @@ def test_native_media_cancellation_during_io_is_not_suppressed(domain, payload, 
 @pytest.mark.parametrize(
     "domain,operation,payload", [("image", "image_decode", _png), ("audio", "audio_resample", _wav)]
 )
-def test_media_benchmark_observes_http_and_spool_costs(tmp_path, domain, operation, payload):
+@pytest.mark.parametrize("backends", ["python", "both"])
+def test_media_benchmark_observes_http_and_spool_costs(tmp_path, domain, operation, payload, backends):
+    pytest.importorskip("resource")
+    for module in ("PIL.Image",) if domain == "image" else ("soundfile", "soxr"):
+        pytest.importorskip(module)
+    extension_args = ["--extension", str(_artifact(domain))] if backends == "both" else []
     source = tmp_path / "input.bin"
     source.write_bytes(payload())
     script = Path(__file__).resolve().parents[2] / "scripts" / "benchmark_native_media.py"
@@ -233,8 +240,9 @@ def test_media_benchmark_observes_http_and_spool_costs(tmp_path, domain, operati
             str(script),
             operation,
             str(source),
-            "--extension",
-            str(_artifact(domain)),
+            "--backend",
+            backends,
+            *extension_args,
             "--rows",
             "2",
             "--concurrency",
@@ -249,21 +257,110 @@ def test_media_benchmark_observes_http_and_spool_costs(tmp_path, domain, operati
         capture_output=True,
         text=True,
         timeout=90,
-        check=True,
     )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     result = json.loads(completed.stdout)
     assert result["aggregate_results_match"]
     assert result["concurrency"] == 2
-    for backend in ("python", "native"):
+    for backend in result["backends"]:
         traffic = result["samples"][backend][0]["http"]
         assert traffic["body_bytes"] > 0 and traffic["get_requests"] > 0
         assert traffic["errors"] == 0 and traffic["active_requests"] == 0
     assert result["diagnostics"]["python"]["python_temporary_files"]["written_bytes"] > 0
-    assert result["diagnostics"]["native"]["python_temporary_files"]["files"] == 0
-    if domain == "audio":
+    if backends == "both":
+        assert result["diagnostics"]["native"]["python_temporary_files"]["files"] == 0
+    if domain == "audio" and backends == "both":
         profiles = result["diagnostics"]["native"]["audio_profiles"]
         assert len(profiles) == 4
         assert (
             sum(profile["file_bytes_read"] for profile in profiles)
             == result["samples"]["native"][0]["http"]["body_bytes"]
         )
+
+
+@pytest.mark.parametrize(
+    "fail_at", [None, 1, 2, 3], ids=["diagnostics", "warmup-error", "timing-error", "diagnostic-error"]
+)
+def test_media_benchmark_preserves_inputs_and_cancels_failed_groups(tmp_path, monkeypatch, capsys, fail_at):
+    # Exercise CLI orchestration even when the optional native artifact is absent.
+    pytest.importorskip("resource")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "benchmark_native_media.py"
+    spec = importlib.util.spec_from_file_location("media_benchmark", script)
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    failure = OSError("benchmark input failed")
+    connections = []
+
+    class Connection:
+        def __init__(self, **kwargs):
+            self.queries = []
+            self.profiles = []
+            self.interrupted = self.closed = False
+            connections.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def load_extension(self, _path):
+            pass
+
+        def execute(self, sql, *_args):
+            if sql.startswith("SELECT native_audio_resample_profile"):
+                self.profiles.append(sql)
+                return SimpleNamespace(fetchall=lambda: [({"file_bytes_read": 32},)] * 2)
+            return SimpleNamespace(fetchall=lambda: [("test engine",)])
+
+        def sql(self, query):
+            self.queries.append(query)
+            if self is connections[0] and len(self.queries) == fail_at:
+                raise failure
+            return SimpleNamespace(fetchone=lambda: (3200,))
+
+        def interrupt(self):
+            self.interrupted = True
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(_wav())
+    artifact = tmp_path / "native_media.duckdb_extension"
+    artifact.write_bytes(b"test connection does not load an artifact")
+    monkeypatch.setattr(vane, "connect", Connection)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "audio_resample",
+            str(source),
+            "--extension",
+            str(artifact),
+            "--backend",
+            "native",
+            "--rows",
+            "2",
+            "--concurrency",
+            "2",
+            "--repetitions",
+            "1",
+            "--diagnostics",
+        ],
+    )
+    if fail_at is not None:
+        with pytest.raises(OSError) as error:
+            benchmark.main()
+        assert error.value is failure
+        assert all(con.interrupted for con in connections)
+    else:
+        benchmark.main()
+        report = json.loads(capsys.readouterr().out)
+        assert report["aggregate_results_match"]
+        assert len(report["diagnostics"]["native"]["audio_profiles"]) == 4
+        for con in connections:
+            assert len(con.queries) == 3
+            assert len(con.profiles) == 1
+            assert con.profiles[0].endswith(" FROM " + con.queries[0].split(" FROM ", 1)[1])
+            assert not con.interrupted
+    assert len(connections) == 2
+    assert all(con.closed for con in connections)

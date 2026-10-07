@@ -281,9 +281,8 @@ endpoint or credentials.
 Cosmos image queries reuse the video model's visual encoder with one frame.
 `tests/fast/test_cosmos_embed1.py` checks preprocessing, precision, RGB validation,
 NULL batches and planning without model downloads. The image/video embedding
-contract tests cover the common Python and SQL paths. The opt-in
-`tests/fast/test_cosmos_embed1.py` covers Cosmos provider and SQL binding
-contracts. GPU inference requires registered local models; the Cosmos GPU
+contract tests cover the common Python and SQL paths.
+GPU inference requires registered local models; the Cosmos GPU
 end-to-end acceptance has not yet been migrated to that API. The independent
 local GPU runtime checks are documented in
 [Local model runtime](LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).

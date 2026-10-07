@@ -304,13 +304,13 @@ def main() -> None:
                 inputs = f"(SELECT ({vane.ConstantExpression(urls)})[(range % {len(urls)})+1] AS url FROM range({args.rows})) inputs"
                 expression = _expression(args)
                 query = f"SELECT {expression} FROM {inputs}" if expression else None
-                group.append((con, query))
+                group.append((con, query, inputs))
             groups[backend] = group
         # Drain query threads before closing the connections.
         executor = stack.enter_context(ThreadPoolExecutor(max_workers=args.concurrency))
 
         def run(item):
-            con, query = item
+            con, query, _ = item
             if query:
                 relation = con.sql(query)
             else:
@@ -327,7 +327,7 @@ def main() -> None:
             try:
                 return list(executor.map(run, groups[backend]))
             except BaseException:
-                for con, _, _, _ in groups[backend]:
+                for con, _, _ in groups[backend]:
                     con.interrupt()
                 raise
 
@@ -360,7 +360,7 @@ def main() -> None:
                 diagnostics[backend] = {"python_temporary_files": temporary}
                 if backend == "native" and args.operation == "audio_resample":
                     profiles = []
-                    for con, _, inputs, _ in groups[backend]:
+                    for con, _, inputs in groups[backend]:
                         profiles.extend(
                             row[0]
                             for row in con.execute(

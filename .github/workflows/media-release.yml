@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/media-release.yml'
+      - 'scripts/bootstrap_manylinux_bison.sh'
       - 'scripts/build_media_release.py'
       - 'scripts/sign_media_release.py'
       - 'scripts/media_release_pipeline.py'
