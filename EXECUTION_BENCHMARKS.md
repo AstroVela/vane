@@ -205,5 +205,87 @@ comparison, not a process-memory saving measurement.
 reservations but made the 1-million-row scan about 1.86 times slower in
 pipelined mode and 1.98 times slower in FTE. It did not show a consistent latency
 benefit on smaller queries. No global capacity or timeout values changed.
-The next performance investigation should break down the roughly one-second
-warm Ray submission interval before choosing an optimization.
+The follow-up below attributes and reduces the warm Ray submission interval.
+
+## Result actor reuse (2026-10-07)
+
+Driver-side timing around planning, worker-pool initialization and synchronous
+control waits attributed most warm submission time to waiting for a newly
+created result actor. Five warm `SELECT 42::BIGINT AS answer` observations per
+mode, after one initial query, gave these median times:
+
+| Operation | Pipelined, ms | FTE, ms |
+|---|---:|---:|
+| Original `query()` return | 945.76 | 936.63 |
+| Original new result actor readiness | 878.01 | 865.77 |
+| Reused result actor checkout | 2.20 | 2.97 |
+
+Planning took less than 1 ms in this trace. Actor readiness includes Ray
+scheduling, process/import startup and the first control response; it is not a
+measurement of the Python constructor alone. These diagnostic observations
+were separate from the uninstrumented benchmark runs below.
+
+Commit `5374cf1c4f` reuses an exclusive result actor within a session. Every
+checkout receives a new epoch and fresh native channels, Flight endpoints and
+FTE reader state. Cleanup must complete before reuse; stale control calls are
+fenced and failed cleanup evicts the process. Both modes share the lazy pool,
+bounded by `max_results`. Idle processes and their Ray memory reservations
+remain until session close. With default frames, each cached actor reserves
+4.5 MiB for a pipelined-only session, or 5.75 MiB when exchange stores are
+registered. These reservations exclude interpreter/module RSS. See the
+[execution design](PIPELINED_EXECUTION_DESIGN.md#p2-已实现的跨进程数据面与-ray-调度) for ownership.
+
+The same two runs as the initial measurements completed on this commit, with
+the same machine, configuration, native artifact, benchmark script and input
+file hashes. The checkout was clean at the start of each run. The 100000-row
+all-scenario run produced 134 samples; the 1000000-row warm run produced 80.
+The 214 timed samples include 40 warmups and six injected worker losses. The
+runs also completed 40 independent full-result validations. All queries, fault checks and ownership checks
+succeeded. Replay using a non-editable installation and fresh output paths:
+
+```bash
+python -I scripts/benchmark_execution.py \
+  --output build/execution-startup-100k --rows 100000 --repetitions 3 --warmups 1
+python -I scripts/benchmark_execution.py \
+  --output build/execution-startup-1m --rows 1000000 --repetitions 3 --warmups 1 \
+  --profiles compact default --scenarios warm
+```
+
+Median warm end-to-end times at 100000 rows, using default capacities:
+
+| Workload | Pipelined before, ms | Pipelined after, ms | FTE before, ms | FTE after, ms |
+|---|---:|---:|---:|---:|
+| Tiny | 976.68 | 92.38 | 1052.37 | 150.82 |
+| Scan | 1121.57 | 270.84 | 1757.57 | 883.47 |
+| Aggregate | 1075.48 | 168.74 | 1426.55 | 494.66 |
+| Join + TopN | 1119.87 | 211.57 | 1582.42 | 686.44 |
+
+The warm tiny `query()` return medians fell from 953.60 to 66.55 ms for
+pipelined, and from 938.79 to 43.97 ms for FTE. Cold tiny medians remained
+1944.34/2044.28 ms, compared with 1898.42/1960.07 ms previously. The first use
+of each concurrent result slot still needs process startup. Ray cluster startup
+was measured separately at 4.05/3.04 seconds for the two runs.
+
+Median scan times at 1000000 rows:
+
+| Mode / profile | Before, ms | After, ms | After, output MiB/s |
+|---|---:|---:|---:|
+| Pipelined / default | 2410.93 | 1542.53 | 23.38 |
+| Pipelined / compact | 4492.06 | 3627.43 | 9.94 |
+| FTE / default | 5536.41 | 4700.03 | 7.67 |
+| FTE / compact | 10972.05 | 10187.44 | 3.54 |
+
+At 100000 rows, default slow-client pipelined/FTE medians were
+1964.21/2518.38 ms. Mixed pipelined scan/FTE aggregate medians were
+1955.24/505.77 ms. FTE recovery took 1590.77 ms versus a 499.37 ms control
+median; the median paired additional time was 1086.03 ms. Every fault still
+retried only the affected attempt, with unchanged input identity and a new
+fence. Worker replacement itself was not optimized.
+
+The change passed 143 distinct related tests, including 17 new tests for
+reuse, stale/in-flight controls, cancellation during checkout, cleanup failure,
+capacity, mode isolation, process loss and session shutdown. Tests enforce
+ownership and correctness without latency thresholds. This follow-up keeps
+capacity and timeout defaults unchanged. The three-sample, single-host limits
+of the initial measurements still apply; the historical intermittent Flight
+timeout and release qualification remain separate work.
