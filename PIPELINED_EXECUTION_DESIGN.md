@@ -670,6 +670,10 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 结果服务是另一个 Ray actor 内的 native relay，数据路径为 root worker → ResultService → 客户端 native channel → QueryResult。两跳各自拥有窗口和 staging，结果服务在启动生产前占有资源。会话 max_results 同时限制这些结果服务及客户端通道的数量；交付 IPC 缓冲另外受 result_buffer_bytes 约束，导出的 Arrow/NumPy 视图继续由 BatchLease 计费。用户看到 QueryResult，与 local 相同；local 入口继续直接执行原生查询。
 
+结果 actor 由会话按需创建，数量不超过 max_results；pipelined 与 FTE 共用这个池。每个 actor 同时仅借给一条查询，借用时创建新的 epoch 和独立的原生状态。所有控制 RPC 都携带该 epoch；迟到的 cancel/release 无效，其他旧调用报错。已经进入 actor 的旧 RPC 持有旧状态，即使随后完成也不能操作下一条查询。原生 Flight、channel、物化读取器和存储 lease 仍按查询创建与关闭，FTE watchdog 退出后才允许归还 actor。
+
+空闲 actor 保留到会话关闭，其 Ray 内存预留也保留。每个 actor 按两个结果窗口、两条 Flight 链路 staging 预留；注册了 exchange store 的会话再预留物化读取 staging，因此任意借用都能切换执行模式。清理失败或超时的 actor 被淘汰，不进入空闲池；发现空闲进程丢失时，可在公布查询端点前新建进程。已在交付的结果服务丢失仍使所属查询失败。会话关闭终止全部 actor；诊断中的 result_services 显示 leased、idle 和 capacity。
+
 ## Native 算子的异步推进
 
 ### Source 的等待与唤醒

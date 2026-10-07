@@ -40,6 +40,7 @@ def assert_idle(connection, *, allow_dead_workers=False):
     runtime = connection.query_runtime
     assert runtime.resource_snapshot()["queries"] == {}
     assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+    assert runtime.resource_snapshot()["result_services"]["leased"] == 0
     for worker in runtime.pool.workers:
         try:
             assert ray.get(worker.resources_snapshot.remote())["reservations"] == {}

@@ -66,6 +66,8 @@ release_tests=(
   "$project_root/tests/fast/test_ray_recovery_runtime.py"
   "$project_root/tests/fast/test_pipelined_plan.py"
   "$project_root/tests/fast/test_ray_pipelined.py"
+  "$project_root/tests/fast/test_ray_result_service_pool.py"
+  "$project_root/tests/fast/test_result_service_pool.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
   "$project_root/tests/fast/test_vane_config.py"

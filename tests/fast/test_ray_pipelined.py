@@ -25,6 +25,7 @@ def assert_idle(connection):
     runtime = connection.query_runtime
     assert runtime.resource_snapshot()["queries"] == {}
     assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+    assert runtime.resource_snapshot()["result_services"]["leased"] == 0
     for worker in runtime.pool.workers:
         assert ray.get(worker.resources_snapshot.remote())["reservations"] == {}
 
@@ -99,6 +100,8 @@ def test_group_capacity_failure_rolls_back_before_start():
         with pytest.raises(Exception, match="capacity"):
             connection.query("select range from range(20)")
         assert len(connection.query_runtime.pool.workers) == 2
+        assert_idle(connection)
+        assert connection.query("select 42").collect().column(0).to_pylist() == [42]
         assert_idle(connection)
 
 

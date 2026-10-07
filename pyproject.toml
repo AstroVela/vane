@@ -333,6 +333,8 @@ include = [
     "/tests/fast/test_ray_recovery_runtime.py",
     "/tests/fast/test_pipelined_plan.py",
     "/tests/fast/test_ray_pipelined.py",
+    "/tests/fast/test_ray_result_service_pool.py",
+    "/tests/fast/test_result_service_pool.py",
     "/tests/fast/test_local_query_runtime.py",
     "/tests/fast/test_local_query_results.py",
     "/tests/fast/test_local_query_streaming.py",

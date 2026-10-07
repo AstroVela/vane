@@ -104,10 +104,112 @@ class PipelinedContext(QueryContext):
             result.request_cancelled(lambda: RuntimeError(message))
 
 
+class ResultServicePool:
+    """Lazy session capacity: one actor per live result, reused only after cleanup."""
+
+    def __init__(self, resources: RayResources) -> None:
+        self.resources = resources
+        self.lock = threading.Lock()
+        self.idle: list[Any] = []
+        self.leased: dict[str, Any] = {}
+        self.closed = False
+
+    def acquire(self, context: QueryContext, resources: RayResources) -> tuple[Any, str]:
+        import ray
+
+        from vane._native import execution_runtime as native
+        from vane.execution.pipelined_worker import ResultService
+
+        # A cached process can have died while idle. Replace it before exposing
+        # any query endpoint; a live result is never moved to another process.
+        reuse = True
+        while True:
+            context.check()
+            with self.lock:
+                if self.closed:
+                    raise RuntimeError("result service pool is closed")
+                cached = bool(self.idle) and reuse
+                if cached:
+                    actor = self.idle.pop()
+                else:
+                    if len(self.leased) + len(self.idle) >= self.resources.max_results:
+                        raise RuntimeError("result service capacity is full")
+                    limits = self.resources.exchange
+                    memory = 2 * limits.window_bytes + 2 * native.DirectFlight.staging_per_link(limits.frame_bytes)
+                    if self.resources.exchange_stores:
+                        memory += native.MaterializedIO.staging_bytes(limits.frame_bytes)
+                    actor = (
+                        ray.remote(max_restarts=0, max_task_retries=0, num_cpus=0, max_concurrency=4)(ResultService)
+                        .options(memory=memory)
+                        .remote()
+                    )
+                epoch = uuid.uuid4().hex
+                self.leased[epoch] = actor
+            try:
+                _get(actor.reserve.remote(epoch, resources), context)
+                return actor, epoch
+            except BaseException as error:
+                self.discard(actor, epoch)
+                if cached and isinstance(error, ray.exceptions.RayActorError):
+                    reuse = False
+                    continue
+                raise
+
+    def discard(self, actor: Any, epoch: str) -> None:
+        import ray
+
+        with self.lock:
+            if epoch not in self.leased or self.leased[epoch] is not actor:
+                return
+            del self.leased[epoch]
+        if ray.is_initialized():
+            ray.kill(actor, no_restart=True)
+
+    def release(self, actor: Any, epoch: str) -> None:
+        import ray
+
+        with self.lock:
+            if epoch not in self.leased or self.leased[epoch] is not actor:
+                return
+        if not ray.is_initialized():
+            self.discard(actor, epoch)
+            return
+        try:
+            _get(actor.release.remote(epoch), timeout=10)
+        except ray.exceptions.RayActorError:
+            self.discard(actor, epoch)
+            return
+        except BaseException:
+            # Timed-out or failed cleanup must never make an actor reusable.
+            self.discard(actor, epoch)
+            raise
+        with self.lock:
+            if epoch in self.leased and self.leased[epoch] is actor:
+                del self.leased[epoch]
+                self.idle.append(actor)
+
+    def snapshot(self) -> dict[str, int]:
+        with self.lock:
+            return {"leased": len(self.leased), "idle": len(self.idle), "capacity": self.resources.max_results}
+
+    def close(self) -> None:
+        import ray
+
+        with self.lock:
+            self.closed = True
+            actors = [*self.idle, *self.leased.values()]
+            self.idle.clear()
+            self.leased.clear()
+        if ray.is_initialized():
+            for actor in actors:
+                ray.kill(actor, no_restart=True)
+
+
 class WorkerPool:
     def __init__(self, resources: RayResources) -> None:
         self.resources = resources
         self.admission = WorkerResourceManager(worker_capacity(resources), resources.worker_count)
+        self.results = ResultServicePool(resources)
         self.lock = threading.Lock()
         self.workers: list[Any] = []
         self.epochs: list[str] = []
@@ -161,6 +263,7 @@ class WorkerPool:
                     ray.kill(worker, no_restart=True)
             self.workers.clear()
             self.epochs.clear()
+        self.results.close()
 
     def replace(self, index: int, epoch: str, context: QueryContext, engine: str) -> None:
         import ray
@@ -220,20 +323,13 @@ class PipelinedScheduler:
         self.reservation = f"pipelined/{spec.query_id}"
 
     def prepare(self) -> None:
-        import ray
-
         from vane._native import execution_runtime as native
-        from vane.execution.pipelined_worker import ResultService, _channel
+        from vane.execution.pipelined_worker import _channel
 
         self.pool.ensure(self.context, self.spec.graph.engine_identity)
         self.context.check()
         resources = self.resources
-        relay_type = ray.remote(max_restarts=0, max_task_retries=0, num_cpus=0, max_concurrency=4)(ResultService)
-        self.relay = relay_type.options(
-            memory=2 * resources.exchange.window_bytes
-            + 2 * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes)
-        ).remote(resources)
-        self.relay_epoch = _get(self.relay.describe.remote(), self.context)
+        self.relay, self.relay_epoch = self.pool.results.acquire(self.context, resources)
         assignments, routes = placement(self.spec, self.pool.epochs, self.relay_epoch)
         demands = {
             index: pipelined_demand(resources, index, [t for t, host in assignments.items() if host == index], routes)
@@ -292,7 +388,9 @@ class PipelinedScheduler:
         root_route = next(route for route in routes if route["target_worker"] == -1)
         timeout = self.spec.options.execution_timeout + self.spec.options.delivery_timeout
         _get(
-            self.relay.connect.remote(locations[root_route["source_worker"]], root_route["ticket"], timeout),
+            self.relay.connect.remote(
+                self.relay_epoch, locations[root_route["source_worker"]], root_route["ticket"], timeout
+            ),
             self.context,
         )
         self.channel = _channel(self.spec.result_schema, resources, "result-service", "client")
@@ -311,7 +409,7 @@ class PipelinedScheduler:
                 _get(self.pool.workers[index].ready.remote(self.pool.epochs[index], self.spec.query_id), self.context)
                 for index in sorted(self.prepared)
             ]
-            relay_status = _get(self.relay.status.remote(), self.context)
+            relay_status = _get(self.relay.status.remote(self.relay_epoch), self.context)
             error = relay_status["error"] or relay_status["channel"]["error"] or self.client.error
             if error:
                 raise RuntimeError(error)
@@ -343,7 +441,7 @@ class PipelinedScheduler:
         ]
         values = [_get(reference, timeout=timeout) for reference in calls]
         error = next((value["error"] for value in values if value["error"]), "")
-        relay = _get(self.relay.status.remote(), timeout=timeout)
+        relay = _get(self.relay.status.remote(self.relay_epoch), timeout=timeout)
         if relay["epoch"] != self.relay_epoch:
             raise RuntimeError("result service epoch changed")
         error = error or relay["error"] or relay["channel"]["error"] or self.client.error
@@ -401,7 +499,7 @@ class PipelinedScheduler:
             for index in self.prepared:
                 self.pool.workers[index].cancel.remote(self.pool.epochs[index], self.spec.query_id, reason)
             if self.relay is not None:
-                self.relay.cancel.remote(reason)
+                self.relay.cancel.remote(self.relay_epoch, reason)
 
     def diagnostics(self) -> dict[str, Any]:
         calls: dict[int, Any] = {}
@@ -446,6 +544,8 @@ class PipelinedScheduler:
             if self.client is not None:
                 self.client.close()
             if not ray.is_initialized():
+                if self.relay is not None:
+                    self.pool.results.release(self.relay, self.relay_epoch)
                 self.pool.admission.release(self.reservation)
                 self.closed = True
                 return
@@ -468,11 +568,9 @@ class PipelinedScheduler:
                     errors.append(error)
             if self.relay is not None:
                 try:
-                    _get(self.relay.release.remote(), timeout=10)
-                except ray.exceptions.RayActorError:
-                    pass
-                finally:
-                    ray.kill(self.relay, no_restart=True)
+                    self.pool.results.release(self.relay, self.relay_epoch)
+                except BaseException as error:
+                    errors.append(error)
             if errors:
                 raise RuntimeError("worker release failed; retry result.close()") from errors[0]
             self.pool.admission.release(self.reservation)
@@ -512,7 +610,11 @@ class RayQueryRuntime(QueryRuntime):
             return self.stores[name]
 
     def resource_snapshot(self) -> dict[str, Any]:
-        return {**super().resource_snapshot(), "workers": self.pool.admission.snapshot()}
+        return {
+            **super().resource_snapshot(),
+            "workers": self.pool.admission.snapshot(),
+            "result_services": self.pool.results.snapshot(),
+        }
 
     def submit(
         self,

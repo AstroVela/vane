@@ -455,11 +455,11 @@ class PipelinedWorker:
                 self.reservations.pop(key, None)
 
 
-class ResultService:
-    """A reachable native relay with independently bounded upstream/client windows."""
+class _ResultSession:
+    """One query's native relay, never reused across result leases."""
 
-    def __init__(self, resources: RayResources) -> None:
-        self.epoch = uuid.uuid4().hex
+    def __init__(self, epoch: str, resources: RayResources) -> None:
+        self.epoch = epoch
         self.resources = resources
         self.channel: Any = None
         self.flight: Any = None
@@ -470,28 +470,29 @@ class ResultService:
         self.lifecycle = threading.RLock()
         self.watchdog: threading.Thread | None = None
 
-    def describe(self) -> str:
-        return self.epoch
-
     def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
         from vane._native import execution_runtime as native
 
-        if epoch != self.epoch or self.flight is not None:
-            raise RuntimeError("invalid result service epoch or duplicate preparation")
-        self.schema = schema
-        self.channel = _channel(schema, self.resources, "root", "client")
-        self.flight = native.DirectFlight(
-            "0.0.0.0",
-            _host(),
-            2,
-            2 * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
-            self.resources.exchange.frame_bytes,
-        )
-        self.flight.publish(ticket, self.channel, "client")
-        return str(self.flight.location)
+        with self.lifecycle:
+            if epoch != self.epoch or self.flight is not None or self.stop.is_set():
+                raise RuntimeError("invalid result service epoch or duplicate preparation")
+            self.schema = schema
+            self.channel = _channel(schema, self.resources, "root", "client")
+            self.flight = native.DirectFlight(
+                "0.0.0.0",
+                _host(),
+                2,
+                2 * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
+                self.resources.exchange.frame_bytes,
+            )
+            self.flight.publish(ticket, self.channel, "client")
+            return str(self.flight.location)
 
     def connect(self, location: str, ticket: str, timeout: float) -> None:
-        self.flight.subscribe(location, ticket, self.channel, "root", timeout)
+        with self.lifecycle:
+            if self.stop.is_set():
+                raise RuntimeError("result service is canceled")
+            self.flight.subscribe(location, ticket, self.channel, "root", timeout)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -517,6 +518,10 @@ class ResultService:
                 self.flight.close()
             if self.store_lease is not None:
                 self.store_lease.close()
+        if self.watchdog is not None and self.watchdog is not threading.current_thread():
+            self.watchdog.join(timeout=5)
+            if self.watchdog.is_alive():
+                raise RuntimeError("result service watchdog cleanup is pending")
 
     def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
         import json
@@ -568,3 +573,54 @@ class ResultService:
                 self.release()
                 return
             self.stop.wait(min(0.5, value["seconds"] / 4))
+
+
+class ResultService:
+    """Reusable process with one exclusive, epoch-fenced result lease at a time."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.session: _ResultSession | None = None
+
+    def reserve(self, epoch: str, resources: RayResources) -> None:
+        with self.lock:
+            if self.session is not None:
+                raise RuntimeError("result service already has a lease")
+            self.session = _ResultSession(epoch, resources)
+
+    def _session(self, epoch: str) -> _ResultSession:
+        with self.lock:
+            if self.session is None or self.session.epoch != epoch:
+                raise RuntimeError("stale result service lease")
+            return self.session
+
+    def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
+        return self._session(epoch).prepare(epoch, schema, ticket)
+
+    def connect(self, epoch: str, location: str, ticket: str, timeout: float) -> None:
+        self._session(epoch).connect(location, ticket, timeout)
+
+    def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+        self._session(epoch).connect_materialized(epoch, manifest, lease)
+
+    def status(self, epoch: str) -> dict[str, Any]:
+        return self._session(epoch).status()
+
+    def cancel(self, epoch: str, reason: str) -> None:
+        with self.lock:
+            session = self.session
+        if session is not None and session.epoch == epoch:
+            session.cancel(reason)
+
+    def release(self, epoch: str) -> None:
+        with self.lock:
+            session = self.session
+        if session is None or session.epoch != epoch:
+            return
+        # Close the native endpoints and join the lease watchdog before the
+        # driver can return this actor to its idle pool. RPCs already in flight
+        # retain the old session; later RPCs must present the new lease epoch.
+        session.release()
+        with self.lock:
+            if self.session is session:
+                self.session = None
