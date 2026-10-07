@@ -16,6 +16,7 @@ from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.query_options import LocalExecution, QueryExecutionOptions
 from vane.execution.request_admission import (
     RequestAdmissionLimits,
+    RequestAdmissionScope,
     RequestCancellationReason,
     RequestCancelled,
     RequestTicket,
@@ -321,7 +322,7 @@ class QueryRuntime:
         if not isinstance(resources, QueryResources):
             raise TypeError("resources must be QueryResources")
         self.resources = resources
-        self._admission = RuntimeRequestAdmission(
+        self._admission: RuntimeRequestAdmission | RequestAdmissionScope = RuntimeRequestAdmission(
             RequestAdmissionLimits(resources.max_active_queries, resources.max_queued_queries)
         )
         self._delivery = RuntimeResultDelivery(

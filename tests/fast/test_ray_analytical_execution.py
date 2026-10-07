@@ -61,7 +61,8 @@ QUERIES = [
 def test_public_analytical_sql_and_repeated_execution(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
     ):
         for sql in QUERIES + QUERIES[:1]:
             expected = local.execute(sql).to_arrow_table().to_pylist()
@@ -82,7 +83,11 @@ def test_public_analytical_type_roundtrip(tmp_path, mode):
     columns = ", ".join(f"case when range % 4=0 then null else {expr} end c{i}" for i, expr in enumerate(EXPRESSIONS))
     sql = f"select range, {columns} from range(13) order by range desc"
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
-    with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
         expected = exchange_expected(local.execute(sql).to_arrow_table())
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
             table = result.collect()
@@ -98,7 +103,11 @@ def test_public_nested_arrays(tmp_path, mode):
     )
     sql = f"select range, {columns} from range(13) order by range desc"
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 3, 2))
-    with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
         expected = local.execute(sql).to_arrow_table()
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
             table = result.collect()
@@ -111,7 +120,8 @@ def test_public_nested_arrays(tmp_path, mode):
 def test_public_min_max_overloads(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
     ):
         for sql in TOP_N_AGGREGATES:
             expected = local.execute(sql).to_arrow_table().to_pylist()
@@ -124,7 +134,8 @@ def test_public_min_max_overloads(tmp_path, mode):
 def test_public_parquet_top_n_with_default_optimizers(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
     ):
         source = parquet_top_n_source(local, tmp_path)
         for tail in PARQUET_TOP_N_TAILS:
@@ -139,7 +150,8 @@ def test_public_parquet_top_n_with_default_optimizers(tmp_path, mode):
 def test_public_decimal_sum_keeps_native_precision(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
     ):
         for sql in DECIMAL_SUM_QUERIES:
             expected = local.execute(sql).to_arrow_table()
@@ -155,7 +167,8 @@ def test_public_decimal_sum_keeps_native_precision(tmp_path, mode):
 def test_public_nested_decimal_aggregation(tmp_path, mode, scale):
     with (
         vane.connect(backend="local", config={"threads": 1}) as local,
-        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
     ):
         for sign in [1, -1]:
             positive = scaled_wide_value(sign * 4 * 10**37, scale)
@@ -190,7 +203,8 @@ def test_public_nested_decimal_aggregation(tmp_path, mode, scale):
 def test_public_native_aggregate_semantics(tmp_path, mode, queries):
     with (
         vane.connect(backend="local", config={"threads": 1}) as local,
-        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
     ):
         for sql in queries:
             expected = exchange_expected(local.execute(sql).to_arrow_table())
@@ -205,7 +219,8 @@ def test_public_native_aggregate_semantics(tmp_path, mode, queries):
 def test_public_wide_numeric_aggregates(tmp_path, mode):
     with (
         vane.connect(backend="local", config={"threads": 1}) as local,
-        vane.connect(backend="ray", resources=resources(tmp_path, partitions=2)) as connection,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
     ):
         for kind, scale in WIDE_AGGREGATE_TYPES:
             for sql in wide_aggregate_queries(kind, scale):
@@ -228,7 +243,11 @@ def test_public_hugeint_full_range(tmp_path, mode):
         "select null::hugeint v where false",
     ]
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(32768, 8192, 8, 2))
-    with vane.connect(backend="local") as local, vane.connect(backend="ray", resources=limits) as connection:
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
         for sql in queries:
             expected = local.execute(sql).to_arrow_table().to_pylist()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
@@ -271,7 +290,7 @@ def test_fte_cancel_racing_with_admission_cannot_leave_waiter(tmp_path, monkeypa
 
     monkeypatch.setattr(RecoveryScheduler, "__init__", observe_lock)
     limits = resources(tmp_path, worker_count=1, partitions=1)
-    with vane.connect(backend="ray", resources=limits) as connection:
+    with vane.Runtime(limits) as application, application.connect() as connection:
         assert connection.query("select 1").collect().column(0).to_pylist() == [1]
         manager = connection.query_runtime.pool.admission
         pressure = {name: 0 for name in manager.capacity}
@@ -329,7 +348,8 @@ def test_fte_cancel_racing_with_admission_cannot_leave_waiter(tmp_path, monkeypa
 def test_temporal_domain_across_aggregate_stages(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
     ):
         for expression, value in TEMPORAL_VALUES:
             sql = f"select min(v)::varchar, max(v)::varchar from (select case when range % 3=0 then null else {expression} end v from range(13))"
@@ -349,7 +369,7 @@ def test_worker_admission_has_its_own_clock(tmp_path, outcome):
     from vane.execution.request_admission import RequestCancelled, RequestQueueTimeout
 
     limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=1)
-    with vane.connect(backend="ray", resources=limits) as connection, connection.cursor() as sibling:
+    with vane.Runtime(limits) as application, application.connect() as connection, connection.cursor() as sibling:
         connection.query("select 0").collect()
         held = connection.query("select 1")
         manager = connection.query_runtime.pool.admission
@@ -408,7 +428,7 @@ def test_waiting_pipelined_graph_precedes_next_fte_attempt(tmp_path, monkeypatch
     # FTE occupies one context. The graph requires three contexts and
     # must queue atomically; later FTE tasks cannot overtake it.
     limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=3)
-    with vane.connect(backend="ray", resources=limits) as connection, connection.cursor() as sibling:
+    with vane.Runtime(limits) as application, application.connect() as connection, connection.cursor() as sibling:
         fte = connection.query("select range from range(19) order by range", options=options(execution=60))
         try:
             assert entered.wait(10)
@@ -466,7 +486,8 @@ def test_analytical_fte_retries_uncommitted_build_stage(tmp_path, monkeypatch, c
     sql = "select a.range % 7 k, sum(b.range) s from range(200) a join range(100) b using(range) group by k order by k"
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
     ):
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=90)) as result:
@@ -496,7 +517,8 @@ def test_analytical_parquet_join_preserves_source_contract(tmp_path, mode):
     )
     with (
         vane.connect(backend="local") as local,
-        vane.connect(backend="ray", resources=resources(tmp_path)) as connection,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
     ):
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:

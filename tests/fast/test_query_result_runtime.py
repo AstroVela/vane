@@ -599,9 +599,9 @@ def test_allocation_and_watcher_failures_keep_cleanup_owner(monkeypatch, failure
 
 def test_late_admission_callback_cannot_cancel_started_execution():
     from vane.execution.pipelined_runtime import PipelinedContext
-    from vane.execution.query_runtime import QueryRuntime
 
-    runtime = QueryRuntime()
+    application = vane.Runtime()
+    runtime = application._new_session("pipelined", None)
     ticket = runtime._admission.request(queue_timeout=30)
     context = PipelinedContext(runtime, ticket, vane.QueryExecutionOptions(vane.RayExecution(), 30, 60, 30))
     result = context.begin()
@@ -618,6 +618,7 @@ def test_late_admission_callback_cannot_cancel_started_execution():
     finally:
         result.close()
         runtime.close()
+        application.close()
 
 
 def test_result_cancel_is_idempotent_and_preserves_retained_batch():

@@ -24,7 +24,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 	}
 	for (auto item : options) {
 		auto name = py::cast<string>(item.first);
-		if (name != "backend" && name != "resources" && name != "execution") {
+		if (name != "backend" && name != "resources" && name != "execution" && name != "runtime") {
 			throw py::value_error("connections do not accept unknown query options");
 		}
 	}
@@ -38,20 +38,32 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 	if (backend == "local" && options.contains("execution")) {
 		throw py::value_error("local connections do not accept execution overrides");
 	}
+	if (backend == "local" && options.contains("runtime")) {
+		throw py::value_error("local connections do not use a Ray Runtime");
+	}
 	auto resources = options.contains("resources") ? py::reinterpret_borrow<py::object>(options["resources"])
 	                                               : py::object(py::none());
 	py::object runtime;
 	if (backend == "ray") {
+		auto runtime_type = py::module_::import("vane.execution.runtime").attr("Runtime");
+		if (!options.contains("runtime") || !py::isinstance(options["runtime"], runtime_type)) {
+			throw py::value_error("Ray sessions require an application Runtime; use Runtime(...).connect()");
+		}
 		auto execution = options.contains("execution") ? py::reinterpret_borrow<py::object>(options["execution"])
 		                                               : py::object(py::str("pipelined"));
-		runtime = py::module_::import("vane.execution.pipelined_runtime").attr("RayQueryRuntime")(resources, execution);
+		runtime = options["runtime"].attr("_new_session")(execution, resources);
 	} else {
 		runtime = py::module_::import("vane.execution.query_runtime").attr("QueryRuntime")(resources);
 	}
-	auto connection = ConnectQuerySession(database, read_only, config);
-	EnableLocalRuntimeInputPolicy(*connection->con.GetConnection().context);
-	connection->vane_session->query_runtime = std::move(runtime);
-	return connection;
+	try {
+		auto connection = ConnectQuerySession(database, read_only, config);
+		EnableLocalRuntimeInputPolicy(*connection->con.GetConnection().context);
+		connection->vane_session->query_runtime = runtime;
+		return connection;
+	} catch (...) {
+		runtime.attr("close")();
+		throw;
+	}
 }
 
 py::object DuckDBPyConnection::GetQueryRuntime() const {

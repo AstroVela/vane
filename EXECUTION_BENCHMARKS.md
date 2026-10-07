@@ -209,6 +209,10 @@ The follow-up below attributes and reduces the warm Ray submission interval.
 
 ## Result actor reuse (2026-10-07)
 
+These are historical measurements of commit `5374cf1c4f`. The application
+Runtime and multi-query result service replace that implementation. The numbers
+below do not measure or validate the current service architecture.
+
 Driver-side timing around planning, worker-pool initialization and synchronous
 control waits attributed most warm submission time to waiting for a newly
 created result actor. Five warm `SELECT 42::BIGINT AS answer` observations per

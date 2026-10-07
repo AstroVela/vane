@@ -177,17 +177,20 @@ def options(config, mode):
     return vane.QueryExecutionOptions(target, config.deadline, config.deadline, config.deadline)
 
 
+@contextmanager
 def connect(config, profile):
     # Match the aggregate CPU and admitted operator-memory allowance of one Ray
     # query. Session delivery limits stay at their production defaults.
     limits = resources(config, profile)
     ray_limits = vane.RayResources()
     memory = config.worker_count * (ray_limits.operator_memory_bytes // ray_limits.max_active_queries)
-    return vane.connect(
-        backend="local" if profile == "local" else "ray",
-        resources=limits,
-        config={"threads": config.worker_count * config.worker_threads, "memory_limit": f"{memory}B"},
-    )
+    settings = {"threads": config.worker_count * config.worker_threads, "memory_limit": f"{memory}B"}
+    if profile == "local":
+        with vane.connect(backend="local", resources=limits, config=settings) as connection:
+            yield connection
+    else:
+        with vane.Runtime(limits) as application, application.connect(config=settings) as connection:
+            yield connection
 
 
 def close_result(result):

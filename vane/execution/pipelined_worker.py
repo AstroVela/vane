@@ -455,11 +455,11 @@ class PipelinedWorker:
                 self.reservations.pop(key, None)
 
 
-class _ResultSession:
-    """One query's native relay, never reused across result leases."""
+class ResultContext:
+    """One query's native relay and storage lifetime in a persistent service."""
 
-    def __init__(self, epoch: str, resources: RayResources) -> None:
-        self.epoch = epoch
+    def __init__(self, query_id: str, resources: RayResources) -> None:
+        self.query_id = query_id
         self.resources = resources
         self.channel: Any = None
         self.flight: Any = None
@@ -470,12 +470,12 @@ class _ResultSession:
         self.lifecycle = threading.RLock()
         self.watchdog: threading.Thread | None = None
 
-    def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
+    def prepare(self, query_id: str, schema: bytes, ticket: str) -> str:
         from vane._native import execution_runtime as native
 
         with self.lifecycle:
-            if epoch != self.epoch or self.flight is not None or self.stop.is_set():
-                raise RuntimeError("invalid result service epoch or duplicate preparation")
+            if query_id != self.query_id or self.flight is not None or self.stop.is_set():
+                raise RuntimeError("invalid result context or duplicate preparation")
             self.schema = schema
             self.channel = _channel(schema, self.resources, "root", "client")
             self.flight = native.DirectFlight(
@@ -496,7 +496,7 @@ class _ResultSession:
 
     def status(self) -> dict[str, Any]:
         return {
-            "epoch": self.epoch,
+            "query_id": self.query_id,
             "channel": self.channel.snapshot(),
             "error": self.flight.error or (self.materialized.status()["error"] if self.materialized else ""),
             "ready": self.flight.ready,
@@ -523,7 +523,7 @@ class _ResultSession:
             if self.watchdog.is_alive():
                 raise RuntimeError("result service watchdog cleanup is pending")
 
-    def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+    def connect_materialized(self, query_id: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
         import json
 
         from vane._native import execution_plan
@@ -532,9 +532,11 @@ class _ResultSession:
         from vane.execution.materialized_exchange import ResultManifest
 
         with self.lifecycle:
-            if epoch != self.epoch or self.materialized is not None or self.stop.is_set():
+            if query_id != self.query_id or self.materialized is not None or self.stop.is_set():
                 raise RuntimeError("result service no longer accepts a manifest")
             result = ResultManifest.from_dict(manifest)
+            if result.stage.query_id != self.query_id:
+                raise ValueError("result manifest belongs to another query context")
             if (
                 result.stage.engine_identity != execution_plan.engine_identity()
                 or result.output.output.schema != self.schema
@@ -576,51 +578,54 @@ class _ResultSession:
 
 
 class ResultService:
-    """Reusable process with one exclusive, epoch-fenced result lease at a time."""
+    """Persistent service hosting independent result contexts for many sessions."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_results: int) -> None:
         self.lock = threading.Lock()
-        self.session: _ResultSession | None = None
+        self.max_results = max_results
+        self.contexts: dict[str, ResultContext] = {}
 
-    def reserve(self, epoch: str, resources: RayResources) -> None:
+    def create(self, query_id: str, resources: RayResources) -> None:
         with self.lock:
-            if self.session is not None:
-                raise RuntimeError("result service already has a lease")
-            self.session = _ResultSession(epoch, resources)
+            if query_id in self.contexts:
+                raise RuntimeError("duplicate result context")
+            if len(self.contexts) >= self.max_results:
+                raise RuntimeError("result service capacity is full")
+            self.contexts[query_id] = ResultContext(query_id, resources)
 
-    def _session(self, epoch: str) -> _ResultSession:
+    def _context(self, query_id: str) -> ResultContext:
         with self.lock:
-            if self.session is None or self.session.epoch != epoch:
-                raise RuntimeError("stale result service lease")
-            return self.session
+            context = self.contexts.get(query_id)
+            if context is None:
+                raise RuntimeError("unknown or closed result context")
+            return context
 
-    def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
-        return self._session(epoch).prepare(epoch, schema, ticket)
+    def prepare(self, query_id: str, schema: bytes, ticket: str) -> str:
+        return self._context(query_id).prepare(query_id, schema, ticket)
 
-    def connect(self, epoch: str, location: str, ticket: str, timeout: float) -> None:
-        self._session(epoch).connect(location, ticket, timeout)
+    def connect(self, query_id: str, location: str, ticket: str, timeout: float) -> None:
+        self._context(query_id).connect(location, ticket, timeout)
 
-    def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
-        self._session(epoch).connect_materialized(epoch, manifest, lease)
+    def connect_materialized(self, query_id: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+        self._context(query_id).connect_materialized(query_id, manifest, lease)
 
-    def status(self, epoch: str) -> dict[str, Any]:
-        return self._session(epoch).status()
+    def status(self, query_id: str) -> dict[str, Any]:
+        return self._context(query_id).status()
 
-    def cancel(self, epoch: str, reason: str) -> None:
+    def cancel(self, query_id: str, reason: str) -> None:
         with self.lock:
-            session = self.session
-        if session is not None and session.epoch == epoch:
-            session.cancel(reason)
+            context = self.contexts.get(query_id)
+        if context is not None:
+            context.cancel(reason)
 
-    def release(self, epoch: str) -> None:
+    def release(self, query_id: str) -> None:
         with self.lock:
-            session = self.session
-        if session is None or session.epoch != epoch:
+            context = self.contexts.get(query_id)
+        if context is None:
             return
-        # Close the native endpoints and join the lease watchdog before the
-        # driver can return this actor to its idle pool. RPCs already in flight
-        # retain the old session; later RPCs must present the new lease epoch.
-        session.release()
+        # Captured RPCs retain this object. Cleanup fences late preparation and
+        # drains the watchdog before removing capacity; other contexts continue.
+        context.release()
         with self.lock:
-            if self.session is session:
-                self.session = None
+            if self.contexts.get(query_id) is context:
+                del self.contexts[query_id]

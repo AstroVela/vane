@@ -87,7 +87,7 @@ def test_resources_without_backend_select_local():
 
 @pytest.mark.parametrize("entry", ["execute", "executemany", "sql", "from_query"])
 def test_ray_native_entries_fail_before_starting_workers(entry):
-    with vane.connect(backend="ray") as connection:
+    with vane.Runtime() as application, application.connect() as connection:
         with pytest.raises(vane.NotImplementedException, match="query\\(\\)"):
             if entry == "executemany":
                 connection.executemany("select ?", [[1]])

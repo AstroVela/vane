@@ -138,11 +138,12 @@ class RuntimeResultDelivery:
     exported views. Transport callbacks never run under the registry condition.
     """
 
-    def __init__(self, limits: ResultDeliveryLimits) -> None:
+    def __init__(self, limits: ResultDeliveryLimits, *, parent: RuntimeResultDelivery | None = None) -> None:
         if not isinstance(limits, ResultDeliveryLimits):
             raise TypeError("result_limit must be ResultDeliveryLimits")
         self.limits = limits
-        self._condition = threading.Condition()
+        self._condition: threading.Condition = threading.Condition() if parent is None else parent._condition
+        self._budgets: tuple[RuntimeResultDelivery, ...] = (self,) if parent is None else (self, *parent._budgets)
         self._results: dict[str, QueryResult] = {}
         self._buffers: dict[str, _BufferLease] = {}
         self._usage_bytes = 0
@@ -155,31 +156,34 @@ class RuntimeResultDelivery:
 
     def begin(self) -> QueryResult:
         with self._condition:
-            if self._closed:
-                raise ResultDeliveryClosed("result delivery runtime is closed")
-            if len(self._results) >= self.limits.max_results:
-                self._rejected += 1
-                raise ResultDeliveryFull(
-                    f"runtime result slots are full: used={len(self._results)}, limit={self.limits.max_results}",
-                    reason="slots",
-                    requested=1,
-                    used=len(self._results),
-                    limit=self.limits.max_results,
-                )
+            for budget in self._budgets:
+                if budget._closed:
+                    raise ResultDeliveryClosed("result delivery runtime is closed")
+                if len(budget._results) >= budget.limits.max_results:
+                    budget._rejected += 1
+                    raise ResultDeliveryFull(
+                        f"runtime result slots are full: used={len(budget._results)}, limit={budget.limits.max_results}",
+                        reason="slots",
+                        requested=1,
+                        used=len(budget._results),
+                        limit=budget.limits.max_results,
+                    )
             result = QueryResult(self, uuid.uuid4().hex)
-            self._results[result.result_id] = result
+            for budget in self._budgets:
+                budget._results[result.result_id] = result
             return result
 
     def _release_result(self, result: QueryResult) -> None:
         with self._condition:
-            if self._results.pop(result.result_id, None) is not None:
-                assert result._outcome is not None
-                result._released_at = time.monotonic()
-                if result._ready_at is not None:
-                    self._delivery_seconds += max(0.0, result._released_at - result._ready_at)
-                    self._delivery_samples += 1
-                self._completed[result._outcome] += 1
-                self._condition.notify_all()
+            for budget in self._budgets:
+                if budget._results.pop(result.result_id, None) is not None:
+                    assert result._outcome is not None
+                    result._released_at = time.monotonic()
+                    if result._ready_at is not None:
+                        budget._delivery_seconds += max(0.0, result._released_at - result._ready_at)
+                        budget._delivery_samples += 1
+                    budget._completed[result._outcome] += 1
+            self._condition.notify_all()
 
     def transition_output_block(self, lease_id: str, state: str) -> bool:
         with self._condition:
@@ -193,10 +197,12 @@ class RuntimeResultDelivery:
 
     def release_output_block(self, lease_id: str) -> bool:
         with self._condition:
-            lease = self._buffers.pop(lease_id, None)
+            lease = self._buffers.get(lease_id)
             if lease is None:
                 return False
-            self._usage_bytes -= lease.size_bytes
+            for budget in self._budgets:
+                budget._buffers.pop(lease_id)
+                budget._usage_bytes -= lease.size_bytes
             self._condition.notify_all()
             return True
 
@@ -358,28 +364,34 @@ class QueryResult:
             self._check_locked()
             if not self._preparing and self._stream is None:
                 raise RuntimeError("result preparation has finished")
-            if self._stream is not None and size_bytes <= runtime.limits.max_bytes:
+
+            def full() -> RuntimeResultDelivery | None:
+                return next((b for b in runtime._budgets if b._usage_bytes + size_bytes > b.limits.max_bytes), None)
+
+            if self._stream is not None and all(size_bytes <= b.limits.max_bytes for b in runtime._budgets):
                 try:
-                    while runtime._usage_bytes + size_bytes > runtime.limits.max_bytes:
+                    while full() is not None:
                         self._waiting_bytes = size_bytes
                         self._check_locked()
                         runtime._condition.wait()
                     self._check_locked()
                 finally:
                     self._waiting_bytes = 0
-            if runtime._usage_bytes + size_bytes > runtime.limits.max_bytes:
-                runtime._rejected += 1
+            budget = full()
+            if budget is not None:
+                budget._rejected += 1
                 raise ResultDeliveryFull(
                     "result buffers exceed runtime delivery byte capacity: "
-                    f"requested={size_bytes}, used={runtime._usage_bytes}, limit={runtime.limits.max_bytes}",
+                    f"requested={size_bytes}, used={budget._usage_bytes}, limit={budget.limits.max_bytes}",
                     reason="bytes",
                     requested=size_bytes,
-                    used=runtime._usage_bytes,
-                    limit=runtime.limits.max_bytes,
+                    used=budget._usage_bytes,
+                    limit=budget.limits.max_bytes,
                 )
             lease = _BufferLease(uuid.uuid4().hex, size_bytes)
-            runtime._buffers[lease.lease_id] = lease
-            runtime._usage_bytes += size_bytes
+            for budget in runtime._budgets:
+                budget._buffers[lease.lease_id] = lease
+                budget._usage_bytes += size_bytes
             return OutputBlockLeaseOwner(runtime, lease)
 
     def check_preparation(self) -> None:
@@ -401,7 +413,7 @@ class QueryResult:
             if not self._preparing or self._stream is not None:
                 raise RuntimeError("result stream has already been prepared")
             self._stream = stream
-            closing = self._runtime._streams_closed and self._finish_locked("closed")
+            closing = any(b._streams_closed for b in self._runtime._budgets) and self._finish_locked("closed")
         if closing:
             # Install the cleanup owner before cancellation. Preparation still
             # owns the result, so let the adapter finish its ownership transfer;

@@ -68,18 +68,20 @@ def test_ticket_capability_is_not_in_repr():
 
 
 def test_ray_api_explicit_configuration():
-    with vane.connect(backend="ray") as connection:
+    with vane.Runtime() as application, application.connect() as connection:
         assert connection.query_runtime.backend == "ray"
         with pytest.raises(ValueError, match="ExchangeStore"):
             connection.query("select 1", execution="fte")
         with pytest.raises(NotImplementedError, match="parameters"):
             connection.query("select ?", [1])
     with pytest.raises(TypeError, match="RayResources"):
-        vane.connect(backend="ray", resources=vane.QueryResources())
+        vane.Runtime(vane.QueryResources())
     with pytest.raises(ValueError, match="ExchangeStore"):
-        vane.connect(backend="ray", execution="fte")
+        with vane.Runtime() as application:
+            application.connect(execution="fte")
     with pytest.raises(vane.InvalidInputException):
-        vane.connect(":default:", backend="ray")
+        with vane.Runtime() as application:
+            application.connect(":default:")
 
 
 def test_failed_prepare_keeps_owner_until_cleanup_succeeds(monkeypatch):

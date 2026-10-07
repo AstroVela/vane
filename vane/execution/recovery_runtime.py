@@ -63,7 +63,7 @@ class RecoveryScheduler:
         self.coordinator: CommitCoordinator | None = None
         self.read_lease: ReadLease | None = None
         self.relay: Any = None
-        self.relay_epoch = ""
+        self.result_id = ""
         self.client: Any = None
         self.channel: Any = None
         self.planning_connection: Any = None
@@ -153,11 +153,12 @@ class RecoveryScheduler:
         from vane.execution.pipelined_worker import _channel
 
         resources = self.resources
-        self.relay, self.relay_epoch = self.pool.results.acquire(self.context, resources)
+        self.relay, self.result_id = self.pool.results.create(self.context.query_id, resources)
+        self.pool.results.prepared(self.result_id, self.context)
         ticket = DirectTicket(
             self.spec.query_id,
             "committed-result",
-            self.relay_epoch,
+            self.result_id,
             uuid.uuid4().hex,
             "client-result",
             "result-service",
@@ -166,7 +167,7 @@ class RecoveryScheduler:
             hashlib.sha256(self.spec.result_schema).hexdigest(),
             secrets.token_urlsafe(32),
         ).encode()
-        location = _get(self.relay.prepare.remote(self.relay_epoch, self.spec.result_schema, ticket), self.context)
+        location = _get(self.relay.prepare.remote(self.result_id, self.spec.result_schema, ticket), self.context)
         self.result_endpoint = {"location": location, "ticket": ticket}
         self.channel = _channel(self.spec.result_schema, resources, "result-service", "client")
         self.client = native.DirectFlight(
@@ -186,7 +187,7 @@ class RecoveryScheduler:
         deadline = time.monotonic() + self.spec.options.admission_timeout
         while True:
             self.context.check()
-            status = _get(self.relay.status.remote(self.relay_epoch), self.context)
+            status = _get(self.relay.status.remote(self.result_id), self.context)
             if status["error"] or self.client.error:
                 raise RuntimeError(status["error"] or self.client.error)
             if status["ready"] and self.client.ready:
@@ -375,15 +376,15 @@ class RecoveryScheduler:
             self.context.produced()
             _get(
                 self.relay.connect_materialized.remote(
-                    self.relay_epoch, self.result_manifest.to_dict(), self.lease.to_dict()
+                    self.result_id, self.result_manifest.to_dict(), self.lease.to_dict()
                 ),
                 self.context,
             )
             while not self.stop.is_set():
                 self.context.check()
-                status = _get(self.relay.status.remote(self.relay_epoch), self.context, timeout=5)
-                if status["epoch"] != self.relay_epoch:
-                    raise RuntimeError("result service epoch changed")
+                status = _get(self.relay.status.remote(self.result_id), self.context, timeout=5)
+                if status["query_id"] != self.result_id:
+                    raise RuntimeError("result context identity changed")
                 error = status["error"] or status["channel"]["error"] or self.client.error
                 if error:
                     raise RuntimeError(error)
@@ -408,7 +409,7 @@ class RecoveryScheduler:
             if state == "end":
                 if self.result_manifest is None or not self.production_status():
                     raise RuntimeError("FTE result ended before commit")
-                status = _get(self.relay.status.remote(self.relay_epoch), self.context)
+                status = _get(self.relay.status.remote(self.result_id), self.context)
                 error = status["error"] or status["channel"]["error"] or self.client.error
                 if error:
                     raise RuntimeError(error)
@@ -436,7 +437,7 @@ class RecoveryScheduler:
                 for attempt in tuple(self.active.values()):
                     attempt.worker.cancel_materialized.remote(attempt.epoch, attempt.key, reason)
                 if self.relay is not None:
-                    self.relay.cancel.remote(self.relay_epoch, reason)
+                    self.relay.cancel.remote(self.result_id, reason)
 
     def close(self) -> None:
         import ray
@@ -470,7 +471,7 @@ class RecoveryScheduler:
                     errors.append(error)
             if self.relay is not None:
                 try:
-                    self.pool.results.release(self.relay, self.relay_epoch)
+                    self.pool.results.release(self.relay, self.result_id)
                 except BaseException as error:
                     errors.append(error)
             if errors:

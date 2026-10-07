@@ -287,6 +287,7 @@ from vane.execution.pipelined_plan import RayResources
 from vane.execution.query_options import FteOptions, LocalExecution, QueryExecutionOptions, RayExecution
 from vane.execution.query_runtime import QueryResources
 from vane.execution.result_delivery import QueryResult
+from vane.execution.runtime import Runtime
 from vane.extensions import (
     DEFAULT_EXTENSION_CATALOG_URL,
     DynamicExtensionDependency,
@@ -400,6 +401,7 @@ __all__: list[str] = [
     "QueryExecutionOptions",
     "QueryResources",
     "RayResources",
+    "Runtime",
     "RayExecution",
     "QueryResult",
     "read_video_frames",

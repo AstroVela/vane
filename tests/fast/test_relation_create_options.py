@@ -43,7 +43,7 @@ def test_create_passes_structured_options_to_native_catalog():
 
 def test_create_rejects_ray_backend(tmp_path):
     database = str(tmp_path / "native.duckdb")
-    with vane.connect(database, backend="ray") as connection:
+    with vane.Runtime() as application, application.connect(database) as connection:
         source = connection.table_function("range", [1])
         with pytest.raises(vane.NotImplementedException, match="require backend='local'"):
             source.create("ray_target")

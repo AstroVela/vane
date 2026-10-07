@@ -88,11 +88,12 @@ class RuntimeRequestAdmission:
                 ticket._state = "timed_out"
                 self._timed_out += 1
                 changed = True
-        while not self._draining and self._queued and len(self._active) < self.limits.max_active_requests:
-            key = next(iter(self._queued))
-            ticket = self._queued.pop(key)
-            self._admit_locked(ticket, now)
-            changed = True
+        if not self._draining:
+            for key, ticket in tuple(self._queued.items()):
+                if self._can_admit(ticket._scope):
+                    del self._queued[key]
+                    self._admit_locked(ticket, now)
+                    changed = True
         if changed:
             self._condition.notify_all()
 
@@ -104,22 +105,35 @@ class RuntimeRequestAdmission:
         self._admitted += 1
         self._queue_wait_seconds += ticket._queue_wait
 
-    def request(self, *, queue_timeout: float | None = None) -> RequestTicket:
+    def _can_admit(self, scope: RequestAdmissionScope | None) -> bool:
+        return len(self._active) < self.limits.max_active_requests and (
+            scope is None or sum(t._scope is scope for t in self._active.values()) < scope.limits.max_active_requests
+        )
+
+    def scope(self, limits: RequestAdmissionLimits) -> RequestAdmissionScope:
+        return RequestAdmissionScope(self, limits)
+
+    def request(
+        self, *, queue_timeout: float | None = None, _scope: RequestAdmissionScope | None = None
+    ) -> RequestTicket:
         timeout = _timeout(self.limits.queue_timeout if queue_timeout is None else queue_timeout, "queue_timeout")
         with self._condition:
-            if self._draining:
+            if self._draining or (_scope is not None and _scope._draining):
                 raise RuntimeError("request admission is draining")
             self._dispatch_locked()
-            if len(self._active) >= self.limits.max_active_requests:
-                if len(self._queued) >= self.limits.max_queued_requests:
+            if not self._can_admit(_scope):
+                if len(self._queued) >= self.limits.max_queued_requests or (
+                    _scope is not None
+                    and sum(t._scope is _scope for t in self._queued.values()) >= _scope.limits.max_queued_requests
+                ):
                     self._rejected += 1
                     raise RequestQueueFull("runtime request queue is full")
                 if timeout == 0:
                     self._timed_out += 1
                     raise RequestQueueTimeout("request queue deadline expired")
             self._next_id += 1
-            ticket = RequestTicket(self, self._next_id, timeout)
-            if len(self._active) < self.limits.max_active_requests:
+            ticket = RequestTicket(self, self._next_id, timeout, _scope)
+            if self._can_admit(_scope):
                 self._admit_locked(ticket, time.monotonic())
             else:
                 self._queued[ticket.request_id] = ticket
@@ -167,15 +181,21 @@ class RuntimeRequestAdmission:
             self._dispatch_locked()
             self._condition.notify_all()
 
-    def drain(self) -> None:
+    def drain(self, *, _scope: RequestAdmissionScope | None = None) -> None:
         with self._condition:
-            self._draining = True
+            if _scope is None:
+                self._draining = True
+            else:
+                _scope._draining = True
             for ticket in (*self._queued.values(), *self._active.values()):
+                if _scope is not None and ticket._scope is not _scope:
+                    continue
                 if ticket._state in {"queued", "ready"}:
                     ticket._state = "drained"
                     self._drained += 1
-            self._queued.clear()
-            self._active = {key: ticket for key, ticket in self._active.items() if ticket._state == "running"}
+            self._queued = {key: ticket for key, ticket in self._queued.items() if ticket._state != "drained"}
+            self._active = {key: ticket for key, ticket in self._active.items() if ticket._state != "drained"}
+            self._dispatch_locked()
             self._condition.notify_all()
 
     def close(self, *, timeout: float = 0.0) -> None:
@@ -217,9 +237,69 @@ class RuntimeRequestAdmission:
             }
 
 
+class RequestAdmissionScope:
+    """Session limits enforced atomically with the enclosing service queue.
+
+    FIFO order is preserved within each session. A session at capacity does not
+    prevent another session from using an available service slot. Historical
+    execution counters belong to the enclosing service; this view reports its
+    own live occupancy only.
+    """
+
+    def __init__(self, runtime: RuntimeRequestAdmission, limits: RequestAdmissionLimits) -> None:
+        if (
+            limits.max_active_requests > runtime.limits.max_active_requests
+            or limits.max_queued_requests > runtime.limits.max_queued_requests
+        ):
+            raise ValueError("session admission exceeds service capacity")
+        self.runtime, self.limits = runtime, limits
+        self._draining = False
+        self._closed = False
+
+    def request(self, *, queue_timeout: float | None = None) -> RequestTicket:
+        return self.runtime.request(queue_timeout=queue_timeout, _scope=self)
+
+    def drain(self) -> None:
+        self.runtime.drain(_scope=self)
+
+    def close(self, *, timeout: float = 0) -> None:
+        deadline = time.monotonic() + _timeout(timeout, "request close timeout")
+        self.drain()
+        with self.runtime._condition:
+            while any(t._scope is self for t in self.runtime._active.values()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("session still has active execution or cleanup")
+                self.runtime._condition.wait(min(remaining, threading.TIMEOUT_MAX))
+            self._closed = True
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.runtime._condition:
+            self.runtime._dispatch_locked()
+            active = [t for t in self.runtime._active.values() if t._scope is self]
+            return {
+                "max_active_requests": self.limits.max_active_requests,
+                "max_queued_requests": self.limits.max_queued_requests,
+                "active_requests": len(active),
+                "ready_requests": sum(t._state == "ready" for t in active),
+                "running_requests": sum(t._state == "running" for t in active),
+                "cancelling_requests": sum(t._cancel_reason is not None for t in active),
+                "queued_requests": sum(t._scope is self for t in self.runtime._queued.values()),
+                "draining": self._draining or self.runtime._draining,
+                "closed": self._closed,
+            }
+
+
 class RequestTicket:
-    def __init__(self, runtime: RuntimeRequestAdmission, request_id: int, timeout: float) -> None:
+    def __init__(
+        self,
+        runtime: RuntimeRequestAdmission,
+        request_id: int,
+        timeout: float,
+        scope: RequestAdmissionScope | None = None,
+    ) -> None:
         self._runtime = runtime
+        self._scope = scope
         self.request_id = request_id
         self._created = time.monotonic()
         self._deadline = self._created + timeout

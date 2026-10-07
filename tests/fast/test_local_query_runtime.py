@@ -846,7 +846,7 @@ def test_owner_close_cancels_running_and_queued_children(native_environment, tmp
 
 
 def test_configuration_rejects_ray_backend():
-    with vane.connect(backend="ray") as connection:
+    with vane.Runtime() as application, application.connect() as connection:
         with pytest.raises(vane.InvalidInputException, match="local"):
             connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
 

@@ -20,7 +20,7 @@ from vane.execution.submission import RayQuerySpec
 
 @dataclass(frozen=True)
 class RayResources(QueryResources):
-    """Session worker pool capacities, shared by all queries and cursors.
+    """Service worker pool capacities, shared by all sessions and queries.
 
     Ray reserves each worker's CPU and operator memory. Native exchange and
     encoding windows are additionally reserved on that worker before start.
