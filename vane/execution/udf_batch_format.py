@@ -18,6 +18,7 @@ from vane._image import _MODE_CHANNELS, _MODE_DTYPES, _image_arrow_scalar_to_num
 from vane.execution._udf_validation import ensure_synchronous_udf_result
 from vane.execution.udf_file_contract import (
     _child_window,
+    _invalid_input,
     _is_arrow_list_like_storage,
     _list_storage_parts,
     _map_array_from_offsets,
@@ -27,7 +28,6 @@ from vane.execution.udf_file_contract import (
 )
 from vane.execution.udf_output_schema import (
     _arrow_type_from_output_schema_entry,
-    _canonicalize_struct_field_names,
     _fixed_shape_tensor_array,
     normalize_output_schema_entries,
 )
@@ -537,16 +537,43 @@ def _container_values_to_arrow(values: Any, dtype: pa.DataType, *, from_pandas: 
             return pa.FixedSizeListArray.from_arrays(child, dtype.list_size, mask=mask)
         return pa.ListArray.from_arrays(offsets, child, mask=mask)
     if pa.types.is_struct(dtype):
-        canonical = [
-            _canonicalize_struct_field_names(row, dtype, boundary="map_batches output", recursive=False) for row in rows
-        ]
+        # Resolve Arrow fields once per column, then transpose directly. Looking
+        # up every declared field by scanning each mapping repeats both Arrow
+        # field construction and case folding for every STRUCT value.
+        fields = list(dtype)
+        names = [field.name for field in fields]
+        folded_names = [name.casefold() for name in names]
+        declared_names = set(folded_names)
+        columns: list[list[Any]] = [[] for _ in fields]
+        for row in rows:
+            if row is None:
+                for column in columns:
+                    column.append(None)
+            elif isinstance(row, Mapping):
+                field_keys: dict[str, str] = {}
+                for key in row:
+                    if not isinstance(key, str):
+                        raise _invalid_input("map_batches output STRUCT value must contain exactly the declared fields")
+                    folded = key.casefold()
+                    if folded in field_keys:
+                        raise _invalid_input(
+                            f"map_batches output STRUCT at column has ambiguous field names matching {key!r}"
+                        )
+                    field_keys[folded] = key
+                if field_keys.keys() != declared_names or len(declared_names) != len(fields):
+                    raise _invalid_input("map_batches output STRUCT value must contain exactly the declared fields")
+                for column, name in zip(columns, folded_names, strict=True):
+                    column.append(row[field_keys[name]])
+            elif isinstance(row, tuple) and len(row) == len(fields):
+                for column, value in zip(columns, row, strict=True):
+                    column.append(value)
+            else:
+                raise TypeError("STRUCT values require a mapping or a matching positional tuple")
         children = [
-            _container_values_to_arrow(
-                [None if row is None else row[field.name] for row in canonical], field.type, from_pandas=from_pandas
-            )
-            for field in dtype
+            _container_values_to_arrow(column, field.type, from_pandas=from_pandas)
+            for column, field in zip(columns, fields, strict=True)
         ]
-        return pa.StructArray.from_arrays(children, names=[field.name for field in dtype], mask=mask)
+        return pa.StructArray.from_arrays(children, names=names, mask=mask)
     return _primitive_values_to_arrow(rows, from_pandas=from_pandas)
 
 
