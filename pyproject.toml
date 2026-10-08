@@ -340,6 +340,7 @@ include = [
     "/tests/fast/test_ray_query_service.py",
     "/tests/fast/test_server_sessions.py",
     "/tests/fast/test_flight_server.py",
+    "/tests/fast/test_flight_proxy_isolation.py",
     "/tests/fast/test_ray_server_sessions.py",
     "/tests/fast/test_server_queries.py",
     "/tests/fast/test_ray_server_queries.py",

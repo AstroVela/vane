@@ -22,7 +22,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.3 已完成相关验收；P5.2.4 独立 Server、历史 Flight 超时定位及 P5.3 待完成 |
+| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.4 已完成相关验收；历史 Flight 超时归因及 P5.3 待完成 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -245,7 +245,7 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 ### P5.2 差分与性能验收
 
 - [x] P5.2.1：系统化比较 native local、Ray pipelined、Ray FTE，加入可重放的种子/分区/线程矩阵、确定到达顺序和重复故障/清理验收。实现与运行方法见[执行验收](EXECUTION_ACCEPTANCE.md)。
-- [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。P5.2.1 已加入数据/控制操作归因、重复长查询及失败现场保存；本轮未复现，根因仍未确认。
+- [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。已复现环境 HTTP 代理停顿导致原生控制 RPC 在约 2 秒超时的独立缺陷，并改为显式直连。历史故障缺少操作及代理现场，尚不能确认与本次缺陷属于同一事件；证据边界见[执行验收](EXECUTION_ACCEPTANCE.md#flight-proxy-isolation)。
 - [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
 - [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
@@ -586,3 +586,10 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 连续两轮无待修问题审查后完成一次非 editable 安装。相关测试 **170 passed、1 skipped**：非 Ray 122、共享 Ray 45、独立 CLI 3；仅缺少可选 ADBC 而跳过。210 个 Python/类型文件与源码一致，native SHA-256 未变。格式、lint、CI copyleft 与 diff 检查通过；没有修改执行核心、C++ 或资源默认值，未运行完整 release/fast 套件。
 - 干净提交 `943a43b8db` 上，32,768 行、两组容量、每项三次重复的 Runtime / Flight 对照共完成 **224 个计时样本（含 32 次预热）、32 项完整结果校验、12 组混跑与 12 次 worker 故障恢复**。两次运行的数据、脚本和 native 哈希一致；混跑均有共享 worker 资源重叠，所有恢复保持输入身份并使用新 fence。数值与复现命令见[执行基准](EXECUTION_BENCHMARKS.md#shared-service-and-flight-measurements-2026-10-08)。
 - P5.2.4 的单机服务验收完成；历史 Flight 超时根因、P5.3 的跨平台 CI / release gate 与发布仍未完成。DuckDB 2.0 升级后再替换 Quack 对外协议，当前不增加兼容或 fallback。
+
+### Flight 代理隔离（2026 年 10 月 9 日）
+
+- 检查旧日志发现原生 Flight 曾以本机 HTTP 代理为 peer；测试环境的代理排除列表未包含 Ray 节点地址。通过受控 CONNECT 代理复现：正常握手后暂停转发，20 秒数据期限下的原生 `control status` 在约 2.03 秒失败，公开 Client 同样超时。修复前 6 个 Vane 用例失败、3 个原生 Arrow 对照通过。
+- 原生数据/控制连接和公开 Client 均设置 `grpc.enable_http_proxy=0`，直接连接指定端点；不修改进程环境或其他 HTTP 客户端。部署需保证端点直接可达，详见 [Server 设计](SERVER_DESIGN.md)。修复后 9 项代理回归全部通过，包括确实经过代理且超时的原生 Arrow 对照。
+- 连续两轮无待修问题审查后，完成一次增量 Release 构建与非 editable 安装。相关测试 **144 passed、1 skipped**：非 Ray 119、共享 Ray 25；跳过项需要可选 ADBC。覆盖原生传输、操作超时归因、公开控制、远程查询、双端口 TLS 及两种模式的原始/重复长查询期限与清理。210 个 Python/类型文件与源码一致；格式、lint、类型与 CI copyleft 检查通过，未运行完整 release/fast 套件。
+- 本次确认并修复代理停顿造成的超时路径；P5.1 原始故障缺少操作名和代理现场，不能直接认定同因。保留历史归因待办与失败证据采集，P5.3 发布资格仍未完成。

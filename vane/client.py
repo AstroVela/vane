@@ -68,7 +68,11 @@ class Client:
         self.rpc_timeout = _timeout(rpc_timeout, "RPC timeout")
         if self.rpc_timeout <= 0:
             raise ValueError("RPC timeout must be positive")
-        self._flight = flight.FlightClient(location, tls_root_certs=tls_root_certs)
+        # Match native result/exchange connections: use the explicit endpoint
+        # directly, independent of HTTP proxy settings in the application.
+        self._flight = flight.FlightClient(
+            location, tls_root_certs=tls_root_certs, generic_options=[("grpc.enable_http_proxy", 0)]
+        )
         self._roots = tls_root_certs or b""
         self._headers = [(b"authorization", ("Bearer " + token).encode("ascii"))]
         self._delivery = RuntimeResultDelivery(result_limits)

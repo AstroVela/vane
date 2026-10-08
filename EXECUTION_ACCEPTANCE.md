@@ -117,6 +117,53 @@ status, ACK and data-read timeout attribution. They retain the existing timeout
 and failure semantics; attribution alone does not establish or fix the cause of
 the historical timeout.
 
+### Flight proxy isolation
+
+Vane's native exchange/result connections and public Python `Client` connect
+directly to their explicit Flight endpoints. Each channel sets
+`grpc.enable_http_proxy=0`; Vane does not change process-wide proxy variables.
+This avoids routing cluster traffic or a public session through an unrelated
+HTTP proxy. Deployments must make both advertised server ports and the internal
+worker endpoints directly reachable. TLS certificate/hostname verification and
+the existing RPC/data deadlines still apply.
+
+The [gRPC proxy mapper](https://grpc.github.io/grpc/core/md_doc_core_default_http_proxy_mapper.html)
+otherwise consults `grpc_proxy`, `https_proxy` and `http_proxy`, in that order,
+unless the target is excluded. The test machine had a loopback proxy configured
+and excluded localhost, but not its Ray node address. An earlier native Flight
+error recorded that proxy as the peer.
+
+`test_flight_proxy_isolation.py` launches each probe in a fresh interpreter and
+uses a loopback CONNECT proxy restricted to the test's registered listeners.
+It verifies a healthy initial handshake, pauses forwarding, and checks all
+three environment variables independently. Before the fix, the native stream
+aborted with `direct Flight control status` after about 2.03 seconds despite a
+20-second data deadline; the public Client also timed out. The baseline produced
+six expected failures and three passing raw-Arrow negative controls. The
+regression requires Vane to make zero proxy connections and complete native
+data, ACK and FINISH. Raw Arrow must still time out through the same proxy,
+proving the fault injection remains active. The child environment must stay
+unchanged after Vane creates and closes its connections.
+
+After two clean review rounds and one incremental Release build, the nine proxy
+cases passed. The focused validation on 2026-10-09 completed with 119 non-Ray
+and 25 shared-Ray tests passing; one optional ADBC test was skipped. This covers
+native operation-attributed timeouts, public session controls, dual-port TLS,
+and the original/repeated long-filter success and execution-timeout cases in
+both modes. No complete release/fast suite was run.
+
+Run the focused regression and native transport tests with the installed wheel:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_flight_proxy_isolation.py tests/fast/test_direct_flight.py
+```
+
+This establishes a reproducible proxy-induced control timeout. The historical
+P5.1 failure did not record its operation or a proxy trace, so it is not possible
+to assert that the same cause explains that particular event. Keep its diagnosis
+open and retain operation-labelled evidence from repeated long-filter tests;
+passing reruns alone do not resolve that uncertainty.
+
 The subsequent [execution benchmark](EXECUTION_BENCHMARKS.md) measures startup,
 warm execution, slow clients, mixed modes and recovery with explicit boundaries.
 CUDA/model UDF acceptance and multi-node deployment qualification remain separate.

@@ -682,7 +682,7 @@ Session 还持有对应的原生连接，并在 Session 层独立索引所有 na
 
 Flight、channel、物化读取器和存储 lease 按查询创建和关闭。FTE watchdog 退出后才释放上下文额度；失败的上下文保留在注册表，其他上下文继续服务。Ray 为常驻结果 actor 预留 max_results 份容量，每份包含两个结果窗口、两条 Flight 链路 staging，配置 FTE 存储时还包含物化读取 staging。这是传输资源预留，不代表进程总 RSS。该进程丢失会使其中所有活动结果失败，随后查询也报告服务不可用；调用方关闭 Runtime 后创建新的 Runtime，不自动重放结果或替换进程。worker 的 FTE attempt 重试仍按原协议执行。
 
-P5.2.3 交付应用内的服务核心：规划、协调器、FTE 续租在应用进程，结果服务和执行 worker 在 Ray 进程。P5.2.4 按[独立服务设计](SERVER_DESIGN.md)推进：先使用 Flight 实现独立进程与会话鉴权、租约和关闭，再接通远程查询与原生结果流。会话核心不依赖线协议，后续 DuckDB 2.0 升级时再接 Quack；当前不实现兼容或 fallback。第一阶段只声明 sessions 能力，远程 SQL 尚未交付。local 继续直接执行原生查询。
+P5.2.3 交付应用内的服务核心：规划、协调器、FTE 续租在应用进程，结果服务和执行 worker 在 Ray 进程。P5.2.4 已按[独立服务设计](SERVER_DESIGN.md)实现 Flight 独立进程、会话鉴权与租约、远程查询控制及原生结果交付，并完成单机故障验收。会话核心不依赖线协议，后续 DuckDB 2.0 升级时再接 Quack；当前不实现兼容或 fallback。local 继续直接执行原生查询。
 
 ## Native 算子的异步推进
 

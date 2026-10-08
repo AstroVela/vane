@@ -1,6 +1,6 @@
 # Vane 独立服务与 Flight 接入
 
-状态：P5.2.4a / b 已完成实现与相关验证。P5.2.4c 完整故障验收未完成。
+状态：P5.2.4a / b / c 已完成实现与单机相关验证；跨平台与多机发布资格尚未完成。
 
 ## 协议选择与服务边界
 
@@ -103,6 +103,8 @@ worker/result actor → native subscriber → bounded channel → native public 
 ```
 
 网关固定监听 `--result-port`，与控制端口同处 Server 主机；`--advertise-host` 指定客户端可达主机名。绑定通配地址必须配置该主机名。两个端口均使用 Flight 自带 TLS，非回环监听需要证书。客户端为两个连接验证证书和主机名；TLS 控制通道不替代结果通道加密。当前受信 Ray 网络内的内部 exchange 保持现有传输。
+
+公开 Client 的控制连接、原生结果连接及 worker exchange 均直接连接各自指定的 Flight 端点。每个通道设置 `grpc.enable_http_proxy=0`，不继承 `grpc_proxy`、`https_proxy` 或 `http_proxy`；部署方需要保证这些端点直接可达。配置只作用于 Vane 创建的 Flight 通道，不修改进程环境或其他 HTTP 客户端。代理停顿的复现与历史超时证据边界见[执行验收](EXECUTION_ACCEPTANCE.md#flight-proxy-isolation)。
 
 READY 返回网关地址、随机查询 capability、原生 schema/列名、engine identity、帧与窗口上限；不暴露 Ray 私网端点或内部 ticket。结果只允许一次订阅，不能透明重放。此阶段原生客户端必须与 Server 使用相同 engine identity，校验发生在解析原生 schema 之前。SQL 最多 32 KiB，控制请求/响应最多 64 KiB，结果 descriptor 最多 60 KiB。
 

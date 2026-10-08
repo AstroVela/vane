@@ -69,6 +69,7 @@ release_tests=(
   "$project_root/tests/fast/test_ray_query_service.py"
   "$project_root/tests/fast/test_server_sessions.py"
   "$project_root/tests/fast/test_flight_server.py"
+  "$project_root/tests/fast/test_flight_proxy_isolation.py"
   "$project_root/tests/fast/test_ray_server_sessions.py"
   "$project_root/tests/fast/test_server_queries.py"
   "$project_root/tests/fast/test_ray_server_queries.py"

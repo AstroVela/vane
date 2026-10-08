@@ -502,6 +502,9 @@ void DirectFlight::Subscribe(const string &location, const string &ticket, share
 	auto address = Unwrap(arrow::flight::Location::Parse(location));
 	auto options = arrow::flight::FlightClientOptions::Defaults();
 	options.tls_root_certs = root_certificates;
+	// Exchange and result endpoints must be reached directly. Inheriting an
+	// unrelated HTTP proxy can stall both the stream and its control RPCs.
+	options.generic_options.emplace_back("grpc.enable_http_proxy", 0);
 	options.generic_options.emplace_back("grpc.max_receive_message_length", int(impl->wire_limit));
 	link->data = Unwrap(arrow::flight::FlightClient::Connect(address, options));
 	link->control = Unwrap(arrow::flight::FlightClient::Connect(address, options));
