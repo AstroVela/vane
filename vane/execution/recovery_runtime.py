@@ -26,6 +26,7 @@ from vane.execution.pipelined_plan import DirectTicket
 from vane.execution.pipelined_runtime import PipelinedContext, WorkerPool, _get
 from vane.execution.query_options import QueryExecutionOptions, RayExecution
 from vane.execution.resource_demand import ResourceDemand
+from vane.execution.result_consumer import NativeResultConsumer
 from vane.execution.submission import RayQuerySpec, stage_ray_query
 from vane.execution.worker_resources import materialized_demand
 
@@ -51,7 +52,14 @@ class RunningAttempt:
 
 
 class RecoveryScheduler:
-    def __init__(self, pool: WorkerPool, store: StorePool, context: PipelinedContext, rows_per_batch: int) -> None:
+    def __init__(
+        self,
+        pool: WorkerPool,
+        store: StorePool,
+        context: PipelinedContext,
+        rows_per_batch: int,
+        consumer: NativeResultConsumer | None = None,
+    ) -> None:
         self.pool, self.store, self.context = pool, store, context
         self.resources = replace(
             pool.resources,
@@ -66,8 +74,7 @@ class RecoveryScheduler:
         self.read_lease: ReadLease | None = None
         self.relay: Any = None
         self.result_id = ""
-        self.client: Any = None
-        self.channel: Any = None
+        self.consumer = NativeResultConsumer() if consumer is None else consumer
         self.planning_connection: Any = None
         self.result_endpoint: dict[str, str] = {}
         self.result_manifest: ResultManifest | None = None
@@ -154,9 +161,6 @@ class RecoveryScheduler:
             self.planning_connection = None
 
     def _prepare_delivery(self) -> None:
-        from vane._native import execution_runtime as native
-        from vane.execution.pipelined_worker import _channel
-
         resources = self.resources
         self.relay, self.result_id = self.pool.results.create(self.context.query_id, resources)
         self.pool.results.prepared(self.result_id, self.context)
@@ -174,28 +178,14 @@ class RecoveryScheduler:
         ).encode()
         location = _get(self.relay.prepare.remote(self.result_id, self.spec.result_schema, ticket), self.context)
         self.result_endpoint = {"location": location, "ticket": ticket}
-        self.channel = _channel(self.spec.result_schema, resources, "result-service", "client")
-        self.client = native.DirectFlight(
-            "127.0.0.1",
-            "127.0.0.1",
-            1,
-            native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
-            resources.exchange.frame_bytes,
-        )
-        self.client.subscribe(
-            location,
-            ticket,
-            self.channel,
-            "result-service",
-            self.spec.options.execution_timeout + self.spec.options.delivery_timeout,
-        )
+        self.consumer.attach(self.spec, resources, location, ticket)
         deadline = time.monotonic() + self.spec.options.admission_timeout
         while True:
             self.context.check()
             status = _get(self.relay.status.remote(self.result_id), self.context)
-            if status["error"] or self.client.error:
-                raise RuntimeError(status["error"] or self.client.error)
-            if status["ready"] and self.client.ready:
+            if status["error"] or self.consumer.error:
+                raise RuntimeError(status["error"] or self.consumer.error)
+            if status["ready"] and self.consumer.ready:
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError("FTE result consumer admission timed out")
@@ -404,7 +394,7 @@ class RecoveryScheduler:
                 status = _get(self.relay.status.remote(self.result_id), self.context, timeout=5)
                 if status["query_id"] != self.result_id:
                     raise RuntimeError("result context identity changed")
-                error = status["error"] or status["channel"]["error"] or self.client.error
+                error = status["error"] or status["channel"]["error"] or self.consumer.error
                 if error:
                     raise RuntimeError(error)
                 self.stop.wait(0.02)
@@ -413,10 +403,21 @@ class RecoveryScheduler:
                 self.context.failed(str(error))
                 self.cancel(str(error))
 
+    def delivery_complete(self) -> bool:
+        if not self.consumer.delivered() or self.result_manifest is None or not self.production_status():
+            return False
+        status = _get(self.relay.status.remote(self.result_id), self.context)
+        if status["query_id"] != self.result_id:
+            raise RuntimeError("result context identity changed")
+        error = status["error"] or status["channel"]["error"] or self.consumer.error
+        if error:
+            raise RuntimeError(error)
+        return True
+
     def read_next_batch(self) -> Any:
         while True:
             self.context.check()
-            state, batch = self.channel.poll("client")
+            state, batch = self.consumer.channel.poll("client")
             if state == "data":
                 if self.result_manifest is None or not self.production_status():
                     batch.close()
@@ -429,7 +430,7 @@ class RecoveryScheduler:
                 if self.result_manifest is None or not self.production_status():
                     raise RuntimeError("FTE result ended before commit")
                 status = _get(self.relay.status.remote(self.result_id), self.context)
-                error = status["error"] or status["channel"]["error"] or self.client.error
+                error = status["error"] or status["channel"]["error"] or self.consumer.error
                 if error:
                     raise RuntimeError(error)
                 self.context.check()
@@ -450,8 +451,8 @@ class RecoveryScheduler:
                 self.coordinator.cancel(reason)
             if self.planning_connection is not None:
                 self.planning_connection.interrupt()
-            if self.client is not None:
-                self.client.cancel(reason)
+            if self.consumer.flight is not None:
+                self.consumer.cancel(reason)
             if ray.is_initialized():
                 for attempt in tuple(self.active.values()):
                     attempt.worker.cancel_materialized.remote(attempt.epoch, attempt.key, reason)
@@ -471,8 +472,8 @@ class RecoveryScheduler:
                     thread.join(timeout=cleanup_timeout(10))
                     if thread.is_alive():
                         raise RuntimeError("FTE query cleanup is pending")
-            if self.client is not None:
-                self.client.close()
+            if self.consumer.flight is not None:
+                self.consumer.close()
             errors = []
             for attempt in tuple(self.active.values()):
                 try:
@@ -535,7 +536,7 @@ class RecoveryScheduler:
             "mode": "fte",
             **self.snapshot(),
             "attempts": attempts,
-            "result_channel": self.channel.snapshot() if self.channel is not None else None,
+            "result_channel": self.consumer.channel.snapshot() if self.consumer.channel is not None else None,
             "resources": self.pool.admission.snapshot(),
             "cleanup_complete": self.closed,
         }

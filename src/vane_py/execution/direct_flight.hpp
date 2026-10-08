@@ -17,12 +17,14 @@ namespace vane_execution {
 class DirectFlight {
 public:
 	DirectFlight(const string &bind_host, const string &advertise_host, idx_t max_links, idx_t staging_bytes,
-	             idx_t frame_bytes);
+	             idx_t frame_bytes, int port = 0, const string &certificate = "", const string &private_key = "");
 	~DirectFlight();
 	string Location() const;
 	void Publish(const string &ticket, shared_ptr<DirectChannel> channel, const string &consumer);
 	void Subscribe(const string &location, const string &ticket, shared_ptr<DirectChannel> channel,
-	               const string &producer, double timeout);
+	               const string &producer, double timeout, const string &root_certificates = "");
+	void Revoke(const string &ticket);
+	bool Delivered(const string &ticket) const;
 	void Cancel(const string &reason);
 	void Close();
 	string Error() const;

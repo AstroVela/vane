@@ -251,7 +251,7 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 - [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
 - [ ] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界验收。
   - [x] P5.2.4a：Flight 会话控制、独立启动、鉴权、租约与可重试关闭；已完成相关验证。详见 [Server 设计](SERVER_DESIGN.md)。
-  - [ ] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与查询所有权迁至 Server。
+  - [x] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与所有权由 Server 管理，已完成两种模式和 TLS 的相关验证。
   - [ ] P5.2.4c：客户端断连、服务故障、混跑与部署验收。
 
 Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Quack。SessionService / QueryService 独立于线协议，内部 Flight exchange 保留，不实现双协议兼容或 fallback。
@@ -569,3 +569,11 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 连续两轮无待修问题的审查后，完成一次非 editable 安装；207 个 Python/类型文件与源码一致，原生二进制 SHA-256 未变。格式、适用 pre-commit、mypy 和源码版权清单通过。
 - 相关验证去重合计 **85 passed、1 skipped**：会话所有权 21、真实 Flight/鉴权/TLS/独立进程 30、包契约 30、真实 Ray 两模式关闭/过期 4。跳过项需要可选 ADBC 依赖。首次测试仅修正嵌套 cursor 的错误文案断言，并定向复跑通过；安装后未修改生产代码，未重建，未运行完整 release/fast 套件。
 - [Server 设计](SERVER_DESIGN.md) 明确后续远程查询与原生结果交付、故障验收，以及 DuckDB 2.0 升级后替换 Quack 对外入口的边界。本步未提供远程 SQL，P5.2.4b / c、历史 Flight 超时及 P5.3 发布资格仍待完成。
+
+### P5.2.4b 远程查询与原生结果（2026 年 10 月 8 日）
+
+- Flight 增加 Execute / Status / Cancel / Finish / CloseQuery；先登记查询所有者再异步执行。会话内连续序号防止回执丢失后重复执行，终态句柄和清理失败记录受全局上限约束。Status 不等待规划锁或 native pump。
+- 两种调度器显式接入 NativeResultConsumer。Server 发布固定、可配置 TLS 的原生结果端口，使用独立 capability；客户端不连接 Ray，Server 的 Python 控制层不读取或转发 Arrow 批次。撤销等待旧流退出后才回收容量，覆盖 Arrow 错误路径不调用 Close 的情况。
+- `vane.client.Client` 提供 query / submit，会话续租、类型化取消与超时、持有 Arrow 视图的字节计费及可重试关闭。FINISH 后通过服务端确认生产、持久错误与清理；成功交付后的清理失败保留成功结局与资源所有者。
+- 两轮无问题审查后进行一次非 editable native 增量 Release 构建。相关测试最终 **270 passed、1 skipped**：非 Ray 203、真实 Ray 66、CLI 1；可选 ADBC 缺失而跳过。首次测试修正不支持的 SQL fixture 与 CLI SIGTERM 注册顺序；再次两轮审查后重新打包 Python，native SHA-256 保持 `dd3706ddb13cee62fa5fc5f26faf3e3fd9b6ebd3f1e4ed88d07e6da3530f205b`，只复跑失败和未运行用例。
+- root 格式、lint、mypy、CI copyleft 检查通过；未运行完整 release/fast 套件。P5.2.4c 的客户端失联/服务故障矩阵、混跑性能、历史 Flight 超时定位及 P5.3 仍待完成。

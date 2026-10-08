@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Standalone Flight session server. Remote SQL execution is a subsequent increment."""
+"""Standalone Flight SQL control and native result gateway."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ class Server:
     """Host leased sessions on Flight while keeping their Runtime server-owned.
 
     The listener starts during construction. close() has a caller deadline;
-    a timed-out call retains all cleanup owners and can be retried. This first
-    increment exposes session actions only, as advertised by vane.info.
+    a timed-out call retains all cleanup owners and can be retried. Ray must
+    be initialized in the hosting process; remote clients never connect to it.
     """
 
     def __init__(
@@ -43,6 +43,8 @@ class Server:
         token: str,
         host: str = "127.0.0.1",
         port: int = 8815,
+        result_port: int = 0,
+        advertise_host: str | None = None,
         tls_certificates: list[tuple[bytes, bytes]] | None = None,
         database: str = ":memory:",
         read_only: bool = False,
@@ -52,29 +54,59 @@ class Server:
     ) -> None:
         if not isinstance(token, str) or not token.isascii() or not 32 <= len(token) <= 4096 or not token.isprintable():
             raise ValueError("token must contain 32 to 4096 printable ASCII characters")
-        if type(port) is not int or not 0 <= port <= 65535:
-            raise ValueError("port must be between 0 and 65535")
+        for value in (port, result_port):
+            if type(value) is not int or not 0 <= value <= 65535:
+                raise ValueError("port must be between 0 and 65535")
+        advertise_host = host if advertise_host is None else advertise_host
+        if advertise_host in {"0.0.0.0", "::", ""}:
+            raise ValueError("advertise_host must be reachable by clients")
+        if tls_certificates is not None and len(tls_certificates) != 1:
+            raise ValueError("supply one TLS certificate and key for both public endpoints")
         if not tls_certificates:
-            if host != "localhost" and not ipaddress.ip_address(host).is_loopback:
-                raise ValueError("TLS certificates are required for non-loopback listeners")
+            for address in (host, advertise_host):
+                if address != "localhost" and not ipaddress.ip_address(address).is_loopback:
+                    raise ValueError("TLS certificates are required for non-loopback listeners")
             location = flight.Location.for_grpc_tcp(host, port)
         else:
             location = flight.Location.for_grpc_tls(host, port)
-        self.service = SessionService(
-            database=database, read_only=read_only, config=config, resources=resources, limits=sessions
+        from vane._native import execution_runtime as native
+
+        resources = RayResources() if resources is None else resources
+        certificate, key = tls_certificates[0] if tls_certificates else (b"", b"")
+        self._gateway = native.DirectFlight(
+            host,
+            advertise_host,
+            resources.max_results,
+            resources.max_results * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
+            resources.exchange.frame_bytes,
+            result_port,
+            certificate.decode("ascii"),
+            key.decode("ascii"),
         )
         try:
-            self._flight = FlightControlServer(self.service, location, token, tls_certificates)
+            self.service = SessionService(
+                database=database,
+                read_only=read_only,
+                config=config,
+                resources=resources,
+                limits=sessions,
+                gateway=self._gateway,
+            )
+            try:
+                self._flight = FlightControlServer(self.service, location, token, tls_certificates)
+            except BaseException:
+                self.service.close()
+                raise
         except BaseException:
-            self.service.close()
+            self._gateway.close()
             raise
         self._lock = threading.Lock()
         self._shutdown: _Shutdown | None = None
         self.port = self._flight.port
         self.location = (
-            flight.Location.for_grpc_tls(host, self.port)
+            flight.Location.for_grpc_tls(advertise_host, self.port)
             if tls_certificates
-            else flight.Location.for_grpc_tcp(host, self.port)
+            else flight.Location.for_grpc_tcp(advertise_host, self.port)
         )
 
     def close(self, *, timeout: float = 10) -> None:
@@ -107,6 +139,7 @@ class Server:
 
     def _stop_flight(self, attempt: _Shutdown) -> None:
         try:
+            self._gateway.close()
             self._flight.shutdown()
         except BaseException as error:
             attempt.error = error.with_traceback(None)
@@ -124,6 +157,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8815)
+    parser.add_argument("--result-port", type=int, default=8816)
+    parser.add_argument("--advertise-host")
+    parser.add_argument("--ray-address", default="auto", help="existing cluster address, or 'local' to start one")
+    parser.add_argument("--ray-cpus", type=int, help="CPU capacity when --ray-address=local")
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--tls-cert", type=Path)
     parser.add_argument("--tls-key", type=Path)
@@ -135,17 +172,28 @@ def main() -> None:
     if bool(args.tls_cert) != bool(args.tls_key):
         parser.error("--tls-cert and --tls-key must be supplied together")
     stop = threading.Event()
+    import ray
+
+    ray.init(address=args.ray_address, **({"num_cpus": args.ray_cpus} if args.ray_cpus is not None else {}))
+    try:
+        server = Server(
+            token=args.token_file.read_text().strip(),
+            host=args.host,
+            port=args.port,
+            result_port=args.result_port,
+            advertise_host=args.advertise_host,
+            tls_certificates=[(args.tls_cert.read_bytes(), args.tls_key.read_bytes())] if args.tls_cert else None,
+            database=args.database,
+            read_only=args.read_only,
+            sessions=SessionLimits(max_sessions=args.max_sessions, lease_seconds=args.lease_seconds),
+        )
+    except BaseException:
+        ray.shutdown()
+        raise
+    # Ray installs native signal handlers during init; the service owns
+    # graceful shutdown after that initialization has completed.
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
-    server = Server(
-        token=args.token_file.read_text().strip(),
-        host=args.host,
-        port=args.port,
-        tls_certificates=[(args.tls_cert.read_bytes(), args.tls_key.read_bytes())] if args.tls_cert else None,
-        database=args.database,
-        read_only=args.read_only,
-        sessions=SessionLimits(max_sessions=args.max_sessions, lease_seconds=args.lease_seconds),
-    )
     try:
         print(json.dumps({"location": server.location.uri.decode(), **server.service.snapshot()}), flush=True)
         stop.wait()
@@ -153,6 +201,7 @@ def main() -> None:
         while True:
             try:
                 server.close()
+                ray.shutdown()
                 break
             except (TimeoutError, RuntimeError) as error:
                 print(f"Server cleanup pending: {error}", file=sys.stderr, flush=True)

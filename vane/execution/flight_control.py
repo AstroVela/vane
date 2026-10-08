@@ -13,10 +13,16 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from vane.execution.query_options import QueryExecutionOptions
 from vane.execution.query_runtime import QueryResources
 from vane.execution.server_session import SessionError, SessionService
 
 _ACTIONS = {
+    "vane.query.execute": "Submit SQL once per consecutive session sequence",
+    "vane.query.status": "Read query state and native result endpoint",
+    "vane.query.cancel": "Cancel execution and retain the cleanup owner",
+    "vane.query.finish": "Confirm native FINISH and complete delivery",
+    "vane.query.close": "Release a query handle; poll until CLOSED",
     "vane.info": "Server instance and session capacity",
     "vane.session.open": "Open a leased SQL session",
     "vane.session.renew": "Renew an unexpired session lease",
@@ -97,7 +103,9 @@ class FlightControlServer(flight.FlightServerBase):
             if action.type == "vane.info":
                 _request(action.body, set())
                 result = self._service.snapshot()
-                result["capabilities"] = ["sessions"]
+                result["capabilities"] = ["sessions"] + (
+                    ["queries", "native-results"] if self._service.gateway is not None else []
+                )
             elif action.type == "vane.session.open":
                 request = _request(action.body, {"execution", "resources"})
                 values = request.get("resources")
@@ -117,6 +125,24 @@ class FlightControlServer(flight.FlightServerBase):
                     self._service.renew_session if action.type == "vane.session.renew" else self._service.close_session
                 )
                 result = operation(*identity)
+            elif action.type == "vane.query.execute":
+                request = _request(
+                    action.body, {"server_id", "session_id", "sequence", "sql", "options", "rows_per_batch"}
+                )
+                values = request.get("options")
+                options = None if values is None else QueryExecutionOptions.from_dict(values)
+                result = self._service.execute(
+                    *_identity(request),
+                    sequence=request.get("sequence", 0),
+                    sql=request.get("sql", ""),
+                    options=options,
+                    rows_per_batch=request.get("rows_per_batch", 1024),
+                )
+            elif action.type in {"vane.query.status", "vane.query.cancel", "vane.query.finish", "vane.query.close"}:
+                request = _request(action.body, {"server_id", "session_id", "query_id"})
+                result = self._service.query_action(
+                    *_identity(request), request.get("query_id", 0), action.type.rsplit(".", 1)[1]
+                )
             else:
                 raise ValueError("unknown control action")
             response = {"protocol": 1, "ok": True, "result": result}
@@ -124,4 +150,7 @@ class FlightControlServer(flight.FlightServerBase):
             response = {"protocol": 1, "ok": False, "error": {"code": error.code, "message": str(error)}}
         except (ValueError, TypeError, RecursionError) as error:
             raise pa.ArrowInvalid(str(error)) from error
-        yield flight.Result(json.dumps(response, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+        encoded = json.dumps(response, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _MAX_BODY_BYTES:
+            raise pa.ArrowInvalid("control response exceeds 65536 bytes")
+        yield flight.Result(encoded)

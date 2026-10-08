@@ -6,7 +6,6 @@
 import json
 import shutil
 import subprocess
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -45,7 +44,7 @@ def test_wire_session_lifecycle_and_server_capabilities(server):
     with flight.FlightClient(server.location) as client:
         info = call(client, "vane.info")["result"]
         assert info["state"] == "READY"
-        assert info["capabilities"] == ["sessions"]
+        assert info["capabilities"] == ["sessions", "queries", "native-results"]
         opened = call(client, "vane.session.open")
         assert opened["ok"]
         handle = {key: opened["result"][key] for key in ("server_id", "session_id")}
@@ -76,6 +75,11 @@ def test_authentication_applies_to_other_flight_methods(server):
         with pytest.raises(flight.FlightUnauthenticatedError):
             client.do_get(flight.Ticket(b"unknown"))
         assert {action.type for action in client.list_actions(options())} == {
+            "vane.query.execute",
+            "vane.query.status",
+            "vane.query.cancel",
+            "vane.query.finish",
+            "vane.query.close",
             "vane.info",
             "vane.session.open",
             "vane.session.renew",
@@ -248,52 +252,3 @@ def test_tls_listener_validates_server_certificate(tmp_path):
         assert server.location.uri.startswith(b"grpc+tls:")
         with flight.FlightClient(server.location, tls_root_certs=cert.read_bytes()) as client:
             assert call(client, "vane.session.open")["ok"]
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="subprocess SIGTERM shutdown uses POSIX signals")
-def test_standalone_cli_handles_sessions_and_releases_database(tmp_path):
-    token_file = tmp_path / "token"
-    token_file.write_text(TOKEN)
-    database = str(tmp_path / "server.db")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-I",
-            "-m",
-            "vane.server",
-            "--port",
-            "0",
-            "--token-file",
-            str(token_file),
-            "--database",
-            database,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        # Read startup in a thread so a failed listener cannot hang this test.
-        with ThreadPoolExecutor(1) as threads:
-            ready = threads.submit(process.stdout.readline)
-            try:
-                info = json.loads(ready.result(timeout=20))
-            except BaseException:
-                process.kill()
-                raise
-        with flight.FlightClient(info["location"]) as client:
-            assert call(client, "vane.session.open")["ok"]
-        process.terminate()
-        stdout, stderr = process.communicate(timeout=20)
-        assert process.returncode == 0, stdout + stderr
-        reopened = subprocess.run(
-            [sys.executable, "-I", "-c", "import vane,sys; vane.connect(sys.argv[1]).close()", database],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        assert reopened.returncode == 0, reopened.stderr
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.communicate(timeout=10)

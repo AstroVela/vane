@@ -5,29 +5,37 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 import threading
 import time
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from vane.execution.pipelined_plan import RayResources
+from vane.execution.query_options import QueryExecutionOptions, RayExecution
 from vane.execution.query_runtime import QueryResources
 from vane.execution.request_admission import _timeout
 from vane.execution.runtime import Runtime
+from vane.execution.server_query import ServerQuery
 
 
 class SessionError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
+        super().__init__(code, message)
         self.code = code
+
+    def __str__(self) -> str:
+        return str(self.args[1])
 
 
 @dataclass(frozen=True)
 class SessionLimits:
     max_sessions: int = 64
+    max_query_handles: int = 128
     lease_seconds: float = 60
     cleanup_timeout: float = 5
     maintenance_interval: float = 0.1
@@ -35,6 +43,8 @@ class SessionLimits:
     def __post_init__(self) -> None:
         if type(self.max_sessions) is not int or not 0 < self.max_sessions <= 1024:
             raise ValueError("max_sessions must be between 1 and 1024")
+        if type(self.max_query_handles) is not int or not 0 < self.max_query_handles <= 4096:
+            raise ValueError("max_query_handles must be between 1 and 4096")
         for name in ("lease_seconds", "cleanup_timeout", "maintenance_interval"):
             if not 0 < _timeout(getattr(self, name), name) <= 86400:
                 raise ValueError(f"{name} must be positive and at most one day")
@@ -50,6 +60,8 @@ class _Session:
     cleaning: bool = False
     retry_at: float = 0
     error: BaseException | None = None
+    sequence: int = 0
+    queries: dict[int, ServerQuery] = field(default_factory=dict)
 
 
 class _SessionRuntime(Runtime):
@@ -84,12 +96,14 @@ class SessionService:
         config: dict[str, Any] | None = None,
         resources: RayResources | None = None,
         limits: SessionLimits | None = None,
+        gateway: Any = None,
     ) -> None:
         self.limits = SessionLimits() if limits is None else limits
         if not isinstance(self.limits, SessionLimits):
             raise TypeError("limits must be SessionLimits")
         self.server_id = uuid.uuid4().hex
         self.runtime = _SessionRuntime(resources)
+        self.gateway = gateway
         self._database = database
         self._read_only = read_only
         self._config = dict(config or {})
@@ -182,6 +196,87 @@ class SessionService:
             # owner remain registered until cleanup has actually succeeded.
             return {"state": "CLOSING"}
 
+    def _live_session(self, server_id: str, session_id: str) -> _Session:
+        self._check_server(server_id)
+        session = self._sessions.get(session_id)
+        if self._closing or session is None or session.opening or session.closing:
+            raise SessionError("SESSION_EXPIRED", "session is unknown or closing")
+        if time.monotonic() >= session.expires_at:
+            session.closing = True
+            self._condition.notify_all()
+            raise SessionError("SESSION_EXPIRED", "session lease expired")
+        return session
+
+    def execute(
+        self,
+        server_id: str,
+        session_id: str,
+        *,
+        sequence: int,
+        sql: str,
+        options: QueryExecutionOptions | None = None,
+        rows_per_batch: int = 1024,
+    ) -> dict[str, Any]:
+        if self.gateway is None:
+            raise SessionError("QUERY_UNAVAILABLE", "native result gateway is not configured")
+        if type(sequence) is not int or not 1 <= sequence <= 2**53 - 1:
+            raise ValueError("sequence must be an integer between 1 and 2**53-1")
+        if not isinstance(sql, str) or not sql.strip() or len(sql.encode("utf-8")) > 32768:
+            raise ValueError("SQL must contain 1 to 32768 UTF-8 bytes")
+        if type(rows_per_batch) is not int or not 0 < rows_per_batch <= 2048:
+            raise ValueError("rows_per_batch must be between 1 and 2048")
+        if options is not None and not isinstance(options.target, RayExecution):
+            raise ValueError("remote queries require RayExecution options")
+        fingerprint = hashlib.sha256(
+            json.dumps([sql, None if options is None else options.to_dict(), rows_per_batch], sort_keys=True).encode()
+        ).hexdigest()
+        with self._condition:
+            session = self._live_session(server_id, session_id)
+            previous = session.queries.get(sequence)
+            if previous is not None:
+                if previous.fingerprint != fingerprint:
+                    raise SessionError("SUBMISSION_CONFLICT", "submission identity has different SQL or options")
+                return previous.snapshot()
+            if sequence <= session.sequence:
+                raise SessionError("QUERY_RETIRED", "submission has already been closed")
+            if sequence != session.sequence + 1:
+                raise SessionError("SUBMISSION_ORDER", "submissions must use consecutive sequence numbers")
+            if sum(len(s.queries) for s in self._sessions.values()) >= self.limits.max_query_handles:
+                raise SessionError("QUERY_CAPACITY", "close completed query handles before submitting more SQL")
+            query = ServerQuery(sequence, fingerprint, session.owner, self.gateway, self.limits.cleanup_timeout)
+            session.queries[sequence] = query
+            session.sequence = sequence
+        thread = threading.Thread(
+            target=query.run, args=(sql, options, rows_per_batch), name="vane-server-query", daemon=True
+        )
+        try:
+            thread.start()
+        except BaseException as error:
+            with query.lock:
+                query.state = "FAILED"
+                query.error = {"code": "QUERY_FAILED", "message": str(error)[:4096]}
+                query.done.set()
+        return query.snapshot()
+
+    def query_action(self, server_id: str, session_id: str, query_id: int, operation: str) -> dict[str, Any]:
+        if type(query_id) is not int or not 1 <= query_id <= 2**53 - 1:
+            raise ValueError("invalid query_id")
+        if operation not in {"status", "cancel", "finish", "close"}:
+            raise ValueError("invalid query operation")
+        with self._condition:
+            session = self._live_session(server_id, session_id)
+            query = session.queries.get(query_id)
+            if query is None:
+                if query_id <= session.sequence and operation == "close":
+                    return {"query_id": query_id, "state": "CLOSED", "cleaned": True}
+                raise SessionError("QUERY_RETIRED", "query is unknown or already closed")
+            if operation != "status":
+                query.request(operation)
+            if query.release_requested and query.done.is_set():
+                del session.queries[query_id]
+                return {"query_id": query_id, "state": "CLOSED", "cleaned": True}
+            return query.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             sessions = tuple(self._sessions.values())
@@ -189,6 +284,8 @@ class SessionService:
                 "server_id": self.server_id,
                 "state": "CLOSED" if self._closed else "DRAINING" if self._closing else "READY",
                 "max_sessions": self.limits.max_sessions,
+                "max_query_handles": self.limits.max_query_handles,
+                "queries": sum(len(s.queries) for s in sessions),
                 "sessions": len(sessions),
                 "opening": sum(s.opening for s in sessions),
                 "closing": sum(s.closing for s in sessions),
@@ -229,8 +326,14 @@ class SessionService:
     def _cleanup(self, session: _Session) -> None:
         error: BaseException | None = None
         try:
+            deadline = time.monotonic() + self.limits.cleanup_timeout
+            for query in session.queries.values():
+                query.request("close")
+            for query in session.queries.values():
+                if not query.done.wait(max(0, deadline - time.monotonic())):
+                    raise TimeoutError("session query cleanup is pending")
             if session.owner is not None:
-                session.owner.close_session(timeout=self.limits.cleanup_timeout)
+                session.owner.close_session(timeout=max(0, deadline - time.monotonic()))
         except BaseException as caught:
             error = caught.with_traceback(None)
         with self._condition:

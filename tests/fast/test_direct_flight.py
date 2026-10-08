@@ -441,3 +441,46 @@ finally:
             child.communicate(timeout=10)
         else:
             child.communicate(timeout=5)
+
+
+def test_gateway_revoke_fences_old_stream_without_canceling_other_query():
+    with vane.connect(backend="local") as connection:
+        sender, first, second = service(), service(), service()
+        left, right = make_channel(connection), make_channel(connection)
+        target_left, target_right = make_channel(connection), make_channel(connection)
+        try:
+            sender.publish("first", left, "consumer")
+            sender.publish("second", right, "consumer")
+            first.subscribe(sender.location, "first", target_left, "producer", 10)
+            second.subscribe(sender.location, "second", target_right, "producer", 10)
+            eventually(lambda: first.ready and second.ready, bool)
+            assert not sender.delivered("first")
+            sender.revoke("first")
+            with pytest.raises(Exception, match="unknown or expired"):
+                sender.delivered("first")
+            assert right._write_rows("producer", 1, [(42,)]) == "accepted"
+            right.finish("producer", 1)
+            _, batch = eventually(lambda: target_right.poll("consumer"), lambda item: item[0] == "data")
+            assert batch.to_rows() == [(42,)]
+            batch.close()
+            eventually(lambda: target_right.poll("consumer"), lambda item: item[0] == "end")
+            assert sender.delivered("second")
+            right.abort("late persistent failure")
+            with pytest.raises(Exception, match="late persistent failure"):
+                sender.delivered("second")
+            sender.revoke("second")
+            assert sender.active_links == 0
+        finally:
+            first.close()
+            second.close()
+            sender.close()
+
+
+def test_gateway_revoke_after_transport_error_releases_reservation(pair):
+    sender, receiver, source, target = pair
+    eventually(lambda: receiver.ready, bool)
+    source.abort("upstream failed before finish")
+    eventually(lambda: target.snapshot()["error"], bool)
+    # Flight can destroy a failed stream without calling its Close method.
+    sender.revoke("opaque-capability")
+    assert sender.active_links == 0

@@ -533,6 +533,35 @@ class QueryResult:
                 self._cleaning = False
                 self._runtime._condition.notify_all()
 
+    def complete_external(self, mark_eof: Callable[[], None]) -> None:
+        """Finish a native external stream after its owner validated FINISH.
+
+        The context arbitrates cancellation; the result condition arbitrates
+        the delivery deadline. No batch is fetched through Python here.
+        """
+        stream = self._stream
+        if stream is None:
+            self._cleanup()
+            return
+
+        accepted_expiry = False
+
+        def commit() -> None:
+            nonlocal accepted_expiry
+            with self._runtime._condition:
+                accepted_expiry = self._expire_locked()
+                self._check_locked()
+                if self._preparing or self._taking or self._payloads:
+                    raise RuntimeError("external delivery cannot share a Python consumer")
+                mark_eof()
+                self._finish_locked("delivered")
+
+        try:
+            stream.commit(commit)
+        finally:
+            if accepted_expiry:
+                self._dispatch_cancellation()
+
     def take(self) -> Any:
         """Export one payload, fencing cancellation and expiry before handoff."""
         self._guard_stream()

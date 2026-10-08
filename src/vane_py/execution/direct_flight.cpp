@@ -65,6 +65,8 @@ struct Endpoint {
 	idx_t sent = 0;
 	idx_t acknowledged = 0;
 	bool opened = false;
+	bool active_stream = false;
+	std::condition_variable idle;
 	bool finished = false;
 	bool closed = false;
 	std::shared_ptr<Signal> signal = std::make_shared<Signal>();
@@ -88,6 +90,9 @@ class Stream : public arrow::flight::FlightDataStream {
 public:
 	Stream(std::shared_ptr<Endpoint> endpoint_p, const arrow::flight::ServerCallContext &context_p)
 	    : endpoint(std::move(endpoint_p)), context(context_p), arrow_schema(ArrowSchemaFor(endpoint->channel->types)) {
+	}
+	~Stream() override {
+		(void)Close();
 	}
 	std::shared_ptr<arrow::Schema> schema() override {
 		return arrow_schema;
@@ -134,6 +139,9 @@ public:
 				string metadata;
 				{
 					std::lock_guard<std::mutex> guard(endpoint->lock);
+					if (endpoint->closed) {
+						return arrow::Status::Cancelled("direct consumer closed");
+					}
 					if (state == DirectRead::END) {
 						endpoint->finished = sent_finish = true;
 						chunk.Initialize(Allocator::DefaultAllocator(), endpoint->channel->types, 0);
@@ -168,6 +176,11 @@ public:
 				endpoint->channel->Abort("direct Flight disconnected before FINISH");
 			}
 		}
+		{
+			std::lock_guard<std::mutex> guard(endpoint->lock);
+			endpoint->active_stream = false;
+			endpoint->idle.notify_all();
+		}
 		return arrow::Status::OK();
 	}
 
@@ -190,8 +203,8 @@ public:
 			if (endpoint->opened || endpoint->closed) {
 				return arrow::Status::Invalid("direct Flight stream cannot be replayed");
 			}
-			endpoint->opened = true;
 			stream->reset(new Stream(endpoint, context));
+			endpoint->opened = endpoint->active_stream = true;
 			return arrow::Status::OK();
 		} catch (const std::exception &error) {
 			return arrow::Status::Invalid(error.what());
@@ -402,15 +415,23 @@ struct DirectFlight::Impl {
 	bool closed = false;
 	bool canceled = false;
 
-	Impl(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame)
+	Impl(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame, int port,
+	     const string &certificate, const string &private_key)
 	    : max_links(maximum), frame_bytes(frame), wire_limit(DirectFlight::StagingPerLink(frame) / 4) {
 		if (!maximum || maximum > 4096 || staging / DirectFlight::StagingPerLink(frame) < maximum || host.empty() ||
-		    advertise.empty()) {
+		    advertise.empty() || port < 0 || port > 65535 || certificate.empty() != private_key.empty()) {
 			throw InvalidInputException("direct Flight requires finite links and reserved staging capacity");
 		}
-		auto address = Unwrap(arrow::flight::Location::ForGrpcTcp(host, 0));
-		Check(server.Init(arrow::flight::FlightServerOptions(address)));
-		location = Unwrap(arrow::flight::Location::ForGrpcTcp(advertise, server.port())).ToString();
+		auto address = Unwrap(certificate.empty() ? arrow::flight::Location::ForGrpcTcp(host, port)
+		                                          : arrow::flight::Location::ForGrpcTls(host, port));
+		arrow::flight::FlightServerOptions options(address);
+		if (!certificate.empty()) {
+			options.tls_certificates.push_back({certificate, private_key});
+		}
+		Check(server.Init(options));
+		location = Unwrap(certificate.empty() ? arrow::flight::Location::ForGrpcTcp(advertise, server.port())
+		                                      : arrow::flight::Location::ForGrpcTls(advertise, server.port()))
+		               .ToString();
 		serving = std::thread([this]() { (void)server.Serve(); });
 	}
 };
@@ -435,8 +456,9 @@ void DirectFlight::ExportBatch(DataChunk &chunk, const vector<string> &names, Ar
 	Check(arrow::ExportRecordBatch(*Encode(chunk, ResultSchemaFor(chunk.GetTypes(), names)), array, schema));
 }
 
-DirectFlight::DirectFlight(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame)
-    : impl(make_uniq<Impl>(host, advertise, maximum, staging, frame)) {
+DirectFlight::DirectFlight(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame,
+                           int port, const string &certificate, const string &private_key)
+    : impl(make_uniq<Impl>(host, advertise, maximum, staging, frame, port, certificate, private_key)) {
 }
 
 DirectFlight::~DirectFlight() {
@@ -465,8 +487,9 @@ void DirectFlight::Publish(const string &ticket, shared_ptr<DirectChannel> chann
 }
 
 void DirectFlight::Subscribe(const string &location, const string &ticket, shared_ptr<DirectChannel> channel,
-                             const string &producer, double timeout) {
+                             const string &producer, double timeout, const string &root_certificates) {
 	std::lock_guard<std::mutex> guard(impl->lock);
+	std::lock_guard<std::mutex> registry_guard(impl->registry->lock);
 	if (impl->closed || impl->canceled || impl->links.size() + impl->registry->endpoints.size() >= impl->max_links ||
 	    channel->limits.frame_bytes != impl->frame_bytes || channel->types.size() > 256 || !(timeout > 0)) {
 		throw InvalidInputException("invalid direct Flight subscription or exhausted reservation");
@@ -478,6 +501,7 @@ void DirectFlight::Subscribe(const string &location, const string &ticket, share
 	link->ticket = ticket;
 	auto address = Unwrap(arrow::flight::Location::Parse(location));
 	auto options = arrow::flight::FlightClientOptions::Defaults();
+	options.tls_root_certs = root_certificates;
 	options.generic_options.emplace_back("grpc.max_receive_message_length", int(impl->wire_limit));
 	link->data = Unwrap(arrow::flight::FlightClient::Connect(address, options));
 	link->control = Unwrap(arrow::flight::FlightClient::Connect(address, options));
@@ -485,6 +509,48 @@ void DirectFlight::Subscribe(const string &location, const string &ticket, share
 	auto limit = impl->wire_limit;
 	link->reader = std::thread([link, timeout, limit]() { link->Read(timeout, limit); });
 	link->watcher = std::thread([link]() { link->Watch(); });
+}
+
+void DirectFlight::Revoke(const string &ticket) {
+	std::shared_ptr<Endpoint> endpoint;
+	{
+		std::lock_guard<std::mutex> guard(impl->registry->lock);
+		auto entry = impl->registry->endpoints.find(ticket);
+		if (entry == impl->registry->endpoints.end()) {
+			return;
+		}
+		endpoint = entry->second;
+	}
+	shared_ptr<DirectBatch> release;
+	{
+		std::lock_guard<std::mutex> guard(endpoint->lock);
+		endpoint->closed = true;
+		release = std::move(endpoint->lease);
+	}
+	endpoint->channel->CloseConsumer(endpoint->consumer);
+	endpoint->signal->changed.notify_all();
+	{
+		std::unique_lock<std::mutex> guard(endpoint->lock);
+		if (!endpoint->idle.wait_for(guard, std::chrono::seconds(2), [&]() { return !endpoint->active_stream; })) {
+			throw IOException("direct Flight revocation is pending; retry cleanup");
+		}
+	}
+	// Retain its transport reservation until entered streams have exited.
+	std::lock_guard<std::mutex> guard(impl->registry->lock);
+	auto entry = impl->registry->endpoints.find(ticket);
+	if (entry != impl->registry->endpoints.end() && entry->second == endpoint) {
+		impl->registry->endpoints.erase(entry);
+	}
+}
+
+bool DirectFlight::Delivered(const string &ticket) const {
+	auto endpoint = impl->registry->Find(ticket);
+	std::lock_guard<std::mutex> guard(endpoint->lock);
+	auto error = endpoint->channel->Snapshot().error;
+	if (!error.empty()) {
+		throw IOException("%s", error);
+	}
+	return endpoint->finished && !endpoint->closed && endpoint->acknowledged == endpoint->sent && !endpoint->lease;
 }
 
 void DirectFlight::Cancel(const string &reason) {
@@ -525,6 +591,7 @@ void DirectFlight::Close() {
 		impl->serving.join();
 	}
 	impl->links.clear();
+	std::lock_guard<std::mutex> registry_guard(impl->registry->lock);
 	impl->registry->endpoints.clear();
 }
 
@@ -541,6 +608,7 @@ string DirectFlight::Error() const {
 
 idx_t DirectFlight::ActiveLinks() const {
 	std::lock_guard<std::mutex> guard(impl->lock);
+	std::lock_guard<std::mutex> registry_guard(impl->registry->lock);
 	return impl->closed ? 0 : impl->links.size() + impl->registry->endpoints.size();
 }
 

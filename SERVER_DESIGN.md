@@ -1,10 +1,10 @@
 # Vane 独立服务与 Flight 接入
 
-状态：P5.2.4 的分阶段设计。当前实现会话控制；远程 SQL、远程结果读取与完整故障验收尚未交付。
+状态：P5.2.4a / b 已完成实现与相关验证。P5.2.4c 完整故障验收未完成。
 
 ## 协议选择与服务边界
 
-本阶段使用 Arrow Flight。`DoAction` 承载有界控制消息，后续结果使用原生 `DoGet`、序号和 ACK。它是 Vane 的 Flight 协议，不宣称兼容 Flight SQL。运行服务不会改变 local / ray 或 pipelined / FTE 的选择规则。
+本阶段使用 Arrow Flight。`DoAction` 承载有界控制消息，结果使用原生 `DoGet`、序号和 ACK。它是 Vane 的 Flight 协议，不宣称兼容 Flight SQL。运行服务不会改变 local / ray 或 pipelined / FTE 的选择规则。
 
 ```mermaid
 flowchart TB
@@ -16,7 +16,8 @@ flowchart TB
     P --> W[Ray workers]
     E --> W
     W --> D[原生结果服务]
-    D -. 后续：原生 Flight 数据流 .-> C
+    D --> G[Server 原生 Flight 结果网关]
+    G --> C
 ```
 
 `SessionService` 不依赖 Flight、gRPC、JSON、ticket 或 Quack。它只管理服务实例、会话、期限和清理所有者。Flight 层负责线格式、鉴权、参数校验与错误映射。已有 Runtime 继续拥有全局准入、worker 池、结果 actor 与存储；会话关闭保留其他会话所使用的共享服务。
@@ -30,14 +31,15 @@ flowchart TB
 - 一个 Server 进程独占一个 Runtime。数据库位置、原生配置、Ray 总预算与 exchange store 由服务端配置，客户端不能提交文件路径或任意原生配置。
 - 每次启动生成新的 `server_id`。每次打开会话生成不可预测的 `session_id`；两个标识共同构成控制句柄。标识永不复用。
 - 一个会话持有一个 RayQueryRuntime，后者持有原生根连接、全部 native cursors 和查询。会话数包含正在打开、正在关闭和清理失败的记录。
-- 打开会话按需建立本进程内的服务核心，不启动 Ray actor。本阶段 CLI 不初始化 Ray；远程查询阶段将在服务端连接已配置的 Ray 集群，客户端不连接 Ray。
+- 打开会话按需建立本进程内的服务核心，不启动 Ray actor。CLI 在监听前通过 `--ray-address` 连接已配置的 Ray 集群；默认 `auto`，显式 `local` 可以启动本机集群。嵌入式 `Server` 由宿主初始化 Ray。客户端不连接 Ray。
 - 当前会话没有共享全局默认连接。`:memory:` 按会话建立独立数据库；指定同一文件时沿用原生数据库实例缓存。临时表等 DuckDB session 状态由其原生连接隔离；分布式 SQL 支持范围仍由 fragment compiler 决定。
 
 公开启动方式为 `vane-server` 或 `python -m vane.server`。监听构造成功后开始接受 RPC；不需要每次查询启动进程。
 
 ```bash
 python -m vane.server \
-  --host 127.0.0.1 --port 8815 \
+  --host 127.0.0.1 --port 8815 --result-port 8816 \
+  --ray-address auto \
   --token-file /run/secrets/vane-token \
   --database /data/vane.db \
   --max-sessions 64 --lease-seconds 60
@@ -49,7 +51,7 @@ python -m vane.server \
 
 ## 第一阶段：会话控制协议
 
-所有 Flight 方法都要求 `authorization: Bearer <token>`，包括能力发现和未实现的方法。令牌在中间件中做常量时间比较。当前是持有同一凭据的受信客户端模型；`session_id` 也是敏感句柄，能力发现不返回其他会话标识。本阶段没有多租户用户体系。
+控制端口的所有 Flight 方法都要求 `authorization: Bearer <token>`，包括能力发现和未实现的方法。令牌在中间件中做常量时间比较。当前是持有同一凭据的受信客户端模型；`session_id` 也是敏感句柄，能力发现不返回其他会话标识。本阶段没有多租户用户体系。
 
 Action body 是 UTF-8 JSON 对象，上限 64 KiB，要求 `"protocol": 1`。未知字段、重复字段、未知版本、非有限数字、非法资源声明均拒绝；不反序列化 pickle 或客户端 Python 对象。
 
@@ -60,7 +62,7 @@ Action body 是 UTF-8 JSON 对象，上限 64 KiB，要求 `"protocol": 1`。未
 | `vane.session.renew` | server_id、session_id | 相同句柄与新的 lease_seconds |
 | `vane.session.close` | server_id、session_id | CLOSING 或 CLOSED |
 
-`execution` 只能是 pipelined / fte；FTE 要求服务端预先注册 exchange store。resources 只接受 QueryResources 的会话限额，且不得超过 Runtime 总量。第一阶段 `capabilities` 只有 `sessions`，客户端不能据此认为已支持远程查询。
+`execution` 只能是 pipelined / fte；FTE 要求服务端预先注册 exchange store。resources 只接受 QueryResources 的会话限额，且不得超过 Runtime 总量。`Server` 的 `capabilities` 为 `sessions`、`queries`、`native-results`；仅构造会话核心而未配置网关时，只声明 `sessions`。
 
 成功响应为 `{"protocol":1,"ok":true,"result":{...}}`。领域错误为 `{"protocol":1,"ok":false,"error":{"code":"...","message":"..."}}`，包括 SESSION_CAPACITY、SESSION_EXPIRED、SERVER_CLOSING、SERVER_CHANGED。请求格式错误使用 ArrowInvalid；鉴权失败使用 FlightUnauthenticatedError。调用方必须检查 `ok`；收到 RPC 回执本身不代表操作成功。
 
@@ -82,16 +84,45 @@ Runtime 的 worker / result 清理继续使用新的 release RPC，保留暂时�
 
 ## 第二阶段：远程查询与原生结果
 
-下一 PR 增加 Execute、Status、Cancel、CloseQuery，以及独立客户端。规划、协调器、状态监控和 FTE 续租在 Server 进程内运行。控制请求只传 SQL、明确支持的 options、会话和查询句柄，不发送运行中的 Python 对象。
+已增加 `vane.query.execute/status/cancel/finish/close`，以及 `vane.client.Client`。规划、协调器、状态监控和 FTE 续租在 Server 进程内运行。控制消息只传 SQL、`QueryExecutionOptions.to_dict()`、rows_per_batch 与身份；SQL 参数暂未进入分布式编译器支持范围。
 
-1. Execute 先在会话中注册查询所有者，返回查询身份和状态；同一提交身份的重试不能重复执行。查询记录随 Session 关闭或租约到期收尾。
-2. SQL 编译、准入与执行在服务端推进。排队时间属于 admission deadline；执行期限从实际获得执行资源开始；生产结束后的消费属于 delivery deadline。
-3. 将当前调度器中硬编码的本地客户端订阅移到明确的结果消费者接入步骤。服务端不能先订阅，再让远程客户端重复订阅同一条不可重放流。
-4. 为远程结果返回可达的原生 Flight endpoint 与绑定查询身份的 capability。客户端原生接收端处理有界窗口、类型转换、序号、ACK 和 FINISH；Python 控制 Server 不读取或重新转发 RecordBatch。
-5. 公网/代理部署需要结果端点的可达地址和 TLS，控制连接的 TLS 不自动保护内部或结果端点。这是第二阶段的交付条件，不能只返回 Ray 节点私网地址就宣称完整远程服务可用。
-6. 服务端继续持有查询配额、结果上下文和清理所有权，直到结果完成关闭；客户端视图持有的本地内存由客户端预算独立计费。EOF 仍需检查持久错误，取消和超时保持类型。
+### 提交与所有权
 
-第一阶段没有提供伪装为 QueryResult 的控制对象，也没有把当前 scheduler.read_next_batch 包成 Python 网络转发循环。第二阶段将明确结果 endpoint、远程 QueryResult 所有权和交付完成确认后再扩展能力声明。
+- Execute 字段为 server_id、session_id、sequence、sql，可选 options、rows_per_batch。会话从 sequence=1 开始，按连续整数提交；必须先确认一个提交已接收，再提交下一个。已接收的序号对应同一 SQL/options 摘要，重试只返回原记录；不同内容报 SUBMISSION_CONFLICT。
+- 会话保存最高已接收序号。清理并关闭的旧序号报 QUERY_RETIRED，不能重新执行；无需无限累积历史 tombstone。Server 以 `SessionLimits.max_query_handles` 限制全部会话中保留的查询记录，默认 128。终态记录也计费，调用方必须 CloseQuery 或关闭会话。
+- Execute 在启动查询线程前登记所有者。每条查询使用独立 native cursor，状态为 PREPARING、READY、SUCCEEDED、FAILED 或 CANCELED；`cleaned` 单独表示清理已确认。Status 只读取缓存元数据，不等待规划锁、pump 或远端 RPC。
+- Cancel/CloseQuery 只设置命令，查询所有者推进中断和清理。两个线程分别负责查询与中断，数量受查询记录上限约束。会话关闭等待所有查询的 native cursor、结果、worker 与 FTE lease 清理，再注销会话。
+- 准入、执行和交付期限沿用 QueryContext/QueryResult。错误响应保留 CANCELLED、ADMISSION_TIMEOUT、EXECUTION_TIMEOUT、DELIVERY_TIMEOUT；客户端还原对应异常类。暂时 RPC 失败不会把查询当成已清理。
+
+### 原生结果链路
+
+`NativeResultConsumer` 是两种调度器的显式结果接入对象。嵌入式调用在本进程读取其 channel；Server 将该 channel 发布在共享的原生结果网关。网关自身不订阅第二条相同流，也没有 Python batch 转发循环：
+
+```text
+worker/result actor → native subscriber → bounded channel → native public Flight → native client
+```
+
+网关固定监听 `--result-port`，与控制端口同处 Server 主机；`--advertise-host` 指定客户端可达主机名。绑定通配地址必须配置该主机名。两个端口均使用 Flight 自带 TLS，非回环监听需要证书。客户端为两个连接验证证书和主机名；TLS 控制通道不替代结果通道加密。当前受信 Ray 网络内的内部 exchange 保持现有传输。
+
+READY 返回网关地址、随机查询 capability、原生 schema/列名、engine identity、帧与窗口上限；不暴露 Ray 私网端点或内部 ticket。结果只允许一次订阅，不能透明重放。此阶段原生客户端必须与 Server 使用相同 engine identity，校验发生在解析原生 schema 之前。SQL 最多 32 KiB，控制请求/响应最多 64 KiB，结果 descriptor 最多 60 KiB。
+
+共享网关的端点数受 Runtime.max_results 限制，每个端点预留一个原生发送 staging；查询另持有一个原生接收 staging 和一个窗口。网关每查询上界为 `window_bytes + 2 * DirectFlight.staging_per_link(frame_bytes)`，乘以 max_results 得到服务进程结果传输上界；它与 worker/result actor 预算分别计费。Revoke 先封闭端点并等待已进入的流退出，再归还端点容量；阻塞或失败保留旧端点和清理所有权，不影响其他查询。
+
+客户端另外配置 `ResultDeliveryLimits`，限制结果数及交付 Arrow 视图的字节预算；每个活跃结果另有声明的原生接收窗口和 staging。导出的 Arrow 切片继续计费，`collect()` 逐批复制到调用方内存。状态监控独立于读取线程，远端取消/超时可以唤醒因持有旧视图而等待预算的消费者。
+
+EOF 不是提交完成回执。客户端原生接收端验证序号、ACK、FINISH；读完本地窗口后发送 FinishQuery。服务端检查网关已发 FINISH、全部帧已 ACK、所有生产任务完成以及持久错误，再提交交付完成状态。清理失败保留 SUCCEEDED 与 `cleaned=false`；清理完成前结果和查询配额仍持有。取消与交付完成通过已有 context/result 锁仲裁。
+
+### 客户端使用
+
+```python
+from vane.client import Client
+
+with Client("grpc+tls://vane.example:8815", token=token, tls_root_certs=ca_pem) as client:
+    with client.query("SELECT sum(range) FROM range(1000000)") as result:
+        table = result.collect()
+```
+
+`client.submit(sql)` 返回 RemoteQuery，可调用 status/cancel/result/close。执行回执丢失时，Client 保留相同序号和 SQL；后续提交先重新确认该提交，绝不自动生成另一查询。Client 定期续租；close 超时可以重试。客户端无法恢复已断开的数据流，完整跨进程故障矩阵留待 P5.2.4c。
 
 ## 第三阶段：故障验收与迁移准备
 
@@ -103,4 +134,6 @@ Runtime 的 worker / result 清理继续使用新的 release RPC，保留暂时�
 
 ## 验证顺序
 
-每次实现先审查修改，连续两轮无问题后，再做一次非 editable 安装和相关测试。Python 改动不重编 native。第一阶段运行 SessionService、真实 Flight 控制/鉴权、独立进程与数据库锁回归；不运行完整 release / fast 套件。测试和设计文件加入源码包与 release gate。
+每次实现先审查修改，连续两轮无问题后，再做一次非 editable 安装和相关测试。Python 改动不重编 native。验证覆盖 SessionService、Flight 控制/鉴权、原生传输、独立客户端/CLI、数据库锁、两种 Ray 模式及结果资源生命周期；不运行完整 release / fast 套件。测试和设计文件加入源码包与 release gate。
+
+第二阶段相关验证共 **270 passed、1 skipped**：非 Ray 203、真实 Ray 66、独立 CLI 1；跳过项需要可选 ADBC。连续两轮审查后完成一次 native 增量 Release 构建。首次执行修正了超时测试中的不支持 SQL，以及 Ray 初始化覆盖 CLI 信号处理的问题；修正再审查两轮后只重新打包 Python，native 哈希不变，复跑失败及未运行用例均通过。

@@ -20,6 +20,7 @@ from vane.execution.pipelined_plan import DirectTicket, RayResources, placement,
 from vane.execution.query_options import DistributedMode, FteOptions, QueryExecutionOptions, RayExecution
 from vane.execution.query_runtime import QueryContext, QueryRuntime
 from vane.execution.resource_demand import MemoryDemand, ResourceDemand
+from vane.execution.result_consumer import NativeResultConsumer
 from vane.execution.submission import prepare_ray_query
 from vane.execution.worker_resources import WorkerResourceManager, pipelined_demand, worker_capacity
 
@@ -313,7 +314,14 @@ class WorkerPool:
 
 
 class PipelinedScheduler:
-    def __init__(self, pool: WorkerPool, context: PipelinedContext, spec: Any, rows_per_batch: int = 2048) -> None:
+    def __init__(
+        self,
+        pool: WorkerPool,
+        context: PipelinedContext,
+        spec: Any,
+        rows_per_batch: int = 2048,
+        consumer: NativeResultConsumer | None = None,
+    ) -> None:
         self.pool = pool
         self.context = context
         self.spec = spec
@@ -325,8 +333,7 @@ class PipelinedScheduler:
         )
         self.relay: Any = None
         self.result_id = ""
-        self.client: Any = None
-        self.channel: Any = None
+        self.consumer = NativeResultConsumer() if consumer is None else consumer
         self.monitor: threading.Thread | None = None
         self.stop = threading.Event()
         self.lock = threading.Lock()
@@ -342,7 +349,6 @@ class PipelinedScheduler:
 
     def prepare(self) -> None:
         from vane._native import execution_runtime as native
-        from vane.execution.pipelined_worker import _channel
 
         self.pool.ensure(self.context, self.spec.graph.engine_identity)
         self.context.check()
@@ -416,15 +422,7 @@ class PipelinedScheduler:
             ),
             self.context,
         )
-        self.channel = _channel(self.spec.result_schema, resources, "result-service", "client")
-        self.client = native.DirectFlight(
-            "127.0.0.1",
-            "127.0.0.1",
-            1,
-            native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
-            resources.exchange.frame_bytes,
-        )
-        self.client.subscribe(location, ticket, self.channel, "result-service", timeout)
+        self.consumer.attach(self.spec, resources, location, ticket)
         self.schema = native.arrow_schema(self.spec.result_schema, list(self.spec.result_names))
         while True:
             self.context.check()
@@ -433,10 +431,10 @@ class PipelinedScheduler:
                 for index in sorted(self.prepared)
             ]
             relay_status = _get(self.relay.status.remote(self.result_id), self.context)
-            error = relay_status["error"] or relay_status["channel"]["error"] or self.client.error
+            error = relay_status["error"] or relay_status["channel"]["error"] or self.consumer.error
             if error:
                 raise RuntimeError(error)
-            if all(ready) and relay_status["ready"] and self.client.ready:
+            if all(ready) and relay_status["ready"] and self.consumer.ready:
                 break
             self.stop.wait(0.01)
         self.context.deadline_probe = self.production_status
@@ -467,7 +465,7 @@ class PipelinedScheduler:
         relay = _get(self.relay.status.remote(self.result_id), timeout=timeout)
         if relay["query_id"] != self.result_id:
             raise RuntimeError("result context identity changed")
-        error = error or relay["error"] or relay["channel"]["error"] or self.client.error
+        error = error or relay["error"] or relay["channel"]["error"] or self.consumer.error
         if error:
             raise RuntimeError(error)
         return bool(values) and all(value["finished"] for value in values)
@@ -486,10 +484,13 @@ class PipelinedScheduler:
                 self.context.failed(str(error))
                 self.cancel(str(error))
 
+    def delivery_complete(self) -> bool:
+        return self.consumer.delivered() and self.production_status()
+
     def read_next_batch(self) -> Any:
         while True:
             self.context.check()
-            state, batch = self.channel.poll("client")
+            state, batch = self.consumer.channel.poll("client")
             if state == "data":
                 try:
                     return batch.to_arrow(list(self.spec.result_names))
@@ -515,8 +516,8 @@ class PipelinedScheduler:
             self.failure = self.failure or reason
             self.stop.set()
             self.pool.admission.cancel_waiting(self.spec.query_id)
-            if self.client is not None:
-                self.client.cancel(reason)
+            if self.consumer.flight is not None:
+                self.consumer.cancel(reason)
             if not ray.is_initialized():
                 return
             for index in self.prepared:
@@ -547,7 +548,7 @@ class PipelinedScheduler:
         return {
             "mode": "pipelined",
             "workers": workers,
-            "result_channel": self.channel.snapshot() if self.channel is not None else None,
+            "result_channel": self.consumer.channel.snapshot() if self.consumer.channel is not None else None,
             "resources": self.pool.admission.snapshot(),
             "cleanup_complete": self.closed,
         }
@@ -564,8 +565,8 @@ class PipelinedScheduler:
                 self.monitor.join(timeout=cleanup_timeout(10))
                 if self.monitor.is_alive():
                     raise RuntimeError("Ray query monitor cleanup is pending")
-            if self.client is not None:
-                self.client.close()
+            if self.consumer.flight is not None:
+                self.consumer.close()
             if not ray.is_initialized():
                 self.pool.results.release(self.pool.results.actor, self.context.query_id)
                 self.pool.admission.release(self.reservation)
@@ -669,6 +670,8 @@ class RayQueryRuntime(QueryRuntime):
         overrides: dict[str, Any],
         publish: Any,
         retire: Any,
+        *,
+        consumer: NativeResultConsumer | None = None,
     ) -> Any:
         if self.service.closing:
             raise RuntimeError("query service is draining")
@@ -729,7 +732,7 @@ class RayQueryRuntime(QueryRuntime):
             if mode is DistributedMode.FTE:
                 assert isinstance(options.target, RayExecution) and options.target.fte_options is not None
                 store = self.exchange_store(options.target.fte_options.exchange_store)
-                scheduler = RecoveryScheduler(self.pool, store, context, rows_per_batch)
+                scheduler = RecoveryScheduler(self.pool, store, context, rows_per_batch, consumer)
                 context.started(scheduler.cancel)
                 scheduler.prepare(connection, sql, options, demand, FragmentCompileOptions(resources.partitions))
                 spec = scheduler.spec
@@ -742,7 +745,7 @@ class RayQueryRuntime(QueryRuntime):
                     resources=demand,
                     compile_options=FragmentCompileOptions(resources.partitions),
                 )
-                scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch)
+                scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch, consumer)
                 context.started(scheduler.cancel)
                 scheduler.prepare()
             context.install_reader(
