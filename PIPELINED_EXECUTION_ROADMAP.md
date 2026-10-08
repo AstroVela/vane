@@ -250,6 +250,11 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
 - [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
 - [ ] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界验收。
+  - [x] P5.2.4a：Flight 会话控制、独立启动、鉴权、租约与可重试关闭；已完成相关验证。详见 [Server 设计](SERVER_DESIGN.md)。
+  - [ ] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与查询所有权迁至 Server。
+  - [ ] P5.2.4c：客户端断连、服务故障、混跑与部署验收。
+
+Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Quack。SessionService / QueryService 独立于线协议，内部 Flight exchange 保留，不实现双协议兼容或 fallback。
 
 ### P5.3 发布验收
 
@@ -555,3 +560,12 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 完成两轮无待修问题的代码审查后，一次增量 Release 构建并非 editable 安装。203 个 Python/类型文件与源码一致，native 与构建产物 SHA-256 一致。格式、mypy、版权清单及修改文档的本地链接检查通过。
 - 相关验证去重合计 **382 passed：271 个非 Ray、110 个共享集群 Ray、1 个独立基准 CLI**。首批 Ray 测试中新增的保留视图用例把 512 字节裸数据误作完整 IPC 预算；改为可容纳单批但不能同时容纳两批的预算，并释放 Future 持有的 Arrow 引用，重新审查后定向重跑通过。生产代码在构建后未改动，未重新编译，未运行完整 release/fast 套件。
 - 既有 `5374cf1c4f` 的性能测量仅代表已替换的 actor 池实现；方法和原始数据保留在[执行基准](EXECUTION_BENCHMARKS.md#result-actor-reuse-2026-10-07)，不能视为当前服务实现的测量结果。历史 Flight 超时及 P5.3 发布资格仍未完成。
+
+### P5.2.4a Flight 会话服务（2026 年 10 月 8 日）
+
+- 新增 `vane-server` / `python -m vane.server`，提供鉴权后的能力发现和会话 Open / Renew / Close。默认回环监听，其他地址要求 TLS；当前只声明 sessions 能力。
+- SessionService 独立于传输协议，持有 Runtime、会话租约和创建/清理所有者。打开与关闭中的会话持续计入容量；租约过期不可恢复，失败清理自动重试，阻塞清理不占注册表锁。
+- 创建原生连接前记录对应 RayQueryRuntime，覆盖连接创建和回滚同时失败的路径。Close 区分 CLOSING 与 CLOSED；Server 关闭从入口计算等待期限，超时保留后台任务，失败的 Flight shutdown 也可重试。
+- 连续两轮无待修问题的审查后，完成一次非 editable 安装；207 个 Python/类型文件与源码一致，原生二进制 SHA-256 未变。格式、适用 pre-commit、mypy 和源码版权清单通过。
+- 相关验证去重合计 **85 passed、1 skipped**：会话所有权 21、真实 Flight/鉴权/TLS/独立进程 30、包契约 30、真实 Ray 两模式关闭/过期 4。跳过项需要可选 ADBC 依赖。首次测试仅修正嵌套 cursor 的错误文案断言，并定向复跑通过；安装后未修改生产代码，未重建，未运行完整 release/fast 套件。
+- [Server 设计](SERVER_DESIGN.md) 明确后续远程查询与原生结果交付、故障验收，以及 DuckDB 2.0 升级后替换 Quack 对外入口的边界。本步未提供远程 SQL，P5.2.4b / c、历史 Flight 超时及 P5.3 发布资格仍待完成。
