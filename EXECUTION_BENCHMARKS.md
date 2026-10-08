@@ -42,6 +42,37 @@ The FTE store is a dedicated directory inside the output directory. This local
 mount survives an actor loss in this benchmark; the benchmark does not qualify
 a production storage failure domain or a multi-node deployment.
 
+### Shared Runtime and Flight comparison
+
+`--interface runtime` (default) opens sessions through the application Runtime.
+`--interface flight` hosts a Server and opens real Flight client sessions. SQL,
+query controls and native result batches use the public network path. Server
+internals are observed only to correlate worker query IDs, inject faults, and
+inspect accounting outside latency samples. The Flight client and Server run in
+the same process over loopback; this is not a WAN or isolated-client benchmark.
+Local-mode reference queries always remain embedded.
+
+Run the same configuration separately for each interface:
+
+```bash
+python -I scripts/benchmark_execution.py \
+  --output "$PWD/build/server-benchmark-runtime" --interface runtime \
+  --rows 32768 --repetitions 3 --warmups 1 --modes pipelined fte \
+  --consumer-rows-per-second 8192
+python -I scripts/benchmark_execution.py \
+  --output "$PWD/build/server-benchmark-flight" --interface flight \
+  --rows 32768 --repetitions 3 --warmups 1 --modes pipelined fte \
+  --consumer-rows-per-second 8192
+```
+
+Flight cold samples include new public listeners, a client session and a worker
+pool. Warm samples reuse the Server and pool; mixed samples use two client
+sessions on that Server. Client sequence numbers are mapped to the server's
+worker query IDs before testing reservation overlap. Submission timestamps alone
+are never accepted as proof. Flight resource snapshots separate the client Arrow
+view budget, server query accounting and gateway links. Tokens and tickets are
+not written to benchmark artifacts.
+
 ## Data, queries and capacity profiles
 
 The runner creates four Parquet files with deterministic integer keys, nullable

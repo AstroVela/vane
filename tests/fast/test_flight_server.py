@@ -147,6 +147,26 @@ def test_lost_open_response_is_cleaned_after_rpc_deadline(server, monkeypatch):
     assert server.service.runtime.resource_snapshot()["service"]["sessions"] == {}
 
 
+def test_restart_on_same_port_rejects_old_session_and_query_handles():
+    with Server(token=TOKEN, port=0) as old:
+        port = old.port
+        with flight.FlightClient(old.location) as client:
+            handle = call(client, "vane.session.open")["result"]
+            identity = {key: handle[key] for key in ("server_id", "session_id")}
+    with Server(token=TOKEN, port=port) as new, flight.FlightClient(new.location) as client:
+        assert new.service.server_id != identity["server_id"]
+        for operation in ("renew", "close"):
+            assert call(client, "vane.session." + operation, identity)["error"]["code"] == "SERVER_CHANGED"
+        for operation in ("status", "cancel", "finish", "close"):
+            reply = call(client, "vane.query." + operation, {**identity, "query_id": 1})
+            assert reply["error"]["code"] == "SERVER_CHANGED"
+        reply = call(client, "vane.query.execute", {**identity, "sequence": 1, "sql": "select 42"})
+        assert reply["error"]["code"] == "SERVER_CHANGED"
+        assert new.service.snapshot()["sessions"] == 0
+        assert new.service.snapshot()["queries"] == 0
+        assert call(client, "vane.session.open")["ok"]
+
+
 def test_shutdown_wait_is_bounded_and_retries_the_same_attempt(server, monkeypatch):
     original = server._flight.shutdown
     entered, proceed = threading.Event(), threading.Event()

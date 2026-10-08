@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.real_ray, pytest.mark.usefixtures("ray_local")]
 
 @pytest.mark.ray_fault
 @pytest.mark.timeout(300)
-def test_ray_benchmark_checks_both_profiles_and_recovery_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interface", benchmark.INTERFACES)
+def test_ray_benchmark_checks_both_profiles_and_recovery_evidence(tmp_path, monkeypatch, interface):
     from vane.execution.recovery_runtime import RecoveryScheduler
 
     # Hold the mixed scan's first batch until FTE is dispatched. This tests
@@ -51,6 +52,7 @@ def test_ray_benchmark_checks_both_profiles_and_recovery_evidence(tmp_path, monk
         repetitions=1,
         modes=("pipelined", "fte"),
         consumer_rows_per_second=512,
+        interface=interface,
     )
     report = benchmark.run(config)
     assert report["complete"]
@@ -84,13 +86,20 @@ def test_ray_benchmark_checks_both_profiles_and_recovery_evidence(tmp_path, monk
         }
     assert len(report["validated"]) == 16
     assert len(snapshots) == 4
-    assert all(s["diagnostics"]["session_resources"]["result_delivery"]["usage_bytes"] > 0 for s in snapshots)
+    if interface == "flight":
+        assert all(s["client_resources"]["exported_bytes"] > 0 and s["gateway_links"] == 1 for s in snapshots)
+        assert all(
+            s["server_diagnostics"]["session_resources"]["result_delivery"]["usage_bytes"] == 0 for s in snapshots
+        )
+    else:
+        assert all(s["diagnostics"]["session_resources"]["result_delivery"]["usage_bytes"] > 0 for s in snapshots)
     assert json.loads((config.output / "report.json").read_text())["complete"]
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("case", ["serial", "failure"])
-def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, monkeypatch, case):
+@pytest.mark.parametrize("interface", benchmark.INTERFACES)
+def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, monkeypatch, case, interface):
     from vane.execution.pipelined_runtime import PipelinedContext
     from vane.execution.recovery_runtime import RecoveryScheduler
 
@@ -102,6 +111,7 @@ def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, mo
         modes=("pipelined", "fte"),
         scenarios=("mixed",),
         consumer_rows_per_second=1 if case == "failure" else 50_000,
+        interface=interface,
     )
     mixed_started, scan_finished = threading.Event(), threading.Event()
     fault = {}

@@ -17,6 +17,7 @@ import json
 import math
 import os
 import platform
+import secrets
 import statistics
 import subprocess
 import sys
@@ -40,6 +41,7 @@ import vane
 MODES = ("local", "pipelined", "fte")
 PROFILES = ("default", "compact")
 SCENARIOS = ("cold", "warm", "slow", "mixed", "recovery")
+INTERFACES = ("runtime", "flight")
 
 
 @dataclass(frozen=True)
@@ -58,8 +60,11 @@ class Configuration:
     modes: tuple[str, ...] = MODES
     profiles: tuple[str, ...] = PROFILES
     scenarios: tuple[str, ...] = SCENARIOS
+    interface: str = "runtime"
 
     def __post_init__(self):
+        if self.interface not in INTERFACES:
+            raise ValueError(f"interface must be one of {INTERFACES}")
         for name in ("rows", "repetitions", "warmups", "worker_count", "worker_threads", "partitions", "batch_rows"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -188,9 +193,73 @@ def connect(config, profile):
     if profile == "local":
         with vane.connect(backend="local", resources=limits, config=settings) as connection:
             yield connection
+    elif config.interface == "flight":
+        from vane.server import Server
+
+        token = secrets.token_urlsafe(48)
+        with (
+            Server(
+                token=token,
+                port=0,
+                resources=limits,
+                config=settings,
+            ) as server,
+            FlightConnection(server, token) as connection,
+        ):
+            yield connection
     else:
         with vane.Runtime(limits) as application, application.connect(config=settings) as connection:
             yield connection
+
+
+class FlightConnection:
+    """Benchmark adapter; SQL and every result batch use the public client.
+
+    The colocated server is observed only for identities, fault injection and
+    post-sample accounting. Each cursor creates another remote session on the
+    same service, so mixed-mode samples exercise cross-session sharing.
+    """
+
+    def __init__(self, server, token):
+        from vane.client import Client
+
+        self.server, self.token = server, token
+        self.client = Client(server.location, token=token)
+        self.session = server.service._sessions[self.client.identity["session_id"]]
+        self.query_runtime = self.session.owner
+        self.queries = {}
+
+    def query(self, *args, **kwargs):
+        result = self.client.query(*args, **kwargs)
+        with self.server.service._condition:
+            self.queries[result.query_id] = self.session.queries[int(result.query_id)]
+        return result
+
+    def execution_query_id(self, result):
+        # Client sequence numbers are session-local and are not worker IDs.
+        return self.queries[result.query_id].context.query_id
+
+    def cursor(self):
+        return FlightConnection(self.server, self.token)
+
+    def interrupt(self):
+        from vane.execution.server_session import SessionError
+
+        with self.client._lock:
+            queries = tuple(self.client._queries.values())
+        for query in queries:
+            try:
+                query.cancel()
+            except SessionError as error:
+                # The reader can close a handle after the snapshot above.
+                if error.code != "QUERY_RETIRED":
+                    raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.client.close()
 
 
 def close_result(result):
@@ -229,6 +298,16 @@ def idle(connection):
         for store in runtime.stores.values():
             if store.snapshot() != {"queries": 0, "reserved_bytes": 0}:
                 raise AssertionError("store retained a query reservation")
+    if isinstance(connection, FlightConnection):
+        delivery = connection.client.resource_snapshot()
+        if any(delivery[n] for n in ("active_results", "usage_bytes", "buffers", "cleanup_pending_results")):
+            raise AssertionError(f"client results did not retire: {delivery}")
+        if connection.server.service.snapshot()["queries"] or connection.server._gateway.active_links:
+            raise AssertionError("server retained query handles or gateway capabilities")
+        service = connection.server.service.runtime.resource_snapshot()["service"]
+        if service["result_service"]["active_contexts"] or service["result_delivery"]["active_results"]:
+            raise AssertionError(f"server retained results: {service}")
+        connection.queries.clear()
     return state
 
 
@@ -255,7 +334,8 @@ def consumer_pause(result, seconds, deadline, stop):
         now = time.monotonic()
         if now >= deadline:
             raise ResultDeliveryTimeout("benchmark result delivery deadline exceeded")
-        result.context.check()
+        if result.context is not None:
+            result.context.check()
         remaining = until - time.monotonic()
         if remaining <= 0:
             return
@@ -306,11 +386,15 @@ def measure(connection, workload, config, mode, expected, *, paced=False, ready=
             raise AssertionError(f"timed row count differs: {rows} != {expected.num_rows}")
         if not workload.streaming:
             compare(workload, expected, pa.Table.from_pylist(captured, schema=expected.schema))
-        if result.execution_state != "SUCCEEDED":
+        if result.completion_status not in {"ok", "empty"} or (
+            result.context is not None and result.execution_state != "SUCCEEDED"
+        ):
             raise AssertionError(f"query did not succeed: {result.execution_state}")
         seconds = ended - start
         return {
-            "query_id": result.query_id,
+            "query_id": connection.execution_query_id(result)
+            if isinstance(connection, FlightConnection)
+            else result.query_id,
             "started_at_monotonic": start,
             "query_return_seconds": returned - start,
             "first_batch_seconds": first - start if first is not None else None,
@@ -535,7 +619,13 @@ def metadata(config):
         "commit": revision,
         "git_dirty": dirty,
         "clock": "perf_counter; p95 uses nearest rank; warmups excluded from summaries",
-        "cold_boundary": "new session and worker pool; Ray startup recorded separately; OS caches not cleared",
+        "cold_boundary": (
+            "new server, Flight listeners, client session and worker pool"
+            if config.interface == "flight"
+            else "new Runtime, session and worker pool"
+        )
+        + "; Ray startup recorded separately; OS caches not cleared",
+        "client_placement": "same process, real loopback Flight RPCs" if config.interface == "flight" else "embedded",
     }
 
 
@@ -658,13 +748,13 @@ def profile_samples(connection, config, profile, modes, workloads, expected, rec
                             long_query.result()
                         if time.monotonic() >= deadline:
                             raise TimeoutError("mixed scan did not deliver its first batch")
-                    _, short_result = recorder.sample(
+                    short_sample, _ = recorder.sample(
                         recovery, cases["aggregate"], "fte", profile, "mixed", iteration, expected["aggregate"]
                     )
-                    _, long_result = long_query.result(timeout=config.deadline)
-                    evidence.update(pipelined_query_id=long_result.query_id, fte_query_id=short_result.query_id)
+                    long_sample, _ = long_query.result(timeout=config.deadline)
+                    evidence.update(pipelined_query_id=long_sample["query_id"], fte_query_id=short_sample["query_id"])
                     evidence["max_shared_worker_overlap_seconds"] = mixed_overlap(
-                        evidence["worker_reservations"], long_result.query_id, short_result.query_id
+                        evidence["worker_reservations"], long_sample["query_id"], short_sample["query_id"]
                     )
                     if evidence["max_shared_worker_overlap_seconds"] <= 0:
                         raise AssertionError(
@@ -707,6 +797,15 @@ def profile_samples(connection, config, profile, modes, workloads, expected, rec
                     "mode": mode,
                     "retained_batch_rows": batch.num_rows if batch is not None else 0,
                     "diagnostics": result.diagnostics(),
+                    **(
+                        {
+                            "server_diagnostics": connection.queries[result.query_id].context.diagnostics(),
+                            "client_resources": connection.client.resource_snapshot(),
+                            "gateway_links": connection.server._gateway.active_links,
+                        }
+                        if isinstance(connection, FlightConnection)
+                        else {}
+                    ),
                 }
             )
         finally:
@@ -806,6 +905,7 @@ def main(argv=None):
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
+    parser.add_argument("--interface", choices=INTERFACES, default="runtime")
     args = vars(parser.parse_args(argv))
     args["output"] = args["output"].resolve()
     try:

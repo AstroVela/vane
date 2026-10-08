@@ -72,6 +72,7 @@ release_tests=(
   "$project_root/tests/fast/test_ray_server_sessions.py"
   "$project_root/tests/fast/test_server_queries.py"
   "$project_root/tests/fast/test_ray_server_queries.py"
+  "$project_root/tests/fast/test_ray_server_acceptance.py"
   "$project_root/tests/fast/test_server_cli.py"
   "$project_root/tests/fast/test_result_service.py"
   "$project_root/tests/fast/test_ray_test_profile.py"

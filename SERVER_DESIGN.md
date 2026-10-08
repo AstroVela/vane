@@ -129,8 +129,10 @@ with Client("grpc+tls://vane.example:8815", token=token, tls_root_certs=ca_pem) 
 - 杀客户端、取消正在创建的会话、丢弃 Execute 回执、停止心跳，验证无孤儿会话、查询、worker context 或 store lease。
 - 慢客户端、结果服务丢失、worker 暂时不可达和永久死亡，验证错误保留、有限内存、配额隔离与清理重试。
 - Server 重启产生新 server_id；旧句柄明确失败。本阶段不提供跨 Server 重启恢复 Session 或透明重放 SQL。
-- 混跑 pipelined / FTE，通过实际 worker 执行区间检查并发；更新当前 Runtime 的基准。历史 Flight 超时仍需独立定位。
+- 混跑 pipelined / FTE，通过同一 worker 的实际资源占用区间检查并发；这证明同时占用已准入资源，不等同于 CPU 同时执行。基准显式区分 Runtime 与 Flight，后者使用同进程回环客户端，两种入口共享同一数据集、预算和正确性检查。历史 Flight 超时仍需独立定位。
 - DuckDB 2.0 升级时，针对 Quack 原生 SQL 执行、结果编码、取消和断连做专项集成，复用本设计的服务所有权测试；协议替换不承担旧客户端兼容或 fallback。
+
+完整故障矩阵、单机部署验收边界与复现命令见[执行验收](EXECUTION_ACCEPTANCE.md#remote-server-acceptance)。性能对照命令见[执行基准](EXECUTION_BENCHMARKS.md#shared-runtime-and-flight-comparison)。真实网络分区、多机部署、Server 被强杀后的运维恢复及跨平台 release gate 不属于本轮单机验证；Server 重启后旧身份失效，不自动重放。
 
 ## 验证顺序
 

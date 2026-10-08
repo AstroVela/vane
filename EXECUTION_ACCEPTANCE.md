@@ -120,3 +120,48 @@ the historical timeout.
 The subsequent [execution benchmark](EXECUTION_BENCHMARKS.md) measures startup,
 warm execution, slow clients, mixed modes and recovery with explicit boundaries.
 CUDA/model UDF acceptance and multi-node deployment qualification remain separate.
+
+## Remote server acceptance
+
+P5.2.4c exercises the public Flight client against the same shared Runtime. Run
+these related modules with the installed wheel; the CLI tests own their clusters
+and must run in a separate process:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_flight_server.py tests/fast/test_server_sessions.py tests/fast/test_server_queries.py tests/fast/test_execution_benchmark.py
+scripts/run_installed_pytest.sh tests/fast/test_ray_server_acceptance.py tests/fast/test_ray_server_queries.py tests/fast/test_ray_server_sessions.py tests/fast/test_ray_execution_benchmark.py
+scripts/run_installed_pytest.sh tests/fast/test_server_cli.py tests/fast/test_execution_benchmark_cli.py
+```
+
+The remote failure matrix checks these ownership boundaries:
+
+| Event | Evidence required |
+|---|---|
+| Kill a separate client process during admission or streaming, in both modes | Actual session lease expires; query admission, worker reservations, gateway capabilities and FTE store reservations disappear; another session and the shared workers remain usable |
+| Lose Execute acknowledgement and stop heartbeat | The accepted sequence remains owned until expiry; no new submission or caller close is needed to reclaim it |
+| Cancel an opening session RPC | The late native connection is closed, even though no handle reached the caller |
+| Worker release submission or ObjectRef temporarily fails | Closing session and charged resources survive multiple failures; a fresh release acknowledgement allows cleanup after recovery |
+| Result release ObjectRef temporarily fails | Query/result admission is retained until a fresh RPC succeeds; the persistent result actor remains usable |
+| Kill the result actor | Both resident pipelined and FTE results fail; the service does not silently replace it or report successful delivery |
+| Kill a pipelined worker after delivery starts | The public reader fails; remaining results are not presented as a complete answer |
+| Kill an FTE worker before downstream commit | Benchmark validates exact values, unchanged input identity and a fresh retry fence |
+| Slow or stalled client | Native receive/gateway window peaks stay within configured bounds; retained Arrow views remain charged; another session can finish |
+| Restart on the same control address | A new server ID rejects all old session/query controls and Execute requests without reserving new owners |
+
+Failure injection uses real Ray actors and real ObjectRefs. Transient RPC tests
+control the acknowledgement path; they do not simulate a network partition or
+prove availability during one. Failure cases have watchdogs, and idle assertions
+inspect the coordinator, actual worker actors, result service and store ledgers.
+
+Deployment checks include a separate client without `ray.init()`, the standalone
+CLI's Ray ownership and SIGTERM cleanup, database reopening from another process,
+and wildcard binding with a reachable advertised hostname and verified TLS on
+both public endpoints. This is single-host acceptance. Cross-host networking,
+external certificate lifecycle and abrupt server-process recovery are separate
+deployment qualification; sessions are not recoverable across a server restart.
+
+The [benchmark](EXECUTION_BENCHMARKS.md) has explicit `runtime` and `flight`
+interfaces. Both use the same workload, correctness oracle, worker budgets and
+mixed-mode reservation evidence. Flight timing includes actual control RPCs and
+native result transfer, with the client colocated in the server's process; the
+separate-process correctness tests must not be interpreted as latency samples.
