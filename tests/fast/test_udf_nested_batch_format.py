@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import datetime
-from collections import UserList
+from collections import UserDict, UserList
 
 import numpy as np
 import pyarrow as pa
@@ -80,6 +80,62 @@ def test_nested_struct_fields_are_checked_and_matched_without_case(batch_format,
             _encode(rows, "STRUCT(value BIGINT)[]", batch_format)
     else:
         assert _encode(rows, "STRUCT(value BIGINT)[]", batch_format).to_pylist() == [[{"value": 7}]]
+
+
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+def test_struct_columns_preserve_mixed_rows_and_nested_nulls(batch_format):
+    rows = [
+        None,
+        [],
+        [
+            UserDict({"BBOX": [1.75, None], "LABEL": 7, "Confidence": 0.5}),
+            (9, None, []),
+            None,
+            {"confidence": 0.25, "label": 11, "bbox": None},
+        ],
+    ]
+    result = _encode(rows, "STRUCT(label BIGINT, confidence DOUBLE, bbox BIGINT[])[]", batch_format)
+    assert result.to_pylist() == [
+        None,
+        [],
+        [
+            {"label": 7, "confidence": 0.5, "bbox": [1.75, None]},
+            {"label": 9, "confidence": None, "bbox": []},
+            None,
+            {"label": 11, "confidence": 0.25, "bbox": None},
+        ],
+    ]
+    # Preserve the inferred float leaf for DuckDB's rounding cast to BIGINT.
+    assert result.type.value_type.field("bbox").type == pa.list_(pa.float64())
+
+
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+@pytest.mark.parametrize(
+    "record,error_type,message",
+    [
+        ({"value": 1, "VALUE": 2}, vane.InvalidInputException, "ambiguous"),
+        ({1: 7}, vane.InvalidInputException, "exactly the declared fields"),
+        ({}, vane.InvalidInputException, "exactly the declared fields"),
+        ({"value": 7, "extra": 8}, vane.InvalidInputException, "exactly the declared fields"),
+        ((7, 8), TypeError, "matching positional tuple"),
+        ([7], TypeError, "matching positional tuple"),
+    ],
+)
+def test_struct_column_encoding_rejects_invalid_rows(batch_format, record, error_type, message):
+    with pytest.raises(error_type, match=message):
+        _encode([[record]], "STRUCT(value BIGINT)[]", batch_format)
+
+
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+def test_struct_field_lookup_uses_unicode_casefold(batch_format):
+    rows = [UserDict({"STRASSE": 1, "OTHER": 2}), (3, 4), {"other": 6, "straße": 5}, None]
+    result = _encode(rows, 'STRUCT("straße" BIGINT, other BIGINT)', batch_format)
+    assert result.to_pylist() == [
+        {"straße": 1, "other": 2},
+        {"straße": 3, "other": 4},
+        {"straße": 5, "other": 6},
+        None,
+    ]
 
 
 @pytest.mark.parametrize("batch_format,writable", [("numpy", False), ("numpy", True), ("pandas", False)])
