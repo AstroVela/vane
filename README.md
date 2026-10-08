@@ -84,6 +84,20 @@ See the [execution design and support matrix](PIPELINED_EXECUTION_DESIGN.md) for
 configuration, ownership and unsupported operations. Global runner selection has
 been removed; unsupported distributed queries fail explicitly.
 
+Use a persistent server when clients should submit SQL without joining Ray:
+
+```python
+from vane.client import Client
+
+with Client("grpc+tls://vane.example:8815", token=token, tls_root_certs=ca_pem) as client:
+    with client.query("SELECT sum(range) FROM range(1000)") as result:
+        print(result.collect())
+```
+
+Server startup, both TLS ports and session ownership are described in the
+[server guide](SERVER_DESIGN.md). The [execution release matrix](EXECUTION_RELEASE.md)
+defines this candidate's platforms, supported entry points and failure boundaries.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)

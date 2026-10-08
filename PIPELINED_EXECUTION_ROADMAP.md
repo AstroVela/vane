@@ -22,7 +22,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.4 已完成相关验收；历史 Flight 超时归因及 P5.3 待完成 |
+| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.4、P5.3a 已完成相关验收；历史 Flight 超时归因、P5.3b 与正式发布待完成 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -258,7 +258,8 @@ Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Q
 
 ### P5.3 发布验收
 
-- [ ] 固定支持矩阵和失败边界，完成跨平台 CI 与 release gate。
+- [x] P5.3a：固定支持矩阵与失败边界，增加独立于 checkout 的 local / Runtime / TLS Flight 安装验收，接入每个 manylinux wheel 与 TestPyPI/PyPI 安装验证。详见[执行发布矩阵](EXECUTION_RELEASE.md)。
+- [ ] P5.3b：为候选提交记录 Python/平台 CI、完整 release gate 与 build-only 发布流程证据；macOS / Windows 原生单元测试不能替代 Python 服务验收。
 - [ ] 更新发布文档与版本，按验收结果发布。
 
 本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 的历史 Flight 超时定位及 P5.3 发布验收未完成前不宣称 P5 整体完成。
@@ -593,3 +594,12 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 原生数据/控制连接和公开 Client 均设置 `grpc.enable_http_proxy=0`，直接连接指定端点；不修改进程环境或其他 HTTP 客户端。部署需保证端点直接可达，详见 [Server 设计](SERVER_DESIGN.md)。修复后 9 项代理回归全部通过，包括确实经过代理且超时的原生 Arrow 对照。
 - 连续两轮无待修问题审查后，完成一次增量 Release 构建与非 editable 安装。相关测试 **144 passed、1 skipped**：非 Ray 119、共享 Ray 25；跳过项需要可选 ADBC。覆盖原生传输、操作超时归因、公开控制、远程查询、双端口 TLS 及两种模式的原始/重复长查询期限与清理。210 个 Python/类型文件与源码一致；格式、lint、类型与 CI copyleft 检查通过，未运行完整 release/fast 套件。
 - 本次确认并修复代理停顿造成的超时路径；P5.1 原始故障缺少操作名和代理现场，不能直接认定同因。保留历史归因待办与失败证据采集，P5.3 发布资格仍未完成。
+
+### P5.3a 安装产物验收（2026 年 10 月 9 日）
+
+- 固定 [执行发布矩阵](EXECUTION_RELEASE.md)：Linux x86_64 / CPython 3.10–3.14 的候选 wheel、local / Runtime / Flight 入口和失败边界。macOS / Windows 原生 CI 不等同于 Python 服务资格，多机部署与真实网络分区验收单独记录。
+- 新增可从匹配 sdist 单独解出的 `verify_execution_install.py`，只依赖基础安装与 OpenSSL CLI。用真实 Parquet 校验分组 SUM、TopN、空结果的 schema、顺序与内容，覆盖 local、Runtime 两种模式、TLS Flight 两种模式。独立客户端检查鉴权且不加入 Ray，所有会话与结果关闭后才报告成功。
+- 接入每个 manylinux wheel 和 TestPyPI / PyPI 安装验证，保留 JSON 身份与阶段证据；基础 release launcher 增加独立的 cluster-owner 进程，使安装验收及已有 Server CLI 用例实际进入 gate。sdist 检查要求携带两个独立验收脚本。
+- 连续两轮无待修问题的审查后打包、非 editable 安装。首轮发现 smoke 自设 FTE 配额不足，改用公开默认配置后重新两轮审查、重新打包，仅复跑失败用例及尚未运行的相关检查。执行器、C++ 与资源默认值未改；native SHA-256 保持 `c22f45389513a6b674a5c447f38b1ab5d84c724f19d6af9fb1a15e154305efce`，没有重新编译原生代码。
+- 本机 Linux x86_64 / CPython 3.12 的 `0.3.0.dev106` 验证去重合计 **155 passed、1 skipped**：包/产物相关 153，独立执行安装与 Server CLI 各 1；缺少可选 ADBC 而跳过。实际 sdist / wheel 校验、两个解出脚本与源码逐字节比较及 checkout 外的 Quickstart 均通过；210 个 Python/类型声明文件及 `py.typed` 与安装一致。审查、首轮失败、修正结果与构建身份保存在 `build/execution-release-qualification/`。
+- 未运行完整 release/fast 套件，未触发远端发布流程、打 tag 或上传索引。P5.3b 仍需记录精确候选提交的 Python / 平台 CI、完整 CI release gate 与 build-only 发布证据；历史 Flight 超时归因及正式发布仍待完成。

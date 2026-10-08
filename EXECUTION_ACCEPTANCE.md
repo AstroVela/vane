@@ -6,6 +6,10 @@ then checks repeated query lifecycles on the shared Ray worker pool. The
 measurements separately. This acceptance does not expand the supported SQL or
 type surface.
 
+Artifact-level local, Runtime and TLS Flight smoke tests and platform boundaries
+are described in the [execution release matrix](EXECUTION_RELEASE.md). They
+supplement this deeper acceptance suite for each installed candidate wheel.
+
 ## Reproduce
 
 Use an installed, non-editable wheel matching the checkout, following

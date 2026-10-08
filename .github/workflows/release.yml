@@ -471,7 +471,7 @@ jobs:
           python -m pip install "$indexed_wheel"
           python -m pip check
 
-      - name: Extract the public smoke test from the sdist
+      - name: Extract public smoke tests from the sdist
         run: |
           sdist="$(find release-files -maxdepth 1 -type f -name '*.tar.gz' -print)"
           test -n "$sdist"
@@ -484,12 +484,27 @@ jobs:
             --directory "$RUNNER_TEMP/vane-smoke" \
             --strip-components=2 \
             --wildcards \
-            '*/scripts/verify_base_install.py'
+            '*/scripts/verify_base_install.py' \
+            '*/scripts/verify_execution_install.py'
           test -f "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+          test -f "$RUNNER_TEMP/vane-smoke/verify_execution_install.py"
 
-      - name: Run the public smoke test outside a source checkout
+      - name: Run public smoke tests outside a source checkout
         working-directory: ${{ runner.temp }}
-        run: python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+        timeout-minutes: 6
+        run: |
+          python -I "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+          python -I "$RUNNER_TEMP/vane-smoke/verify_execution_install.py" \
+            --report "$RUNNER_TEMP/execution-smoke.json"
+
+      - name: Upload execution qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: execution-smoke-testpypi
+          path: ${{ runner.temp }}/execution-smoke.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   publish-pypi:
     name: Publish to PyPI
@@ -566,7 +581,7 @@ jobs:
           python -m pip install "$indexed_wheel"
           python -m pip check
 
-      - name: Extract the public smoke test from the sdist
+      - name: Extract public smoke tests from the sdist
         run: |
           sdist="$(find release-files -maxdepth 1 -type f -name '*.tar.gz' -print)"
           test -n "$sdist"
@@ -579,12 +594,27 @@ jobs:
             --directory "$RUNNER_TEMP/vane-smoke" \
             --strip-components=2 \
             --wildcards \
-            '*/scripts/verify_base_install.py'
+            '*/scripts/verify_base_install.py' \
+            '*/scripts/verify_execution_install.py'
           test -f "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+          test -f "$RUNNER_TEMP/vane-smoke/verify_execution_install.py"
 
-      - name: Run the public smoke test outside a source checkout
+      - name: Run public smoke tests outside a source checkout
         working-directory: ${{ runner.temp }}
-        run: python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+        timeout-minutes: 6
+        run: |
+          python -I "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+          python -I "$RUNNER_TEMP/vane-smoke/verify_execution_install.py" \
+            --report "$RUNNER_TEMP/execution-smoke.json"
+
+      - name: Upload execution qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: execution-smoke-pypi
+          path: ${{ runner.temp }}/execution-smoke.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   publish-github-release:
     name: Publish the draft GitHub Release

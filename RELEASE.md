@@ -11,6 +11,12 @@ base release is available. It requires public source-rebuild, library replacemen
 and two-node Ray acceptance before promoting identical media files through
 TestPyPI to PyPI.
 
+The [execution release matrix](EXECUTION_RELEASE.md) defines the current
+local/Runtime/Flight support boundaries and the installed execution smoke gate.
+Each manylinux wheel, and the indexed TestPyPI/PyPI installation, must pass it
+alongside the Quickstart. The standalone script comes from the matching sdist
+and requires the OpenSSL CLI to exercise both public TLS endpoints.
+
 ## Release invariants
 
 - The package version is a valid, previously unused PEP 440 version. Its tag is

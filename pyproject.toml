@@ -231,6 +231,7 @@ include = [
     "/PIPELINED_EXECUTION_ROADMAP.md",
     "/SERVER_DESIGN.md",
     "/EXECUTION_ACCEPTANCE.md",
+    "/EXECUTION_RELEASE.md",
     "/EXECUTION_BENCHMARKS.md",
     "/LOCAL_SERVING_ACCEPTANCE.md",
     "/DISTRIBUTED_EXTENSIONS.md",
@@ -279,6 +280,7 @@ include = [
     "/scripts/sync_vcpkg_licenses.py",
     "/scripts/validate_testpypi_candidate.py",
     "/scripts/verify_base_install.py",
+    "/scripts/verify_execution_install.py",
     "/scripts/verify_duckdb_coexistence.py",
     "/scripts/verify_extension_wheel.py",
 
@@ -315,6 +317,7 @@ include = [
     "/tests/fast/test_execution_fragment_graph.py",
     "/tests/fast/test_execution_submission.py",
     "/tests/fast/test_execution_cutover.py",
+    "/tests/fast/test_execution_install.py",
     "/tests/fast/test_execution_acceptance.py",
     "/tests/fast/test_ray_execution_acceptance.py",
     "/tests/fast/test_execution_benchmark.py",
@@ -802,7 +805,10 @@ build-frontend = "build[uv]"
 build-verbosity = 1
 manylinux-x86_64-image = "manylinux_2_28"
 skip = "*-musllinux*"
-test-command = "env -u VANE_RUNNER python {project}/scripts/verify_base_install.py"
+test-command = [
+    "python -I {project}/scripts/verify_base_install.py",
+    "python -I {project}/scripts/verify_execution_install.py",
+]
 test-requires = [
     "cloudpickle>=3.1.2,<4",
     "numpy",
@@ -812,7 +818,7 @@ test-requires = [
 
 [tool.cibuildwheel.linux]
 before-all = [
-    "yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip",
+    "yum install -y autoconf automake bison ccache curl flex git libtool make openssl perl pkgconfig tar unzip which zip",
     # AlmaLinux 8 ships Bison 3.0.4, while Thrift 0.23 requires --file-prefix-map.
     "bash {package}/scripts/bootstrap_manylinux_bison.sh",
     "bash {package}/scripts/bootstrap_vcpkg.sh {package}",
