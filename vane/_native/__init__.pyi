@@ -46,6 +46,7 @@ if typing.TYPE_CHECKING:
     from vane.execution.query_options import QueryExecutionOptions
     from vane.execution.query_runtime import QueryResources, QueryRuntime
     from vane.execution.pipelined_plan import RayResources
+    from vane.execution.runtime import Runtime
     from vane.execution.request_admission import RequestAdmissionLimits
     from vane.execution.resources import ResourceVector
     from vane.execution.result_delivery import QueryResult, ResultDeliveryLimits
@@ -1576,7 +1577,8 @@ def connect(
     config: dict[str, str | bool | int | float | lst[str]] | None = None,
     *,
     backend: typing.Literal["local", "ray"] = ...,
-    resources: QueryResources | RayResources | None = None,
+    resources: QueryResources | None = None,
+    runtime: Runtime | None = None,
     **options: typing.Any,
 ) -> DuckDBPyConnection: ...
 def cursor(*, connection: DuckDBPyConnection | None = None) -> DuckDBPyConnection: ...

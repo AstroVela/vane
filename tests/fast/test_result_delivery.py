@@ -816,3 +816,34 @@ def test_queued_request_termination_and_duplicate_calls_never_reserve_result_cap
             finally:
                 queued.cancel()
                 ready.cancel()
+
+
+def test_scoped_result_slots_bytes_and_close_are_isolated():
+    service = registry(results=2, size=64)
+    first = RuntimeResultDelivery(ResultDeliveryLimits(1, 64), parent=service)
+    second = RuntimeResultDelivery(ResultDeliveryLimits(2, 48), parent=service)
+    a, b = first.begin(), second.begin()
+    payload_a = Payload(a, size=32)
+    Payload(b, size=32)
+    with pytest.raises(ResultDeliveryFull) as error:
+        second.begin()
+    assert error.value.limit == 2
+    with pytest.raises(ResultDeliveryFull) as error:
+        Payload(b, size=1)
+    assert error.value.limit == 64
+    a.ready(delivery_timeout=None)
+    b.ready(delivery_timeout=None)
+    first.close()
+    assert payload_a.owner is None
+    assert second.snapshot()["active_results"] == service.snapshot()["active_results"] == 1
+    assert b.take() == "value"
+    b.close()
+    c = second.begin()
+    with pytest.raises(ResultDeliveryFull) as error:
+        Payload(c, size=49)
+    assert error.value.limit == 48
+    c.abort_preparation()
+    assert service.snapshot()["usage_bytes"] == 0
+    service.close()
+    with pytest.raises(ResultDeliveryClosed):
+        second.begin()

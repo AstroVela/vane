@@ -25,12 +25,13 @@ def assert_idle(connection):
     runtime = connection.query_runtime
     assert runtime.resource_snapshot()["queries"] == {}
     assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+    assert runtime.resource_snapshot()["result_service"]["active_contexts"] == 0
     for worker in runtime.pool.workers:
         assert ray.get(worker.resources_snapshot.remote())["reservations"] == {}
 
 
 def test_two_worker_public_query_and_empty_result():
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         with connection.query("select range as value from range(20)", rows_per_batch=2) as result:
             assert isinstance(result, vane.QueryResult)
             first = result.read_batch()
@@ -51,7 +52,7 @@ def test_two_worker_public_query_and_empty_result():
 def test_slow_client_backpressure_and_early_close():
     import ray
 
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         result = connection.query("select range as value from range(1000000)")
         first = result.read_batch()
         assert first.num_rows > 0
@@ -78,7 +79,7 @@ def test_slow_client_backpressure_and_early_close():
 def test_process_loss_after_partial_delivery(victim):
     import ray
 
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         result = connection.query("select range from range(1000000)")
         first = result.read_batch()
         del first
@@ -95,10 +96,12 @@ def test_process_loss_after_partial_delivery(victim):
 
 
 def test_group_capacity_failure_rolls_back_before_start():
-    with vane.connect(backend="ray", resources=resources(io_concurrency=2)) as connection:
+    with vane.Runtime(resources(io_concurrency=2)) as application, application.connect() as connection:
         with pytest.raises(Exception, match="capacity"):
             connection.query("select range from range(20)")
         assert len(connection.query_runtime.pool.workers) == 2
+        assert_idle(connection)
+        assert connection.query("select 42").collect().column(0).to_pylist() == [42]
         assert_idle(connection)
 
 
@@ -106,7 +109,7 @@ def test_interrupt_and_delivery_timeout():
     from vane.execution.request_admission import RequestCancelled
     from vane.execution.result_delivery import ResultDeliveryTimeout
 
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         result = connection.query("select range from range(1000000)")
         batch = result.read_batch()
         del batch
@@ -138,7 +141,7 @@ def test_native_hash_routing_and_parquet(tmp_path, monkeypatch):
         return prepare(*args, **kwargs)
 
     monkeypatch.setattr(pipelined_runtime, "prepare_ray_query", hash_plan)
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         with connection.query(f"select k, v from read_parquet('{source}') where k > 2") as result:
             actual = result.collect().to_pylist()
         assert sorted((row["k"], row["v"]) for row in actual) == sorted(
@@ -151,7 +154,7 @@ def test_native_hash_routing_and_parquet(tmp_path, monkeypatch):
 def test_completed_production_survives_execution_deadline(monkeypatch, poll_status):
     from vane.execution.pipelined_runtime import PipelinedScheduler
 
-    with vane.connect(backend="ray", resources=resources()) as connection:
+    with vane.Runtime(resources()) as application, application.connect() as connection:
         connection.query("select 1").collect()  # Warm up the fixed worker pool.
         if not poll_status:
             monkeypatch.setattr(PipelinedScheduler, "_monitor", lambda owner: owner.stop.wait())
@@ -172,7 +175,8 @@ def test_execution_timeout_and_shared_session_admission():
     from vane.execution.request_admission import RequestExecutionTimeout, RequestQueueTimeout
 
     with (
-        vane.connect(backend="ray", resources=resources(max_active_queries=1)) as connection,
+        vane.Runtime(resources(max_active_queries=1)) as application,
+        application.connect() as connection,
         connection.cursor() as cursor,
     ):
         connection.query("select 1").collect()
@@ -195,7 +199,7 @@ def test_failure_wakes_client_waiting_for_result_capacity():
 
     import ray
 
-    with vane.connect(backend="ray", resources=resources(result_buffer_bytes=512)) as connection:
+    with vane.Runtime(resources(result_buffer_bytes=512)) as application, application.connect() as connection:
         result = connection.query("select range from range(1000000)")
         first = result.read_batch()
         expected = first.column(0).to_pylist()
@@ -227,7 +231,7 @@ def test_long_native_filter_uses_execution_deadline(execution_timeout):
     limits = vane.RayResources(worker_count=1, partitions=1, max_active_queries=1)
     options = vane.QueryExecutionOptions(vane.RayExecution(), 30, execution_timeout, 60)
     sql = "select range from range(30000) where hash(upper('" + "ß" * 16000 + "' || range::varchar)) = 0"
-    with vane.connect(backend="ray", resources=limits) as connection:
+    with vane.Runtime(limits) as application, application.connect() as connection:
         connection.query("select 1").collect()  # Exclude actor startup from the execution deadline.
         if execution_timeout == 60:
             with connection.query(sql, options=options) as result:

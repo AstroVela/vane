@@ -458,3 +458,48 @@ def test_metadata_reservation_and_claim_are_serialized_with_drain():
         runtime.close()
     lease.release()
     runtime.close()
+
+
+def test_scoped_admission_has_one_global_queue_and_skips_full_sessions():
+    service = RuntimeRequestAdmission(RequestAdmissionLimits(2, 2))
+    first = service.scope(RequestAdmissionLimits(1, 2))
+    second = service.scope(RequestAdmissionLimits(1, 2))
+    lease = first.request().take()
+    waiting = first.request()
+    assert waiting.state == "queued"
+    other = second.request().take()
+    assert service.snapshot()["active_requests"] == 2
+    last = second.request()
+    with pytest.raises(RequestQueueFull):
+        first.request()
+    other.release()
+    assert last.state == "ready"  # The first session remains at its own limit.
+    first.drain()
+    with pytest.raises(RequestCancelled):
+        waiting.take()
+    assert last.state == "ready"
+    last.take().release()
+    lease.release()
+    first.close()
+    second.close()
+    service.close()
+
+
+def test_scoped_deadline_and_cancel_release_global_queue_capacity(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    service = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    first = service.scope(RequestAdmissionLimits(1, 1))
+    second = service.scope(RequestAdmissionLimits(1, 1))
+    lease = first.request().take()
+    expired = second.request(queue_timeout=2)
+    now[0] = 12
+    with pytest.raises(RequestQueueTimeout):
+        expired.take()
+    cancelled = second.request()
+    assert cancelled.cancel()
+    waiting = second.request()
+    lease.release()
+    waiting.take().release()
+    assert service.snapshot()["queued_requests"] == 0
+    service.close()

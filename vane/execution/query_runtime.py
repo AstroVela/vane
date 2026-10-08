@@ -12,10 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from vane.execution.batch_lease import BatchLease
+from vane.execution.cleanup_deadline import cleanup_timeout
 from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.query_options import LocalExecution, QueryExecutionOptions
 from vane.execution.request_admission import (
     RequestAdmissionLimits,
+    RequestAdmissionScope,
     RequestCancellationReason,
     RequestCancelled,
     RequestTicket,
@@ -166,7 +168,9 @@ class QueryContext:
 
     def _cancel(self, reason: RequestCancellationReason) -> bool:
         with self._lock:
-            if self._done:
+            # Failure cleanup can interrupt a still-published connection.
+            # That wakeup must not replace an already recorded failure.
+            if self._done or self._state == "FAILED":
                 return False
             if reason == "admission_timeout" and (
                 self._admission_deadline is None or not self._admission_deadline.expired()
@@ -321,7 +325,7 @@ class QueryRuntime:
         if not isinstance(resources, QueryResources):
             raise TypeError("resources must be QueryResources")
         self.resources = resources
-        self._admission = RuntimeRequestAdmission(
+        self._admission: RuntimeRequestAdmission | RequestAdmissionScope = RuntimeRequestAdmission(
             RequestAdmissionLimits(resources.max_active_queries, resources.max_queued_queries)
         )
         self._delivery = RuntimeResultDelivery(
@@ -402,5 +406,5 @@ class QueryRuntime:
 
     def close(self, *, timeout: float = 5.0) -> None:
         self.drain()
-        self._delivery.close(timeout=timeout)
-        self._admission.close(timeout=timeout)
+        self._delivery.close(timeout=cleanup_timeout(timeout))
+        self._admission.close(timeout=cleanup_timeout(timeout))

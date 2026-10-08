@@ -12,13 +12,13 @@ _WHEN_CLAUSES = [
 ]
 
 
-def _merge_connection(database, *, backend="local"):
+def _merge_connection(database, *, application=None):
     with vane.connect(str(database)) as connection:
         connection.execute("CREATE TABLE merge_target (id INTEGER PRIMARY KEY, value VARCHAR)")
         connection.execute("INSERT INTO merge_target VALUES (1, 'old'), (3, 'keep')")
         connection.execute("CREATE TABLE merge_source (id INTEGER, value VARCHAR)")
         connection.execute("INSERT INTO merge_source VALUES (1, 'new'), (2, 'inserted')")
-    return vane.connect(str(database), backend=backend)
+    return vane.connect(str(database)) if application is None else application.connect(str(database))
 
 
 def _merge(source, **kwargs):
@@ -145,7 +145,7 @@ def test_merge_relation_accepts_sql_comments_after_when(tmp_path):
 
 def test_merge_relation_rejects_ray_backend(tmp_path):
     database = tmp_path / "merge.duckdb"
-    with _merge_connection(database, backend="ray") as connection:
+    with vane.Runtime() as application, _merge_connection(database, application=application) as connection:
         with pytest.raises(vane.NotImplementedException, match="require backend='local'"):
             _merge(connection.table("merge_source"))
     with vane.connect(str(database)) as connection:

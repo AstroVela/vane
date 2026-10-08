@@ -36,6 +36,36 @@ def _channel(schema: bytes, resources: RayResources, producer: str, consumer: st
     return channel
 
 
+class _RetiredCalls:
+    """Fence delayed creation RPCs; adjacent retirements share one range.
+
+    Callers issue consecutive sequence numbers per actor epoch. Gaps therefore
+    belong to outstanding calls, rather than retaining every historical query.
+    Access is serialized by the actor's registry lock.
+    """
+
+    def __init__(self) -> None:
+        self.ranges: list[tuple[int, int]] = []
+
+    def check(self, sequence: int) -> None:
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("invalid lifecycle call sequence")
+        if any(start <= sequence <= end for start, end in self.ranges):
+            raise RuntimeError("creation call was already retired")
+
+    def retire(self, sequence: int) -> None:
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("invalid lifecycle call sequence")
+        lower = upper = sequence
+        remaining = []
+        for start, end in self.ranges:
+            if end < lower - 1 or start > upper + 1:
+                remaining.append((start, end))
+            else:
+                lower, upper = min(lower, start), max(upper, end)
+        self.ranges = sorted([*remaining, (lower, upper)])
+
+
 class _Query:
     def __init__(
         self,
@@ -243,6 +273,7 @@ class PipelinedWorker:
         self.queries: dict[str, _Query] = {}
         self.attempts: dict[str, Any] = {}
         self.reservations: dict[str, dict[str, int]] = {}
+        self.retired = _RetiredCalls()
         with vane.connect(backend="local") as connection:
             self.engine = native_plan_capabilities(connection).engine_identity
 
@@ -261,6 +292,7 @@ class PipelinedWorker:
         tasks: list[str],
         routes: list[dict[str, Any]],
         frame_rows: int,
+        sequence: int,
     ) -> str:
 
         self._check(epoch)
@@ -272,6 +304,7 @@ class PipelinedWorker:
         reservation = pipelined_demand(self.resources, index, tasks, routes)
         capacity = worker_capacity(self.resources)
         with self.lock:
+            self.retired.check(sequence)
             if spec.query_id in self.reservations:
                 raise ValueError("query already prepared")
             for name, amount in reservation.items():
@@ -286,7 +319,7 @@ class PipelinedWorker:
             return str(query.flight.location)
         except BaseException as primary:
             try:
-                self.release(epoch, spec.query_id)
+                self.release(epoch, spec.query_id, sequence)
             except BaseException as cleanup:
                 # Retain the registered owner and its reservation for release retry.
                 raise primary from cleanup
@@ -323,9 +356,10 @@ class PipelinedWorker:
         if owner is not None:
             owner.cancel(reason)
 
-    def release(self, epoch: str, query: str) -> None:
+    def release(self, epoch: str, query: str, sequence: int) -> None:
         self._check(epoch)
         with self.lock:
+            self.retired.retire(sequence)
             owner = self.queries.get(query)
         if owner is not None:
             owner.close()
@@ -359,6 +393,7 @@ class PipelinedWorker:
         reserved: dict[str, Any],
         lease: dict[str, Any],
         frame_rows: int,
+        sequence: int,
     ) -> None:
         from pathlib import Path
 
@@ -407,10 +442,11 @@ class PipelinedWorker:
         def orphan() -> None:
             from vane.execution.fte_store import StorePool
 
-            self.release_materialized(epoch, key)
+            self.release_materialized(epoch, key, sequence)
             StorePool(registered).collect_expired()
 
         with self.lock:
+            self.retired.check(sequence)
             if key in self.reservations:
                 raise ValueError("attempt already prepared")
             if any(
@@ -425,7 +461,7 @@ class PipelinedWorker:
             owner.prepare(demand["operator"])
         except BaseException as primary:
             try:
-                self.release_materialized(epoch, key)
+                self.release_materialized(epoch, key, sequence)
             except BaseException as cleanup:
                 raise primary from cleanup
             raise
@@ -443,9 +479,10 @@ class PipelinedWorker:
         if owner is not None:
             owner.cancel(reason)
 
-    def release_materialized(self, epoch: str, key: str) -> None:
+    def release_materialized(self, epoch: str, key: str, sequence: int) -> None:
         self._check(epoch)
         with self.lock:
+            self.retired.retire(sequence)
             owner = self.attempts.get(key)
         if owner is not None:
             owner.close()
@@ -455,11 +492,11 @@ class PipelinedWorker:
                 self.reservations.pop(key, None)
 
 
-class ResultService:
-    """A reachable native relay with independently bounded upstream/client windows."""
+class ResultContext:
+    """One query's native relay and storage lifetime in a persistent service."""
 
-    def __init__(self, resources: RayResources) -> None:
-        self.epoch = uuid.uuid4().hex
+    def __init__(self, query_id: str, resources: RayResources) -> None:
+        self.query_id = query_id
         self.resources = resources
         self.channel: Any = None
         self.flight: Any = None
@@ -470,32 +507,33 @@ class ResultService:
         self.lifecycle = threading.RLock()
         self.watchdog: threading.Thread | None = None
 
-    def describe(self) -> str:
-        return self.epoch
-
-    def prepare(self, epoch: str, schema: bytes, ticket: str) -> str:
+    def prepare(self, query_id: str, schema: bytes, ticket: str) -> str:
         from vane._native import execution_runtime as native
 
-        if epoch != self.epoch or self.flight is not None:
-            raise RuntimeError("invalid result service epoch or duplicate preparation")
-        self.schema = schema
-        self.channel = _channel(schema, self.resources, "root", "client")
-        self.flight = native.DirectFlight(
-            "0.0.0.0",
-            _host(),
-            2,
-            2 * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
-            self.resources.exchange.frame_bytes,
-        )
-        self.flight.publish(ticket, self.channel, "client")
-        return str(self.flight.location)
+        with self.lifecycle:
+            if query_id != self.query_id or self.flight is not None or self.stop.is_set():
+                raise RuntimeError("invalid result context or duplicate preparation")
+            self.schema = schema
+            self.channel = _channel(schema, self.resources, "root", "client")
+            self.flight = native.DirectFlight(
+                "0.0.0.0",
+                _host(),
+                2,
+                2 * native.DirectFlight.staging_per_link(self.resources.exchange.frame_bytes),
+                self.resources.exchange.frame_bytes,
+            )
+            self.flight.publish(ticket, self.channel, "client")
+            return str(self.flight.location)
 
     def connect(self, location: str, ticket: str, timeout: float) -> None:
-        self.flight.subscribe(location, ticket, self.channel, "root", timeout)
+        with self.lifecycle:
+            if self.stop.is_set():
+                raise RuntimeError("result service is canceled")
+            self.flight.subscribe(location, ticket, self.channel, "root", timeout)
 
     def status(self) -> dict[str, Any]:
         return {
-            "epoch": self.epoch,
+            "query_id": self.query_id,
             "channel": self.channel.snapshot(),
             "error": self.flight.error or (self.materialized.status()["error"] if self.materialized else ""),
             "ready": self.flight.ready,
@@ -517,8 +555,12 @@ class ResultService:
                 self.flight.close()
             if self.store_lease is not None:
                 self.store_lease.close()
+        if self.watchdog is not None and self.watchdog is not threading.current_thread():
+            self.watchdog.join(timeout=5)
+            if self.watchdog.is_alive():
+                raise RuntimeError("result service watchdog cleanup is pending")
 
-    def connect_materialized(self, epoch: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+    def connect_materialized(self, query_id: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
         import json
 
         from vane._native import execution_plan
@@ -527,9 +569,11 @@ class ResultService:
         from vane.execution.materialized_exchange import ResultManifest
 
         with self.lifecycle:
-            if epoch != self.epoch or self.materialized is not None or self.stop.is_set():
+            if query_id != self.query_id or self.materialized is not None or self.stop.is_set():
                 raise RuntimeError("result service no longer accepts a manifest")
             result = ResultManifest.from_dict(manifest)
+            if result.stage.query_id != self.query_id:
+                raise ValueError("result manifest belongs to another query context")
             if (
                 result.stage.engine_identity != execution_plan.engine_identity()
                 or result.output.output.schema != self.schema
@@ -568,3 +612,60 @@ class ResultService:
                 self.release()
                 return
             self.stop.wait(min(0.5, value["seconds"] / 4))
+
+
+class ResultService:
+    """Persistent service hosting independent result contexts for many sessions."""
+
+    def __init__(self, max_results: int) -> None:
+        self.lock = threading.Lock()
+        self.max_results = max_results
+        self.contexts: dict[str, ResultContext] = {}
+        self.retired = _RetiredCalls()
+
+    def create(self, query_id: str, resources: RayResources, sequence: int) -> None:
+        with self.lock:
+            self.retired.check(sequence)
+            if query_id in self.contexts:
+                raise RuntimeError("duplicate result context")
+            if len(self.contexts) >= self.max_results:
+                raise RuntimeError("result service capacity is full")
+            self.contexts[query_id] = ResultContext(query_id, resources)
+
+    def _context(self, query_id: str) -> ResultContext:
+        with self.lock:
+            context = self.contexts.get(query_id)
+            if context is None:
+                raise RuntimeError("unknown or closed result context")
+            return context
+
+    def prepare(self, query_id: str, schema: bytes, ticket: str) -> str:
+        return self._context(query_id).prepare(query_id, schema, ticket)
+
+    def connect(self, query_id: str, location: str, ticket: str, timeout: float) -> None:
+        self._context(query_id).connect(location, ticket, timeout)
+
+    def connect_materialized(self, query_id: str, manifest: dict[str, Any], lease: dict[str, Any]) -> None:
+        self._context(query_id).connect_materialized(query_id, manifest, lease)
+
+    def status(self, query_id: str) -> dict[str, Any]:
+        return self._context(query_id).status()
+
+    def cancel(self, query_id: str, reason: str) -> None:
+        with self.lock:
+            context = self.contexts.get(query_id)
+        if context is not None:
+            context.cancel(reason)
+
+    def release(self, query_id: str, sequence: int) -> None:
+        with self.lock:
+            self.retired.retire(sequence)
+            context = self.contexts.get(query_id)
+        if context is None:
+            return
+        # Captured RPCs retain this object. Cleanup fences late preparation and
+        # drains the watchdog before removing capacity; other contexts continue.
+        context.release()
+        with self.lock:
+            if self.contexts.get(query_id) is context:
+                del self.contexts[query_id]

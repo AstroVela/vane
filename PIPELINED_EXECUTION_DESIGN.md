@@ -132,9 +132,9 @@ FteOptions
   retry_backoff_seconds
 ~~~
 
-PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创建后续 attempt。FteOptions 仅进入 FTE 查询快照，向 pipelined 查询传入重试参数时直接报配置错误。连接可以预先登记 exchange_store，供后续 FTE 查询使用；pipelined 查询不使用该存储。
+PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创建后续 attempt。FteOptions 仅进入 FTE 查询快照，向 pipelined 查询传入重试参数时直接报配置错误。Runtime 可以预先登记 exchange_store，供后续 FTE 查询使用；pipelined 查询不使用该存储。
 
-[query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。P3 已接通 RayResources.exchange_stores、文件冻结、RecoveryScheduler 与公开 FTE QueryResult。exchange_store 解析为会话注册的 ExchangeStore，所有 worker 检查相同 root/store_id；独立故障域仍由部署方保证，不能用路径或 marker 自动证明。local 不使用 RayQuerySpec。
+[query_options.py](vane/execution/query_options.py) 实现 LocalExecution、RayExecution、FteOptions 和 QueryExecutionOptions；[submission.py](vane/execution/submission.py) 实现内部 RayQuerySpec。P3 已接通 RayResources.exchange_stores、文件冻结、RecoveryScheduler 与公开 FTE QueryResult。exchange_store 解析为 Runtime 注册的 ExchangeStore，所有 worker 检查相同 root/store_id；独立故障域仍由部署方保证，不能用路径或 marker 自动证明。local 不使用 RayQuerySpec。
 
 纯 `prepare_ray_query` 只编译和验证，不复制文件；普通 Parquet 不能经此入口声明为可重放。公开 FTE 查询在获得存储预留后调用明确具有文件写入效果的 `stage_ray_query`，先冻结输入，再绑定及优化。失败产生的部分副本由查询存储 lease 清理，不改变数据库状态。
 
@@ -172,7 +172,7 @@ QueryResult 暴露 schema（Arrow schema）、query_id、context、read_batch/�
 
 当前默认 rows_per_batch=2048，资源与期限默认值如上例；这些是初始功能配置，性能验收后再调整。result_buffer_bytes 只限制结果交付持有的 IPC 缓冲，不包含 DuckDB 算子、native 预取缓冲或 collect 的完整副本。超过窗口的单批立即报容量错误；能够放入窗口的下一批等待旧 lease 释放，可由取消或期限唤醒。需要控制 native 预取时使用连接的 streaming_buffer_size 设置。查询与交付期限分别从准入及结果句柄就绪开始计算，慢消费期间二者都可能到期。
 
-P2 接通以下 Ray pipelined 入口。先连接 Ray 集群，RayResources 定义会话共享的 worker 池及结果容量；相同连接的 cursors 共用这个池和准入账本。
+Ray 查询通过应用级 Runtime 创建会话。RayResources 定义整个服务的 worker 池、准入、结果和存储容量；不同 Session 及其 cursors 共用这些资源。Session 可传入更小的 QueryResources，服务与会话额度在同一个准入队列和结果账本中同时检查。
 
 ~~~python
 import ray
@@ -180,7 +180,7 @@ import vane
 
 ray.init()  # 也可以连接已经运行的 Ray 集群。
 resources = vane.RayResources(worker_count=2, partitions=2)
-with vane.connect(backend="ray", execution="pipelined", resources=resources) as connection:
+with vane.Runtime(resources) as runtime, runtime.connect(execution="pipelined") as connection:
     with connection.query("SELECT range AS value FROM range(10000) WHERE range > 10") as result:
         for batch in result:
             print(batch)
@@ -189,7 +189,7 @@ with vane.connect(backend="ray", execution="pipelined", resources=resources) as 
 
 当前入口支持 P0 已验证的只读 SQL 子集：常量、range、普通本地 Parquet、filter、projection 与 GATHER；HASH 图可通过 FragmentCompileOptions 验收。文件必须使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。整数、浮点、布尔、字符串及 NULL 在 native Flight 中传输，空结果保留 schema。单次 query 可显式选择 execution="pipelined" 或 execution="fte"；SQL 参数、聚合/join、模型 UDF 等尚未接线的能力明确报错。P3 的 FTE 入口如下。
 
-P3 在同一 Ray 会话中注册共享存储并选择 FTE。部署前将下例路径替换为所有参与者挂载的同一目录；输入文件只需要在提交端可读，worker 读取冻结副本。
+Runtime 注册共享存储，Session 或单条查询选择 FTE。部署前将下例路径替换为所有参与者挂载的同一目录；输入文件只需要在提交端可读，worker 读取冻结副本。
 
 ~~~python
 store = vane.ExchangeStore(
@@ -203,14 +203,14 @@ options = vane.QueryExecutionOptions(
     vane.RayExecution("fte", vane.FteOptions("shared", 3, 0.1)),
     admission_timeout=30, execution_timeout=300, delivery_timeout=300,
 )
-with vane.connect(backend="ray", resources=resources) as connection:
+with vane.Runtime(resources) as runtime, runtime.connect() as connection:
     with connection.query("SELECT range AS value FROM range(10000)", options=options) as result:
         for batch in result:
             print(batch)
             del batch
 ~~~
 
-`connect(backend="ray", execution="fte", resources=resources)` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
+`runtime.connect(execution="fte")` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
 
 客户端必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。当前使用 Ray 节点地址和动态端口；网关、TLS 和固定端口部署属于后续部署能力。
 
@@ -664,11 +664,25 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 
-[pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。会话 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
+[pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。服务共享的 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
 
-[pipelined_runtime.py](vane/execution/pipelined_runtime.py) 的 PipelinedScheduler 将整张图作为活动组，按任务固定分配到 worker。先准备全部任务和独立 ResultService，再绑定输入、验证客户端及 worker 的 Flight 握手，最后逆拓扑启动消费者和生产者。任一准备失败都会等待已发出的 prepare 结算并撤销整组预留；release 失败保留重试所有者。独立 native pump 推进已经启动的任务，Ray RPC 不搬运 RecordBatch。
+[pipelined_runtime.py](vane/execution/pipelined_runtime.py) 的 PipelinedScheduler 将整张图作为活动组，按任务固定分配到 worker。先准备全部任务及结果上下文，再绑定输入、验证客户端及 worker 的 Flight 握手，最后逆拓扑启动消费者和生产者。任一准备失败都会向原 worker epoch 发起新的 release，确认原生清理后撤销整组预留；release 失败保留重试所有者。独立 native pump 推进已经启动的任务，Ray RPC 不搬运 RecordBatch。
 
-结果服务是另一个 Ray actor 内的 native relay，数据路径为 root worker → ResultService → 客户端 native channel → QueryResult。两跳各自拥有窗口和 staging，结果服务在启动生产前占有资源。会话 max_results 同时限制这些结果服务及客户端通道的数量；交付 IPC 缓冲另外受 result_buffer_bytes 约束，导出的 Arrow/NumPy 视图继续由 BatchLease 计费。用户看到 QueryResult，与 local 相同；local 入口继续直接执行原生查询。
+结果服务是一个常驻 Ray actor 内的 native relay，数据路径为 root worker → ResultService → 客户端 native channel → QueryResult。两跳各自拥有窗口和 staging。每条查询拥有独立 ResultContext；服务 max_results 和会话 max_results 同时限制尚未释放的结果数量，已生产完成但仍持有的结果继续占位。交付 IPC 缓冲受服务与会话 result_buffer_bytes 双重约束，导出的 Arrow/NumPy 视图通过 BatchLease 持续计费，关闭会话后也不会提前归还这些字节。
+
+应用使用 `with vane.Runtime(RayResources(...)) as runtime` 明确持有服务。构造 Runtime 不启动 Ray；第一次 connect 建立进程内 QueryService 核心并注册 Session，第一次分布式查询按需启动 worker 及唯一 ResultService actor。后续 Session 和查询复用这些进程。Session.close 取消、清理本会话查询，保留服务和其他 Session；Runtime.close 禁止新会话与查询，清理所有 Session 后停止共享进程。清理失败保留所有者与额度，调用方可重试 close。没有隐式全局 Runtime、每会话 actor 池或自动重建结果服务的路径。
+
+Session 还持有对应的原生连接，并在 Session 层独立索引所有 native cursors；索引使用弱引用，允许不再被使用的中间 cursor 正常回收。关闭 Session 时禁止继续创建 cursor，持有存活连接的强引用并逐个关闭，因此中间节点回收不会遗漏嵌套 cursor。最后一个原生连接释放数据库和查询资源后才注销 Session；Runtime 确认注册表为空后才停止共享进程并标记关闭。worker 或结果服务暂时不可达时，保留清理所有者和配额；只有 release 确认成功或 Ray 明确报告 ActorDiedError 才完成该资源的清理。
+
+创建/准备 RPC 的失败 ObjectRef 不会随 actor 恢复而变为成功，清理不等待旧回执，且每次重试都发起新的 release RPC。结果服务创建、pipelined prepare 和 FTE prepare 共用以下规则：调用方在发送前记录每个 actor epoch 内连续递增的序号；release 在注册表锁内先封闭该序号，再等待已注册 owner 的原生资源关闭。迟到的创建/准备调用在注册原生状态前检查该序号，因此 release 先到也不会在确认后重新留下 context。已释放序号按连续区间合并，区间间隙只对应尚未完成清理的调用，不逐条保留历史查询。新的 release 仍不可达或超时时，Session、查询配额和结果槽位继续由原调用方持有。
+
+`Runtime.close(timeout=...)` 从入口建立单一单调时钟截止时间，取消、RPC 等待、线程退出、存储清理和原生连接关闭共用剩余预算。每个服务最多执行一个关闭任务；即使原生操作或 RPC 提交暂时阻塞，调用方也会在等待期限内收到 TimeoutError。超时不注销尚未关闭的 Session，也不丢弃其资源和关闭任务；后续 close 等待正在进行的任务，或在它结束后用新的剩余预算重试，不并发释放同一资源。
+
+[runtime.py](vane/execution/runtime.py) 中的 QueryService 持有 Session 注册表、worker 池、全局准入、结果预算和存储注册；RayQueryRuntime 负责一个 Session 的 SQL 查询上下文及配置。准入只使用一个服务队列，原子检查全局和会话的 active/queued 上限，保持会话内 FIFO；一个会话已满时允许其他会话使用空闲容量。会话快照报告自身占用，执行/排队历史计数位于 Runtime 服务快照。ResultServiceClient 只持有同一个结果 actor 及尚未释放的创建 RPC，不缓存空闲 actor。所有结果控制调用使用唯一 query_id；迟到 cancel/release 幂等，其他已关闭上下文调用报错。已进入的 RPC 持有其原 ResultContext，无法访问其他查询。
+
+Flight、channel、物化读取器和存储 lease 按查询创建和关闭。FTE watchdog 退出后才释放上下文额度；失败的上下文保留在注册表，其他上下文继续服务。Ray 为常驻结果 actor 预留 max_results 份容量，每份包含两个结果窗口、两条 Flight 链路 staging，配置 FTE 存储时还包含物化读取 staging。这是传输资源预留，不代表进程总 RSS。该进程丢失会使其中所有活动结果失败，随后查询也报告服务不可用；调用方关闭 Runtime 后创建新的 Runtime，不自动重放结果或替换进程。worker 的 FTE attempt 重试仍按原协议执行。
+
+本阶段交付应用内的服务核心：规划、协调器、FTE 续租仍运行在应用进程，结果服务和执行 worker 运行在 Ray 进程。独立 `vane server` 部署、远程 OpenSession/Execute/Cancel/Close 协议、鉴权及客户端断连租约属于下一阶段，尚未提供。届时独立部署可以在接收连接前预热，应用连接只持有远程 Session；本阶段不把本地核心宣称为已具备远程 Server。local 继续直接执行原生查询。
 
 ## Native 算子的异步推进
 
@@ -976,7 +990,7 @@ P3 不能通过委托旧 FTE 引擎完成。新的任务服务、计划格式、
 
 | 入口 | local（默认） | ray |
 | --- | --- | --- |
-| `connect()` / `connect(resources=...)` | 本地原生连接；query 运行时按需建立 | 显式 `backend="ray"` |
+| `connect()` / `connect(resources=...)` | 本地原生连接；query 运行时按需建立 | `Runtime(...).connect()` |
 | `query(SELECT, ...)` | QueryContext/QueryResult，原生流式结果 | 新 fragment compiler 和 pipelined/FTE runtime |
 | `execute` / `executemany` / `sql` / `from_query` | 原生 SQL、命令及 Relation | 在执行或绑定前明确拒绝，使用 query |
 | Relation 终端、DataSink | 原生本地执行，保留参数、事务和模型生命周期 | 当前分布式支持范围不包含此入口 |

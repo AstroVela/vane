@@ -134,9 +134,9 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
+        timeout-minutes: 11
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          bash .github/scripts/install_ubuntu_packages.sh \
             autoconf \
             automake \
             bison \
@@ -170,7 +170,8 @@ jobs:
         run: bash scripts/bootstrap_vcpkg.sh
 
       - name: Install the media test encoder
-        run: sudo apt-get install -y ffmpeg
+        timeout-minutes: 8
+        run: timeout --kill-after=10s 7m sudo apt-get install -y ffmpeg
 
       - name: Install Python build and test dependencies
         run: |

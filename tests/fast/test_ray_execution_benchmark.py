@@ -91,6 +91,7 @@ def test_ray_benchmark_checks_both_profiles_and_recovery_evidence(tmp_path, monk
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("case", ["serial", "failure"])
 def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, monkeypatch, case):
+    from vane.execution.pipelined_runtime import PipelinedContext
     from vane.execution.recovery_runtime import RecoveryScheduler
 
     config = benchmark.Configuration(
@@ -105,6 +106,22 @@ def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, mo
     mixed_started, scan_finished = threading.Event(), threading.Event()
     fault = {}
     original_measure, original_dispatch = benchmark.measure, RecoveryScheduler._dispatch
+    original_start, original_failed = threading.Thread.start, PipelinedContext.failed
+    failure_reported = threading.Event()
+
+    def start(thread):
+        original_start(thread)
+        if case == "failure" and mixed_started.is_set() and thread.name == "vane-recovery-scheduler":
+            # A fast first-attempt failure can precede Thread.start() returning.
+            # Force that ordering so preparation/cleanup races cannot hide.
+            assert failure_reported.wait(10), "FTE did not publish the injected failure"
+
+    def failed(context, message):
+        try:
+            return original_failed(context, message)
+        finally:
+            if message == "controlled mixed dispatch failure":
+                failure_reported.set()
 
     def measure(*args, **kwargs):
         if kwargs.get("ready") is None:
@@ -126,6 +143,8 @@ def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, mo
 
     monkeypatch.setattr(benchmark, "measure", measure)
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", dispatch)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(PipelinedContext, "failed", failed)
     message = "did not overlap in worker reservations" if case == "serial" else "controlled mixed dispatch failure"
     with pytest.raises((AssertionError, RuntimeError), match=message):
         benchmark.run(config)
@@ -141,4 +160,5 @@ def test_mixed_rejects_serial_dispatch_and_stops_a_sleeping_sibling(tmp_path, mo
         }
     else:
         # The held batch would otherwise sleep for hundreds of seconds.
+        assert report["failure"] == {"type": "RuntimeError", "message": message}
         assert time.monotonic() - fault["at"] < 10

@@ -22,7 +22,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1 已实现并完成相关验收；P5.2/P5.3 待开始 |
+| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.3 已完成相关验收；P5.2.4 独立 Server、历史 Flight 超时定位及 P5.3 待完成 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -119,7 +119,7 @@ P1 退出条件已满足。预算保证覆盖通道实际拥有的值缓冲；�
 - [x] 接通 ray/pipelined 查询及 QueryResult。
 - [x] 区分执行结局和交付结局，部分结果之后的失败可观察。
 
-实现位于 [native Flight](src/vane_py/execution/direct_flight.cpp)、[固定放置与容量](vane/execution/pipelined_plan.py)、[worker/ResultService](vane/execution/pipelined_worker.py) 及 [scheduler/QueryContext](vane/execution/pipelined_runtime.py)。公开 `connect(backend="ray")` 使用 RayResources；Ray 须先初始化，当前 SQL/type 范围延续 P0，SQL 参数、分析算子和 FTE 明确拒绝。
+实现位于 [native Flight](src/vane_py/execution/direct_flight.cpp)、[固定放置与容量](vane/execution/pipelined_plan.py)、[worker/ResultService](vane/execution/pipelined_worker.py) 及 [scheduler/QueryContext](vane/execution/pipelined_runtime.py)。公开 `Runtime(RayResources(...)).connect()` 使用服务共享资源；Ray 须先初始化，当前 SQL/type 范围延续 P0，SQL 参数、分析算子和 FTE 明确拒绝。
 
 P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端产生背压；取消和 worker/结果服务失效有明确结局；数据面没有 shuffle 物化文件。
 
@@ -248,14 +248,15 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 - [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。P5.2.1 已加入数据/控制操作归因、重复长查询及失败现场保存；本轮未复现，根因仍未确认。
 - [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
-- [ ] 定位 warm Ray 小查询约一秒的提交准备开销，进一步区分规划、actor 创建、RPC 与传输准备后再选择优化。
+- [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
+- [ ] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界验收。
 
 ### P5.3 发布验收
 
 - [ ] 固定支持矩阵和失败边界，完成跨平台 CI 与 release gate。
 - [ ] 更新发布文档与版本，按验收结果发布。
 
-P5.1 本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 和 P5.3 未完成前不宣称 P5 整体完成。
+本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 的历史 Flight 超时定位及 P5.3 发布验收未完成前不宣称 P5 整体完成。
 
 ## 增量验收记录
 
@@ -436,7 +437,7 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。P1.1 接通 local �
 
 - [DirectFlight](src/vane_py/execution/direct_flight.cpp) 接通 native 通道与 Arrow Flight。完整 ticket 固定查询、attempt、双方 epoch、schema、路由和访问 capability；每条流最多一个未确认帧，累计 ACK 归还发送端所有权。独立控制检查覆盖窗口耗尽、提前关闭、断连及 FINISH 后的持久错误。
 - [PipelinedWorker/ResultService](vane/execution/pipelined_worker.py) 与 [PipelinedScheduler](vane/execution/pipelined_runtime.py) 实现会话共享 worker 池、整图准备和资源预留、固定 split、消费者握手及逆拓扑启动。准备或清理失败保留资源所有者，成功释放后才退还额度；worker 不自动重启或重放任务。
-- 公开 `connect(backend="ray").query()` 返回相同的 QueryResult。数据通过 root worker → native ResultService → 客户端传输，Ray 只负责控制；慢客户端背压一直传回扫描端。最终 EOF 重新检查全图结局，已完成生产不再被执行期限取消，后台失败会唤醒结果容量等待者。
+- 公开 `Runtime(...).connect().query()` 返回相同的 QueryResult。数据通过 root worker → native ResultService → 客户端传输，Ray 只负责控制；慢客户端背压一直传回扫描端。最终 EOF 重新检查全图结局，已完成生产不再被执行期限取消，后台失败会唤醒结果容量等待者。
 - 最终相关测试共 **283 passed**：DirectFlight 24、配置/放置 13、DirectExchange 123、QueryResult runtime 67、执行选项 45、真实 Ray 11。覆盖两个独立 native 进程、两个真实 Ray worker、Parquet/HASH、空 schema、小窗口、部分交付后杀 worker/结果服务、预留回滚、清理失败重试、共享会话准入、取消与执行/交付期限。按要求未运行完整 release/fast 套件。
 - 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装。275 个 Python 源码/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致；engine identity 为 `346ef5b69e:fragment:18497cb82d5466056628bb30c840bc924f5137d61255a71861e002fa76da51cf`。DuckDB 子树与 fragment codec 没有修改。
 - 新增测试已加入 release launcher 和源码包清单。当前 SQL/type 范围延续 P0，原生传输支持 basic types；SQL 参数、聚合/join、模型 UDF 和 FTE 尚未接线。Parquet 使用 worker 共同可访问的绝对路径；客户端须能访问 ResultService 公布的节点地址和动态端口。
@@ -544,3 +545,13 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 100 万行扫描中，default/compact 的 pipelined 中位数为 **2.411/4.492 秒**，FTE 为 **5.536/10.972 秒**。compact 减少缓冲预留但牺牲吞吐，因此保留现有默认容量。warm Ray tiny 查询约 1 秒，主要发生在 `query()` 返回之前，需单独分解准备成本。
 - 相关测试 **20 passed**：辅助/本地 CLI 18、真实 Ray 全流程 1、从源码目录启动并限定一个 Ray CPU 的独立 CLI 1。格式、适用 pre-commit、源码版权清单、文档链接、diff 和 sdist 校验通过。只运行相关测试，未运行完整 release/fast 套件。
 - 本轮未修改生产执行器或 native；使用与 P5.2.1 相同的非 editable wheel。测量边界、环境、脚本/构建身份及详细结果见[执行基准](EXECUTION_BENCHMARKS.md#initial-measurements-2026-10-07)。历史 Flight 超时根因、提交准备开销与 P5.3 发布资格仍待完成。
+
+### P5.2.3 应用级 Runtime 与常驻结果服务（2026 年 10 月 8 日）
+
+- 引入 `Runtime(RayResources(...)).connect(resources=QueryResources(...))`。Runtime 按需建立服务核心，多个 Session 共用 worker、结果服务及存储注册。Session 关闭仅清理自身，Runtime 关闭才停止共享资源。
+- ResultService 常驻并同时持有多个独立 ResultContext，控制 RPC 使用唯一 query_id。删除 actor 借还池和隐式每会话服务创建；结果服务死亡不自动替换或重放。失败清理保留上下文与额度，直到成功重试。
+- 服务与会话的准入使用同一个队列；结果槽位、缓冲和导出视图同时计入两层预算。新增会话不能绕过服务总额度，Session 的关闭、取消和清理失败不会操作其他会话的查询。
+- 规划、协调器及 FTE 续租在本阶段由应用内 QueryService 管理；独立 Server 的进程与远程协议在 P5.2.4 实现。现有 Flight 数据路径保持原生传输。
+- 完成两轮无待修问题的代码审查后，一次增量 Release 构建并非 editable 安装。203 个 Python/类型文件与源码一致，native 与构建产物 SHA-256 一致。格式、mypy、版权清单及修改文档的本地链接检查通过。
+- 相关验证去重合计 **382 passed：271 个非 Ray、110 个共享集群 Ray、1 个独立基准 CLI**。首批 Ray 测试中新增的保留视图用例把 512 字节裸数据误作完整 IPC 预算；改为可容纳单批但不能同时容纳两批的预算，并释放 Future 持有的 Arrow 引用，重新审查后定向重跑通过。生产代码在构建后未改动，未重新编译，未运行完整 release/fast 套件。
+- 既有 `5374cf1c4f` 的性能测量仅代表已替换的 actor 池实现；方法和原始数据保留在[执行基准](EXECUTION_BENCHMARKS.md#result-actor-reuse-2026-10-07)，不能视为当前服务实现的测量结果。历史 Flight 超时及 P5.3 发布资格仍未完成。

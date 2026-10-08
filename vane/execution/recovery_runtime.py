@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
+from vane.execution.cleanup_deadline import cleanup_timeout
 from vane.execution.compiler import FragmentCompileOptions
 from vane.execution.fte_plan import TaskBinding, bind_task
 from vane.execution.fte_store import QueryStoreLease, StorePool
@@ -39,6 +40,7 @@ class RunningAttempt:
     partition: int
     binding: TaskBinding
     reservation: AttemptReservation
+    sequence: int
     prepare: Any = None
     capacity_token: str = ""
 
@@ -63,7 +65,7 @@ class RecoveryScheduler:
         self.coordinator: CommitCoordinator | None = None
         self.read_lease: ReadLease | None = None
         self.relay: Any = None
-        self.relay_epoch = ""
+        self.result_id = ""
         self.client: Any = None
         self.channel: Any = None
         self.planning_connection: Any = None
@@ -143,27 +145,25 @@ class RecoveryScheduler:
             self._prepare_delivery()
             self.context.deadline_probe = self.production_status
             self.context.check()
+            # thread.start() may run the first attempt before returning. Its
+            # failure cleanup must not interrupt an already finished planner.
+            self.planning_connection = None
             self.thread = threading.Thread(target=self._run, name="vane-recovery-scheduler", daemon=True)
             self.thread.start()
         finally:
             self.planning_connection = None
 
     def _prepare_delivery(self) -> None:
-        import ray
-
         from vane._native import execution_runtime as native
-        from vane.execution.pipelined_worker import ResultService, _channel
+        from vane.execution.pipelined_worker import _channel
 
         resources = self.resources
-        relay_type = ray.remote(max_restarts=0, max_task_retries=0, num_cpus=0, max_concurrency=4)(ResultService)
-        staging = 2 * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes)
-        staging += native.MaterializedIO.staging_bytes(resources.exchange.frame_bytes)
-        self.relay = relay_type.options(memory=2 * resources.exchange.window_bytes + staging).remote(resources)
-        self.relay_epoch = _get(self.relay.describe.remote(), self.context)
+        self.relay, self.result_id = self.pool.results.create(self.context.query_id, resources)
+        self.pool.results.prepared(self.result_id, self.context)
         ticket = DirectTicket(
             self.spec.query_id,
             "committed-result",
-            self.relay_epoch,
+            self.result_id,
             uuid.uuid4().hex,
             "client-result",
             "result-service",
@@ -172,7 +172,7 @@ class RecoveryScheduler:
             hashlib.sha256(self.spec.result_schema).hexdigest(),
             secrets.token_urlsafe(32),
         ).encode()
-        location = _get(self.relay.prepare.remote(self.relay_epoch, self.spec.result_schema, ticket), self.context)
+        location = _get(self.relay.prepare.remote(self.result_id, self.spec.result_schema, ticket), self.context)
         self.result_endpoint = {"location": location, "ticket": ticket}
         self.channel = _channel(self.spec.result_schema, resources, "result-service", "client")
         self.client = native.DirectFlight(
@@ -192,7 +192,7 @@ class RecoveryScheduler:
         deadline = time.monotonic() + self.spec.options.admission_timeout
         while True:
             self.context.check()
-            status = _get(self.relay.status.remote(), self.context)
+            status = _get(self.relay.status.remote(self.result_id), self.context)
             if status["error"] or self.client.error:
                 raise RuntimeError(status["error"] or self.client.error)
             if status["ready"] and self.client.ready:
@@ -236,7 +236,16 @@ class RecoveryScheduler:
                 reserved = self.coordinator.begin(
                     binding.task.task_id, epoch, object_bytes=self.store.config.object_bytes
                 )
-                attempt = RunningAttempt(index, worker, epoch, partition, binding, reserved, capacity_token=token)
+                attempt = RunningAttempt(
+                    index,
+                    worker,
+                    epoch,
+                    partition,
+                    binding,
+                    reserved,
+                    self.pool.next_call(index, worker, epoch),
+                    capacity_token=token,
+                )
                 self.active[index] = attempt
                 self.history.append(reserved.token)
                 attempt.prepare = worker.prepare_materialized.remote(
@@ -248,6 +257,7 @@ class RecoveryScheduler:
                     reserved.to_dict(),
                     self.lease.to_dict(),
                     self.resources.exchange.frame_rows,
+                    attempt.sequence,
                 )
                 return True
             except BaseException:
@@ -259,8 +269,12 @@ class RecoveryScheduler:
         import ray
 
         try:
-            _get(attempt.worker.release_materialized.remote(attempt.epoch, attempt.key), timeout=5)
-        except ray.exceptions.RayActorError:
+            timeout = cleanup_timeout(5)
+            _get(
+                attempt.worker.release_materialized.remote(attempt.epoch, attempt.key, attempt.sequence),
+                timeout=timeout,
+            )
+        except ray.exceptions.ActorDiedError:
             pass
         with self.lock:
             if self.active.get(attempt.index) is attempt:
@@ -381,15 +395,15 @@ class RecoveryScheduler:
             self.context.produced()
             _get(
                 self.relay.connect_materialized.remote(
-                    self.relay_epoch, self.result_manifest.to_dict(), self.lease.to_dict()
+                    self.result_id, self.result_manifest.to_dict(), self.lease.to_dict()
                 ),
                 self.context,
             )
             while not self.stop.is_set():
                 self.context.check()
-                status = _get(self.relay.status.remote(), self.context, timeout=5)
-                if status["epoch"] != self.relay_epoch:
-                    raise RuntimeError("result service epoch changed")
+                status = _get(self.relay.status.remote(self.result_id), self.context, timeout=5)
+                if status["query_id"] != self.result_id:
+                    raise RuntimeError("result context identity changed")
                 error = status["error"] or status["channel"]["error"] or self.client.error
                 if error:
                     raise RuntimeError(error)
@@ -414,7 +428,7 @@ class RecoveryScheduler:
             if state == "end":
                 if self.result_manifest is None or not self.production_status():
                     raise RuntimeError("FTE result ended before commit")
-                status = _get(self.relay.status.remote(), self.context)
+                status = _get(self.relay.status.remote(self.result_id), self.context)
                 error = status["error"] or status["channel"]["error"] or self.client.error
                 if error:
                     raise RuntimeError(error)
@@ -442,7 +456,7 @@ class RecoveryScheduler:
                 for attempt in tuple(self.active.values()):
                     attempt.worker.cancel_materialized.remote(attempt.epoch, attempt.key, reason)
                 if self.relay is not None:
-                    self.relay.cancel.remote(reason)
+                    self.relay.cancel.remote(self.result_id, reason)
 
     def close(self) -> None:
         import ray
@@ -454,7 +468,7 @@ class RecoveryScheduler:
             self.cancel("query result released")
             for thread in (self.thread, self.heartbeat):
                 if thread is not None and thread is not threading.current_thread():
-                    thread.join(timeout=10)
+                    thread.join(timeout=cleanup_timeout(10))
                     if thread.is_alive():
                         raise RuntimeError("FTE query cleanup is pending")
             if self.client is not None:
@@ -463,26 +477,16 @@ class RecoveryScheduler:
             for attempt in tuple(self.active.values()):
                 try:
                     if ray.is_initialized():
-                        if attempt.prepare is not None:
-                            try:
-                                _get(attempt.prepare, timeout=5)
-                            except ray.exceptions.RayError:
-                                pass
                         self._release(attempt)
                     else:
                         self.active.pop(attempt.index, None)
                         self.pool.admission.release(attempt.capacity_token)
                 except BaseException as error:
                     errors.append(error)
-            if self.relay is not None and ray.is_initialized():
-                try:
-                    _get(self.relay.release.remote(), timeout=5)
-                except ray.exceptions.RayActorError:
-                    pass
-                except BaseException as error:
-                    errors.append(error)
-                finally:
-                    ray.kill(self.relay, no_restart=True)
+            try:
+                self.pool.results.release(self.pool.results.actor, self.context.query_id)
+            except BaseException as error:
+                errors.append(error)
             if errors:
                 raise RuntimeError("FTE native cleanup is pending; retry result.close()") from errors[0]
             if self.read_lease is not None:
@@ -490,7 +494,7 @@ class RecoveryScheduler:
             # Ray can report actor death before the process has actually
             # released its file locks. Give normal process teardown a bounded
             # grace period; keep quota owned if native I/O still has not exited.
-            cleanup_deadline = time.monotonic() + 5
+            deadline = time.monotonic() + cleanup_timeout(5)
             while True:
                 try:
                     if self.coordinator is not None:
@@ -502,9 +506,9 @@ class RecoveryScheduler:
                         self.lease.close(self.coordinator.close if self.coordinator is not None else lambda: None)
                     break
                 except StorageCleanupPending:
-                    if time.monotonic() >= cleanup_deadline:
+                    if time.monotonic() >= deadline:
                         raise
-                    time.sleep(0.01)
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
             self.closed = True
 
     def snapshot(self) -> dict[str, Any]:

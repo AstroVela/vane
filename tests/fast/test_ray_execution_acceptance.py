@@ -40,7 +40,11 @@ def test_seeded_sql_and_type_differential(tmp_path, seed, partitions, threads):
     )
     evidence.write("resources-config.json", asdict(limits))
     completed = []
-    with vane.connect(config={"threads": 1}) as local, vane.connect(backend="ray", resources=limits) as connection:
+    with (
+        vane.connect(config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
         for case in cases:
             expected, schema = native_reference(local, case)
             for mode in ("pipelined", "fte"):
@@ -73,7 +77,7 @@ def test_mixed_queries_repeatedly_return_all_ownership(tmp_path, stop):
     limits = replace(resources(tmp_path), exchange=DirectExchangeLimits(4096, 1024, 4, 2), result_buffer_bytes=1024)
     evidence = Evidence(tmp_path / "lifecycle", stop=stop)
     case = Case("slow_consumer", "select range id from range(100000)")
-    with vane.connect(backend="ray", resources=limits) as connection, connection.cursor() as sibling:
+    with vane.Runtime(limits) as application, application.connect() as connection, connection.cursor() as sibling:
         for iteration in range(3):
             result = None
             evidence.begin(case, iteration=iteration)
@@ -131,7 +135,7 @@ def test_repeated_worker_loss_replays_fixed_inputs_and_keeps_pool_usable(tmp_pat
         return admitted
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_first_uncommitted)
-    with vane.connect() as local, vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.connect() as local, vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         expected, schema = native_reference(local, case)
         for iteration in range(2):
             result = None
@@ -167,7 +171,7 @@ def test_cancelled_admission_does_not_poison_the_next_query(tmp_path, mode):
 
     evidence = Evidence(tmp_path / "admission", mode=mode)
     limits = resources(tmp_path, max_active_queries=1)
-    with vane.connect(backend="ray", resources=limits) as connection, connection.cursor() as sibling:
+    with vane.Runtime(limits) as application, application.connect() as connection, connection.cursor() as sibling:
         for iteration in range(3):
             held = connection.query("select 1", options=query_options(mode))
             evidence.begin(Case("queued_cancel", "select 2"), iteration=iteration)
@@ -208,7 +212,7 @@ def test_unsupported_queries_fail_without_fallback_and_release_admission(tmp_pat
         "select '00000000-0000-0000-0000-000000000001'::uuid",
     ]
     evidence = Evidence(tmp_path / "unsupported", mode=mode)
-    with vane.connect() as local, vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.connect() as local, vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         for sql in queries:
             assert local.execute(sql).fetchall()
             evidence.begin(Case("unsupported", sql), mode=mode)
@@ -233,7 +237,7 @@ def test_repeated_long_filter_keeps_the_declared_deadline(tmp_path, mode):
     evidence = Evidence(tmp_path / "long-filter", mode=mode)
     sql = "select range from range(30000) where hash(upper('" + "ß" * 16000 + "' || range::varchar)) = 0"
     limits = resources(tmp_path, worker_count=1, partitions=1, max_active_queries=1)
-    with vane.connect(backend="ray", resources=limits) as connection:
+    with vane.Runtime(limits) as application, application.connect() as connection:
         # Include warmup and a successful query after every cancellation. Keep
         # native computation and the real status/Flight watchers enabled.
         connection.query("select 1", options=query_options(mode)).collect()

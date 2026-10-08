@@ -40,6 +40,7 @@ def assert_idle(connection, *, allow_dead_workers=False):
     runtime = connection.query_runtime
     assert runtime.resource_snapshot()["queries"] == {}
     assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+    assert runtime.resource_snapshot()["result_service"]["active_contexts"] == 0
     for worker in runtime.pool.workers:
         try:
             assert ray.get(worker.resources_snapshot.remote())["reservations"] == {}
@@ -66,7 +67,7 @@ def close_result(result):
 
 
 def test_public_fte_query_and_empty_schema(tmp_path):
-    with vane.connect(backend="ray", execution="fte", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect(execution="fte") as connection:
         for count in (50, 0):
             with connection.query(f"select range as value from range({count})") as result:
                 scheduler = result.context._reader
@@ -79,7 +80,7 @@ def test_public_fte_query_and_empty_schema(tmp_path):
 
 
 def test_fte_options_and_pipelined_share_one_session_pool(tmp_path):
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         assert connection.query("select 1 as value").collect().to_pylist() == [{"value": 1}]
         workers = tuple(connection.query_runtime.pool.epochs)
         assert connection.query("select 2 as value", options=options()).collect().to_pylist() == [{"value": 2}]
@@ -94,7 +95,7 @@ def test_failed_orphan_cleanup_preserves_live_result_and_new_admission(tmp_path,
 
     from vane.execution.fte_store import replace_metadata
 
-    with vane.connect(backend="ray", execution="fte", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect(execution="fte") as connection:
         result = connection.query("select 42 as value")
         store = result.context._reader.store
         orphan = None
@@ -143,7 +144,7 @@ def test_slow_orphan_cleanup_does_not_stop_heartbeats_or_result_delivery(tmp_pat
 
     config = resources(tmp_path)
     config = replace(config, exchange_stores=(replace(config.exchange_stores[0], lease_seconds=2),))
-    with vane.connect(backend="ray", execution="fte", resources=config) as connection:
+    with vane.Runtime(config) as application, application.connect(execution="fte") as connection:
         result = connection.query("select 42 as value")
         scheduler = result.context._reader
         store = scheduler.store
@@ -207,7 +208,7 @@ def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_pa
     path = tmp_path / "input.parquet"
     with vane.connect(backend="local") as local:
         local.execute(f"copy (select range as value from range(1, 4)) to '{path}'")
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         with connection.query(f"select value from read_parquet('{path}')" + predicate, options=options()) as result:
             with vane.connect(backend="local") as local:
                 local.execute(f"copy (select 100 as value) to '{path}' (overwrite true)")
@@ -225,7 +226,7 @@ def test_fte_store_inside_recursive_input_glob_preserves_duplicate_rows(tmp_path
     assert expected == [42, 42]
     config = resources(tmp_path, worker_count=partitions, partitions=partitions)
     config = replace(config, exchange_stores=(replace(config.exchange_stores[0], source_bytes=path.stat().st_size),))
-    with vane.connect(backend="ray", execution="fte", resources=config) as connection:
+    with vane.Runtime(config) as application, application.connect(execution="fte") as connection:
         for _ in range(2):
             assert connection.query(sql).collect().column("value").to_pylist() == expected
             assert_idle(connection)
@@ -242,7 +243,7 @@ def test_generated_filename_rejection_releases_fte_resources_and_preserves_pipel
         (f"select {column} as provenance from {scan}", [{"provenance": str(path)}]),
         (f"select value from {scan} where {column} = '{path}'", [{"value": 42}]),
     )
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         for sql, expected in queries:
             with pytest.raises(vane.NotImplementedException, match="generated filename"):
                 connection.query(sql, options=options())
@@ -267,7 +268,7 @@ def test_native_hash_stages_and_fixed_inputs(tmp_path, monkeypatch):
         return stage(*args, **kwargs)
 
     monkeypatch.setattr(recovery_runtime, "stage_ray_query", hash_plan)
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query(
             "select range % 7 as k, 'value-' || range::varchar as v from range(80)", options=options()
         )
@@ -299,7 +300,7 @@ def test_worker_loss_replays_only_the_uncommitted_task(tmp_path, monkeypatch, st
         return True
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_worker)
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range as value from range(100)", options=options())
         scheduler = result.context._reader
         assert sorted(result.collect().column("value").to_pylist()) == list(range(100))
@@ -316,7 +317,7 @@ def test_worker_loss_replays_only_the_uncommitted_task(tmp_path, monkeypatch, st
 def test_worker_loss_after_root_commit_does_not_change_result(tmp_path):
     import ray
 
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range as value from range(100)", options=options())
         scheduler = result.context._reader
         deadline = time.monotonic() + 20
@@ -349,7 +350,7 @@ def test_attempt_exhaustion_exposes_no_rows_and_releases_storage(tmp_path, monke
         return True
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_every_attempt)
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range from range(100)", options=options(attempts=2))
         scheduler = result.context._reader
         try:
@@ -382,7 +383,7 @@ def test_retry_backoff_uses_the_original_execution_deadline(tmp_path, monkeypatc
             ray.kill(owner.active[index].worker, no_restart=True)
         return True
 
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         connection.query("select 1", options=options()).collect()
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_first_attempt)
         start = time.monotonic()
@@ -408,7 +409,7 @@ def test_cancellation_and_delivery_deadline_release_every_owner(tmp_path, cancel
     from vane.execution.request_admission import RequestCancelled
     from vane.execution.result_delivery import ResultDeliveryTimeout
 
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query(
             "select range from range(50000)", options=options(delivery=0.1 if cancel == "delivery" else 30)
         )
@@ -431,7 +432,7 @@ def test_cancellation_and_delivery_deadline_release_every_owner(tmp_path, cancel
 
 
 def test_committed_result_can_outlive_execution_deadline(tmp_path):
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         connection.query("select 1", options=options()).collect()
         result = connection.query("select 42 as value", options=options(execution=3))
         deadline = time.monotonic() + 2.5
@@ -466,7 +467,7 @@ def test_committed_input_damage_is_permanent(tmp_path, monkeypatch, damage):
         return result
 
     monkeypatch.setattr(RecoveryScheduler, "_stage", damage_input)
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range from range(40)", options=options())
         scheduler = result.context._reader
         try:
@@ -482,7 +483,7 @@ def test_committed_input_damage_is_permanent(tmp_path, monkeypatch, damage):
 def test_result_service_loss_after_partial_delivery_fails_without_replay(tmp_path):
     import ray
 
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range from range(20000)", options=options())
         first = result.read_batch()
         expected = first.column(0).to_pylist()
@@ -506,7 +507,8 @@ def test_fte_and_pipelined_share_query_admission(tmp_path):
     from vane.execution.request_admission import RequestQueueTimeout
 
     with (
-        vane.connect(backend="ray", resources=resources(tmp_path, max_active_queries=1)) as connection,
+        vane.Runtime(resources(tmp_path, max_active_queries=1)) as application,
+        application.connect() as connection,
         connection.cursor() as cursor,
     ):
         first = connection.query("select range from range(1000000)")
@@ -523,7 +525,11 @@ def test_fte_and_pipelined_share_query_admission(tmp_path):
 def test_pipelined_and_fte_execute_concurrently_on_one_worker_pool(tmp_path):
     import ray
 
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection, connection.cursor() as cursor:
+    with (
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+        connection.cursor() as cursor,
+    ):
         first = connection.query("select range from range(1000000)")
         batch = first.read_batch()
         del batch
@@ -543,7 +549,7 @@ def test_fte_status_does_not_wait_for_native_pump(tmp_path, execution_timeout):
 
     sql = "select range from range(30000) where hash(upper('" + "ß" * 16000 + "' || range::varchar)) = 0"
     limits = resources(tmp_path, worker_count=1, partitions=1, max_active_queries=1)
-    with vane.connect(backend="ray", resources=limits) as connection:
+    with vane.Runtime(limits) as application, application.connect() as connection:
         connection.query("select 1", options=options()).collect()
         result = connection.query(sql, options=options(execution=execution_timeout, delivery=60))
         try:
@@ -574,7 +580,7 @@ def test_commit_acknowledgement_loss_does_not_replay_selected_attempt(tmp_path, 
         return value
 
     monkeypatch.setattr(CommitCoordinator, publication, drop_reply)
-    with vane.connect(backend="ray", resources=resources(tmp_path)) as connection:
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         result = connection.query("select range from range(40)", options=options())
         scheduler = result.context._reader
         assert sorted(result.collect().column(0).to_pylist()) == list(range(40))
@@ -631,7 +637,7 @@ def test_expired_coordinator_lease_cancels_real_worker_and_reclaims_orphans(tmp_
         lease.renew()
         ray.get(
             worker.prepare_materialized.remote(
-                epoch, spec.to_dict(), fragment.fragment_id, 0, {}, reservation.to_dict(), lease.to_dict(), 64
+                epoch, spec.to_dict(), fragment.fragment_id, 0, {}, reservation.to_dict(), lease.to_dict(), 64, 1
             ),
             timeout=10,
         )
