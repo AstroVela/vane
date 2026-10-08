@@ -270,8 +270,30 @@ class OutputBlockLeaseOwner:
 
 
 @dataclass
+class _ResourceUnitUsage:
+    """Additive lease totals, updated with the owning ledger under its lock.
+
+    Task process resources are fixed by the unit spec. Only retained input and
+    native per-task windows need byte sums. Streaming estimates remain dynamic:
+    readers multiply the latest estimate by the current generator count.
+    """
+
+    task_count: int = 0
+    task_input_bytes: int = 0
+    native_output_window_bytes: int = 0
+    active_actor_count: int = 0
+    live_output_bytes: int = 0
+    producer_output_bytes: int = 0
+    waiting_task_count: int = 0
+    waiting_input_bytes: int = 0
+    waiting_output_count: int = 0
+    waiting_output_bytes: int = 0
+
+
+@dataclass
 class _ResourceUnitState:
     spec: ResourceUnitSpec
+    usage: _ResourceUnitUsage = field(default_factory=_ResourceUnitUsage)
     runnable: bool = False
     actor_ready: bool = False
     queued_input_bytes: int = 0
@@ -702,21 +724,29 @@ class RayQueryResourceManager:
             if existing is not None:
                 return
             self._waiting_task_inputs[key] = value
+            unit.usage.waiting_task_count += 1
+            unit.usage.waiting_input_bytes += retained
             unit.runnable = not unit.completed
             self._recompute_unit_queued_input_locked(resource_unit_id)
             self._publish_change_locked()
 
     def remove_task_waiter(self, task_id: str, attempt_id: str) -> bool:
         with self._lock:
-            value = self._waiting_task_inputs.pop(
-                (str(task_id), str(attempt_id)),
-                None,
-            )
+            value = self._remove_task_waiter_locked((str(task_id), str(attempt_id)))
             if value is None:
                 return False
-            self._recompute_unit_queued_input_locked(str(value[0].resource_unit_id))
             self._publish_change_locked()
             return True
+
+    def _remove_task_waiter_locked(self, key: tuple[str, str]) -> tuple[TaskRequest, int] | None:
+        value = self._waiting_task_inputs.pop(key, None)
+        if value is not None:
+            unit_id = str(value[0].resource_unit_id)
+            usage = self._units[unit_id].usage
+            usage.waiting_task_count -= 1
+            usage.waiting_input_bytes -= value[1]
+            self._recompute_unit_queued_input_locked(unit_id)
+        return value
 
     def mark_task_attempt_terminal(self, task_id: str, attempt_id: str) -> None:
         """Fence a cancelled request identity without retaining driver ownership."""
@@ -729,13 +759,8 @@ class RayQueryResourceManager:
 
     def _recompute_unit_queued_input_locked(self, resource_unit_id: str) -> None:
         unit = self._units[resource_unit_id]
-        waiting = [
-            queued_bytes
-            for request, queued_bytes in self._waiting_task_inputs.values()
-            if str(request.resource_unit_id) == resource_unit_id
-        ]
-        unit.pending_task_count = len(waiting)
-        unit.queued_input_bytes = sum(waiting)
+        unit.pending_task_count = unit.usage.waiting_task_count
+        unit.queued_input_bytes = unit.usage.waiting_input_bytes
 
     def note_output_waiting(self, request: OutputBlockRequest) -> str | None:
         """Register one produced block, or return its fatal identity reason."""
@@ -753,18 +778,30 @@ class RayQueryResourceManager:
                 return None
             self._record_output_observation_locked(request)
             self._waiting_output_blocks[block_id] = request
+            usage = self._units[resource_unit_id].usage
+            usage.waiting_output_count += 1
+            usage.waiting_output_bytes += int(request.size_bytes)
             self._recompute_unit_queued_output_locked(resource_unit_id)
             self._publish_change_locked()
             return None
 
     def remove_output_waiter(self, block_id: str) -> bool:
         with self._lock:
-            value = self._waiting_output_blocks.pop(str(block_id), None)
+            value = self._remove_output_waiter_locked(str(block_id))
             if value is None:
                 return False
-            self._recompute_unit_queued_output_locked(str(value.producer_unit_id))
             self._publish_change_locked()
             return True
+
+    def _remove_output_waiter_locked(self, block_id: str) -> OutputBlockRequest | None:
+        value = self._waiting_output_blocks.pop(block_id, None)
+        if value is not None:
+            unit_id = str(value.producer_unit_id)
+            usage = self._units[unit_id].usage
+            usage.waiting_output_count -= 1
+            usage.waiting_output_bytes -= int(value.size_bytes)
+            self._recompute_unit_queued_output_locked(unit_id)
+        return value
 
     def mark_output_block_terminal(self, block_id: str) -> None:
         """Fence a cancelled output identity without retaining driver ownership."""
@@ -777,18 +814,15 @@ class RayQueryResourceManager:
 
     def _recompute_unit_queued_output_locked(self, resource_unit_id: str) -> None:
         unit = self._units[resource_unit_id]
-        waiting = [
-            int(request.size_bytes)
-            for request in self._waiting_output_blocks.values()
-            if str(request.producer_unit_id) == resource_unit_id
-        ]
-        leased_queue_bytes = sum(
-            lease.size_bytes
-            for lease in self._output_leases.values()
-            if lease.producer_unit_id == resource_unit_id and lease.state in {"generator_pending", "unit_queue"}
-        )
-        unit.pending_output_count = len(waiting)
-        unit.queued_output_bytes = sum(waiting) + leased_queue_bytes
+        unit.pending_output_count = unit.usage.waiting_output_count
+        unit.queued_output_bytes = unit.usage.waiting_output_bytes + unit.usage.producer_output_bytes
+
+    def _update_output_usage_locked(self, lease: OutputBlockLease, *, added: bool) -> None:
+        usage = self._units[lease.producer_unit_id].usage
+        delta = lease.size_bytes if added else -lease.size_bytes
+        usage.live_output_bytes += delta
+        if lease.state in {"generator_pending", "unit_queue"}:
+            usage.producer_output_bytes += delta
 
     def _output_request_identity_error_locked(
         self,
@@ -1698,12 +1732,13 @@ class RayQueryResourceManager:
         *,
         excluded_waiting_block_id: str | None,
     ) -> int:
-        waiting_bytes = sum(
-            int(request.size_bytes)
-            for block_id, request in self._waiting_output_blocks.items()
-            if block_id != excluded_waiting_block_id and str(request.producer_unit_id) == resource_unit_id
-        )
-        return self._live_output_bytes_for_unit_locked(resource_unit_id) + waiting_bytes
+        usage = self._units[resource_unit_id].usage
+        output_bytes = usage.live_output_bytes + usage.waiting_output_bytes
+        if excluded_waiting_block_id is not None:
+            excluded = self._waiting_output_blocks.get(excluded_waiting_block_id)
+            if excluded is not None and str(excluded.producer_unit_id) == resource_unit_id:
+                output_bytes -= int(excluded.size_bytes)
+        return output_bytes
 
     def _object_store_budget_state_locked(
         self,
@@ -2135,13 +2170,19 @@ class RayQueryResourceManager:
             allocation_generation=self.allocation.generation,
         )
         self._task_leases[lease.lease_id] = lease
+        usage = self._units[resource_unit_id].usage
+        usage.task_count += 1
+        usage.task_input_bytes += lease.resources.object_store_bytes
+        if unit.backend == "ray_worker":
+            usage.native_output_window_bytes += lease.output_window_bytes
         self._active_attempt_leases[(lease.task_id, lease.attempt_id)] = lease.lease_id
         if actor_slot is not None:
             if actor_slot not in self._active_actor_slots:
                 self._active_actor_slots[actor_slot] = lease.lease_id
+                usage.active_actor_count += 1
             else:
                 self._queued_actor_slot_leases.setdefault(actor_slot, deque()).append(lease.lease_id)
-        self._waiting_task_inputs.pop((lease.task_id, lease.attempt_id), None)
+        self._remove_task_waiter_locked((lease.task_id, lease.attempt_id))
         self._recompute_unit_queued_input_locked(lease.resource_unit_id)
         if liveness:
             self._active_liveness_task_lease_ids_by_unit[lease.resource_unit_id] = lease.lease_id
@@ -2150,6 +2191,12 @@ class RayQueryResourceManager:
         return TaskGrant(True, lease=lease, liveness=liveness)
 
     def _on_task_lease_removed_locked(self, lease: TaskLease) -> None:
+        unit = self._units[lease.resource_unit_id]
+        usage = unit.usage
+        usage.task_count -= 1
+        usage.task_input_bytes -= lease.resources.object_store_bytes
+        if unit.spec.backend == "ray_worker":
+            usage.native_output_window_bytes -= lease.output_window_bytes
         if lease.actor_index is None:
             return
         actor_slot = (lease.resource_unit_id, int(lease.actor_index))
@@ -2162,6 +2209,7 @@ class RayQueryResourceManager:
                     self._queued_actor_slot_leases.pop(actor_slot, None)
             else:
                 self._active_actor_slots.pop(actor_slot, None)
+                usage.active_actor_count -= 1
         elif queued and lease.lease_id in queued:
             queued.remove(lease.lease_id)
             if not queued:
@@ -2244,6 +2292,7 @@ class RayQueryResourceManager:
             for output_lease in output_leases:
                 self._output_leases[output_lease.lease_id] = output_lease
                 self._output_lease_by_block[output_lease.block_id] = output_lease.lease_id
+                self._update_output_usage_locked(output_lease, added=True)
             self._recompute_unit_queued_output_locked(task.resource_unit_id)
 
             self._task_leases.pop(task.lease_id, None)
@@ -2549,7 +2598,8 @@ class RayQueryResourceManager:
         )
         self._output_leases[lease.lease_id] = lease
         self._output_lease_by_block[lease.block_id] = lease.lease_id
-        self._waiting_output_blocks.pop(lease.block_id, None)
+        self._update_output_usage_locked(lease, added=True)
+        self._remove_output_waiter_locked(lease.block_id)
         self._recompute_unit_queued_output_locked(lease.producer_unit_id)
         if liveness:
             self._active_liveness_output_lease_ids_by_unit[lease.producer_unit_id] = lease.lease_id
@@ -2581,6 +2631,7 @@ class RayQueryResourceManager:
                 # next block.
                 self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
             if target == "downstream_input":
+                self._units[lease.producer_unit_id].usage.producer_output_bytes -= lease.size_bytes
                 self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._recompute_unit_queued_output_locked(lease.producer_unit_id)
             self._publish_change_locked()
@@ -2592,6 +2643,7 @@ class RayQueryResourceManager:
             lease = self._output_leases.pop(lease_key, None)
             if lease is None:
                 return False
+            self._update_output_usage_locked(lease, added=False)
             self._output_lease_by_block.pop(lease.block_id, None)
             self._terminal_output_blocks.add(lease.block_id)
             if self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == lease_key:
@@ -2617,6 +2669,8 @@ class RayQueryResourceManager:
             self._active_actor_slots.clear()
             self._queued_actor_slot_leases.clear()
             self._waiting_task_inputs.clear()
+            for unit in self._units.values():
+                unit.usage = _ResourceUnitUsage()
             for resource_unit_id in self._units:
                 self._recompute_unit_queued_input_locked(resource_unit_id)
             self._output_leases.clear()
@@ -2661,102 +2715,37 @@ class RayQueryResourceManager:
             return counts
 
     def _active_task_count_for_unit_locked(self, resource_unit_id: str) -> int:
-        return sum(1 for lease in self._task_leases.values() if lease.resource_unit_id == resource_unit_id)
-
-    def _live_output_bytes_for_task_locked(self, task_lease_id: str) -> int:
-        task_key = str(task_lease_id)
-        return sum(lease.size_bytes for lease in self._output_leases.values() if lease.task_lease_id == task_key)
-
-    def _scoped_output_bytes_for_task_locked(
-        self,
-        task_lease_id: str,
-        *,
-        states: set[str],
-        include_waiting: bool,
-        excluded_waiting_block_id: str | None = None,
-    ) -> int:
-        task_key = str(task_lease_id)
-        leased = sum(
-            lease.size_bytes
-            for lease in self._output_leases.values()
-            if lease.task_lease_id == task_key and lease.state in states
-        )
-        if not include_waiting:
-            return leased
-        waiting = sum(
-            int(request.size_bytes)
-            for block_id, request in self._waiting_output_blocks.items()
-            if block_id != excluded_waiting_block_id and str(request.task_lease_id) == task_key
-        )
-        return leased + waiting
-
-    def _producer_output_bytes_for_task_locked(
-        self,
-        task_lease_id: str,
-        *,
-        excluded_waiting_block_id: str | None = None,
-    ) -> int:
-        return self._scoped_output_bytes_for_task_locked(
-            task_lease_id,
-            states={"generator_pending", "unit_queue"},
-            include_waiting=True,
-            excluded_waiting_block_id=excluded_waiting_block_id,
-        )
-
-    def _downstream_output_bytes_for_task_locked(self, task_lease_id: str) -> int:
-        return self._scoped_output_bytes_for_task_locked(
-            task_lease_id,
-            states={"downstream_input", "external_consumer"},
-            include_waiting=False,
-        )
+        return self._units[resource_unit_id].usage.task_count
 
     def _live_output_bytes_for_unit_locked(self, resource_unit_id: str) -> int:
-        return sum(
-            lease.size_bytes for lease in self._output_leases.values() if lease.producer_unit_id == resource_unit_id
-        )
+        return self._units[resource_unit_id].usage.live_output_bytes
 
-    def _task_usage_locked(
+    def _task_and_output_usage_for_unit_locked(
         self,
-        lease: TaskLease,
+        resource_unit_id: str,
         *,
         excluded_waiting_block_id: str | None = None,
     ) -> ResourceVector:
-        output_estimate = self._pending_output_estimate_for_lease_locked(lease)
-        producer_output = self._producer_output_bytes_for_task_locked(
-            lease.lease_id,
+        unit = self._units[resource_unit_id]
+        usage = unit.usage
+        if unit.spec.backend == "ray_worker":
+            pending_bytes = usage.native_output_window_bytes
+        else:
+            generators = usage.active_actor_count if unit.spec.backend == "ray_actor" else usage.task_count
+            pending_bytes = generators * self._pending_output_estimate_per_task_locked(unit.spec)
+        # Every managed output remains charged exactly once, even after its
+        # producer task has finished. Its queue/consumer state affects progress
+        # and reservations, but not total ownership.
+        output_bytes = self._object_store_output_usage_for_unit_locked(
+            resource_unit_id,
             excluded_waiting_block_id=excluded_waiting_block_id,
         )
-        downstream_output = self._downstream_output_bytes_for_task_locked(lease.lease_id)
-        return _resource_with_object_store(
-            lease.resources,
-            lease.resources.object_store_bytes + downstream_output + producer_output + output_estimate,
+        return ResourceVector(
+            cpu=unit.spec.per_task.cpu * usage.task_count,
+            gpu=unit.spec.per_task.gpu * usage.task_count,
+            heap_bytes=unit.spec.per_task.heap_bytes * usage.task_count,
+            object_store_bytes=usage.task_input_bytes + pending_bytes + output_bytes,
         )
-
-    def _uncovered_inactive_output_bytes_locked(
-        self,
-        active_task_ids: set[str],
-        *,
-        resource_unit_id: str | None = None,
-        excluded_waiting_block_id: str | None = None,
-    ) -> int:
-        leased = sum(
-            output.size_bytes
-            for output in self._output_leases.values()
-            if output.task_lease_id not in active_task_ids
-            and (resource_unit_id is None or output.producer_unit_id == resource_unit_id)
-        )
-        # Failure cleanup can retire a completed task concurrently with
-        # cancelling its final driver-owned output waiter.  The ObjectRef still
-        # exists during that bounded handoff, so keep its exact bytes charged
-        # even after the task estimate disappears.
-        waiting = sum(
-            int(request.size_bytes)
-            for block_id, request in self._waiting_output_blocks.items()
-            if block_id != excluded_waiting_block_id
-            and str(request.task_lease_id) not in active_task_ids
-            and (resource_unit_id is None or str(request.producer_unit_id) == resource_unit_id)
-        )
-        return leased + waiting
 
     def _query_usage_locked(
         self,
@@ -2764,18 +2753,12 @@ class RayQueryResourceManager:
         excluded_waiting_block_id: str | None = None,
     ) -> ResourceVector:
         total = ResourceVector()
-        active_task_ids = set(self._task_leases)
-        for lease in self._task_leases.values():
-            total = total + self._task_usage_locked(
-                lease,
+        for resource_unit_id in self._units:
+            total = total + self._task_and_output_usage_for_unit_locked(
+                resource_unit_id,
                 excluded_waiting_block_id=excluded_waiting_block_id,
             )
-        return total + ResourceVector(
-            object_store_bytes=self._uncovered_inactive_output_bytes_locked(
-                active_task_ids,
-                excluded_waiting_block_id=excluded_waiting_block_id,
-            )
-        )
+        return total
 
     def _soft_allocation_usage_locked(
         self,
@@ -2826,23 +2809,9 @@ class RayQueryResourceManager:
         *,
         excluded_waiting_block_id: str | None = None,
     ) -> ResourceVector:
-        total = ResourceVector()
-        active_task_ids: set[str] = set()
-        for lease in self._task_leases.values():
-            if lease.resource_unit_id != resource_unit_id:
-                continue
-            active_task_ids.add(lease.lease_id)
-            task_usage = self._task_usage_locked(
-                lease,
-                excluded_waiting_block_id=excluded_waiting_block_id,
-            )
-            total = total + task_usage
-        total = total + ResourceVector(
-            object_store_bytes=self._uncovered_inactive_output_bytes_locked(
-                active_task_ids,
-                resource_unit_id=resource_unit_id,
-                excluded_waiting_block_id=excluded_waiting_block_id,
-            )
+        total = self._task_and_output_usage_for_unit_locked(
+            resource_unit_id,
+            excluded_waiting_block_id=excluded_waiting_block_id,
         )
         if self._units[resource_unit_id].spec.backend == "ray_actor":
             total = total + self._actor_resident_usage_locked(
