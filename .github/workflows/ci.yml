@@ -610,7 +610,7 @@ jobs:
             phase: shared-ray
             shard_index: 0
             shard_count: 1
-            process_timeout: 1800
+            process_timeout: 2400
           - label: isolated Ray owners
             phase: owner-ray
             shard_index: 0

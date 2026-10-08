@@ -16,6 +16,7 @@ import pytest
 import vane
 import vane.runners.fte.fte_scheduler as fte_scheduler_mod
 from vane._ray_errors import RemoteRayException
+from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
 ray = pytest.importorskip("ray")
 
@@ -309,6 +310,7 @@ class _FakeFteTaskHandle:
         self.task_id = FteTaskAttemptId.coerce(task_id)
         self.worker_handle = worker_handle
         self.worker_id = worker_handle.worker_id
+        self.status_completion = Future()
 
 
 class _FakeTask:
@@ -4758,6 +4760,61 @@ def test_fte_wait_task_status_async_times_out_and_cancels_remote_wait(monkeypatc
         asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
 
     assert cancelled == [(pending_ref, False)]
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_async_status_cancel_keeps_loop_responsive_and_waits_for_repeated_cancellation(monkeypatch, timed_out):
+    wait_started = asyncio.Event()
+    cancel_started = threading.Event()
+    release_cancel = threading.Event()
+    cancel_on_loop = []
+
+    class _PendingRef:
+        def __await__(self):
+            async def wait():
+                wait_started.set()
+                await asyncio.Event().wait()
+
+            return wait().__await__()
+
+    pending = _PendingRef()
+    actor = SimpleNamespace(fte_wait_task_status=SimpleNamespace(remote=lambda *_args: pending))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+
+    def cancel(ref, *, force):
+        assert ref is pending and not force
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            cancel_on_loop.append(False)
+        else:
+            cancel_on_loop.append(True)
+        cancel_started.set()
+        assert release_cancel.wait(2.0)
+
+    monkeypatch.setattr(ray, "cancel", cancel)
+    if timed_out:
+        monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.01")
+
+    async def exercise():
+        wait = asyncio.create_task(handle.fte_wait_task_status_async({}, -1, None))
+        await wait_started.wait()
+        if not timed_out:
+            wait.cancel()
+        try:
+            entered = await asyncio.wait_for(asyncio.to_thread(cancel_started.wait, 1.0), timeout=1.5)
+            assert entered
+            assert cancel_on_loop == [False]
+            wait.cancel()
+            await asyncio.sleep(0)
+            assert not wait.done()
+        finally:
+            release_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await wait
+        assert cancel_on_loop == [False]
+
+    asyncio.run(exercise())
 
 
 def test_fte_wait_task_status_async_rechecks_query_deadline_after_submission(monkeypatch):
@@ -12165,7 +12222,59 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
     assert handle.fte_registry_stats()["status_watcher_count"] == 0
 
 
-def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
+@pytest.mark.parametrize("close_at", ["before_registration", "after_operation_token", "during_replacement"])
+def test_status_observation_skipped_by_query_close_settles_result_completion(monkeypatch, close_at):
+    query_id = "query-status-close-registration"
+    attempt = FteTaskAttemptId.coerce(
+        {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    )
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1 << 60)
+    completion = Future()
+    if close_at == "before_registration":
+        worker_handle_mod.close_fte_registry_for_query(query_id)
+    elif close_at == "after_operation_token":
+        original = handle._start_fte_attempt_status_watcher_while_registry_open
+
+        def close_then_register(*args):
+            worker_handle_mod.close_fte_registry_for_query(query_id)
+            return original(*args)
+
+        monkeypatch.setattr(handle, "_start_fte_attempt_status_watcher_while_registry_open", close_then_register)
+    else:
+        previous = SimpleNamespace(
+            stop=lambda: worker_handle_mod.close_fte_registry_for_query(query_id),
+            join=lambda _timeout: None,
+            is_alive=lambda: False,
+            shutdown_timeout_s=lambda: 1.0,
+        )
+        worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt)] = previous
+
+    _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER(handle, query_id, attempt, handle, completion)
+
+    with pytest.raises(InterruptedError, match="query closed before"):
+        completion.result(timeout=0)
+
+
+def test_failed_status_observation_start_settles_result_and_removes_registration(monkeypatch):
+    query_id = "query-status-start-error"
+    attempt = FteTaskAttemptId.coerce(
+        {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    )
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1 << 60)
+    completion = Future()
+
+    def fail_start(_self):
+        raise RuntimeError("status runtime unavailable")
+
+    monkeypatch.setattr(FteAttemptStatusWatcher, "start", fail_start)
+    with pytest.raises(RuntimeError, match="status runtime unavailable"):
+        _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER(handle, query_id, attempt, handle, completion)
+    with pytest.raises(RuntimeError, match="status runtime unavailable"):
+        completion.result(timeout=0)
+    assert str(attempt) not in worker_handle_mod._FTE_STATUS_WATCHERS
+
+
+def test_fte_status_handler_preserves_observer_until_it_receives_the_terminal_payload(monkeypatch):
     from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-fte-live-status"
@@ -12232,7 +12341,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
                 {"state": "FINISHED", "task_stats": {"processed_input_rows": 10}},
             )
         )
-        assert watcher.stop_count == 1
+        assert watcher.stop_count == 0
         assert [status["state"] for status in fragment_execution.statuses] == [
             "RUNNING",
             "FINISHED",
@@ -12243,9 +12352,8 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS.pop((query_id, fragment_id), None)
 
 
-def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
+def test_fte_status_watcher_registry_is_dropped_after_async_wait_settles():
     from vane.runners.fte.fte_scheduler import (
-        FteAttemptStatusWatcher,
         FteSchedulerRegistry,
     )
 
@@ -12256,9 +12364,9 @@ def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
         worker_incarnation_id = "incarnation-slow-watcher-drop"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             entered.set()
-            time.sleep(0.25)
+            await asyncio.sleep(0.25)
             return {
                 "state": "RUNNING",
                 "task_id": task_id,
@@ -12280,7 +12388,6 @@ def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
         attempt_id=attempt_id,
         worker=_SlowWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
     worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt_id)] = watcher
 
@@ -12364,7 +12471,6 @@ def test_worker_pressure_drop_uses_exact_query_identity():
 
 def test_fte_status_watcher_rejects_mismatched_status_identity():
     from vane.runners.fte.fte_scheduler import (
-        FteAttemptStatusWatcher,
         FteEventHandlers,
         FteSchedulerRegistry,
     )
@@ -12374,7 +12480,7 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
         worker_incarnation_id = "incarnation-mismatched-watcher-status"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+        async def fte_wait_task_status_async(self, _task_id, _min_version, _timeout_s):
             return {
                 "state": "FINISHED",
                 "task_id_string": "query-fte-watcher-identity.0.99.0",
@@ -12404,7 +12510,6 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
         attempt_id=attempt_id,
         worker=_MismatchedWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
 
     watcher.start()
@@ -12417,8 +12522,8 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
 
 
 def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monkeypatch):
-    from vane.runners.fte.fte_scheduler import FteAttemptStatusWatcher
     from vane.runners.ray import fragment_worker_events as worker_events_mod
+    from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
     query_id = "query-fte-close-terminal-race"
     fragment_id = f"{query_id}:node:7"
@@ -12441,7 +12546,7 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
         worker_incarnation_id = "incarnation-close-terminal-race"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, _min_version, _timeout_s):
+        async def fte_wait_task_status_async(self, task_id, _min_version, _timeout_s):
             return {
                 "state": "FAILED",
                 "task_id": task_id,
@@ -12484,7 +12589,6 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
         attempt_id=attempt_id,
         worker=_TerminalWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
 
     def unregister(exited_watcher):
@@ -12871,7 +12975,7 @@ def test_fte_attempt_handle_registered_before_status_watcher_start(monkeypatch):
     )
     observed_registered_ids = []
 
-    def assert_registered_before_start(_self, query_id, attempt_id, _worker_handle):
+    def assert_registered_before_start(_self, query_id, attempt_id, _worker_handle, _completion):
         stored = worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY.get(str(query_id), [])
         stored_ids = [str(task_handle.task_id) for task_handle in stored]
         observed_registered_ids.append(stored_ids)
