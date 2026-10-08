@@ -138,6 +138,37 @@ def test_service_shutdown_waits_for_inflight_release(monkeypatch):
     assert killed == [actor]
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_failed_service_termination_retains_retry_and_rejects_new_contexts(monkeypatch, error_type):
+    ray = pytest.importorskip("ray")
+    service = pipelined_runtime.ResultServiceClient(vane.RayResources())
+    actor = service.actor = object()
+    attempts = []
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+
+    def kill(candidate, *, no_restart):
+        assert candidate is actor
+        assert no_restart
+        attempts.append(candidate)
+        if len(attempts) <= 2:
+            raise error_type("temporary termination failure")
+
+    monkeypatch.setattr(ray, "kill", kill)
+    for attempt in (1, 2):
+        with pytest.raises(error_type, match="temporary termination failure"):
+            service.close()
+        assert len(attempts) == attempt
+        assert not service.closed
+        assert service.actor is actor
+        with pytest.raises(RuntimeError, match="closing"):
+            service.create("new", vane.RayResources())
+        assert service.snapshot()["active_contexts"] == 0
+    service.close()
+    assert service.closed
+    service.close()
+    assert attempts == [actor] * 3
+
+
 def test_runtime_is_lazy_and_connections_have_explicit_service_ownership(monkeypatch):
     import sys
 

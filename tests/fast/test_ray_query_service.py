@@ -259,3 +259,59 @@ def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
         first.close()
         second.close()
         application.close()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_runtime_close_retries_failed_result_actor_termination(tmp_path, monkeypatch, mode):
+    import ray
+
+    application = vane.Runtime(resources(tmp_path, worker_count=1, partitions=1))
+    connection = application.connect(execution=mode)
+    original_kill = ray.kill
+    actor = None
+    attempts = 0
+    try:
+        assert connection.query("select 7").collect().column(0).to_pylist() == [7]
+        actor = connection.query_runtime.pool.results.actor
+
+        def fail_once(candidate, *, no_restart):
+            nonlocal attempts
+            if candidate._actor_id == actor._actor_id:
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("temporary actor termination failure")
+            return original_kill(candidate, no_restart=no_restart)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ray, "kill", fail_once)
+            with pytest.raises(RuntimeError, match="temporary actor termination failure"):
+                application.close()
+            snapshot = application.resource_snapshot()["service"]
+            assert snapshot["closing"] and not snapshot["closed"]
+            assert snapshot["result_service"]["active_contexts"] == 0
+            assert attempts == 1
+            assert ray.get(actor.__ray_ready__.remote(), timeout=5)
+            with pytest.raises(RuntimeError, match="closed"):
+                application.connect()
+
+            application.close()
+            assert application.resource_snapshot()["service"]["closed"]
+            assert attempts == 2
+            application.close()
+            assert attempts == 2
+
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "result actor did not terminate after retry"
+            try:
+                ray.get(actor.__ray_ready__.remote(), timeout=remaining)
+            except ray.exceptions.RayActorError:
+                break
+            time.sleep(min(0.01, remaining))
+    finally:
+        if actor is not None:
+            original_kill(actor, no_restart=True)
+        connection.close()
+        application.close()

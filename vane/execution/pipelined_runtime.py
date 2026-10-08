@@ -116,6 +116,7 @@ class ResultServiceClient:
         self.lock = threading.Lock()
         self.actor: Any = None
         self.contexts: dict[str, Any] = {}
+        self.closing = False
         self.closed = False
 
     def create(self, query_id: str, resources: RayResources) -> tuple[Any, str]:
@@ -125,8 +126,8 @@ class ResultServiceClient:
         from vane.execution.pipelined_worker import ResultService
 
         with self.lock:
-            if self.closed:
-                raise RuntimeError("result service is closed")
+            if self.closing:
+                raise RuntimeError("result service is closing")
             if not ray.is_initialized():
                 raise RuntimeError("Runtime queries require ray.init()")
             if query_id in self.contexts:
@@ -188,17 +189,19 @@ class ResultServiceClient:
 
     def close(self) -> None:
         with self.lock:
-            if self.contexts:
-                raise RuntimeError("result context cleanup is pending")
             if self.closed:
                 return
-            self.closed = True
-            actor = self.actor
-        if actor is not None:
-            import ray
+            self.closing = True
+            if self.contexts:
+                raise RuntimeError("result context cleanup is pending")
+            if self.actor is not None:
+                import ray
 
-            if ray.is_initialized():
-                ray.kill(actor, no_restart=True)
+                if ray.is_initialized():
+                    ray.kill(self.actor, no_restart=True)
+            # Reject new contexts once shutdown starts, but keep termination
+            # retryable if ray.kill raises. The lock serializes close attempts.
+            self.closed = True
 
 
 class WorkerPool:
