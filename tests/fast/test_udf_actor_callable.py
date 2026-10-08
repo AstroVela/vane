@@ -263,7 +263,8 @@ def test_materialized_output_preserves_source_types_for_duckdb_casts(values, dec
 
 
 @pytest.mark.parametrize("backend", ["subprocess_actor", pytest.param("ray_actor", marks=pytest.mark.real_ray)])
-def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch, backend):
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch, backend, batch_format):
     import vane
 
     if backend == "ray_actor":
@@ -274,7 +275,9 @@ def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch
 
         class Output:
             def __call__(self, table):
-                ids = table.column("id").to_pylist()
+                ids = (
+                    table["id"].tolist() if materialized and batch_format == "numpy" else table.column("id").to_pylist()
+                )
                 records = [{"X": [1.75, -2.5][i], "Text": b"\x00A"} for i in ids]
                 columns = {
                     "id": ids,
@@ -287,6 +290,13 @@ def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch
                     "empty": [[] for _ in ids],
                 }
                 if materialized:
+                    if batch_format == "numpy":
+                        for name, values in columns.items():
+                            if not isinstance(values, np.ndarray):
+                                column = np.empty(len(values), dtype=object)
+                                for index, value in enumerate(values):
+                                    column[index] = value
+                                columns[name] = column
                     return columns
                 columns["tensor"] = pa.FixedShapeTensorArray.from_numpy_ndarray(columns["tensor"])
                 columns["items"] = [list(items) for items in columns["items"]]
@@ -308,6 +318,7 @@ def test_actor_public_materialized_casts_match_arrow_output(request, monkeypatch
                         "fixed": "STRUCT(x BIGINT, text VARCHAR)[1]",
                         "empty": "STRUCT(x BIGINT)[]",
                     },
+                    batch_format=batch_format if materialized else "pyarrow",
                     batch_size=2,
                     execution_backend=backend,
                     actor_number=1,
@@ -425,19 +436,22 @@ def test_actor_udf_nullable_nested_output_matches_ordinary_contract(stream_outpu
     )
 
 
-def test_actor_udf_retains_normalization_for_different_logical_contract():
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+def test_actor_udf_retains_normalization_for_different_logical_contract(batch_format):
     import vane
 
     class Output:
         def __call__(self, table):
-            return {"frame": np.zeros((1, 2, 3, 3), dtype=np.uint8), "record": [{"x": 7}]}
+            records = np.array([{"x": 7}], dtype=object) if batch_format == "numpy" else [{"x": 7}]
+            return {"frame": np.zeros((1, 2, 3, 3), dtype=np.uint8), "record": records}
 
     runtime = UDFExecutor(
         _payload(
             Output,
+            batch_format=batch_format,
             output_schema=[
                 {"name": "frame", "kind": "tensor", "dtype": "UTINYINT", "shape": [2, 3, 3]},
-                {"name": "record", "type": "STRUCT(x BIGINT)"},
+                {"name": "record", "kind": "duckdb_type", "type": "STRUCT(x BIGINT)"},
             ],
             output_contract_types=[str(vane.tensor_type(vane.sqltypes.UTINYINT, [2, 3, 3])), "STRUCT(X BIGINT)"],
         )
@@ -450,14 +464,15 @@ def test_actor_udf_retains_normalization_for_different_logical_contract():
         runtime.close()
 
 
-def test_actor_udf_retains_governed_output_validation():
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+def test_actor_udf_retains_governed_output_validation(batch_format):
     import vane
 
     class Output:
         def __call__(self, table):
-            return {"y": [1]}
+            return {"y": np.array([1]) if batch_format == "numpy" else [1]}
 
-    runtime = UDFExecutor(_payload(Output, output_contract_types=["FILE"]))
+    runtime = UDFExecutor(_payload(Output, batch_format=batch_format, output_contract_types=["FILE"]))
     try:
         with pytest.raises(vane.InvalidInputException, match="FILE"):
             list(runtime.iter_submit(pa.table({"x": [1]})))
@@ -725,6 +740,84 @@ def test_plain_callable_prepare_method_is_not_a_hook():
         assert list(runtime.iter_submit(pa.table({"x": [1]})))[0].to_pydict() == {"y": [1]}
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("backend", ["ray_actor", "subprocess_actor", "ray_task", "subprocess_task"])
+@pytest.mark.parametrize("rows", [0, 4])
+@pytest.mark.parametrize("stream_output", [False, True])
+def test_numpy_canonical_tensor_output_avoids_repeated_normalization(monkeypatch, backend, rows, stream_output):
+    import vane.execution.udf_batch_format as format_module
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    owner = threading.get_ident()
+    events = []
+    frame_addresses = []
+    encode = format_module._numpy_batch_to_arrow
+    validate = FileUDFContract.validate_output_table
+    features = [None, [], [None], [{"label": 7, "confidence": 0.5, "bbox": [None, 2.0]}]][:rows]
+
+    def record_encode(batch, schema):
+        events.append(("encode", threading.get_ident()))
+        frame_addresses.append(batch["frame"].ctypes.data)
+        return encode(batch, schema)
+
+    def record_validate(self, table):
+        events.append(("validate", threading.get_ident()))
+        return validate(self, table)
+
+    def unexpected_normalization(self, table):
+        raise AssertionError("Framework-encoded canonical NumPy output must not traverse normalization again")
+
+    monkeypatch.setattr(format_module, "_numpy_batch_to_arrow", record_encode)
+    monkeypatch.setattr(FileUDFContract, "validate_output_table", record_validate)
+    monkeypatch.setattr(FileUDFContract, "normalize_output_table", unexpected_normalization)
+
+    def output(batch):
+        nested = np.empty(rows, dtype=object)
+        nested[:] = features
+        return {
+            "frame_index": np.arange(rows, dtype=np.int64),
+            "frame": np.arange(rows * 18, dtype=np.uint8).reshape(rows, 2, 3, 3),
+            "features": nested,
+        }
+
+    class Output:
+        def __call__(self, batch):
+            return output(batch)
+
+    runtime = UDFExecutor(
+        _payload(
+            Output if backend.endswith("actor") else output,
+            execution_backend=backend,
+            batch_format="numpy",
+            stream_output=stream_output,
+            output_schema=[
+                {"name": "frame_index", "kind": "duckdb_type", "type": "BIGINT"},
+                {"name": "frame", "kind": "tensor", "dtype": "UTINYINT", "shape": [2, 3, 3]},
+                {
+                    "name": "features",
+                    "kind": "duckdb_type",
+                    "type": "STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])[]",
+                },
+            ],
+        )
+    )
+    try:
+        tables = list(runtime.iter_submit(pa.table({"x": [1]})))
+    finally:
+        runtime.close()
+    assert events == [("encode", owner), ("validate", owner)]
+    if rows:
+        result = pa.concat_tables(tables)
+        assert result.column("frame_index").to_pylist() == list(range(rows))
+        assert result.column("features").to_pylist() == features
+        actual = result.column("frame").chunk(0).to_numpy_ndarray()
+        assert actual.ctypes.data == frame_addresses[0]
+        del result, tables, runtime
+        gc.collect()
+        np.testing.assert_array_equal(actual, np.arange(rows * 18, dtype=np.uint8).reshape(rows, 2, 3, 3))
+    else:
+        assert sum(table.num_rows for table in tables) == 0
 
 
 @pytest.mark.parametrize("backend", ["ray_actor", "subprocess_actor", "ray_task", "subprocess_task"])

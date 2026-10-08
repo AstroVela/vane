@@ -692,7 +692,20 @@ class UDFExecutor:
                     batch_format=self._batch_format,
                     resolved_output_schema=self._batch_output_schema,
                 ):
-                    yield self._file_contract.normalize_output_table(table)
+                    # NumPy's framework encoder can produce the same canonical
+                    # tensor storage as materialized Arrow-format dictionaries.
+                    # Compare the actual schema: inferred leaves may still need
+                    # the declared logical-storage conversion and DuckDB casts.
+                    if (
+                        self._batch_format == "numpy"
+                        and self._materialized_output_is_canonical
+                        and self._materialized_schema is not None
+                        and table.schema.equals(self._materialized_schema)
+                    ):
+                        self._file_contract.validate_output_table(table)
+                        yield table
+                    else:
+                        yield self._file_contract.normalize_output_table(table)
                 return
             for batch in _iter_output_batches(result):
                 canonical = False
