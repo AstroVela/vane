@@ -1,0 +1,251 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -4,6 +4,7 @@
+ #include "vane_fs/workspace.hpp"
+ #include "owner_lock.hpp"
+ #include "checkpoint.hpp"
++#include "payload_file.hpp"
+ 
+ #include <sqlite3.h>
+ 
+@@ -27,7 +28,7 @@
+ namespace {
+ constexpr int64_t BLOCK_SIZE = 4096;
+ constexpr int WAL_CHECKPOINT_PAGES = 4096;
+-constexpr int APPLICATION_ID = 0x56465331;
++constexpr int APPLICATION_ID = 0x56465833; // Isolated external-payload format.
+ 
+ [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
+ 	throw Error(code, message);
+@@ -471,7 +472,15 @@
+ 	if (!statement.Step()) {
+ 		Fail(ErrorCode::Storage, "Missing block payload");
+ 	}
+-	return statement.Bytes(0);
++	auto bytes = statement.Bytes(0);
++	if (bytes.size() == 8) {
++		auto offset = PayloadFile::Offset(bytes);
++		bytes.resize(BLOCK_SIZE);
++		PayloadFile::Get(db).Read(&bytes[0], bytes.size(), offset);
++	} else if (bytes.size() != BLOCK_SIZE) {
++		Fail(ErrorCode::Storage, "Invalid block payload size");
++	}
++	return bytes;
+ }
+ 
+ std::string Block(sqlite3 *db, int64_t inode, int64_t block, const View &view) {
+@@ -497,6 +506,13 @@
+ 	blocks.Bind(4, view.point);
+ 	blocks.Bind(5, view.point);
+ 	int64_t previous = -1;
++	int64_t pending_offset = 0, pending_target = 0, pending_size = 0;
++	auto flush = [&] {
++		if (pending_size) {
++			PayloadFile::Get(db).Read(&result[size_t(pending_target)], size_t(pending_size), pending_offset);
++			pending_size = 0;
++		}
++	};
+ 	while (blocks.Step()) {
+ 		auto block = blocks.Integer(0);
+ 		if (block == previous) {
+@@ -507,15 +523,29 @@
+ 		if (!bytes) {
+ 			Fail(ErrorCode::Storage, "Missing block payload");
+ 		}
+-		if (blocks.BytesSize(1) != BLOCK_SIZE) {
++		if (blocks.BytesSize(1) != BLOCK_SIZE && blocks.BytesSize(1) != 8) {
+ 			Fail(ErrorCode::Storage, "Invalid block payload size");
+ 		}
+ 		auto start = std::max(offset, block * BLOCK_SIZE);
+ 		auto source_offset = start - block * BLOCK_SIZE;
+ 		auto target_offset = start - offset;
+ 		auto amount = std::min(BLOCK_SIZE - source_offset, length - target_offset);
+-		std::memcpy(&result[size_t(target_offset)], bytes + source_offset, size_t(amount));
+-	}
++		if (blocks.BytesSize(1) == 8) {
++			auto physical = PayloadFile::Offset(blocks.Bytes(1)) + source_offset;
++			if (pending_size &&
++			    (physical != pending_offset + pending_size || target_offset != pending_target + pending_size))
++				flush();
++			if (!pending_size) {
++				pending_offset = physical;
++				pending_target = target_offset;
++			}
++			pending_size += amount;
++		} else {
++			flush();
++			std::memcpy(&result[size_t(target_offset)], bytes + source_offset, size_t(amount));
++		}
++	}
++	flush();
+ 	return result;
+ }
+ 
+@@ -552,6 +582,14 @@
+ 		}
+ 		payload_sql += "(?,?)";
+ 		version_sql += "(?1,?" + std::to_string(5 + 2 * i) + ",?2,?3,?4,0,?" + std::to_string(6 + 2 * i) + ")";
++	}
++	int64_t external = 0;
++	if (blocks.size() == 64) {
++		std::string bytes;
++		bytes.reserve(blocks.size() * BLOCK_SIZE);
++		for (const auto &block : blocks)
++			bytes += block.second;
++		external = PayloadFile::Get(db).Append(bytes);
+ 	}
+ 	Statement payloads(db, payload_sql), versions(db, version_sql);
+ 	versions.Bind(1, inode);
+@@ -561,7 +599,8 @@
+ 	for (size_t i = 0; i < blocks.size(); ++i) {
+ 		auto payload = ++last_payload;
+ 		payloads.Bind(int(1 + 2 * i), payload);
+-		payloads.BindBytes(int(2 + 2 * i), blocks[i].second);
++		payloads.BindBytes(int(2 + 2 * i),
++		                   external ? PayloadFile::Token(external + int64_t(i) * BLOCK_SIZE) : blocks[i].second);
+ 		versions.Bind(int(5 + 2 * i), blocks[i].first);
+ 		versions.Bind(int(6 + 2 * i), payload);
+ 	}
+@@ -741,6 +780,8 @@
+ 	int64_t process = OwnerLock::Process();
+ 	const Durability durability;
+ 	std::unique_ptr<Checkpointer> checkpointer;
++	std::unique_ptr<PayloadFile> payload_file;
++	bool new_workspace = false;
+ 
+ 	explicit Database(const std::string &path, int timeout_ms, Durability durability) : durability(durability) {
+ 		if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos || timeout_ms < 0) {
+@@ -766,6 +807,13 @@
+ 			              },
+ 			              nullptr, nullptr, nullptr));
+ 			ValidateIdentity();
++			{
++				Statement app(db, "PRAGMA application_id");
++				app.Step();
++				payload_file =
++				    std::make_unique<PayloadFile>(sqlite3_db_filename(db, "main"), app.Integer(0) == 0, timeout_ms);
++				Check(db, sqlite3_set_clientdata(db, PayloadFile::CLIENT_DATA, payload_file.get(), nullptr));
++			}
+ 			Exec(db, "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY");
+ 			{
+ 				Statement mode(db, "PRAGMA journal_mode=WAL");
+@@ -779,6 +827,7 @@
+ 			Exec(db, "BEGIN IMMEDIATE");
+ 			ValidateIdentity();
+ 			Initialize();
++			payload_file->Initialize(uuid, new_workspace);
+ 			Exec(db, R"SQL(
+ CREATE TABLE IF NOT EXISTS owners(id TEXT PRIMARY KEY, lock_path TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL) STRICT;
+ CREATE TABLE IF NOT EXISTS mounts(branch TEXT PRIMARY KEY REFERENCES branches(id), owner TEXT NOT NULL REFERENCES owners(id)) STRICT;
+@@ -793,7 +842,7 @@
+ CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload);
+ CREATE TABLE IF NOT EXISTS sync_barrier(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL CHECK(value IN(0,1))) STRICT;
+ INSERT OR IGNORE INTO sync_barrier VALUES(1,0);
+-UPDATE format SET version=2;
++UPDATE format SET version=1003;
+ )SQL");
+ 			owner_lock.Create(sqlite3_db_filename(db, "main"), owner);
+ 			{
+@@ -867,9 +916,10 @@
+ namespace {
+ class Transaction {
+ public:
+-	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false)
++	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false,
++	            bool exclusive_payload = false)
+ 	    : database(database), lock(database.mutex, std::defer_lock),
+-	      restore_normal(write && synchronous && database.durability == Durability::Fsync) {
++	      restore_normal(write && synchronous && database.durability == Durability::Fsync), write(write) {
+ 		if (database.process != OwnerLock::Process()) {
+ 			Fail(ErrorCode::Closed, "Reopen the workspace after fork");
+ 		}
+@@ -877,6 +927,7 @@
+ 		if (!database.db) {
+ 			Fail(ErrorCode::Closed, "Workspace is closed");
+ 		}
++		payload_guard = std::make_unique<PayloadFile::Guard>(*database.payload_file, exclusive_payload);
+ 		if (write && database.checkpointer) {
+ 			if (barrier)
+ 				database.checkpointer->CheckError();
+@@ -918,6 +969,10 @@
+ 		}
+ 	}
+ 	void Commit() {
++		// Even NORMAL metadata commits may reach storage opportunistically.
++		// Make every newly published external extent durable first.
++		if (write)
++			database.payload_file->Flush();
+ 		Exec(database.db, "COMMIT");
+ 		committed = true;
+ 		for (const auto &pin : retired_pins) {
+@@ -930,9 +985,10 @@
+ private:
+ 	Database &database;
+ 	std::unique_lock<std::mutex> lock;
++	std::unique_ptr<PayloadFile::Guard> payload_guard;
+ 	std::vector<std::shared_ptr<SnapshotPin>> retired_pins;
+ 	bool committed = false;
+-	bool restore_normal;
++	bool restore_normal, write;
+ };
+ 
+ void CheckMount(sqlite3 *db, const std::string &branch, bool require_unmounted = false) {
+@@ -1022,13 +1078,13 @@
+ 	app.Step();
+ 	if (app.Integer(0) == APPLICATION_ID) {
+ 		Statement meta(db, "SELECT uuid,version,block_size,coordinate_bytes FROM format");
+-		if (!meta.Step() || (meta.Integer(1) != 1 && meta.Integer(1) != 2) || meta.Integer(2) != BLOCK_SIZE ||
+-		    meta.Integer(3) != 32) {
++		if (!meta.Step() || meta.Integer(1) != 1003 || meta.Integer(2) != BLOCK_SIZE || meta.Integer(3) != 32) {
+ 			Fail(ErrorCode::Storage, "Unsupported VaneFS format");
+ 		}
+ 		uuid = meta.Text(0);
+ 		return;
+ 	}
++	new_workspace = true;
+ 	Exec(db, R"SQL(
+ CREATE TABLE format(uuid TEXT NOT NULL, version INTEGER NOT NULL, block_size INTEGER NOT NULL, coordinate_bytes INTEGER NOT NULL) STRICT;
+ CREATE TABLE branches(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent TEXT NOT NULL, fork_base TEXT NOT NULL,
+@@ -1041,7 +1097,7 @@
+ CREATE TABLE pins(id TEXT PRIMARY KEY, snapshot TEXT NOT NULL REFERENCES snapshots(id), owner TEXT NOT NULL) STRICT;
+ CREATE INDEX snapshot_pins ON pins(snapshot);
+ CREATE TABLE inode_ids(id INTEGER PRIMARY KEY AUTOINCREMENT) STRICT;
+-CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(length(data)=4096)) STRICT;
++CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(length(data) IN (8,4096))) STRICT;
+ )SQL");
+ 	for (auto table : {INODES, DIRENTS, BLOCKS}) {
+ 		std::string keys =
+@@ -1063,7 +1119,7 @@
+ 	}
+ 	uuid = NewId();
+ 	{
+-		Statement meta(db, "INSERT INTO format VALUES(?,1,4096,32)");
++		Statement meta(db, "INSERT INTO format VALUES(?,1003,4096,32)");
+ 		meta.Bind(1, uuid);
+ 		meta.Step();
+ 	}
+@@ -1754,7 +1810,9 @@
+ }
+ 
+ CollectionResult Workspace::CollectGarbage() {
+-	Transaction tx(*database, true);
++	// Exclude native readers until the durable deletion and physical sweep
++	// finish. Inline payloads retain SQLite's usual versioned reclamation.
++	Transaction tx(*database, true, true, false, true);
+ 	CollectionResult result;
+ 	Exec(database->db,
+ 	     "DELETE FROM snapshots WHERE retained=0 AND NOT EXISTS(SELECT 1 FROM branches WHERE state!='deleted' AND "
+@@ -1772,6 +1830,13 @@
+ 	     "DELETE FROM block_payloads WHERE NOT EXISTS(SELECT 1 FROM block_versions WHERE payload=block_payloads.id)");
+ 	result.payloads = sqlite3_changes64(database->db);
+ 	tx.Commit();
++	std::vector<int64_t> live;
++	{
++		Statement rows(database->db, "SELECT data FROM block_payloads WHERE length(data)=8");
++		while (rows.Step())
++			live.push_back(PayloadFile::Offset(rows.Bytes(0)));
++	}
++	database->payload_file->Reclaim(std::move(live));
+ 	return result;
+ }
+ 

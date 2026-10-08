@@ -488,3 +488,10 @@ The [background checkpoint measurements](benchmarks/CHECKPOINT_OPTIMIZATION.md)
 record fsync-mode checkpoints at 16 MiB, write admission at 64 MiB, and the
 before/after throughput and WAL tradeoffs. They include reader backpressure,
 background I/O failures, slow storage, crash recovery and monitored reruns.
+
+The isolated [external-payload experiment](benchmarks/external_payload/README.md)
+implements a C++ hybrid store with immutable external data, inline small updates,
+ordered durable publication and coordinated garbage collection. It compares
+the stock backend with external payloads and a checkpoint batching follow-up,
+including fault injection and allocation aging. These prototypes use a separate
+experimental format; the production storage format and defaults remain unchanged.
