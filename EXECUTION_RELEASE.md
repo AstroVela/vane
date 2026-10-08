@@ -1,8 +1,10 @@
-# Execution support and release qualification
+# Execution support and artifact qualification
 
-This matrix describes the execution candidate.
+This matrix describes the implementation on the development branch.
 Published versions are identified by their approved GitHub Release notes.
 The [release process](RELEASE.md) defines versioning and artifact promotion.
+Branch development covers implementation, installed-package checks and ordinary
+PR CI. A release workflow, version tag or index upload is a separate task.
 
 ## Platforms and entry points
 
@@ -83,7 +85,10 @@ The gate runs in three places:
 The gate is an artifact smoke test. Detailed SQL, lifecycle, recovery, resource
 and performance qualification continues to use the existing acceptance suites.
 
-## Candidate promotion checklist
+## Later release qualification
+
+Use this checklist when a release is explicitly being prepared. It is separate
+from completing development on this branch.
 
 - Record the exact candidate commit, package version, native engine identity,
   artifact checksums and matching CI/build-only release run URLs.
@@ -98,6 +103,6 @@ and performance qualification continues to use the existing acceptance suites.
 - Promote only the exact approved artifacts through the existing protected
   release workflow. This work adds no version tag, publication or index upload.
 
-The [roadmap](PIPELINED_EXECUTION_ROADMAP.md#p53-发布验收) records which candidate
-checks have actually run. Local development runs only affected tests; full CI
-and release qualification remain separate gates.
+The [roadmap](PIPELINED_EXECUTION_ROADMAP.md#p53-开发与安装验收) records which
+development checks have actually run. Local development runs only affected tests;
+ordinary PR CI and formal release qualification remain separate gates.

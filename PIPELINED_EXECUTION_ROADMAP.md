@@ -12,6 +12,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 - 新模块只有完成实际入口接线后才成为公开能力；数据结构测试通过不代表查询已经可运行。
 - 旧源码在接管对应职责后删除；调用方与测试按新契约修改，不增加 legacy 别名或 fallback。
 - 优先运行受影响测试；本轮按要求只验收相关测试，不运行完整 release gate。测试环境必须使用非 editable 安装，并记录运行的代码和 native 基线。
+- 当前目标是分支开发与普通 PR 验收。正式版本选择、合入 main、Release workflow、tag 和包发布属于后续独立任务；准备发布工具不代表现在执行发布流程。
 
 ## 里程碑概览
 
@@ -22,7 +23,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.4、P5.3a 已完成相关验收；历史 Flight 超时归因、P5.3b 与正式发布待完成 |
+| P5 | 旧路径删除、支持矩阵、安装与性能验收 | P4 | P5.1、P5.2.1–P5.2.4、P5.3a 已完成相关验收；历史 Flight 超时归因与 P5.3b 普通 PR CI 待完成 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -248,7 +249,7 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 - [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。已复现环境 HTTP 代理停顿导致原生控制 RPC 在约 2 秒超时的独立缺陷，并改为显式直连。历史故障缺少操作及代理现场，尚不能确认与本次缺陷属于同一事件；证据边界见[执行验收](EXECUTION_ACCEPTANCE.md#flight-proxy-isolation)。
 - [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
-- [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
+- [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试，已通过 PR #977 合入 `a0216cab07`。
 - [x] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界已完成单机验收。
   - [x] P5.2.4a：Flight 会话控制、独立启动、鉴权、租约与可重试关闭；已完成相关验证。详见 [Server 设计](SERVER_DESIGN.md)。
   - [x] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与所有权由 Server 管理，已完成两种模式和 TLS 的相关验证。
@@ -256,13 +257,14 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Quack。SessionService / QueryService 独立于线协议，内部 Flight exchange 保留，不实现双协议兼容或 fallback。
 
-### P5.3 发布验收
+### P5.3 开发与安装验收
 
 - [x] P5.3a：固定支持矩阵与失败边界，增加独立于 checkout 的 local / Runtime / TLS Flight 安装验收，接入每个 manylinux wheel 与 TestPyPI/PyPI 安装验证。详见[执行发布矩阵](EXECUTION_RELEASE.md)。
-- [ ] P5.3b：为候选提交记录 Python/平台 CI、完整 release gate 与 build-only 发布流程证据；macOS / Windows 原生单元测试不能替代 Python 服务验收。
-- [ ] 更新发布文档与版本，按验收结果发布。
+- [ ] P5.3b：为当前分支提交记录普通 PR 的 Python/平台 CI 与 CI 中的基础 release gate 结果；macOS / Windows 原生单元测试不能替代 Python 服务验收。
 
-本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 的历史 Flight 超时定位及 P5.3 发布验收未完成前不宣称 P5 整体完成。
+本地只运行受影响测试，不运行完整 release/fast 套件。历史 Flight 超时的未确认根因与实际 CI 状态继续如实记录，不以重跑成功代替根因证明。
+
+正式发布不作为本轮分支开发的退出条件。后续明确开始发布时，再按 [RELEASE.md](RELEASE.md) 选择版本、完成 build-only / 索引安装验收、合入发布分支并创建 tag；本轮只保留这些流程所需的工具接线。
 
 ## 增量验收记录
 

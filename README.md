@@ -77,9 +77,24 @@ with vane.connect() as connection:
         print(result.collect())
 ```
 
-For distributed analytical SELECTs, initialize Ray and create a connection with
-`backend="ray"`. Ray queries support pipelined execution and FTE with a registered
-shared exchange store. Local SQL, Relation, model and DataSink APIs remain local.
+For distributed analytical SELECTs, initialize Ray and create an application
+`Runtime`. Its connections share workers, result delivery and resource budgets:
+
+```python
+import ray
+import vane
+
+ray.init()
+try:
+    with vane.Runtime() as runtime, runtime.connect() as connection:
+        with connection.query("SELECT sum(range) FROM range(1000)") as result:
+            print(result.collect())
+finally:
+    ray.shutdown()
+```
+
+Ray queries support pipelined execution and FTE with a registered shared exchange
+store. Local SQL, Relation, model and DataSink APIs remain local.
 See the [execution design and support matrix](PIPELINED_EXECUTION_DESIGN.md) for
 configuration, ownership and unsupported operations. Global runner selection has
 been removed; unsupported distributed queries fail explicitly.

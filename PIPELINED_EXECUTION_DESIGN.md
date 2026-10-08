@@ -138,7 +138,7 @@ PIPELINED 只执行一个 attempt。FTE 按显式失败分类和重试上限创�
 
 纯 `prepare_ray_query` 只编译和验证，不复制文件；普通 Parquet 不能经此入口声明为可重放。公开 FTE 查询在获得存储预留后调用明确具有文件写入效果的 `stage_ray_query`，先冻结输入，再绑定及优化。失败产生的部分副本由查询存储 lease 清理，不改变数据库状态。
 
-### 公开 API 与后续目标
+### 公开 API
 
 P1.1 接通以下 local 入口。QueryResources 是会话共享的容量，独立 cursor 共用准入和结果预算；QueryExecutionOptions 是本次查询的不可变期限快照。
 
@@ -170,7 +170,7 @@ local.query 只接受自动提交下的单条只读 SELECT；命令使用 execut
 
 QueryResult 暴露 schema（Arrow schema）、query_id、context、read_batch/迭代、collect、cancel、close、execution_state 和交付 state。read_batch 返回 RecordBatch，正常 EOF 抛出 StopIteration，部分交付后的 native 错误继续抛出。collect 只收集剩余行，逐批复制到调用方内存并释放传输 lease。关闭结果或连接后，已经导出的 Arrow 切片、NumPy 零拷贝视图仍可读取并持续占用预算，直到最后一个视图释放。
 
-当前默认 rows_per_batch=2048，资源与期限默认值如上例；这些是初始功能配置，性能验收后再调整。result_buffer_bytes 只限制结果交付持有的 IPC 缓冲，不包含 DuckDB 算子、native 预取缓冲或 collect 的完整副本。超过窗口的单批立即报容量错误；能够放入窗口的下一批等待旧 lease 释放，可由取消或期限唤醒。需要控制 native 预取时使用连接的 streaming_buffer_size 设置。查询与交付期限分别从准入及结果句柄就绪开始计算，慢消费期间二者都可能到期。
+当前默认 rows_per_batch=2048，资源与期限默认值如上例；P5 的容量与性能对照支持保留当前默认值，依据见[执行基准](EXECUTION_BENCHMARKS.md)。result_buffer_bytes 只限制结果交付持有的 IPC 缓冲，不包含 DuckDB 算子、native 预取缓冲或 collect 的完整副本。超过窗口的单批立即报容量错误；能够放入窗口的下一批等待旧 lease 释放，可由取消或期限唤醒。需要控制 native 预取时使用连接的 streaming_buffer_size 设置。查询与交付期限分别从准入及结果句柄就绪开始计算，慢消费期间二者都可能到期。
 
 Ray 查询通过应用级 Runtime 创建会话。RayResources 定义整个服务的 worker 池、准入、结果和存储容量；不同 Session 及其 cursors 共用这些资源。Session 可传入更小的 QueryResources，服务与会话额度在同一个准入队列和结果账本中同时检查。
 
@@ -187,7 +187,7 @@ with vane.Runtime(resources) as runtime, runtime.connect(execution="pipelined") 
             del batch
 ~~~
 
-当前入口支持 P0 已验证的只读 SQL 子集：常量、range、普通本地 Parquet、filter、projection 与 GATHER；HASH 图可通过 FragmentCompileOptions 验收。文件必须使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。整数、浮点、布尔、字符串及 NULL 在 native Flight 中传输，空结果保留 schema。单次 query 可显式选择 execution="pipelined" 或 execution="fte"；SQL 参数、聚合/join、模型 UDF 等尚未接线的能力明确报错。P3 的 FTE 入口如下。
+当前入口支持只读分析 SQL，包括常量、range、Parquet、filter、projection、分组聚合、等值 join、排序、TopN 和 LIMIT；精确的算子及类型边界见下方“SQL 与类型范围”。Pipelined 文件扫描使用所有 worker 可访问的绝对路径，prepare 和 start 均校验快照。FTE 将输入冻结到注册的共享存储，示例如下。单次 query 可显式选择 execution="pipelined" 或 execution="fte"；SQL 参数、模型 UDF、媒体类型与写入等范围外能力明确报错。
 
 Runtime 注册共享存储，Session 或单条查询选择 FTE。部署前将下例路径替换为所有参与者挂载的同一目录；输入文件只需要在提交端可读，worker 读取冻结副本。
 
@@ -212,7 +212,7 @@ with vane.Runtime(resources) as runtime, runtime.connect() as connection:
 
 `runtime.connect(execution="fte")` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
 
-客户端必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。当前使用 Ray 节点地址和动态端口；网关、TLS 和固定端口部署属于后续部署能力。
+嵌入式 Runtime 的调用进程必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。独立 Server 已提供固定的公开控制与结果端口及双端口 TLS；远程 Client 只需访问这些公开端点，不加入 Ray，详见 [Server 设计](SERVER_DESIGN.md)。
 
 连接提供默认值，query 提交时冻结快照。同一 Ray 连接的并发查询可以选择不同分布式策略，不修改进程环境；local 连接拒绝分布式策略 override。已经提交的查询不能原地切换目标。Relation 等上层表达入口如继续提供，也必须提交到同一个 QuerySpec 入口。
 
@@ -362,7 +362,7 @@ prepare_worker_plan 先检查 worker 的 engine、协议、类型/连接 profile
 
 RayQuerySpec.cache_key 对规范序列化计算 SHA-256，包含 engine、完整图、schema、分区规则、执行/超时选项、资源声明、连接与 source 快照，只排除 query_id。它标识可复用的计划蓝图；不缓存结果、连接、attempt、端点或 reservation，命中后仍必须重新检查 source 与 worker。
 
-[提交验收测试](tests/fast/test_execution_submission.py) 覆盖独立进程加载、规划连接关闭、设置冻结与 session 隔离、文件变化、能力不匹配、快照损坏、native 元数据不一致和缓存身份。测试通过有限物化设施核对 SQL 结果，尚不代表 Ray 流水查询已可公开执行。
+[提交验收测试](tests/fast/test_execution_submission.py) 覆盖独立进程加载、规划连接关闭、设置冻结与 session 隔离、文件变化、能力不匹配、快照损坏、native 元数据不一致和缓存身份。这些测试验证提交层契约；公开 Ray 查询与服务入口另由 P2/P3 和 P5 的真实 Ray 验收覆盖。
 
 ### 固定路由与 split
 
@@ -976,11 +976,11 @@ P3 不能通过委托旧 FTE 引擎完成。新的任务服务、计划格式、
 
 退出条件：SQL 对照、空输入、NULL、倾斜、低容量活性、多消费者及两种模式混跑通过。AI/GPU UDF 按独立 backend 矩阵扩展，不作为纯 SQL 闭环的隐含前提。
 
-### P5 删除旧入口并完成发布验收
+### P5 删除旧入口并完成开发验收
 
 清除被替代的 runner 分流、任务协议、结果包装、配置别名和文档，更新所有受支持调用方。重写依赖旧内部实现的测试，保留并扩展其有效语义场景。
 
-退出条件：所有公开查询入口只进入新引擎，旧调度器和结果路径不在运行依赖中；对应 release gate 通过；提供新 API、支持矩阵、可复现基准和数值默认值依据。
+开发退出条件：所有公开查询入口只进入新引擎，旧调度器和结果路径不在运行依赖中；相关测试和普通 PR CI 中的基础 release gate 通过；提供新 API、支持矩阵、可复现基准和数值默认值依据。正式版本、Release workflow、tag 与包发布是后续独立任务，不要求在本轮分支开发期间执行。
 
 各阶段按新能力组织可审阅的变更。开发期间尚未删除的旧源码只能作为参考，不能成为新实现的执行依赖；阶段性原型不代表完整双模式已经交付。正式发布以新架构和声明的能力范围验收，不以旧接口继续可用为条件。
 
