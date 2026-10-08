@@ -19,6 +19,64 @@ from vane.execution import pipelined_runtime, pipelined_worker
 from vane.execution.compiler import compile_fragment_graph
 
 
+def test_release_fences_delayed_creation_without_retaining_query_history():
+    actor = pipelined_worker.ResultService(2)
+    limits = vane.RayResources()
+    actor.create("held", limits, 1)
+    for sequence in range(2, 1002):
+        actor.release(str(sequence), sequence)
+        with pytest.raises(RuntimeError, match="already retired"):
+            actor.create(str(sequence), limits, sequence)
+    assert tuple(actor.contexts) == ("held",)
+    assert actor.retired.ranges == [(2, 1001)]
+    actor.release("held", 1)
+    assert actor.retired.ranges == [(1, 1001)]
+    actor.create("new", limits, 1002)
+    actor.release("new", 1002)
+
+
+def test_out_of_order_release_preserves_live_creation_gaps():
+    actor = pipelined_worker.ResultService(4)
+    for sequence in (6, 2, 4, 5, 6):
+        actor.release(str(sequence), sequence)
+    for sequence in (1, 3, 7):
+        actor.create(str(sequence), vane.RayResources(), sequence)
+    for sequence in (2, 4, 5, 6):
+        with pytest.raises(RuntimeError, match="already retired"):
+            actor.create(str(sequence), vane.RayResources(), sequence)
+    for sequence in (3, 7, 1):
+        actor.release(str(sequence), sequence)
+    assert actor.retired.ranges == [(1, 7)]
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_creation_submit_error_keeps_owner_until_fresh_release(monkeypatch, installed):
+    ray = pytest.importorskip("ray")
+    limits = vane.RayResources(max_results=1)
+    server = pipelined_worker.ResultService(1)
+
+    def create(identity, resources, sequence):
+        if installed:
+            server.create(identity, resources, sequence)
+        raise ray.exceptions.ActorUnavailableError("ambiguous submit", None)
+
+    client = pipelined_runtime.ResultServiceClient(limits)
+    client.actor = SimpleNamespace(
+        create=SimpleNamespace(remote=create), release=SimpleNamespace(remote=server.release)
+    )
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(pipelined_runtime, "_get", lambda *args, **kwargs: None)
+    with pytest.raises(ray.exceptions.ActorUnavailableError):
+        client.create("query", limits)
+    assert client.snapshot()["active_contexts"] == 1
+    sequence = client.sequences["query"]
+    client.release(client.actor, "query")
+    assert client.snapshot()["active_contexts"] == 0
+    assert server.contexts == {}
+    with pytest.raises(RuntimeError, match="already retired"):
+        server.create("query", limits, sequence)
+
+
 @pytest.mark.parametrize("operation", ["prepare", "connect", "connect_materialized"])
 def test_inflight_rpc_retains_its_closed_context(monkeypatch, operation):
     monkeypatch.setattr(pipelined_worker, "_host", lambda: "127.0.0.1")
@@ -27,8 +85,8 @@ def test_inflight_rpc_retains_its_closed_context(monkeypatch, operation):
         root = next(f for f in graph.fragments if f.fragment_id == graph.result.fragment_id)
         schema = root.outputs[0].schema
     actor = pipelined_worker.ResultService(2)
-    actor.create("old", vane.RayResources())
-    actor.create("other", vane.RayResources())
+    actor.create("old", vane.RayResources(), 1)
+    actor.create("other", vane.RayResources(), 2)
     actor.prepare("other", schema, "other-ticket")
     entered, proceed = threading.Event(), threading.Event()
     original = getattr(pipelined_worker.ResultContext, operation)
@@ -45,27 +103,27 @@ def test_inflight_rpc_retains_its_closed_context(monkeypatch, operation):
         pending = threads.submit(getattr(actor, operation), "old", *args)
         try:
             assert entered.wait(5)
-            actor.release("old")
-            actor.create("new", vane.RayResources())
+            actor.release("old", 1)
+            actor.create("new", vane.RayResources(), 3)
             actor.prepare("new", schema, "new-ticket")
             proceed.set()
             with pytest.raises(RuntimeError, match="context|canceled|no longer accepts"):
                 pending.result(timeout=5)
             actor.cancel("old", "late cancellation")
-            actor.release("old")
+            actor.release("old", 1)
             for name in ("other", "new"):
                 assert actor.status(name)["error"] == ""
                 assert not actor.contexts[name].stop.is_set()
         finally:
             proceed.set()
-            for name in ("old", "other", "new"):
-                actor.release(name)
+            for sequence, name in enumerate(("old", "other", "new"), 1):
+                actor.release(name, sequence)
 
 
 def test_failed_context_cleanup_retains_capacity_and_other_queries(monkeypatch):
     actor = pipelined_worker.ResultService(2)
-    actor.create("a", vane.RayResources())
-    actor.create("b", vane.RayResources())
+    actor.create("a", vane.RayResources(), 1)
+    actor.create("b", vane.RayResources(), 2)
     original = actor.contexts["a"].release
 
     def fail():
@@ -73,24 +131,25 @@ def test_failed_context_cleanup_retains_capacity_and_other_queries(monkeypatch):
 
     monkeypatch.setattr(actor.contexts["a"], "release", fail)
     with pytest.raises(RuntimeError, match="watchdog"):
-        actor.release("a")
+        actor.release("a", 1)
     with pytest.raises(RuntimeError, match="capacity"):
-        actor.create("c", vane.RayResources())
+        actor.create("c", vane.RayResources(), 3)
     assert not actor.contexts["b"].stop.is_set()
     monkeypatch.setattr(actor.contexts["a"], "release", original)
-    actor.release("a")
-    actor.create("c", vane.RayResources())
-    actor.release("b")
-    actor.release("c")
+    actor.release("a", 1)
+    actor.create("c", vane.RayResources(), 3)
+    actor.release("b", 2)
+    actor.release("c", 3)
 
 
 @pytest.mark.parametrize("error", [TimeoutError("cleanup timeout"), RuntimeError("native cleanup failed")])
 def test_failed_release_retains_shared_process_and_context(monkeypatch, error):
     ray = pytest.importorskip("ray")
-    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity: identity))
+    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity, sequence: identity))
     service = pipelined_runtime.ResultServiceClient(vane.RayResources())
     service.actor = actor
     service.contexts.update(a="created-a", b="created-b")
+    service.sequences.update(a=1, b=2)
     killed = []
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(ray, "kill", lambda actor, **kwargs: killed.append(actor))
@@ -112,17 +171,17 @@ def test_failed_release_retains_shared_process_and_context(monkeypatch, error):
     assert killed == [actor]
 
 
-@pytest.mark.parametrize("failed_rpc", ["create", "release"])
 @pytest.mark.parametrize("failure", ["unavailable", "unknown"])
-def test_result_service_outage_retains_capacity_until_release_is_confirmed(monkeypatch, failed_rpc, failure):
+def test_result_service_outage_retains_capacity_until_release_is_confirmed(monkeypatch, failure):
     ray = pytest.importorskip("ray")
     resources = vane.RayResources(max_results=1)
     server = pipelined_worker.ResultService(1)
-    server.create("query", resources)
-    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity: ("release", identity)))
+    server.create("query", resources, 1)
+    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity, sequence: ("release", identity)))
     client = pipelined_runtime.ResultServiceClient(resources)
     client.actor = actor
     client.contexts["query"] = ("create", "query")
+    client.sequences["query"] = 1
     error = (
         ray.exceptions.ActorUnavailableError("temporary transport outage", None)
         if failure == "unavailable"
@@ -132,10 +191,10 @@ def test_result_service_outage_retains_capacity_until_release_is_confirmed(monke
 
     def get(reference, **kwargs):
         operation, query_id = reference
-        if unavailable and operation == failed_rpc:
+        assert operation == "release"
+        if unavailable:
             raise error
-        if operation == "release":
-            server.release(query_id)
+        server.release(query_id, 1)
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(pipelined_runtime, "_get", get)
@@ -152,41 +211,41 @@ def test_result_service_outage_retains_capacity_until_release_is_confirmed(monke
         assert client.snapshot()["active_contexts"] == 0
         assert server.contexts == {}
         client.release(actor, "query")
-        server.create("next", resources)
+        server.create("next", resources, 2)
     finally:
         for query_id in tuple(server.contexts):
-            server.release(query_id)
+            server.release(query_id, 1 if query_id == "query" else 2)
 
 
-@pytest.mark.parametrize("failed_rpc", ["create", "release"])
-def test_confirmed_result_actor_death_retires_cleanup_ownership(monkeypatch, failed_rpc):
+def test_confirmed_result_actor_death_retires_cleanup_ownership(monkeypatch):
     ray = pytest.importorskip("ray")
-    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity: ("release", identity)))
+    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity, sequence: ("release", identity)))
     client = pipelined_runtime.ResultServiceClient(vane.RayResources())
     client.actor = actor
     client.contexts["query"] = ("create", "query")
+    client.sequences["query"] = 1
     calls = []
 
     def get(reference, **kwargs):
         operation, query_id = reference
         calls.append(operation)
-        if operation == failed_rpc:
-            raise ray.exceptions.ActorDiedError()
+        raise ray.exceptions.ActorDiedError()
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(pipelined_runtime, "_get", get)
     client.release(actor, "query")
     assert client.snapshot()["active_contexts"] == 0
     client.release(actor, "query")
-    assert calls == (["create"] if failed_rpc == "create" else ["create", "release"])
+    assert calls == ["release"]
 
 
 def test_service_shutdown_waits_for_inflight_release(monkeypatch):
     ray = pytest.importorskip("ray")
-    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity: identity))
+    actor = SimpleNamespace(release=SimpleNamespace(remote=lambda identity, sequence: identity))
     service = pipelined_runtime.ResultServiceClient(vane.RayResources())
     service.actor = actor
     service.contexts["query"] = "created"
+    service.sequences["query"] = 1
     entered, proceed = threading.Event(), threading.Event()
     killed = []
     monkeypatch.setattr(ray, "is_initialized", lambda: True)

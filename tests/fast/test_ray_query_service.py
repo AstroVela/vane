@@ -53,13 +53,14 @@ def test_late_controls_cannot_touch_other_result_contexts(tmp_path, mode):
     with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
         first = connection.query("select 42", execution=mode)
         old = first.context._reader
+        old_sequence = connection.query_runtime.pool.results.sequences[old.result_id]
         first.collect()
         with connection.query("select range from range(100)", execution=mode) as result:
             current = result.context._reader
             assert current.relay._actor_id == old.relay._actor_id
             assert current.result_id != old.result_id
             ray.get(old.relay.cancel.remote(old.result_id, "late cancellation"), timeout=5)
-            ray.get(old.relay.release.remote(old.result_id), timeout=5)
+            ray.get(old.relay.release.remote(old.result_id, old_sequence), timeout=5)
             stale = [
                 old.relay.status.remote(old.result_id),
                 old.relay.prepare.remote(old.result_id, b"", ""),
@@ -227,11 +228,9 @@ def test_result_process_loss_fails_all_resident_results_without_replacement(tmp_
 
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
-@pytest.mark.parametrize("failed_rpc", ["create_receipt", "release", "release_receipt"])
+@pytest.mark.parametrize("failed_rpc", ["release", "release_receipt"])
 def test_result_service_outage_keeps_public_cleanup_retryable(tmp_path, monkeypatch, mode, failed_rpc):
     import ray
-
-    from vane.execution import pipelined_runtime
 
     with (
         vane.Runtime(resources(tmp_path, worker_count=1, partitions=1, max_results=1)) as application,
@@ -240,27 +239,18 @@ def test_result_service_outage_keeps_public_cleanup_retryable(tmp_path, monkeypa
         result = connection.query("select range from range(8)")
         service = connection.query_runtime.pool.results
         actor = service.actor
-        creation = service.contexts[result.context.query_id]
-        original_get = pipelined_runtime._get
         original_release = actor.release.remote
 
-        def fail_receipt(reference, context=None, timeout=30):
-            if reference == creation:
-                raise ray.exceptions.ActorUnavailableError("temporary create receipt outage", None)
-            return original_get(reference, context, timeout)
-
-        def fail_release(query_id):
+        def fail_release(query_id, sequence):
             if failed_rpc == "release_receipt":
                 # The cleanup may have run even though its reply was lost.
-                ray.get(original_release(query_id), timeout=5)
+                ray.get(original_release(query_id, sequence), timeout=5)
+                return ray.put(ray.exceptions.ActorUnavailableError("lost release reply", None))
             raise ray.exceptions.ActorUnavailableError("temporary release outage", None)
 
         try:
             with monkeypatch.context() as patch:
-                if failed_rpc == "create_receipt":
-                    patch.setattr(pipelined_runtime, "_get", fail_receipt)
-                else:
-                    patch.setattr(actor, "release", SimpleNamespace(remote=fail_release))
+                patch.setattr(actor, "release", SimpleNamespace(remote=fail_release))
                 for _ in range(2):
                     with pytest.raises(RuntimeError, match=r"retry result\.close"):
                         result.close()
@@ -278,11 +268,10 @@ def test_result_service_outage_keeps_public_cleanup_retryable(tmp_path, monkeypa
 
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
-@pytest.mark.parametrize("failed_rpc", ["prepare_receipt", "release"])
+@pytest.mark.parametrize("failed_rpc", ["release", "release_receipt"])
 def test_worker_outage_keeps_session_and_capacity_until_cleanup_succeeds(tmp_path, monkeypatch, mode, failed_rpc):
     import ray
 
-    from vane.execution import pipelined_runtime, recovery_runtime
     from vane.execution.recovery_runtime import RecoveryScheduler
 
     dispatched = threading.Event()
@@ -311,8 +300,13 @@ def test_worker_outage_keeps_session_and_capacity_until_cleanup_succeeds(tmp_pat
             scheduler = result.context._reader
             pool = session.pool
             worker = pool.workers[0]
+            method = "release" if mode == "pipelined" else "release_materialized"
+            original_release = getattr(worker, method).remote
 
             def unavailable(*args):
+                if failed_rpc == "release_receipt":
+                    ray.get(original_release(*args), timeout=5)
+                    return ray.put(ray.exceptions.ActorUnavailableError("lost worker release reply", None))
                 raise ray.exceptions.ActorUnavailableError("temporary worker release outage", None)
 
             try:
@@ -322,33 +316,15 @@ def test_worker_outage_keeps_session_and_capacity_until_cleanup_succeeds(tmp_pat
                 coordinator = pool.admission.snapshot()["reservations"]
                 assert native and coordinator
                 with monkeypatch.context() as outage:
-                    if failed_rpc == "release":
-                        outage.setattr(
-                            worker,
-                            "release" if mode == "pipelined" else "release_materialized",
-                            SimpleNamespace(remote=unavailable),
-                        )
-                    else:
-                        receipts = (
-                            scheduler.prepare_calls
-                            if mode == "pipelined"
-                            else [attempt.prepare for attempt in scheduler.active.values()]
-                        )
-                        module = pipelined_runtime if mode == "pipelined" else recovery_runtime
-                        original_get = module._get
-
-                        def fail_receipt(reference, context=None, timeout=30):
-                            if reference in receipts:
-                                unavailable()
-                            return original_get(reference, context, timeout)
-
-                        outage.setattr(module, "_get", fail_receipt)
+                    outage.setattr(worker, method, SimpleNamespace(remote=unavailable))
                     for _ in range(2):
                         with pytest.raises(RuntimeError, match="retry"):
                             first.close()
                         assert session.session_id in application.resource_snapshot()["service"]["sessions"]
                         assert pool.admission.snapshot()["reservations"] == coordinator
-                        assert ray.get(worker.resources_snapshot.remote(), timeout=5)["reservations"] == native
+                        assert ray.get(worker.resources_snapshot.remote(), timeout=5)["reservations"] == (
+                            native if failed_rpc == "release" else {}
+                        )
                         assert not scheduler.closed
                     with pytest.raises(RequestQueueTimeout):
                         second.query("select 7", options=vane.QueryExecutionOptions(vane.RayExecution(), 0.1, 30, 30))
@@ -363,6 +339,85 @@ def test_worker_outage_keeps_session_and_capacity_until_cleanup_succeeds(tmp_pat
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("receipt_kind", ["create", "prepare"])
+@pytest.mark.parametrize("actor_state", ["alive", "dead"])
+def test_failed_creation_receipt_does_not_block_fresh_cleanup(tmp_path, monkeypatch, mode, receipt_kind, actor_state):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    dispatched = threading.Event()
+    dispatch = RecoveryScheduler._dispatch
+
+    def hold_attempt(owner, *args):
+        accepted = dispatch(owner, *args)
+        if accepted:
+            attempt = next(iter(owner.active.values()))
+            ray.get(attempt.prepare, timeout=10)
+            dispatched.set()
+            assert owner.stop.wait(20), "test did not cancel the prepared attempt"
+        return accepted
+
+    if mode == "fte":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", hold_attempt)
+    application = vane.Runtime(resources(tmp_path, worker_count=1, partitions=1, max_active_queries=1, max_results=1))
+    connection = application.connect(execution=mode)
+    result = connection.query("select range from range(1000000)" if mode == "pipelined" else "select 42")
+    scheduler = result.context._reader
+    session = connection.query_runtime
+    service = session.pool.results
+    try:
+        if mode == "fte":
+            assert dispatched.wait(10)
+        # This is an immutable failed ObjectRef, not a mocked get() which can
+        # become successful later. Recovery must use a new remote invocation.
+        failed = ray.put(ray.exceptions.ActorUnavailableError("lost creation reply", None))
+        for _ in range(2):
+            with pytest.raises(ray.exceptions.ActorUnavailableError):
+                ray.get(failed)
+        if receipt_kind == "create":
+            service.contexts[scheduler.result_id] = failed
+            actor = service.actor
+        else:
+            if mode == "pipelined":
+                scheduler.prepare_calls[:] = [failed]
+            else:
+                next(iter(scheduler.active.values())).prepare = failed
+            actor = session.pool.workers[0]
+        if actor_state == "dead":
+            ray.kill(actor, no_restart=True)
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    ray.get(actor.__ray_ready__.remote(), timeout=1)
+                except ray.exceptions.ActorDiedError:
+                    break
+                except ray.exceptions.ActorUnavailableError:
+                    pass
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        connection.close()
+        assert scheduler.closed
+        snapshot = application.resource_snapshot()["service"]
+        assert snapshot["sessions"] == {}
+        assert snapshot["request_admission"]["active_requests"] == 0
+        assert snapshot["workers"]["reservations"] == {}
+        assert snapshot["result_service"]["active_contexts"] == 0
+        assert snapshot["result_delivery"]["active_results"] == 0
+        if actor_state == "alive":
+            assert ray.get(session.pool.workers[0].resources_snapshot.remote(), timeout=5)["reservations"] == {}
+            with application.connect() as second:
+                assert second.query("select 7").collect().column(0).to_pylist() == [7]
+        application.close()
+        assert application.resource_snapshot()["service"]["closed"]
+    finally:
+        close_result(result)
+        connection.close()
+        application.close()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_runtime_close_deadline_covers_remote_cleanup_and_preserves_retry(tmp_path, monkeypatch, mode):
     from vane.execution import pipelined_runtime
 
@@ -370,13 +425,19 @@ def test_runtime_close_deadline_covers_remote_cleanup_and_preserves_retry(tmp_pa
     connection = application.connect(execution=mode)
     result = connection.query("select 42")
     service = connection.query_runtime.pool.results
-    receipt = service.contexts[result.context.query_id]
+    receipts = []
+    original_release = service.actor.release.remote
     original_get = pipelined_runtime._get
     entered, proceed = threading.Event(), threading.Event()
     timeouts = []
 
+    def release(*args):
+        reference = original_release(*args)
+        receipts.append(reference)
+        return reference
+
     def delayed(reference, context=None, timeout=30):
-        if reference == receipt:
+        if reference in receipts:
             timeouts.append(timeout)
             entered.set()
             assert proceed.wait(10), "test did not release cleanup RPC"
@@ -384,6 +445,7 @@ def test_runtime_close_deadline_covers_remote_cleanup_and_preserves_retry(tmp_pa
 
     try:
         with monkeypatch.context() as patch, ThreadPoolExecutor(1) as threads:
+            patch.setattr(service.actor, "release", SimpleNamespace(remote=release))
             patch.setattr(pipelined_runtime, "_get", delayed)
             started = time.monotonic()
             pending = threads.submit(application.close, timeout=0.2)

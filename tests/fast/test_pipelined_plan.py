@@ -4,6 +4,8 @@
 """Submission identities, fixed placement and capacity validation without Ray."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -108,11 +110,89 @@ def test_failed_prepare_keeps_owner_until_cleanup_succeeds(monkeypatch):
     monkeypatch.setattr(_Query, "prepare", fail_prepare)
     monkeypatch.setattr(_Query, "close", fail_close)
     with pytest.raises(ValueError, match="preparation failed") as error:
-        worker.prepare(worker.epoch, spec.to_dict(), 0, list(tasks), routes, 3)
+        worker.prepare(worker.epoch, spec.to_dict(), 0, list(tasks), routes, 3, 1)
     assert "cleanup pending" in str(error.value.__cause__)
     assert spec.query_id in worker.resources_snapshot()["reservations"]
     assert spec.query_id in worker.queries
     monkeypatch.setattr(_Query, "close", close)
-    worker.release(worker.epoch, spec.query_id)
+    worker.release(worker.epoch, spec.query_id, 1)
     assert worker.resources_snapshot()["reservations"] == {}
     assert worker.queries == {}
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_release_fences_preparation_before_native_registration(tmp_path, monkeypatch, mode):
+    from vane.execution.fte_plan import bind_task
+    from vane.execution.fte_store import StorePool
+    from vane.execution.materialized_store import CommitCoordinator
+    from vane.execution.pipelined_worker import PipelinedWorker
+    from vane.execution.submission import RayQuerySpec
+
+    config = vane.ExchangeStore("shared", str(tmp_path / "store"))
+    limits = vane.RayResources(worker_count=1, partitions=1, exchange_stores=(config,))
+    worker = PipelinedWorker(limits)
+    target = vane.RayExecution(mode, vane.FteOptions("shared", 3, 0) if mode == "fte" else None)
+    with vane.connect(backend="local") as connection:
+        spec = prepare_ray_query(
+            connection,
+            "select 42",
+            query_id="delayed-prepare",
+            options=vane.QueryExecutionOptions(target, 5, 30, 30),
+            resources=ResourceDemand(1, 8, MemoryDemand(2**26, 2**20, 2**20, 2**20), 4),
+        )
+    store = StorePool(config)
+    lease = store.reserve(spec.query_id)
+    coordinator = CommitCoordinator(
+        store.store, spec.query_id, worker.engine, (), max_bytes=config.query_bytes, namespace=lease.value["namespace"]
+    )
+    if mode == "pipelined":
+        tasks, routes = placement(spec, [worker.epoch], "result-context")
+
+        def prepare():
+            return worker.prepare(worker.epoch, spec.to_dict(), 0, list(tasks), routes, 3, 1)
+
+        def release():
+            worker.release(worker.epoch, spec.query_id, 1)
+    else:
+        fragment = spec.graph.fragments[0]
+        binding = bind_task(spec, fragment, 0, {})
+        coordinator.declare_stage((binding.task,))
+        reservation = coordinator.begin(binding.task.task_id, worker.epoch, object_bytes=config.object_bytes)
+        key = f"fte/{spec.query_id}/{reservation.token.fence}"
+
+        def prepare():
+            worker.prepare_materialized(
+                worker.epoch, spec.to_dict(), fragment.fragment_id, 0, {}, reservation.to_dict(), lease.to_dict(), 3, 1
+            )
+
+        def release():
+            worker.release_materialized(worker.epoch, key, 1)
+
+    entered, proceed = threading.Event(), threading.Event()
+    decode = RayQuerySpec.from_dict
+
+    def delayed(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(5), "test did not resume preparation"
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(RayQuerySpec, "from_dict", staticmethod(delayed))
+    try:
+        with ThreadPoolExecutor(1) as threads:
+            pending = threads.submit(prepare)
+            try:
+                assert entered.wait(5)
+                release()
+                assert worker.resources_snapshot()["reservations"] == {}
+            finally:
+                proceed.set()
+            with pytest.raises(RuntimeError, match="already retired"):
+                pending.result(timeout=5)
+        assert worker.queries == {} and worker.attempts == {}
+        assert worker.resources_snapshot()["reservations"] == {}
+    finally:
+        proceed.set()
+        release()
+        if mode == "fte":
+            coordinator.discard(reservation.token)
+        lease.close(coordinator.close)

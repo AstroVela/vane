@@ -666,13 +666,15 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 [pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。服务共享的 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
 
-[pipelined_runtime.py](vane/execution/pipelined_runtime.py) 的 PipelinedScheduler 将整张图作为活动组，按任务固定分配到 worker。先准备全部任务及结果上下文，再绑定输入、验证客户端及 worker 的 Flight 握手，最后逆拓扑启动消费者和生产者。任一准备失败都会等待已发出的 prepare 结算并撤销整组预留；release 失败保留重试所有者。独立 native pump 推进已经启动的任务，Ray RPC 不搬运 RecordBatch。
+[pipelined_runtime.py](vane/execution/pipelined_runtime.py) 的 PipelinedScheduler 将整张图作为活动组，按任务固定分配到 worker。先准备全部任务及结果上下文，再绑定输入、验证客户端及 worker 的 Flight 握手，最后逆拓扑启动消费者和生产者。任一准备失败都会向原 worker epoch 发起新的 release，确认原生清理后撤销整组预留；release 失败保留重试所有者。独立 native pump 推进已经启动的任务，Ray RPC 不搬运 RecordBatch。
 
 结果服务是一个常驻 Ray actor 内的 native relay，数据路径为 root worker → ResultService → 客户端 native channel → QueryResult。两跳各自拥有窗口和 staging。每条查询拥有独立 ResultContext；服务 max_results 和会话 max_results 同时限制尚未释放的结果数量，已生产完成但仍持有的结果继续占位。交付 IPC 缓冲受服务与会话 result_buffer_bytes 双重约束，导出的 Arrow/NumPy 视图通过 BatchLease 持续计费，关闭会话后也不会提前归还这些字节。
 
 应用使用 `with vane.Runtime(RayResources(...)) as runtime` 明确持有服务。构造 Runtime 不启动 Ray；第一次 connect 建立进程内 QueryService 核心并注册 Session，第一次分布式查询按需启动 worker 及唯一 ResultService actor。后续 Session 和查询复用这些进程。Session.close 取消、清理本会话查询，保留服务和其他 Session；Runtime.close 禁止新会话与查询，清理所有 Session 后停止共享进程。清理失败保留所有者与额度，调用方可重试 close。没有隐式全局 Runtime、每会话 actor 池或自动重建结果服务的路径。
 
 Session 还持有对应的原生连接，并在 Session 层独立索引所有 native cursors；索引使用弱引用，允许不再被使用的中间 cursor 正常回收。关闭 Session 时禁止继续创建 cursor，持有存活连接的强引用并逐个关闭，因此中间节点回收不会遗漏嵌套 cursor。最后一个原生连接释放数据库和查询资源后才注销 Session；Runtime 确认注册表为空后才停止共享进程并标记关闭。worker 或结果服务暂时不可达时，保留清理所有者和配额；只有 release 确认成功或 Ray 明确报告 ActorDiedError 才完成该资源的清理。
+
+创建/准备 RPC 的失败 ObjectRef 不会随 actor 恢复而变为成功，清理不等待旧回执，且每次重试都发起新的 release RPC。结果服务创建、pipelined prepare 和 FTE prepare 共用以下规则：调用方在发送前记录每个 actor epoch 内连续递增的序号；release 在注册表锁内先封闭该序号，再等待已注册 owner 的原生资源关闭。迟到的创建/准备调用在注册原生状态前检查该序号，因此 release 先到也不会在确认后重新留下 context。已释放序号按连续区间合并，区间间隙只对应尚未完成清理的调用，不逐条保留历史查询。新的 release 仍不可达或超时时，Session、查询配额和结果槽位继续由原调用方持有。
 
 `Runtime.close(timeout=...)` 从入口建立单一单调时钟截止时间，取消、RPC 等待、线程退出、存储清理和原生连接关闭共用剩余预算。每个服务最多执行一个关闭任务；即使原生操作或 RPC 提交暂时阻塞，调用方也会在等待期限内收到 TimeoutError。超时不注销尚未关闭的 Session，也不丢弃其资源和关闭任务；后续 close 等待正在进行的任务，或在它结束后用新的剩余预算重试，不并发释放同一资源。
 

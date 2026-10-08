@@ -637,7 +637,7 @@ def test_expired_coordinator_lease_cancels_real_worker_and_reclaims_orphans(tmp_
         lease.renew()
         ray.get(
             worker.prepare_materialized.remote(
-                epoch, spec.to_dict(), fragment.fragment_id, 0, {}, reservation.to_dict(), lease.to_dict(), 64
+                epoch, spec.to_dict(), fragment.fragment_id, 0, {}, reservation.to_dict(), lease.to_dict(), 64, 1
             ),
             timeout=10,
         )

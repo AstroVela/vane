@@ -117,6 +117,8 @@ class ResultServiceClient:
         self.lock = threading.Lock()
         self.actor: Any = None
         self.contexts: dict[str, Any] = {}
+        self.sequences: dict[str, int] = {}
+        self.next_sequence = 0
         self.closing = False
         self.closed = False
 
@@ -150,10 +152,12 @@ class ResultServiceClient:
                     .options(memory=memory * self.resources.max_results)
                     .remote(self.resources.max_results)
                 )
-            # Keep the creation RPC even if its caller is interrupted before it
-            # observes completion. release() settles it before retiring state.
-            reference = self.actor.create.remote(query_id, resources)
-            self.contexts[query_id] = reference
+            # Own cleanup before dispatch, including an ambiguous submit error.
+            # A fresh release fences this call even if its receipt never succeeds.
+            self.next_sequence += 1
+            self.sequences[query_id] = self.next_sequence
+            self.contexts[query_id] = None
+            self.contexts[query_id] = self.actor.create.remote(query_id, resources, self.next_sequence)
             return self.actor, query_id
 
     def prepared(self, query_id: str, context: QueryContext) -> None:
@@ -167,19 +171,16 @@ class ResultServiceClient:
         with self.lock:
             if query_id not in self.contexts or actor is not self.actor:
                 return
-            reference = self.contexts[query_id]
+            sequence = self.sequences[query_id]
         if ray.is_initialized():
             try:
-                try:
-                    _get(reference, timeout=cleanup_timeout(10))
-                except ray.exceptions.RayTaskError:
-                    pass  # create may have installed state before failing.
                 timeout = cleanup_timeout(10)
-                _get(actor.release.remote(query_id), timeout=timeout)
+                _get(actor.release.remote(query_id, sequence), timeout=timeout)
             except ray.exceptions.ActorDiedError:
                 pass  # Only confirmed death makes remote cleanup unnecessary.
         with self.lock:
             self.contexts.pop(query_id, None)
+            self.sequences.pop(query_id, None)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -215,6 +216,7 @@ class WorkerPool:
         self.lock = threading.Lock()
         self.workers: list[Any] = []
         self.epochs: list[str] = []
+        self.call_sequences: list[int] = []
         self.closed = False
 
     def ensure(self, context: QueryContext, engine: str) -> None:
@@ -241,6 +243,7 @@ class WorkerPool:
                             + resources.staging_buffer_bytes,
                         ).remote(resources)
                     )
+                    self.call_sequences.append(0)
                 descriptions = [worker.describe.remote() for worker in self.workers]
                 for reference in descriptions:
                     value = _get(reference, context)
@@ -252,7 +255,15 @@ class WorkerPool:
                     ray.kill(worker, no_restart=True)
                 self.workers.clear()
                 self.epochs.clear()
+                self.call_sequences.clear()
                 raise
+
+    def next_call(self, index: int, worker: Any, epoch: str) -> int:
+        with self.lock:
+            if self.closed or self.workers[index] is not worker or self.epochs[index] != epoch:
+                raise RuntimeError("worker epoch changed before preparation")
+            self.call_sequences[index] += 1
+            return self.call_sequences[index]
 
     def close(self) -> None:
         with self.lock:
@@ -267,6 +278,7 @@ class WorkerPool:
                         ray.kill(worker, no_restart=True)
             self.workers.clear()
             self.epochs.clear()
+            self.call_sequences.clear()
         self.results.close()
 
     def replace(self, index: int, epoch: str, context: QueryContext, engine: str) -> None:
@@ -297,6 +309,7 @@ class WorkerPool:
                 raise
             self.workers[index] = replacement
             self.epochs[index] = value["epoch"]
+            self.call_sequences[index] = 0
 
 
 class PipelinedScheduler:
@@ -320,6 +333,7 @@ class PipelinedScheduler:
         self.cleanup_lock = threading.Lock()
         self.prepared: set[int] = set()
         self.prepare_calls: list[Any] = []
+        self.worker_calls: dict[int, tuple[Any, str, int]] = {}
         self.closed = False
         self.failure = ""
         self.schema: Any = None
@@ -371,15 +385,19 @@ class PipelinedScheduler:
             with self.lock:
                 if self.stop.is_set():
                     raise RuntimeError("query canceled before worker preparation")
+                epoch = self.pool.epochs[index]
+                sequence = self.pool.next_call(index, worker, epoch)
+                self.worker_calls[index] = (worker, epoch, sequence)
                 self.prepared.add(index)  # Rollback includes an in-flight prepare RPC.
                 self.prepare_calls.append(
                     worker.prepare.remote(
-                        self.pool.epochs[index],
+                        epoch,
                         self.spec.to_dict(),
                         index,
                         owned,
                         routes,
                         self.resources.exchange.frame_rows,
+                        sequence,
                     )
                 )
         locations = {
@@ -549,35 +567,28 @@ class PipelinedScheduler:
             if self.client is not None:
                 self.client.close()
             if not ray.is_initialized():
-                if self.relay is not None:
-                    self.pool.results.release(self.relay, self.result_id)
+                self.pool.results.release(self.pool.results.actor, self.context.query_id)
                 self.pool.admission.release(self.reservation)
                 self.closed = True
                 return
-            # Do not release a reservation before its prepare call has settled.
-            # Even if the caller stopped waiting, the remote preparation owns it.
-            for reference in self.prepare_calls:
-                try:
-                    _get(reference, timeout=cleanup_timeout(10))
-                except (ray.exceptions.RayTaskError, ray.exceptions.ActorDiedError):
-                    pass
+            # Creation receipts may be permanently failed or still pending. A
+            # fresh release fences late preparation and confirms native cleanup.
             errors = []
-            for index in self.prepared:
+            for worker, epoch, sequence in self.worker_calls.values():
                 try:
                     timeout = cleanup_timeout(10)
                     _get(
-                        self.pool.workers[index].release.remote(self.pool.epochs[index], self.spec.query_id),
+                        worker.release.remote(epoch, self.spec.query_id, sequence),
                         timeout=timeout,
                     )
                 except ray.exceptions.ActorDiedError:
                     pass  # Dead epoch owns no usable native reservation.
                 except BaseException as error:
                     errors.append(error)
-            if self.relay is not None:
-                try:
-                    self.pool.results.release(self.relay, self.result_id)
-                except BaseException as error:
-                    errors.append(error)
+            try:
+                self.pool.results.release(self.pool.results.actor, self.context.query_id)
+            except BaseException as error:
+                errors.append(error)
             if errors:
                 raise RuntimeError("worker release failed; retry result.close()") from errors[0]
             self.pool.admission.release(self.reservation)

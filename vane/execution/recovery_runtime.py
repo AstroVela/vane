@@ -40,6 +40,7 @@ class RunningAttempt:
     partition: int
     binding: TaskBinding
     reservation: AttemptReservation
+    sequence: int
     prepare: Any = None
     capacity_token: str = ""
 
@@ -235,7 +236,16 @@ class RecoveryScheduler:
                 reserved = self.coordinator.begin(
                     binding.task.task_id, epoch, object_bytes=self.store.config.object_bytes
                 )
-                attempt = RunningAttempt(index, worker, epoch, partition, binding, reserved, capacity_token=token)
+                attempt = RunningAttempt(
+                    index,
+                    worker,
+                    epoch,
+                    partition,
+                    binding,
+                    reserved,
+                    self.pool.next_call(index, worker, epoch),
+                    capacity_token=token,
+                )
                 self.active[index] = attempt
                 self.history.append(reserved.token)
                 attempt.prepare = worker.prepare_materialized.remote(
@@ -247,6 +257,7 @@ class RecoveryScheduler:
                     reserved.to_dict(),
                     self.lease.to_dict(),
                     self.resources.exchange.frame_rows,
+                    attempt.sequence,
                 )
                 return True
             except BaseException:
@@ -259,7 +270,10 @@ class RecoveryScheduler:
 
         try:
             timeout = cleanup_timeout(5)
-            _get(attempt.worker.release_materialized.remote(attempt.epoch, attempt.key), timeout=timeout)
+            _get(
+                attempt.worker.release_materialized.remote(attempt.epoch, attempt.key, attempt.sequence),
+                timeout=timeout,
+            )
         except ray.exceptions.ActorDiedError:
             pass
         with self.lock:
@@ -463,22 +477,16 @@ class RecoveryScheduler:
             for attempt in tuple(self.active.values()):
                 try:
                     if ray.is_initialized():
-                        if attempt.prepare is not None:
-                            try:
-                                _get(attempt.prepare, timeout=cleanup_timeout(5))
-                            except (ray.exceptions.RayTaskError, ray.exceptions.ActorDiedError):
-                                pass
                         self._release(attempt)
                     else:
                         self.active.pop(attempt.index, None)
                         self.pool.admission.release(attempt.capacity_token)
                 except BaseException as error:
                     errors.append(error)
-            if self.relay is not None:
-                try:
-                    self.pool.results.release(self.relay, self.result_id)
-                except BaseException as error:
-                    errors.append(error)
+            try:
+                self.pool.results.release(self.pool.results.actor, self.context.query_id)
+            except BaseException as error:
+                errors.append(error)
             if errors:
                 raise RuntimeError("FTE native cleanup is pending; retry result.close()") from errors[0]
             if self.read_lease is not None:
