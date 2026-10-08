@@ -1,0 +1,101 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -29,6 +29,13 @@
+ namespace {
+ constexpr int64_t BLOCK_SIZE = 4096;
+ constexpr int WAL_CHECKPOINT_PAGES = 4096;
++constexpr size_t EXTERNAL_BYTES = 256 * 1024;
++
++// Conservatively include both padded boundary blocks, before BEGIN IMMEDIATE.
++// Acquiring publication after the SQL writer lock would invert checkpoint locks.
++bool MayExternalize(size_t bytes) {
++	return bytes > EXTERNAL_BYTES - 2 * BLOCK_SIZE;
++}
+ constexpr int APPLICATION_ID = 0x56465834; // Isolated external-payload format.
+ 
+ [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
+@@ -585,7 +592,7 @@
+ 		version_sql += "(?1,?" + std::to_string(5 + 2 * i) + ",?2,?3,?4,0,?" + std::to_string(6 + 2 * i) + ")";
+ 	}
+ 	int64_t external = 0;
+-	if (blocks.size() == 64) {
++	if (blocks.size() == EXTERNAL_BYTES / BLOCK_SIZE) {
+ 		std::string bytes;
+ 		bytes.reserve(blocks.size() * BLOCK_SIZE);
+ 		for (const auto &block : blocks)
+@@ -927,7 +934,7 @@
+ class Transaction {
+ public:
+ 	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false,
+-	            bool exclusive_payload = false)
++	            bool exclusive_payload = false, bool external_payload = false)
+ 	    : database(database), lock(database.mutex, std::defer_lock),
+ 	      restore_normal(write && synchronous && database.durability == Durability::Fsync), write(write),
+ 	      full(write && (synchronous || database.durability == Durability::Strict)) {
+@@ -944,7 +951,10 @@
+ 			else
+ 				database.checkpointer->BeforeWrite(database.db);
+ 		}
+-		if (write)
++		// Inline NORMAL transactions cannot introduce unpublished external bytes.
++		// SQLite serializes them with the WAL-prefix capture and FULL barriers;
++		// they need neither the publication gate nor a per-operation fence read.
++		if (full || external_payload)
+ 			publication = std::make_unique<Staging::Guard>(*database.staging);
+ 		payload_guard = std::make_unique<PayloadFile::Guard>(*database.payload_file, exclusive_payload);
+ 		// SQLite requires changing synchronous outside a transaction. On failure
+@@ -1280,7 +1290,7 @@
+ }
+ 
+ void Session::WriteFile(const std::string &path, const std::string &data) {
+-	Transaction tx(*database, true);
++	Transaction tx(*database, true, false, false, false, MayExternalize(data.size()));
+ 	auto view = SessionView(database->db, id, snapshot, closed, true);
+ 	if (!path.empty() && path.back() == '/') {
+ 		Fail(ErrorCode::IsDirectory, "Cannot write a file with a trailing slash");
+@@ -1296,7 +1306,7 @@
+ }
+ 
+ void Session::Write(const std::string &path, const std::string &data, int64_t offset) {
+-	Transaction tx(*database, true);
++	Transaction tx(*database, true, false, false, false, MayExternalize(data.size()));
+ 	auto view = SessionView(database->db, id, snapshot, closed, true);
+ 	auto node = Resolve(database->db, path, view);
+ 	WriteBytes(database->db, node, data, offset, view);
+@@ -2211,7 +2221,7 @@
+ }
+ 
+ void Session::WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append, bool synchronous) {
+-	Transaction tx(*database, true, synchronous);
++	Transaction tx(*database, true, synchronous, false, false, MayExternalize(data.size()));
+ 	auto view = SessionView(database->db, id, snapshot, closed, true);
+ 	auto node = OpenedInode(database->db, inode, view);
+ 	WriteBytes(database->db, node, data, append ? node.fields[1] : offset, view);
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -341,8 +341,9 @@
+ 		CheckpointGuard checkpoint(*this, false);
+ 		// NOOP is SQLITE_LOCKED on a connection already in a transaction.
+ 		// A separate pager reports committed mxFrame, excluding spilled pages
+-		// from the current IMMEDIATE transaction. The publication guard excludes
+-		// other managed writers and checkpoints throughout this capture.
++		// from the current IMMEDIATE transaction. Its SQLite writer lock excludes
++		// inline commits; the publication guard excludes external writers and
++		// managed checkpoints throughout this capture.
+ 		sqlite3 *raw = nullptr;
+ 		auto code = sqlite3_open_v2(path.c_str(), &raw,
+ 		                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, nullptr);
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,3 +117,11 @@
+   add_test(NAME vane_fs_checkpoint_coalescing COMMAND vane_fs_checkpoint_coalescing_test "${CMAKE_CURRENT_BINARY_DIR}/owned-coalescing-test")
+   set_tests_properties(vane_fs_checkpoint_coalescing PROPERTIES TIMEOUT 30)
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_inline_publication_test tests/test_inline_publication.cpp)
++  target_include_directories(vane_fs_inline_publication_test PRIVATE src)
++  target_link_libraries(vane_fs_inline_publication_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  add_test(NAME vane_fs_inline_publication COMMAND vane_fs_inline_publication_test "${CMAKE_CURRENT_BINARY_DIR}/owned-inline-test")
++  set_tests_properties(vane_fs_inline_publication PROPERTIES TIMEOUT 90)
++endif()

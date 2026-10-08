@@ -7,6 +7,11 @@ experiment makes those commits immediately visible while allowing multiple
 appends to share a payload barrier. It adds a recovery protocol; it does not
 change SQLite's durability guarantees by itself.
 
+The [conditional checkpoint and selective publication follow-up](conditional/README.md)
+tests OPEN-only batching and removes publication-gate work from inline NORMAL
+transactions. It reduces the directory regression, but random I/O and sync tails
+still prevent adoption. The results below describe the preceding candidates.
+
 ## Protocol and scope
 
 The prepared component retains the previous immutable external extents, 4 KiB
