@@ -216,3 +216,12 @@ case now retains only its 128 KiB of live content. Fragmented page reuse still
 amplifies random reads, while reclaiming 512 KiB from mostly live extents makes
 GC about 14 times slower in the 8 MiB fixture. Both candidates remain outside
 the production format; all measurements and failure/recovery checks are retained.
+
+The [SQLite page-layout experiment](page_layout/README.md) keeps independent
+4 KiB payload rows and compares 4/8/16/32 KiB database pages with equal cache and
+WAL byte budgets. Larger pages remove payload overflow pages, but eight fresh
+FUSE rounds show no 256 MiB write improvement; WAL volume and random-write cost
+increase. Four rounds after deletion and GC retain the same read/write tradeoff,
+with additional metadata and allocation costs. All four candidates pass the
+related component and native tests. Production defaults remain unchanged;
+the report retains full samples, GC/space checks and reproduction patches.
