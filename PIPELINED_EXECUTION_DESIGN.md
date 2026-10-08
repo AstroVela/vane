@@ -672,7 +672,7 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 应用使用 `with vane.Runtime(RayResources(...)) as runtime` 明确持有服务。构造 Runtime 不启动 Ray；第一次 connect 建立进程内 QueryService 核心并注册 Session，第一次分布式查询按需启动 worker 及唯一 ResultService actor。后续 Session 和查询复用这些进程。Session.close 取消、清理本会话查询，保留服务和其他 Session；Runtime.close 禁止新会话与查询，清理所有 Session 后停止共享进程。清理失败保留所有者与额度，调用方可重试 close。没有隐式全局 Runtime、每会话 actor 池或自动重建结果服务的路径。
 
-Session 还持有对应的原生连接；Runtime 关闭时同时关闭该连接及其 cursors，最后一个原生连接释放数据库和查询资源后才注销 Session。worker 或结果服务暂时不可达时，保留清理所有者和配额；只有 release 确认成功或 Ray 明确报告 ActorDiedError 才完成该资源的清理。
+Session 还持有对应的原生连接，并在 Session 层独立索引所有 native cursors；索引使用弱引用，允许不再被使用的中间 cursor 正常回收。关闭 Session 时禁止继续创建 cursor，持有存活连接的强引用并逐个关闭，因此中间节点回收不会遗漏嵌套 cursor。最后一个原生连接释放数据库和查询资源后才注销 Session；Runtime 确认注册表为空后才停止共享进程并标记关闭。worker 或结果服务暂时不可达时，保留清理所有者和配额；只有 release 确认成功或 Ray 明确报告 ActorDiedError 才完成该资源的清理。
 
 `Runtime.close(timeout=...)` 从入口建立单一单调时钟截止时间，取消、RPC 等待、线程退出、存储清理和原生连接关闭共用剩余预算。每个服务最多执行一个关闭任务；即使原生操作或 RPC 提交暂时阻塞，调用方也会在等待期限内收到 TimeoutError。超时不注销尚未关闭的 Session，也不丢弃其资源和关闭任务；后续 close 等待正在进行的任务，或在它结束后用新的剩余预算重试，不并发释放同一资源。
 

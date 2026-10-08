@@ -451,6 +451,29 @@ def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
         application.close()
 
 
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_runtime_close_retires_query_on_orphaned_nested_cursor(tmp_path, mode):
+    application = vane.Runtime(resources(tmp_path, worker_count=1, partitions=1))
+    connection = application.connect(execution=mode)
+    nested = connection.cursor().cursor()
+    result = nested.query("select range from range(1000000)" if mode == "pipelined" else "select 42")
+    try:
+        application.close()
+        snapshot = application.resource_snapshot()["service"]
+        assert snapshot["closed"] and snapshot["sessions"] == {}
+        assert snapshot["request_admission"]["active_requests"] == 0
+        assert snapshot["result_delivery"]["active_results"] == 0
+        assert snapshot["workers"]["reservations"] == {}
+        assert not result.context.cleanup_pending()
+        with pytest.raises(vane.ConnectionException, match="closed"):
+            nested.cursor()
+    finally:
+        close_result(result)
+        nested.close()
+        connection.close()
+        application.close()
+
+
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_runtime_close_retries_failed_result_actor_termination(tmp_path, monkeypatch, mode):

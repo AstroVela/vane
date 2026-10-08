@@ -3,10 +3,12 @@
 
 """Persistent result contexts: concurrent cleanup and late control requests."""
 
+import gc
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -299,7 +301,9 @@ def test_close_racing_connection_creation_cannot_publish_a_new_session(monkeypat
 
 
 @pytest.mark.parametrize("factory", ["runtime", "native"])
-def test_runtime_close_releases_native_connections_and_database_lock(tmp_path, factory):
+@pytest.mark.parametrize("drop_intermediate", [False, True])
+@pytest.mark.parametrize("closer", ["runtime", "connection"])
+def test_runtime_close_releases_native_connections_and_database_lock(tmp_path, factory, drop_intermediate, closer):
     path = str(tmp_path / "session.duckdb")
     application = vane.Runtime()
     connection = (
@@ -307,11 +311,19 @@ def test_runtime_close_releases_native_connections_and_database_lock(tmp_path, f
     )
     cursor = connection.cursor()
     nested = cursor.cursor()
+    if drop_intermediate:
+        reference = weakref.ref(cursor)
+        cursor = None
+        gc.collect()
+        assert reference() is None
+    close = application.close if closer == "runtime" else connection.close
     try:
-        application.close()
+        close()
+        close()
         snapshot = application.resource_snapshot()["service"]
-        assert snapshot["closed"] and snapshot["sessions"] == {}
-        for handle in (connection, cursor, nested):
+        assert snapshot["sessions"] == {}
+        assert snapshot["closed"] == (closer == "runtime")
+        for handle in (connection, nested, *((cursor,) if cursor is not None else ())):
             with pytest.raises(vane.ConnectionException, match="closed"):
                 handle.execute("select 1")
         opened = subprocess.run(
@@ -324,7 +336,48 @@ def test_runtime_close_releases_native_connections_and_database_lock(tmp_path, f
         assert opened.returncode == 0, opened.stderr
     finally:
         nested.close()
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
+        connection.close()
+        application.close()
+
+
+def test_orphaned_cursor_close_failure_keeps_session_available_for_retry(tmp_path, monkeypatch):
+    application = vane.Runtime()
+    connection = application.connect(tmp_path / "session.duckdb")
+    nested = connection.cursor().cursor().cursor()
+    session = connection.query_runtime
+    closed = session._connection_closed
+    calls = 0
+
+    def fail_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("native session retirement failed")
+        closed()
+
+    try:
+        monkeypatch.setattr(session, "_connection_closed", fail_once)
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            application.close()
+        snapshot = application.resource_snapshot()["service"]
+        assert not snapshot["closed"]
+        assert session.session_id in snapshot["sessions"]
+        assert connection.query_runtime is session
+        assert calls == 1
+        reference = weakref.ref(nested)
+        nested = None
+        gc.collect()
+        assert reference() is None
+        application.close()
+        assert calls == 2
+        snapshot = application.resource_snapshot()["service"]
+        assert snapshot["closed"] and snapshot["sessions"] == {}
+    finally:
+        monkeypatch.setattr(session, "_connection_closed", closed)
+        if nested is not None:
+            nested.close()
         connection.close()
         application.close()
 

@@ -174,6 +174,9 @@ class QueryService:
                 errors.append(error)
         if errors:
             raise RuntimeError("service cleanup is pending; retry Runtime.close()") from errors[0]
+        with self.lock:
+            if self.sessions:
+                raise RuntimeError("native session cleanup is pending; retry Runtime.close()")
         self.delivery.close(timeout=cleanup_timeout(10))
         self.admission.close(timeout=cleanup_timeout(10))
         cleanup_timeout(10)

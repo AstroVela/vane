@@ -174,6 +174,8 @@ struct VaneSessionContext {
 	vector<string> dynamic_extension_snapshot_entries;
 	mutex lock;
 	idx_t connection_count = 1;
+	//! Independent of the parent cursor tree, whose intermediate nodes may expire.
+	unordered_map<DuckDBPyConnection *, weak_ptr<DuckDBPyConnection>> connections;
 	py::object local_query_runtime = py::none();
 	py::object query_runtime = py::none();
 	bool local_runtime_closing = false;

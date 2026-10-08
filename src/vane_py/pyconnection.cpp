@@ -2819,6 +2819,28 @@ void DuckDBPyConnection::Close() {
 	D_ASSERT(py::gil_check());
 	CheckCallbackEntry();
 	CheckLocalQueryCloseReentrancy();
+	const bool close_session = vane_session_owner && vane_session && !vane_session->query_runtime.is_none() &&
+	                           vane_session->query_runtime.attr("backend").cast<string>() == "ray";
+	vector<shared_ptr<DuckDBPyConnection>> session_cursors;
+	if (close_session) {
+		{
+			lock_guard<mutex> guard(vane_session->lock);
+			session_cursors.reserve(vane_session->connections.size());
+			for (auto &entry : vane_session->connections) {
+				auto cursor = entry.second.lock();
+				if (cursor && cursor.get() != this) {
+					session_cursors.push_back(std::move(cursor));
+				}
+			}
+		}
+		// Check orphaned descendants too, before draining or detaching anything.
+		// Holding the GIL through the fence keeps this snapshot closed to new cursors.
+		for (auto &cursor : session_cursors) {
+			cursor->CheckLocalQueryCloseReentrancy();
+		}
+		lock_guard<mutex> guard(vane_session->lock);
+		vane_session->local_runtime_closing = true;
+	}
 	local_query_closing = true;
 	if (!local_query_stream.is_none()) {
 		auto result = local_query_stream();
@@ -2861,8 +2883,11 @@ void DuckDBPyConnection::Close() {
 				con.SetDatabase(nullptr);
 				registered_function_catalog_types.clear();
 			}
-			// Children retain their session references until their own close completes.
-			ReleaseVaneSession();
+			// The Ray session owner stays attached until every cursor closes. A
+			// failed child close must remain retryable even if that child is collected.
+			if (!close_session) {
+				ReleaseVaneSession();
+			}
 			// Keep registered callables alive while children finish, including when
 			// a child's initializer reenters Close on this parent.
 			closing_functions.swap(registered_functions);
@@ -2870,8 +2895,24 @@ void DuckDBPyConnection::Close() {
 		// Child connections acquire their own execution locks. Do not hold this
 		// connection's lock while waiting for a child's initializer to finish.
 		py::gil_scoped_release release;
+		for (auto &cursor : session_cursors) {
+			PythonGILWrapper gil;
+			cursor->Close();
+		}
 		// https://peps.python.org/pep-0249/#Connection.close
 		cursors.ClearCursors();
+		if (close_session) {
+			PythonGILWrapper gil;
+			auto lock = LockConnection(py_connection_lock);
+			{
+				lock_guard<mutex> guard(vane_session->lock);
+				const idx_t owner_count = vane_session_attached ? 1 : 0;
+				if (vane_session->connection_count != owner_count) {
+					throw InvalidInputException("native session cleanup is pending; retry close()");
+				}
+			}
+			ReleaseVaneSession();
+		}
 		closing_functions.clear();
 	} catch (...) {
 		// A later Close must retain the dependencies of children still awaiting cleanup.
@@ -3269,6 +3310,7 @@ void DuckDBPyConnection::InitializeVaneSession() {
 	}
 	captured.attr("pop")("VANE_RUNNER", py::none());
 	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
+	vane_session->connections.emplace(this, shared_from_this());
 	vane_session_attached = true;
 	vane_session_owner = true;
 }
@@ -3286,6 +3328,7 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 		if (!vane_session->local_query_runtime.is_none() || !vane_session->query_runtime.is_none()) {
 			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
 		}
+		vane_session->connections.emplace(this, shared_from_this());
 		vane_session->connection_count++;
 	}
 	vane_session_attached = true;
@@ -3472,6 +3515,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		throw InternalException("DuckDB connection Vane session reference count underflow");
 	}
 	if (vane_session->connection_count > 1) {
+		vane_session->connections.erase(this);
 		vane_session->connection_count--;
 		vane_session_attached = false;
 		return;
@@ -3496,6 +3540,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		guard.lock();
 		vane_session->query_runtime = py::none();
 	}
+	vane_session->connections.erase(this);
 	vane_session->connection_count = 0;
 	vane_session->config = py::dict();
 	vane_session->dynamic_extension_snapshot_entries.clear();
