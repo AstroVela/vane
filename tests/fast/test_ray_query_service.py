@@ -239,11 +239,20 @@ def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
             application.connect()
         with pytest.raises(RuntimeError, match="draining"):
             first.query("select 7")
-        for worker in workers:
-            with pytest.raises(ray.exceptions.RayActorError):
-                ray.get(worker.describe.remote(), timeout=10)
-        with pytest.raises(ray.exceptions.RayActorError):
-            ray.get(actor.status.remote(a.query_id), timeout=10)
+        # ray.kill sends a termination request; its return does not acknowledge
+        # process exit. Observe death with a bound instead of assuming that the
+        # very next RPC cannot race the kill. A live-but-closed service can reject
+        # status(), so use Ray's health method to distinguish that from death.
+        deadline = time.monotonic() + 10
+        for process in (*workers, actor):
+            while True:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, "Runtime actor did not terminate"
+                try:
+                    ray.get(process.__ray_ready__.remote(), timeout=remaining)
+                except ray.exceptions.RayActorError:
+                    break
+                time.sleep(min(0.01, remaining))
     finally:
         close_result(a)
         close_result(b)

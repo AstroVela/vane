@@ -56,9 +56,8 @@ jobs:
 
       - name: Install shfmt on Linux
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shfmt
+        timeout-minutes: 11
+        run: bash .github/scripts/install_ubuntu_packages.sh shfmt
 
       - name: Install shfmt on macOS
         if: runner.os == 'macOS'
@@ -88,9 +87,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install check tools
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shfmt
+          bash .github/scripts/install_ubuntu_packages.sh shfmt
           python -m pip install \
             "black==24.*" \
             "clang_format==11.0.1" \

@@ -621,6 +621,44 @@ def test_late_admission_callback_cannot_cancel_started_execution():
         application.close()
 
 
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("first", ["failure", "cancel"])
+def test_distributed_failure_and_cancellation_keep_the_first_outcome(ready, first):
+    from vane.execution.pipelined_runtime import PipelinedContext
+
+    with vane.Runtime() as application:
+        runtime = application._new_session("pipelined", None)
+        ticket = runtime._admission.request(queue_timeout=30)
+        context = PipelinedContext(runtime, ticket, vane.QueryExecutionOptions(vane.RayExecution(), 30, 60, 30))
+        result = context.begin()
+        callback_cancellations = []
+        # A native/planning interrupt can reenter the published request's
+        # cancel() method while the original failure is still being reported.
+        context.started(lambda: callback_cancellations.append(context.cancel()))
+        try:
+            context.start_execution()
+            if ready:
+                result.ready(delivery_timeout=30)
+            if first == "cancel":
+                assert context.cancel()
+            context.failed("first worker failure")
+            assert context.cancel() is False
+            assert callback_cancellations == [False]
+            error = RuntimeError if first == "failure" else RequestCancelled
+            message = "first worker failure" if first == "failure" else "cancelled"
+            for check in (context.check, result.check_preparation):
+                with pytest.raises(error, match=message):
+                    check()
+            assert context.state == ("FAILED" if first == "failure" else "CANCELED")
+            assert ticket.cancellation_reason == (None if first == "failure" else "cancelled")
+        finally:
+            if not ready:
+                result.abort_preparation()
+            result.close()
+        idle(runtime)
+
+
 def test_result_cancel_is_idempotent_and_preserves_retained_batch():
     with vane.connect(backend="local", resources=limits()) as connection:
         result = connection.query("SELECT i FROM range(10000) t(i)")

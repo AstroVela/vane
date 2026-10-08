@@ -167,7 +167,9 @@ class QueryContext:
 
     def _cancel(self, reason: RequestCancellationReason) -> bool:
         with self._lock:
-            if self._done:
+            # Failure cleanup can interrupt a still-published connection.
+            # That wakeup must not replace an already recorded failure.
+            if self._done or self._state == "FAILED":
                 return False
             if reason == "admission_timeout" and (
                 self._admission_deadline is None or not self._admission_deadline.expired()

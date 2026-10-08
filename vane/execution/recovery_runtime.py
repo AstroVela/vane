@@ -143,6 +143,9 @@ class RecoveryScheduler:
             self._prepare_delivery()
             self.context.deadline_probe = self.production_status
             self.context.check()
+            # thread.start() may run the first attempt before returning. Its
+            # failure cleanup must not interrupt an already finished planner.
+            self.planning_connection = None
             self.thread = threading.Thread(target=self._run, name="vane-recovery-scheduler", daemon=True)
             self.thread.start()
         finally:
