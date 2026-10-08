@@ -174,8 +174,8 @@ class ResultServiceClient:
                 except ray.exceptions.RayTaskError:
                     pass  # create may have installed state before failing.
                 _get(actor.release.remote(query_id), timeout=10)
-            except ray.exceptions.RayActorError:
-                pass  # A dead process cannot retain usable native state.
+            except ray.exceptions.ActorDiedError:
+                pass  # Only confirmed death makes remote cleanup unnecessary.
         with self.lock:
             self.contexts.pop(query_id, None)
 

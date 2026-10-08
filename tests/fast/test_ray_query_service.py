@@ -7,6 +7,7 @@ import gc
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -224,6 +225,57 @@ def test_result_process_loss_fails_all_resident_results_without_replacement(tmp_
         assert first.query_runtime.pool.results.actor is actor
 
 
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("failed_rpc", ["create_receipt", "release", "release_receipt"])
+def test_result_service_outage_keeps_public_cleanup_retryable(tmp_path, monkeypatch, mode, failed_rpc):
+    import ray
+
+    from vane.execution import pipelined_runtime
+
+    with (
+        vane.Runtime(resources(tmp_path, worker_count=1, partitions=1, max_results=1)) as application,
+        application.connect(execution=mode) as connection,
+    ):
+        result = connection.query("select range from range(8)")
+        service = connection.query_runtime.pool.results
+        actor = service.actor
+        creation = service.contexts[result.context.query_id]
+        original_get = pipelined_runtime._get
+        original_release = actor.release.remote
+
+        def fail_receipt(reference, context=None, timeout=30):
+            if reference == creation:
+                raise ray.exceptions.ActorUnavailableError("temporary create receipt outage", None)
+            return original_get(reference, context, timeout)
+
+        def fail_release(query_id):
+            if failed_rpc == "release_receipt":
+                # The cleanup may have run even though its reply was lost.
+                ray.get(original_release(query_id), timeout=5)
+            raise ray.exceptions.ActorUnavailableError("temporary release outage", None)
+
+        try:
+            with monkeypatch.context() as patch:
+                if failed_rpc == "create_receipt":
+                    patch.setattr(pipelined_runtime, "_get", fail_receipt)
+                else:
+                    patch.setattr(actor, "release", SimpleNamespace(remote=fail_release))
+                for _ in range(2):
+                    with pytest.raises(RuntimeError, match=r"retry result\.close"):
+                        result.close()
+                    assert service.snapshot()["active_contexts"] == 1
+                    assert application.resource_snapshot()["service"]["result_delivery"]["active_results"] == 1
+                    with pytest.raises(RuntimeError, match="capacity is full"):
+                        service.create("next", service.resources)
+            close_result(result)
+            assert_idle(connection)
+            assert connection.query("select 42").collect().column(0).to_pylist() == [42]
+            assert service.actor is actor
+        finally:
+            close_result(result)
+
+
 def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
     import ray
 
@@ -250,8 +302,10 @@ def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
                 assert remaining > 0, "Runtime actor did not terminate"
                 try:
                     ray.get(process.__ray_ready__.remote(), timeout=remaining)
-                except ray.exceptions.RayActorError:
+                except ray.exceptions.ActorDiedError:
                     break
+                except ray.exceptions.ActorUnavailableError:
+                    pass
                 time.sleep(min(0.01, remaining))
     finally:
         close_result(a)
@@ -307,8 +361,10 @@ def test_runtime_close_retries_failed_result_actor_termination(tmp_path, monkeyp
             assert remaining > 0, "result actor did not terminate after retry"
             try:
                 ray.get(actor.__ray_ready__.remote(), timeout=remaining)
-            except ray.exceptions.RayActorError:
+            except ray.exceptions.ActorDiedError:
                 break
+            except ray.exceptions.ActorUnavailableError:
+                pass
             time.sleep(min(0.01, remaining))
     finally:
         if actor is not None:
