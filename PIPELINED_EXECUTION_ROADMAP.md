@@ -249,10 +249,10 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 - [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
 - [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
-- [ ] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界验收。
+- [x] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界已完成单机验收。
   - [x] P5.2.4a：Flight 会话控制、独立启动、鉴权、租约与可重试关闭；已完成相关验证。详见 [Server 设计](SERVER_DESIGN.md)。
   - [x] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与所有权由 Server 管理，已完成两种模式和 TLS 的相关验证。
-  - [ ] P5.2.4c：客户端断连、服务故障、混跑与部署验收。
+  - [x] P5.2.4c：客户端断连、服务故障、混跑与单机部署验收；完成当前共享服务的 Runtime / Flight 性能对照。
 
 Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Quack。SessionService / QueryService 独立于线协议，内部 Flight exchange 保留，不实现双协议兼容或 fallback。
 
@@ -577,3 +577,12 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - `vane.client.Client` 提供 query / submit，会话续租、类型化取消与超时、持有 Arrow 视图的字节计费及可重试关闭。FINISH 后通过服务端确认生产、持久错误与清理；成功交付后的清理失败保留成功结局与资源所有者。
 - 两轮无问题审查后进行一次非 editable native 增量 Release 构建。相关测试最终 **270 passed、1 skipped**：非 Ray 203、真实 Ray 66、CLI 1；可选 ADBC 缺失而跳过。首次测试修正不支持的 SQL fixture 与 CLI SIGTERM 注册顺序；再次两轮审查后重新打包 Python，native SHA-256 保持 `dd3706ddb13cee62fa5fc5f26faf3e3fd9b6ebd3f1e4ed88d07e6da3530f205b`，只复跑失败和未运行用例。
 - root 格式、lint、mypy、CI copyleft 检查通过；未运行完整 release/fast 套件。P5.2.4c 的客户端失联/服务故障矩阵、混跑性能、历史 Flight 超时定位及 P5.3 仍待完成。
+
+### P5.2.4c 故障与部署验收（2026 年 10 月 8 日）
+
+- 新增 16 个真实 Ray 远程故障用例：两种模式的排队/流式客户端强杀、丢失 Execute 回执后停止心跳、worker 暂时不可达及失败 ObjectRef、结果服务清理重试和进程死亡、慢客户端与有限窗口。确认会话、查询、实际 worker context、结果通道及 FTE store 计费在清理后归零，暂时故障期间保留所有权。
+- 补充同一控制端口重启后的旧身份拒绝；复用独立客户端、双端口 TLS、CLI SIGTERM 与跨进程数据库锁验证。故障注入覆盖 RPC 回执和 actor 死亡，单机范围及未覆盖的真实网络分区、多机/跨平台资格见[执行验收](EXECUTION_ACCEPTANCE.md#remote-server-acceptance)。
+- 基准增加显式 `--interface runtime/flight`；Flight 经公开客户端和原生网络结果链路，混跑使用两个远程 Session。通过服务端查询 ID 对齐实际 worker 资源占用，串行与失败注入对照在两种入口均通过，不把提交重叠当成并发。
+- 连续两轮无待修问题审查后完成一次非 editable 安装。相关测试 **170 passed、1 skipped**：非 Ray 122、共享 Ray 45、独立 CLI 3；仅缺少可选 ADBC 而跳过。210 个 Python/类型文件与源码一致，native SHA-256 未变。格式、lint、CI copyleft 与 diff 检查通过；没有修改执行核心、C++ 或资源默认值，未运行完整 release/fast 套件。
+- 干净提交 `943a43b8db` 上，32,768 行、两组容量、每项三次重复的 Runtime / Flight 对照共完成 **224 个计时样本（含 32 次预热）、32 项完整结果校验、12 组混跑与 12 次 worker 故障恢复**。两次运行的数据、脚本和 native 哈希一致；混跑均有共享 worker 资源重叠，所有恢复保持输入身份并使用新 fence。数值与复现命令见[执行基准](EXECUTION_BENCHMARKS.md#shared-service-and-flight-measurements-2026-10-08)。
+- P5.2.4 的单机服务验收完成；历史 Flight 超时根因、P5.3 的跨平台 CI / release gate 与发布仍未完成。DuckDB 2.0 升级后再替换 Quack 对外协议，当前不增加兼容或 fallback。

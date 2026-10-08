@@ -337,3 +337,70 @@ ownership and correctness without latency thresholds. This follow-up keeps
 capacity and timeout defaults unchanged. The three-sample, single-host limits
 of the initial measurements still apply; the historical intermittent Flight
 timeout and release qualification remain separate work.
+
+## Shared service and Flight measurements (2026-10-08)
+
+This is the measurement of the current shared QueryService, replacing the actor
+pool measured in the historical section above. Both runs used clean commit
+`943a43b8db`, the installed non-editable `vane-ai 0.3.0.dev103` wheel, Linux x86-64,
+Python 3.12.14, Ray 2.59.0, PyArrow 25.0.1 and NumPy 2.5.3. The host reports 36 CPUs;
+each benchmark Ray cluster exposes two CPUs to two single-thread workers. The
+native SHA-256 is
+`dd3706ddb13cee62fa5fc5f26faf3e3fd9b6ebd3f1e4ed88d07e6da3530f205b`;
+the benchmark script SHA-256 is
+`0af39ac3303012858a056a03fbb7b7806ed477f6d058e41da957dcc4c134981e`.
+Input file hashes, native identity and script hashes match between the runs.
+
+Use the commands in [Shared Runtime and Flight comparison](#shared-runtime-and-flight-comparison):
+32768 rows, seed 970, two partitions, both capacity profiles, three repetitions,
+one warmup and a paced consumption rate of 8192 rows/second. Runtime ran first;
+Flight ran separately after its cluster stopped. Each produced 112 samples and
+16 independent full-result validations. Combined, the 224 samples include 32
+warmups, 12 mixed pairs and 12 successful pre-commit worker-loss recoveries. All
+correctness, ownership and overlap checks passed.
+
+Median warm latencies with the default capacity profile, in milliseconds:
+
+| Mode | SQL | Runtime first batch | Flight first batch | Runtime total | Flight total |
+|---|---|---:|---:|---:|---:|
+| pipelined | Tiny | 66.78 | 76.28 | 85.14 | 101.43 |
+| pipelined | Scan | 67.30 | 83.70 | 129.80 | 158.13 |
+| pipelined | Aggregate | 96.41 | 111.60 | 135.17 | 170.40 |
+| pipelined | Join + TopN | 130.40 | 138.40 | 167.68 | 195.52 |
+| FTE | Tiny | 122.41 | 142.45 | 142.43 | 168.87 |
+| FTE | Scan | 373.65 | 384.79 | 438.05 | 453.38 |
+| FTE | Aggregate | 403.60 | 418.37 | 427.03 | 445.76 |
+| FTE | Join + TopN | 543.23 | 550.48 | 582.13 | 577.48 |
+
+With compact capacities, median scan totals were 220.11/212.33 ms
+(Runtime/Flight pipelined) and 618.82/612.75 ms (Runtime/Flight FTE). The differences
+compare complete query lifecycles, including coordination and cleanup, rather
+than isolating network overhead. These are three-sample loopback measurements;
+small reversals do not establish a speed improvement. Capacity defaults remain
+unchanged.
+
+Default-profile cold session plus first-query medians were 1964.60/2011.01 ms
+(Runtime/Flight pipelined) and 2105.97/2134.28 ms (Runtime/Flight FTE). Ray cluster
+startup, excluded from those values, was 3.17/3.28 seconds. Flight cold includes
+constructing both public listeners and its client session.
+
+All six mixed pairs per interface held overlapping reservations on a shared
+worker. The longest per-pair overlaps ranged from 102.11 to 171.41 ms for Runtime
+and 89.68 to 153.58 ms for Flight. These intervals include retained pipelined output
+and prove concurrent charged capacity; they are not CPU-utilization samples.
+Unlike the historical submission-only checks, serial dispatch cannot pass this
+criterion.
+
+Default-profile FTE recovery medians were 1539.72/1607.71 ms (Runtime/Flight),
+against control medians of 419.04/435.34 ms. Median paired additional times were
+1120.68/1182.29 ms. With compact capacities, additional medians were
+1107.83/1150.84 ms. Each fault retried the affected attempt with fixed inputs and
+a distinct fence, and all worker/store/result ledgers retired successfully.
+
+Raw reports, samples, resource observations and replayable inputs are in
+`build/server-benchmark-runtime/` and `build/server-benchmark-flight/`; the combined
+summary and review/install/test evidence are in `build/server-acceptance/`.
+These generated directories are not committed. The related tests passed
+**170 cases, with one optional ADBC skip**. No full release/fast suite was run.
+Cross-host deployment and release qualification, plus the historical intermittent
+Flight timeout investigation, remain separate work.

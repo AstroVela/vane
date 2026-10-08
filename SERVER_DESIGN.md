@@ -122,7 +122,7 @@ with Client("grpc+tls://vane.example:8815", token=token, tls_root_certs=ca_pem) 
         table = result.collect()
 ```
 
-`client.submit(sql)` 返回 RemoteQuery，可调用 status/cancel/result/close。执行回执丢失时，Client 保留相同序号和 SQL；后续提交先重新确认该提交，绝不自动生成另一查询。Client 定期续租；close 超时可以重试。客户端无法恢复已断开的数据流，完整跨进程故障矩阵留待 P5.2.4c。
+`client.submit(sql)` 返回 RemoteQuery，可调用 status/cancel/result/close。执行回执丢失时，Client 保留相同序号和 SQL；后续提交先重新确认该提交，绝不自动生成另一查询。Client 定期续租；close 超时可以重试。客户端无法恢复已断开的数据流，跨进程故障矩阵已在 P5.2.4c 完成单机验收。
 
 ## 第三阶段：故障验收与迁移准备
 
@@ -139,3 +139,5 @@ with Client("grpc+tls://vane.example:8815", token=token, tls_root_certs=ca_pem) 
 每次实现先审查修改，连续两轮无问题后，再做一次非 editable 安装和相关测试。Python 改动不重编 native。验证覆盖 SessionService、Flight 控制/鉴权、原生传输、独立客户端/CLI、数据库锁、两种 Ray 模式及结果资源生命周期；不运行完整 release / fast 套件。测试和设计文件加入源码包与 release gate。
 
 第二阶段相关验证共 **270 passed、1 skipped**：非 Ray 203、真实 Ray 66、独立 CLI 1；跳过项需要可选 ADBC。连续两轮审查后完成一次 native 增量 Release 构建。首次执行修正了超时测试中的不支持 SQL，以及 Ray 初始化覆盖 CLI 信号处理的问题；修正再审查两轮后只重新打包 Python，native 哈希不变，复跑失败及未运行用例均通过。
+
+第三阶段相关验证共 **170 passed、1 skipped**：非 Ray 122、共享 Ray 45、独立 CLI 3；跳过项仍为可选 ADBC。先连续两轮审查，再做一次非 editable 打包安装及相关测试；native 哈希不变，没有 C++ 修改。两种入口的三次重复、两组容量实测共完成 224 个计时样本、32 项完整结果校验与 12 次 worker 故障恢复。混跑以共享 worker 的资源占用重叠验收，所有检查通过。方法、实际数值和单机范围见[基准记录](EXECUTION_BENCHMARKS.md#shared-service-and-flight-measurements-2026-10-08)。
