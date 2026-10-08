@@ -12,6 +12,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
+from vane.execution.cleanup_deadline import cleanup_timeout
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.request_admission import _timeout
 from vane.execution.request_deadline import MonotonicDeadline
@@ -707,7 +708,7 @@ class QueryResult:
 
     def _close_stream(self, timeout: float = 5.0) -> None:
         """A connection may wait for its interrupted consumer before teardown."""
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + cleanup_timeout(timeout)
         while True:
             try:
                 self.close()

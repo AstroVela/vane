@@ -276,6 +276,142 @@ def test_result_service_outage_keeps_public_cleanup_retryable(tmp_path, monkeypa
             close_result(result)
 
 
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("failed_rpc", ["prepare_receipt", "release"])
+def test_worker_outage_keeps_session_and_capacity_until_cleanup_succeeds(tmp_path, monkeypatch, mode, failed_rpc):
+    import ray
+
+    from vane.execution import pipelined_runtime, recovery_runtime
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    dispatched = threading.Event()
+    dispatch = RecoveryScheduler._dispatch
+
+    def hold_attempt(owner, *args):
+        accepted = dispatch(owner, *args)
+        if accepted:
+            # Keep a real, prepared FTE context resident until session close
+            # cancels it, regardless of how quickly its task finishes.
+            attempt = next(iter(owner.active.values()))
+            ray.get(attempt.prepare, timeout=10)
+            dispatched.set()
+            assert owner.stop.wait(20), "test did not cancel the prepared attempt"
+        return accepted
+
+    limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=1, max_active_queries=1)
+    with vane.Runtime(limits) as application, application.connect() as first, application.connect() as second:
+        with monkeypatch.context() as patch:
+            if mode == "fte":
+                patch.setattr(RecoveryScheduler, "_dispatch", hold_attempt)
+            result = first.query(
+                "select range from range(1000000)" if mode == "pipelined" else "select 42", execution=mode
+            )
+            session = first.query_runtime
+            scheduler = result.context._reader
+            pool = session.pool
+            worker = pool.workers[0]
+
+            def unavailable(*args):
+                raise ray.exceptions.ActorUnavailableError("temporary worker release outage", None)
+
+            try:
+                if mode == "fte":
+                    assert dispatched.wait(10)
+                native = ray.get(worker.resources_snapshot.remote(), timeout=5)["reservations"]
+                coordinator = pool.admission.snapshot()["reservations"]
+                assert native and coordinator
+                with monkeypatch.context() as outage:
+                    if failed_rpc == "release":
+                        outage.setattr(
+                            worker,
+                            "release" if mode == "pipelined" else "release_materialized",
+                            SimpleNamespace(remote=unavailable),
+                        )
+                    else:
+                        receipts = (
+                            scheduler.prepare_calls
+                            if mode == "pipelined"
+                            else [attempt.prepare for attempt in scheduler.active.values()]
+                        )
+                        module = pipelined_runtime if mode == "pipelined" else recovery_runtime
+                        original_get = module._get
+
+                        def fail_receipt(reference, context=None, timeout=30):
+                            if reference in receipts:
+                                unavailable()
+                            return original_get(reference, context, timeout)
+
+                        outage.setattr(module, "_get", fail_receipt)
+                    for _ in range(2):
+                        with pytest.raises(RuntimeError, match="retry"):
+                            first.close()
+                        assert session.session_id in application.resource_snapshot()["service"]["sessions"]
+                        assert pool.admission.snapshot()["reservations"] == coordinator
+                        assert ray.get(worker.resources_snapshot.remote(), timeout=5)["reservations"] == native
+                        assert not scheduler.closed
+                    with pytest.raises(RequestQueueTimeout):
+                        second.query("select 7", options=vane.QueryExecutionOptions(vane.RayExecution(), 0.1, 30, 30))
+                first.close()
+                assert session.session_id not in application.resource_snapshot()["service"]["sessions"]
+                assert pool.admission.snapshot()["reservations"] == {}
+                assert ray.get(worker.resources_snapshot.remote(), timeout=5)["reservations"] == {}
+                assert second.query("select 7").collect().column(0).to_pylist() == [7]
+            finally:
+                close_result(result)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_runtime_close_deadline_covers_remote_cleanup_and_preserves_retry(tmp_path, monkeypatch, mode):
+    from vane.execution import pipelined_runtime
+
+    application = vane.Runtime(resources(tmp_path, worker_count=1, partitions=1))
+    connection = application.connect(execution=mode)
+    result = connection.query("select 42")
+    service = connection.query_runtime.pool.results
+    receipt = service.contexts[result.context.query_id]
+    original_get = pipelined_runtime._get
+    entered, proceed = threading.Event(), threading.Event()
+    timeouts = []
+
+    def delayed(reference, context=None, timeout=30):
+        if reference == receipt:
+            timeouts.append(timeout)
+            entered.set()
+            assert proceed.wait(10), "test did not release cleanup RPC"
+        return original_get(reference, context, timeout)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(1) as threads:
+            patch.setattr(pipelined_runtime, "_get", delayed)
+            started = time.monotonic()
+            pending = threads.submit(application.close, timeout=0.2)
+            try:
+                assert entered.wait(5)
+                with pytest.raises(TimeoutError, match="retry Runtime.close"):
+                    pending.result(timeout=1)
+                assert time.monotonic() - started < 1
+                assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.2
+                assert service.snapshot()["active_contexts"] == 1
+                snapshot = application.resource_snapshot()["service"]
+                assert snapshot["closing"] and not snapshot["closed"]
+                assert snapshot["sessions"]
+            finally:
+                proceed.set()
+            assert application._service.close_attempt.done.wait(5)
+        application.close()
+        snapshot = application.resource_snapshot()["service"]
+        assert snapshot["closed"] and snapshot["sessions"] == {}
+        assert snapshot["workers"]["reservations"] == {}
+        assert service.snapshot()["active_contexts"] == 0
+    finally:
+        proceed.set()
+        application.close()
+        close_result(result)
+        connection.close()
+
+
 def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
     import ray
 
@@ -289,7 +425,7 @@ def test_runtime_close_cancels_queries_and_stops_shared_processes(tmp_path):
         application.close()
         with pytest.raises(RuntimeError, match="closed"):
             application.connect()
-        with pytest.raises(RuntimeError, match="draining"):
+        with pytest.raises(vane.ConnectionException, match="clos(ed|ing)"):
             first.query("select 7")
         # ray.kill sends a termination request; its return does not acknowledge
         # process exit. Observe death with a bound instead of assuming that the

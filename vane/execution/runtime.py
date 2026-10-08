@@ -15,10 +15,18 @@ import time
 import uuid
 from typing import Any
 
+from vane.execution.cleanup_deadline import cleanup_deadline, cleanup_timeout
 from vane.execution.pipelined_plan import RayResources
 from vane.execution.query_runtime import QueryResources
 from vane.execution.request_admission import RequestAdmissionLimits, RuntimeRequestAdmission
 from vane.execution.result_delivery import ResultDeliveryLimits, RuntimeResultDelivery
+
+
+class _CloseAttempt:
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.done = threading.Event()
+        self.error: BaseException | None = None
 
 
 class QueryService:
@@ -38,6 +46,7 @@ class QueryService:
         )
         self.lock = threading.RLock()
         self.cleanup_lock = threading.Lock()
+        self.close_attempt: _CloseAttempt | None = None
         self.sessions: dict[str, Any] = {}
         self.stores: dict[str, Any] = {}
         self.closing = False
@@ -97,32 +106,79 @@ class QueryService:
             "closed": self.closed,
         }
 
-    def close(self, timeout: float) -> None:
-        with self.cleanup_lock:
-            with self.lock:
+    def close(self, deadline: float) -> None:
+        # Cleanup can enter native code or a slow RPC submission. The service
+        # retains one attempt so a caller's deadline never abandons its owners
+        # or starts overlapping cleanup. A later close can wait or retry.
+        self.closing = True
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self.cleanup_lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX)):
+                raise TimeoutError("service cleanup is pending; retry Runtime.close()")
+            try:
                 if self.closed:
                     return
-                self.closing = True
-                sessions = tuple(self.sessions.values())
-            self.admission.drain()
-            errors = []
-            for session in sessions:
-                try:
-                    session.drain()
-                except BaseException as error:
-                    errors.append(error)
-            deadline = time.monotonic() + timeout
-            for session in sessions:
-                try:
-                    session.close(timeout=max(0.0, deadline - time.monotonic()))
-                except BaseException as error:
-                    errors.append(error)
-            if errors:
-                raise RuntimeError("service cleanup is pending; retry Runtime.close()") from errors[0]
-            self.delivery.close(timeout=max(0.0, deadline - time.monotonic()))
-            self.admission.close(timeout=max(0.0, deadline - time.monotonic()))
-            self.pool.close()
-            self.closed = True
+                attempt = self.close_attempt
+                started = attempt is None or attempt.done.is_set()
+                if started:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("service cleanup is pending; retry Runtime.close()")
+                    attempt = _CloseAttempt(deadline)
+                    self.close_attempt = attempt
+                    thread = threading.Thread(
+                        target=self._run_close, args=(attempt,), name="vane-service-close", daemon=True
+                    )
+                    try:
+                        thread.start()
+                    except BaseException:
+                        self.close_attempt = None
+                        raise
+            finally:
+                self.cleanup_lock.release()
+            assert attempt is not None
+            remaining = max(0.0, deadline - time.monotonic())
+            if not attempt.done.wait(min(remaining, threading.TIMEOUT_MAX)):
+                raise TimeoutError("service cleanup is pending; retry Runtime.close()")
+            if attempt.error is None:
+                return
+            if started:
+                raise attempt.error
+            # This invocation joined a previous attempt. Its failure may have
+            # exhausted the previous caller's budget; retry with our remainder.
+
+    def _run_close(self, attempt: _CloseAttempt) -> None:
+        try:
+            with cleanup_deadline(attempt.deadline):
+                self._close()
+        except BaseException as error:
+            attempt.error = error.with_traceback(None)
+        finally:
+            attempt.done.set()
+
+    def _close(self) -> None:
+        self.admission.drain()
+        with self.lock:
+            sessions = tuple(self.sessions.values())
+        errors = []
+        for session in sessions:
+            cleanup_timeout(10)
+            try:
+                session.drain()
+            except BaseException as error:
+                errors.append(error)
+        for session in sessions:
+            timeout = cleanup_timeout(10)
+            try:
+                session.close_session(timeout=timeout)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise RuntimeError("service cleanup is pending; retry Runtime.close()") from errors[0]
+        self.delivery.close(timeout=cleanup_timeout(10))
+        self.admission.close(timeout=cleanup_timeout(10))
+        cleanup_timeout(10)
+        self.pool.close()
+        self.closed = True
 
 
 class Runtime:
@@ -142,12 +198,19 @@ class Runtime:
         self._service: QueryService | None = None
         self._closing = False
 
+    def _check_open(self) -> None:
+        if self._closing:
+            if self._service is not None:
+                self._service.closing = True
+            raise RuntimeError("Runtime is closed")
+
     def _new_session(self, execution: str, resources: QueryResources | None) -> Any:
         with self._lock:
-            if self._closing:
-                raise RuntimeError("Runtime is closed")
+            self._check_open()
             if self._service is None:
                 self._service = QueryService(self.resources)
+            # Construction can yield the GIL to a close that times out on our lock.
+            self._check_open()
             return self._service.session(execution, resources)
 
     def connect(
@@ -183,21 +246,31 @@ class Runtime:
         return {"started": service is not None, "service": None if service is None else service.snapshot()}
 
     def close(self, *, timeout: float = 10) -> None:
+        started = time.monotonic()
         from vane._native.execution_runtime import check_entry
         from vane.execution.request_admission import _timeout
 
         check_entry()
-        timeout = _timeout(timeout, "Runtime close timeout")
-        with self._lock:
-            self._closing = True
-            service = self._service
+        deadline = started + _timeout(timeout, "Runtime close timeout")
+        self._closing = True
+        # Fence existing sessions even if another caller is still holding the
+        # Runtime lock. _new_session also fences a core constructed concurrently.
+        service = self._service
         if service is not None:
-            service.close(timeout)
+            service.closing = True
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX)):
+            raise TimeoutError("Runtime cleanup is pending; retry Runtime.close()")
+        try:
+            service = self._service
+        finally:
+            self._lock.release()
+        if service is not None:
+            service.close(deadline)
 
     def __enter__(self) -> Runtime:
         with self._lock:
-            if self._closing:
-                raise RuntimeError("Runtime is closed")
+            self._check_open()
         return self
 
     def __exit__(self, *args: Any) -> None:

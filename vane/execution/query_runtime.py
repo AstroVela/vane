@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from vane.execution.batch_lease import BatchLease
+from vane.execution.cleanup_deadline import cleanup_timeout
 from vane.execution.native_cancellation import NativeQueryCancellation
 from vane.execution.query_options import LocalExecution, QueryExecutionOptions
 from vane.execution.request_admission import (
@@ -405,5 +406,5 @@ class QueryRuntime:
 
     def close(self, *, timeout: float = 5.0) -> None:
         self.drain()
-        self._delivery.close(timeout=timeout)
-        self._admission.close(timeout=timeout)
+        self._delivery.close(timeout=cleanup_timeout(timeout))
+        self._admission.close(timeout=cleanup_timeout(timeout))

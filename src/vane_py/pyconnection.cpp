@@ -589,6 +589,14 @@ DuckDBPyConnection::~DuckDBPyConnection() {
 		try {
 			PythonGILWrapper gil;
 			con.SetResult(nullptr);
+			if (vane_session && !vane_session->query_runtime.is_none() &&
+			    vane_session->query_runtime.attr("backend").cast<string>() == "ray") {
+				// The last cursor may be destroyed concurrently with its parent's
+				// close. Retire the service session only after releasing its database.
+				py::gil_scoped_release release;
+				con.SetConnection(nullptr);
+				con.SetDatabase(nullptr);
+			}
 			ReleaseVaneSession();
 		} catch (...) { // NOLINT
 		}
@@ -2827,6 +2835,10 @@ void DuckDBPyConnection::Close() {
 			auto runtime =
 			    vane_session->query_runtime.is_none() ? vane_session->local_query_runtime : vane_session->query_runtime;
 			runtime.attr("drain")();
+			if (!vane_session->query_runtime.is_none() && runtime.attr("backend").cast<string>() == "ray") {
+				// Keep the native owner attached when remote cleanup is still pending.
+				runtime.attr("close")();
+			}
 		}
 		// A queued request must be cancelled before waiting for its execution
 		// lock. Running requests keep their owners until native cleanup ends.
@@ -3478,6 +3490,9 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		auto runtime = vane_session->query_runtime;
 		guard.unlock();
 		runtime.attr("close")();
+		if (runtime.attr("backend").cast<string>() == "ray") {
+			runtime.attr("_connection_closed")();
+		}
 		guard.lock();
 		vane_session->query_runtime = py::none();
 	}

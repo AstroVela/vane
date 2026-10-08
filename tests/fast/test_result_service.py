@@ -3,7 +3,10 @@
 
 """Persistent result contexts: concurrent cleanup and late control requests."""
 
+import subprocess
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -293,6 +296,118 @@ def test_close_racing_connection_creation_cannot_publish_a_new_session(monkeypat
         with pytest.raises(RuntimeError, match="closed while opening"):
             pending.result(timeout=5)
     assert application.resource_snapshot()["service"]["sessions"] == {}
+
+
+@pytest.mark.parametrize("factory", ["runtime", "native"])
+def test_runtime_close_releases_native_connections_and_database_lock(tmp_path, factory):
+    path = str(tmp_path / "session.duckdb")
+    application = vane.Runtime()
+    connection = (
+        application.connect(path) if factory == "runtime" else vane.connect(path, backend="ray", runtime=application)
+    )
+    cursor = connection.cursor()
+    nested = cursor.cursor()
+    try:
+        application.close()
+        snapshot = application.resource_snapshot()["service"]
+        assert snapshot["closed"] and snapshot["sessions"] == {}
+        for handle in (connection, cursor, nested):
+            with pytest.raises(vane.ConnectionException, match="closed"):
+                handle.execute("select 1")
+        opened = subprocess.run(
+            [sys.executable, "-I", "-c", "import sys, vane; vane.connect(sys.argv[1]).close()", path],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert opened.returncode == 0, opened.stderr
+    finally:
+        nested.close()
+        cursor.close()
+        connection.close()
+        application.close()
+
+
+def test_runtime_close_deadline_bounds_drain_and_serializes_retries(monkeypatch):
+    application = vane.Runtime()
+    connection = application.connect()
+    session = connection.query_runtime
+    entered, proceed = threading.Event(), threading.Event()
+    drain = session.drain
+    calls = 0
+
+    def blocked_drain():
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert proceed.wait(10), "test did not release session drain"
+        drain()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "drain", blocked_drain)
+            with ThreadPoolExecutor(1) as threads:
+                started = time.monotonic()
+                pending = threads.submit(application.close, timeout=0.2)
+                try:
+                    assert entered.wait(5)
+                    with pytest.raises(TimeoutError, match="retry Runtime.close"):
+                        pending.result(timeout=1)
+                    assert time.monotonic() - started < 1
+                    attempt = application._service.close_attempt
+                    assert not attempt.done.is_set()
+                    with pytest.raises(TimeoutError, match="retry Runtime.close"):
+                        application.close(timeout=0.01)
+                    assert application._service.close_attempt is attempt
+                    assert calls == 1
+                    snapshot = application.resource_snapshot()["service"]
+                    assert session.session_id in snapshot["sessions"]
+                    assert snapshot["closing"] and not snapshot["closed"]
+                    with pytest.raises(RuntimeError, match="closed"):
+                        application.connect()
+                    with pytest.raises(RuntimeError, match="draining"):
+                        connection.query("select 1")
+                finally:
+                    proceed.set()
+            assert attempt.done.wait(5)
+        application.close()
+        assert application.resource_snapshot()["service"]["sessions"] == {}
+        assert application.resource_snapshot()["service"]["closed"]
+    finally:
+        proceed.set()
+        application.close()
+        connection.close()
+
+
+def test_runtime_close_fences_sessions_while_waiting_for_runtime_lock():
+    application = vane.Runtime()
+    connection = application.connect()
+    entered, proceed = threading.Event(), threading.Event()
+
+    def hold_lock():
+        with application._lock:
+            entered.set()
+            assert proceed.wait(5), "test did not release Runtime lock"
+
+    try:
+        with ThreadPoolExecutor(1) as threads:
+            pending = threads.submit(hold_lock)
+            try:
+                assert entered.wait(5)
+                with pytest.raises(TimeoutError, match="retry Runtime.close"):
+                    application.close(timeout=0.01)
+                with pytest.raises(RuntimeError, match="draining"):
+                    connection.query("select 1")
+            finally:
+                proceed.set()
+            pending.result(timeout=5)
+        application.close()
+        assert application.resource_snapshot()["service"]["sessions"] == {}
+    finally:
+        proceed.set()
+        application.close()
+        connection.close()
 
 
 def test_materialized_manifest_must_belong_to_its_result_context(monkeypatch):

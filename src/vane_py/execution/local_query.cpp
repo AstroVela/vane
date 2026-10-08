@@ -59,6 +59,9 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectQuery(const py::object
 		auto connection = ConnectQuerySession(database, read_only, config);
 		EnableLocalRuntimeInputPolicy(*connection->con.GetConnection().context);
 		connection->vane_session->query_runtime = runtime;
+		if (backend == "ray") {
+			runtime.attr("_attach_connection")(connection);
+		}
 		return connection;
 	} catch (...) {
 		runtime.attr("close")();

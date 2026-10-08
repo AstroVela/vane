@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
+from vane.execution.cleanup_deadline import cleanup_timeout
 from vane.execution.compiler import FragmentCompileOptions
 from vane.execution.fte_plan import TaskBinding, bind_task
 from vane.execution.fte_store import QueryStoreLease, StorePool
@@ -257,8 +258,9 @@ class RecoveryScheduler:
         import ray
 
         try:
-            _get(attempt.worker.release_materialized.remote(attempt.epoch, attempt.key), timeout=5)
-        except ray.exceptions.RayActorError:
+            timeout = cleanup_timeout(5)
+            _get(attempt.worker.release_materialized.remote(attempt.epoch, attempt.key), timeout=timeout)
+        except ray.exceptions.ActorDiedError:
             pass
         with self.lock:
             if self.active.get(attempt.index) is attempt:
@@ -452,7 +454,7 @@ class RecoveryScheduler:
             self.cancel("query result released")
             for thread in (self.thread, self.heartbeat):
                 if thread is not None and thread is not threading.current_thread():
-                    thread.join(timeout=10)
+                    thread.join(timeout=cleanup_timeout(10))
                     if thread.is_alive():
                         raise RuntimeError("FTE query cleanup is pending")
             if self.client is not None:
@@ -463,8 +465,8 @@ class RecoveryScheduler:
                     if ray.is_initialized():
                         if attempt.prepare is not None:
                             try:
-                                _get(attempt.prepare, timeout=5)
-                            except ray.exceptions.RayError:
+                                _get(attempt.prepare, timeout=cleanup_timeout(5))
+                            except (ray.exceptions.RayTaskError, ray.exceptions.ActorDiedError):
                                 pass
                         self._release(attempt)
                     else:
@@ -484,7 +486,7 @@ class RecoveryScheduler:
             # Ray can report actor death before the process has actually
             # released its file locks. Give normal process teardown a bounded
             # grace period; keep quota owned if native I/O still has not exited.
-            cleanup_deadline = time.monotonic() + 5
+            deadline = time.monotonic() + cleanup_timeout(5)
             while True:
                 try:
                     if self.coordinator is not None:
@@ -496,9 +498,9 @@ class RecoveryScheduler:
                         self.lease.close(self.coordinator.close if self.coordinator is not None else lambda: None)
                     break
                 except StorageCleanupPending:
-                    if time.monotonic() >= cleanup_deadline:
+                    if time.monotonic() >= deadline:
                         raise
-                    time.sleep(0.01)
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
             self.closed = True
 
     def snapshot(self) -> dict[str, Any]:

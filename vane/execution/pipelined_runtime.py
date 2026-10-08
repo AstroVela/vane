@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+from vane.execution.cleanup_deadline import cleanup_deadline, cleanup_timeout
 from vane.execution.compiler import FragmentCompileOptions
 from vane.execution.pipelined_plan import DirectTicket, RayResources, placement, task_id
 from vane.execution.query_options import DistributedMode, FteOptions, QueryExecutionOptions, RayExecution
@@ -28,11 +29,11 @@ def _get(reference: Any, context: QueryContext | None = None, timeout: float = 3
 
     if not ray.is_initialized():
         raise RuntimeError("Ray session is no longer connected")
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + cleanup_timeout(timeout)
     while True:
         if context is not None:
             context.check()
-        ready, _ = ray.wait([reference], timeout=0.05)
+        ready, _ = ray.wait([reference], timeout=min(0.05, max(0.0, deadline - time.monotonic())))
         if ready:
             return ray.get(reference)
         if time.monotonic() >= deadline:
@@ -170,10 +171,11 @@ class ResultServiceClient:
         if ray.is_initialized():
             try:
                 try:
-                    _get(reference, timeout=10)
+                    _get(reference, timeout=cleanup_timeout(10))
                 except ray.exceptions.RayTaskError:
                     pass  # create may have installed state before failing.
-                _get(actor.release.remote(query_id), timeout=10)
+                timeout = cleanup_timeout(10)
+                _get(actor.release.remote(query_id), timeout=timeout)
             except ray.exceptions.ActorDiedError:
                 pass  # Only confirmed death makes remote cleanup unnecessary.
         with self.lock:
@@ -198,6 +200,7 @@ class ResultServiceClient:
                 import ray
 
                 if ray.is_initialized():
+                    cleanup_timeout(10)
                     ray.kill(self.actor, no_restart=True)
             # Reject new contexts once shutdown starts, but keep termination
             # retryable if ray.kill raises. The lock serializes close attempts.
@@ -260,6 +263,7 @@ class WorkerPool:
 
                 if ray.is_initialized():
                     for worker in self.workers:
+                        cleanup_timeout(10)
                         ray.kill(worker, no_restart=True)
             self.workers.clear()
             self.epochs.clear()
@@ -539,7 +543,7 @@ class PipelinedScheduler:
             self.context.deadline_probe = None
             self.cancel("query result released")
             if self.monitor is not None and self.monitor is not threading.current_thread():
-                self.monitor.join(timeout=10)
+                self.monitor.join(timeout=cleanup_timeout(10))
                 if self.monitor.is_alive():
                     raise RuntimeError("Ray query monitor cleanup is pending")
             if self.client is not None:
@@ -554,16 +558,18 @@ class PipelinedScheduler:
             # Even if the caller stopped waiting, the remote preparation owns it.
             for reference in self.prepare_calls:
                 try:
-                    _get(reference, timeout=10)
-                except ray.exceptions.RayError:
+                    _get(reference, timeout=cleanup_timeout(10))
+                except (ray.exceptions.RayTaskError, ray.exceptions.ActorDiedError):
                     pass
             errors = []
             for index in self.prepared:
                 try:
+                    timeout = cleanup_timeout(10)
                     _get(
-                        self.pool.workers[index].release.remote(self.pool.epochs[index], self.spec.query_id), timeout=10
+                        self.pool.workers[index].release.remote(self.pool.epochs[index], self.spec.query_id),
+                        timeout=timeout,
                     )
-                except ray.exceptions.RayActorError:
+                except ray.exceptions.ActorDiedError:
                     pass  # Dead epoch owns no usable native reservation.
                 except BaseException as error:
                     errors.append(error)
@@ -585,6 +591,7 @@ class RayQueryRuntime(QueryRuntime):
     def __init__(self, service: Any, execution: str, resources: Any) -> None:
         self.service = service
         self.session_id = uuid.uuid4().hex
+        self._connection: Any = None
         try:
             self.execution = DistributedMode(execution)
         except (ValueError, TypeError) as error:
@@ -608,6 +615,30 @@ class RayQueryRuntime(QueryRuntime):
     def exchange_store(self, name: str) -> Any:
         return self.service.exchange_store(name)
 
+    def _attach_connection(self, connection: Any) -> None:
+        with self.service.lock:
+            if self.service.closing or self.session_id not in self.service.sessions:
+                raise RuntimeError("Runtime closed while opening a session")
+            if self._connection is not None:
+                raise RuntimeError("session already has a native connection")
+            self._connection = connection
+
+    def _connection_closed(self) -> None:
+        # The native session calls this only after its last connection has
+        # released the database and query cleanup has succeeded.
+        with self.service.lock:
+            self._connection = None
+            self.service.retire(self)
+
+    def close_session(self, *, timeout: float) -> None:
+        with cleanup_deadline(time.monotonic() + timeout):
+            self.close(timeout=cleanup_timeout(timeout))
+            with self.service.lock:
+                connection = self._connection
+            if connection is not None:
+                cleanup_timeout(timeout)
+                connection.close()
+
     def resource_snapshot(self) -> dict[str, Any]:
         return {
             **super().resource_snapshot(),
@@ -628,6 +659,8 @@ class RayQueryRuntime(QueryRuntime):
         publish: Any,
         retire: Any,
     ) -> Any:
+        if self.service.closing:
+            raise RuntimeError("query service is draining")
         if parameters is not None:
             raise NotImplementedError("Ray query parameters are not supported by the fragment compiler")
         if not isinstance(sql, str) or not sql.strip():
@@ -710,5 +743,8 @@ class RayQueryRuntime(QueryRuntime):
         return self.run(execute, publish, options)
 
     def close(self, *, timeout: float = 5.0) -> None:
-        super().close(timeout=timeout)
-        self.service.retire(self)
+        with cleanup_deadline(time.monotonic() + timeout):
+            super().close(timeout=cleanup_timeout(timeout))
+        with self.service.lock:
+            if self._connection is None:
+                self.service.retire(self)

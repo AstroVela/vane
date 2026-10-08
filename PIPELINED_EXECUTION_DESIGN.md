@@ -672,6 +672,10 @@ DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据�
 
 应用使用 `with vane.Runtime(RayResources(...)) as runtime` 明确持有服务。构造 Runtime 不启动 Ray；第一次 connect 建立进程内 QueryService 核心并注册 Session，第一次分布式查询按需启动 worker 及唯一 ResultService actor。后续 Session 和查询复用这些进程。Session.close 取消、清理本会话查询，保留服务和其他 Session；Runtime.close 禁止新会话与查询，清理所有 Session 后停止共享进程。清理失败保留所有者与额度，调用方可重试 close。没有隐式全局 Runtime、每会话 actor 池或自动重建结果服务的路径。
 
+Session 还持有对应的原生连接；Runtime 关闭时同时关闭该连接及其 cursors，最后一个原生连接释放数据库和查询资源后才注销 Session。worker 或结果服务暂时不可达时，保留清理所有者和配额；只有 release 确认成功或 Ray 明确报告 ActorDiedError 才完成该资源的清理。
+
+`Runtime.close(timeout=...)` 从入口建立单一单调时钟截止时间，取消、RPC 等待、线程退出、存储清理和原生连接关闭共用剩余预算。每个服务最多执行一个关闭任务；即使原生操作或 RPC 提交暂时阻塞，调用方也会在等待期限内收到 TimeoutError。超时不注销尚未关闭的 Session，也不丢弃其资源和关闭任务；后续 close 等待正在进行的任务，或在它结束后用新的剩余预算重试，不并发释放同一资源。
+
 [runtime.py](vane/execution/runtime.py) 中的 QueryService 持有 Session 注册表、worker 池、全局准入、结果预算和存储注册；RayQueryRuntime 负责一个 Session 的 SQL 查询上下文及配置。准入只使用一个服务队列，原子检查全局和会话的 active/queued 上限，保持会话内 FIFO；一个会话已满时允许其他会话使用空闲容量。会话快照报告自身占用，执行/排队历史计数位于 Runtime 服务快照。ResultServiceClient 只持有同一个结果 actor 及尚未释放的创建 RPC，不缓存空闲 actor。所有结果控制调用使用唯一 query_id；迟到 cancel/release 幂等，其他已关闭上下文调用报错。已进入的 RPC 持有其原 ResultContext，无法访问其他查询。
 
 Flight、channel、物化读取器和存储 lease 按查询创建和关闭。FTE watchdog 退出后才释放上下文额度；失败的上下文保留在注册表，其他上下文继续服务。Ray 为常驻结果 actor 预留 max_results 份容量，每份包含两个结果窗口、两条 Flight 链路 staging，配置 FTE 存储时还包含物化读取 staging。这是传输资源预留，不代表进程总 RSS。该进程丢失会使其中所有活动结果失败，随后查询也报告服务不可用；调用方关闭 Runtime 后创建新的 Runtime，不自动重放结果或替换进程。worker 的 FTE attempt 重试仍按原协议执行。
