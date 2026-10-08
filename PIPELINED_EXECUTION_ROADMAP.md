@@ -246,8 +246,9 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 
 - [x] P5.2.1：系统化比较 native local、Ray pipelined、Ray FTE，加入可重放的种子/分区/线程矩阵、确定到达顺序和重复故障/清理验收。实现与运行方法见[执行验收](EXECUTION_ACCEPTANCE.md)。
 - [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。P5.2.1 已加入数据/控制操作归因、重复长查询及失败现场保存；本轮未复现，根因仍未确认。
-- [ ] 测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。
-- [ ] 根据实测调整容量默认值，并给出数值依据。
+- [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
+- [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
+- [ ] 定位 warm Ray 小查询约一秒的提交准备开销，进一步区分规划、actor 创建、RPC 与传输准备后再选择优化。
 
 ### P5.3 发布验收
 
@@ -534,3 +535,12 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 最终非 editable Release wheel 上：差分辅助/到达顺序与 Direct Flight **59 passed**，真实 Ray **15 passed**，合计 **74 passed**。本轮仅执行相关测试，未运行完整 release/fast 套件。
 - Linux/Python 3.12.14、Ray 2.59.0、PyArrow 25.0.1；202 个 Python/类型文件与 checkout 一致，native 与构建产物 SHA-256 一致。engine identity 为 `cf29aa2922:fragment:847f6b376f191fa98542d9fa34d21ba9704a831f8e4f2f97470effa8f169696c`。
 - root 格式、适用 pre-commit、源码版权清单、diff 和源码包校验通过。性能测量、默认容量调整、历史 Flight 超时根因及 P5.3 发布资格仍待完成。
+
+### P5.2.2 可复现性能基准（2026 年 10 月 7 日）
+
+- `scripts/benchmark_execution.py` 通过安装后的公开 `query()` API 测量 native local、Ray pipelined、Ray FTE；记录冷会话、预热、首批、读完/清理、输出吞吐、按行速率消费、共享池混跑和成对故障恢复。完整正确性对照、资源快照与计时分开。
+- 基准逐组释放 worker 池，在有限 CPU 的私有 Ray 集群上比较默认与 compact 容量。CLI 从临时工作目录启动，并将已安装包放到 worker 导入路径首位，避免仓库源码遮蔽非 editable wheel。
+- 在 `0abbe6dfb6` 的干净源码上完成 10 万行全部场景和 100 万行 warm 场景，后者反转容量配置顺序。每个组合 3 次测量、1 次预热；共 **214 条样本**（含 40 条预热）、**40 次完整结果对照**和 **6 次 worker 故障恢复**，全部成功并归还资源。
+- 100 万行扫描中，default/compact 的 pipelined 中位数为 **2.411/4.492 秒**，FTE 为 **5.536/10.972 秒**。compact 减少缓冲预留但牺牲吞吐，因此保留现有默认容量。warm Ray tiny 查询约 1 秒，主要发生在 `query()` 返回之前，需单独分解准备成本。
+- 相关测试 **20 passed**：辅助/本地 CLI 18、真实 Ray 全流程 1、从源码目录启动并限定一个 Ray CPU 的独立 CLI 1。格式、适用 pre-commit、源码版权清单、文档链接、diff 和 sdist 校验通过。只运行相关测试，未运行完整 release/fast 套件。
+- 本轮未修改生产执行器或 native；使用与 P5.2.1 相同的非 editable wheel。测量边界、环境、脚本/构建身份及详细结果见[执行基准](EXECUTION_BENCHMARKS.md#initial-measurements-2026-10-07)。历史 Flight 超时根因、提交准备开销与 P5.3 发布资格仍待完成。

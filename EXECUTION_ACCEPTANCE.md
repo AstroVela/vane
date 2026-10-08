@@ -117,5 +117,6 @@ status, ACK and data-read timeout attribution. They retain the existing timeout
 and failure semantics; attribution alone does not establish or fix the cause of
 the historical timeout.
 
-Performance reports, capacity-default changes, CUDA/model UDF acceptance and
-multi-node deployment qualification are outside this first P5.2 PR.
+The subsequent [execution benchmark](EXECUTION_BENCHMARKS.md) measures startup,
+warm execution, slow clients, mixed modes and recovery with explicit boundaries.
+CUDA/model UDF acceptance and multi-node deployment qualification remain separate.
