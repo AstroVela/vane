@@ -148,8 +148,12 @@ class _NativeEmbeddingDescriptor:
         if {"text", "images", "videos", "padding", "truncation", "return_tensors"} & processor.keys():
             raise ValueError("processor_kwargs cannot override inputs, padding or truncation")
         text_options = processor.get("text_kwargs", {})
-        if not isinstance(text_options, Mapping) or text_options.get("truncation", False) is not False:
-            raise ValueError("Embedding processor cannot truncate inputs")
+        if not isinstance(text_options, Mapping):
+            raise TypeError("processor_kwargs.text_kwargs must be a mapping")
+        if any(text_options.get(key, False) is not False for key in ("padding", "truncation")):
+            raise ValueError("Embedding processor cannot pad or truncate inputs")
+        if text_options.get("return_tensors", "pt") != "pt":
+            raise ValueError("Embedding processor requires return_tensors='pt'")
         if any(values.get("add_special_tokens", False) is not False for values in (processor, text_options)):
             raise ValueError("Native embedding chat templates own special tokens; add_special_tokens must be False")
         video = processor.get("videos_kwargs", {})
@@ -303,7 +307,7 @@ class NativeMediaPrompterDescriptor(PrompterDescriptor):
         return NativePrompter(self)
 
 
-def _clip_data(clip: VideoClip) -> tuple[np.ndarray, dict[str, Any]]:
+def _clip_data(clip: VideoClip, *, requires_frame_rate: bool = False) -> tuple[np.ndarray, dict[str, Any]]:
     if not clip.frames or len(clip.frames) != len(clip.frame_times):
         raise EmbeddingConfigurationError("Video frames and timestamps must be nonempty and aligned")
     if any(frame.shape != clip.frames[0].shape for frame in clip.frames):
@@ -311,6 +315,29 @@ def _clip_data(clip: VideoClip) -> tuple[np.ndarray, dict[str, Any]]:
     if any(not math.isfinite(value) or not 0 <= value <= (2**53 - 1) / 1_000_000 for value in clip.frame_times):
         raise EmbeddingConfigurationError("Video timestamp exceeds the microsecond clock")
     ticks = [round(time * 1_000_000) for time in clip.frame_times]
+    if requires_frame_rate:
+        # A scalar temporal-grid interval cannot represent irregular samples.
+        # Its clock is clip-relative: the source offset must not change fps.
+        count = len(ticks)
+        span = ticks[-1] - ticks[0]
+        if (
+            count < 2
+            or span <= 0
+            or any(a >= b for a, b in zip(ticks, ticks[1:]))
+            or any(abs((tick - ticks[0]) * (count - 1) - i * span) > count - 1 for i, tick in enumerate(ticks))
+        ):
+            raise EmbeddingConfigurationError(
+                "The selected processor requires at least two uniformly spaced video frames "
+                "for second_per_grid_ts (microsecond precision)"
+            )
+        fps = (count - 1) * 1_000_000 / span
+        return np.stack(clip.frames), {
+            "fps": fps,
+            "frames_indices": list(range(count)),
+            "total_num_frames": count,
+            "duration": count / fps,
+            "do_sample_frames": False,
+        }
     return np.stack(clip.frames), {
         "fps": 1_000_000,
         "frames_indices": ticks,
@@ -501,7 +528,30 @@ class NativeEmbedder(_NativeRuntime):
         if kind == "image":
             media["image"] = [value]
         elif kind == "video":
-            media["video"] = [_clip_data(value)]
+            # Use the processor's temporal input contract, not a model-name
+            # dispatch. Other processors retain per-frame absolute timestamps.
+            media["video"] = [
+                _clip_data(value, requires_frame_rate="second_per_grid_ts" in self.processor.model_input_names)
+            ]
+        processing = copy.deepcopy(self.options.get("processor_kwargs", {}))
+        # HF rejects duplicate flat/nested arguments. Normalize owned text
+        # settings once, and flatten text_kwargs only for standalone tokenizers.
+        text_options = processing.pop("text_kwargs", {})
+        text_options.pop("return_tensors", None)
+        for key in ("padding", "truncation", "add_special_tokens"):
+            processing.pop(key, None)
+            text_options[key] = False
+        if self._is_tokenizer:
+            if text_options.keys() & processing.keys():
+                raise EmbeddingConfigurationError("Duplicate flat and nested embedding text options")
+            processing.update(text_options)
+        else:
+            processing["text_kwargs"] = text_options
+        processing["return_tensors"] = "pt"
+        if kind == "video":
+            processing.setdefault("videos_kwargs", {}).pop("do_sample_frames", None)
+            # vLLM's media adapters read this flat option before invoking HF.
+            processing["do_sample_frames"] = False
         dimensions = self.descriptor.dimensions if self.options["supports_overriding_dimensions"] else None
         if self.descriptor.family == "vllm":
             from vllm import PoolingParams
@@ -510,7 +560,7 @@ class NativeEmbedder(_NativeRuntime):
             request = {
                 "prompt": text,
                 "multi_modal_data": media,
-                "mm_processor_kwargs": copy.deepcopy(self.options.get("processor_kwargs", {})),
+                "mm_processor_kwargs": processing,
             }
             result = await self._vllm_result(
                 self._ensure_engine().encode(
@@ -522,7 +572,6 @@ class NativeEmbedder(_NativeRuntime):
         # native processor_output input does: precompute tokens and pixels
         # together, retaining the caller's frame grid without resampling.
         kwargs: dict[str, Any] = {}
-        processing = copy.deepcopy(self.options.get("processor_kwargs", {}))
         payload: dict[str, Any] = {}
         if kind == "video":
             from transformers.video_utils import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -531,24 +580,12 @@ class NativeEmbedder(_NativeRuntime):
 
             frames, metadata = media["video"][0]
             metadata = {key: item for key, item in metadata.items() if key != "do_sample_frames"}
-            processing.setdefault("videos_kwargs", {}).update(
-                video_metadata=[VideoMetadata(**metadata)], do_sample_frames=False
-            )
+            processing["videos_kwargs"]["video_metadata"] = [VideoMetadata(**metadata)]
             payload["videos"] = [frames]
         elif kind == "image":
             payload["images"] = media["image"]
-        if not self._is_tokenizer and "text_kwargs" in processing:
-            # HF processors reject duplicate flat/nested arguments, and their
-            # nested text settings take precedence over flat defaults.
-            processing.pop("add_special_tokens", None)
-            processing["text_kwargs"]["add_special_tokens"] = False
-        else:
-            processing.setdefault("add_special_tokens", False)
         inputs = self.processor(
             text=[text],
-            padding=False,
-            truncation=False,
-            return_tensors="pt",
             **payload,
             **processing,
         )

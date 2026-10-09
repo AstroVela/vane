@@ -31,8 +31,12 @@ view lasts until engine shutdown; the checkpoint and shared cache are unchanged.
 
 Decoded clip embedding uses vane.ai.embed_video on an ordered LIST of
 {frame_index, frame_time, data IMAGE}. Sampling belongs to the caller; both
-native adapters retain frame timestamps at microsecond precision. SGLang uses
-its native processor_output interface and submits the resulting token IDs
+native adapters use microsecond timestamp precision and disable resampling.
+Processors declaring second_per_grid_ts consume a scalar time interval: they
+require at least two uniformly spaced frames and use their actual sampling
+rate, independent of the source start time. Their temporal positions are
+clip-relative. Other processors receive the original per-frame timestamps.
+SGLang uses its native processor_output interface and submits the resulting token IDs
 directly, including for text. Chat templates own special tokens, so native
 embedding processor_kwargs.add_special_tokens must remain False. Models
 must accept the configured processor inputs. Incompatible inputs or SDK/model

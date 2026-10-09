@@ -26,6 +26,8 @@ def install_sdk(setitem, *, mock_transformers=True):
     state.config = SimpleNamespace()
 
     class Processor:
+        model_input_names = ["input_ids", "attention_mask"]
+
         def __init__(self):
             self.tokenizer = self
 
@@ -335,7 +337,7 @@ def test_native_embedding_preserves_inputs_and_reuses_engine(family, kind, sdk):
             assert frames.shape == (2, 8, 8, 3)
         else:
             metadata = vars(sdk.processing[0]["videos_kwargs"]["video_metadata"][0])
-            assert sdk.processing[0]["videos_kwargs"]["do_sample_frames"] is False
+            assert sdk.processing[0]["do_sample_frames"] is False
             assert sdk.calls[0][1]["video_data"][0]["format"] == "processor_output"
             assert sdk.calls[0][1]["input_ids"] == sdk.calls[0][1]["video_data"][0]["input_ids"][0].tolist()
         assert metadata["frames_indices"] == [125000, 1375000] and metadata["fps"] == 1000000
@@ -435,6 +437,9 @@ def test_engine_resource_admission_and_input_ownership(family):
         load_provider(family).get_text_embedder("configured", 2, options={**options, "gpus_per_actor": 1})
     for invalid in (
         {"processor_kwargs": {"videos_kwargs": {"do_sample_frames": True}}},
+        {"processor_kwargs": {"text_kwargs": {"padding": True}}},
+        {"processor_kwargs": {"text_kwargs": {"truncation": True}}},
+        {"processor_kwargs": {"text_kwargs": {"return_tensors": "np"}}},
         {"engine_args": {"model": "other"}},
         {"pooling_args": {"dimensions": 9}},
     ):
@@ -495,6 +500,24 @@ def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
 
     asyncio.run(run())
     assert sdk.engines == []
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("times", [(0.0,), (0.0, 0.5, 1.5, 2.0), (0.0, 0.5, 0.5, 1.0), (1.0, 0.5)])
+def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup(family, times, sdk):
+    sys.modules["transformers"].AutoProcessor.model_input_names = ["input_ids", "second_per_grid_ts"]
+    frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in times)
+
+    async def run():
+        runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+        try:
+            with pytest.raises(ValueError, match="at least two uniformly spaced video frames"):
+                await runtime.embed_video([VideoClip(frames, times, tuple(range(len(times))))])
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.engines == [] and sdk.calls == [] and sdk.processing == []
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -789,7 +812,14 @@ def test_vllm_processor_model_view_is_cleaned_on_failures(tmp_path, failure, sdk
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
-@pytest.mark.parametrize("processing", [{}, {"add_special_tokens": False}])
+@pytest.mark.parametrize(
+    "processing",
+    [
+        {},
+        {"add_special_tokens": False},
+        {"text_kwargs": {"padding": False, "truncation": False, "add_special_tokens": False, "return_tensors": "pt"}},
+    ],
+)
 def test_native_template_token_ids_are_submitted_without_retokenization(
     tmp_path, family, processing, bos_tokenizer, monkeypatch
 ):
@@ -826,19 +856,12 @@ def test_native_template_token_ids_are_submitted_without_retokenization(
         assert bos_tokenizer.encode(call[1]["prompt"], **call[3].get("tokenization_kwargs", {})) == expected
 
 
-# Transformers 5.12 builds modality IDs with np.array(torch.Tensor), whose
-# NumPy 2 copy-keyword warning is unrelated to the processor-output contract.
-@pytest.mark.filterwarnings(
-    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
-)
-@pytest.mark.parametrize("text_options", [{}, {"text_kwargs": {}}, {"text_kwargs": {"add_special_tokens": False}}])
-def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_options):
+@pytest.fixture
+def make_real_video_processor():
     transformers = pytest.importorskip("transformers", minversion="4.57.1")
     pytest.importorskip("torchvision")
     from tokenizers import Tokenizer, decoders, pre_tokenizers
     from tokenizers.models import BPE
-    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
-    from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
     specials = ["<unk>", "<pad>", "<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
     vocabulary = specials + sorted(pre_tokenizers.ByteLevel.alphabet())
@@ -848,12 +871,40 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_o
     tokenizer = transformers.Qwen2TokenizerFast(
         tokenizer_object=backend, unk_token="<unk>", pad_token="<pad>", additional_special_tokens=specials[2:]
     )
-    processor = Qwen3VLProcessor(
-        image_processor=transformers.Qwen2VLImageProcessor(),
-        tokenizer=tokenizer,
-        video_processor=Qwen3VLVideoProcessor(),
-        chat_template="<|video_pad|>",
-    )
+
+    def make(*, scalar_timing=False):
+        processor = transformers.Qwen2_5_VLProcessor if scalar_timing else transformers.Qwen3VLProcessor
+        video_processor = transformers.Qwen2VLVideoProcessor if scalar_timing else transformers.Qwen3VLVideoProcessor
+        return processor(
+            image_processor=transformers.Qwen2VLImageProcessor(),
+            tokenizer=tokenizer,
+            video_processor=video_processor(),
+            chat_template="<|video_pad|>",
+        )
+
+    return make
+
+
+# Transformers 5.12 builds modality IDs with np.array(torch.Tensor), whose
+# NumPy 2 copy-keyword warning is unrelated to the processor-output contract.
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+@pytest.mark.parametrize(
+    "text_options",
+    [
+        {},
+        {"text_kwargs": {}},
+        {"text_kwargs": {"add_special_tokens": False}},
+        {"text_kwargs": {"truncation": False}},
+        {"text_kwargs": {"padding": False}},
+        {"text_kwargs": {"padding": False, "truncation": False, "add_special_tokens": False, "return_tensors": "pt"}},
+    ],
+)
+def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_options, make_real_video_processor):
+    import transformers
+
+    processor = make_real_video_processor()
     state = install_sdk(monkeypatch.setitem, mock_transformers=False)
     monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     descriptor = load_provider("sglang").get_video_embedder(
@@ -862,11 +913,12 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_o
         options={
             "gpus_per_actor": 0,
             "processor_kwargs": {
-                "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}},
+                "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}, "do_sample_frames": False},
                 **text_options,
             },
         },
     )
+    before = descriptor.get_options()
     frames = tuple(np.full((64, 64, 3), value, dtype=np.uint8) for value in (10, 20, 30))
 
     async def run():
@@ -878,10 +930,104 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_o
 
     asyncio.run(run())
     request = state.calls[0][1]
-    text = tokenizer.decode(request["input_ids"], skip_special_tokens=False)
+    text = processor.tokenizer.decode(request["input_ids"], skip_special_tokens=False)
     assert "<0.4 seconds>" in text and "<1.4 seconds>" in text
     assert request["video_data"][0]["format"] == "processor_output"
     assert request["input_ids"] == request["video_data"][0]["input_ids"][0].tolist()
+    assert descriptor.get_options() == before
+
+
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("start", [0.0, 10.0])
+@pytest.mark.parametrize("interval", [0.5, 1 / 30])
+def test_real_video_processor_preserves_sampling_interval(
+    monkeypatch, family, start, interval, make_real_video_processor
+):
+    import transformers
+    from transformers.video_utils import VideoMetadata
+
+    processor = make_real_video_processor(scalar_timing=True)
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    descriptor = load_provider(family).get_video_embedder(
+        "custom-local-checkpoint",
+        2,
+        options={
+            "gpus_per_actor": 0,
+            "processor_kwargs": {
+                "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}},
+            },
+        },
+    )
+    before = descriptor.get_options()
+    frames = tuple(np.full((64, 64, 3), value, dtype=np.uint8) for value in (10, 20, 30, 40))
+    times = tuple(start + i * interval for i in range(4))
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            assert await runtime.embed_video([VideoClip(frames, times, (1, 5, 9, 13))]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    request = state.calls[0][1]
+    if family == "vllm":
+        assert request["mm_processor_kwargs"]["do_sample_frames"] is False
+        assert "do_sample_frames" not in request["mm_processor_kwargs"]["videos_kwargs"]
+        array, metadata = request["multi_modal_data"]["video"][0]
+        # vLLM's native adapter reconstructs HF metadata from this dictionary.
+        # Exercise the submitted metadata/options with the real processor.
+        output = processor(
+            text=[request["prompt"]],
+            videos=[array],
+            video_metadata=[
+                VideoMetadata(**{key: value for key, value in metadata.items() if key != "do_sample_frames"})
+            ],
+            **request["mm_processor_kwargs"],
+        )
+    else:
+        output = request["video_data"][0]
+    np.testing.assert_allclose(output["second_per_grid_ts"], [2 * interval], atol=1e-6, rtol=0)
+    assert output["video_grid_thw"][0][0] == 2  # Four frames, without resampling.
+    assert descriptor.get_options() == before
+
+
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_sglang_real_processor_accepts_nested_text_options(monkeypatch, kind, make_real_video_processor):
+    import transformers
+
+    processor = make_real_video_processor()
+    processor.chat_template = "hello" if kind == "text" else "<|image_pad|>"
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    descriptor = getattr(load_provider("sglang"), f"get_{kind}_embedder")(
+        "custom-local-checkpoint",
+        2,
+        options={
+            "gpus_per_actor": 0,
+            "processor_kwargs": {
+                "text_kwargs": {"padding": False, "truncation": False, "add_special_tokens": False},
+            },
+        },
+    )
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            value = "hello" if kind == "text" else np.zeros((64, 64, 3), dtype=np.uint8)
+            assert await getattr(runtime, f"embed_{kind}")([value]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert state.requests_closed == 1 and state.engines[0].closed == 1
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
