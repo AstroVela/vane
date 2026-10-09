@@ -179,11 +179,8 @@ class TransformersProvider(Provider):
     ) -> TextEmbedderDescriptor:
         from vane.ai.providers._clap import ClapTextEmbedderDescriptor
         from vane.ai.providers._cosmos_embed1 import CosmosTextEmbedderDescriptor
-        from vane.ai.providers._qwen3_vl_embedding import QwenTextEmbedderDescriptor
 
         resolved_options = dict(options or {})
-        if model is not None and model.startswith("Qwen/Qwen3-VL"):
-            return QwenTextEmbedderDescriptor(model, dimensions, resolved_options, self._name)
         if model is not None and model.startswith("laion/clap-"):
             return ClapTextEmbedderDescriptor(model, dimensions, resolved_options, self._name)
         if model is not None and model.startswith("nvidia/Cosmos-Embed1"):
@@ -203,10 +200,7 @@ class TransformersProvider(Provider):
         options: Mapping[str, Any] | None = None,
     ) -> ImageEmbedderDescriptor:
         from vane.ai.providers._cosmos_embed1 import CosmosImageEmbedderDescriptor
-        from vane.ai.providers._qwen3_vl_embedding import QwenImageEmbedderDescriptor
 
-        if model is not None and model.startswith("Qwen/Qwen3-VL"):
-            return QwenImageEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
         if model is not None and model.startswith("nvidia/Cosmos-Embed1"):
             return CosmosImageEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
         return TransformersImageEmbedderDescriptor(
@@ -224,14 +218,9 @@ class TransformersProvider(Provider):
         options: Mapping[str, Any] | None = None,
     ) -> VideoEmbedderDescriptor:
         from vane.ai.providers._cosmos_embed1 import COSMOS_MODEL, CosmosVideoEmbedderDescriptor
-        from vane.ai.providers._qwen3_vl_embedding import QwenVideoEmbedderDescriptor
 
-        if model is not None and model.startswith("Qwen/Qwen3-VL"):
-            return QwenVideoEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
         if model != COSMOS_MODEL:
-            raise EmbeddingConfigurationError(
-                f"Transformers video embedding requires model={COSMOS_MODEL!r} or a Qwen3-VL-Embedding model"
-            )
+            raise EmbeddingConfigurationError(f"Transformers video embedding requires model={COSMOS_MODEL!r}")
         return CosmosVideoEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
 
     def get_audio_embedder(

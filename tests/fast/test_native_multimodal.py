@@ -139,12 +139,20 @@ def clip():
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 def test_models_and_dimensions_are_explicit_and_planning_is_lazy(family, sdk):
     provider = load_provider(family)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="model"):
         provider.get_prompter()
+    for model in (None, "", " "):
+        with pytest.raises(ValueError, match="model"):
+            provider.get_prompter(model=model)
+        with pytest.raises(ValueError, match="model"):
+            provider.get_prompter(model=model, options={"media_mime_types": ["video/mp4"]})
     assert isinstance(provider.get_prompter(model="configured-text-model"), NativeInferencePlan)
     for kind in ("text", "image", "video"):
+        for model in (None, "", " "):
+            with pytest.raises(ValueError, match="model"):
+                getattr(provider, f"get_{kind}_embedder")(model, dimensions=17)
         with pytest.raises(ValueError, match="dimensions"):
-            getattr(provider, f"get_{kind}_embedder")("Qwen/Qwen3-VL-Embedding-2B")
+            getattr(provider, f"get_{kind}_embedder")("configured-encoder")
         desc, dims, udf, *_ = _prepare_embed_call(
             family, "/models/custom-encoder", 17, "raise", {"gpus_per_actor": 2}, relation=True, input_kind=kind
         )
