@@ -21,14 +21,14 @@ import weakref
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from concurrent.futures import Future
     from multiprocessing import shared_memory
     from typing import NoReturn
@@ -37,6 +37,7 @@ from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import _bounded_close_error
 from vane.execution.local_resource_graph import LocalResourceUnitContext
+from vane.execution.local_stream_adapter import LocalStreamAdapter
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
@@ -93,7 +94,8 @@ from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuEx
 from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
-from vane.execution.udf_shm_store import ParentShmPeer
+from vane.execution.udf_shm_store import LocalShmStoreCapacityError, ParentShmPeer
+from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
@@ -103,6 +105,7 @@ from vane.runners.ray.ray_env import build_explicit_session_process_env
 
 _active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
 _active_local_output: ContextVar[Callable[[Any], None] | None] = ContextVar("vane_local_output", default=None)
+_active_local_stream: ContextVar[LocalStreamAdapter | None] = ContextVar("vane_local_stream", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -122,6 +125,8 @@ _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
 _MSG_REF_BUNDLE_CHUNK = 0x11
 _MSG_OUTPUT_GRANT_FAILED = 0x12
+_MSG_STREAM_NEXT = 0x13
+_MSG_STREAM_CONTINUE = 0x14
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -350,7 +355,6 @@ def _make_local_ref_bundle_worker_payload_with_lease(
     *,
     submit_id: int | None,
     name: str,
-    reserve_output_credit: bool,
 ) -> tuple[dict[str, Any], int] | tuple[None, None]:
     worker_payload = make_local_ref_bundle_worker_payload(block_refs, slices, metadata, names)
     if worker_payload is None:
@@ -359,7 +363,6 @@ def _make_local_ref_bundle_worker_payload_with_lease(
         tuple(block_refs),
         name=name,
         submit_id=submit_id,
-        reserve_output_credit=reserve_output_credit,
     )
     if (task := current_data_task()) is not None:
         task.hold_input_transport(local_shm_budget_manager(), lease_id)
@@ -1013,7 +1016,6 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
-                reserve_output_credit=self._ref_bundle_output and reservation is None,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
@@ -1201,23 +1203,40 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             try:
                 task = current_data_task()
                 reservation = task.reservation if task is not None else None
-                if reservation is not None:
-                    scope.raise_if_cancelled("UDF subprocess output grant")
-                    grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
-                else:
-                    grant_id = request_local_shm_output_grant(
-                        size,
-                        name=f"udf-output-{request_id}",
-                        priority=priority,
-                        input_lease_id=input_lease_id,
-                        cancel_event=scope,
-                        wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
-                    )
-                self._track_output_grant(grant_id, scope)
-                scope.raise_if_cancelled("UDF subprocess output grant")
                 if self._shm_peer is None:
                     raise RuntimeError("worker has no shared-memory ownership channel")
-                allocation = self._shm_peer.reserve_write(grant_id, size)
+                self._shm_peer.store.check_write_size(size)
+                while True:
+                    if reservation is not None:
+                        scope.raise_if_cancelled("UDF subprocess output grant")
+                        grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
+                    else:
+                        grant_id = request_local_shm_output_grant(
+                            size,
+                            name=f"udf-output-{request_id}",
+                            priority=priority,
+                            input_lease_id=input_lease_id,
+                            cancel_event=scope,
+                            wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
+                        )
+                    self._track_output_grant(grant_id, scope)
+                    scope.raise_if_cancelled("UDF subprocess output grant")
+                    try:
+                        allocation = self._shm_peer.reserve_write(grant_id, size)
+                        break
+                    except LocalShmStoreCapacityError:
+                        if reservation is not None:
+                            # Explicit envelopes are strict. They consume the
+                            # declared output allowance once, without escape.
+                            raise
+                        self._release_output_grant(grant_id, name="udf-output-waiting-for-storage")
+                        grant_id = 0
+                        self._shm_peer.store.wait_for_capacity(
+                            size,
+                            local_shm_budget_manager().consuming_inputs(input_lease_id),
+                            scope,
+                            lambda: self._capacity_wait_context("shared_memory_output"),
+                        )
             except BaseException as exc:
                 if grant_id > 0:
                     if self._shm_peer is not None:
@@ -1283,8 +1302,28 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     _MSG_OUTPUT_GRANT_REQUEST,
                     _MSG_OUTPUT_GRANT_RELEASE,
                     _MSG_TASK_CANCELLED,
+                    _MSG_STREAM_NEXT,
                 )
             )
+            if msg_type == _MSG_STREAM_NEXT:
+                scope = self._current_execution_scope()
+                stream = _active_local_stream.get()
+                if payload or stream is None:
+                    protocol_error = RuntimeError("invalid local output stream permit request")
+                    self._record_worker_protocol_failure(protocol_error)
+                    raise protocol_error
+                try:
+                    stream.reserve(scope, lambda: self._capacity_wait_context("shared_memory_output"))
+                except BaseException as exc:
+                    self._send_worker_message(
+                        self._require_socket(),
+                        _MSG_OUTPUT_GRANT_CANCELLED if scope.is_set() else _MSG_OUTPUT_GRANT_FAILED,
+                        str(exc).encode("utf-8", errors="replace"),
+                    )
+                else:
+                    self._send_worker_message(self._require_socket(), _MSG_STREAM_CONTINUE)
+                msg_type = None
+                continue
             if msg_type in (_MSG_OK, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
                 self._awaiting_submit_terminal = False
             try:
@@ -1409,7 +1448,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if payload.get("estimated_num_rows") == 0:
             # The worker will never receive this bundle and therefore cannot
             # acknowledge its lease. Cancel rather than consume it so an empty
-            # result does not leave behind unused output credit.
+            # result does not leave behind an unacknowledged input lease.
             if lease_id_raw is not None:
                 cancel_local_shm_input_lease(int(lease_id_raw), name="udf-input-zero-row")
             return None
@@ -1448,7 +1487,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 ) from exc
             raise RuntimeError(self._broken_error) from exc
         try:
-            return self._recv_submit_result()
+            result = self._recv_submit_result()
+            if lease_id is not None:
+                local_shm_budget_manager().finish_consuming(lease_id)
+            return result
         except BaseException as submit_error:
             cleanup_error: BaseException | None = None
             if lease_id is not None:
@@ -1475,7 +1517,6 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             names,
             submit_id=None,
             name="udf-input",
-            reserve_output_credit=self._ref_bundle_output,
         )
         if worker_payload is not None:
             try:
@@ -1496,24 +1537,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
 
     def submit(self, args: pa.Table) -> None:
-        self._pending_batches += 1
-        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
-        try:
+        with self._collect_output_stream(None):
             result = self._submit_table(args)
-        finally:
-            _active_local_output.reset(token)
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
         self._notify_wakeup()
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
-        self._pending_batches += 1
-        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
-        try:
+        with self._collect_output_stream(submit_id):
             result = self._submit_table(args)
-        finally:
-            _active_local_output.reset(token)
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
@@ -1525,26 +1556,38 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
-        self._pending_batches += 1
-        token = _active_local_output.set(lambda result: self._queue_stream_result(submit_id, result))
-        try:
+        with self._collect_output_stream(submit_id):
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
-        finally:
-            _active_local_output.reset(token)
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
     def submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> None:
-        self._pending_batches += 1
-        token = _active_local_output.set(lambda result: self._queue_stream_result(None, result))
-        try:
+        with self._collect_output_stream(None):
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
-        finally:
-            _active_local_output.reset(token)
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
         self._notify_wakeup()
+
+    @contextmanager
+    def _collect_output_stream(self, submit_id: int | None) -> Iterator[None]:
+        # This low-level synchronous protocol client explicitly collects every
+        # block during submit(). The runner uses UDFExecutor's capacity-aware
+        # asynchronous receiver instead, and returns permits on native reads.
+        stream = LocalStreamAdapter()
+
+        def collect(result: Any) -> None:
+            self._queue_stream_result(submit_id, result)
+            stream.consumed()
+
+        self._pending_batches += 1
+        stream_token = _active_local_stream.set(stream)
+        output_token = _active_local_output.set(collect)
+        try:
+            yield
+        finally:
+            _active_local_output.reset(output_token)
+            _active_local_stream.reset(stream_token)
+            stream.close()
+            self._pending_batches = max(0, self._pending_batches - 1)
 
     def _queue_stream_result(self, submit_id: int | None, result: Any) -> None:
         with self._stream_result_lock:
@@ -3687,6 +3730,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._debug_submit_count = 0
         self._queue: deque[Any] = deque()
         self._result_admissions: deque[AdmissionLease | None] = deque()
+        self._result_streams: deque[LocalStreamAdapter | None] = deque()
         self._queue_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
@@ -3842,12 +3886,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return None
         return self._workers[0]._proc
 
-    def _enqueue_result(self, item: Any | None) -> None:
-        if item is not None:
-            with self._queue_lock:
-                self._queue.append(item)
-        self._notify_wakeup()
-
     @staticmethod
     def _submit_result_item(submit_id: int | None, result: Any | None) -> Any:
         if submit_id is not None:
@@ -3866,6 +3904,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             # A block transfers data ownership only. The terminal result retains
             # the physical task slot until backend cleanup has completed.
             self._result_admissions.append(None)
+            self._result_streams.append(_active_local_stream.get())
         self._notify_wakeup()
 
     def _output_budget_estimate(self, num_rows: int | None) -> int:
@@ -3913,11 +3952,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             "udf_local_shm_budget_limit_bytes": int(budget_snapshot.get("limit_bytes", 0)),
             "udf_local_shm_allocated_bytes": int(budget_snapshot.get("allocated_bytes", 0)),
             "udf_local_shm_output_grant_bytes": int(budget_snapshot.get("output_grant_bytes", 0)),
-            "udf_local_shm_output_credit_bytes": int(budget_snapshot.get("output_credit_bytes", 0)),
             "udf_local_shm_input_lease_bytes": int(budget_snapshot.get("input_lease_bytes", 0)),
             "udf_local_shm_available_bytes": int(budget_snapshot.get("available_bytes", 0)),
             "udf_local_shm_active_input_leases": int(budget_snapshot.get("active_input_leases", 0)),
-            "udf_local_shm_active_output_credits": int(budget_snapshot.get("active_output_credits", 0)),
             "udf_local_shm_waiting_output_grants": int(budget_snapshot.get("waiting_output_grants", 0)),
             "udf_local_shm_input_consumed_count": int(budget_snapshot.get("input_consumed_count", 0)),
             "udf_local_shm_refs_released_by_input_ack": int(budget_snapshot.get("refs_released_by_input_ack", 0)),
@@ -4123,6 +4160,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     else:
                         self._queue.append(item)
                         self._result_admissions.append(admission)
+                        self._result_streams.append(None)
             elif admission is not None:
                 try:
                     admission.release()
@@ -4278,11 +4316,15 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             output_fn = fn
 
             def run_streaming(worker: _SingleSubprocessExecutor) -> Any | None:
+                stream = LocalStreamAdapter()
+                stream_token = _active_local_stream.set(stream)
                 token = _active_local_output.set(lambda result: self._publish_stream_result(submit_id, result))
                 try:
                     return output_fn(worker)
                 finally:
                     _active_local_output.reset(token)
+                    _active_local_stream.reset(stream_token)
+                    stream.close()
 
             fn = run_streaming
 
@@ -4432,7 +4474,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
-        data_scope = getattr(self, "_data_scope", None)
         worker_payload: dict[str, Any] | None = None
         lease_id: int | None = None
 
@@ -4445,8 +4486,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 names,
                 submit_id=int(submit_id),
                 name=f"udf-input-{int(submit_id)}",
-                reserve_output_credit=self._ref_bundle_output
-                and not (data_scope is not None and data_scope.limits is not None),
             )
             if worker_payload is None:
                 raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
@@ -4504,17 +4543,32 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             "subprocess UDF ref-bundle submission requires submit_ref_bundle_with_id() and a pregranted admission lease"
         )
 
-    def take_ready_result(self) -> Any | None:
+    def take_ready_result(self, capacity: dict[str, Any] | None = None) -> Any | None:
         self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._queue_lock:
+            if self._queue and capacity is not None:
+                item = self._queue[0]
+                if isinstance(item, tuple) and item[0] == SUBMIT_RESULT_MARKER:
+                    output = item[2]
+                elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool):
+                    output = item[0]
+                else:
+                    output = item
+                if output is not None and not isinstance(output, BaseException):
+                    window = StreamReadWindow(StreamCapacity.parse(capacity))
+                    if not window.take(estimate_local_shm_ref_bundle_ipc_size(output)):
+                        return None
             try:
                 result = self._queue.popleft()
             except IndexError:
                 return None
             result_admissions = getattr(self, "_result_admissions", None)
             admission = result_admissions.popleft() if result_admissions else None
+            stream = self._result_streams.popleft() if self._result_streams else None
+        if stream is not None:
+            stream.consumed()
         if admission is not None:
             admission.release()
         transition_local_shm_output(result, "downstream_input")
@@ -4661,9 +4715,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 admissions = list(result_admissions or ())
                 if result_admissions is not None:
                     result_admissions.clear()
+                streams = list(self._result_streams)
+                self._result_streams.clear()
         else:
             queued_results = []
             admissions = []
+            streams = []
         for result in queued_results:
             _release_local_ref_bundle_result(result)
         for admission in admissions:
@@ -4681,6 +4738,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 cleanup_errors.append(exc)
         cancelled_scopes, wait_cleanup_errors = self._cancel_local_shm_waits()
         cleanup_errors.extend(wait_cleanup_errors)
+        for stream in streams:
+            if stream is not None:
+                stream.close()
         close_kill = bool(kill)
         if close_kill:
             actor_pool = self._actor_pool

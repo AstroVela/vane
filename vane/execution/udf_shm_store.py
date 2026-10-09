@@ -22,10 +22,14 @@ import struct
 import threading
 import uuid
 import weakref
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from itertools import count
 from typing import Any
+
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 _RELEASE = struct.Struct("!Q")
 _ALIGNMENT = 64
@@ -259,6 +263,15 @@ class LocalShmStoreCapacityError(RuntimeError):
     """Live physical buffers, rather than transport credits, fill the store."""
 
 
+def _allocation_capacity(size: int) -> int:
+    if type(size) is not int or size <= 0:
+        raise ValueError("shared-memory allocation size must be positive")
+    # Sixteen size classes per power-of-two range absorb small IPC metadata
+    # changes without stranding an almost-large-enough free slot.
+    alignment = 1 << max(6, (size - 1).bit_length() - 5)
+    return (size + alignment - 1) // alignment * alignment
+
+
 @dataclass(frozen=True)
 class ShmAllocation:
     store_id: str
@@ -297,12 +310,15 @@ class _LiveAllocation:
     capacity: int
     refs: int = 1
     forks: list[_ForkHold] = dataclass_field(default_factory=list)
+    budget_releases: list[Callable[[], None]] = dataclass_field(default_factory=list)
+    retained: bool = True
 
 
 class StoreLease:
     def __init__(self, store: LocalShmStore, allocation: ShmAllocation) -> None:
         self.store = store
         self.allocation = allocation
+        self._lifetime = store._require_locked(allocation)
         self._lock = threading.Lock()
         self._released = False
 
@@ -318,10 +334,12 @@ class StoreLease:
         # finalizers must not reclaim pages or names owned by the parent.
         if self.store._owner_pid != os.getpid():
             return
+        callbacks = []
         with self._lock:
             if not self._released:
-                self.store.release(self.allocation)
+                callbacks = self.store.release(self.allocation)
                 self._released = True
+        self.store.return_budgets(callbacks)
         self.store.drain_if_idle()
 
     def __del__(self) -> None:
@@ -337,6 +355,8 @@ class LocalShmStore:
         self.store_id = uuid.uuid4().hex
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
+        self._capacity_condition = threading.Condition(self._lock)
+        self._waiting_writes: dict[tuple[str, int], tuple[int, set[int]]] = {}
         self._shm: Any = None
         self._free = [(0, capacity)]
         self._live: dict[int, _LiveAllocation] = {}
@@ -348,6 +368,7 @@ class LocalShmStore:
         self._allocations = 0
         self._reused_allocations = 0
         self._high_water = 0
+        self._budget_releases: list[Callable[[], None]] = []
         with _registry_lock, _fork_lock:
             _stores[self.store_id] = self
 
@@ -367,7 +388,7 @@ class LocalShmStore:
     def remove_client(self, client_id: str) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock, _fork_lock:
+        with self._mutation():
             self._collect_fork_pins_locked()
             self._clients.discard(client_id)
             if not self._clients:
@@ -375,22 +396,13 @@ class LocalShmStore:
 
     def allocate(self, size: int) -> StoreLease:
         self._require_owner()
-        if type(size) is not int or size <= 0:
-            raise ValueError("shared-memory allocation size must be positive")
-        # Sixteen size classes per power-of-two range keep large-block slack
-        # below 6.25%, while absorbing small IPC metadata changes between
-        # batches. Exact-size free holes otherwise strand almost an entire
-        # image batch when its successor grows by only a few bytes.
-        alignment = 1 << max(6, (size - 1).bit_length() - 5)
-        required = (size + alignment - 1) // alignment * alignment
-        with self._lock, _fork_lock:
+        required = self.check_write_size(size)
+        with self._mutation():
             self._collect_fork_pins_locked()
             if self._closed:
                 raise RuntimeError("shared-memory store is closed")
             index = next((i for i, (_, length) in enumerate(self._free) if length >= required), None)
             if index is None:
-                # Waiting with input views pinned can deadlock a pipeline. This
-                # is a physical capacity error and must not wait for an ACK.
                 live = sum(entry.capacity for entry in self._live.values())
                 raise LocalShmStoreCapacityError(
                     f"shared-memory store cannot allocate {size} bytes: "
@@ -413,6 +425,69 @@ class LocalShmStore:
             self._high_water = max(self._high_water, offset + required)
             return StoreLease(self, allocation)
 
+    def check_write_size(self, size: int) -> int:
+        required = _allocation_capacity(size)
+        if required > self.capacity:
+            raise LocalShmStoreCapacityError(
+                f"shared-memory output block exceeds arena capacity: requested={size}, capacity={self.capacity}"
+            )
+        return required
+
+    def wait_for_capacity(
+        self,
+        size: int,
+        inputs: tuple[ShmAllocation, ...],
+        scope: ExecutionCancellationScope,
+        wait_context: Callable[[], AbstractContextManager[None]],
+    ) -> None:
+        """Wait for a physical release without owning a grant or a worker CPU.
+
+        A wait cannot resolve when every live region is an input of a writer
+        waiting for output space. Report that capacity boundary instead of
+        letting the producers and consumers wait on each other indefinitely.
+        """
+        self._require_owner()
+        required = self.check_write_size(size)
+        generations = {allocation.generation for allocation in inputs if allocation.store_id == self.store_id}
+
+        def wake() -> None:
+            with self._capacity_condition:
+                self._capacity_condition.notify_all()
+
+        unregister = scope.register_cancel_wakeup(wake)
+        try:
+            # Admission transitions can acquire unrelated locks. Keep them
+            # outside the store lock, including CPU reacquisition on exit.
+            with wait_context():
+                with self._capacity_condition:
+                    self._waiting_writes[scope.identity] = (required, generations)
+                    self._capacity_condition.notify_all()
+                    try:
+                        while True:
+                            scope.raise_if_cancelled("shared-memory output capacity")
+                            if self._closed:
+                                raise RuntimeError("shared-memory store is closed")
+                            largest = max((length for _, length in self._free), default=0)
+                            if largest >= required:
+                                return
+                            pinned = sum(self._live[g].capacity for g in generations if g in self._live)
+                            blocked_inputs = set().union(*(g for _, g in self._waiting_writes.values()))
+                            all_blocked = self._live.keys() <= blocked_inputs and all(
+                                requested > largest for requested, _ in self._waiting_writes.values()
+                            )
+                            if pinned + required > self.capacity or all_blocked:
+                                raise LocalShmStoreCapacityError(
+                                    f"shared-memory output cannot make progress: requested={size}, "
+                                    f"pinned_input_bytes={pinned}, capacity={self.capacity}, "
+                                    f"largest_free={largest}; reduce task input or output block size"
+                                )
+                            self._capacity_condition.wait()
+                    finally:
+                        del self._waiting_writes[scope.identity]
+                        self._capacity_condition.notify_all()
+        finally:
+            unregister()
+
     def _require_locked(self, allocation: ShmAllocation) -> _LiveAllocation:
         entry = self._live.get(allocation.generation)
         if entry is None or entry.allocation != allocation:
@@ -426,9 +501,9 @@ class LocalShmStore:
             entry.refs += 1
             return StoreLease(self, allocation)
 
-    def release(self, allocation: ShmAllocation) -> None:
+    def release(self, allocation: ShmAllocation) -> list[Callable[[], None]]:
         if self._owner_pid != os.getpid():
-            return
+            return []
         with self._lock, _fork_lock:
             self._collect_fork_pins_locked()
             entry = self._require_locked(allocation)
@@ -437,9 +512,49 @@ class LocalShmStore:
             entry.refs -= 1
             if not entry.refs and not entry.forks:
                 self._free_allocation_locked(entry)
+            callbacks, self._budget_releases = self._budget_releases, []
+            return callbacks
+
+    def retain_budget(self, allocation: ShmAllocation, release: Callable[[], None]) -> None:
+        self._require_owner()
+        with self._lock:
+            self._require_locked(allocation).budget_releases.append(release)
+
+    @staticmethod
+    def return_budgets(callbacks: list[Callable[[], None]]) -> None:
+        error: BaseException | None = None
+        for callback in callbacks:
+            try:
+                callback()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+
+    @contextmanager
+    def _mutation(self) -> Iterator[None]:
+        callbacks = []
+        try:
+            with self._lock, _fork_lock:
+                try:
+                    yield
+                finally:
+                    callbacks, self._budget_releases = self._budget_releases, []
+        except BaseException as error:
+            try:
+                self.return_budgets(callbacks)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        else:
+            self.return_budgets(callbacks)
 
     def _free_allocation_locked(self, entry: _LiveAllocation) -> None:
         del self._live[entry.allocation.generation]
+        entry.retained = False
+        self._budget_releases.extend(entry.budget_releases)
+        entry.budget_releases.clear()
         self._free.append((entry.allocation.offset, entry.capacity))
         merged: list[tuple[int, int]] = []
         for start, length in sorted(self._free):
@@ -449,6 +564,7 @@ class LocalShmStore:
             else:
                 merged.append((start, length))
         self._free = merged
+        self._capacity_condition.notify_all()
 
     def _collect_fork_pins_locked(self) -> bool:
         if not self._forked:
@@ -466,7 +582,7 @@ class LocalShmStore:
     def drain_if_idle(self) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock, _fork_lock:
+        with self._mutation():
             self._collect_fork_pins_locked()
             if not self._clients:
                 self._drain_locked()
@@ -494,6 +610,7 @@ class LocalShmStore:
             self._shm.close()
             self._shm = None
         self._closed = True
+        self._capacity_condition.notify_all()
         # Registry entries remain until cleanup succeeds, so close can retry.
 
     def _unlink_locked(self) -> None:
@@ -519,7 +636,7 @@ class LocalShmStore:
     def close(self) -> None:
         if self._owner_pid != os.getpid():
             return
-        with self._lock, _fork_lock:
+        with self._mutation():
             self._collect_fork_pins_locked()
             if self._clients:
                 raise RuntimeError("shared-memory store still has live worker clients")
@@ -527,7 +644,7 @@ class LocalShmStore:
 
     def snapshot(self) -> dict[str, int]:
         self._require_owner()
-        with self._lock, _fork_lock:
+        with self._mutation():
             if self._collect_fork_pins_locked() and not self._clients:
                 self._drain_locked()
             live = sum(entry.capacity for entry in self._live.values())

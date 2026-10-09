@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
     from multiprocessing import shared_memory
 
 from vane import pickle as vane_pickle
@@ -57,6 +58,8 @@ _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
 _MSG_REF_BUNDLE_CHUNK = 0x11
 _MSG_OUTPUT_GRANT_FAILED = 0x12
+_MSG_STREAM_NEXT = 0x13
+_MSG_STREAM_CONTINUE = 0x14
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -507,6 +510,40 @@ def _publish_output_block(
         raise
 
 
+def _publish_output_iterator(
+    outputs: Iterable[pa.Table], sock: socket.socket, *, submit_count: int, input_lease_id: int | None
+) -> None:
+    iterator = iter(outputs)
+    try:
+        while True:
+            _send_message(sock, _MSG_STREAM_NEXT)
+            msg_type, response = _recv_message(sock)
+            if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
+                raise _TaskCancelledError(response.decode("utf-8", errors="replace"))
+            if msg_type == _MSG_OUTPUT_GRANT_FAILED:
+                raise RuntimeError(response.decode("utf-8", errors="replace"))
+            if msg_type != _MSG_STREAM_CONTINUE or response:
+                raise RuntimeError("unexpected local output stream permit response")
+            try:
+                output = next(iterator)
+            except StopIteration:
+                return
+            _publish_output_block(output, sock, submit_count=submit_count, input_lease_id=input_lease_id)
+            del output
+    except BaseException as error:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            try:
+                close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+        raise
+    finally:
+        # Normal exhaustion closes generator frames itself. On failure the
+        # explicit close above preserves the original task/cancellation error.
+        del iterator
+
+
 def _execute_submit(
     executor: RuntimeUDFExecutor,
     input_table: pa.Table,
@@ -525,12 +562,13 @@ def _execute_submit(
     if produce_ref_bundle_output and call_mode in {"map_batches", "flat_map"}:
         # Each bounded runtime output owns its own exact-byte grant. The
         # terminal response follows executor cleanup in task mode.
-        for output in executor.iter_submit(input_table):
-            _publish_output_block(output, sock, submit_count=submit_count, input_lease_id=input_lease_id)
-        if finish_before_drain:
-            executor.finished_submitting()
-        for output in executor.drain_outputs():
-            _publish_output_block(output, sock, submit_count=submit_count, input_lease_id=input_lease_id)
+        def outputs() -> Iterator[pa.Table]:
+            yield from executor.iter_submit(input_table)
+            if finish_before_drain:
+                executor.finished_submitting()
+            yield from executor.drain_outputs()
+
+        _publish_output_iterator(outputs(), sock, submit_count=submit_count, input_lease_id=input_lease_id)
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
     row_preserving = call_mode == "map_batches_rows" or (
         call_mode == "map" and payload.get("scalar_arg_count") is not None

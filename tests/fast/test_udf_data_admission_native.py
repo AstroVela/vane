@@ -133,7 +133,7 @@ def test_input_cleanup_retry_preserves_another_subprocess_borrow(
     first, second = ledger.open_query(), ledger.open_query()
     task = first.open_task(first.reserve_task() if limited else None)
     ref_bundle.track_local_shm_inputs(task, [owner], original[2])
-    lease = ref_bundle.create_local_shm_input_lease([owner], reserve_output_credit=False)
+    lease = ref_bundle.create_local_shm_input_lease([owner])
     task.hold_input_transport(strict_transport, lease)
 
     class Identity:

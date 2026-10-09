@@ -608,7 +608,7 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
     )
     _marker, refs, metadata, names = subprocess_exec.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
     payload, lease_id = subprocess_exec._make_local_ref_bundle_worker_payload_with_lease(
-        refs, None, metadata, names, submit_id=None, name="test-input", reserve_output_credit=False
+        refs, None, metadata, names, submit_id=None, name="test-input"
     )
     assert payload is not None
     # Keep the real lease alive, but send an unreadable descriptor so the worker
@@ -1039,7 +1039,7 @@ def test_chained_decode_failure_cannot_notify_or_release_unowned_inputs(monkeypa
     try:
         result = _submit_single(producer, 1)
         ref = result[1][0]
-        foreign_lease = ref_bundle.create_local_shm_input_lease(result[1], reserve_output_credit=False)
+        foreign_lease = ref_bundle.create_local_shm_input_lease(result[1])
         _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(ref)]}, "invalid_ipc")
         monkeypatch.setattr(local, "_recv_message", invalid_failure)
         with pytest.raises(RuntimeError):
@@ -1189,6 +1189,8 @@ def test_standalone_deferred_decode_failure_precedes_cleanup_and_preserves_categ
 @pytest.mark.parametrize("failure", [pa.ArrowInvalid, pa.ArrowMemoryError, OSError])
 @pytest.mark.parametrize("cleanup_failure", [False, True])
 def test_pooled_decode_failure_precedes_worker_cleanup_and_preserves_category(monkeypatch, failure, cleanup_failure):
+    import traceback
+
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -1242,6 +1244,13 @@ def test_pooled_decode_failure_precedes_worker_cleanup_and_preserves_category(mo
                 ref.release()
     assert worker._cleanup_finished
     assert nonzero(metrics) == {field: 1}
+    # The injected decoder's traceback still holds its BufferReader argument.
+    # Keep charging that live view after worker/descriptor cleanup; only the
+    # last physical buffer release may return its transport bytes.
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before + result[1][0].size
+    traceback.clear_frames(decode_error.__traceback__)
+    if cleanup_failure:
+        traceback.clear_frames(cleanup_error.__traceback__)
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
 
 
