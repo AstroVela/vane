@@ -367,7 +367,7 @@ unique_ptr<DataSourceStream> DataSourceStreamFactory::ProduceStream(const char *
 		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(&stream->arrow_array_stream));
 		TieExecutionContextToArrowStream(&stream->arrow_array_stream, execution_context, context->shared_from_this());
 		return make_uniq<PythonDataSourceStream>(std::move(adapter), std::move(stream), execution_context,
-		                                       context->shared_from_this());
+		                                         context->shared_from_this());
 	} catch (...) {
 		execution_context->Invalidate();
 		throw;

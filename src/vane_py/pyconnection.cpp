@@ -890,7 +890,6 @@ void DuckDBPyConnection::UnregisterFilesystem(const py::str &name) {
 	py::gil_scoped_release release;
 	unique_ptr<FileSystem> removed;
 	{
-		std::lock_guard<std::recursive_mutex> connection_guard(py_connection_lock);
 		lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
 		removed = con.GetDatabase().GetFileSystem().ExtractSubSystem(subsystem);
 	}
@@ -943,7 +942,6 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 	}
 
 	py::gil_scoped_release release;
-	std::lock_guard<std::recursive_mutex> connection_guard(py_connection_lock);
 	lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
 	auto &fs = con.GetDatabase().GetFileSystem();
 	for (const auto &name : protocols) {
@@ -963,10 +961,9 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 }
 
 static vector<string> ReadFileSystemNames(DuckDBPyConnection &connection) {
-	// ExtractSubSystem moves a pointer shared by registry snapshots. Copy
-	// names under the writer lock, releasing the GIL before waiting for it.
+	// Callers hold the connection lock. ExtractSubSystem moves a pointer
+	// shared by registry snapshots, so copy names under the registration lock.
 	py::gil_scoped_release release;
-	std::lock_guard<std::recursive_mutex> connection_guard(connection.py_connection_lock);
 	lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
 	return connection.con.GetDatabase().GetFileSystem().ListSubSystems();
 }

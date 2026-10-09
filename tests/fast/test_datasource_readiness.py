@@ -283,6 +283,72 @@ class _WakeDuringPollSource(DataSource):
         return [_WakeDuringPollTask(offset) for offset in range(0, 128, 16)]
 
 
+class _CallbackWait(_ManualWait):
+    def subscribe(self, wakeup):
+        import builtins
+
+        builtins._vane_readiness_callback("subscribe")
+        return super().subscribe(wakeup)
+
+
+class _CallbackTask(DataSourceTask):
+    def execute(self):
+        raise AssertionError("requires native readiness polling")
+
+    def _execute_with_context(self, execution_context):
+        import builtins
+
+        try:
+            builtins._vane_readiness_callback("iterate")
+            yield _CallbackWait(wake_during_subscribe=True)
+            yield pa.record_batch({"id": [7]})
+            yield pa.record_batch({"id": [8]})
+        finally:
+            builtins._vane_readiness_callback("close")
+
+
+class _CallbackSource(DataSource):
+    @property
+    def schema(self):
+        return {"id": "BIGINT"}
+
+    def get_tasks(self):
+        return [_CallbackTask()]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("phase", ["iterate", "subscribe", "close"])
+@pytest.mark.parametrize("action", ["execute", "register_native_fs", "unregister_native_fs"])
+def test_native_readiness_and_teardown_reject_connection_reentry(monkeypatch, configured, phase, action):
+    import builtins
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    attempts = []
+    with vane.connect(config={"threads": 1}) as connection, vane.connect() as target:
+        if configured:
+            from vane.execution.request_admission import RequestAdmissionLimits
+
+            connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+        def callback(current_phase):
+            if current_phase != phase:
+                return
+            attempts.append(current_phase)
+            with pytest.raises(vane.InvalidInputException, match="Python input callback"):
+                if action == "execute":
+                    target.execute("SELECT 42")
+                elif action == "register_native_fs":
+                    target._register_vane_fs(None)
+                else:
+                    target._unregister_vane_fs("unused")
+
+        monkeypatch.setattr(builtins, "_vane_readiness_callback", callback, raising=False)
+        assert read_datasource(_CallbackSource(), con=connection).limit(1).fetchall() == [(7,)]
+        assert attempts == [phase]
+        assert connection.execute("SELECT 8").fetchall() == [(8,)]
+        assert target.execute("SELECT 42").fetchall() == [(42,)]
+
+
 def test_native_scan_cannot_lose_callback_before_blocking(duckdb_cursor):
     # Every callback runs synchronously before the scan returns BLOCKED.
     rows = read_datasource(_WakeDuringPollSource(), con=duckdb_cursor).fetchall()
