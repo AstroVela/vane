@@ -284,15 +284,18 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
 
     monkeypatch.setattr(pa.ipc, "new_stream", serialize)
     monkeypatch.setattr(worker, "_request_output_grant", grant)
-    monkeypatch.setattr(worker, "_send_message", lambda _sock, kind, payload: sent.append((kind, payload)))
+    monkeypatch.setattr(worker, "_send_message", lambda _sock, kind, payload=b"": sent.append((kind, payload)))
+    monkeypatch.setattr(worker, "_recv_message", lambda _sock: (worker._MSG_STREAM_CONTINUE, b""))
     _, kind, payload = worker._execute_submit(Executor(), table, None, True, sock=None, submit_count=1)
-    descriptor = vane_pickle.loads(sent[0][1] if streaming else payload)
+    chunks = [payload for kind, payload in sent if kind == worker._MSG_REF_BUNDLE_CHUNK]
+    descriptor = vane_pickle.loads(chunks[0] if streaming else payload)
     try:
         assert serialized == [True]
         assert grants == [descriptor["metadata"][0]["ipc_size_bytes"]]
         assert descriptor["grant_id"] == 9
         if streaming:
-            assert sent[0][0] == worker._MSG_REF_BUNDLE_CHUNK
+            assert len(chunks) == 1
+            assert [message for message, _ in sent].count(worker._MSG_STREAM_NEXT) == 2
             assert kind == worker._MSG_OK
     finally:
         ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
@@ -370,24 +373,47 @@ def test_interleaved_submits_preserve_ids_empty_results_and_compute_tail(runtime
         executor.close(kill=True)
 
 
-def test_cancelling_a_full_output_queue_releases_all_block_owners(runtime):
+@pytest.mark.parametrize("kill", [False, True])
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_cancelling_a_full_output_queue_releases_all_block_owners(runtime, monkeypatch, kill, backend):
     def expand(_table):
         for _ in range(100):
             yield pa.table({"blob": [b"x" * 32768]})
 
-    executor = udf_subprocess.UDFExecutor(_payload(expand))
+    class Expand:
+        def __call__(self, table):
+            return expand(table)
+
+    full = threading.Event()
+    reserve = udf_subprocess.LocalStreamAdapter.reserve
+
+    def observed_reserve(stream, *args, **kwargs):
+        with stream._condition:
+            if stream._outstanding == 2:
+                full.set()
+        return reserve(stream, *args, **kwargs)
+
+    monkeypatch.setattr(udf_subprocess.LocalStreamAdapter, "reserve", observed_reserve)
+    metrics = WorkerMetrics()
+    payload = _payload(Expand if backend == "subprocess_actor" else expand, execution_backend=backend)
+    pool = (
+        udf_subprocess.LocalSubprocessActorPool(payload, 1, worker_metrics=metrics)
+        if backend == "subprocess_actor"
+        else None
+    )
+    executor = udf_subprocess.UDFExecutor(
+        payload, {"local_worker_metrics": metrics, **({"local_actor_pool": pool} if pool is not None else {})}
+    )
     try:
         assert executor.request_task_admission(0)
         executor.submit_with_id(1, pa.table({"x": [1]}))
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if ref_bundle.local_shm_ref_budget_snapshot()["waiting_output_grants"]:
-                break
-            time.sleep(0.01)
-        else:
-            pytest.fail("producer did not block on its bounded output queue")
+        assert full.wait(timeout=15), "producer did not block on its bounded output queue"
+        executor.close(kill=kill)
+        assert metrics.snapshot()["runtime_errors"] == metrics.snapshot()["execution_errors"] == 0
     finally:
         executor.close(kill=True)
+        if pool is not None:
+            pool.shutdown(kill=True)
 
 
 def test_native_pipeline_consumes_blocks_before_a_physical_task_completes(runtime, monkeypatch, tmp_path):
@@ -445,7 +471,7 @@ def test_physical_store_exhaustion_reports_capacity_failure_and_cleans_grants(ru
         executor.submit_with_id(1, pa.table({"x": [1]}))
         result = _next(executor)[2]
         assert isinstance(result, RuntimeError)
-        assert "shared-memory store cannot allocate" in str(result)
+        assert "shared-memory output block exceeds arena capacity" in str(result)
         assert "cancelled" not in str(result)
     finally:
         executor.close(kill=True)

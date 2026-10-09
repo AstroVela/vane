@@ -3835,6 +3835,7 @@ def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
     import vane.execution.ref_bundle as ref_bundle
 
     monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
+    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 100 * ref_bundle._GIB)
     monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 80 * ref_bundle._GIB)
 
@@ -3850,10 +3851,18 @@ def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monke
     from vane.execution import ref_bundle
 
     shm_capacity = 256 * ref_bundle._MIB
+    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 80 * ref_bundle._GIB)
     monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: shm_capacity)
 
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() <= shm_capacity
+    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(shm_capacity * 0.95) // 2
+
+
+def test_local_shm_auto_budget_respects_explicit_small_arena(monkeypatch):
+    from vane.execution import ref_bundle
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64m")
+    assert ref_bundle._auto_local_shm_ref_budget_bytes() == 32 * ref_bundle._MIB
 
 
 def test_local_shm_ref_bundle_acquires_budget_before_creating_shm(monkeypatch):
@@ -6062,6 +6071,7 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     }
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
@@ -6213,6 +6223,7 @@ def test_subprocess_wakeup_callback_errors_are_reported_on_ready_result_take():
     executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
     executor._wakeup = lambda: (_ for _ in ()).throw(RuntimeError("wakeup failed"))
     executor._queue = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._wakeup_error = None
 
@@ -7402,8 +7413,6 @@ def test_subprocess_zero_row_ref_bundle_releases_input_lease(monkeypatch):
         "active_input_ref_holds": 0,
         "active_input_ref_hold_count": 0,
         "input_lease_bytes": 0,
-        "active_output_credits": 0,
-        "output_credit_bytes": 0,
     }
 
     def lease_state():
@@ -7522,8 +7531,6 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     assert snapshot["active_input_ref_holds"] == 0
     assert snapshot["active_input_ref_hold_count"] == 0
     assert snapshot["input_lease_bytes"] == 0
-    assert snapshot["active_output_credits"] == 0
-    assert snapshot["output_credit_bytes"] == 0
 
 
 def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed(monkeypatch):
@@ -8151,13 +8158,11 @@ def test_local_shm_budget_manager_input_lease_is_diagnostic_only(monkeypatch):
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 0
     assert snapshot["input_lease_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 400
-    assert snapshot["usage_bytes"] == 400
-    assert snapshot["available_bytes"] == 624
+    assert snapshot["usage_bytes"] == 0
+    assert snapshot["available_bytes"] == 1024
 
     manager.cancel_input_lease(lease_id, name="lease-a")
     snapshot = manager.snapshot()
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 0
     assert snapshot["available_bytes"] == 1024
 
@@ -8237,7 +8242,6 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
         lease_id = ref_bundle.create_local_shm_input_lease(
             refs,
             name="input",
-            reserve_output_credit=False,
         )
         ref_bundle.consume_local_shm_input_lease(lease_id, name="input")
 
@@ -8249,9 +8253,7 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
             ref.release()
 
 
-def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
-    import threading
-
+def test_local_shm_budget_manager_ack_returns_actual_capacity_without_reserving_outputs():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8264,44 +8266,18 @@ def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
 
     manager.acquire_allocation(650, name="backlog")
     manager.acquire_allocation(300, name="input")
-    lease_id = manager.create_input_lease((BudgetedRef(),), 300, name="input")
-
-    manager.consume_input_lease(lease_id, name="input")
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 650
-    assert snapshot["output_credit_bytes"] == 300
-    assert snapshot["usage_bytes"] == 950
-
-    producer_grants = []
-
-    def request_producer_grant():
-        producer_grants.append(manager.request_output_grant(100, name="producer", priority="producer"))
-
-    producer_thread = threading.Thread(target=request_producer_grant)
-    producer_thread.start()
-    threading.Event().wait(0.05)
-    assert producer_grants == []
-
-    consumer_grant = manager.request_output_grant(
-        200,
-        name="consumer",
-        priority="consumer",
-        input_lease_id=lease_id,
-    )
-    assert isinstance(consumer_grant, int)
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 650
-    assert snapshot["output_grant_bytes"] == 200
-    assert snapshot["output_credit_bytes"] == 0
-    assert snapshot["usage_bytes"] == 850
-
-    producer_thread.join(timeout=2)
-    assert len(producer_grants) == 1
+    lease = manager.create_input_lease([BudgetedRef()], 300)
+    manager.consume_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 650
+    grant = manager.request_output_grant(100, priority="producer")
+    assert manager.snapshot()["usage_bytes"] == 750
+    manager.release_output_grant(grant)
+    manager.release_allocation(650)
+    manager.cancel_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_credits():
-    import threading
-
+def test_local_shm_budget_manager_consumed_inputs_cannot_block_expanding_output():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8312,54 +8288,22 @@ def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_cr
         def release(self):
             manager.release_allocation(self.size, name="input")
 
-    manager.acquire_allocation(400, name="input-a")
-    manager.acquire_allocation(400, name="input-b")
-    lease_a = manager.create_input_lease((BudgetedRef(),), 400, name="input-a")
-    lease_b = manager.create_input_lease((BudgetedRef(),), 400, name="input-b")
-
-    manager.consume_input_lease(lease_a, name="input-a")
-    manager.consume_input_lease(lease_b, name="input-b")
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 800
-
-    cancel_event = threading.Event()
-    grants = []
-    errors = []
-
-    def request_matching_output():
-        try:
-            grants.append(
-                manager.request_output_grant(
-                    700,
-                    name="consumer-a",
-                    priority="consumer",
-                    input_lease_id=lease_a,
-                    cancel_event=cancel_event,
-                )
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=request_matching_output)
-    thread.start()
-    thread.join(timeout=0.2)
-    assert grants == []
-    assert thread.is_alive()
-
-    manager.cancel_input_lease(lease_b, name="input-b")
-    thread.join(timeout=2)
-
-    assert len(grants) == 1
-    assert errors == []
-    snapshot = manager.snapshot()
-    assert snapshot["usage_bytes"] == 700
-    assert snapshot["usage_bytes"] <= snapshot["limit_bytes"]
-    manager.release_output_grant(grants[0], name="consumer-a")
-    manager.cancel_input_lease(lease_a, name="input-a")
+    leases = []
+    for _ in range(2):
+        manager.acquire_allocation(400)
+        leases.append(manager.create_input_lease([BudgetedRef()], 400))
+    for lease in leases:
+        manager.consume_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
+    grant = manager.request_output_grant(700, priority="consumer", input_lease_id=leases[0])
+    assert manager.snapshot()["usage_bytes"] == 700
+    manager.release_output_grant(grant)
+    for lease in leases:
+        manager.cancel_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit():
+def test_local_shm_budget_manager_cancel_after_ack_does_not_release_unrelated_bytes():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8375,16 +8319,14 @@ def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit()
     lease_id = manager.create_input_lease((BudgetedRef(),), 300, name="input")
 
     manager.consume_input_lease(lease_id, name="input")
-    assert manager.snapshot()["output_credit_bytes"] == 300
 
     manager.cancel_input_lease(lease_id, name="input-error")
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 500
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 500
 
 
-def test_local_shm_budget_manager_can_consume_input_without_output_credit():
+def test_local_shm_budget_manager_input_consumption_returns_released_capacity():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8400,13 +8342,11 @@ def test_local_shm_budget_manager_can_consume_input_without_output_credit():
         (BudgetedRef(),),
         300,
         name="legacy-output-input",
-        reserve_output_credit=False,
     )
 
     manager.consume_input_lease(lease_id, name="legacy-output-input")
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 0
 
 
@@ -9708,6 +9648,7 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9774,6 +9715,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
             FakeAdmission("second"),
         ]
     )
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = lambda: events.append("unregister")
     executor._execution_scopes_lock = threading.Lock()
@@ -9930,7 +9872,6 @@ def test_close_during_input_ack_keeps_executor_cleanup_retryable(monkeypatch, ow
                 executor._untrack_input_lease(lease)
                 assert lease in executor._active_input_leases
                 assert budget.snapshot()["input_lease_bytes"] == ref.size
-                assert budget.snapshot()["output_credit_bytes"] == 0
             finally:
                 proceed.set()
             if fails:
@@ -10003,6 +9944,7 @@ def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypa
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -10051,6 +9993,7 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._task_futures_cv = threading.Condition()
@@ -10115,6 +10058,7 @@ def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -10190,6 +10134,7 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     executor._task_future_meta = {}
     executor._pending_lock = threading.Lock()
     executor._pending_batches = 0
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._queue = deque()
     executor._result_admissions = deque()
@@ -10243,6 +10188,7 @@ def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     executor._ref_bundle_output = False
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
@@ -10290,6 +10236,7 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
     executor._admission_authority = FakeAuthority()
     executor._queue = deque([(ref_bundle.SUBMIT_RESULT_MARKER, 41, result)])
     executor._result_admissions = deque([admission])
+    executor._result_streams = deque()
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -10374,11 +10321,9 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
             "udf_local_shm_budget_limit_bytes",
             "udf_local_shm_allocated_bytes",
             "udf_local_shm_output_grant_bytes",
-            "udf_local_shm_output_credit_bytes",
             "udf_local_shm_input_lease_bytes",
             "udf_local_shm_available_bytes",
             "udf_local_shm_active_input_leases",
-            "udf_local_shm_active_output_credits",
             "udf_local_shm_waiting_output_grants",
             "udf_local_shm_input_consumed_count",
             "udf_local_shm_refs_released_by_input_ack",

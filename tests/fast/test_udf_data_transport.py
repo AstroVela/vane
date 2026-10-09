@@ -36,13 +36,13 @@ def test_failed_shared_input_hold_transfers_only_unreleased_owners(release_metho
                 raise RuntimeError("planned shared input release failure")
 
     failed, succeeded, later, newest = Ref(fail=True), Ref(), Ref(), Ref()
-    first = budget.create_input_lease([failed, succeeded], 400, reserve_output_credit=False)
+    first = budget.create_input_lease([failed, succeeded], 400)
     finish = getattr(budget, finish_method)
     with pytest.raises(RuntimeError, match="planned shared input release failure"):
         finish(first)
     assert (failed.calls, succeeded.calls) == (1, 1)
     assert budget.snapshot()["active_input_ref_holds"] == 1
-    second = budget.create_input_lease([later], 400, reserve_output_credit=False)
+    second = budget.create_input_lease([later], 400)
     failed.fail = False
     if retry_first:
         assert finish(first) == 400
@@ -51,7 +51,7 @@ def test_failed_shared_input_hold_transfers_only_unreleased_owners(release_metho
     assert (failed.calls, succeeded.calls, later.calls) == (2, 1, 1)
     # An old retry must neither repeat completed releases nor erase a newer
     # generation's hold when the shared-memory name is reused.
-    third = budget.create_input_lease([newest], 400, reserve_output_credit=False)
+    third = budget.create_input_lease([newest], 400)
     assert finish(first) == (0 if retry_first else 400)
     assert newest.calls == 0
     assert budget.snapshot()["active_input_ref_hold_count"] == 1
@@ -83,7 +83,7 @@ def test_new_input_borrow_is_atomic_while_owner_release_is_running(fails):
                     raise RuntimeError("planned blocked input release failure")
 
     owner, alias, unrelated = Ref("shared"), Ref("shared"), Ref("other")
-    first = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    first = budget.create_input_lease([owner], 400)
     with ThreadPoolExecutor(max_workers=1) as threads:
         cleanup = threads.submit(budget.cancel_input_lease, first)
         try:
@@ -100,7 +100,7 @@ def test_new_input_borrow_is_atomic_while_owner_release_is_running(fails):
             with pytest.raises(RuntimeError, match="planned blocked input release failure"):
                 cleanup.result(timeout=5)
             # Once the failed release returns, later borrowing is safe again.
-            second = budget.create_input_lease([alias], 400, reserve_output_credit=False)
+            second = budget.create_input_lease([alias], 400)
             assert budget.cancel_input_lease(first) == 400
             assert owner.calls == 1
             assert budget.cancel_input_lease(second) == 400
@@ -132,10 +132,10 @@ def test_shared_cleanup_retries_preserve_the_running_release_owner(fails):
                     raise RuntimeError("planned second release failure")
 
     owner = Ref()
-    first = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    first = budget.create_input_lease([owner], 400)
     with pytest.raises(RuntimeError, match="planned initial release failure"):
         budget.cancel_input_lease(first)
-    second = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    second = budget.create_input_lease([owner], 400)
     with ThreadPoolExecutor(max_workers=1) as threads:
         cleanup = threads.submit(budget.cancel_input_lease, second)
         try:
@@ -170,10 +170,10 @@ def test_input_release_rechecks_later_holds_after_reentrant_borrow():
         def release(self):
             self.calls += 1
             if self is first:
-                later_leases.append(budget.create_input_lease([second], 400, reserve_output_credit=False))
+                later_leases.append(budget.create_input_lease([second], 400))
 
     first, second = Ref("first"), Ref("second")
-    original = budget.create_input_lease([first, second], 800, reserve_output_credit=False)
+    original = budget.create_input_lease([first, second], 800)
     assert budget.cancel_input_lease(original) == 800
     assert (first.calls, second.calls) == (1, 0)
     assert budget.snapshot()["input_lease_bytes"] == 400
@@ -194,8 +194,8 @@ def test_failed_input_cleanup_retries_partial_release_without_touching_other_que
     refs = [ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [i]}))[1][0] for i in range(3)]
     ref_bundle.track_local_shm_inputs(task, refs[:2])
     ref_bundle.track_local_shm_inputs(other_task, refs[2:])
-    first_lease = ref_bundle.create_local_shm_input_lease(refs[:2], reserve_output_credit=False)
-    other_lease = ref_bundle.create_local_shm_input_lease(refs[2:], reserve_output_credit=False)
+    first_lease = ref_bundle.create_local_shm_input_lease(refs[:2])
+    other_lease = ref_bundle.create_local_shm_input_lease(refs[2:])
     task.hold_input_transport(budget, first_lease)
     other_task.hold_input_transport(budget, other_lease)
     release = budget._release_input_ack_ref
@@ -246,7 +246,7 @@ def test_concurrent_transport_cleanup_keeps_input_accounted_until_release_finish
     task = query.open_task(query.reserve_task())
     ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
     ref_bundle.track_local_shm_inputs(task, [ref])
-    lease = ref_bundle.create_local_shm_input_lease([ref], reserve_output_credit=False)
+    lease = ref_bundle.create_local_shm_input_lease([ref])
     task.hold_input_transport(budget, lease)
     entered, proceed = threading.Event(), threading.Event()
     release = budget._release_input_ack_ref
@@ -301,7 +301,6 @@ def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, firs
             raise RuntimeError("planned concurrent input release failure")
         release(ref)
 
-    expected_credit = ref.size if first == second == "consume_input_lease" else 0
     try:
         with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
             patch.setattr(budget, "_release_input_ack_ref", blocked_release)
@@ -311,7 +310,6 @@ def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, firs
                 assert getattr(budget, second)(lease) is None
                 assert budget.input_lease_pending(lease)
                 assert budget.snapshot()["input_lease_bytes"] == ref.size
-                assert budget.snapshot()["output_credit_bytes"] == expected_credit
                 assert calls == [ref.name]
             finally:
                 proceed.set()
@@ -322,12 +320,11 @@ def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, firs
                 assert cleanup.result(timeout=5) == ref.size
         assert budget.input_lease_pending(lease) == fails
         if fails:
-            # Even a late ACK must not revive a cancelled lease's credit.
+            # A late ACK completes cleanup without reviving the cancelled lease.
             assert budget.consume_input_lease(lease) == ref.size
         assert not budget.input_lease_pending(lease)
         snapshot = budget.snapshot()
         assert snapshot["input_lease_bytes"] == snapshot["allocated_bytes"] == 0
-        assert snapshot["output_credit_bytes"] == expected_credit
     finally:
         proceed.set()
         budget.cancel_input_lease(lease)
@@ -335,7 +332,7 @@ def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, firs
     assert budget.snapshot()["usage_bytes"] == 0
 
 
-def test_reentrant_input_cancellation_revokes_credit_without_waiting(monkeypatch):
+def test_reentrant_input_cancellation_does_not_wait_for_its_own_release(monkeypatch):
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
     ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
@@ -347,7 +344,7 @@ def test_reentrant_input_cancellation_revokes_credit_without_waiting(monkeypatch
             if budget.input_lease_pending(lease):
                 pending.append(budget.cancel_input_lease(lease))
                 # Notifications must not hold the manager lock on this thread.
-                assert threads.submit(budget.snapshot).result(timeout=5)["output_credit_bytes"] == 0
+                assert threads.submit(budget.snapshot).result(timeout=5)["usage_bytes"] == 0
 
         unregister = ref_bundle.register_local_shm_ref_budget_wakeup(cancel_on_release)
         try:
@@ -486,7 +483,7 @@ def test_input_ack_does_not_release_data_borrows_or_double_count_shared_output(t
     ref_bundle.track_local_shm_inputs(consumer, [ref, ref])
     assert ledger.snapshot()["retained_bytes"] == size
     assert ledger.snapshot()["input_bytes"] == ledger.snapshot()["output_bytes"] == size
-    transport_lease = ref_bundle.create_local_shm_input_lease([ref], reserve_output_credit=False)
+    transport_lease = ref_bundle.create_local_shm_input_lease([ref])
     try:
         ref_bundle.consume_local_shm_input_lease(transport_lease)
         assert budget.snapshot()["allocated_bytes"] == 0

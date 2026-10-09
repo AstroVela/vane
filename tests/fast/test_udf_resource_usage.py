@@ -246,7 +246,7 @@ def test_failed_input_cleanup_keeps_unit_accounting_until_success():
 
     owner = Owner()
     task.hold_inputs([DataAllocation("local_shm", "input", owner.size)])
-    lease = manager.create_input_lease([owner], owner.size, reserve_output_credit=False)
+    lease = manager.create_input_lease([owner], owner.size)
     task.hold_input_transport(manager, lease)
     try:
         with pytest.raises(RuntimeError, match="planned input cleanup failure"):
