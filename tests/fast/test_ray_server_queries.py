@@ -116,10 +116,17 @@ def test_retained_client_views_are_charged_and_cancel_wakes_buffer_wait(server, 
                         break
                     batches.append(pending.result())
                 assert client.resource_snapshot()["waiting_byte_results"] == 1
+                # Without ORDER BY, either scan partition may arrive first.
+                # Copy values before cancellation to verify every retained view.
+                expected = [batch.column(0).to_pylist() for batch in batches]
+                assert expected and len(expected[0]) == 64
+                values = [value for batch in expected for value in batch]
+                assert len(values) == len(set(values))
+                assert all(0 <= value < 10000 for value in values)
                 query.cancel()
                 with pytest.raises(RequestCancelled):
                     pending.result(timeout=10)
-                assert batches[0].column(0).to_pylist() == list(range(64))
+                assert [batch.column(0).to_pylist() for batch in batches] == expected
                 assert client.resource_snapshot()["exported_bytes"] > 0
             finally:
                 batches.clear()
