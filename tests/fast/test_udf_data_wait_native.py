@@ -179,8 +179,8 @@ def test_native_later_query_waits_for_a_slow_consumer_view(native_environment, l
     views = []
     take_result = udf_subprocess.UDFExecutor.take_ready_result
 
-    def retain_view(executor):
-        result = take_result(executor)
+    def retain_view(executor, capacity=None):
+        result = take_result(executor, capacity)
         # A successful stream also returns a terminal envelope with no payload.
         if result is not None and result[2] is not None and not isinstance(result[2], BaseException):
             views.extend(ref.to_table() for ref in result[2][1])

@@ -2614,7 +2614,17 @@ private:
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			return false;
 		}
-		auto raw_result = slot.py_executor->obj.attr("take_ready_result")();
+		py::object raw_result;
+		if (IsSubprocessExecutionBackend(GetStructStringOrDefault(slot.payload, "execution_backend"))) {
+			auto capacity = GetSlotResultCapacity(slot, generation);
+			py::dict limits;
+			limits["rows"] = py::int_(capacity.rows);
+			limits["bytes"] = py::int_(capacity.bytes);
+			limits["item_bytes"] = py::int_(capacity.item_bytes);
+			raw_result = slot.py_executor->obj.attr("take_ready_result")(limits);
+		} else {
+			raw_result = slot.py_executor->obj.attr("take_ready_result")();
+		}
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			return true;
 		}
@@ -3235,7 +3245,11 @@ private:
 				continue;
 			}
 			auto generation = slot->generation.load();
-			if (!ShouldDrainSyncResults(*slot, generation)) {
+			// Subprocess streams apply the shared capacity policy to DATA in
+			// Python. Their terminal/error events must remain readable even
+			// when the downstream DATA window is empty.
+			if (!IsSubprocessExecutionBackend(GetStructStringOrDefault(slot->payload, "execution_backend")) &&
+			    !ShouldDrainSyncResults(*slot, generation)) {
 				continue;
 			}
 			if (DrainSyncSlotSafely(*slot, generation)) {

@@ -70,7 +70,7 @@ def test_reuse_coalesces_free_blocks_and_rejects_stale_generation(store):
         last.release()
 
 
-def test_retained_arrow_slice_pins_data_after_ref_and_transport_budget_release(store, monkeypatch):
+def test_retained_arrow_slice_keeps_storage_and_transport_bytes_charged(store, monkeypatch):
     manager = refs.LocalShmBudgetManager(limit_factory=lambda: store.capacity)
     monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     ref = _input(store, [11, 22, 33], track_budget=True)
@@ -78,10 +78,10 @@ def test_retained_arrow_slice_pins_data_after_ref_and_transport_budget_release(s
     table = ref.to_table()
     kept = table.column(0).chunk(0).slice(1)
     del table
-    input_lease = refs.create_local_shm_input_lease([ref], reserve_output_credit=False)
+    input_lease = refs.create_local_shm_input_lease([ref])
     assert manager.snapshot()["allocated_bytes"] == ref.size
     refs.consume_local_shm_input_lease(input_lease)
-    assert manager.snapshot()["allocated_bytes"] == 0
+    assert manager.snapshot()["allocated_bytes"] == ref.size
     refs.cancel_local_shm_input_lease(input_lease)
     ref.release()
     gc.collect()
@@ -96,6 +96,7 @@ def test_retained_arrow_slice_pins_data_after_ref_and_transport_budget_release(s
     del kept
     gc.collect()
     assert store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["allocated_bytes"] == 0
 
 
 def test_batch_size_jitter_reuses_a_free_slot_with_other_batches_live():

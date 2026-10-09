@@ -209,7 +209,7 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 result = self._output
                 self._output = None
                 return result
@@ -339,7 +339,7 @@ def test_native_dispatcher_notification_cannot_cross_the_wait_boundary(notificat
                                make_local_shm_ref_bundle_result(pa.table({'y': self.values})))
                 self.waiting_output = False
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 result, self.output = self.output, None
                 return result
 
@@ -541,7 +541,7 @@ def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
                 self._producer = threading.Thread(target=publish, daemon=True)
                 self._producer.start()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 with self._lock:
                     output = self._output
                     self._output = None
@@ -647,7 +647,7 @@ def test_native_dispatcher_shutdown_closes_active_executor():
                 self._admission_state = "idle"
                 submitted.set()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -808,7 +808,7 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
                 self._admission_state = "idle"
                 return object()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -983,7 +983,7 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
                 self._admission_state = "idle"
                 return object()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1185,7 +1185,7 @@ def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1311,7 +1311,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 if self._output is None:
                     return None
                 if self._block_result:
@@ -1744,7 +1744,7 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1993,7 +1993,7 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -2163,7 +2163,7 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 if self._output is None:
                     return None
                 result = self._output
@@ -2426,7 +2426,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
                 self._publish(submit_id, table)
                 return None
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 with self._lock:
                     if not self._output:
                         return None

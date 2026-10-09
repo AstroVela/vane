@@ -150,9 +150,9 @@ def test_projection_cleanup_keeps_external_views_charged(native_environment, mon
     output_count = 0
     take_result = udf_subprocess.UDFExecutor.take_ready_result
 
-    def retain_first_output(executor):
+    def retain_first_output(executor, capacity=None):
         nonlocal output_count
-        result = take_result(executor)
+        result = take_result(executor, capacity)
         # Count data outputs without counting the stream's terminal envelope.
         if result is not None and result[2] is not None and not isinstance(result[2], BaseException):
             if output_count == 0:

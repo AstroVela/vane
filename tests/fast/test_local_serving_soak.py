@@ -462,7 +462,6 @@ def test_soak_rejects_gpu_execution_ownership_after_cpu_resources_are_idle(retai
                 "usage_bytes",
                 "active_input_leases",
                 "active_input_ref_holds",
-                "active_output_credits",
                 "waiting_output_grants",
             ),
             0,
