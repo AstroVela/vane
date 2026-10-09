@@ -16,7 +16,7 @@ import pytest
 import ray
 
 from tests.fast.test_flight_server import TOKEN
-from tests.fast.test_ray_recovery_runtime import resources
+from tests.fast.test_ray_recovery_runtime import close_result, resources
 from tests.fast.test_ray_server_queries import query_options
 from tests.fast.test_server_sessions import wait_until
 from vane.client import Client
@@ -122,7 +122,7 @@ threading.Event().wait()
                 process.communicate(timeout=5)
                 if blocker is not None:
                     for result in blocker:
-                        result.close()
+                        close_result(result)
         assert_idle(server)
         assert survivor.query("select 7").collect().column(0).to_pylist() == [7]
         assert tuple(server.service.runtime._service.pool.epochs) == epochs
@@ -170,7 +170,8 @@ def test_result_actor_loss_fails_resident_remote_queries_without_replacement(ser
             wait_until(lambda: record.snapshot()["state"] == "FAILED", timeout=15)
             with pytest.raises(RuntimeError):
                 result.collect()
-            result.close()
+            # The failure watcher may still own client-side cleanup.
+            close_result(result)
         assert_idle(server)
         with pytest.raises(RuntimeError):
             a.query("select 7")
@@ -191,7 +192,7 @@ def test_worker_loss_after_partial_remote_delivery_is_an_error(server):
         wait_until(lambda: record.snapshot()["state"] == "FAILED", timeout=15)
         with pytest.raises(RuntimeError):
             result.collect()
-        result.close()
+        close_result(result)
         assert_idle(server, dead_workers=True)
 
 
@@ -219,7 +220,7 @@ def test_failed_result_release_receipt_keeps_remote_cleanup_retryable(server, mo
             assert core.pool.results.snapshot()["active_contexts"] == 1
             assert core.admission.snapshot()["active_requests"] == 1
         wait_until(record.done.is_set, timeout=15)
-        result.close()
+        close_result(result)
         assert_idle(server)
         assert client.query("select 7").collect().column(0).to_pylist() == [7]
         assert core.pool.results.actor is actor
@@ -278,7 +279,7 @@ def test_worker_outage_retains_remote_session_until_fresh_cleanup(server, mode, 
             survivor._call("session.renew", **survivor.identity)
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", original_dispatch)
         wait_until(lambda: session.session_id not in server.service._sessions, timeout=15)
-        result.close()
+        close_result(result)
         assert_idle(server)
         assert survivor.query("select 7").collect().column(0).to_pylist() == [7]
 
@@ -301,7 +302,7 @@ def test_slow_remote_client_has_bounded_native_windows_and_does_not_block_other_
             assert server._gateway.active_links <= server.service.runtime.resources.max_results
         assert fast.query("select 7").collect().column(0).to_pylist() == [7]
         query.cancel()
-        result.close()
+        close_result(result)
         assert batch.column(0).to_pylist()  # Caller-owned views survive remote cleanup.
         assert slow.resource_snapshot()["exported_bytes"] > 0
         del batch

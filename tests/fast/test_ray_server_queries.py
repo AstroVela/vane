@@ -14,7 +14,7 @@ import pytest
 
 import vane
 from tests.fast.test_flight_server import TOKEN
-from tests.fast.test_ray_recovery_runtime import resources
+from tests.fast.test_ray_recovery_runtime import close_result, resources
 from tests.fast.test_server_sessions import wait_until
 from vane.client import Client
 from vane.execution.request_admission import RequestCancelled, RequestExecutionTimeout
@@ -130,7 +130,7 @@ def test_retained_client_views_are_charged_and_cancel_wakes_buffer_wait(server, 
                 assert client.resource_snapshot()["exported_bytes"] > 0
             finally:
                 batches.clear()
-        result.close()
+        close_result(result)
         wait_until(lambda: client.resource_snapshot()["usage_bytes"] == 0)
         wait_until(lambda: idle(server), timeout=10)
 
@@ -143,7 +143,7 @@ def test_delivery_timeout_preserves_exception_type(server, mode):
         time.sleep(1.2)
         with pytest.raises(ResultDeliveryTimeout):
             result.take()
-        result.close()
+        close_result(result)
         wait_until(lambda: idle(server), timeout=10)
 
 
