@@ -18,11 +18,18 @@ chat_template and chat_template_kwargs. For prompts, configure engine_args and
 generate_args (including native sampling_params). Top-level max_tokens and
 sampling_params token limits cannot both specify the same setting. Declare the
 image/video media_mime_types actually supported by the selected model.
+For a checkpoint containing only weights/configuration, set engine_args.tokenizer
+(vLLM) or engine_args.tokenizer_path (SGLang) to its matching processing source.
+This source supplies the chat template and tokenizer; image/video inputs also
+require the matching processor configuration there. vLLM's tokenizer_revision
+selects the processing revision independently of the model revision.
 
 Decoded clip embedding uses vane.ai.embed_video on an ordered LIST of
 {frame_index, frame_time, data IMAGE}. Sampling belongs to the caller; both
 native adapters retain frame timestamps at microsecond precision. SGLang uses
-its native processor_output interface with token round-trip validation. Models
+its native processor_output interface and submits the resulting token IDs
+directly, including for text. Chat templates own special tokens, so SGLang
+embedding processor_kwargs.add_special_tokens must remain False. Models
 must accept the configured processor inputs. Incompatible inputs or SDK/model
 parameters fail; no model, transport or modality is substituted.
 Embedding dimensions describe the expected output shape. Set

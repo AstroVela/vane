@@ -148,6 +148,10 @@ class _NativeEmbeddingDescriptor:
         text_options = processor.get("text_kwargs", {})
         if not isinstance(text_options, Mapping) or text_options.get("truncation", False) is not False:
             raise ValueError("Embedding processor cannot truncate inputs")
+        if self.family == "sglang" and any(
+            values.get("add_special_tokens", False) is not False for values in (processor, text_options)
+        ):
+            raise ValueError("SGLang embedding chat templates own special tokens; add_special_tokens must be False")
         video = processor.get("videos_kwargs", {})
         if not isinstance(video, Mapping):
             raise TypeError("processor_kwargs.videos_kwargs must be a mapping")
@@ -323,21 +327,22 @@ class _NativeRuntime:
             )
 
         args = self.options["engine_args"]
-        loading = {key: args[key] for key in ("revision",) if key in args}
-        self.processor = AutoProcessor.from_pretrained(descriptor.model, trust_remote_code=False, **loading)
-        tokenizer_model = args.get("tokenizer" if descriptor.family == "vllm" else "tokenizer_path")
-        if tokenizer_model or args.get("tokenizer_revision"):
-            from transformers import AutoTokenizer
+        source = args.get("tokenizer" if descriptor.family == "vllm" else "tokenizer_path") or descriptor.model
+        revision = args.get("revision")
+        if descriptor.family == "vllm":
+            revision = args.get("tokenizer_revision") or revision
+        # A checkpoint may contain only weights/configuration. Resolve the
+        # caller's processing source before loading any tokenizer or processor.
+        loading = {"revision": revision, "trust_remote_code": False}
+        if source != descriptor.model:
+            from transformers import AutoConfig
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_model or descriptor.model,
-                revision=args.get("tokenizer_revision", args.get("revision")),
-                trust_remote_code=False,
+            # A standalone tokenizer directory need not include model config.
+            # Processor class selection still belongs to the selected model.
+            loading["config"] = AutoConfig.from_pretrained(
+                descriptor.model, revision=args.get("revision"), trust_remote_code=False
             )
-            if hasattr(self.processor, "tokenizer"):
-                self.processor.tokenizer = tokenizer
-            else:
-                self.processor = tokenizer
+        self.processor = AutoProcessor.from_pretrained(source, **loading)
         self._is_tokenizer = isinstance(self.processor, PreTrainedTokenizerBase)
 
     def _ensure_engine(self) -> Any:
@@ -447,26 +452,40 @@ class NativeEmbedder(_NativeRuntime):
             payload["videos"] = [frames]
         elif kind == "image":
             payload["images"] = media["image"]
-        if payload or processing:
-            inputs = self.processor(
-                text=[text],
-                padding=False,
-                truncation=False,
-                return_tensors="pt",
-                **payload,
-                **processing,
-            )
-            ids = inputs["input_ids"][0].tolist()
-            limit = self.options["engine_args"].get("context_length")
-            if limit is not None and len(ids) > limit:
-                raise EmbeddingConfigurationError("Embedding input exceeds context_length")
-            tokenizer = self.processor if self._is_tokenizer else self.processor.tokenizer
-            text = tokenizer.decode(ids, skip_special_tokens=False)
-            if tokenizer.encode(text, add_special_tokens=False) != ids:
-                raise EmbeddingConfigurationError("SGLang processor tokens do not round-trip")
-            if kind != "text":
-                kwargs[kind + "_data"] = [{"format": "processor_output", **dict(inputs)}]
-        result = await self._ensure_engine().async_encode(prompt=text, dimensions=dimensions, **kwargs)
+        if not self._is_tokenizer and "text_kwargs" in processing:
+            # HF processors reject duplicate flat/nested arguments, and their
+            # nested text settings take precedence over flat defaults.
+            processing.pop("add_special_tokens", None)
+            processing["text_kwargs"]["add_special_tokens"] = False
+        else:
+            processing.setdefault("add_special_tokens", False)
+        inputs = self.processor(
+            text=[text],
+            padding=False,
+            truncation=False,
+            return_tensors="pt",
+            **payload,
+            **processing,
+        )
+        ids = inputs["input_ids"][0].tolist()
+        limit = self.options["engine_args"].get("context_length")
+        if limit is not None and len(ids) > limit:
+            raise EmbeddingConfigurationError("Embedding input exceeds context_length")
+        if kind != "text":
+            kwargs[kind + "_data"] = [{"format": "processor_output", **dict(inputs)}]
+        # SGLang 0.5.17's async_encode only accepts text and tokenizes it again
+        # with special tokens. Use its native request path to preserve the exact
+        # template/processor IDs, including expanded image/video placeholders.
+        from sglang.srt.managers.io_struct import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            EmbeddingReqInput,
+        )
+
+        request = EmbeddingReqInput(input_ids=ids, dimensions=dimensions, **kwargs)
+        stream = self._ensure_engine().tokenizer_manager.generate_request(request, None)
+        try:
+            result = await anext(stream)
+        finally:
+            await stream.aclose()
         if not isinstance(result, dict) or "embedding" not in result:
             raise ValueError("Native SGLang returned no embedding")
         return result["embedding"]

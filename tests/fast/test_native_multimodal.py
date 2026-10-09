@@ -20,9 +20,10 @@ from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
 from vane.ai.provider import load_provider
 
 
-def install_sdk(setitem):
+def install_sdk(setitem, *, mock_transformers=True):
     """Doubles for the documented Python APIs, installed inside each worker."""
-    state = SimpleNamespace(loads=[], engines=[], calls=[], processing=[], finish="stop", fail=False)
+    state = SimpleNamespace(loads=[], engines=[], calls=[], processing=[], finish="stop", fail=False, requests_closed=0)
+    state.config = SimpleNamespace()
 
     class Processor:
         def __init__(self):
@@ -47,19 +48,16 @@ def install_sdk(setitem):
                 result.update(pixel_values=np.array([[1.0]]), image_grid_thw=np.array([[1, 2, 2]]))
             return result
 
-        def decode(self, ids, **kwargs):
-            assert ids == [10, 20, 30]
-            return "processed-with-timestamps"
-
-        def encode(self, text, **kwargs):
-            assert text == "processed-with-timestamps"
-            return [10, 20, 30]
+    class EmbeddingRequest(SimpleNamespace):
+        def __init__(self, *, input_ids, dimensions=None, image_data=None, video_data=None):
+            super().__init__(input_ids=input_ids, dimensions=dimensions, image_data=image_data, video_data=video_data)
 
     class Engine:
         def __init__(self, **kwargs):
             self.args = kwargs
             self.loop = asyncio.get_running_loop()
             self.closed = 0
+            self.tokenizer_manager = self
             state.engines.append(self)
 
         @classmethod
@@ -89,12 +87,16 @@ def install_sdk(setitem):
                 raise ValueError("engine failure")
             return {"text": '{"answer":"ok"}', "meta_info": {"finish_reason": {"type": state.finish}}}
 
-        async def async_encode(self, **kwargs):
-            assert self.loop is asyncio.get_running_loop()
-            state.calls.append(("encode", kwargs))
-            if state.fail:
-                raise ValueError("engine failure")
-            return {"embedding": [3.0, 4.0]}
+        async def generate_request(self, request, http_request):
+            assert self.loop is asyncio.get_running_loop() and http_request is None
+            assert isinstance(request, EmbeddingRequest)
+            state.calls.append(("encode", vars(request)))
+            try:
+                if state.fail:
+                    raise ValueError("engine failure")
+                yield {"embedding": [3.0, 4.0]}
+            finally:
+                state.requests_closed += 1
 
         def shutdown(self):
             assert self.loop is asyncio.get_running_loop()
@@ -109,7 +111,11 @@ def install_sdk(setitem):
             return SimpleNamespace(media=(np.zeros((2, 4, 4, 3), dtype=np.uint8), {"fps": 2, "frames_indices": [0, 1]}))
 
     for name, entries in {
-        "transformers": {"AutoProcessor": Processor, "PreTrainedTokenizerBase": type("TokenizerBase", (), {})},
+        "transformers": {
+            "AutoProcessor": Processor,
+            "AutoConfig": SimpleNamespace(from_pretrained=lambda *args, **kwargs: state.config),
+            "PreTrainedTokenizerBase": type("TokenizerBase", (), {}),
+        },
         "transformers.video_utils": {"VideoMetadata": SimpleNamespace},
         "vllm": {
             "AsyncEngineArgs": SimpleNamespace,
@@ -120,7 +126,10 @@ def install_sdk(setitem):
         "vllm.sampling_params": {"StructuredOutputsParams": SimpleNamespace},
         "vllm.multimodal.media": {"ImageMediaIO": SimpleNamespace, "VideoMediaIO": VideoIO},
         "sglang": {"Engine": Engine},
+        "sglang.srt.managers.io_struct": {"EmbeddingReqInput": EmbeddingRequest},
     }.items():
+        if not mock_transformers and name.startswith("transformers"):
+            continue
         module = ModuleType(name)
         module.__dict__.update(entries)
         setitem(sys.modules, name, module)
@@ -172,6 +181,38 @@ def test_http_options_are_rejected(family, options):
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["text", "image", "video", "prompt"])
+def test_explicit_processing_source_is_used_on_the_first_load(family, kind, sdk):
+    key = "tokenizer" if family == "vllm" else "tokenizer_path"
+    args = {key: "separate-processing-source", "revision": "model-revision"}
+    if family == "vllm":
+        args["tokenizer_revision"] = "processing-revision"
+    options = {"engine_args": args, "gpus_per_actor": 0}
+    provider = load_provider(family)
+    if kind == "prompt":
+        descriptor = provider.get_prompter(
+            "weights-only-checkpoint", options={**options, "media_mime_types": ["image/png"]}
+        )
+    else:
+        descriptor = getattr(provider, f"get_{kind}_embedder")("weights-only-checkpoint", 2, options=options)
+    runtime = descriptor.instantiate()
+    try:
+        assert sdk.loads == [
+            (
+                "separate-processing-source",
+                {
+                    "revision": "processing-revision" if family == "vllm" else "model-revision",
+                    "trust_remote_code": False,
+                    "config": sdk.config,
+                },
+            )
+        ]
+        assert descriptor.get_model() == "weights-only-checkpoint" and sdk.engines == []
+    finally:
+        asyncio.run(runtime.aclose())
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("processing", [False, True])
 def test_native_text_embedding_formats_tokenizer_messages(family, processing, sdk, monkeypatch):
     transformers = sys.modules["transformers"]
@@ -203,10 +244,12 @@ def test_native_text_embedding_formats_tokenizer_messages(family, processing, sd
         {"role": "system", "content": "Find related items"},
         {"role": "user", "content": "query"},
     ]
-    expected = (
-        "processed-with-timestamps" if family == "sglang" and processing else "system: Find related items\nuser: query"
-    )
-    assert sdk.calls[0][1]["prompt"] == expected
+    if family == "sglang":
+        assert sdk.calls[0][1]["input_ids"] == [10, 20, 30]
+        assert sdk.processing[0]["text"] == ["system: Find related items\nuser: query"]
+        assert sdk.processing[0]["add_special_tokens"] is False
+    else:
+        assert sdk.calls[0][1]["prompt"] == "system: Find related items\nuser: query"
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -288,8 +331,10 @@ def test_native_embedding_preserves_inputs_and_reuses_engine(family, kind, sdk):
             metadata = vars(sdk.processing[0]["videos_kwargs"]["video_metadata"][0])
             assert sdk.processing[0]["videos_kwargs"]["do_sample_frames"] is False
             assert sdk.calls[0][1]["video_data"][0]["format"] == "processor_output"
-            assert sdk.calls[0][1]["prompt"] == "processed-with-timestamps"
+            assert sdk.calls[0][1]["input_ids"] == sdk.calls[0][1]["video_data"][0]["input_ids"][0].tolist()
         assert metadata["frames_indices"] == [125000, 1375000] and metadata["fps"] == 1000000
+    if family == "sglang":
+        assert sdk.requests_closed == 2
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -390,6 +435,51 @@ def test_engine_resource_admission_and_input_ownership(family):
             load_provider(family).get_video_embedder("configured", 2, options=invalid)
 
 
+@pytest.mark.parametrize("processing", [{"add_special_tokens": True}, {"text_kwargs": {"add_special_tokens": True}}])
+def test_sglang_chat_template_owns_special_tokens(processing):
+    with pytest.raises(ValueError, match="chat templates own special tokens"):
+        load_provider("sglang").get_text_embedder("configured", 2, options={"processor_kwargs": processing})
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_sglang_embedding_request_is_closed_on_success_or_failure(sdk, failure):
+    sdk.fail = failure
+
+    async def run():
+        runtime = (
+            load_provider("sglang").get_text_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+        )
+        try:
+            if failure:
+                with pytest.raises(ValueError, match="engine failure"):
+                    await runtime.embed_text(["query"])
+            else:
+                assert await runtime.embed_text(["query"]) == [[3, 4]]
+            assert sdk.requests_closed == 1
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.engines[0].closed == 1
+
+
+def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
+    async def run():
+        runtime = (
+            load_provider("sglang")
+            .get_text_embedder("configured", 2, options={"gpus_per_actor": 0, "engine_args": {"context_length": 2}})
+            .instantiate()
+        )
+        try:
+            with pytest.raises(ValueError, match="context_length"):
+                await runtime.embed_text(["query"])
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.engines == []
+
+
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("processing", [False, True])
 def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypatch):
@@ -407,12 +497,8 @@ def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypat
         pad_token="<pad>",
         chat_template="{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\\n' }}{% endfor %}",
     )
-    tokenizer_base = transformers.PreTrainedTokenizerBase
-    state = install_sdk(monkeypatch.setitem)
-    monkeypatch.setattr(sys.modules["transformers"], "PreTrainedTokenizerBase", tokenizer_base)
-    monkeypatch.setattr(
-        sys.modules["transformers"], "AutoProcessor", SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer)
-    )
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: tokenizer)
     descriptor = load_provider(family).get_text_embedder(
         "configured-text-encoder",
         2,
@@ -431,17 +517,98 @@ def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypat
             await runtime.aclose()
 
     asyncio.run(run())
-    assert state.calls[0][1]["prompt"] == "system: Find related items\nuser: query\n"
+    expected_text = "system: Find related items\nuser: query\n"
+    if family == "sglang":
+        assert state.calls[0][1]["input_ids"] == tokenizer.encode(expected_text, add_special_tokens=False)
+        assert "prompt" not in state.calls[0][1]
+    else:
+        assert state.calls[0][1]["prompt"] == expected_text
 
 
-def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch):
+@pytest.fixture
+def bos_tokenizer():
+    transformers = pytest.importorskip("transformers", minversion="4.57.1")
+    from tokenizers import Tokenizer, pre_tokenizers, processors
+    from tokenizers.models import WordLevel
+
+    backend = Tokenizer(WordLevel({"<unk>": 0, "<s>": 1, "</s>": 2, "hello": 3}, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    backend.post_processor = processors.TemplateProcessing(
+        single="<s> $A </s>", special_tokens=[("<s>", 1), ("</s>", 2)]
+    )
+    return transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        chat_template="{{ bos_token }}{{ messages[-1]['content'] }}{{ eos_token }}",
+    )
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+def test_real_standalone_tokenizer_loads_with_weights_only_checkpoint(tmp_path, family, bos_tokenizer, monkeypatch):
+    import transformers
+
+    model, processing = tmp_path / "checkpoint", tmp_path / "processing"
+    transformers.LlamaConfig().save_pretrained(model)
+    bos_tokenizer.save_pretrained(processing)
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    key = "tokenizer" if family == "vllm" else "tokenizer_path"
+
+    async def run():
+        runtime = (
+            load_provider(family)
+            .get_text_embedder(str(model), 2, options={"gpus_per_actor": 0, "engine_args": {key: str(processing)}})
+            .instantiate()
+        )
+        try:
+            assert runtime._render([{"type": "text", "text": "hello"}], None) == "<s>hello</s>"
+            assert await runtime.embed_text(["hello"]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert state.engines[0].args["model" if family == "vllm" else "model_path"] == str(model)
+    assert state.engines[0].args[key] == str(processing)
+
+
+@pytest.mark.parametrize("processing", [{}, {"add_special_tokens": False}])
+def test_sglang_template_token_ids_are_submitted_without_retokenization(
+    tmp_path, processing, bos_tokenizer, monkeypatch
+):
+    import transformers
+
+    transformers.LlamaConfig().save_pretrained(tmp_path)
+    bos_tokenizer.save_pretrained(tmp_path)
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+
+    async def run():
+        runtime = (
+            load_provider("sglang")
+            .get_text_embedder(str(tmp_path), 2, options={"gpus_per_actor": 0, "processor_kwargs": processing})
+            .instantiate()
+        )
+        try:
+            assert await runtime.embed_text(["hello"]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    expected = bos_tokenizer.apply_chat_template([{"role": "user", "content": "hello"}], tokenize=True)
+    assert expected == [1, 3, 2]
+    assert bos_tokenizer.encode("<s>hello</s>") == [1, 1, 3, 2, 2]
+    assert state.calls[0][1]["input_ids"] == expected
+    assert "prompt" not in state.calls[0][1]
+
+
+@pytest.mark.parametrize("text_options", [{}, {"text_kwargs": {}}, {"text_kwargs": {"add_special_tokens": False}}])
+def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_options):
     transformers = pytest.importorskip("transformers", minversion="4.57.1")
     pytest.importorskip("torchvision")
     from tokenizers import Tokenizer, decoders, pre_tokenizers
     from tokenizers.models import BPE
     from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
     from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
-    from transformers.video_utils import VideoMetadata
 
     specials = ["<unk>", "<pad>", "<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
     vocabulary = specials + sorted(pre_tokenizers.ByteLevel.alphabet())
@@ -457,17 +624,17 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch):
         video_processor=Qwen3VLVideoProcessor(),
         chat_template="<|video_pad|>",
     )
-    state = install_sdk(monkeypatch.setitem)
-    monkeypatch.setattr(
-        sys.modules["transformers"], "AutoProcessor", SimpleNamespace(from_pretrained=lambda *args, **kwargs: processor)
-    )
-    monkeypatch.setattr(sys.modules["transformers.video_utils"], "VideoMetadata", VideoMetadata)
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     descriptor = load_provider("sglang").get_video_embedder(
         "custom-local-checkpoint",
         2,
         options={
             "gpus_per_actor": 0,
-            "processor_kwargs": {"videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}}},
+            "processor_kwargs": {
+                "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}},
+                **text_options,
+            },
         },
     )
     frames = tuple(np.full((64, 64, 3), value, dtype=np.uint8) for value in (10, 20, 30))
@@ -481,8 +648,10 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch):
 
     asyncio.run(run())
     request = state.calls[0][1]
-    assert "<0.4 seconds>" in request["prompt"] and "<1.4 seconds>" in request["prompt"]
+    text = tokenizer.decode(request["input_ids"], skip_special_tokens=False)
+    assert "<0.4 seconds>" in text and "<1.4 seconds>" in text
     assert request["video_data"][0]["format"] == "processor_output"
+    assert request["input_ids"] == request["video_data"][0]["input_ids"][0].tolist()
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
