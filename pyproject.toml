@@ -87,7 +87,7 @@ cosmos = [
     "pillow>=10.4",
 ]
 vllm = [
-    "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
+    "vllm>=0.31.0,<0.32; platform_system == 'Linux' and platform_machine == 'x86_64'", # native multimodal and pooling API target
 ]
 sglang = [
     "sglang==0.5.17; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
@@ -285,6 +285,7 @@ include = [
     "/tests/fast/test_ai_audio_embedding.py",
     "/tests/fast/test_clap.py",
     "/tests/fast/test_cosmos_embed1.py",
+    "/tests/fast/test_native_multimodal.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
     "/tests/fast/test_doris_datasink.py",
@@ -304,6 +305,7 @@ include = [
 
     # Source code and stubs
     "/examples/jev_judgments.py",
+    "/examples/multimodal_providers.py",
     "src/**",
     "vane/**",
 

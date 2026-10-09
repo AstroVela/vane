@@ -321,7 +321,9 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
 
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
-    options = _build_native_vllm_options_argument(NativeVLLMPromptPlan().build_physical_vllm_options())
+    options = _build_native_vllm_options_argument(
+        NativeVLLMPromptPlan(model_name="test-model").build_physical_vllm_options()
+    )
     executor = vllm_executor.build_executor("test-model", options)
 
     assert executor._ray_actor_mode is False

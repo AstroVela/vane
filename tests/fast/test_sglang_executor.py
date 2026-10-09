@@ -366,6 +366,7 @@ def test_sglang_plan_lowers_prompt_controls_into_sampling_params():
     from vane.ai.providers.sglang import NativeSGLangPromptPlan
 
     plan = NativeSGLangPromptPlan(
+        model_name="test-model",
         sglang_options={
             "actor_number": 3,
             "batch_size": 7,
@@ -405,6 +406,7 @@ def test_sglang_plan_translates_nested_max_tokens_alias(sampling_params, expecte
 
     original = dict(sampling_params)
     plan = NativeSGLangPromptPlan(
+        model_name="test-model",
         sglang_options={"generate_args": {"sampling_params": sampling_params}},
     )
 

@@ -36,8 +36,8 @@ from vane.ai.options import (
     _require_prompt_number,
     normalize_prompt_options,
 )
-from vane.ai.protocols import NativeInferencePlan
-from vane.ai.provider import Provider
+from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
+from vane.ai.providers._native_inference import NativeEmbeddingProviderMixin
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_ENGINE_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -275,10 +275,10 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any], *, engine: s
     }
 
 
-class VLLMProvider(Provider):
-    """Provider backed by a local or remote vLLM engine."""
+class VLLMProvider(NativeEmbeddingProviderMixin):
+    """Provider backed by a native Python vLLM engine."""
 
-    DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
+    _native_family = "vllm"
 
     def __init__(self, name: str | None = None):
         self._name = name or "vllm"
@@ -295,12 +295,14 @@ class VLLMProvider(Provider):
         return_raw_response: bool = False,
         *,
         options: Mapping[str, Any] | None = None,
-    ) -> NativeVLLMPromptPlan:
+    ) -> NativeVLLMPromptPlan | PrompterDescriptor:
+        if "media_mime_types" in (options or {}):
+            return self._media_prompter(model, system_message, return_format, return_raw_response, options)
         if return_raw_response:
             raise ValueError("Provider 'vllm' does not support return_raw_response")
         prepared = normalize_prompt_options("vllm", options or {}, relation=False)
         prepared = _validate_vllm_prompt_options(prepared)
-        model_name = model or self.DEFAULT_MODEL
+        model_name = model
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("vLLM prompt model must be a non-empty string")
         return NativeVLLMPromptPlan(
@@ -323,7 +325,7 @@ class NativeVLLMPromptPlan(NativeInferencePlan):
     """
 
     provider_name: str = "vllm"
-    model_name: str = "Qwen/Qwen3-1.7B"
+    model_name: str = ""
     system_message: str | None = None
     on_error: str = "raise"
     return_format: dict[str, Any] | None = None
