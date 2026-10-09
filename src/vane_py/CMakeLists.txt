@@ -45,6 +45,7 @@ add_library(
   datasource_function.cpp
   pyexpression.cpp
   pyfilesystem.cpp
+  vane_fs.cpp
   pyrelation.cpp
   pyresult.cpp
   pyresult_source.cpp
@@ -61,4 +62,5 @@ add_library(
 
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
 target_include_directories(
-  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include")
+  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include"
+                     "${PROJECT_SOURCE_DIR}/vane_fs/include")

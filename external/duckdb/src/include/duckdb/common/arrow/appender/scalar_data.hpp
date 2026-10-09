@@ -13,6 +13,9 @@
 
 #include "duckdb/common/bswap.hpp"
 
+#include <cstring>
+#include <type_traits>
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
@@ -104,6 +107,15 @@ struct ArrowScalarBaseData {
 		main_buffer.resize(main_buffer.size() + sizeof(TGT) * size);
 		auto data = UnifiedVectorFormat::GetData<SRC>(format);
 		auto result_data = main_buffer.GetData<TGT>();
+
+		// Flat byte arrays, such as image tensor children, have no selection or
+		// scalar conversion to perform. Validity was appended above as usual.
+		if (size > 0 && std::is_same<TGT, uint8_t>::value && std::is_same<SRC, uint8_t>::value &&
+		    std::is_same<OP, ArrowScalarConverter>::value && input.GetVectorType() == VectorType::FLAT_VECTOR) {
+			std::memcpy(result_data + append_data.row_count, data + from, size * sizeof(TGT));
+			append_data.row_count += size;
+			return;
+		}
 
 		for (idx_t i = from; i < to; i++) {
 			auto source_idx = format.sel->get_index(i);

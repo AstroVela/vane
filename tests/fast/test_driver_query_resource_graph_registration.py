@@ -1133,7 +1133,8 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
     assert dropped == []
 
 
-def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
+@pytest.mark.parametrize("live_actor", [False, True])
+def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier(live_actor):
     from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
     )
@@ -1150,10 +1151,13 @@ def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
         query_id=query_id,
         resource_unit_id=f"resource:{query_id}:upstream",
         physical_node_id="node:upstream:udf",
-        unit_kind="ray_task_udf",
-        backend="ray_task",
+        unit_kind="ray_actor_pool" if live_actor else "ray_task_udf",
+        backend="ray_actor" if live_actor else "ray_task",
         input_unit_ids=(),
-        per_task=ResourceVector(cpu=1, heap_bytes=10),
+        per_task=ResourceVector() if live_actor else ResourceVector(cpu=1, heap_bytes=10),
+        resident_per_actor=ResourceVector(cpu=1, heap_bytes=10) if live_actor else ResourceVector(),
+        actor_pool_size=1 if live_actor else 0,
+        actor_prefetch_depth=2 if live_actor else 1,
         target_output_block_bytes=0,
         generator_buffer_blocks=0,
         max_concurrency=None,
@@ -1227,6 +1231,22 @@ def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
     runner._active_udf_actors_by_plan = {}
     runner._signal_query_resource_change = lambda _query_id: None
 
+    shutdowns = []
+    actor_leases = []
+    if live_actor:
+        pool = SimpleNamespace(_vane_retired=False, shutdown=lambda: shutdowns.append("shutdown"))
+        runner._active_udf_actor_by_unit = {query_id: {upstream.resource_unit_id: pool}}
+        runner._active_udf_actors = [pool]
+        runner._active_udf_actors_by_plan = {query_id: [pool]}
+        manager.set_submitted_actor_slots(upstream.resource_unit_id, {0})
+        manager.set_ready_actor_slots(upstream.resource_unit_id, {0: "node-a"})
+        for index in range(2):
+            grant = manager.try_acquire_task(
+                TaskRequest(query_id, upstream.resource_unit_id, f"actor-{index}", "0", None)
+            )
+            assert grant.granted
+            actor_leases.append(grant.lease)
+
     assert manager.mark_materialization_barrier_completed_for_node("materializer")
     assert len(transitions) == 1
     eligible, fence_epoch = transitions[0]
@@ -1255,6 +1275,24 @@ def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
         fence_epoch,
     )
 
+    if live_actor:
+        assert shutdowns == []
+        assert manager.pending_allocation_frontier() == (eligible, fence_epoch)
+        assert manager.has_actor_leases_outside_phase()
+        assert manager.snapshot()["actor_process_usage"]["cpu"] == 1
+        with pytest.raises(RuntimeError, match="cannot retire actor pool with live leases"):
+            manager.begin_actor_pool_retirement(upstream.resource_unit_id)
+
+        for index, lease in enumerate(actor_leases):
+            assert manager.release_task_lease(lease.lease_id, attempt_id=lease.attempt_id)
+            runner_cls._drain_query_execution_phase_and_fte(runner, query_id)
+            if index == 0:
+                assert shutdowns == []
+                assert manager.pending_allocation_frontier() == (eligible, fence_epoch)
+        assert shutdowns == ["shutdown"]
+        assert manager.snapshot()["actor_process_usage"]["cpu"] == 0
+
+    assert manager.pending_allocation_frontier() is None
     opened = manager.try_acquire_task(
         TaskRequest(query_id, downstream.resource_unit_id, "after-phase-refresh", "0", None)
     )

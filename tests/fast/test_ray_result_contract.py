@@ -4302,6 +4302,130 @@ def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
         release_query_resource_manager(query_id, reason="test_complete")
 
 
+@pytest.mark.parametrize(
+    "drop_fragments,fail_actor_cleanup",
+    [(True, False), (False, False), (True, True)],
+    ids=["running-query", "before-fragment-start", "actor-cleanup-retry"],
+)
+def test_plan_teardown_releases_actor_lock_before_waiting_for_phase_pump(
+    monkeypatch, drop_fragments, fail_actor_cleanup
+):
+    from vane.runners.ray import fte_fragment_scheduler
+    from vane.runners.ray.query_resource_runtime import (
+        clear_query_resource_managers,
+        get_query_resource_manager,
+    )
+
+    async def scenario():
+        query_id = "phase-pump-during-plan-teardown"
+        cls, runner = _make_local_query_driver_actor()
+        loop = asyncio.get_running_loop()
+        runner._query_resource_admission_loop = loop
+        runner._ensure_query_resource_admission_state()
+        runner._query_resource_lock = threading.RLock()
+        runner._synchronize_query_allocations = lambda: ()
+        manager = _bind_test_query_resource_owner(runner, query_id)
+        unit_id = manager.graph.units[0].resource_unit_id
+        manager.update_unit_state(unit_id, runnable=False, completed=True)
+        assert manager.pending_allocation_frontier() is not None
+        if not drop_fragments:
+            lifecycle = driver._PlanLifecycle(query_id, _TEST_SESSION_ID, "query")
+            lifecycle.set_query_id(query_id)
+            assert lifecycle.begin_startup()
+            assert lifecycle.finish_setup(succeeded=False)
+            runner._plan_lifecycles[query_id] = lifecycle
+
+        phase_entered = threading.Event()
+        phase_returned = threading.Event()
+        fte_drained = threading.Event()
+        original_transition = runner._transition_query_execution_phase
+
+        def transition(*args):
+            phase_entered.set()
+            original_transition(*args)
+            phase_returned.set()
+
+        runner._transition_query_execution_phase = transition
+
+        class _Pool:
+            def __init__(self):
+                self.actors = [object()]
+                self.shutdown_calls = 0
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+                assert query_id in runner._plan_teardowns_in_progress
+                if self.shutdown_calls == 1:
+                    # Enter the real phase transition while actor cleanup owns
+                    # the lifecycle lock, then let teardown reach its pump wait.
+                    loop.call_soon_threadsafe(runner._schedule_query_fte_admission_pump, query_id)
+                    assert phase_entered.wait(2.0)
+                    assert not phase_returned.is_set()
+                    if fail_actor_cleanup:
+                        raise RuntimeError("planned actor cleanup failure")
+                self.actors.clear()
+
+        pool = _Pool()
+        runner._active_udf_actors = [pool]
+        runner._active_udf_actors_by_plan[query_id] = [pool]
+        runner._active_udf_actor_by_unit[query_id] = {unit_id: pool}
+
+        def drain(actual_query_id):
+            assert actual_query_id == query_id
+            assert phase_returned.is_set()
+            fte_drained.set()
+
+        monkeypatch.setattr(fte_fragment_scheduler, "drain_fte_resource_admission_change", drain)
+        runner._wait_for_query_fte_admission_pump = lambda qid: cls._wait_for_query_fte_admission_pump(
+            runner, qid, timeout_s=2.0
+        )
+        fragment_releases = []
+
+        def drop_after_fence(actual_query_id, *, release_resources):
+            runner._fence_query_resource_admission_for_teardown(actual_query_id)
+            assert fte_drained.is_set()
+            fragment_releases.append(release_resources)
+            if release_resources:
+                runner._release_query_resources(
+                    actual_query_id,
+                    reason="test_fragments_dropped",
+                    admission_fenced=True,
+                    execution_quiesced=True,
+                )
+
+        # Use a native-free fragment drop while retaining the production
+        # teardown, actor cleanup, phase transition, admission fence and wait.
+        runner._drop_query_fragments_after_admission_fence_sync = drop_after_fence
+        if fail_actor_cleanup:
+            with pytest.raises(RuntimeError, match="planned actor cleanup failure") as exc_info:
+                await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+            assert "timed out" not in str(exc_info.value)
+            assert get_query_resource_manager(query_id) is manager
+            assert query_id in runner._plan_lifecycles
+            assert runner._active_udf_actors_by_plan[query_id] == [pool]
+            assert runner._query_fte_admission_pumps == {}
+
+        await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+        assert phase_returned.is_set()
+        assert fte_drained.is_set()
+        assert fragment_releases == ([False, True] if fail_actor_cleanup else [True] if drop_fragments else [])
+        assert pool.shutdown_calls == (2 if fail_actor_cleanup else 1)
+        assert runner._active_udf_actors == []
+        assert runner._query_fte_admission_pumps == {}
+        assert runner._query_fte_admission_done_events == {}
+        assert runner._query_udf_actor_lifecycle_locks == {}
+        assert query_id not in runner._plan_session_ids
+        assert query_id not in runner._plan_lifecycles
+        assert query_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+        with pytest.raises(KeyError):
+            get_query_resource_manager(query_id)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        clear_query_resource_managers()
+
+
 def test_concurrent_plan_teardown_runs_owned_cleanup_once(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "concurrent-teardown"
@@ -5872,6 +5996,8 @@ def test_fte_output_publication_validates_metadata_without_hard_estimate_caps():
 
 
 class _RequiredFteWorkerCallbacks:
+    manager_instance_id = "manager-test"
+
     @property
     def worker_incarnation_id(self):
         return f"incarnation-{self.worker_id}"
@@ -5964,6 +6090,48 @@ class _FakeFteStatusWorker(_RequiredFteWorkerCallbacks):
         return [_FakeOutputLeaseOwner() for _ in outputs]
 
 
+_TEST_STATUS_OBSERVATIONS = []
+
+
+@pytest.fixture(autouse=True)
+def _settle_test_status_observations():
+    yield
+    for watcher in _TEST_STATUS_OBSERVATIONS:
+        watcher.stop()
+    for watcher in _TEST_STATUS_OBSERVATIONS:
+        watcher.join(2.0)
+        assert not watcher.is_alive()
+    _TEST_STATUS_OBSERVATIONS.clear()
+
+
+class _ObservedFteWorkerTaskHandle(driver.FteWorkerTaskHandle):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from vane.runners.fte.fte_scheduler import FteEventHandlers, FteQueryScheduler
+        from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
+
+        scheduler = FteQueryScheduler(self.task_id.query_id)
+        scheduler.set_handlers(
+            FteEventHandlers(
+                on_worker_failed=lambda event: self.worker_handle.mark_fte_worker_failed(
+                    event.worker_id, event.error, worker_incarnation_id=event.worker_incarnation_id
+                ),
+            )
+        )
+        self.observer = FteAttemptStatusWatcher(
+            scheduler=scheduler,
+            attempt_id=self.task_id,
+            worker=self.worker_handle,
+            completion=self.status_completion,
+        )
+        _TEST_STATUS_OBSERVATIONS.append(self.observer)
+
+    def _ensure_started(self):
+        if not self._is_done and self._result is None and self._error is None:
+            self.observer.start()
+        super()._ensure_started()
+
+
 def _wait_batch_ready(handle, timeout_s=2.0):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -5977,7 +6145,7 @@ def _wait_batch_ready(handle, timeout_s=2.0):
 def test_fte_worker_task_handle_finishes_via_status_wait():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert handle.done() is False
     worker.status = {"state": "FINISHED", "stats": [1, 2, 3]}
@@ -5986,7 +6154,7 @@ def test_fte_worker_task_handle_finishes_via_status_wait():
     result = handle.get_result_sync()
     assert result.ok
     assert result.result_schema is None
-    assert worker.calls[0] == ("wait", task_id, -1, handle.status_wait_timeout_s)
+    assert worker.calls[0] == ("wait", task_id, None, handle.observer.wait_timeout_s)
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -5994,7 +6162,7 @@ def test_fte_worker_task_status_transition_uses_dedicated_executor(monkeypatch):
     worker = _FakeFteStatusWorker()
     worker.status = {"state": "FINISHED", "stats": [1]}
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     original_apply_status = handle._apply_status
     transition_threads = []
 
@@ -6053,7 +6221,7 @@ def test_fte_worker_task_handle_starts_one_watcher_under_concurrent_polling(
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6112,7 +6280,7 @@ def test_fte_explicit_ack_wins_atomically_over_concurrent_cancel():
         "partition_id": 2,
         "attempt_id": 0,
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-finish-cancel"},
@@ -6168,7 +6336,7 @@ def test_fte_terminal_record_failure_is_not_masked_by_adopted_result():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {
             "query_id": "q",
             "fragment_execution_id": 1,
@@ -6197,7 +6365,7 @@ def test_fte_worker_task_handle_requires_status_wait_protocol():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(RuntimeError, match="must provide fte_wait_task_status_async"):
-        driver.FteWorkerTaskHandle(task_id, _StatusOnlyWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _StatusOnlyWorker())
 
 
 def test_fte_worker_task_handle_requires_worker_id():
@@ -6207,7 +6375,7 @@ def test_fte_worker_task_handle_requires_worker_id():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(AttributeError, match="worker_id"):
-        driver.FteWorkerTaskHandle(task_id, _NoWorkerIdWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _NoWorkerIdWorker())
 
 
 def test_fte_worker_task_handle_requires_worker_incarnation_id():
@@ -6223,7 +6391,7 @@ def test_fte_worker_task_handle_requires_worker_incarnation_id():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(AttributeError, match="worker_incarnation_id"):
-        driver.FteWorkerTaskHandle(task_id, _NoWorkerIncarnationIdWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _NoWorkerIncarnationIdWorker())
 
 
 def test_fte_worker_task_handle_finishes_with_result_payload():
@@ -6234,7 +6402,7 @@ def test_fte_worker_task_handle_finishes_with_result_payload():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], schema, [9]),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6283,7 +6451,7 @@ def test_fte_worker_task_handle_rolls_back_new_output_owners_when_replacing_owne
         64,
         _RaisingPreviousOwner(),
     )
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6306,7 +6474,7 @@ def test_fte_worker_task_handle_releases_partial_invalid_ownership_transfer():
             return [self.owner]
 
     worker = _InvalidTransferWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6345,7 +6513,7 @@ def test_fte_worker_task_handle_releases_adopted_and_remote_results_when_ack_fai
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6384,7 +6552,7 @@ def test_fte_worker_task_handle_defers_attempt_selection_to_query_commit():
         "state": "FINISHED",
         "result": (["loser-ref"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "loser-lease"},
@@ -6415,7 +6583,7 @@ def test_fte_worker_task_handle_acks_remote_result_once():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
@@ -6435,7 +6603,7 @@ def test_fte_worker_task_handle_ack_does_not_release_remote_result():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
@@ -6450,7 +6618,7 @@ def test_fte_worker_task_handle_ack_does_not_release_remote_result():
 def test_fte_worker_task_handle_release_result_payload_calls_worker_once():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     handle.release_result_payload()
     handle.release_result_payload()
@@ -6465,7 +6633,7 @@ def test_fte_worker_task_handle_does_not_adopt_payload_after_release():
 
     worker = _TrackingWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-released-result"},
@@ -6509,7 +6677,7 @@ def test_fte_worker_task_handle_enqueues_result_controls_without_sync_rpc():
 
     worker = _QueuedControlWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     handle._result = driver.RayTaskResult.success([], [1], None)
 
     assert handle.get_result_sync().ok
@@ -6532,7 +6700,7 @@ def test_fte_worker_task_handle_does_not_publish_finished_status_event():
     worker = _EventWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {"state": "FINISHED", "stats": [1]}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
 
@@ -6553,7 +6721,7 @@ def test_fte_worker_task_handle_does_not_publish_failed_status_event():
             "message": "remote failed",
         },
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
 
@@ -6580,7 +6748,7 @@ def test_fte_worker_task_handle_does_not_adopt_retry_from_data_plane():
         def handle_fte_task_status(self, _status):
             raise AssertionError("the authoritative status watcher owns retry scheduling")
 
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _EventWorker(),
     )
@@ -6613,18 +6781,18 @@ def test_fte_worker_task_handle_malformed_status_fails_worker_and_records_termin
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _MalformedStatusWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
 
-    with pytest.raises(RuntimeError, match="failed to apply FTE task status.*MALFORMED"):
+    with pytest.raises(ValueError, match="unknown FTE task state.*MALFORMED"):
         asyncio.run(handle.get_result())
 
     assert handle.done() is True
     assert len(worker.worker_failures) == 1
     assert worker.worker_failures[0][0] == "worker-malformed-status"
-    assert "status protocol failed" in str(worker.worker_failures[0][1])
+    assert "unknown FTE task state" in str(worker.worker_failures[0][1])
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -6649,7 +6817,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
 
     oom_error = driver.ray.exceptions.OutOfMemoryError("Ray killed the worker for memory pressure")
     worker = _OomStatusWorker(oom_error)
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6660,8 +6828,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
     assert len(worker.worker_failures) == 1
     worker_id, published_error = worker.worker_failures[0]
     assert worker_id == "worker-oom-status"
-    assert "status wait failed" in str(published_error)
-    assert published_error.__cause__ is oom_error
+    assert published_error is oom_error
     from vane.runners.ray.fte_fragment_scheduler import _worker_failure_payload
 
     assert (
@@ -6700,7 +6867,7 @@ def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
 
     failure = _UnprintableError()
     worker = _StatusWorker(failure)
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6711,8 +6878,7 @@ def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
     assert len(worker.worker_failures) == 1
     worker_id, published_error = worker.worker_failures[0]
     assert worker_id == "worker-unprintable-status"
-    assert str(published_error).endswith("<unprintable _UnprintableError>")
-    assert published_error.__cause__ is failure
+    assert published_error is failure
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -6744,7 +6910,7 @@ def test_fte_worker_task_handle_rejects_mismatched_status_identity():
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _MismatchedStatusWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6776,7 +6942,7 @@ def test_fte_worker_task_handle_treats_query_deadline_as_hard_failure():
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _DeadlineWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6792,7 +6958,7 @@ def test_fte_worker_task_handle_rejects_exchange_finish_without_final_info():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {"state": "FINISHED"}
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         task_context_info={"exchange_sink_instance": {"attempt_id": 0}},
@@ -6811,7 +6977,7 @@ def test_fte_worker_task_handle_accepts_exchange_finish_with_spooling_stats():
         "state": "FINISHED",
         "spooling_output_stats": {"rows": 3},
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         task_context_info={"exchange_sink_instance": {"attempt_id": 0}},
@@ -6846,12 +7012,12 @@ def test_fte_worker_task_handle_uses_status_long_poll_when_available():
 
     worker = _LongPollWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     result = asyncio.run(handle.get_result())
 
     assert result.ok
-    assert worker.calls == [("wait", task_id, -1, handle.status_wait_timeout_s)]
+    assert worker.calls == [("wait", task_id, None, handle.observer.wait_timeout_s)]
 
 
 def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
@@ -6862,7 +7028,7 @@ def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
             time.sleep(60)
             return {"state": "RUNNING", "task_id": task_id, "version": 1}
 
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _SlowLongPollWorker(),
     )
@@ -6873,6 +7039,46 @@ def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
 
     assert result.ok
     assert handle.done() is True
+
+
+def test_result_consumer_cancellation_preserves_the_schedulers_status_observation():
+    entered = threading.Event()
+    release = Future()
+
+    class _PendingWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-shared-status"
+        calls = 0
+
+        async def fte_wait_task_status_async(self, task_id, _min_version, _timeout_s):
+            self.calls += 1
+            entered.set()
+            await asyncio.shield(asyncio.wrap_future(release))
+            return {"task_id": task_id, "state": "FINISHED", "version": 1, "stats": [17]}
+
+    worker = _PendingWorker()
+    handle = _ObservedFteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    async def exercise():
+        consumer = asyncio.create_task(handle.get_result())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            assert not handle.status_completion.done()
+            assert handle.observer.is_alive()
+        finally:
+            release.set_result(None)
+        await asyncio.to_thread(handle.observer.join, 2.0)
+        assert not handle.observer.is_alive()
+        assert handle.status_completion.result()["stats"] == [17]
+        assert handle.observer.scheduler.stats().processed_events == 1
+        assert worker.calls == 1
+
+    asyncio.run(exercise())
 
 
 def test_fte_worker_task_handle_publishes_worker_loss_without_adopting_retry():
@@ -6900,14 +7106,14 @@ def test_fte_worker_task_handle_publishes_worker_loss_without_adopting_retry():
         def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.calls.append(("mark_failed", worker_id, error))
             return [
-                driver.FteWorkerTaskHandle(
+                _ObservedFteWorkerTaskHandle(
                     {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 1},
                     _RetryWorker(),
                 )
             ]
 
     worker = _LostWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6938,7 +7144,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
         worker_id = "coordinator"
 
         def __init__(self):
-            self.retry = driver.FteWorkerTaskHandle(
+            self.retry = _ObservedFteWorkerTaskHandle(
                 {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 1},
                 _RetryWorker(),
             )
@@ -6963,7 +7169,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
             return coordinator.pop_fte_result_handle_for_task(task_id)
 
     coordinator = _Coordinator()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _LostWorker(),
     )
@@ -6979,7 +7185,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
 def test_fte_worker_task_handle_failed_status_raises_result_error():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     worker.status = {
         "state": "FAILED",
         "failure": {
@@ -6997,7 +7203,7 @@ def test_fte_worker_task_handle_failed_status_raises_result_error():
 def test_fte_worker_task_handle_cancel_calls_worker():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     handle.cancel()
 

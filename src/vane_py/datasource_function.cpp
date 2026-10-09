@@ -66,6 +66,60 @@ PythonDataSourceExecutionContext::LockContext(shared_ptr<ClientContext> &active_
 
 namespace {
 
+class PythonDataSourceStream final : public DataSourceStream {
+public:
+	PythonDataSourceStream(py::object iterator_p, unique_ptr<ArrowArrayStreamWrapper> stream_p,
+	                       shared_ptr<PythonDataSourceExecutionContext> context_p,
+	                       const shared_ptr<ClientContext> &callback_context_p)
+	    : iterator(std::move(iterator_p)), stream(std::move(stream_p)), context(std::move(context_p)),
+	      callback_context(callback_context_p) {
+	}
+
+	~PythonDataSourceStream() override {
+		PythonGILWrapper gil;
+		PythonInputCallbackScope callback(callback_context.lock());
+		context->Invalidate();
+		try {
+			iterator.attr("close")();
+		} catch (py::error_already_set &error) {
+			error.discard_as_unraisable("DataSource iterator close");
+		}
+		stream.reset();
+		iterator = py::object();
+	}
+
+	shared_ptr<ArrowArrayWrapper> Poll(const InterruptState &interrupt_state) override {
+		PythonInputCallbackScope callback(callback_context.lock());
+		{
+			PythonGILWrapper gil;
+			context->CheckInterrupted();
+			auto wakeup = py::cpp_function([interrupt_state]() {
+				// Rescheduling can take executor locks or release the final task
+				// reference. Do not hold the GIL across either operation.
+				py::gil_scoped_release release;
+				interrupt_state.Callback();
+			});
+			if (!iterator.attr("poll")(wakeup).cast<bool>()) {
+				return nullptr;
+			}
+		}
+		try {
+			auto result = stream->GetNextChunk();
+			context->RethrowStreamError();
+			return result;
+		} catch (...) {
+			context->RethrowStreamError();
+			throw;
+		}
+	}
+
+private:
+	py::object iterator;
+	unique_ptr<ArrowArrayStreamWrapper> stream;
+	shared_ptr<PythonDataSourceExecutionContext> context;
+	weak_ptr<const ClientContext> callback_context;
+};
+
 struct DataSourceArrowStreamState {
 	DataSourceArrowStreamState(ArrowArrayStream stream_p,
 	                           shared_ptr<PythonDataSourceExecutionContext> execution_context_p,
@@ -273,8 +327,8 @@ static bool HasFactoryOwners(const DataSourceFactoryRegistryEntry &entry) {
 // C callback called by datasource_scan GetData/InitLocal from pipeline threads.
 // pickled_task blob layout: [magic/version][source UUID][pickled task bytes]
 
-void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
-                                            ClientContext *context) {
+unique_ptr<DataSourceStream> DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len,
+                                                                    ClientContext *context) {
 	if (!context) {
 		throw InvalidInputException("datasource_scan requires the current query execution context");
 	}
@@ -306,20 +360,16 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 	auto execution_context = make_shared_ptr<PythonDataSourceExecutionContext>(context->shared_from_this());
 	try {
 		auto generator = task_obj.attr("_execute_with_context")(execution_context);
-
-		// 3. Wrap in RecordBatchReader
+		auto adapter = py::module_::import("vane.datasource._iterator").attr("_DataSourceIterator")(generator);
 		auto pa = py::module::import("pyarrow");
-		auto reader = pa.attr("RecordBatchReader").attr("from_batches")(factory->arrow_schema, generator);
-
-		// 4. Export to C ArrowArrayStream. The forwarding release callback
-		// invalidates the query-context capability before stream teardown returns.
-		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_stream));
-		TieExecutionContextToArrowStream(out_stream, execution_context, context->shared_from_this());
+		auto reader = pa.attr("RecordBatchReader").attr("from_batches")(factory->arrow_schema, adapter);
+		auto stream = make_uniq<ArrowArrayStreamWrapper>();
+		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(&stream->arrow_array_stream));
+		TieExecutionContextToArrowStream(&stream->arrow_array_stream, execution_context, context->shared_from_this());
+		return make_uniq<PythonDataSourceStream>(std::move(adapter), std::move(stream), execution_context,
+		                                         context->shared_from_this());
 	} catch (...) {
 		execution_context->Invalidate();
-		if (out_stream && out_stream->release) {
-			out_stream->release(out_stream);
-		}
 		throw;
 	}
 }

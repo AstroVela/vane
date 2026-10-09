@@ -19,7 +19,6 @@ from vane.runners.ray.fragment_registry import (
     _FTE_PENDING_WORKER_RESERVATIONS,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
-    _FTE_STATUS_WATCHERS,
 )
 from vane.runners.ray.fragment_worker_exchange import apply_exchange_selector_update
 from vane.runners.ray.fragment_worker_failures import (
@@ -255,11 +254,9 @@ class FteWorkerEventHandlingMixin:
             FteTaskState.CANCELED,
             FteTaskState.ABORTED,
         }
-        if terminal:
-            with _FTE_REGISTRY_LOCK:
-                watcher = _FTE_STATUS_WATCHERS.get(str(event.attempt_id))
-            if watcher is not None:
-                watcher.stop()
+        # Control mutations can report terminal state before the sole status
+        # observer receives the full result payload. That observer retires on
+        # its own terminal response; only query teardown may interrupt it.
         fragment_execution_key = fragment_execution_key_for_fte_attempt(event.attempt_id)
         if fragment_execution_key is None:
             return []

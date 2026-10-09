@@ -202,6 +202,13 @@ declarations are removed when the coordinator produces a physical worker plan.
 Workers consume the immutable bind state serialized by the table function and
 never receive attachment SQL or repeat coordinator metadata binding.
 
+A catalog whose bound scans contain only self-contained metadata or physical
+storage paths can override `Catalog::RequiresAttachmentForPlanDeserialization()`
+to return false. Its attachment is then omitted from the logical-plan snapshot
+as well. Gravitino uses this contract: its token remains on the querying
+connection and planning does not repeat remote authentication. Other catalogs
+retain attachment replay by default.
+
 Connection snapshots do not transport DuckDB `CREATE SECRET` objects. A Ray
 worker disables host persistent-secret loading before a newly opened snapshot
 database first uses its secret manager, so host secrets are never an implicit

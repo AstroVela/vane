@@ -140,6 +140,11 @@ public:
 	virtual ~GlobalSourceState() {
 	}
 
+	// A downstream operator stopped this pipeline before exhausting its source.
+	// Streaming sources with producer pipelines must stop those producers too.
+	virtual void OnConsumerFinished() {
+	}
+
 	virtual idx_t MaxThreads() {
 		return 1;
 	}

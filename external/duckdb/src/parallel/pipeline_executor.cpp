@@ -692,9 +692,14 @@ void PipelineExecutor::FinishProcessing(int32_t operator_idx) {
 	blocked_on_finalize = false;
 
 	if (pipeline.GetSource()) {
-		auto guard = pipeline.source_state->Lock();
-		pipeline.source_state->PreventBlocking(guard);
-		pipeline.source_state->UnblockTasks(guard);
+		{
+			auto guard = pipeline.source_state->Lock();
+			pipeline.source_state->PreventBlocking(guard);
+			pipeline.source_state->UnblockTasks(guard);
+		}
+		if (!exhausted_source) {
+			pipeline.source_state->OnConsumerFinished();
+		}
 	}
 	if (pipeline.GetSink()) {
 		auto guard = pipeline.GetSink()->sink_state->Lock();

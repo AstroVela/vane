@@ -31,6 +31,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
+from vane.datasource._iterator import _DataSourceWait
+
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
@@ -59,7 +61,9 @@ class DataSourceTask(ABC):
         """
         ...
 
-    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+    def _execute_with_context(
+        self, execution_context: _DataSourceExecutionContext
+    ) -> Iterator[pa.RecordBatch | _DataSourceWait]:
         """Internal engine hook carrying the current Worker query context."""
         del execution_context
         return self.execute()

@@ -465,6 +465,141 @@ def test_driver_resource_change_event_drives_fte_owner_without_polling(monkeypat
     asyncio.run(scenario())
 
 
+def test_resource_release_resumes_phase_off_the_driver_event_loop(monkeypatch):
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.query_resource_manager import TaskRequest
+
+    async def scenario():
+        query_id = "query-phase-completion-wake"
+        graph = _graph(query_id)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        manager = register_query_resource_graph(graph, _allocation())
+        unit_id = graph.units[0].resource_unit_id
+        manager.update_unit_state(unit_id, runnable=True)
+        grant = manager.try_acquire_task(TaskRequest(query_id, unit_id, "task", "attempt", None))
+        assert grant.granted
+        # Model the closed frontier after downstream LIMIT completion. Only
+        # releasing the live lease below emits the wakeup exercised here.
+        manager.update_unit_state(unit_id, runnable=False, completed=True)
+        frontier = manager.pending_allocation_frontier()
+        assert frontier is not None
+        loop_thread = threading.get_ident()
+        resumed = threading.Event()
+        calls = []
+
+        def transition(actual_query_id, eligible, epoch):
+            assert threading.get_ident() != loop_thread
+            assert not manager.snapshot()["task_leases"]
+            calls.append((actual_query_id, eligible, epoch))
+            resumed.set()
+
+        runner._transition_query_execution_phase = transition
+        monkeypatch.setattr(fte_scheduler, "drain_fte_resource_admission_change", lambda _query_id: None)
+        manager._on_change = lambda: runner_cls._signal_query_resource_change(runner, query_id)
+        assert manager.release_task_lease(grant.lease.lease_id, attempt_id=grant.lease.attempt_id)
+        assert await asyncio.to_thread(resumed.wait, 2)
+        for task in tuple(runner._query_fte_admission_pumps.values()):
+            await task
+        assert calls == [(query_id, *frontier)]
+
+    asyncio.run(scenario())
+
+
+def test_fte_state_lock_does_not_block_driver_lease_admission_or_release(monkeypatch):
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.fte.fte_execution import FteFragmentExecution
+
+    async def scenario():
+        query_id = "query-fte-lock-isolation"
+        execution = FteFragmentExecution(query_id, 1, fragment_id="fragment:1", task_memory_bytes=100)
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        demand_entered = threading.Event()
+        drain_threads = []
+        loop_thread = threading.get_ident()
+
+        def hold_fragment_lock():
+            with execution._state_lock:
+                lock_held.set()
+                release_lock.wait(5.0)
+
+        def demand(actual_query_id):
+            assert actual_query_id == query_id
+            # Fail before taking the held lock if the driver regresses to a
+            # synchronous check; the test must not deadlock its event loop.
+            assert threading.get_ident() != loop_thread, "FTE demand check blocked the driver event loop"
+            demand_entered.set()
+            return execution.has_pending_partitions()
+
+        def drain(actual_query_id):
+            drain_threads.append(threading.get_ident())
+            demand(actual_query_id)
+            return []
+
+        monkeypatch.setattr(fte_scheduler, "has_fte_resource_admission_demand", demand)
+        monkeypatch.setattr(fte_scheduler, "drain_fte_resource_admission_change", drain)
+        runner_cls, runner = _runner(asyncio.get_running_loop())
+        runner_cls._ensure_query_resource_admission_state(runner)
+        holder = threading.Thread(target=hold_fragment_lock)
+        holder.start()
+        try:
+            assert lock_held.wait(1.0)
+            runner_cls._schedule_query_fte_admission_pump(runner, query_id)
+            pump = runner._query_fte_admission_pumps[query_id]
+            assert await asyncio.to_thread(demand_entered.wait, 1.0)
+            assert not pump.done()
+
+            graph = _graph(query_id)
+            manager = register_query_resource_graph(
+                graph,
+                _allocation(),
+                on_change=lambda: runner_cls._signal_query_resource_change(runner, query_id),
+            )
+            manager.update_unit_state(graph.units[0].resource_unit_id, runnable=True)
+            first_request = _task_request(runner, query_id, "request:first", "task:first")
+            first = await runner_cls.acquire_query_task_lease(runner, first_request)
+            assert first["granted"]
+            output_request = {
+                "request_id": "request:output",
+                "query_id": query_id,
+                "producer_unit_id": graph.units[0].resource_unit_id,
+                "task_lease_id": first["lease"]["lease_id"],
+                "attempt_id": first["lease"]["attempt_id"],
+                "block_id": "block:output",
+                "size_bytes": 10,
+            }
+            output = await runner_cls.acquire_query_output_block_lease(runner, output_request)
+            assert output["granted"]
+            second_request = _task_request(runner, query_id, "request:second", "task:second")
+            second_waiter = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, second_request))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not second_waiter.done()
+            assert await runner_cls.release_query_task_lease(
+                runner, first_request["request_id"], first["lease"]["lease_id"], first["lease"]["attempt_id"]
+            ) == {"released": True}
+            second = await asyncio.wait_for(second_waiter, timeout=1.0)
+            assert second["granted"]
+            await _release_owned_outputs(runner_cls, runner, [(output_request, output)])
+            assert await runner_cls.release_query_task_lease(
+                runner, second_request["request_id"], second["lease"]["lease_id"], second["lease"]["attempt_id"]
+            ) == {"released": True}
+            assert manager.snapshot()["task_leases"] == {}
+            assert not release_lock.is_set()
+            assert not pump.done()
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+        await asyncio.wait_for(pump, timeout=1.0)
+        assert runner._query_fte_admission_done_events[query_id].is_set()
+        # Changes made while the background scan was blocked must be drained
+        # again, even though an existing pump coalesced their notifications.
+        assert len(drain_threads) >= 2
+        assert all(thread != loop_thread for thread in drain_threads)
+
+    asyncio.run(scenario())
+
+
 def test_driver_pending_task_lease_can_be_cancelled_without_a_polling_wakeup():
     async def scenario():
         query_id = "query-lease-cancel"

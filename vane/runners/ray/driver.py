@@ -44,7 +44,6 @@ from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavail
 from vane.runners.fte import (
     FteTaskAttemptId,
     FteTaskState,
-    fte_status_wait_timeout_s,
     validate_fte_status_identity,
 )
 from vane.runners.fte.fte_failures import _normalize_failure_payload, _safe_failure_message
@@ -60,7 +59,7 @@ from vane.runners.ray.ray_env import (
     reject_node_local_ray_runtime_env,
     scrub_shared_runtime_session_env,
 )
-from vane.runners.ray.safe_get import QueryDeadlineExceeded, resolve_object_refs_blocking
+from vane.runners.ray.safe_get import resolve_object_refs_blocking
 from vane.runners.ray.worker import WorkerTaskMetadata
 
 _LEASE_REQUEST_REPLAY_CAPACITY = 65_536
@@ -1124,6 +1123,9 @@ def shutdown_background_event_loop(timeout_s: float = 5.0) -> None:
     global _GLOBAL_EVENT_LOOP
     global _GLOBAL_EVENT_LOOP_THREAD
 
+    from vane.runners.ray.fte_status_observation import shutdown_status_observation_runtime
+
+    shutdown_status_observation_runtime(timeout_s)
     with _GLOBAL_EVENT_LOOP_LOCK:
         loop = _GLOBAL_EVENT_LOOP
         thread = _GLOBAL_EVENT_LOOP_THREAD
@@ -1167,13 +1169,13 @@ def _apply_duckdb_thread_setting(conn: Any) -> None:
 class FteWorkerTaskHandle:
     """Handle for worker-side FTE task attempts.
 
-    FTE worker handles use versioned long-poll status waits to avoid polling
-    worker status in a tight loop.
+    The scheduler's status observation supplies the terminal payload. Result
+    consumers never start a second remote status stream.
     """
 
     task_id: FteTaskAttemptId | str | dict[str, Any]
     worker_handle: Any
-    status_wait_timeout_s: float = 0.0
+    status_completion: ConcurrentFuture[dict[str, Any]] = field(default_factory=ConcurrentFuture)
     task_context_info: dict[str, Any] | None = None
     query_task_lease: dict[str, Any] | None = None
     _result: Any = None
@@ -1213,8 +1215,6 @@ class FteWorkerTaskHandle:
             raise RuntimeError("FTE worker handle must provide non-empty worker_id")
         if not self.worker_incarnation_id:
             raise RuntimeError("FTE worker handle must provide non-empty worker_incarnation_id")
-        if self.status_wait_timeout_s <= 0:
-            self.status_wait_timeout_s = fte_status_wait_timeout_s()
 
     def _attempt_id(self) -> FteTaskAttemptId:
         return FteTaskAttemptId.coerce(self.task_id)
@@ -1237,66 +1237,26 @@ class FteWorkerTaskHandle:
                 loop,
             )
 
-    async def _wait_task_status(self) -> dict[str, Any]:
-        with self._lifecycle_lock:
-            min_version = self._last_status_version
-        return await self.worker_handle.fte_wait_task_status_async(
-            self._attempt_id().to_dict(),
-            min_version,
-            self.status_wait_timeout_s,
-        )
-
-    @staticmethod
-    def _is_soft_status_wait_timeout(exc: BaseException) -> bool:
-        message = _safe_failure_message(exc)
-        if issubclass(type(exc), QueryDeadlineExceeded) or "query deadline expired" in message.lower():
-            return False
-        if issubclass(type(exc), TimeoutError):
-            return True
-        name = type(exc).__name__
-        if name in {"TimeoutError", "GetTimeoutError"}:
-            return True
-        return "did not complete within" in message or "timed out" in message.lower()
-
     async def _watch_status(self) -> Any:
-        while True:
-            with self._lifecycle_lock:
-                if self._is_done:
-                    if self._error is not None:
-                        raise self._error
-                    if self._result is None:
-                        raise RuntimeError("FTE task completed without result")
-                    return self._result
-            try:
-                status = await self._wait_task_status()
-            except Exception as exc:
-                # Soft timeouts are expected when workers are busy or no status
-                # version advanced; never mark the worker failed for that.
-                if self._is_soft_status_wait_timeout(exc):
-                    continue
-                with self._lifecycle_lock:
-                    if self._terminal_state_is_set():
-                        continue
-                terminal_error = await self._finalize_status_watch_failure(
-                    exc,
-                    failure_kind="status wait failed",
-                )
-                if terminal_error is None:
-                    continue
-                raise terminal_error
-            apply_failure = await _run_in_executor(
-                _FTE_STATUS_EXECUTOR,
-                self._apply_status,
-                status,
+        try:
+            # A consumer cancellation must not cancel the shared producer's
+            # completion or prevent it from publishing scheduler terminal state.
+            status = await asyncio.shield(asyncio.wrap_future(self.status_completion))
+        except Exception as exc:
+            terminal_error = await self._finalize_status_watch_failure(
+                exc, failure_kind="status wait failed", publish_worker_failure=False
             )
+            if terminal_error is not None:
+                raise terminal_error
+        else:
+            apply_failure = await _run_in_executor(_FTE_STATUS_EXECUTOR, self._apply_status, status)
             if apply_failure is not None:
                 terminal_error = await self._finalize_status_watch_failure(
-                    apply_failure,
-                    failure_kind="status protocol failed",
+                    apply_failure, failure_kind="status protocol failed"
                 )
-                if terminal_error is None:
-                    continue
-                raise terminal_error
+                if terminal_error is not None:
+                    raise terminal_error
+        return self.get_result_sync()
 
     async def _publish_worker_failure(
         self,
@@ -1323,16 +1283,18 @@ class FteWorkerTaskHandle:
         exc: BaseException,
         *,
         failure_kind: str,
+        publish_worker_failure: bool = True,
     ) -> Exception | None:
         with self._lifecycle_lock:
             if self._is_done:
                 return None
         cleanup_errors: list[str] = []
         try:
-            await self._publish_worker_failure(
-                exc,
-                failure_kind=failure_kind,
-            )
+            if publish_worker_failure:
+                await self._publish_worker_failure(
+                    exc,
+                    failure_kind=failure_kind,
+                )
         except BaseException as cleanup_exc:
             cleanup_errors.append(f"worker failure publication failed: {_safe_failure_message(cleanup_exc)}")
         try:
@@ -3293,15 +3255,11 @@ class RayQueryDriverActor:
 
     def _schedule_query_fte_admission_pump(self, query_id: str) -> None:
         """Wake the FTE ownership domain without blocking the actor loop."""
-        from vane.runners.ray.fte_fragment_scheduler import (
-            has_fte_resource_admission_demand,
-        )
-
         query_key = str(query_id)
         if query_key in self._query_resource_closing_queries:
             return
-        if not has_fte_resource_admission_demand(query_key):
-            return
+        # The background drain rechecks demand. Checking it here can wait on
+        # fragment state locks and stall task/output admission on the actor loop.
         self._query_fte_admission_dirty_queries.add(query_key)
         existing = self._query_fte_admission_pumps.get(query_key)
         if existing is not None and not existing.done():
@@ -3322,10 +3280,6 @@ class RayQueryDriverActor:
         query_id: str,
         done: threading.Event,
     ) -> None:
-        from vane.runners.ray.fte_fragment_scheduler import (
-            drain_fte_resource_admission_change,
-        )
-
         query_key = str(query_id)
         current = asyncio.current_task()
         try:
@@ -3335,7 +3289,7 @@ class RayQueryDriverActor:
             ):
                 self._query_fte_admission_dirty_queries.discard(query_key)
                 await asyncio.to_thread(
-                    drain_fte_resource_admission_change,
+                    self._drain_query_execution_phase_and_fte,
                     query_key,
                 )
         except asyncio.CancelledError:
@@ -3366,6 +3320,23 @@ class RayQueryDriverActor:
                 and query_key not in self._query_resource_closing_queries
             ):
                 self._schedule_query_fte_admission_pump(query_key)
+
+    def _drain_query_execution_phase_and_fte(self, query_id: str) -> None:
+        from vane.runners.ray.fte_fragment_scheduler import drain_fte_resource_admission_change
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        try:
+            manager = get_query_resource_manager(query_id)
+        except KeyError:
+            manager = None
+        if manager is not None:
+            frontier = manager.pending_allocation_frontier()
+            if frontier is not None:
+                # Task completion and prefetch cancellation publish resource
+                # changes. Retry the fenced phase on those edges, outside the
+                # actor event loop, so lease acknowledgements can keep running.
+                self._transition_query_execution_phase(query_id, *frontier)
+        drain_fte_resource_admission_change(query_id)
 
     def _wait_for_query_fte_admission_pump(
         self,
@@ -5489,7 +5460,13 @@ class RayQueryDriverActor:
             # Validate before touching physical actors. Each retirement target
             # is checked atomically against the current eligible set, and the
             # complete frontier token is checked again before allocation.
-            if (eligible, fence_epoch) != manager.current_allocation_frontier():
+            if (eligible, fence_epoch) != manager.pending_allocation_frontier():
+                return
+            if manager.has_actor_leases_outside_phase():
+                # LIMIT can finish the native fragment after transferring
+                # cancelled invocations to driver-owned completion waiters.
+                # Preserve their actor reservation and the closed phase fence
+                # until the final lease release wakes the admission pump.
                 return
             self._retire_udf_actor_pools_outside_phase(query_key, eligible)
 
@@ -6506,22 +6483,21 @@ class RayQueryDriverActor:
                 if self._plan_connections.get(plan_key) is not query_connection:
                     raise RuntimeError(f"query plan connection identity changed before teardown: {plan_key}")
             lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
-            with lifecycle_lock:
-                if force_udf_actor_cleanup:
-                    cleanup_diagnostics = self._teardown_plan_resources_once(
-                        lifecycle,
-                        query_id,
-                        query_connection,
-                        drop_fragments=drop_fragments,
-                        force_udf_actor_cleanup=True,
-                    )
-                else:
-                    cleanup_diagnostics = self._teardown_plan_resources_once(
-                        lifecycle,
-                        query_id,
-                        query_connection,
-                        drop_fragments=drop_fragments,
-                    )
+            if force_udf_actor_cleanup:
+                cleanup_diagnostics = self._teardown_plan_resources_once(
+                    lifecycle,
+                    query_id,
+                    query_connection,
+                    drop_fragments=drop_fragments,
+                    force_udf_actor_cleanup=True,
+                )
+            else:
+                cleanup_diagnostics = self._teardown_plan_resources_once(
+                    lifecycle,
+                    query_id,
+                    query_connection,
+                    drop_fragments=drop_fragments,
+                )
             with self._session_lock:
                 if self._plan_lifecycles.get(plan_key) is lifecycle:
                     raise RuntimeError(f"query plan teardown returned without releasing its lifecycle: {plan_key}")
@@ -6552,60 +6528,64 @@ class RayQueryDriverActor:
     ) -> list[BaseException]:
         plan_id = lifecycle.plan_id
         errors: list[BaseException] = []
-        with self._session_lock:
-            stored_cleanup_diagnostics = tuple(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
         cleanup_diagnostics: list[BaseException] = []
-        for diagnostic in stored_cleanup_diagnostics:
-            _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
         execution_owner_failed = False
-        self.curr_plans.pop(plan_id, None)
-        self.curr_streams.pop(plan_id, None)
-        async_streams = getattr(self, "_async_result_streams", None)
-        if async_streams is not None:
-            async_streams.pop(str(plan_id), None)
-        with self._plan_teardown_condition:
-            leased_refs = getattr(self, "_leased_result_partition_refs", None)
-            records = {} if leased_refs is None else dict(leased_refs.get(str(plan_id), {}))
-        if records:
-            for release_token, record in records.items():
-                _, output_lease_owner = record
-                try:
-                    output_lease_owner.release()
-                except BaseException as exc:
-                    _append_query_cleanup_error(errors, exc)
-                    execution_owner_failed = True
-                else:
-                    with self._plan_teardown_condition:
-                        current_refs = self._leased_result_partition_refs.get(str(plan_id))
-                        if current_refs is not None and current_refs.get(release_token) is record:
-                            current_refs.pop(release_token, None)
-                            if not current_refs:
-                                self._leased_result_partition_refs.pop(str(plan_id), None)
-        with self._plan_teardown_condition:
-            leased_refs = getattr(self, "_leased_result_partition_refs", None)
-            remaining_refs = None if leased_refs is None else leased_refs.get(str(plan_id))
-            if not remaining_refs:
-                counters = getattr(self, "_result_partition_ref_counters", None)
-                if counters is not None:
-                    counters.pop(str(plan_id), None)
-        try:
-            if force_udf_actor_cleanup:
-                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(
-                    str(plan_id),
-                    force=True,
-                )
-            else:
-                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(str(plan_id))
-            for diagnostic in actor_cleanup_diagnostics:
+        # Serialize physical owner cleanup with phase retirement and activation.
+        # Release this lock before the admission fence waits for the phase pump,
+        # which may itself be waiting to acquire the same lifecycle lock.
+        with _query_udf_actor_lifecycle_lock(self, str(plan_id)):
+            with self._session_lock:
+                stored_cleanup_diagnostics = tuple(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
+            for diagnostic in stored_cleanup_diagnostics:
                 _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
-        except BaseException as exc:
-            _append_query_cleanup_error(errors, exc)
-            execution_owner_failed = True
-        try:
-            self._cleanup_vllm_actor_pools(str(plan_id))
-        except BaseException as exc:
-            _append_query_cleanup_error(errors, exc)
-            execution_owner_failed = True
+            self.curr_plans.pop(plan_id, None)
+            self.curr_streams.pop(plan_id, None)
+            async_streams = getattr(self, "_async_result_streams", None)
+            if async_streams is not None:
+                async_streams.pop(str(plan_id), None)
+            with self._plan_teardown_condition:
+                leased_refs = getattr(self, "_leased_result_partition_refs", None)
+                records = {} if leased_refs is None else dict(leased_refs.get(str(plan_id), {}))
+            if records:
+                for release_token, record in records.items():
+                    _, output_lease_owner = record
+                    try:
+                        output_lease_owner.release()
+                    except BaseException as exc:
+                        _append_query_cleanup_error(errors, exc)
+                        execution_owner_failed = True
+                    else:
+                        with self._plan_teardown_condition:
+                            current_refs = self._leased_result_partition_refs.get(str(plan_id))
+                            if current_refs is not None and current_refs.get(release_token) is record:
+                                current_refs.pop(release_token, None)
+                                if not current_refs:
+                                    self._leased_result_partition_refs.pop(str(plan_id), None)
+            with self._plan_teardown_condition:
+                leased_refs = getattr(self, "_leased_result_partition_refs", None)
+                remaining_refs = None if leased_refs is None else leased_refs.get(str(plan_id))
+                if not remaining_refs:
+                    counters = getattr(self, "_result_partition_ref_counters", None)
+                    if counters is not None:
+                        counters.pop(str(plan_id), None)
+            try:
+                if force_udf_actor_cleanup:
+                    actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(
+                        str(plan_id),
+                        force=True,
+                    )
+                else:
+                    actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(str(plan_id))
+                for diagnostic in actor_cleanup_diagnostics:
+                    _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
+            except BaseException as exc:
+                _append_query_cleanup_error(errors, exc)
+                execution_owner_failed = True
+            try:
+                self._cleanup_vllm_actor_pools(str(plan_id))
+            except BaseException as exc:
+                _append_query_cleanup_error(errors, exc)
+                execution_owner_failed = True
         query_key = str(query_id or "").strip()
         if query_key:
             try:

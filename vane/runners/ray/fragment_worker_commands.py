@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,6 @@ from vane.runners.common import QueryDeadlineExceeded
 from vane.runners.fte import FteWorkerControlFailure, fte_status_wait_timeout_s
 from vane.runners.fte.fte_events import FteCreateTaskCommand, TaskStatusChanged
 from vane.runners.fte.fte_scheduler import (
-    FteAttemptStatusWatcher,
     FteSplitQueueTerminal,
     FteSplitSubmissionCancelled,
 )
@@ -31,6 +31,7 @@ from vane.runners.ray.fte_fragment_scheduler import (
     end_fte_registry_operation,
     fte_partition_task_lease_payload,
 )
+from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
 if TYPE_CHECKING:
     from vane.runners.fte import FteFragmentExecution, FteTaskAttemptId
@@ -325,7 +326,7 @@ class FteWorkerCommandMixin:
         try:
             fte_handle_cls = self._fte_task_handle_cls()
             handles: list[Any] = []
-            watcher_requests: list[tuple[FteTaskAttemptId, Any]] = []
+            watcher_requests: list[tuple[FteTaskAttemptId, Any, Any]] = []
             for scheduled_attempt in scheduled_attempts:
                 owner = (
                     self._fte_partition_owner(
@@ -351,7 +352,7 @@ class FteWorkerCommandMixin:
                     raise RuntimeError(f"scheduled FTE attempt {scheduled_attempt.attempt_id} has no query task lease")
                 handle.query_task_lease = dict(query_task_lease)
                 handles.append(handle)
-                watcher_requests.append((scheduled_attempt.attempt_id, owner))
+                watcher_requests.append((scheduled_attempt.attempt_id, owner, handle.status_completion))
             # Make results visible before a watcher can publish terminal
             # status; the outer lifecycle token keeps teardown from observing
             # this publication half-complete.
@@ -360,8 +361,13 @@ class FteWorkerCommandMixin:
                 handles,
                 registry_operation_owned=True,
             )
-            for attempt_id, owner in watcher_requests:
-                self._start_fte_attempt_status_watcher(query_id, attempt_id, owner)
+            for index, (attempt_id, owner, completion) in enumerate(watcher_requests):
+                try:
+                    self._start_fte_attempt_status_watcher(query_id, attempt_id, owner, completion)
+                except Exception as exc:
+                    for _, _, remaining in watcher_requests[index + 1 :]:
+                        remaining.set_exception(exc)
+                    raise
             with _FTE_REGISTRY_LOCK:
                 if query_id in _FTE_CLOSING_QUERIES:
                     # Successful teardown owns registry removal.  Retain the
@@ -376,16 +382,25 @@ class FteWorkerCommandMixin:
         query_id: str,
         attempt_id: FteTaskAttemptId,
         worker_handle: Any,
+        completion: Future[dict[str, Any]],
     ) -> None:
         query_id = str(query_id)
         if not begin_fte_registry_operation(query_id):
+            completion.set_exception(InterruptedError("query closed before FTE status observation started"))
             return
         try:
-            self._start_fte_attempt_status_watcher_while_registry_open(
+            started = self._start_fte_attempt_status_watcher_while_registry_open(
                 query_id,
                 attempt_id,
                 worker_handle,
+                completion,
             )
+            if not started:
+                completion.set_exception(InterruptedError("query closed before FTE status observation started"))
+        except Exception as exc:
+            if not completion.done():
+                completion.set_exception(exc)
+            raise
         finally:
             end_fte_registry_operation(query_id)
 
@@ -394,11 +409,12 @@ class FteWorkerCommandMixin:
         query_id: str,
         attempt_id: FteTaskAttemptId,
         worker_handle: Any,
-    ) -> None:
+        completion: Future[dict[str, Any]],
+    ) -> bool:
         query_id = str(query_id)
         with _FTE_REGISTRY_LOCK:
             if query_id in _FTE_CLOSING_QUERIES:
-                return
+                return False
         scheduler = _FTE_SCHEDULERS.get_or_create(query_id)
         self._bind_fte_scheduler_handlers(scheduler)
         watcher = FteAttemptStatusWatcher(
@@ -406,6 +422,7 @@ class FteWorkerCommandMixin:
             attempt_id=attempt_id,
             worker=worker_handle,
             wait_timeout_s=fte_status_wait_timeout_s(),
+            completion=completion,
         )
         attempt_key = str(attempt_id)
 
@@ -424,7 +441,7 @@ class FteWorkerCommandMixin:
                 raise RuntimeError(f"previous FTE status watcher did not stop: {attempt_key}")
         with _FTE_REGISTRY_LOCK:
             if query_id in _FTE_CLOSING_QUERIES:
-                return
+                return False
             current = _FTE_STATUS_WATCHERS.get(attempt_key)
             if current is previous:
                 _FTE_STATUS_WATCHERS.pop(attempt_key, None)
@@ -437,3 +454,4 @@ class FteWorkerCommandMixin:
                 if _FTE_STATUS_WATCHERS.get(attempt_key) is watcher:
                     _FTE_STATUS_WATCHERS.pop(attempt_key, None)
                 raise
+        return True

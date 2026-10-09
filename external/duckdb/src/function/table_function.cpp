@@ -101,7 +101,7 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
                              table_function_init_local_t init_local)
     : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
       bind_operator(nullptr), init_global(init_global), init_local(init_local), function(function_),
-      in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
+      poll_function(nullptr), in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
       in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
       cardinality(nullptr), rows_scanned(nullptr), get_metrics(nullptr), pushdown_complex_filter(nullptr),
       pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
@@ -117,7 +117,7 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
                              table_function_init_local_t init_local)
     : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
       bind_operator(nullptr), init_global(init_global), init_local(init_local), function(nullptr),
-      in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
+      poll_function(nullptr), in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
       in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
       cardinality(nullptr), rows_scanned(nullptr), get_metrics(nullptr), pushdown_complex_filter(nullptr),
       pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
@@ -145,8 +145,9 @@ TableFunction::TableFunction() : TableFunction("", {}, nullptr, nullptr, nullptr
 bool TableFunction::operator==(const TableFunction &rhs) const {
 	return name == rhs.name && arguments == rhs.arguments && varargs == rhs.varargs && bind == rhs.bind &&
 	       bind_replace == rhs.bind_replace && bind_operator == rhs.bind_operator && init_global == rhs.init_global &&
-	       init_local == rhs.init_local && function == rhs.function && in_out_function == rhs.in_out_function &&
-	       in_out_function_final == rhs.in_out_function_final && in_out_function_batch == rhs.in_out_function_batch &&
+	       init_local == rhs.init_local && function == rhs.function && poll_function == rhs.poll_function &&
+	       in_out_function == rhs.in_out_function && in_out_function_final == rhs.in_out_function_final &&
+	       in_out_function_batch == rhs.in_out_function_batch &&
 	       in_out_function_final_batch == rhs.in_out_function_final_batch && statistics == rhs.statistics &&
 	       dependency == rhs.dependency && cardinality == rhs.cardinality &&
 	       pushdown_complex_filter == rhs.pushdown_complex_filter && pushdown_expression == rhs.pushdown_expression &&

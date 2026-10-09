@@ -59,6 +59,8 @@ public:
 	unique_ptr<FileSystem> ExtractSubSystem(const string &name) override;
 
 	vector<string> ListSubSystems() override;
+	//! Whether a registered subsystem handles this path (without opening it).
+	bool CanHandleFile(const string &path) override;
 
 	FileSystem &GetDefaultFileSystem();
 

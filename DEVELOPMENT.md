@@ -66,6 +66,10 @@ non-editable package so the test environment receives them. Changes below
 
 ## Building a loadable extension artifact
 
+For the Gravitino Catalog and Fileset connector, see
+[Gravitino integration](GRAVITINO.md). It uses the same optional artifact and
+provider-wheel workflow below.
+
 For `native_media`, first prepare its separate SDK and shared libraries using
 [the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
@@ -217,6 +221,9 @@ protocol tests and extension-specific normal and fault-tolerant tests when
 implementing either contract.
 
 ## Python tests
+
+See [Python source execution](DATASOURCE_EXECUTION.md) for the native readiness,
+decoder admission, and cancellation contracts and their focused regression checks.
 
 The required release gate covers the supported base installation and does not
 need model downloads, cloud credentials, GPUs, or external services:
