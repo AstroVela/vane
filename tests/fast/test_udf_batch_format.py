@@ -313,8 +313,10 @@ def test_numpy_masked_tensor_output_preserves_whole_row_nulls():
     )[0]
 
     tensor = output.column("embedding").combine_chunks()
-    assert tensor.null_count == 1
-    np.testing.assert_array_equal(tensor.to_numpy_ndarray()[0], np.arange(4, dtype=np.float32).reshape(2, 2))
+    assert tensor.is_valid().to_pylist() == [True, False]
+    np.testing.assert_array_equal(
+        tensor.drop_null().to_numpy_ndarray()[0], np.arange(4, dtype=np.float32).reshape(2, 2)
+    )
 
 
 def test_numpy_masked_tensor_output_rejects_partial_row_masks():
@@ -502,10 +504,11 @@ def test_pandas_batch_format_round_trip_preserves_tensor_cells():
     )
     assert len(output) == 1
     assert output[0].column("x").to_pylist() == [6, 7, 8]
-    assert output[0].column("embedding").null_count == 1
+    tensor = output[0].column("embedding").combine_chunks()
+    assert tensor.is_valid().to_pylist() == [True, False, True]
     np.testing.assert_array_equal(
-        output[0].column("embedding").combine_chunks().to_numpy_ndarray()[0],
-        np.arange(4, dtype=np.float32).reshape(2, 2),
+        tensor.drop_null().to_numpy_ndarray(),
+        np.arange(12, dtype=np.float32).reshape(3, 2, 2)[[0, 2]],
     )
 
 
