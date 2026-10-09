@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import math
 import random
 
 import pytest
@@ -1725,12 +1726,98 @@ def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
     _assert_object_store_budget_invariants(manager.snapshot())
 
 
-def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
+def _assert_usage_matches_leases(manager):
+    """Recompute ownership from raw leases, independently of usage counters."""
+
+    tasks = tuple(manager._task_leases.values())
+    outputs = tuple(manager._output_leases.values())
+    waiting = manager._waiting_output_blocks
+    active_actor_tasks = set(manager._active_actor_slots.values())
+    resident_total = _r()
+    for unit_id, _ in manager._submitted_actor_slots:
+        resident_total += manager.graph.unit_by_id(unit_id).resident_per_actor
+
+    for excluded in (None, "missing-block", *waiting):
+        total = _r()
+        for unit_id, state in manager._units.items():
+            spec = state.spec
+            expected = _r()
+            if spec.target_output_block_bytes <= 0:
+                estimate = 0
+            elif state.num_task_outputs_generated == 0:
+                estimate = spec.output_window_bytes
+            else:
+                blocks = spec.generator_buffer_blocks
+                if state.num_outputs_of_finished_tasks:
+                    blocks = min(blocks, state.num_outputs_of_finished_tasks / state.num_tasks_finished)
+                estimate = min(
+                    spec.output_window_bytes,
+                    math.ceil(state.bytes_task_outputs_generated * blocks / state.num_task_outputs_generated),
+                )
+            for task in tasks:
+                if task.resource_unit_id != unit_id:
+                    continue
+                pending = estimate
+                if spec.backend == "ray_worker":
+                    pending = task.output_window_bytes
+                elif spec.backend == "ray_actor" and task.lease_id not in active_actor_tasks:
+                    pending = 0
+                expected += task.resources + _r(store=pending)
+            exact = sum(output.size_bytes for output in outputs if output.producer_unit_id == unit_id)
+            exact += sum(
+                request.size_bytes
+                for block_id, request in waiting.items()
+                if block_id != excluded and request.producer_unit_id == unit_id
+            )
+            expected += _r(store=exact)
+            total += expected
+            resident = _r()
+            for owner, _ in manager._submitted_actor_slots:
+                if owner == unit_id:
+                    resident += spec.resident_per_actor
+            actual = manager._unit_usage_locked(unit_id, excluded_waiting_block_id=excluded)
+            assert actual.to_dict() == pytest.approx((expected + resident).to_dict())
+            assert actual.object_store_bytes == expected.object_store_bytes + resident.object_store_bytes
+            assert (
+                manager._object_store_output_usage_for_unit_locked(unit_id, excluded_waiting_block_id=excluded) == exact
+            )
+        actual = manager._query_usage_locked(excluded_waiting_block_id=excluded)
+        assert actual.to_dict() == pytest.approx(total.to_dict())
+        assert actual.object_store_bytes == total.object_store_bytes
+        assert manager._soft_allocation_usage_locked(excluded_waiting_block_id=excluded).to_dict() == pytest.approx(
+            (total + resident_total).to_dict()
+        )
+
+    for unit_id, state in manager._units.items():
+        queued_inputs = [
+            size for request, size in manager._waiting_task_inputs.values() if request.resource_unit_id == unit_id
+        ]
+        queued_outputs = [request.size_bytes for request in waiting.values() if request.producer_unit_id == unit_id]
+        assert manager._active_task_count_for_unit_locked(unit_id) == sum(
+            task.resource_unit_id == unit_id for task in tasks
+        )
+        assert state.pending_task_count == len(queued_inputs)
+        assert state.queued_input_bytes == sum(queued_inputs)
+        assert state.pending_output_count == len(queued_outputs)
+        assert state.queued_output_bytes == sum(queued_outputs) + sum(
+            output.size_bytes
+            for output in outputs
+            if output.producer_unit_id == unit_id and output.state in {"generator_pending", "unit_queue"}
+        )
+
+
+@pytest.mark.parametrize("mixed_backends", [False, True])
+def test_object_store_ledgers_hold_across_seeded_lifecycle_traces(mixed_backends):
     """Exercise valid lifecycle interleavings while checking an independent ledger."""
 
     for seed in range(12):
         randomizer = random.Random(seed)
-        upstream = _unit(f"resource:f:trace-{seed}-upstream", target=1, blocks=1)
+        upstream = _unit(
+            f"resource:f:trace-{seed}-upstream",
+            target=1,
+            blocks=1,
+            backend="ray_worker" if mixed_backends else "ray_task",
+        )
         middle = _unit(
             f"resource:f:trace-{seed}-middle",
             inputs=(upstream.resource_unit_id,),
@@ -1742,6 +1829,9 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
             inputs=(middle.resource_unit_id,),
             target=5,
             blocks=1,
+            backend="ray_actor" if mixed_backends else "ray_task",
+            actor_pool_size=2 if mixed_backends else 0,
+            actor_prefetch_depth=3 if mixed_backends else 1,
         )
         units = (upstream, middle, downstream)
         manager = _manager(
@@ -1773,6 +1863,7 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
                     resource_unit_id,
                     f"{seed}-{next_identity}",
                     retained=randomizer.randrange(24),
+                    node_id="node-a" if manager.graph.unit_by_id(resource_unit_id).backend == "ray_worker" else None,
                 )
                 next_identity += 1
                 grant = manager.try_acquire_task(request)
@@ -1852,6 +1943,7 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
 
             snapshot = manager.snapshot()
             _assert_object_store_budget_invariants(snapshot)
+            _assert_usage_matches_leases(manager)
 
             expected_output_bytes_by_unit = {unit.resource_unit_id: 0 for unit in units}
             for request in waiting_outputs.values():
@@ -1864,9 +1956,10 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
             expected_query_usage = sum(task.resources.object_store_bytes for task in active_tasks)
             expected_query_usage += sum(expected_output_bytes_by_unit.values())
             expected_query_usage += sum(
-                snapshot["units"][unit.resource_unit_id]["active_task_count"]
-                * snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"]
-                for unit in units
+                snapshot["units"][task.resource_unit_id]["pending_output_estimate_per_active_task_bytes"]
+                for task in active_tasks
+                if manager.graph.unit_by_id(task.resource_unit_id).backend != "ray_actor"
+                or task.lease_id in manager._active_actor_slots.values()
             )
             assert snapshot["admission"]["object_store"]["query_usage_bytes"] == expected_query_usage
 
@@ -1878,6 +1971,149 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
             }
             assert snapshot["liveness"]["active_task_lease_ids_by_unit"] == expected_task_liveness
             assert snapshot["liveness"]["active_output_lease_ids_by_unit"] == expected_output_liveness
+
+        manager.fail("trace shutdown")
+        _assert_usage_matches_leases(manager)
+        manager.cancel("trace cleanup")
+        _assert_usage_matches_leases(manager)
+
+
+def test_usage_tracks_mixed_native_windows_actor_promotion_and_retry():
+    mib = 1024**2
+    native = _unit("resource:f:usage-native", backend="ray_worker", target=128 * mib)
+    actor = _unit(
+        "resource:f:usage-actor",
+        inputs=(native.resource_unit_id,),
+        backend="ray_actor",
+        actor_pool_size=2,
+        actor_prefetch_depth=3,
+    )
+    manager = _manager(native, actor, resources=_r(cpu=100, heap=10000, store=4096 * mib))
+    _ready(manager, native.resource_unit_id, actor.resource_unit_id)
+    data = manager.try_acquire_task(_task(native.resource_unit_id, 0, retained=7, node_id="node-a")).lease
+    copy = manager.try_acquire_task(
+        _task(native.resource_unit_id, 1, retained=11, node_id="node-a", output_kind="copy_metadata")
+    ).lease
+    assert data and copy
+    assert data.output_window_bytes == 256 * mib
+    assert copy.output_window_bytes == 4 * mib
+    calls = []
+    for index in range(6):
+        request = _task(actor.resource_unit_id, index, retained=index + 1)
+        manager.note_task_waiting(request)
+        manager.note_task_waiting(request)
+        _assert_usage_matches_leases(manager)
+        grant = manager.try_acquire_task(request)
+        assert grant.granted
+        calls.append(grant.lease)
+        _assert_usage_matches_leases(manager)
+
+    # A queued cancellation does not remove the actor's active generator.
+    assert manager.abandon_task_lease(calls[-1].lease_id, attempt_id="0")
+    _assert_usage_matches_leases(manager)
+    retry = manager.try_acquire_task(_task(actor.resource_unit_id, 5, retained=6))
+    assert retry.granted
+    _assert_usage_matches_leases(manager)
+
+    request = OutputBlockRequest("q", actor.resource_unit_id, calls[0].lease_id, "0", "waiting", 7)
+    assert manager.note_output_waiting(request) is None
+    assert manager.note_output_waiting(request) is None
+    _assert_usage_matches_leases(manager)
+    output = manager.try_acquire_output_block(request)
+    assert output.granted
+    for state in ("unit_queue", "downstream_input", "external_consumer"):
+        assert manager.transition_output_block(output.lease.lease_id, state)
+        _assert_usage_matches_leases(manager)
+    # Completing the active call promotes a prefetched call. Learning the
+    # completed output count also changes the estimate for the other actor.
+    assert manager.release_task_lease(calls[0].lease_id, attempt_id="0")
+    _assert_usage_matches_leases(manager)
+    assert not manager.release_task_lease(calls[0].lease_id, attempt_id="0")
+    assert manager.reconcile_actor_runtime_node(actor.resource_unit_id, 0, "node-b")
+    _assert_usage_matches_leases(manager)
+
+    metadata = OutputBlockRequest("q", native.resource_unit_id, copy.lease_id, "0", "metadata", 17)
+    before = manager._query_usage_locked()
+    with pytest.raises(RuntimeError, match="not unique"):
+        manager.finish_task_with_outputs(copy.lease_id, attempt_id="0", outputs=[metadata, metadata])
+    assert manager._query_usage_locked() == before
+    _assert_usage_matches_leases(manager)
+    copied = manager.finish_task_with_outputs(copy.lease_id, attempt_id="0", outputs=[metadata])
+    _assert_usage_matches_leases(manager)
+    assert manager.release_output_block(copied[0].lease_id)
+    assert not manager.release_output_block(copied[0].lease_id)
+    assert manager.abandon_task_lease(data.lease_id, attempt_id="0")
+    _assert_usage_matches_leases(manager)
+
+    for task in tuple(manager._task_leases.values()):
+        assert manager.release_task_lease(task.lease_id, attempt_id=task.attempt_id)
+        _assert_usage_matches_leases(manager)
+    manager.fail("physical ownership remains")
+    _assert_usage_matches_leases(manager)
+    assert manager._query_usage_locked().object_store_bytes == 7
+    manager.cancel("physical work stopped")
+    _assert_usage_matches_leases(manager)
+    assert manager._soft_allocation_usage_locked().is_zero()
+    manager.cancel("duplicate cleanup")
+    _assert_usage_matches_leases(manager)
+
+
+@pytest.mark.parametrize("native_count", [23, 512])
+def test_admission_usage_does_not_scan_task_or_output_ledgers(monkeypatch, native_count):
+    """Guard complexity deterministically instead of asserting wall-clock time."""
+
+    class NoScanDict(dict):
+        def __iter__(self):
+            raise AssertionError("admission scanned a lease ledger")
+
+        def values(self):
+            raise AssertionError("admission scanned a lease ledger")
+
+        def items(self):
+            raise AssertionError("admission scanned a lease ledger")
+
+    mib = 1024**2
+    native = _unit("resource:f:scale-native", backend="ray_worker", target=128 * mib, concurrency=1000)
+    stream = _unit(
+        "resource:f:scale-stream",
+        inputs=(native.resource_unit_id,),
+        resources=_r(cpu=0.1, gpu=0.125, heap=10),
+    )
+    manager = _manager(native, stream, resources=_r(cpu=100, gpu=10, heap=10000, store=20 * 1024 * mib))
+    _ready(manager, native.resource_unit_id, stream.resource_unit_id)
+    tasks = []
+    for index in range(native_count):
+        request = _task(native.resource_unit_id, index, node_id="node-a", output_kind="copy_metadata")
+        grant = manager.try_acquire_task(request)
+        assert grant.granted
+        tasks.append(grant.lease)
+    streaming = manager.try_acquire_task(_task(stream.resource_unit_id, 0, retained=13)).lease
+    assert streaming
+    output_request = OutputBlockRequest("q", stream.resource_unit_id, streaming.lease_id, "0", "block", 9)
+    task_request = _task(stream.resource_unit_id, 1, retained=17)
+    _assert_usage_matches_leases(manager)
+
+    with monkeypatch.context() as patch:
+        for name in ("_task_leases", "_output_leases", "_waiting_task_inputs", "_waiting_output_blocks"):
+            patch.setattr(manager, name, NoScanDict(getattr(manager, name)))
+        manager.note_task_waiting(task_request)
+        manager.note_output_waiting(output_request)
+        assert manager._normal_task_block_reason_locked(task_request)[0] is None
+        assert manager._normal_output_block_reason_locked(output_request)[0] is None
+        grant = manager.try_acquire_task(task_request)
+        assert grant.granted
+        output = manager.try_acquire_output_block(output_request)
+        assert output.granted
+        assert manager._active_task_count_for_unit_locked(native.resource_unit_id) == native_count
+        assert manager._query_usage_locked().object_store_bytes == native_count * 4 * mib + 13 + 17 + 2 * 18 + 9
+        for state in ("unit_queue", "downstream_input", "external_consumer"):
+            assert manager.transition_output_block(output.lease.lease_id, state)
+        assert manager.release_output_block(output.lease.lease_id)
+        assert manager.release_task_lease(grant.lease.lease_id, attempt_id="0")
+        finished = tasks[-1]
+        metadata = OutputBlockRequest("q", native.resource_unit_id, finished.lease_id, "0", "copy", 3)
+        manager.finish_task_with_outputs(finished.lease_id, attempt_id="0", outputs=[metadata])
+        assert manager._query_usage_locked().object_store_bytes == (native_count - 1) * 4 * mib + 13 + 18 + 3
 
 
 def test_task_admission_cannot_consume_the_output_handoff_reservation():
