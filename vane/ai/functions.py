@@ -586,8 +586,10 @@ def _embedding_provider_family(provider: Any) -> str | None:
         return "google"
     if module == "vane.ai.providers.transformers":
         return "transformers"
+    if module in {"vane.ai.providers.vllm", "vane.ai.providers.sglang"}:
+        return module.rsplit(".", 1)[1]
     name = getattr(provider, "name", None)
-    if isinstance(name, str) and name.casefold() in {"openai", "google", "transformers"}:
+    if isinstance(name, str) and name.casefold() in {"openai", "google", "transformers", "vllm", "sglang"}:
         return name.casefold()
     return None
 
@@ -2266,7 +2268,7 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family in {"vllm", "sglang"}:
+    if family in {"vllm", "sglang"} and prepared.get("transport") != "http":
         if return_raw_response:
             raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1

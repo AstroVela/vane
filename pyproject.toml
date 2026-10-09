@@ -78,6 +78,7 @@ transformers = [
     "transformers",
     "pillow>=10.4",
 ]
+qwen = ["torch>=2.6", "torchvision", "transformers>=4.57.1,<5", "pillow"]
 clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
 cosmos = [
     "torch>=2.7",
@@ -285,6 +286,8 @@ include = [
     "/tests/fast/test_ai_audio_embedding.py",
     "/tests/fast/test_clap.py",
     "/tests/fast/test_cosmos_embed1.py",
+    "/tests/fast/test_inference_http.py",
+    "/tests/fast/test_qwen3_vl_embedding.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
     "/tests/fast/test_doris_datasink.py",
@@ -304,6 +307,7 @@ include = [
 
     # Source code and stubs
     "/examples/jev_judgments.py",
+    "/examples/multimodal_providers.py",
     "src/**",
     "vane/**",
 

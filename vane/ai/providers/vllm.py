@@ -36,8 +36,8 @@ from vane.ai.options import (
     _require_prompt_number,
     normalize_prompt_options,
 )
-from vane.ai.protocols import NativeInferencePlan
-from vane.ai.provider import Provider
+from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
+from vane.ai.providers._inference_http import HTTPProviderMixin
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_ENGINE_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -275,8 +275,10 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any], *, engine: s
     }
 
 
-class VLLMProvider(Provider):
+class VLLMProvider(HTTPProviderMixin):
     """Provider backed by a local or remote vLLM engine."""
+
+    _http_family = "vllm"
 
     DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
 
@@ -295,7 +297,9 @@ class VLLMProvider(Provider):
         return_raw_response: bool = False,
         *,
         options: Mapping[str, Any] | None = None,
-    ) -> NativeVLLMPromptPlan:
+    ) -> NativeVLLMPromptPlan | PrompterDescriptor:
+        if (options or {}).get("transport") == "http":
+            return self._http_prompter(model, system_message, return_format, return_raw_response, options)
         if return_raw_response:
             raise ValueError("Provider 'vllm' does not support return_raw_response")
         prepared = normalize_prompt_options("vllm", options or {}, relation=False)

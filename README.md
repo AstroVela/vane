@@ -65,6 +65,9 @@ For encoded video intervals with synchronized audio and source timestamps, see
 the [video clipping example](examples/video_clip.py). It covers `VideoFile.clip`,
 the `video_clip` Python/SQL expression, output codecs, and resource limits.
 
+The [multimodal provider example](examples/multimodal_providers.py) covers explicit
+vLLM/SGLang HTTP deployments and paired Qwen3-VL text, image, and video embeddings.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)

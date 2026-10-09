@@ -16,8 +16,8 @@ from vane.ai.options import (
     _require_prompt_number,
     normalize_prompt_options,
 )
-from vane.ai.protocols import NativeInferencePlan
-from vane.ai.provider import Provider
+from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
+from vane.ai.providers._inference_http import HTTPProviderMixin
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
@@ -201,8 +201,10 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
         return options
 
 
-class SGLangProvider(Provider):
+class SGLangProvider(HTTPProviderMixin):
     """Provider backed by a local or remote SGLang engine."""
+
+    _http_family = "sglang"
 
     DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
 
@@ -221,7 +223,9 @@ class SGLangProvider(Provider):
         return_raw_response: bool = False,
         *,
         options: Mapping[str, Any] | None = None,
-    ) -> NativeSGLangPromptPlan:
+    ) -> NativeSGLangPromptPlan | PrompterDescriptor:
+        if (options or {}).get("transport") == "http":
+            return self._http_prompter(model, system_message, return_format, return_raw_response, options)
         if return_raw_response:
             raise ValueError("Provider 'sglang' does not support return_raw_response")
         prepared = normalize_prompt_options("sglang", options or {}, relation=False)
