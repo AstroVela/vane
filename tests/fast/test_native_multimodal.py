@@ -385,6 +385,7 @@ def test_native_prompt_forwards_model_settings_and_structured_output(family, sdk
         assert sdk.video_bytes == b"video-bytes"
         assert sdk.calls[0][2]["top_k"] == 7 and sdk.calls[0][2]["max_tokens"] == 128
         assert sdk.calls[0][2]["structured_outputs"].json == schema
+        assert sdk.calls[0][3]["tokenization_kwargs"] == {"add_special_tokens": False}
     else:
         assert sdk.calls[0][1]["video_data"] == [b"video-bytes"]
         assert sdk.calls[0][1]["sampling_params"]["top_k"] == 7
@@ -435,10 +436,20 @@ def test_engine_resource_admission_and_input_ownership(family):
             load_provider(family).get_video_embedder("configured", 2, options=invalid)
 
 
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("processing", [{"add_special_tokens": True}, {"text_kwargs": {"add_special_tokens": True}}])
-def test_sglang_chat_template_owns_special_tokens(processing):
+def test_native_chat_template_owns_special_tokens(family, processing):
     with pytest.raises(ValueError, match="chat templates own special tokens"):
-        load_provider("sglang").get_text_embedder("configured", 2, options={"processor_kwargs": processing})
+        load_provider(family).get_text_embedder("configured", 2, options={"processor_kwargs": processing})
+
+
+@pytest.mark.parametrize("tokenization", [{"add_special_tokens": True}, None])
+def test_vllm_prompt_chat_template_owns_special_tokens(tokenization):
+    with pytest.raises(ValueError, match="chat templates own special tokens"):
+        load_provider("vllm").get_prompter(
+            "configured",
+            options={"media_mime_types": ["image/png"], "generate_args": {"tokenization_kwargs": tokenization}},
+        )
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -523,6 +534,7 @@ def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypat
         assert "prompt" not in state.calls[0][1]
     else:
         assert state.calls[0][1]["prompt"] == expected_text
+        assert state.calls[0][3]["tokenization_kwargs"] == {"add_special_tokens": False}
 
 
 @pytest.fixture
@@ -572,9 +584,154 @@ def test_real_standalone_tokenizer_loads_with_weights_only_checkpoint(tmp_path, 
     assert state.engines[0].args[key] == str(processing)
 
 
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("kind", ["image", "video", "prompt"])
+def test_vllm_engine_loads_separate_real_processor_with_original_weights(
+    tmp_path, kind, remote, bos_tokenizer, monkeypatch
+):
+    from pathlib import Path
+
+    import transformers
+
+    pytest.importorskip("torchvision")
+    processor = transformers.Qwen3VLProcessor(
+        image_processor=transformers.Qwen2VLImageProcessor(),
+        tokenizer=bos_tokenizer,
+        video_processor=transformers.Qwen3VLVideoProcessor(),
+        chat_template="hello",
+    )
+    checkpoint, processing = tmp_path / "checkpoint", tmp_path / "processing"
+    transformers.Qwen3VLConfig().save_pretrained(checkpoint)
+    (checkpoint / "model.safetensors").write_bytes(b"fixture weights")
+    (checkpoint / "preprocessor_config.json").write_text('{"image_processor_type": "UnrelatedProcessor"}')
+    (checkpoint / "video_preprocessor_config.json").write_text('{"video_processor_type": "UnrelatedProcessor"}')
+    processor.save_pretrained(processing)
+    before = {path.name: path.read_bytes() for path in checkpoint.iterdir()}
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    model = "fixture/model" if remote else str(checkpoint)
+    downloads = []
+
+    def snapshot(name, **kwargs):
+        downloads.append((name, kwargs))
+        return str(checkpoint)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    original_config = transformers.AutoConfig.from_pretrained
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda name, **kwargs: original_config(checkpoint if name == model else name, **kwargs),
+    )
+    engine = sys.modules["vllm"].AsyncLLMEngine
+    create = engine.from_engine_args
+    model_views = []
+
+    def create_with_processor(args):
+        view = Path(args.model)
+        model_views.append(view)
+        # The SDK loads its processor from model, not tokenizer. Reload from
+        # precisely that source while checking the checkpoint is unchanged.
+        loaded = transformers.AutoProcessor.from_pretrained(args.model, trust_remote_code=False)
+        assert isinstance(loaded, transformers.Qwen3VLProcessor)
+        assert loaded.chat_template == "hello"
+        assert type(transformers.AutoImageProcessor.from_pretrained(view)) is type(loaded.image_processor)
+        assert type(transformers.AutoVideoProcessor.from_pretrained(view)) is type(loaded.video_processor)
+        assert (view / "model.safetensors").samefile(checkpoint / "model.safetensors")
+        assert (view / "config.json").samefile(checkpoint / "config.json")
+        assert args.served_model_name == model
+        assert args.tokenizer == str(processing)
+        return create(args)
+
+    monkeypatch.setattr(engine, "from_engine_args", create_with_processor)
+    options = {
+        "gpus_per_actor": 0,
+        "engine_args": {
+            "tokenizer": str(processing),
+            "revision": "weights-revision",
+            "tokenizer_revision": "processor-revision",
+            "download_dir": str(tmp_path / "cache"),
+        },
+    }
+    provider = load_provider("vllm")
+    descriptor = (
+        provider.get_prompter(model, options={**options, "media_mime_types": ["image/png"]})
+        if kind == "prompt"
+        else getattr(provider, f"get_{kind}_embedder")(model, 2, options=options)
+    )
+    original_options = descriptor.get_options()
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            runtime._ensure_engine()
+            assert runtime._ensure_engine() is state.engines[0]
+            assert model_views[0].is_dir()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert len(model_views) == 1 and not model_views[0].exists()
+    assert {path.name: path.read_bytes() for path in checkpoint.iterdir()} == before
+    assert descriptor.get_model() == model and descriptor.get_options() == original_options
+    assert downloads == (
+        [(model, {"revision": "weights-revision", "cache_dir": str(tmp_path / "cache"), "token": None})]
+        if remote
+        else []
+    )
+
+
+@pytest.mark.parametrize("failure", ["save", "engine", "shutdown"])
+def test_vllm_processor_model_view_is_cleaned_on_failures(tmp_path, failure, sdk, monkeypatch):
+    from pathlib import Path
+
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+    directories = []
+
+    def save(self, path):
+        directories.append(Path(path))
+        (Path(path) / "preprocessor_config.json").write_text("{}")
+        if failure == "save":
+            raise RuntimeError("save failed")
+
+    monkeypatch.setattr(sys.modules["transformers"].AutoProcessor, "save_pretrained", save, raising=False)
+    engine = sys.modules["vllm"].AsyncLLMEngine
+    create = engine.from_engine_args
+
+    def create_or_fail(args):
+        if failure == "engine":
+            raise RuntimeError("engine failed")
+        result = create(args)
+        result.shutdown = lambda: (_ for _ in ()).throw(RuntimeError("shutdown failed"))
+        return result
+
+    monkeypatch.setattr(engine, "from_engine_args", create_or_fail)
+
+    async def run():
+        runtime = (
+            load_provider("vllm")
+            .get_image_embedder(
+                str(checkpoint), 2, options={"gpus_per_actor": 0, "engine_args": {"tokenizer": "separate-processor"}}
+            )
+            .instantiate()
+        )
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            try:
+                runtime._ensure_engine()
+            finally:
+                await runtime.aclose()
+        assert runtime._model_directory is None
+
+    asyncio.run(run())
+    assert len(directories) == 1 and not directories[0].exists()
+    assert list(checkpoint.iterdir()) == [checkpoint / "config.json"]
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("processing", [{}, {"add_special_tokens": False}])
-def test_sglang_template_token_ids_are_submitted_without_retokenization(
-    tmp_path, processing, bos_tokenizer, monkeypatch
+def test_native_template_token_ids_are_submitted_without_retokenization(
+    tmp_path, family, processing, bos_tokenizer, monkeypatch
 ):
     import transformers
 
@@ -584,7 +741,7 @@ def test_sglang_template_token_ids_are_submitted_without_retokenization(
 
     async def run():
         runtime = (
-            load_provider("sglang")
+            load_provider(family)
             .get_text_embedder(str(tmp_path), 2, options={"gpus_per_actor": 0, "processor_kwargs": processing})
             .instantiate()
         )
@@ -594,13 +751,26 @@ def test_sglang_template_token_ids_are_submitted_without_retokenization(
             await runtime.aclose()
 
     asyncio.run(run())
-    expected = bos_tokenizer.apply_chat_template([{"role": "user", "content": "hello"}], tokenize=True)
+    expected = bos_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hello"}], tokenize=True, return_dict=False
+    )
     assert expected == [1, 3, 2]
     assert bos_tokenizer.encode("<s>hello</s>") == [1, 1, 3, 2, 2]
-    assert state.calls[0][1]["input_ids"] == expected
-    assert "prompt" not in state.calls[0][1]
+    if family == "sglang":
+        assert state.calls[0][1]["input_ids"] == expected
+        assert "prompt" not in state.calls[0][1]
+    else:
+        # vLLM completion tokenization defaults to adding special tokens. Check
+        # the actual engine argument, not the unrelated multimodal kwargs.
+        call = state.calls[0]
+        assert bos_tokenizer.encode(call[1]["prompt"], **call[3].get("tokenization_kwargs", {})) == expected
 
 
+# Transformers 5.12 builds modality IDs with np.array(torch.Tensor), whose
+# NumPy 2 copy-keyword warning is unrelated to the processor-output contract.
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
 @pytest.mark.parametrize("text_options", [{}, {"text_kwargs": {}}, {"text_kwargs": {"add_special_tokens": False}}])
 def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_options):
     transformers = pytest.importorskip("transformers", minversion="4.57.1")

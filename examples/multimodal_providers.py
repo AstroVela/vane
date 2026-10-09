@@ -22,13 +22,18 @@ For a checkpoint containing only weights/configuration, set engine_args.tokenize
 (vLLM) or engine_args.tokenizer_path (SGLang) to its matching processing source.
 This source supplies the chat template and tokenizer; image/video inputs also
 require the matching processor configuration there. vLLM's tokenizer_revision
-selects the processing revision independently of the model revision.
+selects the processing revision independently of the model revision. For a
+separate multimodal processor, Vane gives vLLM a temporary local model view:
+processor files come from that processing source and weights/configuration link
+to the selected checkpoint. Remote checkpoints are first resolved to a local Hub
+snapshot at engine_args.revision, using engine_args.download_dir when set. The
+view lasts until engine shutdown; the checkpoint and shared cache are unchanged.
 
 Decoded clip embedding uses vane.ai.embed_video on an ordered LIST of
 {frame_index, frame_time, data IMAGE}. Sampling belongs to the caller; both
 native adapters retain frame timestamps at microsecond precision. SGLang uses
 its native processor_output interface and submits the resulting token IDs
-directly, including for text. Chat templates own special tokens, so SGLang
+directly, including for text. Chat templates own special tokens, so native
 embedding processor_kwargs.add_special_tokens must remain False. Models
 must accept the configured processor inputs. Incompatible inputs or SDK/model
 parameters fail; no model, transport or modality is substituted.

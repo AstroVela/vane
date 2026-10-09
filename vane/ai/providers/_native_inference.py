@@ -15,9 +15,11 @@ import inspect
 import io
 import json
 import math
+import tempfile
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -148,10 +150,8 @@ class _NativeEmbeddingDescriptor:
         text_options = processor.get("text_kwargs", {})
         if not isinstance(text_options, Mapping) or text_options.get("truncation", False) is not False:
             raise ValueError("Embedding processor cannot truncate inputs")
-        if self.family == "sglang" and any(
-            values.get("add_special_tokens", False) is not False for values in (processor, text_options)
-        ):
-            raise ValueError("SGLang embedding chat templates own special tokens; add_special_tokens must be False")
+        if any(values.get("add_special_tokens", False) is not False for values in (processor, text_options)):
+            raise ValueError("Native embedding chat templates own special tokens; add_special_tokens must be False")
         video = processor.get("videos_kwargs", {})
         if not isinstance(video, Mapping):
             raise TypeError("processor_kwargs.videos_kwargs must be a mapping")
@@ -237,6 +237,11 @@ class NativeMediaPrompterDescriptor(PrompterDescriptor):
             "stream",
         } & generate.keys():
             raise ValueError("generate_args cannot override inputs, request identity or streaming")
+        tokenization = generate.get("tokenization_kwargs", {})
+        if self.family == "vllm" and (
+            not isinstance(tokenization, Mapping) or tokenization.get("add_special_tokens", False) is not False
+        ):
+            raise ValueError("Native Prompt chat templates own special tokens; add_special_tokens must be False")
         sampling = generate.get("sampling_params", {})
         if not isinstance(sampling, Mapping):
             raise TypeError("generate_args.sampling_params must be a mapping")
@@ -319,6 +324,7 @@ class _NativeRuntime:
         self.descriptor = descriptor
         self.options = descriptor.options
         self.engine: Any = None
+        self._model_directory: tempfile.TemporaryDirectory[str] | None = None
         self.closed = False
         with _translate_missing_provider_dependency(descriptor.family, descriptor.family):
             from transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -343,7 +349,73 @@ class _NativeRuntime:
                 descriptor.model, revision=args.get("revision"), trust_remote_code=False
             )
         self.processor = AutoProcessor.from_pretrained(source, **loading)
+        self._processing_source = source
+        self._processing_revision = revision
         self._is_tokenizer = isinstance(self.processor, PreTrainedTokenizerBase)
+
+    def _vllm_model(self) -> str:
+        model = self.descriptor.model
+        args = self.options["engine_args"]
+        if self._is_tokenizer or (
+            self._processing_source == model and self._processing_revision == args.get("revision")
+        ):
+            return model
+        if self._model_directory is not None:
+            return self._model_directory.name
+        # vLLM 0.31 loads its multimodal processors from model_config.model,
+        # independently of tokenizer. Give all native engine processes one
+        # local model view, preserving the checkpoint's weights/configuration.
+        checkpoint = Path(model)
+        if not checkpoint.is_dir():
+            from huggingface_hub import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                snapshot_download,
+            )
+
+            checkpoint = Path(
+                snapshot_download(
+                    model,
+                    revision=args.get("revision"),
+                    cache_dir=args.get("download_dir"),
+                    token=args.get("hf_token"),
+                )
+            )
+        directory = tempfile.TemporaryDirectory(prefix="vane-vllm-model-")
+        try:
+            destination = Path(directory.name)
+            # Save before adding links: never overwrite the caller's checkpoint
+            # or the shared Hub cache through a linked processor file.
+            self.processor.save_pretrained(destination)
+            if (destination / "config.json").exists():
+                raise ValueError("A native processor cannot replace the model configuration")
+
+            processing_metadata = {
+                "processor_config.json",
+                "preprocessor_config.json",
+                "video_preprocessor_config.json",
+                "chat_template.json",
+                "chat_template.jinja",
+                "chat_templates",
+            }
+
+            def link_missing(source: Path, target: Path) -> None:
+                for item in source.iterdir():
+                    # HF versions can store processor settings in different
+                    # files. Old checkpoint metadata must not supplement the
+                    # explicitly selected, fully serialized processor.
+                    if source == checkpoint and item.name in processing_metadata:
+                        continue
+                    output = target / item.name
+                    if not output.exists():
+                        output.symlink_to(item.resolve(), target_is_directory=item.is_dir())
+                    elif item.is_dir() and output.is_dir():
+                        link_missing(item, output)
+
+            link_missing(checkpoint, destination)
+        except BaseException:
+            directory.cleanup()
+            raise
+        self._model_directory = directory
+        return directory.name
 
     def _ensure_engine(self) -> Any:
         if self.closed:
@@ -354,9 +426,15 @@ class _NativeRuntime:
                 if family == "vllm":
                     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-                    self.engine = AsyncLLMEngine.from_engine_args(
-                        AsyncEngineArgs(model=self.descriptor.model, **self.options["engine_args"])
-                    )
+                    args = copy.deepcopy(self.options["engine_args"])
+                    args.setdefault("served_model_name", self.descriptor.model)
+                    try:
+                        self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=self._vllm_model(), **args))
+                    except BaseException:
+                        if self._model_directory is not None:
+                            self._model_directory.cleanup()
+                            self._model_directory = None
+                        raise
                 else:
                     from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
@@ -392,6 +470,9 @@ class _NativeRuntime:
                     await result
         finally:
             self.processor = None
+            if self._model_directory is not None:
+                self._model_directory.cleanup()
+                self._model_directory = None
 
     async def _vllm_result(self, stream: Any) -> Any:
         final = None
@@ -431,7 +512,11 @@ class NativeEmbedder(_NativeRuntime):
                 "multi_modal_data": media,
                 "mm_processor_kwargs": copy.deepcopy(self.options.get("processor_kwargs", {})),
             }
-            result = await self._vllm_result(self._ensure_engine().encode(request, params, uuid.uuid4().hex))
+            result = await self._vllm_result(
+                self._ensure_engine().encode(
+                    request, params, uuid.uuid4().hex, tokenization_kwargs={"add_special_tokens": False}
+                )
+            )
             return result.outputs.data.tolist()
         # SGLang's raw decoded-video input does not carry timestamps. Its
         # native processor_output input does: precompute tokens and pixels
@@ -560,6 +645,7 @@ class NativePrompter(_NativeRuntime):
                 media["image"] = images
             if videos:
                 media["video"] = videos
+            generate.setdefault("tokenization_kwargs", {})["add_special_tokens"] = False
             result = await self._vllm_result(
                 self._ensure_engine().generate(
                     {"prompt": text, "multi_modal_data": media}, sampling, uuid.uuid4().hex, **generate
