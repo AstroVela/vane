@@ -657,8 +657,14 @@ class NativePrompter(_NativeRuntime):
         params.setdefault("max_new_tokens", self.options.get("max_tokens", 1024))
         if self.descriptor.return_format is not None:
             params["json_schema"] = json.dumps(self.descriptor.return_format)
+        inputs: dict[str, Any] = {"prompt": text}
+        if not images and not videos:
+            # NULL media rows use SGLang's text tokenizer, which would add
+            # special tokens a second time to the already rendered template.
+            tokenizer = self.processor if self._is_tokenizer else self.processor.tokenizer
+            inputs = {"input_ids": tokenizer.encode(text, add_special_tokens=False)}
         result = await self._ensure_engine().async_generate(
-            prompt=text,
+            **inputs,
             image_data=images or None,
             video_data=videos or None,
             sampling_params=params,

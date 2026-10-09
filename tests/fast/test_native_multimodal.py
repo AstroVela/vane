@@ -39,6 +39,10 @@ def install_sdk(setitem, *, mock_transformers=True):
             state.template = kwargs
             return "rendered:" + "\n".join(part.get("text", "") for item in messages for part in item["content"])
 
+        def encode(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [10, 20, 30]
+
         def __call__(self, **kwargs):
             state.processing.append(kwargs)
             result = {"input_ids": np.array([[10, 20, 30]]), "attention_mask": np.array([[1, 1, 1]])}
@@ -83,6 +87,8 @@ def install_sdk(setitem, *, mock_transformers=True):
         async def async_generate(self, **kwargs):
             assert self.loop is asyncio.get_running_loop()
             state.calls.append(("generate", kwargs))
+            if not kwargs.get("image_data") and not kwargs.get("video_data"):
+                assert "input_ids" in kwargs and "prompt" not in kwargs
             if state.fail:
                 raise ValueError("engine failure")
             return {"text": '{"answer":"ok"}', "meta_info": {"finish_reason": {"type": state.finish}}}
@@ -557,6 +563,60 @@ def bos_tokenizer():
     )
 
 
+@pytest.mark.parametrize("processor_kind", ["tokenizer", "gemma3"])
+def test_sglang_text_only_prompt_preserves_real_template_tokens(tmp_path, processor_kind, bos_tokenizer, monkeypatch):
+    import transformers
+
+    tokenizer = bos_tokenizer
+    if processor_kind == "gemma3":
+        pytest.importorskip("torchvision")
+        tokenizer = transformers.PreTrainedTokenizerFast(
+            tokenizer_object=bos_tokenizer.backend_tokenizer,
+            unk_token=bos_tokenizer.unk_token,
+            bos_token=bos_tokenizer.bos_token,
+            eos_token=bos_tokenizer.eos_token,
+            chat_template=bos_tokenizer.chat_template,
+            extra_special_tokens={
+                "image_token": "<image_soft_token>",
+                "boi_token": "<start_of_image>",
+                "eoi_token": "<end_of_image>",
+            },
+        )
+        processor = transformers.Gemma3Processor(
+            image_processor=transformers.Gemma3ImageProcessor(),
+            tokenizer=tokenizer,
+            chat_template="{{ bos_token }}{{ messages[-1]['content'][0]['text'] }}{{ eos_token }}",
+        )
+        transformers.Gemma3Config().save_pretrained(tmp_path)
+        processor.save_pretrained(tmp_path)
+    else:
+        transformers.LlamaConfig().save_pretrained(tmp_path)
+        tokenizer.save_pretrained(tmp_path)
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    descriptor = load_provider("sglang").get_prompter(
+        str(tmp_path), options={"media_mime_types": ["image/png"], "gpus_per_actor": 0, "max_tokens": 64}
+    )
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            assert await runtime.prompt(("hello",)) == '{"answer":"ok"}'
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    expected = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hello"}], tokenize=True, return_dict=False, add_generation_prompt=True
+    )
+    assert expected == [1, 3, 2]
+    assert tokenizer.encode("<s>hello</s>") == [1, 1, 3, 2, 2]
+    request = state.calls[0][1]
+    assert request["input_ids"] == expected and "prompt" not in request
+    assert request["image_data"] is None and request["video_data"] is None
+    assert request["sampling_params"]["max_new_tokens"] == 64
+    assert state.engines[0].closed == 1
+
+
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 def test_real_standalone_tokenizer_loads_with_weights_only_checkpoint(tmp_path, family, bos_tokenizer, monkeypatch):
     import transformers
@@ -851,8 +911,9 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
             prompt_runtime, embed_runtime = prompt_desc.instantiate(), embed_desc.instantiate()
             try:
                 answer = await prompt_runtime.prompt(("question", PromptMedia(b"video", "video/mp4")))
+                text_answer = await prompt_runtime.prompt(("question",))
                 result = await embed_runtime.embed_video([clip()])
-                return answer, result
+                return answer, text_answer, result
             finally:
                 await prompt_runtime.aclose()
                 await embed_runtime.aclose()
@@ -868,7 +929,11 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
         assert len(state.engines) == 2 and all(engine.closed == 1 for engine in state.engines)
         return result
 
-    assert ray.get(execute.remote(descriptor, embedding, install_sdk), timeout=30) == ('{"answer":"ok"}', [[3.0, 4.0]])
+    assert ray.get(execute.remote(descriptor, embedding, install_sdk), timeout=30) == (
+        '{"answer":"ok"}',
+        '{"answer":"ok"}',
+        [[3.0, 4.0]],
+    )
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -912,6 +977,12 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
     media.write_bytes(b"fixture-video")
     schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
     with vane.connect() as conn:
+        conn.sql(
+            """create table prompts as select id, 'question' as q,
+            case when id = 0 then NULL::FILE else file(?, 'video/mp4', NULL, NULL, NULL) end as media
+            from range(2) t(id)""",
+            params=[str(media)],
+        )
         if entry == "python":
             relation = conn.sql("select * from (values (NULL::VARCHAR), ('question')) t(q)")
             vectors = embed(
@@ -927,22 +998,22 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
             assert vectors[0][1] is None
             np.testing.assert_allclose(vectors[1][1], [0.6, 0.8])
             result = prompt(
-                conn.sql("select 'question' as q"),
-                [vane.col("q"), vane.file(str(media), "video/mp4")],
+                conn.sql("select * from prompts order by id"),
+                [vane.col("q"), vane.col("media")],
                 provider=family,
                 model="configured-vlm",
                 gpus_per_actor=0,
                 media_mime_types=["video/mp4"],
                 return_format=schema,
                 max_retries=0,
-            ).fetchone()[-1]
+            ).fetchall()
         else:
             import json
 
             result = conn.sql(
-                """select ai_prompt('question', file(?, 'video/mp4', NULL, NULL, NULL),
+                """select id, ai_prompt(q, media,
                 provider => ?, model => 'configured-vlm', return_format => ?,
-                options => {gpus_per_actor: 0, media_mime_types: ['video/mp4']})""",
-                params=[str(media), family, json.dumps(schema)],
-            ).fetchone()[0]
-        assert result == {"answer": "ok"}
+                options => {gpus_per_actor: 0, media_mime_types: ['video/mp4']}) from prompts order by id""",
+                params=[family, json.dumps(schema)],
+            ).fetchall()
+        assert [(row[0], row[-1]) for row in result] == [(0, {"answer": "ok"}), (1, {"answer": "ok"})]
