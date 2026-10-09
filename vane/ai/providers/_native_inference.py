@@ -159,6 +159,8 @@ class _NativeEmbeddingDescriptor:
         video = processor.get("videos_kwargs", {})
         if not isinstance(video, Mapping):
             raise TypeError("processor_kwargs.videos_kwargs must be a mapping")
+        if not isinstance(processor.get("images_kwargs", {}), Mapping):
+            raise TypeError("processor_kwargs.images_kwargs must be a mapping")
         for values in (processor, video):
             if {"video_metadata", "num_frames", "fps"} & values.keys() or values.get(
                 "do_sample_frames", False
@@ -535,13 +537,14 @@ class NativeEmbedder(_NativeRuntime):
             ]
         processing = copy.deepcopy(self.options.get("processor_kwargs", {}))
         # HF rejects duplicate flat/nested arguments. Normalize owned text
-        # settings once, and flatten text_kwargs only for standalone tokenizers.
+        # settings once. vLLM also injects flat text options in its media
+        # adapters, so it must receive flat settings even for HF processors.
         text_options = processing.pop("text_kwargs", {})
         text_options.pop("return_tensors", None)
         for key in ("padding", "truncation", "add_special_tokens"):
             processing.pop(key, None)
             text_options[key] = False
-        if self._is_tokenizer:
+        if self._is_tokenizer or self.descriptor.family == "vllm":
             if text_options.keys() & processing.keys():
                 raise EmbeddingConfigurationError("Duplicate flat and nested embedding text options")
             processing.update(text_options)
@@ -556,6 +559,15 @@ class NativeEmbedder(_NativeRuntime):
         if self.descriptor.family == "vllm":
             from vllm import PoolingParams
 
+            # Each embedding request contains one modality. Flatten only its
+            # options: native adapters augment flat size/sampling keys, while
+            # retaining scoped copies would give HF duplicate arguments.
+            for modality, scope in (("image", "images_kwargs"), ("video", "videos_kwargs")):
+                scoped = processing.pop(scope, {})
+                if kind == modality:
+                    if scoped.keys() & processing.keys():
+                        raise EmbeddingConfigurationError("Duplicate flat and nested embedding media options")
+                    processing.update(scoped)
             params = PoolingParams(task="embed", dimensions=dimensions, **self.options.get("pooling_args", {}))
             request = {
                 "prompt": text,

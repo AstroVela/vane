@@ -440,10 +440,11 @@ def test_engine_resource_admission_and_input_ownership(family):
         {"processor_kwargs": {"text_kwargs": {"padding": True}}},
         {"processor_kwargs": {"text_kwargs": {"truncation": True}}},
         {"processor_kwargs": {"text_kwargs": {"return_tensors": "np"}}},
+        {"processor_kwargs": {"images_kwargs": []}},
         {"engine_args": {"model": "other"}},
         {"pooling_args": {"dimensions": 9}},
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises((TypeError, ValueError)):
             load_provider(family).get_video_embedder("configured", 2, options=invalid)
 
 
@@ -518,6 +519,30 @@ def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup
 
     asyncio.run(run())
     assert sdk.engines == [] and sdk.calls == [] and sdk.processing == []
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_vllm_rejects_ambiguous_media_options_before_engine_startup(kind, sdk):
+    descriptor = getattr(load_provider("vllm"), f"get_{kind}_embedder")(
+        "configured",
+        2,
+        options={
+            "gpus_per_actor": 0,
+            "processor_kwargs": {"do_resize": True, f"{kind}s_kwargs": {"do_resize": False}},
+        },
+    )
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            value = clip() if kind == "video" else clip().frames[0]
+            with pytest.raises(ValueError, match="Duplicate flat and nested embedding media options"):
+                await getattr(runtime, f"embed_{kind}")([value])
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.engines == [] and sdk.calls == []
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -885,6 +910,160 @@ def make_real_video_processor():
     return make
 
 
+@pytest.fixture
+def vllm_processor_methods():
+    """Read vLLM's Python preprocessing without importing its CUDA runtime.
+
+    Uses an installed SDK, or VANE_TEST_VLLM_SOURCE pointing to its source
+    checkout. No upstream source is copied into Vane or downloaded by tests.
+    """
+    import ast
+    import os
+    from collections.abc import Mapping
+    from importlib.metadata import PackageNotFoundError, distribution
+    from pathlib import Path
+    from typing import Any
+
+    import torch
+    from transformers.video_utils import VideoMetadata
+
+    configured = os.environ.get("VANE_TEST_VLLM_SOURCE")
+    if configured:
+        root = Path(configured)
+    else:
+        try:
+            root = Path(distribution("vllm").locate_file(""))
+        except PackageNotFoundError:
+            pytest.skip("requires installed vLLM SDK or VANE_TEST_VLLM_SOURCE")
+    namespace = {
+        "Mapping": Mapping,
+        "Any": Any,
+        "torch": torch,
+        "VideoMetadata": VideoMetadata,
+        "is_list_of": lambda value, typ: isinstance(value, list) and all(isinstance(item, typ) for item in value),
+        "_HF_MODALITY_PROCESSOR_KWARGS": {"image": "images_kwargs", "video": "videos_kwargs", "audio": "audio_kwargs"},
+        "HFMultiModalInputs": lambda *values: values,
+    }
+    for filename, owner, name in (
+        ("multimodal/processing/context.py", None, "overlay_modality_mm_kwargs"),
+        ("multimodal/processing/processor.py", "BaseMultiModalProcessor", "_get_hf_mm_inputs"),
+        ("model_executor/models/qwen3_vl.py", "Qwen3VLMultiModalProcessor", "_apply_hf_processor_main"),
+    ):
+        path = root / "vllm" / filename
+        tree = ast.parse(path.read_text())
+        scope = (
+            tree
+            if owner is None
+            else next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == owner)
+        )
+        function = next(node for node in scope.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+@pytest.mark.parametrize("kind", ["image", "video"])
+@pytest.mark.parametrize("settings", ["default", "nested_text", "flat_size", "nested_size", "scoped_sizes"])
+def test_vllm_real_sdk_accepts_processor_options(
+    monkeypatch, kind, settings, make_real_video_processor, vllm_processor_methods
+):
+    import transformers
+
+    processor = make_real_video_processor()
+    processor.chat_template = f"<|{kind}_pad|>"
+    state = install_sdk(monkeypatch.setitem, mock_transformers=False)
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    size = {"shortest_edge": 4096, "longest_edge": 8192}
+    options = {}
+    if settings == "nested_text":
+        options["text_kwargs"] = {"padding": False, "truncation": False, "add_special_tokens": False}
+    elif settings == "flat_size":
+        options["size"] = size
+    elif settings in ("nested_size", "scoped_sizes"):
+        options[f"{kind}s_kwargs"] = {"size": size}
+        if settings == "scoped_sizes":
+            other = "images_kwargs" if kind == "video" else "videos_kwargs"
+            options[other] = {"size": {"shortest_edge": 16384, "longest_edge": 32768}}
+    descriptor = getattr(load_provider("vllm"), f"get_{kind}_embedder")(
+        "configured-model", 2, options={"gpus_per_actor": 0, "processor_kwargs": options}
+    )
+    before = descriptor.get_options()
+    frames = tuple(np.full((64, 64, 3), value, dtype=np.uint8) for value in (10, 20))
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            value = VideoClip(frames, (0.2, 0.6), (2, 6)) if kind == "video" else frames[0]
+            assert await getattr(runtime, f"embed_{kind}")([value]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    request = state.calls[0][1]
+    outputs = []
+
+    class CompletedHFCall(Exception):
+        pass
+
+    def call_hf_processor(hf_processor, data, kwargs):
+        outputs.append((hf_processor(**data, **kwargs), kwargs))
+        # The regression boundary ends after the real SDK's parameter
+        # injection and HF token/pixel preprocessing, before model execution.
+        raise CompletedHFCall
+
+    methods = vllm_processor_methods
+    context = SimpleNamespace(
+        get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        get_merged_mm_kwargs=lambda kwargs, modality=None: methods["overlay_modality_mm_kwargs"](kwargs, modality),
+        call_hf_processor=call_hf_processor,
+    )
+    config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        vision_start_token_id=processor.tokenizer.convert_tokens_to_ids("<|vision_start|>"),
+        vision_end_token_id=processor.tokenizer.convert_tokens_to_ids("<|vision_end|>"),
+        video_token_id=processor.video_token_id,
+    )
+    info = SimpleNamespace(
+        ctx=context,
+        get_hf_config=lambda: config,
+        get_tokenizer=lambda: processor.tokenizer,
+        get_video_processor=lambda: processor.video_processor,
+        get_hf_processor=lambda **kwargs: processor,
+        _get_video_second_idx=lambda **kwargs: [0.4],
+    )
+    adapter = SimpleNamespace(info=info, _get_hf_mm_text=lambda counts: f"<|vision_start|><|{kind}_pad|><|vision_end|>")
+    adapter._get_hf_mm_inputs = lambda items, kwargs: methods["_get_hf_mm_inputs"](adapter, items, kwargs)
+
+    class Modalities(dict):
+        def get_all_counts(self):
+            return {kind: 1}
+
+    items = Modalities(
+        {
+            kind: SimpleNamespace(
+                get_processor_data=lambda: {kind + "s": request["multi_modal_data"][kind]},
+                get_passthrough_data=lambda: {},
+            )
+        }
+    )
+    with pytest.raises(CompletedHFCall):
+        methods["_apply_hf_processor_main"](adapter, items, request["mm_processor_kwargs"])
+    assert len(outputs) == 1
+    output, forwarded = outputs[0]
+    assert forwarded["truncation"] is False and forwarded["add_special_tokens"] is False
+    assert not {"text_kwargs", "images_kwargs", "videos_kwargs"} & forwarded.keys()
+    if "size" in settings:
+        assert forwarded["size"] == size
+    assert output[f"{kind}_grid_thw"][0][0] == 1
+    assert descriptor.get_options() == before
+
+
 # Transformers 5.12 builds modality IDs with np.array(torch.Tensor), whose
 # NumPy 2 copy-keyword warning is unrelated to the processor-output contract.
 @pytest.mark.filterwarnings(
@@ -977,7 +1156,7 @@ def test_real_video_processor_preserves_sampling_interval(
     request = state.calls[0][1]
     if family == "vllm":
         assert request["mm_processor_kwargs"]["do_sample_frames"] is False
-        assert "do_sample_frames" not in request["mm_processor_kwargs"]["videos_kwargs"]
+        assert "videos_kwargs" not in request["mm_processor_kwargs"]
         array, metadata = request["multi_modal_data"]["video"][0]
         # vLLM's native adapter reconstructs HF metadata from this dictionary.
         # Exercise the submitted metadata/options with the real processor.

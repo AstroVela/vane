@@ -14,8 +14,12 @@ The engine's tensor/pipeline parallelism must fit gpus_per_actor. Use zero only
 for an explicitly configured engine/device that can execute on CPU.
 
 Embedding options accept engine_args, pooling_args (vLLM), processor_kwargs,
-chat_template and chat_template_kwargs. For prompts, configure engine_args and
-generate_args (including native sampling_params). Top-level max_tokens and
+chat_template and chat_template_kwargs. Native vLLM embedding flattens text
+settings and the current modality's images_kwargs/videos_kwargs before SDK
+processing. Other modality settings are omitted for that request; overlapping
+flat and scoped media options are rejected. SGLang retains HF's scoped arguments.
+For prompts, configure engine_args and generate_args (including native
+sampling_params). Top-level max_tokens and
 sampling_params token limits cannot both specify the same setting. Declare the
 image/video media_mime_types actually supported by the selected model.
 For a checkpoint containing only weights/configuration, set engine_args.tokenizer
