@@ -325,10 +325,10 @@ mutex &VaneFSRegistrationLock() {
 
 void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>> &connection) {
 	connection.def("_register_vane_fs", [](DuckDBPyConnection &owner, py::object capsule) {
+		auto query_lock = owner.LockForQuery();
 		auto provider = make_shared_ptr<SnapshotProvider>(std::move(capsule));
 		const string id = provider->api->workspace_id;
 		py::gil_scoped_release release;
-		std::lock_guard<std::recursive_mutex> connection_guard(owner.py_connection_lock);
 		if (owner.GetRunnerType() != "local-fast") {
 			throw InvalidInputException("Native VaneFS registration requires runner='local-fast'");
 		}
@@ -355,8 +355,8 @@ void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnecti
 		return id;
 	});
 	connection.def("_unregister_vane_fs", [](DuckDBPyConnection &owner, const string &id) {
+		auto query_lock = owner.LockForQuery();
 		py::gil_scoped_release release;
-		std::lock_guard<std::recursive_mutex> connection_guard(owner.py_connection_lock);
 		auto &context = *owner.con.GetConnection().context;
 		auto state = context.registered_state->Get<SnapshotState>(STATE_KEY);
 		if (state) {
