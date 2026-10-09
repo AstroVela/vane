@@ -333,7 +333,6 @@ def test_native_readiness_and_teardown_reject_connection_reentry(monkeypatch, co
         def callback(current_phase):
             if current_phase != phase:
                 return
-            attempts.append(current_phase)
             with pytest.raises(vane.InvalidInputException, match="Python input callback"):
                 if action == "execute":
                     target.execute("SELECT 42")
@@ -341,6 +340,9 @@ def test_native_readiness_and_teardown_reject_connection_reentry(monkeypatch, co
                     target._register_vane_fs(None)
                 else:
                     target._unregister_vane_fs("unused")
+            # Iterator close reports callback errors as unraisable. Record
+            # success only after the expected rejection has been verified.
+            attempts.append(current_phase)
 
         monkeypatch.setattr(builtins, "_vane_readiness_callback", callback, raising=False)
         assert read_datasource(_CallbackSource(), con=connection).limit(1).fetchall() == [(7,)]
