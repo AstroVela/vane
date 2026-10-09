@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner]
 
 
 @pytest.mark.timeout(180)
-def test_benchmark_cli_from_checkout_keeps_workers_on_installed_wheel(tmp_path):
+@pytest.mark.parametrize("interface", benchmark.INTERFACES)
+def test_benchmark_cli_from_checkout_keeps_workers_on_installed_wheel(tmp_path, interface):
     root = Path(benchmark.__file__).resolve().parents[1]
     output = tmp_path / "benchmark"
     completed = subprocess.run(
@@ -27,6 +28,8 @@ def test_benchmark_cli_from_checkout_keeps_workers_on_installed_wheel(tmp_path):
             str(root / "scripts/benchmark_execution.py"),
             "--output",
             str(output),
+            "--interface",
+            interface,
             "--rows",
             "257",
             "--repetitions",

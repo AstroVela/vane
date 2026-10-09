@@ -345,15 +345,19 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 		}
 	});
 	py::class_<DirectFlight, shared_ptr<DirectFlight>>(runtime, "DirectFlight")
-	    .def(py::init([](const string &host, const string &advertise, idx_t links, idx_t staging, idx_t frame) {
-		    TaskEntry entry;
-		    py::gil_scoped_release release;
-		    return shared_ptr<DirectFlight>(new DirectFlight(host, advertise, links, staging, frame),
-		                                    [](DirectFlight *service) {
-			                                    py::gil_scoped_release release;
-			                                    delete service;
-		                                    });
-	    }))
+	    .def(py::init([](const string &host, const string &advertise, idx_t links, idx_t staging, idx_t frame, int port,
+	                     const string &certificate, const string &key) {
+		         TaskEntry entry;
+		         py::gil_scoped_release release;
+		         return shared_ptr<DirectFlight>(
+		             new DirectFlight(host, advertise, links, staging, frame, port, certificate, key),
+		             [](DirectFlight *service) {
+			             py::gil_scoped_release release;
+			             delete service;
+		             });
+	         }),
+	         py::arg("host"), py::arg("advertise"), py::arg("links"), py::arg("staging"), py::arg("frame"),
+	         py::arg("port") = 0, py::arg("certificate") = "", py::arg("private_key") = "")
 	    .def_property_readonly("location", &DirectFlight::Location)
 	    .def_property_readonly("error", &DirectFlight::Error)
 	    .def_property_readonly("active_links", &DirectFlight::ActiveLinks)
@@ -366,12 +370,27 @@ void RegisterDirectRuntimeBindings(py::module_ &module) {
 		        py::gil_scoped_release release;
 		        service.Publish(ticket, std::move(channel), consumer);
 	        })
-	    .def("subscribe",
-	         [](DirectFlight &service, const string &location, const string &ticket, shared_ptr<DirectChannel> channel,
-	            const string &producer, double timeout) {
+	    .def(
+	        "subscribe",
+	        [](DirectFlight &service, const string &location, const string &ticket, shared_ptr<DirectChannel> channel,
+	           const string &producer, double timeout, const string &roots) {
+		        TaskEntry entry;
+		        py::gil_scoped_release release;
+		        service.Subscribe(location, ticket, std::move(channel), producer, timeout, roots);
+	        },
+	        py::arg("location"), py::arg("ticket"), py::arg("channel"), py::arg("producer"), py::arg("timeout"),
+	        py::arg("root_certificates") = "")
+	    .def("revoke",
+	         [](DirectFlight &service, const string &ticket) {
 		         TaskEntry entry;
 		         py::gil_scoped_release release;
-		         service.Subscribe(location, ticket, std::move(channel), producer, timeout);
+		         service.Revoke(ticket);
+	         })
+	    .def("delivered",
+	         [](DirectFlight &service, const string &ticket) {
+		         TaskEntry entry;
+		         py::gil_scoped_release release;
+		         return service.Delivered(ticket);
 	         })
 	    .def("cancel",
 	         [](DirectFlight &service, const string &reason) {

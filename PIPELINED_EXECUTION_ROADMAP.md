@@ -12,6 +12,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 - 新模块只有完成实际入口接线后才成为公开能力；数据结构测试通过不代表查询已经可运行。
 - 旧源码在接管对应职责后删除；调用方与测试按新契约修改，不增加 legacy 别名或 fallback。
 - 优先运行受影响测试；本轮按要求只验收相关测试，不运行完整 release gate。测试环境必须使用非 editable 安装，并记录运行的代码和 native 基线。
+- 当前目标是分支开发与普通 PR 验收。正式版本选择、合入 main、Release workflow、tag 和包发布属于后续独立任务；准备发布工具不代表现在执行发布流程。
 
 ## 里程碑概览
 
@@ -22,7 +23,7 @@ P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime �
 | P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | P2.1–P2.3 已合入 |
 | P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | P3.1—P3.3 已实现，完整相关验收见下文 |
 | P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | P4.1—P4.4 已完成，相关验收通过 |
-| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | P5.1、P5.2.1–P5.2.3 已完成相关验收；P5.2.4 独立 Server、历史 Flight 超时定位及 P5.3 待完成 |
+| P5 | 旧路径删除、支持矩阵、安装与性能验收 | P4 | P5.1、P5.2.1–P5.2.4、P5.3a 已完成相关验收；历史 Flight 超时归因与 P5.3b 普通 PR CI 待完成 |
 
 P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
 
@@ -245,18 +246,25 @@ P3.1—P3.3 退出条件已满足。后续进入 P4 的分析算子、类型、�
 ### P5.2 差分与性能验收
 
 - [x] P5.2.1：系统化比较 native local、Ray pipelined、Ray FTE，加入可重放的种子/分区/线程矩阵、确定到达顺序和重复故障/清理验收。实现与运行方法见[执行验收](EXECUTION_ACCEPTANCE.md)。
-- [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。P5.2.1 已加入数据/控制操作归因、重复长查询及失败现场保存；本轮未复现，根因仍未确认。
+- [ ] 完成 P5.1 偶发 Flight 超时的根因定位与验证。已复现环境 HTTP 代理停顿导致原生控制 RPC 在约 2 秒超时的独立缺陷，并改为显式直连。历史故障缺少操作及代理现场，尚不能确认与本次缺陷属于同一事件；证据边界见[执行验收](EXECUTION_ACCEPTANCE.md#flight-proxy-isolation)。
 - [x] P5.2.2：测量冷启动、预热、首批、吞吐、混跑、慢客户端与故障恢复；每个指标记录配置及重复次数。工具、计时边界与结果见[执行基准](EXECUTION_BENCHMARKS.md)。
 - [x] 根据实测评估容量默认值。两组容量、两个数据规模的对照支持保留当前默认值；较小窗口的缓冲预留更低，但扫描延迟更高，数值依据见基准记录。
-- [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试。
-- [ ] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界验收。
+- [x] P5.2.3：应用级 Runtime、服务共享 worker/结果服务、多 Session 配额与独立查询上下文；完成连续两轮代码审查、一次增量构建及相关测试，已通过 PR #977 合入 `a0216cab07`。
+- [x] P5.2.4：独立 Server 部署及远程会话/查询协议，迁移规划、协调器与续租至 Server 进程；客户端断连租约及服务故障边界已完成单机验收。
+  - [x] P5.2.4a：Flight 会话控制、独立启动、鉴权、租约与可重试关闭；已完成相关验证。详见 [Server 设计](SERVER_DESIGN.md)。
+  - [x] P5.2.4b：远程查询控制、客户端及原生结果交付；规划与所有权由 Server 管理，已完成两种模式和 TLS 的相关验证。
+  - [x] P5.2.4c：客户端断连、服务故障、混跑与单机部署验收；完成当前共享服务的 Runtime / Flight 性能对照。
 
-### P5.3 发布验收
+Server 先使用 Flight 对外接入；DuckDB 整体升级到 2.0 时再集成 Quack。SessionService / QueryService 独立于线协议，内部 Flight exchange 保留，不实现双协议兼容或 fallback。
 
-- [ ] 固定支持矩阵和失败边界，完成跨平台 CI 与 release gate。
-- [ ] 更新发布文档与版本，按验收结果发布。
+### P5.3 开发与安装验收
 
-本地只运行受影响测试，不运行完整 release/fast 套件。P5.2 的历史 Flight 超时定位及 P5.3 发布验收未完成前不宣称 P5 整体完成。
+- [x] P5.3a：固定支持矩阵与失败边界，增加独立于 checkout 的 local / Runtime / TLS Flight 安装验收，接入每个 manylinux wheel 与 TestPyPI/PyPI 安装验证。详见[执行发布矩阵](EXECUTION_RELEASE.md)。
+- [ ] P5.3b：为当前分支提交记录普通 PR 的 Python/平台 CI 与 CI 中的基础 release gate 结果；macOS / Windows 原生单元测试不能替代 Python 服务验收。
+
+本地只运行受影响测试，不运行完整 release/fast 套件。历史 Flight 超时的未确认根因与实际 CI 状态继续如实记录，不以重跑成功代替根因证明。
+
+正式发布不作为本轮分支开发的退出条件。后续明确开始发布时，再按 [RELEASE.md](RELEASE.md) 选择版本、完成 build-only / 索引安装验收、合入发布分支并创建 tag；本轮只保留这些流程所需的工具接线。
 
 ## 增量验收记录
 
@@ -555,3 +563,45 @@ P5.1 已通过 PR #971 合入 `integration/pipelined-execution`，提交为 `b1c
 - 完成两轮无待修问题的代码审查后，一次增量 Release 构建并非 editable 安装。203 个 Python/类型文件与源码一致，native 与构建产物 SHA-256 一致。格式、mypy、版权清单及修改文档的本地链接检查通过。
 - 相关验证去重合计 **382 passed：271 个非 Ray、110 个共享集群 Ray、1 个独立基准 CLI**。首批 Ray 测试中新增的保留视图用例把 512 字节裸数据误作完整 IPC 预算；改为可容纳单批但不能同时容纳两批的预算，并释放 Future 持有的 Arrow 引用，重新审查后定向重跑通过。生产代码在构建后未改动，未重新编译，未运行完整 release/fast 套件。
 - 既有 `5374cf1c4f` 的性能测量仅代表已替换的 actor 池实现；方法和原始数据保留在[执行基准](EXECUTION_BENCHMARKS.md#result-actor-reuse-2026-10-07)，不能视为当前服务实现的测量结果。历史 Flight 超时及 P5.3 发布资格仍未完成。
+
+### P5.2.4a Flight 会话服务（2026 年 10 月 8 日）
+
+- 新增 `vane-server` / `python -m vane.server`，提供鉴权后的能力发现和会话 Open / Renew / Close。默认回环监听，其他地址要求 TLS；当前只声明 sessions 能力。
+- SessionService 独立于传输协议，持有 Runtime、会话租约和创建/清理所有者。打开与关闭中的会话持续计入容量；租约过期不可恢复，失败清理自动重试，阻塞清理不占注册表锁。
+- 创建原生连接前记录对应 RayQueryRuntime，覆盖连接创建和回滚同时失败的路径。Close 区分 CLOSING 与 CLOSED；Server 关闭从入口计算等待期限，超时保留后台任务，失败的 Flight shutdown 也可重试。
+- 连续两轮无待修问题的审查后，完成一次非 editable 安装；207 个 Python/类型文件与源码一致，原生二进制 SHA-256 未变。格式、适用 pre-commit、mypy 和源码版权清单通过。
+- 相关验证去重合计 **85 passed、1 skipped**：会话所有权 21、真实 Flight/鉴权/TLS/独立进程 30、包契约 30、真实 Ray 两模式关闭/过期 4。跳过项需要可选 ADBC 依赖。首次测试仅修正嵌套 cursor 的错误文案断言，并定向复跑通过；安装后未修改生产代码，未重建，未运行完整 release/fast 套件。
+- [Server 设计](SERVER_DESIGN.md) 明确后续远程查询与原生结果交付、故障验收，以及 DuckDB 2.0 升级后替换 Quack 对外入口的边界。本步未提供远程 SQL，P5.2.4b / c、历史 Flight 超时及 P5.3 发布资格仍待完成。
+
+### P5.2.4b 远程查询与原生结果（2026 年 10 月 8 日）
+
+- Flight 增加 Execute / Status / Cancel / Finish / CloseQuery；先登记查询所有者再异步执行。会话内连续序号防止回执丢失后重复执行，终态句柄和清理失败记录受全局上限约束。Status 不等待规划锁或 native pump。
+- 两种调度器显式接入 NativeResultConsumer。Server 发布固定、可配置 TLS 的原生结果端口，使用独立 capability；客户端不连接 Ray，Server 的 Python 控制层不读取或转发 Arrow 批次。撤销等待旧流退出后才回收容量，覆盖 Arrow 错误路径不调用 Close 的情况。
+- `vane.client.Client` 提供 query / submit，会话续租、类型化取消与超时、持有 Arrow 视图的字节计费及可重试关闭。FINISH 后通过服务端确认生产、持久错误与清理；成功交付后的清理失败保留成功结局与资源所有者。
+- 两轮无问题审查后进行一次非 editable native 增量 Release 构建。相关测试最终 **270 passed、1 skipped**：非 Ray 203、真实 Ray 66、CLI 1；可选 ADBC 缺失而跳过。首次测试修正不支持的 SQL fixture 与 CLI SIGTERM 注册顺序；再次两轮审查后重新打包 Python，native SHA-256 保持 `dd3706ddb13cee62fa5fc5f26faf3e3fd9b6ebd3f1e4ed88d07e6da3530f205b`，只复跑失败和未运行用例。
+- root 格式、lint、mypy、CI copyleft 检查通过；未运行完整 release/fast 套件。P5.2.4c 的客户端失联/服务故障矩阵、混跑性能、历史 Flight 超时定位及 P5.3 仍待完成。
+
+### P5.2.4c 故障与部署验收（2026 年 10 月 8 日）
+
+- 新增 16 个真实 Ray 远程故障用例：两种模式的排队/流式客户端强杀、丢失 Execute 回执后停止心跳、worker 暂时不可达及失败 ObjectRef、结果服务清理重试和进程死亡、慢客户端与有限窗口。确认会话、查询、实际 worker context、结果通道及 FTE store 计费在清理后归零，暂时故障期间保留所有权。
+- 补充同一控制端口重启后的旧身份拒绝；复用独立客户端、双端口 TLS、CLI SIGTERM 与跨进程数据库锁验证。故障注入覆盖 RPC 回执和 actor 死亡，单机范围及未覆盖的真实网络分区、多机/跨平台资格见[执行验收](EXECUTION_ACCEPTANCE.md#remote-server-acceptance)。
+- 基准增加显式 `--interface runtime/flight`；Flight 经公开客户端和原生网络结果链路，混跑使用两个远程 Session。通过服务端查询 ID 对齐实际 worker 资源占用，串行与失败注入对照在两种入口均通过，不把提交重叠当成并发。
+- 连续两轮无待修问题审查后完成一次非 editable 安装。相关测试 **170 passed、1 skipped**：非 Ray 122、共享 Ray 45、独立 CLI 3；仅缺少可选 ADBC 而跳过。210 个 Python/类型文件与源码一致，native SHA-256 未变。格式、lint、CI copyleft 与 diff 检查通过；没有修改执行核心、C++ 或资源默认值，未运行完整 release/fast 套件。
+- 干净提交 `943a43b8db` 上，32,768 行、两组容量、每项三次重复的 Runtime / Flight 对照共完成 **224 个计时样本（含 32 次预热）、32 项完整结果校验、12 组混跑与 12 次 worker 故障恢复**。两次运行的数据、脚本和 native 哈希一致；混跑均有共享 worker 资源重叠，所有恢复保持输入身份并使用新 fence。数值与复现命令见[执行基准](EXECUTION_BENCHMARKS.md#shared-service-and-flight-measurements-2026-10-08)。
+- P5.2.4 的单机服务验收完成；历史 Flight 超时根因、P5.3 的跨平台 CI / release gate 与发布仍未完成。DuckDB 2.0 升级后再替换 Quack 对外协议，当前不增加兼容或 fallback。
+
+### Flight 代理隔离（2026 年 10 月 9 日）
+
+- 检查旧日志发现原生 Flight 曾以本机 HTTP 代理为 peer；测试环境的代理排除列表未包含 Ray 节点地址。通过受控 CONNECT 代理复现：正常握手后暂停转发，20 秒数据期限下的原生 `control status` 在约 2.03 秒失败，公开 Client 同样超时。修复前 6 个 Vane 用例失败、3 个原生 Arrow 对照通过。
+- 原生数据/控制连接和公开 Client 均设置 `grpc.enable_http_proxy=0`，直接连接指定端点；不修改进程环境或其他 HTTP 客户端。部署需保证端点直接可达，详见 [Server 设计](SERVER_DESIGN.md)。修复后 9 项代理回归全部通过，包括确实经过代理且超时的原生 Arrow 对照。
+- 连续两轮无待修问题审查后，完成一次增量 Release 构建与非 editable 安装。相关测试 **144 passed、1 skipped**：非 Ray 119、共享 Ray 25；跳过项需要可选 ADBC。覆盖原生传输、操作超时归因、公开控制、远程查询、双端口 TLS 及两种模式的原始/重复长查询期限与清理。210 个 Python/类型文件与源码一致；格式、lint、类型与 CI copyleft 检查通过，未运行完整 release/fast 套件。
+- 本次确认并修复代理停顿造成的超时路径；P5.1 原始故障缺少操作名和代理现场，不能直接认定同因。保留历史归因待办与失败证据采集，P5.3 发布资格仍未完成。
+
+### P5.3a 安装产物验收（2026 年 10 月 9 日）
+
+- 固定 [执行发布矩阵](EXECUTION_RELEASE.md)：Linux x86_64 / CPython 3.10–3.14 的候选 wheel、local / Runtime / Flight 入口和失败边界。macOS / Windows 原生 CI 不等同于 Python 服务资格，多机部署与真实网络分区验收单独记录。
+- 新增可从匹配 sdist 单独解出的 `verify_execution_install.py`，只依赖基础安装与 OpenSSL CLI。用真实 Parquet 校验分组 SUM、TopN、空结果的 schema、顺序与内容，覆盖 local、Runtime 两种模式、TLS Flight 两种模式。独立客户端检查鉴权且不加入 Ray，所有会话与结果关闭后才报告成功。
+- 接入每个 manylinux wheel 和 TestPyPI / PyPI 安装验证，保留 JSON 身份与阶段证据；基础 release launcher 增加独立的 cluster-owner 进程，使安装验收及已有 Server CLI 用例实际进入 gate。sdist 检查要求携带两个独立验收脚本。
+- 连续两轮无待修问题的审查后打包、非 editable 安装。首轮发现 smoke 自设 FTE 配额不足，改用公开默认配置后重新两轮审查、重新打包，仅复跑失败用例及尚未运行的相关检查。执行器、C++ 与资源默认值未改；native SHA-256 保持 `c22f45389513a6b674a5c447f38b1ab5d84c724f19d6af9fb1a15e154305efce`，没有重新编译原生代码。
+- 本机 Linux x86_64 / CPython 3.12 的 `0.3.0.dev106` 验证去重合计 **155 passed、1 skipped**：包/产物相关 153，独立执行安装与 Server CLI 各 1；缺少可选 ADBC 而跳过。实际 sdist / wheel 校验、两个解出脚本与源码逐字节比较及 checkout 外的 Quickstart 均通过；210 个 Python/类型声明文件及 `py.typed` 与安装一致。审查、首轮失败、修正结果与构建身份保存在 `build/execution-release-qualification/`。
+- 未运行完整 release/fast 套件，未触发远端发布流程、打 tag 或上传索引。P5.3b 仍需记录精确候选提交的 Python / 平台 CI、完整 CI release gate 与 build-only 发布证据；历史 Flight 超时归因及正式发布仍待完成。

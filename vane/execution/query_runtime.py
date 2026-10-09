@@ -254,6 +254,20 @@ class QueryContext:
         finally:
             batch = None
 
+    def complete_external(self, result: QueryResult) -> bool:
+        self.check()
+        reader = self._reader
+        if reader is None or not reader.delivery_complete():
+            return False
+        self.check()
+
+        def mark_eof() -> None:
+            self._eof = True
+            result.completion_status = "ok"
+
+        result.complete_external(mark_eof)
+        return True
+
     def fail(self, error: BaseException) -> None:
         with self._lock:
             if self._state not in {"CANCELED", "FAILED"}:

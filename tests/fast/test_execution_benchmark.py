@@ -34,6 +34,7 @@ from scripts import benchmark_execution as benchmark
         {"profiles": ("default", "default")},
         {"scenarios": ()},
         {"modes": ("unknown",)},
+        {"interface": "unknown"},
     ],
 )
 def test_invalid_benchmark_configuration_is_rejected_before_work(tmp_path, changes):

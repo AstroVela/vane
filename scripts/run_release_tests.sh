@@ -40,6 +40,7 @@ release_tests=(
   "$project_root/tests/fast/test_execution_fragment_graph.py"
   "$project_root/tests/fast/test_execution_submission.py"
   "$project_root/tests/fast/test_execution_cutover.py"
+  "$project_root/tests/fast/test_execution_install.py"
   "$project_root/tests/fast/test_execution_acceptance.py"
   "$project_root/tests/fast/test_ray_execution_acceptance.py"
   "$project_root/tests/fast/test_execution_benchmark.py"
@@ -67,6 +68,14 @@ release_tests=(
   "$project_root/tests/fast/test_pipelined_plan.py"
   "$project_root/tests/fast/test_ray_pipelined.py"
   "$project_root/tests/fast/test_ray_query_service.py"
+  "$project_root/tests/fast/test_server_sessions.py"
+  "$project_root/tests/fast/test_flight_server.py"
+  "$project_root/tests/fast/test_flight_proxy_isolation.py"
+  "$project_root/tests/fast/test_ray_server_sessions.py"
+  "$project_root/tests/fast/test_server_queries.py"
+  "$project_root/tests/fast/test_ray_server_queries.py"
+  "$project_root/tests/fast/test_ray_server_acceptance.py"
+  "$project_root/tests/fast/test_server_cli.py"
   "$project_root/tests/fast/test_result_service.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
@@ -135,3 +144,9 @@ python -m pytest \
 
 # Cluster-owner media/provider checks require optional signed artifacts and run
 # separately in their CI jobs and the fast-test owner-ray phase.
+# Base-installation CLI and wheel qualification own their clusters too; run
+# them only after the shared-cluster pytest process has completely exited.
+python -m pytest \
+  "${pytest_args[@]}" \
+  -m "not external_service and real_ray and ray_cluster_owner" \
+  "${release_tests[@]}"

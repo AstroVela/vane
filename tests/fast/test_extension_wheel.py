@@ -661,6 +661,11 @@ def _write_minimal_base_wheel(
             REPOSITORY_ROOT / "LICENSES/Bison-parser-notice.txt"
         ).read_bytes(),
     }
+    if check_release_artifacts.EXPECTED_ENTRY_POINTS:
+        entries[f"{dist_info}/entry_points.txt"] = "\n".join(
+            f"[{group}]\n" + "\n".join(f"{name} = {reference}" for name, reference in values.items()) + "\n"
+            for group, values in check_release_artifacts.EXPECTED_ENTRY_POINTS.items()
+        ).encode("utf-8")
     record_name = f"{dist_info}/RECORD"
     entries[record_name] = extension_wheel_module._record(entries, record_name).encode("utf-8")
     with zipfile.ZipFile(path, mode="w") as wheel:
@@ -4064,7 +4069,19 @@ def test_clean_verifier_rejects_unowned_members_in_the_base_wheel(tmp_path):
         )
 
 
-def test_clean_verifier_rejects_undeclared_base_wheel_entry_points(tmp_path):
+@pytest.mark.parametrize(
+    ("contents", "expected_message"),
+    [
+        (None, "expected one exact entry-point metadata member"),
+        (b"[console_scripts]\nvane-server = missing:main\n", "must match project metadata exactly"),
+        (
+            b"[console_scripts]\nvane-server = vane.server:main\npip = missing:main\n",
+            "must match project metadata exactly",
+        ),
+    ],
+    ids=["missing", "changed-target", "undeclared-command"],
+)
+def test_clean_verifier_requires_exact_base_wheel_entry_points(tmp_path, contents, expected_message):
     base_wheel = _write_minimal_base_wheel(tmp_path)
     tampered_directory = tmp_path / "tampered-base-entry-points"
     tampered_directory.mkdir()
@@ -4074,10 +4091,11 @@ def test_clean_verifier_rejects_undeclared_base_wheel_entry_points(tmp_path):
     tampered_wheel = _rewrite_wheel(
         base_wheel,
         tampered_directory / base_wheel.name,
-        extra_members={entry_points_member: b"[console_scripts]\npip = missing:main\n"},
+        extra_members={entry_points_member: contents} if contents is not None else {},
+        removed_members={entry_points_member} if contents is None else set(),
     )
 
-    with pytest.raises(RuntimeError, match="project metadata declares no entry points"):
+    with pytest.raises(RuntimeError, match=expected_message):
         verify_extension_wheel_module._assert_base_wheel(
             tampered_wheel,
             expected_vane_version=vane.__version__,
