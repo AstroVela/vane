@@ -205,6 +205,23 @@ class TestDescriptorReprRedaction:
         _assert_no_plaintext(repr(plan))
         _assert_no_plaintext(repr(plan.get_options()))
 
+    @pytest.mark.parametrize("family", ["vllm", "sglang"])
+    @pytest.mark.parametrize("kind", ["text", "image", "video"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"engine_args": {"hf_token": HUB_TOKEN}},
+            {"processor_kwargs": {"token": HUB_TOKEN}},
+            {"engine_args": {"extra_config": [{"Authorization": API_KEY}]}},
+        ],
+    )
+    def test_native_embedding_descriptors_reject_sensitive_options(self, family, kind, options):
+        from vane.ai.provider import load_provider
+
+        with pytest.raises(ValueError, match="sensitive field") as exc_info:
+            getattr(load_provider(family), f"get_{kind}_embedder")("configured-model", 2, options=options)
+        _assert_no_plaintext(str(exc_info.value))
+
     def test_credential_kwarg_cannot_land_in_embed_options(self):
         from vane.ai.providers.google import GoogleProvider
 

@@ -25,7 +25,12 @@ import numpy as np
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
-from vane.ai.options import _NATIVE_EMBED_OPTIONS, _NATIVE_MEDIA_PROMPT_OPTIONS, normalize_prompt_options
+from vane.ai.options import (
+    _NATIVE_EMBED_OPTIONS,
+    _NATIVE_MEDIA_PROMPT_OPTIONS,
+    _reject_sensitive_embed_options,
+    normalize_prompt_options,
+)
 from vane.ai.protocols import (
     ImageEmbedderDescriptor,
     PrompterDescriptor,
@@ -113,6 +118,7 @@ class _NativeEmbeddingDescriptor:
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
             raise EmbeddingConfigurationError("Native embedding requires an explicit model name")
+        _reject_sensitive_embed_options(self.options)
         self.options = copy.deepcopy(self.options)
         if self.options.keys() - _NATIVE_EMBED_OPTIONS:
             raise TypeError(
@@ -311,7 +317,10 @@ class _NativeRuntime:
         self.engine: Any = None
         self.closed = False
         with _translate_missing_provider_dependency(descriptor.family, descriptor.family):
-            from transformers import AutoProcessor  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                AutoProcessor,
+                PreTrainedTokenizerBase,
+            )
 
         args = self.options["engine_args"]
         loading = {key: args[key] for key in ("revision",) if key in args}
@@ -329,6 +338,7 @@ class _NativeRuntime:
                 self.processor.tokenizer = tokenizer
             else:
                 self.processor = tokenizer
+        self._is_tokenizer = isinstance(self.processor, PreTrainedTokenizerBase)
 
     def _ensure_engine(self) -> Any:
         if self.closed:
@@ -349,10 +359,17 @@ class _NativeRuntime:
         return self.engine
 
     def _render(self, content: list[dict[str, Any]], system: str | None) -> str:
+        user_content: Any = content
+        system_content: Any = [{"type": "text", "text": system}]
+        if self._is_tokenizer:
+            if any(part["type"] != "text" for part in content):
+                raise EmbeddingConfigurationError("The selected tokenizer cannot format image or video inputs")
+            user_content = "\n".join(part["text"] for part in content)
+            system_content = system
         messages = []
         if system:
-            messages.append({"role": "system", "content": [{"type": "text", "text": system}]})
-        messages.append({"role": "user", "content": content})
+            messages.append({"role": "system", "content": system_content})
+        messages.append({"role": "user", "content": user_content})
         kwargs = dict(self.options.get("chat_template_kwargs", {}))
         if "chat_template" in self.options:
             kwargs["chat_template"] = self.options["chat_template"]
@@ -443,8 +460,9 @@ class NativeEmbedder(_NativeRuntime):
             limit = self.options["engine_args"].get("context_length")
             if limit is not None and len(ids) > limit:
                 raise EmbeddingConfigurationError("Embedding input exceeds context_length")
-            text = self.processor.tokenizer.decode(ids, skip_special_tokens=False)
-            if self.processor.tokenizer.encode(text, add_special_tokens=False) != ids:
+            tokenizer = self.processor if self._is_tokenizer else self.processor.tokenizer
+            text = tokenizer.decode(ids, skip_special_tokens=False)
+            if tokenizer.encode(text, add_special_tokens=False) != ids:
                 raise EmbeddingConfigurationError("SGLang processor tokens do not round-trip")
             if kind != "text":
                 kwargs[kind + "_data"] = [{"format": "processor_output", **dict(inputs)}]

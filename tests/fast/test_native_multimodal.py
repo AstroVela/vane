@@ -109,7 +109,7 @@ def install_sdk(setitem):
             return SimpleNamespace(media=(np.zeros((2, 4, 4, 3), dtype=np.uint8), {"fps": 2, "frames_indices": [0, 1]}))
 
     for name, entries in {
-        "transformers": {"AutoProcessor": Processor},
+        "transformers": {"AutoProcessor": Processor, "PreTrainedTokenizerBase": type("TokenizerBase", (), {})},
         "transformers.video_utils": {"VideoMetadata": SimpleNamespace},
         "vllm": {
             "AsyncEngineArgs": SimpleNamespace,
@@ -169,6 +169,93 @@ def test_http_options_are_rejected(family, options):
         provider.get_text_embedder("configured", 2, options=options)
     with pytest.raises((TypeError, ValueError)):
         provider.get_prompter("configured", options={"media_mime_types": ["video/mp4"], **options})
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("processing", [False, True])
+def test_native_text_embedding_formats_tokenizer_messages(family, processing, sdk, monkeypatch):
+    transformers = sys.modules["transformers"]
+
+    class Tokenizer(transformers.AutoProcessor, transformers.PreTrainedTokenizerBase):
+        def __init__(self):
+            # A text tokenizer does not have a nested .tokenizer attribute.
+            pass
+
+        def apply_chat_template(self, messages, **kwargs):
+            sdk.messages = messages
+            return "\n".join(message["role"] + ": " + message["content"] for message in messages)
+
+    monkeypatch.setattr(transformers, "AutoProcessor", Tokenizer)
+    options = {"gpus_per_actor": 0, "instruction": "Find related items"}
+    if processing:
+        options["processor_kwargs"] = {"add_special_tokens": False}
+    descriptor = load_provider(family).get_text_embedder("configured-text-encoder", 2, options=options)
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            assert await runtime.embed_text(["query"]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.messages == [
+        {"role": "system", "content": "Find related items"},
+        {"role": "user", "content": "query"},
+    ]
+    expected = (
+        "processed-with-timestamps" if family == "sglang" and processing else "system: Find related items\nuser: query"
+    )
+    assert sdk.calls[0][1]["prompt"] == expected
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_tokenizer_rejects_media_before_engine_initialization(family, kind, sdk, monkeypatch):
+    transformers = sys.modules["transformers"]
+    monkeypatch.setattr(
+        transformers,
+        "AutoProcessor",
+        SimpleNamespace(from_pretrained=lambda *args, **kwargs: transformers.PreTrainedTokenizerBase()),
+    )
+    descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
+        "configured-text-encoder", 2, options={"gpus_per_actor": 0}
+    )
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            with pytest.raises(ValueError, match="tokenizer cannot format"):
+                await getattr(runtime, f"embed_{kind}")([clip().frames[0] if kind == "image" else clip()])
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert sdk.engines == []
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["text", "image", "video"])
+def test_native_embedding_enforces_input_bytes_before_preprocessing(family, kind, sdk):
+    value = "中文" if kind == "text" else clip().frames[0] if kind == "image" else clip()
+    size = 6 if kind == "text" else 192 if kind == "image" else 384
+
+    async def run(limit):
+        descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
+            "configured-encoder", 2, options={"gpus_per_actor": 0, "max_input_bytes": limit}
+        )
+        runtime = descriptor.instantiate()
+        try:
+            return await getattr(runtime, f"embed_{kind}")([value])
+        finally:
+            await runtime.aclose()
+
+    with pytest.raises(ValueError, match="max_input_bytes"):
+        asyncio.run(run(1))
+    with pytest.raises(ValueError, match="max_input_bytes"):
+        asyncio.run(run(size - 1))
+    assert sdk.engines == [] and sdk.processing == [] and not hasattr(sdk, "messages")
+    assert asyncio.run(run(size)) == [[3, 4]]
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -301,6 +388,50 @@ def test_engine_resource_admission_and_input_ownership(family):
     ):
         with pytest.raises(ValueError):
             load_provider(family).get_video_embedder("configured", 2, options=invalid)
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("processing", [False, True])
+def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypatch):
+    transformers = pytest.importorskip("transformers", minversion="4.57.1")
+    from tokenizers import Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import BPE
+
+    vocabulary = ["<unk>", "<pad>"] + sorted(pre_tokenizers.ByteLevel.alphabet())
+    backend = Tokenizer(BPE({word: index for index, word in enumerate(vocabulary)}, [], unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        pad_token="<pad>",
+        chat_template="{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\\n' }}{% endfor %}",
+    )
+    tokenizer_base = transformers.PreTrainedTokenizerBase
+    state = install_sdk(monkeypatch.setitem)
+    monkeypatch.setattr(sys.modules["transformers"], "PreTrainedTokenizerBase", tokenizer_base)
+    monkeypatch.setattr(
+        sys.modules["transformers"], "AutoProcessor", SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer)
+    )
+    descriptor = load_provider(family).get_text_embedder(
+        "configured-text-encoder",
+        2,
+        options={
+            "gpus_per_actor": 0,
+            "instruction": "Find related items",
+            "processor_kwargs": {"add_special_tokens": False} if processing else {},
+        },
+    )
+
+    async def run():
+        runtime = descriptor.instantiate()
+        try:
+            assert await runtime.embed_text(["query"]) == [[3, 4]]
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+    assert state.calls[0][1]["prompt"] == "system: Find related items\nuser: query\n"
 
 
 def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch):
