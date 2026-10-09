@@ -358,7 +358,7 @@ def test_structured_provider_extras_require_supported_sdk_versions():
 
     assert openai.specifier == SpecifierSet(">=1.66.0")
     assert google.specifier == SpecifierSet(">=1.22.0")
-    assert vllm.specifier == SpecifierSet(">=0.11.0")
+    assert vllm.specifier == SpecifierSet(">=0.31.0,<0.32")
     assert sglang.specifier == SpecifierSet("==0.5.17")
 
 

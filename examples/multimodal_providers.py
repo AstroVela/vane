@@ -1,40 +1,39 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Explicit multimodal model deployments, through Vane's regular AI APIs.
+"""Native Python engines through Vane's regular AI APIs.
 
-HTTP prompt: install vane-ai[openai,image]; deploy a video-capable model with
-vLLM or SGLang, then run this example with --base-url and --model. Optional
-authentication comes from VLLM_API_KEY or SGLANG_API_KEY, captured before worker
-dispatch. No OpenAI environment setting is inherited by these deployments.
+Install vane-ai[vllm,image] or vane-ai[sglang,image] on execution workers.
+No serving endpoint is used. Select a model ID/path explicitly; for example,
+Qwen/Qwen3-VL-Embedding-2B for embedding or a video-capable Instruct model for
+prompting. These are examples, not default models. Declare embedding dimensions
+and compatible engine parameters, such as dtype and model context length.
 
-Local embedding: install vane-ai[qwen] and use --embedding with
-Qwen/Qwen3-VL-Embedding-2B (or -8B). Select CPU/float32 or CUDA/float16 explicitly.
-Model loading happens on the executing worker. Images, text and clips share
-the model's vector space. Instruct models cannot be used as embedding models.
+Vane's actor owns the native model engine and releases it when execution ends.
+The engine's tensor/pipeline parallelism must fit gpus_per_actor. Use zero only
+for an explicitly configured engine/device that can execute on CPU.
+
+Embedding options accept engine_args, pooling_args (vLLM), processor_kwargs,
+chat_template and chat_template_kwargs. For prompts, configure engine_args and
+generate_args (including native sampling_params). Top-level max_tokens and
+sampling_params token limits cannot both specify the same setting. Declare the
+image/video media_mime_types actually supported by the selected model.
 
 Decoded clip embedding uses vane.ai.embed_video on an ordered LIST of
-{frame_index, frame_time, data IMAGE} records. The caller controls sampling.
-Both Transformers Qwen and HTTP vLLM preserve all supplied frames and express
-presentation timestamps at microsecond precision. Qwen has variable frame
-counts, defaults to 64 frames / 64 MiB decoded bytes, and rejects token overflow.
-Its max_pixels limits image pixels or total clip pixels during preprocessing.
-
-The vLLM HTTP embedding deployment must support /v1/embeddings messages and
-video/jpeg sequences with media_io_kwargs (as in Qwen3-VL-Embedding). SGLang
-uses its multimodal input dictionaries for text/image embedding and its serving
-chat template; decoded video embedding is rejected because this wire format
-does not carry the supplied timestamps. Neither provider starts a local serving
-engine in transport='http' mode. Native text inference remains a separate mode.
-
-Declare media_mime_types for the actual prompt model. An HTTP endpoint alone
-does not establish model capabilities. Unsupported inputs and endpoint errors
-fail explicitly, without changing models, sampling, or transport.
+{frame_index, frame_time, data IMAGE}. Sampling belongs to the caller; both
+native adapters retain frame timestamps at microsecond precision. SGLang uses
+its native processor_output interface with token round-trip validation. Models
+must accept the configured processor inputs. Incompatible inputs or SDK/model
+parameters fail; no model, transport or modality is substituted.
+Embedding dimensions describe the expected output shape. Set
+supports_overriding_dimensions=True only to request a model-supported
+Matryoshka dimension override; fixed-width models must leave it disabled.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 
 import vane
 from vane.ai import embed, prompt
@@ -42,35 +41,38 @@ from vane.ai import embed, prompt
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider", choices=["vllm", "sglang"], default="vllm")
-    parser.add_argument("--base-url", help="Explicit deployment URL, including /v1")
+    parser.add_argument("--provider", choices=["vllm", "sglang"], required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--video", help="MP4 path accessible to executing workers")
+    parser.add_argument("--video", help="Video path accessible to executing workers")
     parser.add_argument("--embedding", action="store_true")
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--dimensions", type=int)
+    parser.add_argument("--engine-args", type=json.loads, default={})
+    parser.add_argument("--gpus-per-actor", type=int, default=1)
     args = parser.parse_args()
+    options = {"engine_args": args.engine_args, "gpus_per_actor": args.gpus_per_actor}
     with vane.connect() as connection:
         inputs = connection.sql("SELECT 'Find the person opening the door' AS query")
         if args.embedding:
+            if args.dimensions is None:
+                parser.error("--embedding requires --dimensions matching the selected model")
             expression = embed(
                 vane.col("query"),
-                provider="transformers",
+                provider=args.provider,
                 model=args.model,
-                device=args.device,
-                dtype="float32" if args.device == "cpu" else "float16",
+                dimensions=args.dimensions,
                 normalize=True,
+                **options,
             )
         else:
-            if not args.video or not args.base_url:
-                parser.error("HTTP video prompt requires --video and --base-url")
+            if not args.video:
+                parser.error("video prompting requires --video")
             expression = prompt(
                 [vane.col("query"), vane.file(args.video, "video/mp4")],
                 provider=args.provider,
                 model=args.model,
-                transport="http",
-                base_url=args.base_url,
                 media_mime_types=["video/mp4"],
                 max_tokens=256,
+                **options,
             )
         print(inputs.select(expression.alias("result")).fetchall())
 

@@ -29,24 +29,23 @@ class JevOptions(TypedDict, total=False):
     timeout: float | None
 
 
-class InferenceHTTPOptions(TypedDict, total=False):
-    """Explicit HTTP transport to a separately deployed inference server."""
-
-    transport: Literal["http"]
-    base_url: str | None
-    timeout: float | None
-
-
-class MultimodalEmbedOptions(InferenceHTTPOptions, total=False):
+class MultimodalEmbedOptions(TypedDict, total=False):
     instruction: str
     max_frames: int
     max_input_bytes: int
     paired_image_queries: bool
     max_length: int
     max_pixels: int
+    processor_kwargs: Mapping[str, VLLMJSONValue]
+    pooling_args: Mapping[str, VLLMJSONValue]
+    chat_template: str
+    chat_template_kwargs: Mapping[str, VLLMJSONValue]
+    engine_args: Mapping[str, VLLMJSONValue]
+    gpus_per_actor: int
+    supports_overriding_dimensions: bool
 
 
-class PromptOptions(InferenceHTTPOptions, total=False):
+class PromptOptions(TypedDict, total=False):
     """Closed keyword surface shared by the Python Prompt entry points."""
 
     # Provider request option shared by every built-in Prompt adapter.
@@ -61,6 +60,8 @@ class PromptOptions(InferenceHTTPOptions, total=False):
 
     # OpenAI / OpenAI-compatible prompt options.
     use_chat_completions: bool
+    base_url: str | None
+    timeout: float | None
     max_output_tokens: int | None
     top_p: float | None
     stop_sequences: list[str] | None
@@ -71,8 +72,12 @@ class PromptOptions(InferenceHTTPOptions, total=False):
     max_new_tokens: int | None
     top_k: int | None
 
-    # HTTP deployments declare the media accepted by the served model.
+    # Native model capabilities, validated before loading any weights.
     media_mime_types: list[str]
+    chat_template: str
+    chat_template_kwargs: Mapping[str, VLLMJSONValue]
+    max_input_bytes: int
+    max_frames: int
 
     # Native vLLM provider options.
     gpus_per_actor: float
@@ -109,7 +114,8 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     overlength: Literal["error", "truncate", "chunk_mean"]
 
     # OpenAI / OpenAI-compatible embedding options.
-    supports_overriding_dimensions: bool
+    base_url: str | None
+    timeout: float | None
     encoding_format: Literal["float", "base64"]
     batch_token_limit: int
     input_text_token_limit: int | None
@@ -189,16 +195,40 @@ class EmbedVideoOptions(MultimodalEmbedOptions, total=False):
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
-_INFERENCE_HTTP_OPTIONS = frozenset({"transport", "base_url", "timeout"})
-_HTTP_EMBED_OPTIONS = _INFERENCE_HTTP_OPTIONS | frozenset(
-    {"instruction", "max_frames", "max_input_bytes", "paired_image_queries"}
+_NATIVE_EMBED_OPTIONS = frozenset(
+    {
+        "instruction",
+        "max_frames",
+        "max_input_bytes",
+        "paired_image_queries",
+        "processor_kwargs",
+        "pooling_args",
+        "chat_template",
+        "chat_template_kwargs",
+        "engine_args",
+        "gpus_per_actor",
+        "supports_overriding_dimensions",
+    }
 )
-_HTTP_PROMPT_OPTIONS = _INFERENCE_HTTP_OPTIONS | frozenset(
-    {"media_mime_types", "temperature", "max_tokens", "top_p", "stop_sequences"}
+_NATIVE_MEDIA_PROMPT_OPTIONS = frozenset(
+    {
+        "media_mime_types",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "stop_sequences",
+        "max_frames",
+        "max_input_bytes",
+        "engine_args",
+        "gpus_per_actor",
+        "generate_args",
+        "chat_template",
+        "chat_template_kwargs",
+    }
 )
 _EMBED_PROVIDER_OPTIONS = {
-    "vllm": _HTTP_EMBED_OPTIONS,
-    "sglang": _HTTP_EMBED_OPTIONS,
+    "vllm": _NATIVE_EMBED_OPTIONS,
+    "sglang": _NATIVE_EMBED_OPTIONS,
     "openai": _EMBED_REMOTE_OPTIONS
     | frozenset(
         {
@@ -437,7 +467,7 @@ def validate_embed_image_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _HTTP_EMBED_OPTIONS
+        allowed |= _NATIVE_EMBED_OPTIONS
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -485,7 +515,7 @@ def validate_embed_video_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _HTTP_EMBED_OPTIONS
+        allowed |= _NATIVE_EMBED_OPTIONS
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -613,12 +643,14 @@ def normalize_prompt_options(
     copied = dict(options)
     _reject_sensitive_prompt_options(copied)
     family = (provider_family or "").casefold()
-    http_inference = family in {"vllm", "sglang"} and copied.get("transport") == "http"
-    provider_options = _HTTP_PROMPT_OPTIONS if http_inference else _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
+    media_inference = family in {"vllm", "sglang"} and "media_mime_types" in copied
+    provider_options = (
+        _NATIVE_MEDIA_PROMPT_OPTIONS if media_inference else _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
+    )
     allowed = _PROMPT_SHARED_PROVIDER_OPTIONS | _PROMPT_BASE_EXECUTION_OPTIONS | provider_options
-    if family not in {"vllm", "sglang"} or http_inference:
+    if family not in {"vllm", "sglang"} or media_inference:
         allowed |= _PROMPT_REMOTE_EXECUTION_OPTIONS
-    if relation and (family not in {"vllm", "sglang"} or http_inference):
+    if relation and (family not in {"vllm", "sglang"} or media_inference):
         allowed |= _PROMPT_RELATION_EXECUTION_OPTIONS
     unknown = sorted(set(copied) - allowed)
     if unknown:
@@ -640,7 +672,7 @@ def normalize_prompt_options(
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Prompt option 'actor_number' requires an actor execution backend")
 
-    if family in {"vllm", "sglang"} and not http_inference and copied.get("max_retries", 0) != 0:
+    if family in {"vllm", "sglang"} and not media_inference and copied.get("max_retries", 0) != 0:
         raise ValueError("native prompting only accepts max_retries=0")
 
     return copied

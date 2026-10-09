@@ -102,7 +102,7 @@ def _google_prompt_descriptor(options):
 def _vllm_prompt_plan(options):
     from vane.ai.providers.vllm import NativeVLLMPromptPlan
 
-    return NativeVLLMPromptPlan(vllm_options=options)
+    return NativeVLLMPromptPlan(model_name="test-model", vllm_options=options)
 
 
 ALL_DESCRIPTOR_FACTORIES = [

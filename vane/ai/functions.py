@@ -2268,7 +2268,7 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family in {"vllm", "sglang"} and prepared.get("transport") != "http":
+    if family in {"vllm", "sglang"} and "media_mime_types" not in prepared:
         if return_raw_response:
             raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1

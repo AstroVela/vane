@@ -389,9 +389,10 @@ def test_ai_embed_accepts_registered_embedding_provider_name(monkeypatch):
     assert expr is not None
 
 
-def test_ai_embed_rejects_provider_without_text_embedder():
-    with pytest.raises((AttributeError, TypeError, ValueError), match=r"get_text_embedder|embedding provider"):
-        vane.ai.embed(vane.col("text"), provider="vllm")
+@pytest.mark.parametrize("provider", ["vllm", "sglang"])
+def test_ai_embed_native_provider_requires_explicit_model(provider):
+    with pytest.raises(ValueError, match="explicit model"):
+        vane.ai.embed(vane.col("text"), provider=provider)
 
 
 def test_ai_embed_rejects_non_provider_objects_and_undocumented_first_keyword():
@@ -1697,7 +1698,7 @@ def test_ai_prompt_options_are_provider_closed(provider, options, offending):
         ("openai", None, {}),
         ("anthropic", "claude-test", {"max_tokens": 8}),
         ("google", "gemini-test", {}),
-        ("vllm", None, {}),
+        ("vllm", "test-model", {}),
     ],
 )
 def test_builtin_prompt_rejects_negative_temperature_during_planning(provider, model, required_options):
@@ -1717,7 +1718,7 @@ def test_builtin_prompt_rejects_negative_temperature_during_planning(provider, m
         ("openai", None, {}),
         ("anthropic", "claude-test", {"max_tokens": 8}),
         ("google", "gemini-test", {}),
-        ("vllm", None, {}),
+        ("vllm", "test-model", {}),
     ],
 )
 def test_builtin_prompt_accepts_zero_temperature_during_planning(provider, model, required_options):
@@ -1822,6 +1823,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
             vane.ai.prompt(
                 vane.col("prompt"),
                 provider="vllm",
+                model="test-model",
                 return_format=schema,
                 on_error="ignore",
             ).alias("response"),
@@ -1831,6 +1833,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
             relation,
             vane.col("prompt"),
             provider="vllm",
+            model="test-model",
             return_format=schema,
             on_error="ignore",
         )
@@ -1845,7 +1848,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
 
 def test_ai_prompt_vllm_rejects_raw_response_during_planning():
     with pytest.raises(ValueError, match="does not support return_raw_response"):
-        vane.ai.prompt(vane.col("prompt"), provider="vllm", return_raw_response=True)
+        vane.ai.prompt(vane.col("prompt"), provider="vllm", model="test-model", return_raw_response=True)
 
 
 @pytest.mark.parametrize(
@@ -1860,7 +1863,7 @@ def test_ai_prompt_vllm_rejects_raw_response_during_planning():
 def test_vllm_prompt_rejects_invalid_options_during_planning(options):
     error = (TypeError, ValueError)
     with pytest.raises(error):
-        vane.ai.prompt(vane.col("text"), provider="vllm", **options)
+        vane.ai.prompt(vane.col("text"), provider="vllm", model="test-model", **options)
 
 
 @pytest.mark.parametrize(
@@ -1896,13 +1899,14 @@ def test_vllm_prompt_rejects_invalid_options_during_planning(options):
 )
 def test_sglang_prompt_rejects_invalid_options_during_planning(options, message):
     with pytest.raises((TypeError, ValueError), match=message):
-        vane.ai.prompt(vane.col("text"), provider="sglang", **options)
+        vane.ai.prompt(vane.col("text"), provider="sglang", model="test-model", **options)
 
 
 def test_sglang_prompt_accepts_resource_and_sampling_boundaries():
     vane.ai.prompt(
         vane.col("text"),
         provider="sglang",
+        model="test-model",
         max_tokens=1,
         max_new_tokens=1,
         temperature=0,
@@ -1923,12 +1927,14 @@ def test_ai_prompt_vllm_rejects_images_and_execution_backend():
             relation,
             [vane.col("question"), vane.col("image")],
             provider="vllm",
+            model="test-model",
         )
     with pytest.raises(TypeError, match="execution_backend"):
         vane.ai.prompt(
             relation,
             vane.col("question"),
             provider="vllm",
+            model="test-model",
             execution_backend="ray_actor",
         )
 
@@ -1947,6 +1953,7 @@ def test_ai_prompt_expression_vllm_rejects_mixed_media_input_during_planning(med
     expression = vane.ai.prompt(
         [vane.col("question"), vane.col("media")],
         provider="vllm",
+        model="test-model",
     )
 
     with pytest.raises(Exception, match="VARCHAR"):
