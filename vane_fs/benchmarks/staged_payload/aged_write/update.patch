@@ -1,0 +1,47 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -371,6 +371,30 @@
+ 		while (statement.Step()) {
+ 			overlaps.push_back(ReadRecord(statement, table));
+ 		}
++	}
++	if (overlaps.size() == 1 && overlaps[0].low == view.point && overlaps[0].high == view.high) {
++		// This version already covers exactly the writable interval. Preserve
++		// its key and boundaries; snapshots and inherited intervals still split.
++		const char *assignments = table == INODES    ? "kind=?,size=?,mode=?,mtime_ns=?"
++		                          : table == DIRENTS ? "inode=?"
++		                                             : "payload=?";
++		Statement update(db, "UPDATE " + std::string(TableName(table)) + " SET writer=?,deleted=?," + assignments +
++		                         " WHERE " + KeyPredicate(table) + " AND low=? AND high=?");
++		int index = 1;
++		update.Bind(index++, view.writer);
++		update.Bind(index++, int64_t(deleted));
++		for (auto field : fields) {
++			if (table == BLOCKS && deleted) {
++				update.BindNull(index++);
++			} else {
++				update.Bind(index++, field);
++			}
++		}
++		index = key.Bind(update, table, index);
++		update.Bind(index++, view.point);
++		update.Bind(index, view.high);
++		update.Step();
++		return;
+ 	}
+ 	for (auto record : overlaps) {
+ 		Statement remove(db, "DELETE FROM " + std::string(TableName(table)) + " WHERE " + KeyPredicate(table) +
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -133,3 +133,11 @@
+   add_test(NAME vane_fs_transaction_cache COMMAND vane_fs_transaction_cache_test "${CMAKE_CURRENT_BINARY_DIR}/owned-transaction-cache")
+   set_tests_properties(vane_fs_transaction_cache PROPERTIES TIMEOUT 30)
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_version_update_test tests/test_version_update.cpp)
++  target_link_libraries(vane_fs_version_update_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  target_link_options(vane_fs_version_update_test PRIVATE "LINKER:--wrap=sqlite3_step")
++  add_test(NAME vane_fs_version_update COMMAND vane_fs_version_update_test "${CMAKE_CURRENT_BINARY_DIR}/owned-version-update")
++  set_tests_properties(vane_fs_version_update PROPERTIES TIMEOUT 30)
++endif()
