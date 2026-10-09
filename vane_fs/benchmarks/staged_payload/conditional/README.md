@@ -235,3 +235,8 @@ No owned native builds or correctness tests overlap formal throughput windows.
 The next adoption gate remains consistent 4 KiB read/write performance across
 fresh and aged workspaces, alongside the existing recovery and synchronization
 checks. The current large-write gain alone is insufficient to change the default.
+
+The [transaction-control cache follow-up](../random_io/README.md) separates native
+probe overhead from real read-path work, tests cached BEGIN/COMMIT statements,
+and repeats random-I/O and synchronization measurements without changing the
+production package.
