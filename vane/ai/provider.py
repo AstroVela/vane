@@ -17,6 +17,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._errors import _message, technical_detail
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
@@ -88,6 +90,9 @@ def _safe_original_error_summary(original_error: Exception) -> str:
     if isinstance(original_error, _SafeProviderError):
         return str(original_error)
     error_type = _safe_error_type(original_error)
+    technical = technical_detail(error_type, _message(original_error))
+    if technical is not None:
+        return f"{error_type}: {technical}"
     details: list[str] = []
     for name in _SAFE_ERROR_DETAIL_NAMES:
         try:

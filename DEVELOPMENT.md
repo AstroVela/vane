@@ -387,3 +387,13 @@ python scripts/check_release_artifacts.py dist/*.tar.gz
 ```
 
 See [RELEASE.md](RELEASE.md) for the complete process.
+
+AI error diagnostics use `vane.ai.summarize_error(error)` to produce a bounded,
+public-safe root-cause summary, including cleanup failures. Known engine option,
+GPU-memory and cuDNN errors retain actionable details; arbitrary upstream text is
+not copied because it can contain credentials or input data. Numeric status and
+errno values remain available. Provider wrappers preserve these diagnostics over
+Ray/native transport. A resolved actor initializer failure now fails its pool and
+releases owned actors immediately, even if other actors are pending for resources.
+Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and the
+isolated single-CPU Ray diagnostic regression.
