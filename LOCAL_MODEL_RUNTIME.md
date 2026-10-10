@@ -1202,7 +1202,33 @@ available system memory. `cpus` can be fractional; `memory_bytes` is an optional
 per-process heap reservation. These declarations govern admission, not OS CPU or
 RSS enforcement.
 Shared-memory flow remains governed by its separate transport and data budgets.
-The host-memory estimate does not detect container memory limits.
+On Linux with cgroup v2, available process memory also respects containing
+cgroup limits.
+
+Tasks without `memory_bytes` use observed process memory to limit concurrency.
+An unmeasured pool starts with one task per prepared stage; completed tasks
+allow gradual growth. Observations use worker high-water RSS on Linux, current
+RSS on macOS, and peak working set on Windows. Admission uses 1.5 times the largest observation,
+with a 64 MiB minimum estimate. Half of the initially available process memory
+is shared across prepared task stages, leaving headroom for models, native
+execution and shared-memory transport. Declared heap reservations reduce that
+budget. Low current available memory reduces admission to the progress minimum,
+and surplus cached workers retire when their tasks complete.
+
+Every prepared stage retains a first-task allowance, including multiple stages
+sharing one worker pool. Transport waiters retain their observed-memory slot;
+task completion returns it even when output is still buffered. This avoids
+blocking the consumer needed to release upstream output. Observations are an
+admission heuristic, not an OS memory limit: a single task, an unexpectedly
+larger later batch, or the pipeline's minimum working set can still exceed
+available memory. Declare `memory_bytes` when a known working-set reservation
+is required. Runtime process-resource snapshots include learned task peaks,
+estimates and in-flight counts.
+
+Retiring an idle task worker tolerates an exit deadline after a successful
+close acknowledgement only if forced termination, reaping and all resource
+cleanup succeed. Protocol errors and failed cleanup remain errors and retain
+their cleanup owner for retry.
 
 Native scan width controls native pipeline work only. It does not set the number
 of UDF workers: a single Parquet row group and one native thread can submit

@@ -1450,6 +1450,9 @@ def test_native_task_queries_progress_while_other_pools_wait_for_output_memory(m
     monkeypatch.setattr(local.os, "cpu_count", lambda: workers)
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    # Keep a competing envelope so consumers cannot use a first-output soft
+    # overage allowance instead of entering the wait under test.
+    competing_task = budget.reserve_task_bytes(1, 1)
     held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": list(range(8192))}))
 
     def make_task(index):
@@ -1470,7 +1473,9 @@ def test_native_task_queries_progress_while_other_pools_wait_for_output_memory(m
                 relation = cursor.sql("SELECT 1 AS x").map_batches(
                     make_task(index),
                     schema={"x": vane.sqltypes.BIGINT},
-                    batch_size=1,
+                    # Keep the large result in one stream block: one-row
+                    # output chunks can be consumed without memory pressure.
+                    batch_size=8192,
                     execution_backend="subprocess_task",
                 )
                 plans.append(
@@ -1523,10 +1528,12 @@ def test_native_task_queries_progress_while_other_pools_wait_for_output_memory(m
                         if not future.done():
                             cursor.interrupt()
             assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+            competing_task.release()
             assert budget.snapshot()["usage_bytes"] == 0
             if track_data:
                 assert runtime.resource_snapshot()["data"]["tasks"] == 0
     finally:
+        competing_task.release()
         for ref in held[1]:
             ref.release()
         for resource in resources:
@@ -1756,6 +1763,7 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
 
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    competing_task = budget.reserve_task_bytes(1, 1)
     producer_entered = str(tmp_path / "producer-entered")
     consumer_entered, release = str(tmp_path / "consumer-entered"), str(tmp_path / "release")
 
@@ -1837,6 +1845,7 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
         for output in [held, *outputs]:
             for ref in output[1]:
                 ref.release()
+        competing_task.release()
         runtime.close(timeout=5, kill=True)
     snapshot = runtime.resource_snapshot()["task_admission"]
     assert snapshot["running_tasks"] == snapshot["waiting_tasks"] == snapshot["resuming_tasks"] == 0
@@ -1852,6 +1861,7 @@ def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "100000")
+    competing_task = ref_bundle.local_shm_budget_manager().reserve_task_bytes(1, 1)
     entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
     memory_waited = threading.Event()
     original_wait = ref_bundle.LocalShmBudgetManager._wait_for_capacity_locked
@@ -1893,7 +1903,7 @@ def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure
                     Producer,
                     schema={"value": vane.sqltypes.BIGINT},
                     actor_number=1,
-                    batch_size=1,
+                    batch_size=8192,
                     execution_backend="subprocess_actor",
                 )
                 .map_batches(
@@ -1907,7 +1917,11 @@ def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure
             plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(cursor)
             plans.append(plan)
             nodes.append(
-                next(node for node in plan.collect_udf_nodes(conn=cursor) if node["payload"]["batch_size"] == 1)
+                next(
+                    node
+                    for node in plan.collect_udf_nodes(conn=cursor)
+                    if any(column["name"] == "value" for column in node["payload"]["output_schema"])
+                )
             )
         runtime = LocalModelRuntime(
             session_id=plans[0].session_id(),
@@ -1946,10 +1960,12 @@ def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure
                             cursor.interrupt()
             admission = runtime.resource_snapshot()["task_admission"]
             assert admission["running_tasks"] == admission["waiting_tasks"] == admission["resuming_tasks"] == 0
+            competing_task.release()
             budget = ref_bundle.local_shm_ref_budget_snapshot()
             assert budget["waiting_output_grants"] == budget["output_grant_bytes"] == 0
             assert budget["usage_bytes"] == 0
         finally:
+            competing_task.release()
             for resource in resources:
                 resource.shutdown(kill=True)
             runtime.close(timeout=5, kill=True)

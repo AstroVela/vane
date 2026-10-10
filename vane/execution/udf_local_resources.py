@@ -8,9 +8,8 @@ from __future__ import annotations
 import math
 import os
 
-import psutil
-
 from vane.execution.resources import ResourceVector
+from vane.execution.udf_local_memory import available_process_memory
 
 
 class LocalProcessCapacityError(ValueError):
@@ -21,7 +20,7 @@ def local_process_capacity() -> ResourceVector:
     cpus = max(1, os.cpu_count() or 1)
     if hasattr(os, "sched_getaffinity"):
         cpus = min(cpus, len(os.sched_getaffinity(0)))
-    return ResourceVector(cpu=cpus, heap_bytes=int(psutil.virtual_memory().available))
+    return ResourceVector(cpu=cpus, heap_bytes=available_process_memory())
 
 
 def local_task_capacity(resources: ResourceVector, limit: ResourceVector) -> int:

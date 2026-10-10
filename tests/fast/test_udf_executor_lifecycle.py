@@ -4499,6 +4499,9 @@ def test_subprocess_task_stats_report_worker_slot_admission(monkeypatch):
         _subprocess_map_payload(
             sleeper,
             execution_backend="subprocess_task",
+            # This tests the CPU slot ceiling; observed-memory calibration has
+            # its own first-task gate when the working set is undeclared.
+            memory_bytes=64 * 1024**2,
         )
     )
     try:
@@ -6012,6 +6015,7 @@ def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails
         total = 1
         active = 1
         idle = []
+        memory = None
 
         def acquire_worker(self, _scope):
             events.append("acquire")
@@ -6956,6 +6960,7 @@ def test_subprocess_task_releases_result_cancelled_after_worker_call():
         total = 1
         active = 1
         idle = []
+        memory = None
 
         def acquire_worker(self, _scope):
             return wrapper
@@ -7314,6 +7319,7 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         _subprocess_map_payload(
             maybe_sleep_add_one,
             execution_backend="subprocess_task",
+            memory_bytes=64 * 1024**2,
         )
     )
     try:
@@ -8956,6 +8962,54 @@ def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
     assert proc.kill_calls == 0
     assert len(proc.wait_timeouts) == 1
     assert sock.closed
+
+
+def test_task_pool_commits_retirement_after_acknowledged_exit_timeout():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    ack = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    proc = _FakeShutdownProcess(exits_on_wait=False)
+    worker = _bare_shutdown_executor(subprocess_exec, _GracefulShutdownSocket(ack), proc)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    pool = runtime.acquire_pool({"execution_backend": "subprocess_task"}, 1)
+    wrapper = subprocess_exec._PooledTaskWorker(worker)
+    pool.total = runtime.total_workers = 1
+    pool._retire_worker_locked(wrapper)
+    try:
+        pool._close_retiring_worker(wrapper, kill=False)
+        assert proc.kill_calls == 1
+        assert worker._cleanup_finished
+        assert worker._proc is None
+        assert pool.total == runtime.total_workers == 0
+        assert not pool._retiring_workers and not runtime._retiring_workers
+    finally:
+        runtime.close(kill=True)
+
+
+@pytest.mark.parametrize("failure", ["ack_error", "resource_cleanup"])
+def test_task_pool_does_not_hide_shutdown_failures_after_exit(failure, monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    kind = subprocess_exec._MSG_ERROR if failure == "ack_error" else subprocess_exec._MSG_ACK
+    proc = _FakeShutdownProcess(exits_on_wait=False)
+    worker = _bare_shutdown_executor(
+        subprocess_exec, _GracefulShutdownSocket(subprocess_exec._HEADER.pack(kind, 0)), proc
+    )
+    if failure == "resource_cleanup":
+        monkeypatch.setattr(worker, "_close_data_shm", lambda: (_ for _ in ()).throw(RuntimeError("cleanup failure")))
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    pool = runtime.acquire_pool({"execution_backend": "subprocess_task"}, 1)
+    wrapper = subprocess_exec._PooledTaskWorker(worker)
+    pool.total = runtime.total_workers = 1
+    pool._retire_worker_locked(wrapper)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            pool._close_retiring_worker(wrapper, kill=False)
+        assert not isinstance(caught.value, subprocess_exec._SubprocessExitDeadlineExceeded)
+        assert wrapper in pool._retiring_workers and pool.total == 1
+    finally:
+        monkeypatch.setattr(worker, "_close_data_shm", lambda: None)
+        runtime.close(kill=True)
 
 
 def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch):

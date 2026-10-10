@@ -91,6 +91,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancelledError,
 )
 from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
+from vane.execution.udf_local_memory import LocalTaskMemory, available_process_memory, task_process_peak_bytes
 from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
@@ -102,6 +103,11 @@ from vane.execution.udf_threading import (
 from vane.execution.udf_worker_metrics import WorkerLifecycle, WorkerMetrics, WorkerOutcome
 from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
+
+
+class _SubprocessExitDeadlineExceeded(RuntimeError):
+    """CLOSE was acknowledged and forced termination completed all cleanup."""
+
 
 _active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
 _active_local_output: ContextVar[Callable[[Any], None] | None] = ContextVar("vane_local_output", default=None)
@@ -1741,6 +1747,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         sock = self._sock
         shutdown_error: BaseException | None = None
         graceful_error: BaseException | None = None
+        exit_deadline_error: BaseException | None = None
         finalizer_cleanup_failed = False
 
         if proc is not None and proc.poll() is None and sock is not None and not kill:
@@ -1771,7 +1778,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     proc.wait(timeout=remaining)
                 except (subprocess.TimeoutExpired, TimeoutError) as exc:
                     if graceful_error is None:
-                        graceful_error = RuntimeError(
+                        exit_deadline_error = RuntimeError(
                             "UDF subprocess graceful shutdown did not exit before deadline: "
                             f"{type(exc).__name__}: {exc}"
                         )
@@ -1860,6 +1867,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             )
         if graceful_error is not None:
             cleanup_errors.append(graceful_error)
+        if exit_deadline_error is not None:
+            if self._cleanup_finished and not cleanup_errors:
+                raise _SubprocessExitDeadlineExceeded(str(exit_deadline_error)) from exit_deadline_error
+            cleanup_errors.append(exit_deadline_error)
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
             raise RuntimeError(f"UDF subprocess close failed: {details}") from cleanup_errors[0]
@@ -1987,6 +1998,7 @@ class _TaskWorkerPool:
         )
         self.pool_size = max(1, int(pool_size))
         self.resources = udf_process_resources(payload)
+        self.memory = None if self.resources.heap_bytes else runtime.task_memory(key)
         self.executor = ThreadPoolExecutor(max_workers=self.pool_size, thread_name_prefix="vane-udf-subprocess-task")
         self.ref_count = 0
         self.closing = False
@@ -2005,6 +2017,7 @@ class _TaskWorkerPool:
             execution_slot_prefix=f"subprocess_task:{self.key}",
             execution_capacity=runtime.execution_capacity,
             resources=self.resources,
+            memory=self.memory,
         )
 
     def create_admission_authority(
@@ -2079,7 +2092,13 @@ class _TaskWorkerPool:
         self.runtime._retiring_workers[wrapper] = self
 
     def _close_retiring_worker(self, wrapper: _PooledTaskWorker, *, kill: bool) -> None:
-        wrapper.worker.close(kill=kill or self.kill_on_release)
+        try:
+            wrapper.worker.close(kill=kill or self.kill_on_release)
+        except _SubprocessExitDeadlineExceeded:
+            # An idle cache entry has no user work left. A post-ACK exit timeout
+            # is recoverable only after kill/reap and every cleanup succeeded.
+            # Other close failures retain ownership and propagate to the caller.
+            pass
         with self.runtime.cond:
             if wrapper in self._retiring_workers:
                 self._retiring_workers.pop(wrapper)
@@ -2304,16 +2323,23 @@ class _TaskWorkerPool:
         to_close = False
         kill_close = False
         with self.runtime.cond:
-            self._active_wrappers.discard(wrapper)
-            self.active = max(0, self.active - 1)
-            wrapper.active_scope = None
-            if (
+            retire = (
                 self.closing
                 or wrapper.abort_requested
                 or not reusable
                 or not _worker_is_reusable(wrapper.worker)
                 or self.runtime.total_workers > self.runtime.max_workers
-            ):
+                or (
+                    self.memory is not None
+                    and self.total > self.runtime.execution_capacity.task_memory_limit(self.memory)
+                )
+            )
+            # Headroom sampling can fail. Keep the active owner until the
+            # retirement decision succeeds, so query/runtime cleanup can retry.
+            self._active_wrappers.discard(wrapper)
+            self.active = max(0, self.active - 1)
+            wrapper.active_scope = None
+            if retire:
                 self._retire_worker_locked(wrapper)
                 to_close = True
                 kill_close = self.kill_on_release or wrapper.abort_requested or not reusable
@@ -2350,13 +2376,27 @@ class _TaskWorkerPool:
 class _GlobalSubprocessTaskRuntime:
     def __init__(self, *, resource_limit: ResourceVector | None = None) -> None:
         self.resource_limit = local_process_capacity() if resource_limit is None else resource_limit
-        self.execution_capacity = LocalExecutionCapacity(max_slots=None, resource_limit=self.resource_limit)
+        self.execution_capacity = LocalExecutionCapacity(
+            max_slots=None,
+            resource_limit=self.resource_limit,
+            task_memory_budget=max(1, self.resource_limit.heap_bytes // 2),
+            available_memory=available_process_memory,
+        )
         self.cond = threading.Condition()
+        self._task_memory: weakref.WeakValueDictionary[str, LocalTaskMemory] = weakref.WeakValueDictionary()
         self.pools: dict[str, _TaskWorkerPool] = {}
         self._retiring_workers: dict[_PooledTaskWorker, _TaskWorkerPool] = {}
         self.total_workers = 0
         self.closed = False
         self._close_finished = True
+
+    def task_memory(self, key: str) -> LocalTaskMemory:
+        with self.cond:
+            profile = self._task_memory.get(key)
+            if profile is None:
+                profile = LocalTaskMemory()
+                self._task_memory[key] = profile
+            return profile
 
     @property
     def max_workers(self) -> int:
@@ -2434,6 +2474,15 @@ class _GlobalSubprocessTaskRuntime:
             scope.raise_if_cancelled("subprocess task")
             result = wrapper.worker._run_in_execution_scope(scope, fn)
             result_ready = True
+            if pool.memory is not None:
+                try:
+                    proc = getattr(wrapper.worker, "_proc", None)
+                    peak = task_process_peak_bytes(proc.pid) if proc is not None else 0
+                    self.execution_capacity.observe_task_memory(pool.memory, peak)
+                except BaseException:
+                    _release_local_ref_bundle_result(result)
+                    result_ready = False
+                    raise
         except BaseException:
             reusable = _worker_is_reusable(wrapper.worker)
             raise
@@ -3623,7 +3672,16 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             actor_options_map[node_id] = executor_options
 
         if task_resources:
-            progress = runtime.execution_capacity.reserve_task_progress(task_resources)
+            memory = {
+                str(node["node_id"]): runtime.task_memory(
+                    _payload_task_key(
+                        node["payload"], _normalize_session_config_option(node.get("executor_options") or {})
+                    )
+                )
+                for node in udf_nodes
+                if str(node["node_id"]) in task_resources and not task_resources[str(node["node_id"])].heap_bytes
+            }
+            progress = runtime.execution_capacity.reserve_task_progress(task_resources, memory=memory)
             created.append(progress)
             for node in udf_nodes:
                 node_id = str(node["node_id"])

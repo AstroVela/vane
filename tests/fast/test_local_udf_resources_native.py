@@ -51,13 +51,22 @@ def transport(monkeypatch):
 def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(monkeypatch, tracking, limited_tasks):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     observed = []
+    outputs = []
     complete = udf_subprocess.UDFExecutor._complete_task_submit
+    publish = udf_subprocess.UDFExecutor._publish_stream_result
 
     def observe(executor, *args, **kwargs):
         observed.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
         return complete(executor, *args, **kwargs)
 
+    def observe_output(executor, *args, **kwargs):
+        # A consumer may release streamed output before the producer finishes.
+        # Inspect byte ownership while the block is still awaiting publication.
+        outputs.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
+        return publish(executor, *args, **kwargs)
+
     monkeypatch.setattr(udf_subprocess.UDFExecutor, "_complete_task_submit", observe)
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "_publish_stream_result", observe_output)
 
     class Identity:
         def __call__(self, table):
@@ -107,11 +116,16 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
                 gc.collect()
                 _wait(lambda: not runtime.resource_snapshot()["udf_units"])
             assert len(query_ids) == 2 and worker_pids[0] == worker_pids[1]
-        assert {identity["query_id"] for identity, _ in observed} == query_ids
-        assert {identity["backend"] for identity, _ in observed} == {"subprocess_task", "subprocess_actor"}
+        for observations in (observed, outputs):
+            assert len(observations) == 4
+            assert {identity["query_id"] for identity, _ in observations} == query_ids
+            assert {identity["backend"] for identity, _ in observations} == {"subprocess_task", "subprocess_actor"}
         for identity, units in observed:
             own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
             assert own["completing_tasks"] >= 1
+        for identity, units in outputs:
+            own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
+            assert own["running_tasks"] >= 1
             if tracking == "graph_only":
                 assert own["data"] is None
             else:
@@ -224,6 +238,8 @@ def test_real_transport_wait_is_attributed_and_cancellation_or_release_retires_i
         },
     )
     occupied = transport.acquire_allocation(70_000)
+    # Require a real wait rather than the consumer's first-output soft overage.
+    competing_task = transport.reserve_task_bytes(1, 1)
     refs = []
     try:
         assert executor.request_task_admission(0)
@@ -247,6 +263,7 @@ def test_real_transport_wait_is_attributed_and_cancellation_or_release_retires_i
             assert usage["output_bytes"] == usage["retained_bytes"] > (65_536 if kind == "output" else 0)
         _wait(lambda: not any(value for key, value in activity.snapshot().items() if key.endswith("_tasks")))
     finally:
+        competing_task.release()
         transport.release_allocation(occupied)
         executor.close(kill=True)
         if actor_pool:
