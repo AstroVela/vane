@@ -17,6 +17,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._errors import summarize_error
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
@@ -65,46 +67,19 @@ _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
     {"anthropic", "cosmos", "google", "openai", "transformers", "typesafe", "vllm"}
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
-_MAX_ERROR_TYPE_CHARS = 128
-_SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")
 
 
 class _SafeProviderError(RuntimeError):
     """A bounded, credential-safe summary of an upstream provider error."""
 
 
-def _safe_error_type(original_error: Exception) -> str:
-    try:
-        name = type(original_error).__name__
-    except Exception:
-        return "Exception"
-    name = name[:_MAX_ERROR_TYPE_CHARS]
-    if not name or not name.isascii() or not name.isidentifier():
-        return "Exception"
-    return name
-
-
 def _safe_original_error_summary(original_error: Exception) -> str:
     if isinstance(original_error, _SafeProviderError):
         return str(original_error)
-    error_type = _safe_error_type(original_error)
-    details: list[str] = []
-    for name in _SAFE_ERROR_DETAIL_NAMES:
-        try:
-            value = getattr(original_error, name, None)
-        except Exception:
-            continue
-        # Provider messages and string-valued fields can echo opaque API keys,
-        # tokens, request bodies, or other user data without a recognizable
-        # label.  Preserve only builtin numeric status metadata; never inspect
-        # or stringify arbitrary upstream text on an exception path.
-        if type(value) is not int or not -999_999 <= value <= 999_999:
-            continue
-        details.append(f"{name}={value}")
-    summary = error_type
-    if details:
-        summary += " (" + ", ".join(details) + ")"
-    return summary
+    # Capture the safe cause/cleanup chain before batch wrappers detach the
+    # original exceptions for transport. Keeping only the outer error here
+    # permanently loses initialization failures masked by teardown errors.
+    return summarize_error(original_error)
 
 
 def _safe_provider_execution_error(
