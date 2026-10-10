@@ -90,4 +90,29 @@ if(VANE_FS_BUILD_TESTS)
     add_test(NAME vane_fs_crash COMMAND vane_fs_crash_test)
     set_tests_properties(vane_fs_crash PROPERTIES TIMEOUT 60)
   endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(VANE_FS_TEST_SQLITE_SYNC
+        "auto"
+        CACHE STRING
+              "Expected SQLite WAL syscall in tests: auto, fsync, or fdatasync")
+    set_property(CACHE VANE_FS_TEST_SQLITE_SYNC PROPERTY STRINGS auto fsync
+                                                         fdatasync)
+    if(NOT VANE_FS_TEST_SQLITE_SYNC MATCHES "^(auto|fsync|fdatasync)$")
+      message(
+        FATAL_ERROR "VANE_FS_TEST_SQLITE_SYNC must be auto, fsync, or fdatasync"
+      )
+    endif()
+    add_executable(vane_fs_sync_syscalls_test tests/test_sync_syscalls.cpp)
+    target_link_libraries(vane_fs_sync_syscalls_test
+                          PRIVATE vane_fs unofficial::sqlite3::sqlite3)
+    target_link_options(vane_fs_sync_syscalls_test PRIVATE
+                        "LINKER:--wrap=fsync" "LINKER:--wrap=fdatasync")
+    add_test(
+      NAME vane_fs_sync_syscalls
+      COMMAND
+        vane_fs_sync_syscalls_test
+        "${CMAKE_CURRENT_BINARY_DIR}/owned-sync-syscalls"
+        "${VANE_FS_TEST_SQLITE_SYNC}")
+    set_tests_properties(vane_fs_sync_syscalls PROPERTIES TIMEOUT 30)
+  endif()
 endif()

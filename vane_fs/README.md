@@ -52,6 +52,53 @@ statically and includes its notice in the wheel. It does not rebuild the Vane
 engine. Other platforms need the corresponding static vcpkg triplet and their
 own validation before release.
 
+### Optional Linux SQLite fdatasync build
+
+On Linux x86-64, `triplets/x64-linux-fdatasync-release.cmake` builds SQLite with
+`HAVE_FDATASYNC=1`. It is opt-in: `x64-linux-release` retains the existing build.
+The triplet uses vcpkg's
+[per-port compiler flags](https://learn.microsoft.com/en-us/vcpkg/users/triplets#per-port-customization)
+for SQLite only, with a separate target triplet and binary-cache identity.
+There is no runtime switch and no database migration. FULL/NORMAL settings and
+VaneFS's durability barriers retain their existing meaning.
+
+Install this SDK separately, then use a fresh VaneFS build directory so an old
+cached package path cannot select the default SQLite library:
+
+```bash
+"$VCPKG_ROOT/vcpkg" install \
+  --x-manifest-root="$PWD" --x-install-root="$PWD/build/sqlite-fdatasync" \
+  --overlay-triplets="$PWD/triplets" \
+  --triplet=x64-linux-fdatasync-release --host-triplet=x64-linux-release \
+  --clean-buildtrees-after-build --clean-packages-after-build
+export CMAKE_PREFIX_PATH="$PWD/build/sqlite-fdatasync/x64-linux-fdatasync-release"
+cmake -S . -B build/fdatasync -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+  -DVANE_FS_BUILD_TOOLS=ON -DVANE_FS_TEST_SQLITE_SYNC=fdatasync
+cmake --build build/fdatasync -j 2
+ctest --test-dir build/fdatasync --output-on-failure
+```
+
+With that prefix selected, install the Python wheel using a separate
+`SKBUILD_BUILD_DIR`, for example `build/python-fdatasync`, and the non-editable
+install command above. Add `VANE_FS_BUILD_FUSE=ON` when building the mount tool.
+The triplet is included in source distributions.
+
+On Linux, `VANE_FS_TEST_SQLITE_SYNC=fsync|fdatasync` asserts the actual WAL
+syscall used by the linked static SQLite library. It only configures the test
+expectation; it does not rebuild SQLite or select a durability mode. The test's
+default `auto` accepts either primitive, while still requiring observable
+barriers and verifying sync failures, rollback and retries. CI tests both
+triplets with explicit expectations. SQLite does not report `HAVE_FDATASYNC`
+through its compile-options API, so checking that API alone is insufficient.
+
+The [production-format comparison](benchmarks/production_sync/README.md) found
+lower common small-write costs but retained long stalls and a strict small-file
+total-time regression. This option is for evaluation on the intended storage;
+it is not a default performance recommendation. The
+[strict-mode diagnosis](benchmarks/strict_sync/README.md) locates the remaining
+waits in per-mutation WAL synchronization and checkpoint I/O.
+
 ## Native commands and Linux mounts
 
 `build/core/vane-fs` provides `init`, `branches`, `fork SOURCE NAME`,
