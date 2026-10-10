@@ -103,6 +103,10 @@ The [strict background-checkpoint experiment](benchmarks/strict_checkpoint/READM
 retains a tested C++ candidate that reuses the fsync worker. It is not enabled:
 frequent small checkpoints regress several workloads despite faster large
 writes. The report includes the patch, reproduction steps and complete results.
+The [batching follow-up](benchmarks/strict_checkpoint/batching/README.md)
+eliminates those repeated checkpoints and preserves retries across worker
+restart, but retains write regressions associated with WAL growth. It also
+remains an isolated experiment, with strict FULL commits unchanged.
 
 ## Native commands and Linux mounts
 
