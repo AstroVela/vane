@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from multiprocessing import shared_memory
     from typing import NoReturn
 
+    from vane.execution.local_gpu_devices import GpuDeviceLease
     from vane.execution.local_query_admission import LocalQueryAdmission, LocalQueryAdmissionAuthority
 
 from vane import pickle as vane_pickle
@@ -2550,12 +2551,14 @@ class LocalSubprocessActorPool:
         if worker_metrics is not None and not isinstance(worker_metrics, WorkerMetrics):
             raise TypeError("worker_metrics must be WorkerMetrics")
         self._worker_metrics = worker_metrics
+        self._owner_pid = os.getpid()
         self.payload = dict(payload)
         self.session_config = (
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
         self.pool_size = max(1, int(pool_size))
         self._gpu_devices: tuple[str, ...] = ()
+        self._query_owned_gpu = _gpu_devices is None
         if _gpu_devices is not None:
             from vane.execution.udf_local_gpu import _device_ids
 
@@ -2592,6 +2595,7 @@ class LocalSubprocessActorPool:
         self._executor: ThreadPoolExecutor | None = None
         self._cleanup_pending_executor: ThreadPoolExecutor | None = None
         self._resident_release: Callable[[], None] | None = None
+        self._gpu_reservation: GpuDeviceLease | None = None
         initializing_workers: dict[int, _SingleSubprocessExecutor] = {}
         startup_lock = threading.Lock()
         starting_worker: _SingleSubprocessExecutor | None = None
@@ -2622,6 +2626,16 @@ class LocalSubprocessActorPool:
 
         try:
             declared = udf_process_resources(payload).scale(self.pool_size)
+            if declared.gpu:
+                from vane.execution.local_gpu_devices import reserve_gpu_devices
+
+                if payload.get("gpus") != 1 or type(payload.get("gpus")) not in (int, float):
+                    raise ValueError("local GPU actors require exactly one GPU per replica")
+                self._gpu_reservation = reserve_gpu_devices(self.pool_size, self._gpu_devices or None)
+                self._gpu_devices = self._gpu_reservation.devices
+                self.admission_slots = LocalGpuExecutionSlotPool(
+                    self._gpu_devices, execution_slot_prefix=f"subprocess_actor:{pool_identity}"
+                )
             self._resident_release = _global_task_runtime().execution_capacity.reserve_resident(
                 ResourceVector(cpu=declared.cpu, heap_bytes=declared.heap_bytes), startup_cancellation
             )
@@ -3324,9 +3338,12 @@ class LocalSubprocessActorPool:
             raise RuntimeError(f"local subprocess actor abort failed: {details}") from cleanup_errors[0]
 
     def shutdown(self, *, kill: bool = False) -> None:
+        if os.getpid() != self._owner_pid:
+            return
         retry_workers: list[_SingleSubprocessExecutor] = []
         retry_executor: ThreadPoolExecutor | None = None
         retry_cleanup = False
+        release_residency = False
         with self._cond:
             if self._closed:
                 while not getattr(self, "_shutdown_finished", True):
@@ -3344,14 +3361,20 @@ class LocalSubprocessActorPool:
                     )
                 )
                 if not retry_cleanup:
-                    return
+                    release_residency = True
             else:
                 self._closed = True
-            self._shutdown_finished = False
-            if not retry_cleanup:
-                self._replacement_startup_cancel_requested = bool(kill)
-            active_scopes = [] if retry_cleanup else list(self._active_scopes.values())
-            self._cond.notify_all()
+            if not release_residency:
+                self._shutdown_finished = False
+                if not retry_cleanup:
+                    self._replacement_startup_cancel_requested = bool(kill)
+                active_scopes = [] if retry_cleanup else list(self._active_scopes.values())
+                self._cond.notify_all()
+        if release_residency:
+            # A completing callback may have been the only cleanup owner at
+            # the first shutdown. It can finish without another worker close.
+            self._release_resident_resources()
+            return
         try:
             cleanup_errors: list[BaseException] = []
             if retry_cleanup:
@@ -3497,8 +3520,13 @@ class LocalSubprocessActorPool:
     def _release_resident_resources(self) -> None:
         with self._cond:
             release, self._resident_release = self._resident_release, None
-        if release is not None:
-            release()
+            gpu_reservation, self._gpu_reservation = self._gpu_reservation, None
+        try:
+            if release is not None:
+                release()
+        finally:
+            if gpu_reservation is not None:
+                gpu_reservation.release()
 
     def __del__(self) -> None:
         try:
@@ -3683,8 +3711,6 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 executor_options["local_actor_pool"] = borrow.pool
                 actor_options_map[node_id] = executor_options
                 continue
-            if float(raw_payload.get("gpus") or 0.0) > 0.0:
-                raise ValueError("GPU resources require a Ray UDF backend or an explicitly registered local model")
             existing_pool = executor_options.get("local_actor_pool")
             if existing_pool is not None:
                 existing_pool_size = _validate_local_actor_pool_contract(existing_pool)
@@ -3696,6 +3722,10 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 existing_session_config = getattr(existing_pool, "session_config", None)
                 if existing_session_config != session_config:
                     raise ValueError("pre-created local_actor_pool belongs to a different Vane session")
+                if float(raw_payload.get("gpus") or 0.0) > 0.0:
+                    from vane.execution.udf_local_gpu import validate_query_gpu_pool
+
+                    validate_query_gpu_pool(raw_payload, existing_pool, session_config)
                 actor_options_map[node_id] = executor_options
                 continue
             pool_name = f"local-subprocess-actor-{identity}-{node_id}"
