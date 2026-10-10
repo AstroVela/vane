@@ -107,6 +107,12 @@ The [batching follow-up](benchmarks/strict_checkpoint/batching/README.md)
 eliminates those repeated checkpoints and preserves retries across worker
 restart, but retains write regressions associated with WAL growth. It also
 remains an isolated experiment, with strict FULL commits unchanged.
+The [WAL capacity follow-up](benchmarks/strict_checkpoint/wal_reuse/README.md)
+retains up to 64 MiB between generations while holding batching and FULL
+commits fixed. It removes repeated growth during reuse and improves common
+small-write costs, but cold-write and random-write stalls remain. The report
+includes initialization, shutdown and retained-space costs; the candidate is
+not enabled by default.
 
 ## Native commands and Linux mounts
 

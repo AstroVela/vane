@@ -1,0 +1,78 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -807,9 +807,9 @@
+ 			owner_committed = true;
+ 			if (durability == Durability::Fsync)
+ 				Exec(db, "PRAGMA synchronous=NORMAL");
+-			// Reuse a modest WAL allocation after restart, including after a
+-			// single transaction temporarily exceeds the admission budget.
+-			Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
++			// Retain the admission-sized allocation across WAL generations.
++			// Oversized transactions can still grow it until the next reset.
++			Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::LIMIT_BYTES));
+ 			Statement pages(db, "PRAGMA page_size");
+ 			pages.Step();
+ 			checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
+--- a/tests/test_checkpoint.cpp
++++ b/tests/test_checkpoint.cpp
+@@ -279,9 +279,49 @@
+ 		}
+ 	});
+ 	Require(second->Read("/file", 0, 2) == "ok", "Retry not visible across connections");
+-	Require(std::filesystem::file_size(path + "-wal") <= 16 * MIB, "Restart retained oversized WAL allocation");
++	Require(std::filesystem::file_size(path + "-wal") == 64 * MIB, "Restart did not retain the admission-sized WAL");
+ 	workspace.Close();
+ 	other.Close();
++}
++
++static void CheckAllocationReuse(const std::string &path, int page_size, Durability durability) {
++	{
++		Inspector inspector(path);
++		inspector.SQL(page_size == 8192 ? "PRAGMA page_size=8192; VACUUM" : "PRAGMA page_size=4096; VACUUM");
++	}
++	{
++		Workspace workspace(path, 1000, durability);
++		auto session = workspace.Checkout();
++		session->WriteFile("/file", "small");
++		Require(std::filesystem::file_size(path + "-wal") < MIB, "Small workspace unexpectedly preallocated WAL");
++		// An atomic write can exceed the admission budget. Its successor
++		// must reset the generation and reclaim only the excess allocation.
++		session->WriteFile("/file", std::string(64 * MIB, 'a'));
++		Require(std::filesystem::file_size(path + "-wal") > 64 * MIB, "Missing oversized WAL allocation");
++		session->Write("/file", "ok", 0);
++		Require(std::filesystem::file_size(path + "-wal") == 64 * MIB,
++		        "Oversized WAL did not shrink to reuse capacity");
++		for (int i = 1; i <= 24; ++i) {
++			auto syncs = foreground_wal_syncs.load();
++			session->Write("/file", std::string(MIB, 'r'), int64_t(i) * MIB);
++			if (durability == Durability::Strict)
++				Require(foreground_wal_syncs > syncs, "Reused allocation skipped the strict commit barrier");
++			Require(std::filesystem::file_size(path + "-wal") == 64 * MIB, "WAL shrank or grew during capacity reuse");
++		}
++		workspace.Close();
++	}
++	Require(!std::filesystem::exists(path + "-wal"), "Final close retained WAL allocation");
++	Require(!std::filesystem::exists(path + "-shm"), "Final close retained shared memory");
++	{
++		Workspace workspace(path, 1000, durability);
++		auto session = workspace.Checkout();
++		Require(session->Read("/file", 0, 2) == "ok", "Reopen lost the first reused write");
++		Require(session->Read("/file", MIB, 24 * MIB) == std::string(24 * MIB, 'r'), "Reopen changed reused bytes");
++		Require(session->Read("/file", 63 * MIB) == std::string(MIB, 'a'), "Reopen changed untouched bytes");
++		Require(std::filesystem::file_size(path + "-wal") < MIB, "Reopen unexpectedly preallocated WAL");
++		workspace.Close();
++	}
++	Require(!std::filesystem::exists(path + "-wal"), "Reopened workspace did not reclaim WAL");
+ }
+ 
+ static void CheckErrors(const std::string &path, Durability durability) {
+@@ -497,6 +537,9 @@
+ 			std::cout << "CheckPinnedReader" << std::endl;
+ 			CheckPinnedReader((prefix / "pinned.sqlite").string(), 4096, mode);
+ 			CheckPinnedReader((prefix / "pinned-8k.sqlite").string(), 8192, mode);
++			std::cout << "CheckAllocationReuse" << std::endl;
++			CheckAllocationReuse((prefix / "reuse.sqlite").string(), 4096, mode);
++			CheckAllocationReuse((prefix / "reuse-8k.sqlite").string(), 8192, mode);
+ 			std::cout << "CheckErrors" << std::endl;
+ 			CheckErrors((prefix / "errors.sqlite").string(), mode);
+ 			std::cout << "CheckBackfilledReader" << std::endl;
