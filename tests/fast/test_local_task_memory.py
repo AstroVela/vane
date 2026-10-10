@@ -29,6 +29,7 @@ def memory_capacity():
     for progress in list(capacity._progress):
         progress.shutdown()
     assert capacity.reserved_slots == 0
+    assert not capacity._memory_stages
 
 
 def _pool(capacity, profile, name="task"):
@@ -122,7 +123,7 @@ def test_pressure_does_not_revoke_downstream_credit_after_producers_started(memo
     pool = _pool(memory_capacity, profile)
     producer = pool.create_task_authority(progress.bind("producer"))
     consumer = pool.create_task_authority(progress.bind("consumer"))
-    producers = [producer.try_acquire(0) for _ in range(3)]
+    producers = [producer.try_acquire(0) for _ in range(2)]
     assert all(lease is not None for lease in producers)
     memory_capacity._available_memory = lambda: 0
     memory_capacity._memory_sample_time = 0
@@ -144,6 +145,145 @@ def test_budget_is_shared_with_other_profiles_and_declared_heap(memory_capacity)
     for lease in leases:
         lease.release()
     release_resident()
+
+
+def test_heavy_stage_uses_shared_surplus_without_spending_downstream_protection(memory_capacity):
+    # Reproduce the audio shape: one heavy stage formerly stopped at one task
+    # because its estimate exceeded half its fixed share of a three-way split.
+    heavy = LocalTaskMemory(peak_bytes=GiB, completed=100)
+    small = LocalTaskMemory(peak_bytes=GiB // 8, completed=100)
+    resources = {key: ResourceVector(cpu=1) for key in ("heavy", "decode", "resample")}
+    progress = memory_capacity.reserve_task_progress(
+        resources, memory={"heavy": heavy, "decode": small, "resample": small}
+    )
+    producer = _pool(memory_capacity, heavy, "heavy").create_task_authority(progress.bind("heavy"))
+    leases = [producer.try_acquire(0) for _ in range(2)]
+    assert all(lease is not None for lease in leases)
+    assert producer.try_acquire(0) is None
+    snapshot = memory_capacity.resource_snapshot()["observed_task_memory"]
+    assert snapshot["shared_pool_bytes"] > 0
+    assert snapshot["shared_used_bytes"] > 0
+    downstream = _pool(memory_capacity, small, "small")
+    for node in ("decode", "resample"):
+        lease = downstream.create_task_authority(progress.bind(node)).try_acquire(0)
+        assert lease is not None
+        leases.append(lease)
+    for lease in leases:
+        lease.release()
+
+
+def test_competing_profiles_cannot_each_spend_the_same_shared_capacity(memory_capacity):
+    profiles = [LocalTaskMemory(peak_bytes=GiB, completed=100) for _ in range(2)]
+    left, right = [_pool(memory_capacity, profile, str(i)).create_authority() for i, profile in enumerate(profiles)]
+    leases = [left.try_acquire(0), right.try_acquire(0), left.try_acquire(0)]
+    assert all(lease is not None for lease in leases)
+    assert left.try_acquire(0) is None
+    right_extra = right.try_acquire(0)
+    assert right_extra is not None
+    leases.append(right_extra)
+    assert left.try_acquire(0) is None and right.try_acquire(0) is None
+    assert memory_capacity.resource_snapshot()["observed_task_memory"]["usage_bytes"] == 6 * GiB
+    for lease in leases:
+        lease.release()
+
+
+@pytest.mark.parametrize("close_owner", ["authority", "pool", "query"])
+def test_closed_owner_keeps_live_heap_charged_until_execution_finishes(memory_capacity, close_owner):
+    heavy = LocalTaskMemory(peak_bytes=2 * GiB, completed=100)
+    pool = _pool(memory_capacity, heavy, "closing")
+    progress = None
+    if close_owner == "query":
+        progress = memory_capacity.reserve_task_progress({"task": ResourceVector(cpu=1)}, memory={"task": heavy})
+    authority = pool.create_task_authority(None if progress is None else progress.bind("task"))
+    live = [authority.try_acquire(0), authority.try_acquire(0)]
+    assert all(lease is not None for lease in live)
+    if close_owner == "query":
+        progress.shutdown()
+    else:
+        (pool if close_owner == "pool" else authority).close()
+    peer = _pool(memory_capacity, LocalTaskMemory(peak_bytes=GiB, completed=100), "peer").create_authority()
+    first = peer.try_acquire(0)
+    assert first is not None
+    snapshot = memory_capacity.resource_snapshot()["observed_task_memory"]
+    assert snapshot["usage_bytes"] == 15 * GiB // 2
+    assert snapshot["retired_usage_bytes"] == 6 * GiB
+    peer.request(0)
+    assert not peer.state()["available"]
+    live[0].complete_execution()
+    assert peer.state()["available"]
+    second = peer.take(0)
+    for lease in [*live, first, second]:
+        lease.release()
+    assert heavy.inflight == 0
+
+
+def test_same_stage_authorities_share_one_calibration_and_budget(memory_capacity):
+    profile = LocalTaskMemory()
+    progress = memory_capacity.reserve_task_progress({"task": ResourceVector(cpu=1)}, memory={"task": profile})
+    pool = _pool(memory_capacity, profile)
+    first_owner = pool.create_task_authority(progress.bind("task"))
+    second_owner = pool.create_task_authority(progress.bind("task"))
+    first = first_owner.try_acquire(0)
+    assert first is not None
+    assert second_owner.try_acquire(0) is None
+    first_owner.close()
+    assert second_owner.try_acquire(0) is None
+    first.release()
+    second = second_owner.try_acquire(0)
+    assert second is not None
+    second.release()
+
+
+def test_releasing_an_idle_stage_reassigns_its_share_and_wakes_a_waiter(memory_capacity):
+    profiles = [LocalTaskMemory(peak_bytes=GiB, completed=100) for _ in range(2)]
+    busy, idle = [_pool(memory_capacity, profile, str(i)).create_authority() for i, profile in enumerate(profiles)]
+    leases = [busy.try_acquire(0), busy.try_acquire(0)]
+    assert all(lease is not None for lease in leases)
+    busy.request(0)
+    assert not busy.state()["available"]
+    idle.close()
+    assert busy.state()["available"]
+    leases.append(busy.take(0))
+    for lease in leases:
+        lease.release()
+
+
+def test_idle_cache_can_keep_workers_supported_by_shared_capacity(memory_capacity):
+    heavy = LocalTaskMemory(peak_bytes=GiB, completed=100)
+    small = LocalTaskMemory(peak_bytes=GiB // 8, completed=100)
+    _pool(memory_capacity, heavy, "heavy").create_authority()
+    _pool(memory_capacity, small, "small").create_authority()
+    assert memory_capacity.task_memory_limit(heavy) == 3
+    memory_capacity._available_memory = lambda: 0
+    memory_capacity._memory_sample_time = 0
+    assert memory_capacity.task_memory_limit(heavy) == 1
+
+
+def test_transport_wait_retains_observed_heap_and_leaves_downstream_capacity(memory_capacity):
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
+
+    memory_capacity.resource_limit = ResourceVector(cpu=1, heap_bytes=20 * GiB)
+    memory_capacity._task_memory_budget = 3 * GiB
+    profiles = [LocalTaskMemory(peak_bytes=GiB, completed=100) for _ in range(2)]
+    producer, consumer = [
+        _pool(memory_capacity, profile, str(i)).create_authority() for i, profile in enumerate(profiles)
+    ]
+    upstream = producer.try_acquire(0)
+    assert upstream is not None
+    try:
+        with upstream.suspend_for_wait(ExecutionCancellationScope("memory transport", 1)):
+            assert producer.try_acquire(0) is None
+            downstream = consumer.try_acquire(0)
+            assert downstream is not None
+            try:
+                snapshot = memory_capacity.resource_snapshot()
+                assert snapshot["usage"]["cpu"] == 1
+                assert snapshot["observed_task_memory"]["usage_bytes"] == 3 * GiB
+                assert profiles[0].inflight == 1
+            finally:
+                downstream.release()
+    finally:
+        upstream.release()
 
 
 @pytest.mark.parametrize("close_pool", [False, True])

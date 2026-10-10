@@ -1210,20 +1210,38 @@ An unmeasured pool starts with one task per prepared stage; completed tasks
 allow gradual growth. Observations use worker high-water RSS on Linux, current
 RSS on macOS, and peak working set on Windows. Admission uses 1.5 times the largest observation,
 with a 64 MiB minimum estimate. Half of the initially available process memory
-is shared across prepared task stages, leaving headroom for models, native
-execution and shared-memory transport. Declared heap reservations reduce that
-budget. Low current available memory reduces admission to the progress minimum,
-and surplus cached workers retire when their tasks complete.
+forms a shared budget, leaving headroom for models, native execution and
+shared-memory transport. Declared heap reservations reduce that budget.
+
+Observed heap uses the same reservation allocator, default reservation ratio
+(`0.5`) and shared-capacity calculation as the Ray query resource manager.
+When the budget fits the aggregate minimum, each prepared task stage protects
+one task's estimated cost; half the surplus is distributed among stages as
+additional protection and the rest stays shared. Smaller budgets apportion
+protection by task cost, while the first-task progress allowance remains.
+Reservations are capped by each stage's achievable concurrency, and unused
+capped capacity stays in the shared pool. A stage can use this pool beyond its
+own reservation without taking another stage's protection. The entire budget
+is no longer divided into fixed, equal per-stage ceilings. Worker pools share
+memory observations, while each prepared stage owns its admission allowance.
+Low current available memory reduces admission to the progress minimum, and
+surplus cached workers retire when their tasks complete.
 
 Every prepared stage retains a first-task allowance, including multiple stages
 sharing one worker pool. Transport waiters retain their observed-memory slot;
-task completion returns it even when output is still buffered. This avoids
+task completion returns it even when output is still buffered. Closing a query,
+executor or pool does not erase the cost of its still-running tasks. This avoids
 blocking the consumer needed to release upstream output. Observations are an
 admission heuristic, not an OS memory limit: a single task, an unexpectedly
 larger later batch, or the pipeline's minimum working set can still exceed
 available memory. Declare `memory_bytes` when a known working-set reservation
 is required. Runtime process-resource snapshots include learned task peaks,
-estimates and in-flight counts.
+estimates, in-flight counts, protected bytes, and shared-pool usage.
+The common budget policy takes costs from backend-specific sources: local
+undeclared tasks use these measurements, whereas Ray heap admission uses
+explicit `memory_bytes`. Equal declared and observed costs use the same
+reservation and sharing arithmetic; this does not make the memory estimates,
+physical capacity enforcement, or complete backend scheduling identical.
 
 Retiring an idle task worker tolerates an exit deadline after a successful
 close acknowledgement only if forced termination, reaping and all resource

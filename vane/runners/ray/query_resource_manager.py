@@ -13,13 +13,15 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
 from vane.execution.byte_budget import (
+    DEFAULT_RESOURCE_RESERVATION_RATIO,
     ByteBudgetUsage,
     allocate_resource_reservations,
     build_byte_budget_state,
     byte_budget_block_reason,
+    resource_budget_remaining,
 )
+from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.runners.ray.admission_ledger import BoundedSet
 from vane.runners.ray.query_resource_graph import (
@@ -233,7 +235,7 @@ class RayQueryResourceManager:
         allocation: QueryAllocation,
         *,
         admission_open: bool = True,
-        reservation_ratio: float = 0.5,
+        reservation_ratio: float = DEFAULT_RESOURCE_RESERVATION_RATIO,
         on_change: Callable[[], None] | None = None,
         on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
     ) -> None:
@@ -1564,24 +1566,17 @@ class RayQueryResourceManager:
             if amount <= 0:
                 continue
             assert usage_by_unit is not None
-            dimension_unit_ids, reserved_by_unit, limit = self._dimension_reservations_locked(
+            _, reserved_by_unit, limit = self._dimension_reservations_locked(
                 field_name,
                 requested_unit_id=resource_unit_id,
             )
-            reserved = reserved_by_unit[resource_unit_id]
-            current_amount = getattr(usage_by_unit[resource_unit_id], field_name)
-            if current_amount + amount <= reserved + _EPSILON:
-                continue
-            shared_pool = max(0.0, limit - sum(reserved_by_unit.values()))
-            shared_used = sum(
-                max(
-                    0.0,
-                    getattr(usage_by_unit[key], field_name) - reserved_by_unit[key],
-                )
-                for key in dimension_unit_ids
+            remaining = resource_budget_remaining(
+                resource_unit_id,
+                usage={key: getattr(usage_by_unit[key], field_name) for key in reserved_by_unit},
+                reserved=reserved_by_unit,
+                limit=limit,
             )
-            shared_need = amount - max(0.0, reserved - current_amount)
-            if shared_used + shared_need > shared_pool + _EPSILON:
+            if amount > remaining + _EPSILON:
                 return f"unit_soft_{field_name}"
 
         if not ignore_object_store and request.object_store_bytes > 0:
