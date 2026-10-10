@@ -58,6 +58,54 @@ def _take(authority, retained=16):
     return authority.take(retained)
 
 
+@pytest.mark.parametrize("transport_limit", ["auto", "4MiB", "unbounded"])
+@pytest.mark.parametrize("fraction", ["0.5", "0.25", "1"])
+def test_query_capacity_uses_pinned_physical_store_once(monkeypatch, transport_limit, fraction):
+    from vane.execution import udf_shm_store as storage
+    from vane.execution import udf_subprocess
+
+    capacity = 64 << 20
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(capacity))
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", transport_limit)
+    monkeypatch.setenv("VANE_QUERY_OBJECT_STORE_FRACTION", fraction)
+    nodes = [{"node_id": "0", "payload": {"execution_backend": "subprocess_task"}}]
+    resources, _ = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(
+        nodes, resource_graph=linear_metadata(nodes)
+    )
+    try:
+        query = next(owner for owner in resources if isinstance(owner, LocalQueryAdmission))
+        arena = next(owner for owner in resources if isinstance(owner, storage.LocalQueryShmStore))
+        assert query.manager.allocation.resources.object_store_bytes == int(capacity * float(fraction))
+        assert arena.store.snapshot()["mapped_capacity_bytes"] == 0
+        # Task-only queries prepare before their workers start. Their arena must
+        # match admission even if available memory changes before the first task.
+        monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "32MiB")
+        worker_store = storage.current_store("query-capacity-test")
+        try:
+            assert worker_store is arena.store
+            assert worker_store.capacity == capacity
+        finally:
+            worker_store.remove_client("query-capacity-test")
+        assert not arena.store._closed
+    finally:
+        for owner in reversed(resources):
+            owner.shutdown()
+    assert arena.store._closed
+
+
+def test_invalid_query_fraction_releases_arena_owner(monkeypatch):
+    from vane.execution import udf_shm_store as storage
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64MiB")
+    monkeypatch.setenv("VANE_QUERY_OBJECT_STORE_FRACTION", "nan")
+    before = storage.local_shm_store_snapshot()["clients"]
+    nodes = [{"node_id": "0", "payload": {"execution_backend": "subprocess_task"}}]
+    with pytest.raises(ValueError, match="VANE_QUERY_OBJECT_STORE_FRACTION"):
+        udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(nodes, resource_graph=linear_metadata(nodes))
+    assert storage.local_shm_store_snapshot()["clients"] == before
+
+
 @pytest.mark.parametrize("heap", [None, 100])
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("cpu", [3, 4])

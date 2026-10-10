@@ -98,7 +98,7 @@ from vane.execution.udf_local_resources import LocalProcessCapacityError, local_
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_process_group import WorkerProcessGroup
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
-from vane.execution.udf_shm_store import LocalShmStoreCapacityError, ParentShmPeer
+from vane.execution.udf_shm_store import LocalQueryShmStore, LocalShmStoreCapacityError, ParentShmPeer
 from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
@@ -2807,13 +2807,38 @@ class LocalSubprocessActorPool:
         if self._terminal_error is not None:
             raise RuntimeError(f"local subprocess actor pool failed: {self._terminal_error}") from self._terminal_error
 
-    def _spawn_worker(self, worker_idx: int) -> _SingleSubprocessExecutor:
-        return _SingleSubprocessExecutor(
-            self.payload,
-            worker_env=self._worker_env(worker_idx),
-            session_config=self.session_config,
-            startup_observer=lambda executor: self._track_replacing_executor(worker_idx, executor),
+    def _spawn_worker(
+        self, worker_idx: int, *, startup_cancellation: ExecutionCancellationScope | None = None
+    ) -> _SingleSubprocessExecutor:
+        starting_worker: _SingleSubprocessExecutor | None = None
+        startup_lock = threading.Lock()
+
+        def cancel_startup() -> None:
+            with startup_lock:
+                if starting_worker is not None:
+                    starting_worker._cancel_startup()
+
+        def observe_startup(worker: _SingleSubprocessExecutor) -> None:
+            nonlocal starting_worker
+            self._track_replacing_executor(worker_idx, worker)
+            with startup_lock:
+                starting_worker = worker
+                if startup_cancellation is not None and startup_cancellation.is_set():
+                    worker._cancel_startup()
+
+        unregister = (
+            startup_cancellation.register_cancel_wakeup(cancel_startup) if startup_cancellation is not None else None
         )
+        try:
+            return _SingleSubprocessExecutor(
+                self.payload,
+                worker_env=self._worker_env(worker_idx),
+                session_config=self.session_config,
+                startup_observer=observe_startup,
+            )
+        finally:
+            if unregister is not None:
+                unregister()
 
     def _set_terminal_error(self, error: BaseException) -> None:
         should_close_admission = False
@@ -2969,20 +2994,57 @@ class LocalSubprocessActorPool:
         if isinstance(self.admission_slots, LocalGpuExecutionSlotPool):
             self.admission_slots.retry_cleanup()
 
+    def _return_retired_worker(
+        self, worker_idx: int, worker_generation: int, worker: _SingleSubprocessExecutor
+    ) -> None:
+        with self._cond:
+            if (
+                not self._closed
+                and worker_idx < len(self._workers)
+                and self._worker_generations[worker_idx] == worker_generation
+                and self._workers[worker_idx] is worker
+            ):
+                # Acquisition checks is_reusable() and reconstructs this slot.
+                # Keep the closed worker as its owner until that handoff.
+                self._idle_workers.append((worker_idx, worker_generation))
+            self._cond.notify_all()
+
+    def _retire_worker(self, worker_idx: int, worker_generation: int, worker: _SingleSubprocessExecutor) -> None:
+        retired = False
+        try:
+            try:
+                worker.close(kill=True)
+            except BaseException as exc:
+                self._record_replacement_cleanup_error(worker_idx, "failed worker", exc)
+                return
+            retired = True
+        finally:
+            with self._cond:
+                self._replacing_workers.discard(worker_idx)
+                if retired:
+                    self._return_retired_worker(worker_idx, worker_generation, worker)
+                self._cond.notify_all()
+
     def _replace_worker(
         self,
         worker_idx: int,
         worker_generation: int,
         failed_worker: _SingleSubprocessExecutor,
+        *,
+        startup_cancellation: ExecutionCancellationScope | None = None,
     ) -> None:
+        return_retired = False
         try:
             try:
                 failed_worker.close(kill=True)
             except BaseException as exc:
                 self._record_replacement_cleanup_error(worker_idx, "failed worker", exc)
                 return
+            if startup_cancellation is not None and startup_cancellation.is_set():
+                return_retired = True
+                return
             try:
-                replacement = self._spawn_worker(worker_idx)
+                replacement = self._spawn_worker(worker_idx, startup_cancellation=startup_cancellation)
             except BaseException as exc:
                 with self._cond:
                     pool_closed = self._closed
@@ -2994,6 +3056,13 @@ class LocalSubprocessActorPool:
                     self._retain_cleanup_pending_worker(provisional_worker)
                 if pool_closed and (isinstance(exc, _SubprocessStartupCleanupError) or provisional_cleanup_pending):
                     self._record_replacement_cleanup_error(worker_idx, "replacement startup", exc)
+                elif (
+                    startup_cancellation is not None
+                    and startup_cancellation.is_set()
+                    and not isinstance(exc, _SubprocessStartupCleanupError)
+                    and not provisional_cleanup_pending
+                ):
+                    return_retired = True
                 elif not pool_closed:
                     self._set_terminal_error(
                         RuntimeError(f"failed to replace local subprocess actor {worker_idx}: {exc}")
@@ -3004,6 +3073,7 @@ class LocalSubprocessActorPool:
             with self._cond:
                 if (
                     self._closed
+                    or (startup_cancellation is not None and startup_cancellation.is_set())
                     or worker_idx >= len(self._workers)
                     or self._worker_generations[worker_idx] != worker_generation
                     or self._workers[worker_idx] is not failed_worker
@@ -3020,6 +3090,8 @@ class LocalSubprocessActorPool:
                 except BaseException as exc:
                     self._retain_cleanup_pending_worker(replacement)
                     self._record_replacement_cleanup_error(worker_idx, "replacement", exc)
+                else:
+                    return_retired = True
         finally:
             # Keep replacement ownership visible until a rejected replacement
             # has also finished closing. Shutdown uses this set as its join
@@ -3028,6 +3100,8 @@ class LocalSubprocessActorPool:
             with self._cond:
                 getattr(self, "_replacing_executors", {}).pop(worker_idx, None)
                 self._replacing_workers.discard(worker_idx)
+                if return_retired:
+                    self._return_retired_worker(worker_idx, worker_generation, failed_worker)
                 self._cond.notify_all()
 
     def _acquire_worker(
@@ -3069,7 +3143,7 @@ class LocalSubprocessActorPool:
                         self._cond.wait()
                         continue
                 assert replacement is not None
-                self._replace_worker(*replacement)
+                self._replace_worker(*replacement, startup_cancellation=scope)
         finally:
             unregister()
 
@@ -3187,7 +3261,7 @@ class LocalSubprocessActorPool:
         worker: _SingleSubprocessExecutor | None = None
         worker_pid = None
         reusable = False
-        replace_worker = False
+        retire_worker = False
         result: Any | None = None
         result_ready = False
         try:
@@ -3230,10 +3304,12 @@ class LocalSubprocessActorPool:
                             self._idle_workers.append((worker_idx, worker_generation))
                         elif not self._closed and worker_idx not in self._replacing_workers:
                             self._replacing_workers.add(worker_idx)
-                            replace_worker = True
+                            retire_worker = True
                         self._cond.notify_all()
-                    if replace_worker:
-                        self._replace_worker(worker_idx, worker_generation, worker)
+                    if retire_worker:
+                        # A cancelled invocation must finish after retiring its
+                        # worker, without waiting for another model to initialize.
+                        self._retire_worker(worker_idx, worker_generation, worker)
                 if _should_debug_submit(debug_seq):
                     _subprocess_debug_log(
                         "local_actor_pool_worker_finished "
@@ -3537,7 +3613,11 @@ def ensure_local_subprocess_actor_pools_for_plan(
     conn: Any = None,
 ) -> tuple[
     list[
-        LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress | LocalQueryAdmission
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
     ],
     dict[str, Any],
 ]:
@@ -3561,13 +3641,21 @@ def ensure_local_subprocess_actor_pools_for_nodes(
     set_handles: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
     list[
-        LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress | LocalQueryAdmission
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
     ],
     dict[str, Any],
 ]:
     """Pre-create local subprocess actors for already-collected UDF nodes."""
     created: list[
-        LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | LocalTaskProgress | LocalQueryAdmission
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
     ] = []
     actor_options_map: dict[str, Any] = {}
     udf_nodes = list(udf_nodes)
@@ -3721,7 +3809,8 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 env=os.environ,
             )
             runtime = _global_task_runtime()
-            store_limit = local_shm_ref_budget_snapshot()["limit_bytes"]
+            query_store = LocalQueryShmStore()
+            created.append(query_store)
             fraction = float(os.environ.get("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5"))
             heap_reserve = int(os.environ.get("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE", "0"))
             if not math.isfinite(fraction) or not 0 < fraction <= 1:
@@ -3735,7 +3824,7 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                         cpu=runtime.resource_limit.cpu,
                         heap_bytes=max(0, runtime.resource_limit.heap_bytes - heap_reserve),
                         gpu=len(gpu_devices),
-                        object_store_bytes=math.floor((store_limit or sys.maxsize) * fraction),
+                        object_store_bytes=math.floor(query_store.store.capacity * fraction),
                     ),
                     generation=1,
                 ),
