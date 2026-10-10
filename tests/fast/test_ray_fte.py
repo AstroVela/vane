@@ -12,6 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from vane.execution.query_resource_spec import (
+    QueryAllocation,
+    QueryResourceGraph,
+    ResourceUnitSpec,
+    ResourceVector,
+)
 from vane.runners.common import QueryDeadlineExceeded
 from vane.runners.fte import (
     ArbitrarySplitAssigner,
@@ -60,12 +66,6 @@ from vane.runners.ray.fragment_registry import (
 )
 from vane.runners.ray.fragment_worker_assignment import make_fte_assigner
 from vane.runners.ray.fragment_worker_results import fte_query_status
-from vane.runners.ray.query_resource_graph import (
-    QueryAllocation,
-    QueryResourceGraph,
-    ResourceUnitSpec,
-    ResourceVector,
-)
 from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_resource_graph,

@@ -502,8 +502,8 @@ import sys
 import vane
 before = set(sys.modules)
 from vane.execution.local_resource_graph import LocalResourceGraphAdapter
-assert 'vane.runners.ray.query_resource_graph' not in sys.modules
-assert 'vane.runners.ray.cluster_resource_coordinator' not in sys.modules
+assert 'vane.execution.query_resource_spec' not in sys.modules
+assert 'vane.execution.cluster_resource_policy' not in sys.modules
 assert not any(name == 'ray' or name.startswith('ray.') for name in set(sys.modules) - before)
 """,
         ],

@@ -207,16 +207,16 @@ def output_owner(request):
         def retained():
             return ledger.snapshot()["retained_bytes"]
     else:
-        from vane.execution.resources import ResourceVector
-        from vane.runners.ray.query_resource_graph import QueryAllocation, QueryResourceGraph, ResourceUnitSpec
-        from vane.runners.ray.query_resource_manager import (
+        from vane.execution.query_resource_policy import (
             OutputBlockLeaseOwner as RayOutputBlockLeaseOwner,
         )
-        from vane.runners.ray.query_resource_manager import (
+        from vane.execution.query_resource_policy import (
             OutputBlockRequest,
-            RayQueryResourceManager,
+            QueryResourceManager,
             TaskRequest,
         )
+        from vane.execution.query_resource_spec import QueryAllocation, QueryResourceGraph, ResourceUnitSpec
+        from vane.execution.resources import ResourceVector
 
         assert RayOutputBlockLeaseOwner is OutputBlockLeaseOwner
         unit = ResourceUnitSpec(
@@ -232,7 +232,7 @@ def output_owner(request):
             max_concurrency=None,
         )
         graph = QueryResourceGraph("q", "sha256:ownership-test", (unit,), (unit.resource_unit_id,))
-        manager = RayQueryResourceManager(
+        manager = QueryResourceManager(
             graph, QueryAllocation(resources=ResourceVector(cpu=1, object_store_bytes=1000), generation=1)
         )
         manager.update_unit_state(unit.resource_unit_id, runnable=True)

@@ -11,7 +11,6 @@ the executor as an opaque :class:`AdmissionLease`.
 from __future__ import annotations
 
 import threading
-import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -19,14 +18,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from vane.execution.byte_budget import (
-    DEFAULT_RESOURCE_RESERVATION_RATIO,
-    allocate_resource_reservations,
-    resource_budget_remaining,
-)
 from vane.execution.resources import ResourceVector
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
-from vane.execution.udf_local_memory import LocalTaskMemory
 from vane.execution.udf_local_resources import LocalProcessCapacityError
 
 
@@ -151,16 +144,6 @@ def _notify_slot_wakeups(wakeups: list[Callable[[], None]]) -> None:
         raise error
 
 
-@dataclass(eq=False)
-class _LocalTaskMemoryStage:
-    """One admission owner; worker pools share observations, not allowances."""
-
-    profile: LocalTaskMemory
-    resources: ResourceVector
-    inflight: int = 0
-    closed: bool = False
-
-
 class LocalExecutionCapacity:
     """Process resources shared by local task pools and resident actors.
 
@@ -170,14 +153,7 @@ class LocalExecutionCapacity:
     All pools use this ledger's lock to acquire slots and resources atomically.
     """
 
-    def __init__(
-        self,
-        *,
-        max_slots: int | None,
-        resource_limit: ResourceVector | None = None,
-        task_memory_budget: int = 0,
-        available_memory: Callable[[], int] | None = None,
-    ) -> None:
+    def __init__(self, *, max_slots: int | None, resource_limit: ResourceVector | None = None) -> None:
         if max_slots is not None and int(max_slots) <= 0:
             raise ValueError("max_slots must be positive")
         if resource_limit is None and max_slots is None:
@@ -199,11 +175,6 @@ class LocalExecutionCapacity:
         self._turn_pool: LocalExecutionSlotPool | None = None
         self._turn_remaining = 0
         self._deferred_guards: set[Callable[[], bool]] = set()
-        self._task_memory_budget = task_memory_budget
-        self._memory_stages: set[_LocalTaskMemoryStage] = set()
-        self._available_memory = available_memory
-        self._memory_headroom = task_memory_budget * 2
-        self._memory_sample_time = 0.0
 
     @property
     def reserved_slots(self) -> int:
@@ -222,9 +193,7 @@ class LocalExecutionCapacity:
     def _task_cpu_floor_locked(self) -> float:
         return max((query.cpu_floor for query in self._progress), default=0.0)
 
-    def reserve_task_progress(
-        self, requirements: dict[str, ResourceVector], *, memory: dict[str, LocalTaskMemory] | None = None
-    ) -> LocalTaskProgress:
+    def reserve_task_progress(self, requirements: dict[str, ResourceVector]) -> LocalTaskProgress:
         """Protect one heap reservation per task stage until query cleanup.
 
         Transport waiters cannot return heap. Every prepared task stage therefore
@@ -232,7 +201,7 @@ class LocalExecutionCapacity:
         CPU is reusable across waits, so only the largest task CPU is protected
         against new resident actors.
         """
-        progress = LocalTaskProgress(self, requirements, memory=memory)
+        progress = LocalTaskProgress(self, requirements)
         with self._lock:
             resident = sum(self._residents.values(), ResourceVector())
             needed = ResourceVector(
@@ -242,98 +211,7 @@ class LocalExecutionCapacity:
             if self.resource_limit is not None and not needed.fits_within(self.resource_limit):
                 raise LocalProcessCapacityError("local task progress exceeds available node CPU/heap resource capacity")
             self._progress.add(progress)
-            self._memory_stages.update(progress.memory_stages.values())
         return progress
-
-    def _memory_budget_locked(
-        self,
-    ) -> tuple[int, dict[_LocalTaskMemoryStage, int], dict[_LocalTaskMemoryStage, int | float]]:
-        """Use Ray's per-unit baselines, protected surplus and shared pool."""
-        budget = max(0, self._task_memory_budget - self._resources.heap_bytes - self._protected_heap_locked())
-        usage = {stage: stage.inflight * stage.profile.estimate_bytes for stage in self._memory_stages}
-        baselines = {stage: stage.profile.estimate_bytes for stage in self._memory_stages if not stage.closed}
-        maxima: dict[_LocalTaskMemoryStage, int] = {}
-        for stage, estimate in baselines.items():
-            concurrency = min(1 + stage.profile.completed, budget // estimate)
-            if self._max_slots is not None:
-                concurrency = min(concurrency, self._max_slots)
-            if self.resource_limit is not None and stage.resources.cpu > 0:
-                concurrency = min(concurrency, int((self.resource_limit.cpu + 1e-9) / stage.resources.cpu))
-            maxima[stage] = concurrency * estimate
-        reserved = allocate_resource_reservations(
-            baselines,
-            maxima,
-            limit=budget,
-            reservation_ratio=DEFAULT_RESOURCE_RESERVATION_RATIO,
-            integral=True,
-        )
-        return budget, usage, reserved
-
-    def _memory_pressure_locked(self, profile: LocalTaskMemory) -> bool:
-        if self._available_memory is not None:
-            now = time.monotonic()
-            if now - self._memory_sample_time >= 0.1:
-                self._memory_headroom = self._available_memory()
-                self._memory_sample_time = now
-            return self._memory_headroom < self._task_memory_budget // 4 + profile.estimate_bytes
-        return False
-
-    def _can_acquire_memory_locked(self, stage: _LocalTaskMemoryStage) -> bool:
-        if stage.closed:
-            return False
-        # Measurements and external pressure can shrink a soft budget while
-        # producers retain their heaps. Preserve one task per prepared stage
-        # so the downstream consumer can still drain those producers.
-        if stage.inflight == 0:
-            return True
-        profile = stage.profile
-        if stage.inflight >= 1 + profile.completed or self._memory_pressure_locked(profile):
-            return False
-        budget, usage, reserved = self._memory_budget_locked()
-        amount = profile.estimate_bytes
-        return sum(usage.values()) + amount <= budget and amount <= resource_budget_remaining(
-            stage, usage=usage, reserved=reserved, limit=budget
-        )
-
-    def _memory_limit_locked(self, profile: LocalTaskMemory) -> int:
-        """Bound a pool's idle cache by the capacity its stages could acquire."""
-        budget, usage, reserved = self._memory_budget_locked()
-        stages = {stage for stage in reserved if stage.profile is profile}
-        floor = len(stages)
-        if self._memory_pressure_locked(profile):
-            return floor
-        # Treat this pool's stages as one prospective cache owner. Reuse the
-        # admission arithmetic without charging its current tasks twice.
-        cache_usage: dict[object, int | float] = {
-            stage: amount for stage, amount in usage.items() if stage not in stages
-        }
-        other_usage = sum(cache_usage.values())
-        cache_usage[profile] = 0
-        cache_reserved: dict[object, int | float] = {
-            stage: amount for stage, amount in reserved.items() if stage not in stages
-        }
-        cache_reserved[profile] = sum(reserved[stage] for stage in stages)
-        available = min(
-            max(0, budget - other_usage),
-            resource_budget_remaining(profile, usage=cache_usage, reserved=cache_reserved, limit=budget),
-        )
-        return max(floor, min(floor * (1 + profile.completed), int(available) // profile.estimate_bytes))
-
-    def _close_memory_stage_locked(self, stage: _LocalTaskMemoryStage) -> None:
-        stage.closed = True
-        if stage.inflight == 0:
-            self._memory_stages.discard(stage)
-
-    def task_memory_limit(self, profile: LocalTaskMemory) -> int:
-        with self._lock:
-            return self._memory_limit_locked(profile)
-
-    def observe_task_memory(self, profile: LocalTaskMemory, peak_bytes: int) -> None:
-        with self._lock:
-            profile.peak_bytes = max(profile.peak_bytes, peak_bytes)
-            profile.completed += 1
-        # The finishing task returns its execution reservation next, waking the
-        # ordinary fair arbiter. Do not invoke user callbacks from measurement.
 
     def _can_acquire_locked(self, resources: ResourceVector, progress: LocalTaskProgressBinding | None = None) -> bool:
         if progress is not None and progress.query.closed:
@@ -342,19 +220,12 @@ class LocalExecutionCapacity:
         protected = ResourceVector(heap_bytes=self._protected_heap_locked() - credit)
         return not self._resuming and not self._slots_full_locked() and self._fits_locked(resources + protected)
 
-    def _return_ready_locked(
-        self,
-        resources: ResourceVector,
-        progress: LocalTaskProgressBinding | None = None,
-        authority: LocalSlotAdmissionAuthority | None = None,
-    ) -> None:
+    def _return_ready_locked(self, resources: ResourceVector, progress: LocalTaskProgressBinding | None = None) -> None:
         self._reserved -= 1
         self._resources -= resources
         self._task_resources -= resources
         if progress is not None:
             progress.release_locked()
-        if authority is not None:
-            authority._release_memory_locked()
         self._condition.notify_all()
 
     def reserve_resident(
@@ -408,34 +279,11 @@ class LocalExecutionCapacity:
 
     def resource_snapshot(self) -> dict[str, Any]:
         with self._lock:
-            memory_budget, memory_usage, memory_reserved = self._memory_budget_locked()
             return {
                 "limit": None if self.resource_limit is None else self.resource_limit.to_dict(),
                 "usage": self._resources.to_dict(),
                 "resident": sum(self._residents.values(), ResourceVector()).to_dict(),
                 "resuming_tasks": len(self._resuming),
-                "observed_task_memory": {
-                    "budget_bytes": self._task_memory_budget,
-                    "available_budget_bytes": memory_budget,
-                    "usage_bytes": sum(memory_usage.values()),
-                    "retired_usage_bytes": sum(amount for stage, amount in memory_usage.items() if stage.closed),
-                    "reserved_bytes": sum(memory_reserved.values()),
-                    "shared_pool_bytes": max(0, memory_budget - sum(memory_reserved.values())),
-                    "shared_used_bytes": sum(
-                        max(0, memory_usage[stage] - amount) for stage, amount in memory_reserved.items()
-                    ),
-                    "stages": len(memory_reserved),
-                    "pools": {
-                        pool._prefix: {
-                            "peak_bytes": pool._memory.peak_bytes,
-                            "estimate_bytes": pool._memory.estimate_bytes,
-                            "completed": pool._memory.completed,
-                            "inflight": pool._memory.inflight,
-                        }
-                        for pool in self._pools
-                        if pool._memory is not None
-                    },
-                },
                 "task_progress": {
                     "queries": len(self._progress),
                     "protected_heap_bytes": self._protected_heap_locked(),
@@ -518,8 +366,6 @@ class LocalExecutionCapacity:
             self._task_resources -= reservation.resources
             if reservation.progress is not None:
                 reservation.progress.release_locked()
-            if reservation.authority is not None:
-                reservation.authority._release_memory_locked()
             self._resources -= (
                 reservation.resources - reservation.cpu if reservation.suspended else reservation.resources
             )
@@ -531,21 +377,9 @@ class LocalExecutionCapacity:
 class LocalTaskProgress:
     """Query-owned minimum heap for all prepared subprocess task stages."""
 
-    def __init__(
-        self,
-        capacity: LocalExecutionCapacity,
-        requirements: dict[str, ResourceVector],
-        *,
-        memory: dict[str, LocalTaskMemory] | None = None,
-    ) -> None:
+    def __init__(self, capacity: LocalExecutionCapacity, requirements: dict[str, ResourceVector]) -> None:
         self.capacity = capacity
         self.requirements = dict(requirements)
-        self.memory = dict(memory or {})
-        if not self.memory.keys() <= self.requirements.keys():
-            raise ValueError("memory profiles require prepared task nodes")
-        self.memory_stages = {
-            node: _LocalTaskMemoryStage(profile, self.requirements[node]) for node, profile in self.memory.items()
-        }
         self.active = {node: 0 for node in requirements}
         self.total_heap = sum(resources.heap_bytes for resources in requirements.values())
         self.cpu_floor = max((resources.cpu for resources in requirements.values()), default=0.0)
@@ -566,8 +400,6 @@ class LocalTaskProgress:
                 return
             self.closed = True
             self.capacity._progress.remove(self)
-            for stage in self.memory_stages.values():
-                self.capacity._close_memory_stage_locked(stage)
             wakeups = self.capacity._dispatch_locked()
         _notify_slot_wakeups(wakeups)
 
@@ -601,12 +433,10 @@ class _LocalExecutionReservation:
         capacity: LocalExecutionCapacity,
         resources: ResourceVector,
         progress: LocalTaskProgressBinding | None = None,
-        authority: LocalSlotAdmissionAuthority | None = None,
     ) -> None:
         self.capacity = capacity
         self.resources = resources
         self.progress = progress
-        self.authority = authority
         self.cpu = ResourceVector(cpu=resources.cpu)
         self.suspended = False
         self.finished = False
@@ -659,7 +489,6 @@ class LocalExecutionSlotPool:
         execution_slot_prefix: str,
         execution_capacity: LocalExecutionCapacity | None = None,
         resources: ResourceVector = ResourceVector(),
-        memory: LocalTaskMemory | None = None,
     ) -> None:
         slot_count = int(max_slots)
         if slot_count <= 0:
@@ -670,9 +499,6 @@ class LocalExecutionSlotPool:
         self._prefix = prefix
         self._execution_capacity = execution_capacity
         self._resources = resources
-        self._memory = memory
-        if memory is not None and (execution_capacity is None or execution_capacity._task_memory_budget <= 0):
-            raise ValueError("observed task memory requires an execution memory budget")
         if execution_capacity is not None and execution_capacity.resource_limit is not None:
             if not resources.fits_within(execution_capacity.resource_limit):
                 raise ValueError("local task exceeds the node CPU/heap resource capacity")
@@ -705,6 +531,9 @@ class LocalExecutionSlotPool:
     def create_task_authority(self, progress: LocalTaskProgressBinding | None = None) -> LocalSlotAdmissionAuthority:
         return LocalSlotAdmissionAuthority(slot_pool=self, progress=progress)
 
+    def _select_slot_locked(self, authority: LocalSlotAdmissionAuthority | None) -> int | None:
+        return self._available_slots[0] if self._available_slots else None
+
     def _try_take_slot_locked(
         self,
         source: int = 0,
@@ -717,11 +546,9 @@ class LocalExecutionSlotPool:
             capacity is not None and not capacity._can_acquire_locked(self._resources, progress)
         ):
             return None
-        if self._memory is not None:
-            assert capacity is not None and authority is not None
-            assert authority._memory_stage is not None
-            if not capacity._can_acquire_memory_locked(authority._memory_stage):
-                return None
+        slot = self._select_slot_locked(authority)
+        if slot is None:
+            return None
         if capacity is not None:
             if capacity._dispatch_requested and not capacity._dispatching:
                 return None
@@ -751,11 +578,6 @@ class LocalExecutionSlotPool:
         # this source's fair turn are available. It must not invoke callbacks.
         if guard is not None and not guard():
             return None
-        if self._memory is not None:
-            assert authority is not None
-            assert authority._memory_stage is not None
-            self._memory.inflight += 1
-            authority._memory_stage.inflight += 1
         if self._dispatching:
             self._turn_remaining -= 1
         self._deferred_guards.clear()
@@ -771,7 +593,8 @@ class LocalExecutionSlotPool:
                 capacity._turn_remaining -= 1
             capacity._pools.pop(self)
             capacity._pools[self] = None
-        return self._available_slots.popleft()
+        self._available_slots.remove(slot)
+        return slot
 
     def _dispatch_waiters_locked(self) -> list[Callable[[], None]]:
         wakeups: list[Callable[[], None]] = []
@@ -883,9 +706,8 @@ class LocalExecutionSlotPool:
             elif authority._state == "ready" and authority._ready_slot is not None:
                 self._available_slots.append(authority._ready_slot)
                 if self._execution_capacity is not None:
-                    self._execution_capacity._return_ready_locked(self._resources, authority._progress, authority)
+                    self._execution_capacity._return_ready_locked(self._resources, authority._progress)
             authority._state = "closed"
-            authority._close_memory_locked()
             authority._request_id = ""
             authority._retained_input_bytes = 0
             authority._ready_slot = None
@@ -910,9 +732,8 @@ class LocalExecutionSlotPool:
             self._waiters.clear()
             for authority in authorities:
                 if authority._ready_slot is not None and self._execution_capacity is not None:
-                    self._execution_capacity._return_ready_locked(self._resources, authority._progress, authority)
+                    self._execution_capacity._return_ready_locked(self._resources, authority._progress)
                 authority._state = "closed"
-                authority._close_memory_locked()
                 authority._request_id = ""
                 authority._retained_input_bytes = 0
                 authority._ready_slot = None
@@ -951,7 +772,6 @@ class LocalSlotAdmissionAuthority:
             raise ValueError("slot_pool cannot be combined with max_slots or execution_slot_prefix")
         self._pool = slot_pool
         self._progress = progress
-        self._memory_stage: _LocalTaskMemoryStage | None = None
         self._state = "idle"
         self._request_id = ""
         self._retained_input_bytes = 0
@@ -968,34 +788,9 @@ class LocalSlotAdmissionAuthority:
                 or progress.query.closed
                 or progress.query not in progress.query.capacity._progress
                 or progress.query.requirements.get(progress.node_id) != self._pool._resources
-                or progress.query.memory.get(progress.node_id) is not self._pool._memory
             ):
                 raise ValueError("task progress binding does not match its pool resources")
             self._pool._authorities.add(self)
-            if self._pool._memory is not None:
-                capacity = self._pool._execution_capacity
-                assert capacity is not None
-                if progress is not None:
-                    self._memory_stage = progress.query.memory_stages[progress.node_id]
-                else:
-                    self._memory_stage = _LocalTaskMemoryStage(self._pool._memory, self._pool._resources)
-                    capacity._memory_stages.add(self._memory_stage)
-
-    def _release_memory_locked(self) -> None:
-        if self._pool._memory is not None:
-            self._pool._memory.inflight -= 1
-            stage = self._memory_stage
-            capacity = self._pool._execution_capacity
-            assert stage is not None and capacity is not None
-            stage.inflight -= 1
-            if stage.closed and stage.inflight == 0:
-                capacity._memory_stages.discard(stage)
-
-    def _close_memory_locked(self) -> None:
-        if self._memory_stage is not None and self._progress is None:
-            capacity = self._pool._execution_capacity
-            assert capacity is not None
-            capacity._close_memory_stage_locked(self._memory_stage)
 
     @property
     def active_lease_count(self) -> int:
@@ -1005,6 +800,9 @@ class LocalSlotAdmissionAuthority:
     def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         with self._pool._lock:
             self._wakeup = callback
+
+    def select_actor(self, actor_index: int) -> None:
+        raise ValueError("task admission has no actor replica")
 
     def register_capacity_wakeup(self, callback: Callable[[], None]) -> None:
         with self._pool._lock:
@@ -1103,10 +901,14 @@ class LocalSlotAdmissionAuthority:
         self._active_lease_ids.add(lease_id)
         capacity = self._pool._execution_capacity
         reservation = (
-            None
-            if capacity is None
-            else _LocalExecutionReservation(capacity, self._pool._resources, self._progress, self)
+            None if capacity is None else _LocalExecutionReservation(capacity, self._pool._resources, self._progress)
         )
+
+        def complete() -> None:
+            if reservation is not None:
+                reservation.complete()
+            self._pool._release(lease_id)
+
         return AdmissionLease(
             request_id=request_id,
             retained_input_bytes=retained,
@@ -1116,7 +918,7 @@ class LocalSlotAdmissionAuthority:
                 "slot_index": slot,
             },
             _release_callback=lambda: self._pool._release(lease_id),
-            _execution_finished_callback=None if reservation is None else reservation.complete,
+            _execution_finished_callback=complete,
             _capacity_wait_context=None if reservation is None else reservation.suspend,
         )
 

@@ -10,6 +10,13 @@ import pytest
 import vane
 import vane.runners.progress as progress_mod
 import vane.runners.progress as shared_progress_mod
+from vane.execution.query_resource_policy import TaskRequest
+from vane.execution.query_resource_spec import (
+    QueryAllocation,
+    QueryResourceGraph,
+    ResourceUnitSpec,
+    ResourceVector,
+)
 from vane.runners.fte import FteTaskExecution
 from vane.runners.progress import (
     LocalProgressSnapshotStore,
@@ -21,13 +28,6 @@ from vane.runners.progress import (
     format_progress_snapshot,
     progress_enabled,
 )
-from vane.runners.ray.query_resource_graph import (
-    QueryAllocation,
-    QueryResourceGraph,
-    ResourceUnitSpec,
-    ResourceVector,
-)
-from vane.runners.ray.query_resource_manager import TaskRequest
 from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_resource_graph,

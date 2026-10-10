@@ -498,7 +498,8 @@ private:
 				auto subprocess_module = pybind11::module_::import("vane.execution.udf_subprocess");
 				auto result = pybind11::reinterpret_borrow<pybind11::tuple>(
 				    subprocess_module.attr("ensure_local_subprocess_actor_pools_for_nodes")(
-				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared)));
+				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared),
+				        pybind11::arg("resource_graph") = CollectNativeLocalResourceGraph(context, prepared)));
 				auto created = result[0];
 				auto handles_map = result[1];
 				AppendCreatedResources(resources, created);

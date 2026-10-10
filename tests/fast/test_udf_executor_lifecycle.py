@@ -18,6 +18,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
+from tests.local_admission_helpers import linear_metadata
+
 pytest.importorskip("pyarrow")
 
 import pyarrow as pa
@@ -2138,6 +2140,9 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
                 },
             ]
 
+        def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+            return linear_metadata(self.collect_udf_nodes(conn))
+
         def set_udf_actor_handles(self, handles_map, conn=None):
             self.set_calls.append((handles_map, conn))
 
@@ -2147,13 +2152,13 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_plan(plan, conn="conn")
 
     try:
-        assert len(created) == 2
+        assert len(created) == 3
         assert created_args[0][1] == 3
-        assert isinstance(created[1], LocalTaskProgress)
+        assert isinstance(created[2], LocalTaskProgress)
         assert set(handles_map) == {"7", "8"}
-        assert handles_map["7"] == {"local_actor_pool": created[0]}
+        assert handles_map["7"]["local_actor_pool"] is created[1]
         binding = handles_map["8"]["local_task_progress"]
-        assert binding.query is created[1]
+        assert binding.query is created[2]
         assert binding.node_id == "8"
         assert plan.set_calls == [(handles_map, "conn")]
     finally:
@@ -2213,23 +2218,25 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
 
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(
         nodes,
+        resource_graph=linear_metadata(nodes),
         plan_identity="direct-plan",
         set_handles=inject,
     )
 
     try:
-        assert len(created) == 2
+        assert len(created) == 3
         assert created_args[0][1] == 2
         assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
         assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
-        assert isinstance(created[1], LocalTaskProgress)
+        assert isinstance(created[2], LocalTaskProgress)
         assert set(handles_map) == {"4", "5"}
         assert handles_map["4"] == {
-            "local_actor_pool": created[0],
+            "local_actor_pool": created[1],
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
+            "local_query_admission": handles_map["4"]["local_query_admission"],
         }
         binding = handles_map["5"]["local_task_progress"]
-        assert binding.query is created[1]
+        assert binding.query is created[2]
         assert binding.node_id == "5"
         assert injected == [handles_map]
     finally:
@@ -2294,13 +2301,17 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create a duplicate pool")),
     )
 
-    created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+    created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(
+        nodes, resource_graph=linear_metadata(nodes)
+    )
 
-    assert created == []
+    assert len(created) == 1
+    created[0].shutdown()
     assert handles_map == {
         "4": {
             "session_config": session_config,
             "local_actor_pool": existing_pool,
+            "local_query_admission": handles_map["4"]["local_query_admission"],
         }
     }
 
@@ -2349,7 +2360,7 @@ def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reus
     ]
 
     with pytest.raises(ValueError, match="belongs to a different Vane session"):
-        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes, resource_graph=linear_metadata(nodes))
 
 
 def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
@@ -2435,6 +2446,9 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
                     },
                 },
             ]
+
+        def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+            return linear_metadata(self.collect_udf_nodes(conn))
 
         def set_udf_actor_handles(self, handles_map, conn=None):
             raise RuntimeError("inject failed")
@@ -3923,49 +3937,6 @@ def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(mo
     assert ref_bundle.can_claim_local_shm_ref_output_budget(200)
 
 
-def test_local_shm_ref_bundle_submit_admission_allows_small_consumer_when_hard_budget_full(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(995, name="full")
-
-    assert not ref_bundle.can_claim_local_shm_ref_output_budget(10)
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(10)
-
-
-def test_local_shm_ref_bundle_submit_admission_throttles_large_producer_at_soft_watermark(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(700, name="backlog")
-
-    assert ref_bundle.can_claim_local_shm_ref_output_budget(100)
-    assert not ref_bundle.can_admit_local_shm_ref_output_submit(100)
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(10)
-
-
-def test_local_shm_ref_bundle_submit_admission_counts_projected_inflight_output(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(600, name="backlog")
-
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(100)
-    assert not ref_bundle.can_admit_local_shm_ref_output_submit(100, projected_output_bytes=100)
-
-
 def test_local_shm_ref_output_budget_cancel_wait_is_event_driven(monkeypatch):
     import vane.execution.ref_bundle as ref_bundle
 
@@ -4558,7 +4529,6 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
     )
     executor = subprocess_exec.UDFExecutor(payload)
     try:
-        assert executor._output_budget_estimate(2) >= 2 * 3 * 4 * 4
         _submit_with_admission(executor, pa.table({"x": [1, 2]}), submit_id=175)
         wrapped = _wait_for_results(executor, 1, timeout_s=10.0)[0]
 
@@ -4579,15 +4549,10 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
         subprocess_exec._shutdown_global_task_runtime()
 
 
-def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypatch):
+def test_subprocess_ref_bundle_output_stats_report_physical_budget(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
-    monkeypatch.setattr(
-        subprocess_exec,
-        "can_admit_local_shm_ref_output_submit",
-        lambda _size, *, projected_output_bytes=0: False,
-    )
     monkeypatch.setattr(
         subprocess_exec,
         "local_shm_ref_budget_snapshot",
@@ -4622,44 +4587,13 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
         )
     )
     try:
-        assert executor._output_budget_estimate(2) >= 2 * 3 * 4 * 4
         stats = executor.stats()
-        assert stats["udf_output_budget_available"] == 0
-        assert stats["udf_output_budget_estimated_bytes"] >= 2 * 3 * 4 * 4
+        assert "udf_output_budget_available" not in stats
         assert stats["udf_output_budget_limit_bytes"] == 100
         assert stats["udf_output_budget_usage_bytes"] == 99
     finally:
         executor.close(kill=True)
         subprocess_exec._shutdown_global_task_runtime()
-
-
-def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
-    from vane.execution.udf_subprocess import UDFExecutor
-
-    def make_output(table):
-        return pa.table({"blob": table.column("x")})
-
-    executor = UDFExecutor(
-        _subprocess_map_payload(
-            make_output,
-            execution_backend="subprocess_task",
-            produce_ref_bundle_output=True,
-            streaming_output_mode="local_shm_ref_bundle",
-            output_schema=[
-                {
-                    "name": "blob",
-                    "kind": "duckdb_type",
-                    "type": "BLOB",
-                    "dtype": "",
-                    "shape": [],
-                }
-            ],
-        )
-    )
-    try:
-        assert executor._output_budget_estimate(64) >= 64 * (1 << 20)
-    finally:
-        executor.close(kill=True)
 
 
 def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch, pooled_shm_worker):
@@ -5802,7 +5736,7 @@ def test_local_subprocess_actor_pool_rollback_preserves_owned_constructor_failur
     ]
 
     with pytest.raises(subprocess_exec._OwnedLocalSubprocessActorPoolsError) as exc_info:
-        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes, resource_graph=linear_metadata(nodes))
 
     assert exc_info.value.creation_error is creation_error
     assert exc_info.value.owned_actor_pools == [pending_pool]
@@ -6117,7 +6051,7 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
     class FakeActorPool:
         pool_size = 1
 
-        def submit(self, _fn, scope, _debug_seq):
+        def submit(self, _fn, scope, _debug_seq, *, admission=None):
             events.append(f"submit:{scope.generation}")
             raise RuntimeError("planned actor submit failure")
 
@@ -6264,56 +6198,12 @@ def test_subprocess_submit_without_worker_owner_fails_fast():
     assert executor._task_futures == set()
 
 
-def test_subprocess_ref_bundle_output_stats_include_pending_projected_bytes(monkeypatch):
-    import vane.execution.udf_subprocess as subprocess_exec
+def test_subprocess_stats_do_not_add_a_second_task_output_gate():
+    from vane.execution.udf_subprocess import UDFExecutor
 
-    calls = []
-
-    def fake_admit(size, *, projected_output_bytes=0):
-        calls.append((int(size), int(projected_output_bytes)))
-        return projected_output_bytes == 0
-
-    monkeypatch.setattr(subprocess_exec, "can_admit_local_shm_ref_output_submit", fake_admit)
-    monkeypatch.setattr(
-        subprocess_exec,
-        "local_shm_ref_budget_snapshot",
-        lambda: {
-            "limit_bytes": 1000,
-            "usage_bytes": 600,
-            "reserved_bytes": 600,
-            "pending_output_bytes": 0,
-        },
-    )
-
-    def make_output(table):
-        return pa.table({"blob": table.column("x")})
-
-    executor = subprocess_exec.UDFExecutor(
-        _subprocess_map_payload(
-            make_output,
-            execution_backend="subprocess_task",
-            produce_ref_bundle_output=True,
-            streaming_output_mode="local_shm_ref_bundle",
-            output_schema=[
-                {
-                    "name": "blob",
-                    "kind": "duckdb_type",
-                    "type": "BLOB",
-                    "dtype": "",
-                    "shape": [],
-                }
-            ],
-        )
-    )
-    try:
-        estimated = executor._output_budget_estimate(64)
-        with executor._pending_lock:
-            executor._pending_batches = 3
-        stats = executor.stats()
-        assert stats["udf_output_budget_available"] == 0
-        assert calls[-1] == (estimated, 3 * estimated)
-    finally:
-        executor.close(kill=True)
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._ref_bundle_output = True
+    assert "udf_output_budget_available" not in executor._output_budget_stats()
 
 
 def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
@@ -7026,7 +6916,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
     pool._aborting_workers = set()
     pool._idle_workers = deque()
     pool._workers = [worker]
-    pool._acquire_worker = lambda _scope: (0, 0, worker)
+    pool._acquire_worker = lambda _scope, *, replica=None: (0, 0, worker)
 
     with pytest.raises(ExecutionCancelledError, match="local subprocess actor result cancelled"):
         pool._run(lambda _worker: result, scope)
@@ -7539,7 +7429,7 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     assert snapshot["input_lease_bytes"] == 0
 
 
-def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed(monkeypatch):
+def test_subprocess_admission_returns_worker_slot_before_completed_result_is_consumed(monkeypatch):
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from vane.execution.udf_subprocess import UDFExecutor
 
@@ -7567,7 +7457,7 @@ def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consum
                     break
             time.sleep(0.005)
 
-        assert executor.task_admission_state()["state"] == "requested"
+        assert executor.task_admission_state()["state"] == "ready"
         first = executor.take_ready_result()
         assert first == (SUBMIT_RESULT_MARKER, 401, pa.table({"x": [1]}))
         assert executor.task_admission_state()["state"] == "ready"
@@ -10159,7 +10049,7 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
         def stats(self):
             return {"active_workers": 0, "idle_workers": 1}
 
-        def submit(self, _fn, _scope, _debug_seq):
+        def submit(self, _fn, _scope, _debug_seq, *, admission=None):
             submit_started.set()
             assert release_submit.wait(timeout=5.0)
             return submitted_future

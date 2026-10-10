@@ -14,14 +14,24 @@ from vane.execution.resource_graph import (
     ResourceGraph,
     _strict_fields,
 )
-
-# Keep the original import path valid for callers and serialized references.
 from vane.execution.resources import ResourceVector as ResourceVector
 
 _RESOURCE_UNIT_KIND_BY_BACKEND = {
     "ray_worker": "native_fragment",
     "ray_task": "ray_task_udf",
     "ray_actor": "ray_actor_pool",
+    "local_native": "native_fragment",
+    "subprocess_task": "subprocess_task_udf",
+    "subprocess_actor": "subprocess_actor_pool",
+}
+
+_EXECUTION_KIND_BY_BACKEND = {
+    "ray_worker": "native",
+    "local_native": "native",
+    "ray_task": "task",
+    "subprocess_task": "task",
+    "ray_actor": "actor",
+    "subprocess_actor": "actor",
 }
 
 
@@ -36,12 +46,10 @@ def _process_resources(resources: ResourceVector) -> ResourceVector:
 
 @dataclass(frozen=True)
 class QueryAllocation:
-    """One driver's aggregate soft budget for a query.
+    """One runner's aggregate soft budget for a query.
 
-    This is deliberately not a Ray placement claim. Concrete tasks and actors
-    carry their real resource requests to Ray Core, which owns node selection,
-    pending demand, and autoscaling. Vane uses this vector only to decide when
-    to apply query/operator backpressure.
+    Backends own placement and physical process capacity. This vector controls
+    the common query/operator admission and backpressure policy.
     """
 
     resources: ResourceVector
@@ -135,6 +143,10 @@ class ResourceUnitSpec:
     def output_window_bytes(self) -> int:
         return int(self.target_output_block_bytes) * int(self.generator_buffer_blocks)
 
+    @property
+    def execution_kind(self) -> str:
+        return _EXECUTION_KIND_BY_BACKEND[self.backend]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "query_id": self.query_id,
@@ -176,7 +188,7 @@ class ResourceUnitSpec:
 
 @dataclass(frozen=True)
 class QueryResourceGraph(ResourceGraph[ResourceUnitSpec]):
-    """Ray resource policy on the shared dependency graph."""
+    """Resource policy for local and Ray execution on one dependency graph."""
 
     def _validate_unit(self, unit: ResourceUnitSpec) -> None:
         super()._validate_unit(unit)
@@ -207,9 +219,9 @@ class QueryResourceGraph(ResourceGraph[ResourceUnitSpec]):
         if unit.max_concurrency is not None and int(unit.max_concurrency) <= 0:
             raise ValueError(f"unit {unit.resource_unit_id} max_concurrency must be > 0")
         process_resources = (
-            unit.resident_per_actor if unit.backend == "ray_actor" else _process_resources(unit.per_task)
+            unit.resident_per_actor if unit.execution_kind == "actor" else _process_resources(unit.per_task)
         )
-        if unit.backend == "ray_worker":
+        if unit.execution_kind == "native":
             if not process_resources.is_zero():
                 raise ValueError(f"native fragment unit {unit.resource_unit_id} process resources are owned by DuckDB")
         else:
@@ -218,7 +230,7 @@ class QueryResourceGraph(ResourceGraph[ResourceUnitSpec]):
 
         actor_pool_size = int(unit.actor_pool_size)
         actor_prefetch_depth = int(unit.actor_prefetch_depth)
-        if unit.backend == "ray_actor":
+        if unit.execution_kind == "actor":
             if actor_pool_size <= 0:
                 raise ValueError(f"ray_actor unit {unit.resource_unit_id} actor_pool_size must be > 0")
             if actor_prefetch_depth <= 0:
@@ -235,7 +247,7 @@ class QueryResourceGraph(ResourceGraph[ResourceUnitSpec]):
             raise ValueError(f"actor_prefetch_depth is only configurable for ray_actor units: {unit.resource_unit_id}")
         elif not unit.resident_per_actor.is_zero():
             raise ValueError(f"resident_per_actor is only valid for ray_actor units: {unit.resource_unit_id}")
-        if unit.backend == "ray_task" and unit.max_concurrency is not None:
+        if unit.execution_kind == "task" and unit.max_concurrency is not None:
             raise ValueError(f"ray_task unit {unit.resource_unit_id} concurrency is owned by resource credit")
 
     @classmethod

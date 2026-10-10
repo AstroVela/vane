@@ -14,8 +14,9 @@ import pytest
 import vane
 from vane._ray_cxx import validate_plan_serialization_for_submission
 from vane._ray_errors import RemoteRayException
-from vane.runners.ray.cluster_resource_coordinator import NodeCapacity
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.cluster_resource_policy import NodeCapacity
+from vane.execution.query_resource_demand import build_query_demand
+from vane.execution.query_resource_spec import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -377,7 +378,7 @@ def test_driver_opens_admission_with_a_zero_soft_budget_for_ray_core_liveness():
     snapshot = get_query_resource_manager(query_id).snapshot()
     assert snapshot["allocation"]["resources"] == ResourceVector().to_dict()
     assert snapshot["allocation_admission_open"] is True
-    assert snapshot["ray_core_owns_placement"] is True
+    assert snapshot["backend_owns_placement"] is True
     assert runner.curr_streams[query_id] == "stream"
 
 
@@ -920,16 +921,15 @@ def test_driver_database_disables_persistent_secrets_at_connect(monkeypatch):
 
 
 def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomically():
-    from vane.runners.ray.cluster_resource_coordinator import (
+    from vane.execution.cluster_resource_policy import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
+    from vane.execution.query_resource_policy import TaskRequest
     from vane.runners.ray.driver import RayQueryDriverActor
     from vane.runners.ray.query_resource_graph_builder import (
-        build_query_demand,
         build_query_resource_graph,
     )
-    from vane.runners.ray.query_resource_manager import TaskRequest
     from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -1045,7 +1045,7 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
 
 
 def test_driver_maintenance_reuses_a_valid_empty_capacity_snapshot_after_gcs_failure():
-    from vane.runners.ray.cluster_resource_coordinator import ClusterQueryResourceCoordinator
+    from vane.execution.cluster_resource_policy import ClusterQueryResourceCoordinator
     from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -1074,13 +1074,12 @@ def test_driver_maintenance_reuses_a_valid_empty_capacity_snapshot_after_gcs_fai
 
 
 def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
-    from vane.runners.ray.cluster_resource_coordinator import (
+    from vane.execution.cluster_resource_policy import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
     from vane.runners.ray.driver import RayQueryDriverActor
     from vane.runners.ray.query_resource_graph_builder import (
-        build_query_demand,
         build_query_resource_graph,
     )
     from vane.runners.ray.query_resource_runtime import register_query_resource_graph
@@ -1127,7 +1126,7 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
     assert snapshot["allocation_admission_open"] is True
     assert snapshot["allocation"]["resources"] == allocation.resources.to_dict()
     assert "node_allocations" not in snapshot["allocation"]
-    assert snapshot["ray_core_owns_placement"] is True
+    assert snapshot["backend_owns_placement"] is True
     assert coordinator.snapshot()["queries"][query_id]["state"] == "RUNNING"
     assert runner._query_terminal_errors == {}
     assert dropped == []
@@ -1135,13 +1134,13 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
 
 @pytest.mark.parametrize("live_actor", [False, True])
 def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier(live_actor):
-    from vane.runners.ray.cluster_resource_coordinator import (
+    from vane.execution.cluster_resource_policy import (
         ClusterQueryResourceCoordinator,
     )
+    from vane.execution.query_resource_demand import build_query_demand
+    from vane.execution.query_resource_policy import TaskRequest
+    from vane.execution.query_resource_spec import MaterializationBarrierSpec
     from vane.runners.ray.driver import RayQueryDriverActor
-    from vane.runners.ray.query_resource_graph import MaterializationBarrierSpec
-    from vane.runners.ray.query_resource_graph_builder import build_query_demand
-    from vane.runners.ray.query_resource_manager import TaskRequest
     from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -1303,8 +1302,8 @@ def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier(live_actor):
 
 
 def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():
+    from vane.execution.query_resource_policy import TaskRequest
     from vane.runners.ray.driver import RayQueryDriverActor
-    from vane.runners.ray.query_resource_manager import TaskRequest
     from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class

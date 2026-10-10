@@ -37,7 +37,7 @@ class FteWorkerPressureAccountingMixin:
         query_task_lease: Mapping[str, Any],
         outputs: list[Mapping[str, Any]],
     ) -> list[Any]:
-        from vane.runners.ray.query_resource_manager import (
+        from vane.execution.query_resource_policy import (
             OutputBlockLeaseOwner,
             OutputBlockRequest,
         )

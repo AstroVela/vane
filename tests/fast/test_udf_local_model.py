@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 import vane
+from tests.local_admission_helpers import PreparedOwners, linear_metadata
 from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
@@ -54,6 +55,9 @@ class _Plan:
     def collect_udf_nodes(self, conn=None):
         return self.nodes
 
+    def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+        return linear_metadata(self.nodes)
+
     def set_udf_actor_handles(self, options, conn=None):
         self.published.append(options)
         for node in self.nodes:
@@ -64,7 +68,7 @@ class _Plan:
 def _prepare(runtime, payload):
     plan = _Plan(payload)
     resources = runtime.prepare(plan, {"1": "model"})
-    return resources[0], plan.published[-1]["1"]
+    return PreparedOwners(resources), plan.published[-1]["1"]
 
 
 def _result(executor, value):
@@ -439,11 +443,11 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
         else:
             resources = runtime.prepare(plan, {"1": "model"})
             try:
-                assert len(resources) == 3
-                assert isinstance(resources[0], ModelPoolBorrow)
-                assert resources[1] is pools[1]
-                assert isinstance(resources[2], LocalTaskProgress)
-                assert published[0]["3"]["local_task_progress"].query is resources[2]
+                assert len(resources) == 4
+                assert any(isinstance(owner, ModelPoolBorrow) for owner in resources)
+                assert pools[1] in resources
+                progress = next(owner for owner in resources if isinstance(owner, LocalTaskProgress))
+                assert published[0]["3"]["local_task_progress"].query is progress
             finally:
                 for resource in reversed(resources):
                     resource.shutdown()
@@ -640,6 +644,7 @@ def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypat
             _submit(executor_b, pa.table({"x": [7]}))
             assert second_waiting.wait(10)
             executor_a.close(kill=True)
+            _wait_until(lambda: not executor_a.cleanup_pending(), "cancelled invocation did not finish cleanup")
             first.shutdown(kill=True)
             assert cancellations[0].is_set()
             assert not cancellations[1].is_set()
@@ -1173,16 +1178,18 @@ def test_runtime_task_completion_releases_global_quota_before_output_is_consumed
             assert same_pool.request_task_admission(8)
             assert other_pool.request_task_admission(8)
             _wait_until(
-                lambda: other_pool.task_admission_state()["available"], "other model did not get execution quota"
+                lambda: same_pool.task_admission_state()["available"], "older prefetched call did not get quota"
             )
             _wait_until(lambda: bool(first._queue), "completed output was not queued")
-            assert same_pool.task_admission_state()["state"] == "requested"
+            assert other_pool.task_admission_state()["state"] == "requested"
+            same_pool.submit(pa.table({"x": [3]}))
+            assert _wait_result(same_pool).to_pydict() == {"x": [3]}
+            _wait_until(
+                lambda: other_pool.task_admission_state()["available"], "other model did not get execution quota"
+            )
             other_pool.submit(pa.table({"x": [2]}))
             assert _wait_result(other_pool).to_pydict() == {"x": [2]}
             assert first.take_ready_result().to_pydict() == {"x": [1]}
-            _wait_until(lambda: same_pool.task_admission_state()["available"], "buffered result slot was not returned")
-            same_pool.submit(pa.table({"x": [3]}))
-            assert _wait_result(same_pool).to_pydict() == {"x": [3]}
         finally:
             for executor in executors:
                 executor.close(kill=True)
@@ -1286,8 +1293,10 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
             track_data=tracking != "tasks",
         )
         resources = runtime.prepare(plan, {}, conn=connection)
-        assert len(resources) == (3 if tracking == "both" else 2)
-        assert isinstance(resources[0], QueryDataScope if tracking == "data" else QueryTaskAdmission)
+        assert len(resources) == (4 if tracking == "both" else 3)
+        assert any(
+            isinstance(owner, QueryDataScope if tracking == "data" else QueryTaskAdmission) for owner in resources
+        )
         try:
             with pytest.raises(TimeoutError, match="active queries"):
                 runtime.close()

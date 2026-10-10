@@ -1205,43 +1205,23 @@ Shared-memory flow remains governed by its separate transport and data budgets.
 On Linux with cgroup v2, available process memory also respects containing
 cgroup limits.
 
-Tasks without `memory_bytes` use observed process memory to limit concurrency.
-An unmeasured pool starts with one task per prepared stage; completed tasks
-allow gradual growth. Observations use worker high-water RSS on Linux, current
-RSS on macOS, and peak working set on Windows. Admission uses 1.5 times the largest observation,
-with a 64 MiB minimum estimate. Half of the initially available process memory
-forms a shared budget, leaving headroom for models, native execution and
-shared-memory transport. Declared heap reservations reduce that budget.
+Tasks without `memory_bytes` have zero declared heap commitment, matching
+Ray. Worker RSS, including mapped shared memory and past high-water marks,
+does not create a separate local concurrency cap or calibration phase. Declare
+`memory_bytes` when a known per-process heap reservation is required.
 
-Observed heap uses the same reservation allocator, default reservation ratio
-(`0.5`) and shared-capacity calculation as the Ray query resource manager.
-When the budget fits the aggregate minimum, each prepared task stage protects
-one task's estimated cost; half the surplus is distributed among stages as
-additional protection and the rest stays shared. Smaller budgets apportion
-protection by task cost, while the first-task progress allowance remains.
-Reservations are capped by each stage's achievable concurrency, and unused
-capped capacity stays in the shared pool. A stage can use this pool beyond its
-own reservation without taking another stage's protection. The entire budget
-is no longer divided into fixed, equal per-stage ceilings. Worker pools share
-memory observations, while each prepared stage owns its admission allowance.
-Low current available memory reduces admission to the progress minimum, and
-surplus cached workers retire when their tasks complete.
+Default local admission uses the same query resource manager, query budget
+allocator, downstream reservations, and pending-output accounting as Ray.
+The node's process capacity still governs physical placement; shared-memory
+allocations keep their transport limits. Additional `task_limit` and
+`data_limit` settings remain explicit application constraints.
 
-Every prepared stage retains a first-task allowance, including multiple stages
-sharing one worker pool. Transport waiters retain their observed-memory slot;
-task completion returns it even when output is still buffered. Closing a query,
-executor or pool does not erase the cost of its still-running tasks. This avoids
-blocking the consumer needed to release upstream output. Observations are an
-admission heuristic, not an OS memory limit: a single task, an unexpectedly
-larger later batch, or the pipeline's minimum working set can still exceed
-available memory. Declare `memory_bytes` when a known working-set reservation
-is required. Runtime process-resource snapshots include learned task peaks,
-estimates, in-flight counts, protected bytes, and shared-pool usage.
-The common budget policy takes costs from backend-specific sources: local
-undeclared tasks use these measurements, whereas Ray heap admission uses
-explicit `memory_bytes`. Equal declared and observed costs use the same
-reservation and sharing arithmetic; this does not make the memory estimates,
-physical capacity enforcement, or complete backend scheduling identical.
+Execution completion returns task and actor slots independently of result
+consumption. Retained results and zero-copy views keep their output-byte
+charges until storage is released. Query shutdown waits for execution cleanup
+to return these policy leases; failed cleanup keeps its owner for retry.
+Process-resource snapshots report declared commitments, and query policy
+snapshots report task, output, reservation, and shared-budget usage.
 
 Retiring an idle task worker tolerates an exit deadline after a successful
 close acknowledgement only if forced termination, reaping and all resource
@@ -2094,7 +2074,37 @@ Row-preserving calls keep their row-count validation and fused output contract.
 Local IPC transport and Ray's object store remain different implementations;
 this change does not imply equal throughput or equal memory budgets.
 
-Common byte-accounting tests also verify the intentional backend differences:
+Local subprocess and Ray execution now use `QueryResourceManager` and
+`ClusterQueryResourceCoordinator` from `vane.execution` for default admission.
+Both charge declared CPU/GPU/heap, retained task inputs, managed outputs, and
+the same dynamically learned pending-generator window. An undeclared UDF heap
+commitment is zero; worker RSS high-water marks do not become an additional
+local concurrency limit. Native plan preparation installs this policy even
+when `track_data`, `track_graph`, and explicit runtime limits are omitted.
+
+Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
+soft budgets, split those budgets between live queries, and preserve downstream
+operator reservations with the common bounded liveness policy. Local capacity
+comes from the node and shared-memory transport; Ray capacity comes from its
+cluster. Their actual object storage and physical placement remain backend
+responsibilities. DuckDB schedules local native operators and supplies their
+materialization ordering; local UDF concurrency does not depend on pipeline
+width or the number of Parquet row groups.
+
+`VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
+`VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S` configure the same reservation and
+refresh policy for both runners. Concurrent local queries count distinct GPU
+device identities, including when models expose overlapping device subsets.
+
+Actor prefetch defaults to two admitted calls per replica, with one executing
+call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
+queues preserve per-replica submission order and cancellation ownership.
+Execution completion returns the task/actor slot immediately; managed output
+bytes remain charged through queued results, zero-copy Arrow/NumPy views,
+remote readers, and inherited views protected by the shared-memory store.
+
+Explicit local `DataAdmissionLimits` remain an additional application limit.
+Their byte-accounting tests verify these differences from default soft admission:
 Local preserves a complete task envelope even at a zero reservation ratio;
 Ray's object-store reservation baseline stays zero. Both charge retained output
 after its producing unit retires. Matching full reservation settings share the
