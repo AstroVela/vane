@@ -1531,6 +1531,9 @@ views, or increase the store capacity when the working set cannot fit.
 Outputs are measured with a counting IPC stream before byte admission, then
 serialized directly into the granted arena region. Publication requires the
 exact measured size; no intermediate payload buffer is copied into the arena.
+The output writer matches Ray's large-buffer copy policy: individual writes
+larger than 1 MiB use six copy threads and 64-byte blocks. Smaller writes remain
+serial. The copy completes before the result descriptor is published.
 
 On Linux, releasing the last worker and query owner decommits wholly free pages.
 Returned Arrow views remain valid after runtime shutdown; the arena closes after

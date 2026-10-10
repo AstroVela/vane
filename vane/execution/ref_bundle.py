@@ -1757,6 +1757,10 @@ class PreparedLocalShmBlock:
         writer = None
         try:
             with sink:
+                # Match Ray's copy policy for each buffer, not the total IPC size.
+                sink.set_memcopy_threads(6)
+                sink.set_memcopy_blocksize(64)
+                sink.set_memcopy_threshold(_MIB)
                 sink.write((self.ipc_size_bytes - _IPC_HEADER_SIZE).to_bytes(_IPC_HEADER_SIZE, "little"))
                 with pa.ipc.new_stream(sink, self.table.schema) as writer:
                     writer.write_table(self.table)

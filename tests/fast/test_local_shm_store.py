@@ -51,7 +51,21 @@ def _input(store, values, *, track_budget=False):
     )
 
 
-@pytest.mark.parametrize("kind", ["sliced", "chunked", "dictionary", "nested", "tensor", "empty", "no_columns"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "sliced",
+        "chunked",
+        "dictionary",
+        "nested",
+        "tensor",
+        "empty",
+        "no_columns",
+        "large_sliced",
+        "large_chunked",
+        "large_tensor",
+    ],
+)
 def test_direct_ipc_matches_stream_size_and_preserves_all_buffers(monkeypatch, kind):
     if kind == "sliced":
         table = pa.table({"x": [1, None, 3], "s": ["one", "two", None]}).slice(1)
@@ -69,6 +83,19 @@ def test_direct_ipc_matches_stream_size_and_preserves_all_buffers(monkeypatch, k
         table = pa.table(
             {"x": pa.FixedShapeTensorArray.from_numpy_ndarray(np.arange(256, dtype=np.float32).reshape(4, 8, 8))}
         )
+    elif kind.startswith("large_"):
+        import numpy as np
+
+        # Each data buffer crosses the parallel-copy threshold. Slices and
+        # chunk boundaries also leave unaligned starts and short tails.
+        values = np.arange((1 << 18) + 37, dtype=np.int64)
+        if kind == "large_sliced":
+            table = pa.table({"x": pa.array(values).slice(3, len(values) - 11)})
+        elif kind == "large_chunked":
+            table = pa.table({"x": pa.chunked_array([pa.array(values).slice(3), pa.array(-values).slice(5)])})
+        else:
+            tensor = values[: (1 << 18)].reshape(256, 32, 32)
+            table = pa.table({"x": pa.FixedShapeTensorArray.from_numpy_ndarray(tensor).slice(1, 254)})
     elif kind == "empty":
         table = pa.table({"x": pa.array([], type=pa.list_(pa.int64()))})
     else:
@@ -97,8 +124,15 @@ def test_direct_ipc_matches_stream_size_and_preserves_all_buffers(monkeypatch, k
 
 
 @pytest.mark.parametrize("size_delta", [-8, 8])
-def test_direct_ipc_size_failure_does_not_leave_an_exported_mapping(monkeypatch, size_delta):
-    block = refs.prepare_local_shm_block(pa.table({"x": [11, 22, 33]}))
+@pytest.mark.parametrize("large", [False, True])
+def test_direct_ipc_size_failure_does_not_leave_an_exported_mapping(monkeypatch, size_delta, large):
+    if large:
+        import numpy as np
+
+        table = pa.table({"x": np.arange((1 << 18) + 3, dtype=np.int64)})
+    else:
+        table = pa.table({"x": [11, 22, 33]})
+    block = refs.prepare_local_shm_block(table)
     block = replace(block, ipc_size_bytes=block.ipc_size_bytes + size_delta)
     created = []
     create = refs._create_shm
