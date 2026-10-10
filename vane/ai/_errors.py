@@ -88,8 +88,10 @@ _MEMORY = re.compile(
 _SAFE_MEMORY = re.compile(
     rf"insufficient GPU KV-cache memory; mem_fraction_static=({_FRACTION}), required above ({_FRACTION})(?![0-9.])"
 )
-_PROVIDER_SUMMARY = re.compile(r"upstream error: ([A-Za-z_][A-Za-z_0-9]{0,127})([^\n]{0,1024})")
-_STATUS = re.compile(r"(status_code|status|code|errno)=(-?[0-9]{1,6})(?![0-9])")
+_PROVIDER_SUMMARY = re.compile(r"upstream error: ([^\n]{1,4096})")
+_TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}")
+_STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
+_STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
 
 
 def _arguments(error: BaseException) -> tuple[Any, ...]:
@@ -146,12 +148,80 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     return None
 
 
-def _attributes(error: BaseException) -> dict[str, Any]:
+def _attributes(error: object) -> dict[str, Any]:
     try:
-        attrs = BaseException.__getattribute__(error, "__dict__")
+        attrs = object.__getattribute__(error, "__dict__")
     except BaseException:
         return {}
     return attrs if type(attrs) is dict else {}
+
+
+def _stored_attribute(value: object, name: str) -> Any:
+    attrs = _attributes(value)
+    if name in attrs:
+        return attrs[name]
+    # Some SDK errors declare numeric status as a class attribute. Read stored
+    # values without invoking arbitrary SDK properties on the failure path.
+    try:
+        for cls in type.__getattribute__(type(value), "__mro__")[:16]:
+            namespace = type.__getattribute__(cls, "__dict__")
+            if name in namespace:
+                return namespace[name]
+    except BaseException:
+        return None
+    return None
+
+
+def _numeric_details(error: BaseException) -> list[str]:
+    details = []
+    for field in ("status_code", "status", "code", "errno"):
+        value = _stored_attribute(error, field)
+        if field == "errno" and isinstance(error, OSError):
+            value = OSError.__dict__["errno"].__get__(error)
+        if field == "status_code" and type(value) is not int:
+            # HTTPX keeps status on response, not on HTTPStatusError. Inspect
+            # only that numeric field, never request URLs, headers or bodies.
+            value = _stored_attribute(_stored_attribute(error, "response"), "status_code")
+        if type(value) is int and -999999 <= value <= 999999:
+            details.append(f"{field}={value}")
+    return details
+
+
+def _transported_summary(message: str) -> str:
+    """Read complete canonical atoms, retaining cause/cleanup boundaries."""
+    parts = []
+    position, cleanup_count = 0, 0
+    separator = ""
+    for _ in range(19):
+        match = _TYPE.match(message, position)
+        if match is None:
+            break
+        name = match[0] if match[0] in _ERROR_TYPES else "ProviderError"
+        position = match.end()
+        rendered = name
+        status = _STATUS_GROUP.match(message, position)
+        if status:
+            rendered += status[0]
+            position = status.end()
+        elif message.startswith(": ", position):
+            tail = message[position + 2 :]
+            detail = technical_detail(name, tail, transported=True)
+            if detail and tail.startswith(detail):
+                rendered += ": " + detail
+                position += 2 + len(detail)
+        parts.append(separator + rendered)
+        if message.startswith(" <- ", position):
+            separator = " <- "
+        elif not cleanup_count and message.startswith("; cleanup: ", position):
+            separator = "; cleanup: "
+            cleanup_count = 1
+        elif 0 < cleanup_count < 3 and message.startswith("; ", position):
+            separator = "; "
+            cleanup_count += 1
+        else:
+            break
+        position += len(separator)
+    return "".join(parts) or "ProviderError"
 
 
 def _summary(error: BaseException) -> str:
@@ -164,24 +234,9 @@ def _summary(error: BaseException) -> str:
     # provider's safe grammar; surrounding SQL, prompts and paths are discarded.
     match = _PROVIDER_SUMMARY.search(message)
     if match:
-        name = match[1] if match[1] in _ERROR_TYPES else "ProviderError"
-        tail = match[2].strip()
-        # Native transport embeds the canonical message in a larger JSON or
-        # traceback string. Reconstruct only the recognized prefix and discard
-        # its suffix, including any transport syntax or private request text.
-        detail = technical_detail(name, tail.removeprefix(": "), transported=True)
-        if detail:
-            return f"{name}: {detail}"
-        status = _STATUS.search(tail)
-        return f"{name} ({status[1]}={status[2]})" if status else name
-    attrs = _attributes(error)
-    for field in ("status_code", "status", "code", "errno"):
-        value = attrs.get(field)
-        if field == "errno" and isinstance(error, OSError):
-            value = OSError.__dict__["errno"].__get__(error)
-        if type(value) is int and -999999 <= value <= 999999:
-            return f"{name} ({field}={value})"
-    return name
+        return _transported_summary(match[1])
+    details = _numeric_details(error)
+    return f"{name} ({', '.join(details)})" if details else name
 
 
 def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:

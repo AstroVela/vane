@@ -117,3 +117,98 @@ def test_actor_creation_error_preserves_pickled_initializer_cause():
         summary = summarize_error(error)
         assert "max_model_len" in summary and "ActorDiedError" in summary
         assert "private" not in summary
+
+
+def test_embedding_batch_preserves_initialization_cause_before_detaching_errors():
+    import asyncio
+
+    import pyarrow as pa
+
+    from vane.ai.functions import _EmbedTextBatch
+
+    class Descriptor:
+        def get_provider(self):
+            return "sglang"
+
+        def get_model(self):
+            return "private-model"
+
+        def instantiate(self):
+            try:
+                raise TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+            finally:
+                raise OSError(errno.EIO, "private cleanup path")
+
+    batch = _EmbedTextBatch(Descriptor(), "text", "embedding", 3, max_retries=0)
+    loop = asyncio.new_event_loop()
+    batch.bind_async_runtime(loop.run_until_complete)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            batch(pa.table({"text": ["private source"]}))
+    finally:
+        loop.close()
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    restored = pickle.loads(pickle.dumps(caught.value))
+    flattened = RuntimeError(json.dumps({"exception_message": str(restored)}))
+    for error in (caught.value, restored, flattened):
+        summary = summarize_error(error)
+        assert "max_model_len" in summary and " <- OSError (errno=5)" in summary
+        assert "private" not in summary
+    assert b"private cleanup path" not in pickle.dumps(caught.value)
+
+
+@pytest.mark.parametrize("explicit_cleanup", [False, True])
+def test_flattened_errors_retain_each_causes_own_status(explicit_cleanup):
+    primary = ConnectionError("private request")
+    cleanup = OSError(errno.EIO, "private path")
+    if explicit_cleanup:
+        error = RuntimeError("private wrapper")
+        error.primary_error = primary
+        error.cleanup_errors = (cleanup,)
+    else:
+        error = cleanup
+        error.__context__ = primary
+    expected = summarize_error(error)
+    for message in (
+        "transcription failed; upstream error: " + expected,
+        json.dumps({"exception_message": "upstream error: " + expected}),
+    ):
+        assert summarize_error(RuntimeError(message)) == expected
+    assert "OSError (errno=5)" in expected and "ConnectionError (errno=" not in expected
+
+
+def test_transport_does_not_attribute_status_from_arbitrary_suffix():
+    message = "upstream error: ConnectionError private-url?status_code=401 errno=5"
+    assert summarize_error(RuntimeError(message)) == "ConnectionError"
+
+
+@pytest.mark.parametrize("status", [401, 429, 503])
+def test_httpx_response_status_survives_provider_and_native_transport(status):
+    httpx = pytest.importorskip("httpx")
+    response = httpx.Response(
+        status,
+        request=httpx.Request("POST", "https://example.test/private-path?token=private-key"),
+        json={"private": "body"},
+    )
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        response.raise_for_status()
+    public = _safe_provider_execution_error("httpx", "private-model", "request", caught.value)
+    flattened = RuntimeError(json.dumps({"exception_message": str(public)}))
+    expected = f"HTTPStatusError (status_code={status})"
+    for error in (caught.value, public, pickle.loads(pickle.dumps(public)), flattened):
+        assert summarize_error(error) == expected
+
+
+def test_numeric_class_status_does_not_invoke_sdk_properties():
+    class SDKError(Exception):
+        status_code = 429
+
+        @property
+        def response(self):
+            raise AssertionError("must not evaluate SDK properties")
+
+        @property
+        def code(self):
+            raise AssertionError("must not evaluate SDK properties")
+
+    assert summarize_error(SDKError("private payload")) == "SDKError (status_code=429)"
