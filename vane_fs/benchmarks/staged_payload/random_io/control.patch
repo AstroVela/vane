@@ -1,0 +1,47 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -961,7 +961,7 @@
+ 		// leave FULL enabled until a subsequent successful synchronous commit.
+ 		if (restore_normal)
+ 			Exec(database.db, "PRAGMA synchronous=FULL");
+-		Exec(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
++		Control(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
+ 		try {
+ 			if (write) {
+ 				{
+@@ -995,7 +995,7 @@
+ 		// OPEN keeps a durable recovery prefix while NORMAL commits remain visible.
+ 		if (full)
+ 			database.staging->BeforeFullCommit();
+-		Exec(database.db, "COMMIT");
++		Control(database.db, "COMMIT");
+ 		committed = true;
+ 		if (full)
+ 			database.staging->AfterFullCommit();
+@@ -1022,6 +1022,12 @@
+ 	}
+ 
+ private:
++	// These single, fixed statements share the connection's existing cache.
++	// Error unwinding still uses the non-throwing ROLLBACK path above.
++	static void Control(sqlite3 *db, const char *sql) {
++		Statement statement(db, sql);
++		statement.Step();
++	}
+ 	Database &database;
+ 	std::unique_lock<std::mutex> lock;
+ 	std::unique_ptr<Staging::Guard> publication;
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -125,3 +125,11 @@
+   add_test(NAME vane_fs_inline_publication COMMAND vane_fs_inline_publication_test "${CMAKE_CURRENT_BINARY_DIR}/owned-inline-test")
+   set_tests_properties(vane_fs_inline_publication PROPERTIES TIMEOUT 90)
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_transaction_cache_test tests/test_transaction_cache.cpp)
++  target_link_libraries(vane_fs_transaction_cache_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  target_link_options(vane_fs_transaction_cache_test PRIVATE "LINKER:--wrap=sqlite3_prepare_v2" "LINKER:--wrap=sqlite3_step" "LINKER:--wrap=sqlite3_exec")
++  add_test(NAME vane_fs_transaction_cache COMMAND vane_fs_transaction_cache_test "${CMAKE_CURRENT_BINARY_DIR}/owned-transaction-cache")
++  set_tests_properties(vane_fs_transaction_cache PROPERTIES TIMEOUT 30)
++endif()

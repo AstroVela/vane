@@ -1,0 +1,13 @@
+--- a/tests/test_durability.cpp
++++ b/tests/test_durability.cpp
+@@ -49,6 +49,10 @@
+ 		if (n <= 0)
+ 			return -1;
+ 		auto path = std::filesystem::path(std::string(target, size_t(n)));
++		// SQLite images are captured by the VFS hook. Retaining a deleted rollback
++		// journal here would incorrectly roll the durable database back on reopen.
++		if (path.extension() != ".payload" && path.extension() != ".stage-fence")
++			return rc;
+ 		std::error_code error;
+ 		std::filesystem::copy_file(path, synced_images / path.filename(),
+ 		                           std::filesystem::copy_options::overwrite_existing, error);

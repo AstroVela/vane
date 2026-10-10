@@ -15,17 +15,25 @@
 
 using namespace vane_fs;
 namespace {
+// The mount's exclusive branch lease routes every live mutation through this
+// kernel, which invalidates its entries/attributes on mutations. Snapshots are
+// immutable. Out-of-band writers would require explicit cache invalidation.
+constexpr double METADATA_TIMEOUT = 60.0;
+
 struct Mount {
 	Workspace workspace;
 	std::shared_ptr<Session> session;
 	std::string database;
 	bool readonly;
+	bool sync_on_request;
+	fuse_session *fuse = nullptr;
 	uid_t uid = getuid();
 	gid_t gid = getgid();
-	std::map<uint64_t, std::vector<std::pair<std::string, FileStat>>> directories;
+	std::map<uint64_t, std::optional<std::vector<std::pair<std::string, FileStat>>>> directories;
 	uint64_t next_directory = 0;
-	Mount(const std::string &path, const std::string &id, bool readonly)
-	    : workspace(path), database(path), readonly(readonly) {
+	Mount(const std::string &path, const std::string &id, bool readonly, Durability durability)
+	    : workspace(path, 5000, readonly ? Durability::Strict : durability), database(path), readonly(readonly),
+	      sync_on_request(!readonly && durability == Durability::Fsync) {
 		workspace.RecoverOwners();
 		session = readonly ? workspace.OpenSnapshot(id) : workspace.Checkout(workspace.AcquireMount(id).id);
 		session->OpenDirectory("/");
@@ -113,7 +121,9 @@ fuse_entry_param Entry(Mount &mount, const FileStat &stat) {
 	result.ino = stat.inode;
 	result.generation = 1; // Inode IDs are never reused.
 	result.attr = Describe(mount, stat);
-	return result; // Zero timeouts avoid stale namespace/attribute caches.
+	result.entry_timeout = METADATA_TIMEOUT;
+	result.attr_timeout = METADATA_TIMEOUT;
+	return result;
 }
 void ReplyEntry(fuse_req_t request, const FileStat &stat) {
 	auto &mount = Context(request);
@@ -125,6 +135,17 @@ void ConfigureHandle(Mount &mount, fuse_file_info *info, int64_t inode) {
 	info->fh = inode;
 	info->direct_io = !mount.readonly;
 	info->keep_cache = mount.readonly;
+}
+bool Synchronous(const fuse_file_info *info) {
+	return info && (info->flags & (O_SYNC | O_DSYNC));
+}
+void InvalidateAttributes(Mount &mount, int64_t inode) {
+	// Linux invalidates size/mtime after writes, but our atime aliases mtime.
+	// Invalidate all attributes before replying, including for statx(ATIME).
+	// An attributes-only notification has no dirty pages to flush or wait for.
+	auto error = fuse_lowlevel_notify_inval_inode(mount.fuse, inode, -1, 0);
+	if (error && error != -ENOENT)
+		throw Error(ErrorCode::Storage, "Could not invalidate inode attributes: " + std::to_string(-error));
 }
 fuse_lowlevel_ops Operations() {
 	fuse_lowlevel_ops ops {};
@@ -146,7 +167,7 @@ fuse_lowlevel_ops Operations() {
 	ops.getattr = [](fuse_req_t req, fuse_ino_t inode, fuse_file_info *) {
 		Guard(req, [&] {
 			auto stat = Describe(Context(req), Context(req).session->StatInode(inode));
-			fuse_reply_attr(req, &stat, 0);
+			fuse_reply_attr(req, &stat, METADATA_TIMEOUT);
 		});
 	};
 	ops.open = [](fuse_req_t req, fuse_ino_t inode, fuse_file_info *info) {
@@ -154,7 +175,14 @@ fuse_lowlevel_ops Operations() {
 			auto &mount = Context(req);
 			if ((info->flags & O_ACCMODE) != O_RDONLY || (info->flags & O_TRUNC))
 				Mutable(mount);
-			mount.session->OpenInode(inode, false, info->flags & O_TRUNC);
+			mount.session->OpenInode(inode, false, info->flags & O_TRUNC, Synchronous(info));
+			try {
+				if (info->flags & O_TRUNC)
+					InvalidateAttributes(mount, inode);
+			} catch (...) {
+				Close(mount, inode, 1);
+				throw;
+			}
 			ConfigureHandle(mount, info, inode);
 			if (fuse_reply_open(req, info) < 0)
 				Close(mount, inode, 1);
@@ -169,7 +197,7 @@ fuse_lowlevel_ops Operations() {
 				return;
 			}
 			auto stat = mount.session->CreateNode(parent, name, false, mode & 0777, info->flags & O_EXCL,
-			                                      info->flags & O_TRUNC, 2);
+			                                      info->flags & O_TRUNC, 2, Synchronous(info));
 			auto entry = Entry(mount, stat);
 			ConfigureHandle(mount, info, stat.inode);
 			if (fuse_reply_create(req, &entry, info) < 0)
@@ -190,7 +218,9 @@ fuse_lowlevel_ops Operations() {
 		Guard(req, [&] {
 			auto &mount = Context(req);
 			Mutable(mount);
-			mount.session->WriteInode(info->fh, std::string(buffer, size), offset, info->flags & O_APPEND);
+			mount.session->WriteInode(info->fh, std::string(buffer, size), offset, info->flags & O_APPEND,
+			                          Synchronous(info));
+			InvalidateAttributes(mount, info->fh);
 			fuse_reply_write(req, size);
 		});
 	};
@@ -205,11 +235,8 @@ fuse_lowlevel_ops Operations() {
 			auto &mount = Context(req);
 			mount.session->OpenInode(inode, true);
 			try {
-				// Cookies index this handle's fixed listing, so namespace
-				// mutations cannot shift entries between readdir requests.
-				auto entries = mount.session->DirectoryEntries(inode);
 				info->fh = ++mount.next_directory;
-				mount.directories.emplace(info->fh, std::move(entries));
+				mount.directories.emplace(info->fh, std::nullopt);
 			} catch (...) {
 				Close(mount, inode, 1);
 				throw;
@@ -220,7 +247,7 @@ fuse_lowlevel_ops Operations() {
 			}
 		});
 	};
-	ops.readdir = [](fuse_req_t req, fuse_ino_t, size_t size, off_t offset, fuse_file_info *info) {
+	ops.readdir = [](fuse_req_t req, fuse_ino_t inode, size_t size, off_t offset, fuse_file_info *info) {
 		Guard(req, [&] {
 			if (offset < 0 || size > INT_MAX) {
 				fuse_reply_err(req, EINVAL);
@@ -231,7 +258,12 @@ fuse_lowlevel_ops Operations() {
 				return;
 			}
 			auto &mount = Context(req);
-			const auto &entries = mount.directories.at(info->fh);
+			auto &listing = mount.directories.at(info->fh);
+			// Opening a directory for openat/chdir needs no listing. Capture it
+			// on the first read, then keep cookies stable even across rewind.
+			if (!listing)
+				listing = mount.session->DirectoryEntries(inode);
+			const auto &entries = *listing;
 			std::vector<char> buffer(size);
 			size_t used = 0;
 			for (size_t i = size_t(offset); i < entries.size(); ++i) {
@@ -323,13 +355,17 @@ fuse_lowlevel_ops Operations() {
 			}
 			mount.session->SetAttributes("", mode, modified, inode, size);
 			auto stat = Describe(mount, mount.session->StatInode(inode));
-			fuse_reply_attr(req, &stat, 0);
+			fuse_reply_attr(req, &stat, METADATA_TIMEOUT);
 		});
 	};
-	// synchronous=FULL commits finish before write/setattr replies.
 	ops.fsync = [](fuse_req_t req, fuse_ino_t inode, int, fuse_file_info *) {
 		Guard(req, [&] {
-			Context(req).session->StatInode(inode);
+			auto &mount = Context(req);
+			mount.session->StatInode(inode);
+			// Strict mounts already synchronized every mutation to this leased
+			// branch. Fsync mode needs an explicit database-wide WAL barrier.
+			if (mount.sync_on_request)
+				mount.workspace.Sync();
 			fuse_reply_err(req, 0);
 		});
 	};
@@ -375,10 +411,24 @@ struct FuseSession {
 } // namespace
 
 int main(int argc, char **argv) {
-	if ((argc != 5 && !(argc == 6 && std::string(argv[5]) == "--debug")) ||
-	    (std::string(argv[2]) != "--branch" && std::string(argv[2]) != "--snapshot")) {
+	bool debug = false, has_durability = false, valid = true;
+	Durability durability = Durability::Strict;
+	for (int index = 5; index < argc; ++index) {
+		const std::string option = argv[index];
+		if (option == "--debug" && !debug)
+			debug = true;
+		else if (!has_durability && (option == "--durability=strict" || option == "--durability=fsync")) {
+			has_durability = true;
+			durability = option == "--durability=fsync" ? Durability::Fsync : Durability::Strict;
+		} else
+			valid = false;
+	}
+	if (argc < 5 || !valid || (std::string(argv[2]) != "--branch" && std::string(argv[2]) != "--snapshot")) {
 		std::cerr << "Usage: vane-fs-mount DATABASE (--branch NAME_OR_ID | --snapshot ID) EMPTY_MOUNTPOINT "
-		             "[--debug]\nRuns in the foreground. Unmount with fusermount3 -u MOUNTPOINT.\n";
+		             "[--debug] [--durability=strict|fsync]\n"
+		             "Default strict: synchronize every mutation. Fsync: synchronize on fsync/fdatasync, "
+		             "O_SYNC/O_DSYNC writes and clean unmount.\n"
+		             "Runs in the foreground. Unmount with fusermount3 -u MOUNTPOINT.\n";
 		return argc == 2 && std::string(argv[1]) == "--help" ? 0 : 2;
 	}
 	try {
@@ -389,12 +439,12 @@ int main(int argc, char **argv) {
 		if (!std::filesystem::is_directory(mountpoint) || !std::filesystem::is_empty(mountpoint))
 			throw std::runtime_error("Mountpoint must be an empty directory");
 		bool readonly = std::string(argv[2]) == "--snapshot";
-		Mount mount(database.string(), argv[3], readonly);
+		Mount mount(database.string(), argv[3], readonly, durability);
 		FuseSession fuse;
 		std::vector<std::string> arguments {
 		    argv[0], "-f", "-o", readonly ? "ro,default_permissions,nodev,nosuid" : "default_permissions,nodev,nosuid",
 		    mountpoint.string()};
-		if (argc == 6)
+		if (debug)
 			arguments.push_back("-d");
 		for (const auto &argument : arguments)
 			if (fuse_opt_add_arg(&fuse.args, argument.c_str()) != 0)
@@ -405,13 +455,18 @@ int main(int argc, char **argv) {
 		fuse.session = fuse_session_new(&fuse.args, &operations, sizeof(operations), &mount);
 		if (!fuse.session)
 			throw std::runtime_error("Could not create FUSE session");
+		mount.fuse = fuse.session;
 		if (fuse_set_signal_handlers(fuse.session) != 0)
 			throw std::runtime_error("Could not install FUSE signal handlers");
 		fuse.signals = true;
 		if (fuse_session_mount(fuse.session, fuse.options.mountpoint) != 0)
 			throw std::runtime_error("Could not mount VaneFS");
 		fuse.mounted = true;
-		return fuse_session_loop(fuse.session) == 0 ? 0 : 1;
+		auto result = fuse_session_loop(fuse.session);
+		// Explicit close reports a failed final FULL commit through the process
+		// exit status. A destructor alone cannot report a durability failure.
+		mount.workspace.Close();
+		return result == 0 ? 0 : 1;
 	} catch (const std::exception &error) {
 		std::cerr << "VaneFS: " << error.what() << '\n';
 		return 1;

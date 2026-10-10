@@ -1,0 +1,1631 @@
+{
+  "started_utc": "2026-10-05T16:01:04.199205+00:00",
+  "config": {
+    "runs": 3,
+    "cache_state": "hot",
+    "environment": "local",
+    "drop_caches_command": "",
+    "small_count": 1000,
+    "stat_count": 1000,
+    "dir_large_count": 1000,
+    "large_mib": 64,
+    "random_reads": 4096,
+    "macro_files": 100,
+    "macro_total_mib": 4,
+    "git_clone_mode": "no-local",
+    "keep_workdirs": false
+  },
+  "drive9_commit": "3334e43d47e00d1411c32defe837a87a969d1e56",
+  "harness_sha256": "352cce87372ea37aba28da8a9fb06ace1b9ff1b5060d8733cdfa0c7260d96629",
+  "runner_sha256": "ab79229846b4098f13e16905251698378bee6c187751e17d5c52e02bda3afe76",
+  "cli_sha256": "94f85f93d376a950763509a7ce37bb935d349e80cd96af67052c80f1dd4ea74b",
+  "server_sha256": "23fc0651ddac84dcbf6b12ba70fcf8fa9c166e948346144c2947c58e015a155c",
+  "build": {
+    "go": "go1.25.1",
+    "cgo_enabled": false,
+    "make_targets": [
+      "build-server",
+      "build-cli"
+    ],
+    "parallelism": 4
+  },
+  "backend": {
+    "tenant_provider": "local",
+    "metadata": "TiDB v8.5.6 unistore (upstream local development mode, not distributed TiKV)",
+    "large_files": "real MinIO S3 API on loopback, independent owned container and data directory"
+  },
+  "cache_policy": "upstream hot-cache workload; Drive9 default read and metadata caches plus --trust-process-local-events for the isolated single-server deployment; no global cache eviction",
+  "trust_process_local_events": true,
+  "default_profile_artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/drive9-local/default-profile/results.json",
+  "durability": "explicit --durability=fsync: fsync waits for remote commit; ordinary write/close may complete before remote upload; no extra fsync in timed upstream workloads",
+  "profile": "none: all file paths, including .git, go through Drive9 remote persistent storage",
+  "comparison": {
+    "vane_results": "paired_samples in this report",
+    "same_host_and_config": true,
+    "different_measurement_window": false,
+    "vane_mutation_durability": "SQLite WAL/FULL per mutation",
+    "production_ranking": false
+  },
+  "host": {
+    "platform": "Linux-6.11.0-24-generic-x86_64-with-glibc2.39",
+    "cpus": 36,
+    "isolated": false
+  },
+  "results": {},
+  "paired_samples": [
+    {
+      "variant": "vane_fs",
+      "metric": "sequential_write",
+      "repetition": 0,
+      "value": 45.912156845150854,
+      "seconds": 1.393966313014971,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216078.6040719,
+      "load": [
+        3.4970703125,
+        3.43994140625,
+        3.3505859375
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "sequential_write",
+      "repetition": 0,
+      "value": 87.97101338925786,
+      "seconds": 0.7275123649742454,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d",
+        "remote_bytes": 67108864,
+        "remote_sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216083.0701773,
+      "load": [
+        3.376953125,
+        3.416015625,
+        3.34326171875
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "stat",
+      "repetition": 0,
+      "value": 110304.89238924604,
+      "seconds": 0.009065781021490693,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216095.3122866,
+      "load": [
+        3.55322265625,
+        3.4521484375,
+        3.3564453125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "stat",
+      "repetition": 0,
+      "value": 143680.16344671365,
+      "seconds": 0.006959902995731682,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "pending_writes_drained": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216101.9911923,
+      "load": [
+        3.5087890625,
+        3.4443359375,
+        3.3544921875
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_clone",
+      "repetition": 0,
+      "value": 1.5897392949846108,
+      "seconds": 1.5897392949846108,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216132.6078556,
+      "load": [
+        3.93505859375,
+        3.5546875,
+        3.39453125
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_status_dirty",
+      "repetition": 0,
+      "value": 0.09766210301313549,
+      "seconds": 0.09766210301313549,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216132.609186,
+      "load": [
+        3.93505859375,
+        3.5546875,
+        3.39453125
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 0,
+      "value": 0.007421904010698199,
+      "seconds": 0.007421904010698199,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216132.610406,
+      "load": [
+        3.93505859375,
+        3.5546875,
+        3.39453125
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_find_files",
+      "repetition": 0,
+      "value": 0.011684640019666404,
+      "seconds": 0.011684640019666404,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216132.6116571,
+      "load": [
+        3.93505859375,
+        3.5546875,
+        3.39453125
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_go_build",
+      "repetition": 0,
+      "value": 0.0827741370012518,
+      "seconds": 0.0827741370012518,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216132.6130002,
+      "load": [
+        3.93505859375,
+        3.5546875,
+        3.39453125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_clone",
+      "repetition": 0,
+      "value": 3.1352986519923434,
+      "seconds": 3.1352986519923434,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216138.0269053,
+      "load": [
+        3.9404296875,
+        3.5625,
+        3.39794921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_status_dirty",
+      "repetition": 0,
+      "value": 0.17705340500106104,
+      "seconds": 0.17705340500106104,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216138.0280535,
+      "load": [
+        3.9404296875,
+        3.5625,
+        3.39794921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 0,
+      "value": 0.05390518199419603,
+      "seconds": 0.05390518199419603,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216138.0290287,
+      "load": [
+        3.9404296875,
+        3.5625,
+        3.39794921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_find_files",
+      "repetition": 0,
+      "value": 0.009653387009166181,
+      "seconds": 0.009653387009166181,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216138.0300262,
+      "load": [
+        3.9404296875,
+        3.5625,
+        3.39794921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_go_build",
+      "repetition": 0,
+      "value": 0.16423068201402202,
+      "seconds": 0.16423068201402202,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216138.0310657,
+      "load": [
+        3.9404296875,
+        3.5625,
+        3.39794921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "sequential_write",
+      "repetition": 1,
+      "value": 90.89100540628895,
+      "seconds": 0.7041400820016861,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d",
+        "remote_bytes": 67108864,
+        "remote_sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216146.3057842,
+      "load": [
+        3.9453125,
+        3.56982421875,
+        3.4013671875
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "sequential_write",
+      "repetition": 1,
+      "value": 45.33738209975672,
+      "seconds": 1.4116386309906375,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216148.5521774,
+      "load": [
+        4.02978515625,
+        3.59375,
+        3.41015625
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "stat",
+      "repetition": 1,
+      "value": 146656.78968634334,
+      "seconds": 0.006818641006248072,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "pending_writes_drained": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216150.529985,
+      "load": [
+        4.02978515625,
+        3.59375,
+        3.41015625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "stat",
+      "repetition": 1,
+      "value": 111827.77818214582,
+      "seconds": 0.00894232199061662,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216184.4051623,
+      "load": [
+        4.53564453125,
+        3.7529296875,
+        3.47021484375
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_clone",
+      "repetition": 1,
+      "value": 3.551661809993675,
+      "seconds": 3.551661809993675,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216194.5815642,
+      "load": [
+        4.6201171875,
+        3.79443359375,
+        3.486328125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_status_dirty",
+      "repetition": 1,
+      "value": 0.13994786600233056,
+      "seconds": 0.13994786600233056,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216194.5835483,
+      "load": [
+        4.6201171875,
+        3.79443359375,
+        3.486328125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 1,
+      "value": 0.006652481009950861,
+      "seconds": 0.006652481009950861,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216194.5974007,
+      "load": [
+        4.6201171875,
+        3.79443359375,
+        3.486328125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_find_files",
+      "repetition": 1,
+      "value": 0.00970977297401987,
+      "seconds": 0.00970977297401987,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216194.599308,
+      "load": [
+        4.6201171875,
+        3.79443359375,
+        3.486328125
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_go_build",
+      "repetition": 1,
+      "value": 0.24613583699101582,
+      "seconds": 0.24613583699101582,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216194.601261,
+      "load": [
+        4.6201171875,
+        3.79443359375,
+        3.486328125
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_clone",
+      "repetition": 1,
+      "value": 3.2616393210191745,
+      "seconds": 3.2616393210191745,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216203.4503708,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_status_dirty",
+      "repetition": 1,
+      "value": 0.03606133899302222,
+      "seconds": 0.03606133899302222,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216203.4533527,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 1,
+      "value": 0.016410001000622287,
+      "seconds": 0.016410001000622287,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216203.456466,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_find_files",
+      "repetition": 1,
+      "value": 0.012804672995116562,
+      "seconds": 0.012804672995116562,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216203.4599755,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_go_build",
+      "repetition": 1,
+      "value": 0.10768555497634225,
+      "seconds": 0.10768555497634225,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216203.4632082,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "sequential_write",
+      "repetition": 2,
+      "value": 46.24721753983543,
+      "seconds": 1.3838670390250627,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216206.4728496,
+      "load": [
+        5.06005859375,
+        3.91650390625,
+        3.52978515625
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "sequential_write",
+      "repetition": 2,
+      "value": 83.2859819994148,
+      "seconds": 0.7684366379980929,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d",
+        "remote_bytes": 67108864,
+        "remote_sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791216211.1320236,
+      "load": [
+        4.97509765625,
+        3.91796875,
+        3.53271484375
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "stat",
+      "repetition": 2,
+      "value": 108213.16277078941,
+      "seconds": 0.009241019986802712,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216217.347226,
+      "load": [
+        5.072265625,
+        3.970703125,
+        3.55419921875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "stat",
+      "repetition": 2,
+      "value": 120634.34843182474,
+      "seconds": 0.008289513003546745,
+      "unit": "ops/s",
+      "validation": {
+        "entries": 1000,
+        "verified": true,
+        "pending_writes_drained": true,
+        "content_checked_files": 1000
+      },
+      "epoch": 1791216229.3186035,
+      "load": [
+        4.8271484375,
+        3.95458984375,
+        3.55322265625
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_clone",
+      "repetition": 2,
+      "value": 1.6556331170140766,
+      "seconds": 1.6556331170140766,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216259.506302,
+      "load": [
+        5.17919921875,
+        4.1064453125,
+        3.615234375
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_status_dirty",
+      "repetition": 2,
+      "value": 0.06544842998846434,
+      "seconds": 0.06544842998846434,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216259.5097995,
+      "load": [
+        5.17919921875,
+        4.1064453125,
+        3.615234375
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 2,
+      "value": 0.04394330098875798,
+      "seconds": 0.04394330098875798,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216259.5129702,
+      "load": [
+        5.17919921875,
+        4.1064453125,
+        3.615234375
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_find_files",
+      "repetition": 2,
+      "value": 0.012097722996259108,
+      "seconds": 0.012097722996259108,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216259.5162632,
+      "load": [
+        5.17919921875,
+        4.1064453125,
+        3.615234375
+      ]
+    },
+    {
+      "variant": "vane_fs",
+      "metric": "macro_go_build",
+      "repetition": 2,
+      "value": 0.1335984820034355,
+      "seconds": 0.1335984820034355,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100
+      },
+      "epoch": 1791216259.5195246,
+      "load": [
+        5.17919921875,
+        4.1064453125,
+        3.615234375
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_clone",
+      "repetition": 2,
+      "value": 3.1263157260254957,
+      "seconds": 3.1263157260254957,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216264.9196334,
+      "load": [
+        5.16455078125,
+        4.12158203125,
+        3.623046875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_status_dirty",
+      "repetition": 2,
+      "value": 0.18173602200113237,
+      "seconds": 0.18173602200113237,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216264.921625,
+      "load": [
+        5.16455078125,
+        4.12158203125,
+        3.623046875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_git_diff_dirty",
+      "repetition": 2,
+      "value": 0.055648616020334885,
+      "seconds": 0.055648616020334885,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216264.9235082,
+      "load": [
+        5.16455078125,
+        4.12158203125,
+        3.623046875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_find_files",
+      "repetition": 2,
+      "value": 0.008953684999141842,
+      "seconds": 0.008953684999141842,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216264.925391,
+      "load": [
+        5.16455078125,
+        4.12158203125,
+        3.623046875
+      ]
+    },
+    {
+      "variant": "drive9",
+      "metric": "macro_go_build",
+      "repetition": 2,
+      "value": 0.16882603301201016,
+      "seconds": 0.16882603301201016,
+      "unit": "seconds",
+      "validation": {
+        "git_fsck": true,
+        "expected_dirty_file": true,
+        "content_checked_files": 100,
+        "remote_git_head_verified": true
+      },
+      "epoch": 1791216264.9273095,
+      "load": [
+        5.16455078125,
+        4.12158203125,
+        3.623046875
+      ]
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/sequential_write-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/sequential_write-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/stat-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/stat-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/macro-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/macro-0",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/sequential_write-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/sequential_write-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/stat-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/stat-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/macro-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/macro-1",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/sequential_write-2",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/sequential_write-2",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/stat-2",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/stat-2",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount/macro-2",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount/macro-2",
+      "removed": true
+    },
+    {
+      "unmount_error": "CalledProcessError(1, ['/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/bin/drive9', 'umount', '--timeout', '60s', '/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount'])"
+    },
+    {
+      "pid": 3911410,
+      "stopped": true,
+      "returncode": 0
+    },
+    {
+      "pid": 3911375,
+      "stopped": true,
+      "returncode": 0
+    },
+    {
+      "pid": 3911224,
+      "stopped": true,
+      "returncode": 0
+    },
+    {
+      "container": "vane-drive9-bench-tidb-3910675",
+      "id": "86b048b8ad3d6b7ff499f67aa5e84289a9bce1f040a5a566cfaf563eb63c5075",
+      "removed": true
+    },
+    {
+      "container": "vane-drive9-bench-minio-3910675",
+      "id": "14d6672b1e97435e932b993345f00842e5489a106649ef54ae2fe4b7798a8d0c",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb",
+      "removed": true,
+      "artifacts": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane.sqlite",
+          "bytes": 279625728,
+          "sha256": "0a599ce7be1f193b026e2bea18ec563ac847ffab7c8c6d27580c5b75259f6cd6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/tidb-slow.log",
+          "bytes": 11555,
+          "sha256": "723edf5b8a4942d9186f7dd8a9ffe06881f3afaf4df48f343d2704d5de35a721"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/lock_store",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/journal.wal",
+          "bytes": 2420,
+          "sha256": "e379ac831628b4749641b5d52bd461a65031ab2e419d49a02817b767fa9c5ef4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/182fd8e5c65931b636893ceafa086aaf684f3e2560b397de5cabf019e07f3f10.shadow.retired.1",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/5180a589c24bf2089af3940698a07657ad500cd3d29e28fa40add48aa3149c8d.shadow.retired.12",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/5180a589c24bf2089af3940698a07657ad500cd3d29e28fa40add48aa3149c8d.shadow.retired.13",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/6f4a903874f584cee788cf650ccc84cb145be5122380aaddb597570531fc5105.shadow.retired.3",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/7d5a5398b592fe616207ff75af39f06e258cd28d79f97f693f7f81234bb28a90.shadow.retired.7",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/d9cc4d22fe4f11fc7e3cbf30d0e6f1039d1cea4012d5156655b5be6d0081088d.shadow.retired.15",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/ad562b308aa73ab524fb2a77f09696e7dbd2763e798212d9b0b0d8086b31a9c6.shadow.retired.5",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/adb30ad98a79413349e19469b58a4108a472eca55c5c863e6d90743585f342bd.shadow.retired.6",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/a4302d326a17b84ed2657f6ed1da4ddce38842ae49c0ea1794ae80a7345db268.shadow.retired.9",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/3398b8ac97209b657f814ef07b152e20d88b4923ac9d655373795bab4b1833c7.shadow.retired.16",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/6f4a903874f584cee788cf650ccc84cb145be5122380aaddb597570531fc5105.shadow.retired.2",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache/a11906f1521df05c/shadow/bdf702ccd0daf61d12470ce2f285061a1bd2004052beba3c3aafceee58785194.shadow.retired.11",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000005.sst.idx",
+          "bytes": 232809,
+          "sha256": "0e7dedbe75ba077d10cb674ecbc70819e8d32701e397e7101b99b24347d90c44"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000010.sst",
+          "bytes": 3191356,
+          "sha256": "fb6bca0f444e5ca0d8c977b796e011fbff7358ffe832a5fb51780de12ca4876e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000012.sst",
+          "bytes": 22071,
+          "sha256": "f6db7bea49fb5ed4a5485a9cb0da02a2c7e93bb61acfbe32d3fb8ce57d2c97cb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000f.sst",
+          "bytes": 1335904,
+          "sha256": "8511ab3b1b6df3937ece8b34b1154b2ea61c45e0091cded3e454be2862185b2d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000b.sst",
+          "bytes": 5867325,
+          "sha256": "40505924e1dd5bbc941d915e8ab890b09509bda738adae8dd51c3b37e2e7e4a4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000001.sst",
+          "bytes": 46543311,
+          "sha256": "b06c8a05eb2300dac22b2b9a9bf9e7470686a8d9758dbc2a0f5c47659deec433"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000a.sst.idx",
+          "bytes": 62859,
+          "sha256": "df1cb182acac0ef603f736eeaff8ab0818ca70b91df8e4dace3026b94e47ba5a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000004.sst",
+          "bytes": 4670694,
+          "sha256": "e94869aca4be7043853d53e0ca7b6da3fb66adde1772bdc96748d69c65b6690f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000008.sst",
+          "bytes": 4250656,
+          "sha256": "834067c8f08768da616fadd5014b81e8e1cde4394e1937b3bf1ade47a0e82dc8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000e.sst",
+          "bytes": 2418043,
+          "sha256": "b29325c1830ff676acaf708333d604fddb5386f2d8665a55271d0ec00ded878f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000b.sst.idx",
+          "bytes": 17124,
+          "sha256": "907015f49f56e6e00db6cb32303c3b073f44249475149b65d860423c7b2a39ce"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000007.sst",
+          "bytes": 3611106,
+          "sha256": "e3caf8ad970b42789f670aa607b3e53e854bee7ff9de4fb09060009d9a7e9123"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000a.sst",
+          "bytes": 8388671,
+          "sha256": "4dfed28f3b3f5eaf1ea4836ace42c56211632c43257280f982fc1afd82cc6c66"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000d.sst",
+          "bytes": 1328871,
+          "sha256": "39e24f141240b4fabf8d6c70ab869a02921d003c96057c1d9eefc3e0da187ca4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/blob_change.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000e.sst.idx",
+          "bytes": 1185,
+          "sha256": "1821359990927335e008ca59ee8951b544d0cba4b7ffdf29a70ffa74756695be"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000006.sst.idx",
+          "bytes": 60726,
+          "sha256": "e83d427bb9d5bd9ab6b4e9f292f571f6c9ba8b3090e9a33a2418b9d15afd45c0"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/MANIFEST",
+          "bytes": 141,
+          "sha256": "435c84a86f868bdcf9049134e0a8d297c18384d34e5953afb44a8e7756ee0f9c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000009.sst.idx",
+          "bytes": 109631,
+          "sha256": "37fba3014cea4ec3051b9887926a47ed514ea5bcb1c24a199b260ba5e4f1d696"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000006.sst",
+          "bytes": 1478876,
+          "sha256": "557d0949ac9679457dceea849d12d479f2567da44d3695c4e265144ef2e54d0f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000010.sst.idx",
+          "bytes": 1878,
+          "sha256": "e4354006faa0691c9545270281f9c19ac205a4aba4c5e23824a0b9e229212c34"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000009.sst",
+          "bytes": 1786662,
+          "sha256": "96884e7b04cfb755ee4c963e38640b802d852e5fc3ba75cb19b7efd55f9cce79"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000004.sst.idx",
+          "bytes": 8850,
+          "sha256": "99926df3b15afebdb431c97035eba12acb75b65a80f1d7fab6a7b409378caad1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000005.sst",
+          "bytes": 3251682,
+          "sha256": "0b5c3248f8dcd449ffc835dcebddd80d4461d0dd1bc7f3dd789eb5a0052eb111"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000011.sst.idx",
+          "bytes": 521,
+          "sha256": "bee7afee3bc5c3697ad6f4549a6ab7e5919ea454630d314b70c46cf620550840"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000f.sst.idx",
+          "bytes": 4075,
+          "sha256": "8cce701bc745e3eda8122c82d3457c4c3394a3e8c7c8a69e292495021012c3ec"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000011.sst",
+          "bytes": 2371,
+          "sha256": "e4ec13f99fc3518978cf3e5a66a2da022b5fe917cdbbedf1f7b132f0e709b130"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000d.sst.idx",
+          "bytes": 123312,
+          "sha256": "b1efba88f42bc5842acdf806164030c2839d54078f65c4766ff966855b78baef"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000c.sst",
+          "bytes": 4910190,
+          "sha256": "0066ba14c6f6ce21a584a1c1437f0cef57d5ce8b5a2b9016360bc2cfd11467a9"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/000000.vlog",
+          "bytes": 268435456,
+          "sha256": "564d5cec954827e24804fc06cd4f6feb35425755fa0d9a91556b1bc0c4a12195"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000008.sst.idx",
+          "bytes": 225256,
+          "sha256": "25c708c9364d9c5134b24dfc649536c9df8bee04707d2c7d778f887f06ab9752"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000007.sst.idx",
+          "bytes": 218092,
+          "sha256": "b15aa172f8bf4ee14e2752b240abdd0f0c1bc8e33147ce60cf4be4f9a8322cd4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/0000000c.sst.idx",
+          "bytes": 232512,
+          "sha256": "dfd5306eae32f80566750ebd394e704a2d40eb336d32935ee127053acabf5b6f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000012.sst.idx",
+          "bytes": 1677,
+          "sha256": "50919662190ac4e323bd5063f08751ebdf87d7a8dc9247635f2f80a7a3b0814e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/tidb/kv/00000001.sst.idx",
+          "bytes": 1607907,
+          "sha256": "8ce8258fa1aaa7956dd0ede2dede135e0d85b740db75eacc83b1289f49e40e6f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/format.json",
+          "bytes": 232,
+          "sha256": "20f854d62fd7de7ac87a560039660fecd2b3f73e5a66c6ea8ae83097947eb6f1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/pool.bin/xl.meta",
+          "bytes": 479,
+          "sha256": "8bd02fd9ff7ac681fc3d2484e1dcdd3e8ed6bc20a1a020f158f0da2ac02ab3ef"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/tmp/27bdff99-965c-4170-9858-1095ddd8face",
+          "bytes": 2049,
+          "sha256": "2344ffae04a826129dd552f134c853ddb1bd74b568faa33c8168e4842db3a6c4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/.bloomcycle.bin/xl.meta",
+          "bytes": 552,
+          "sha256": "c485daf3d6bc2be0584d45301b5903975f7b36a3b833add5a06250250b77fadf"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/.usage.json/xl.meta",
+          "bytes": 1513,
+          "sha256": "041ee23019f520b3d8a9b569982cb6aaeb761a9269aa9cdff8b311cf8f8fbc2b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/.usage-cache.bin/xl.meta",
+          "bytes": 633,
+          "sha256": "3cef045dda9cd61744e7d13d82a4bd76a34f95f963c30c934f767a2454e5e48b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/.usage-cache.bin.bkp/xl.meta",
+          "bytes": 633,
+          "sha256": "856dd69dd50f9282b8ca0308490cb811f73414cd5f6ba090184f6d5e404b84c8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/.heal/mrf/list.bin",
+          "bytes": 4,
+          "sha256": "507503b51960cceda8d924904fb85377fe7d177fb8dfcf56b24e4557644ed486"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/vane-drive9-bench/.metadata.bin/xl.meta",
+          "bytes": 1200,
+          "sha256": "a5c1fc6f0c9770cbb9da2ed44b9a6f4d4b50f2bddce03a76bd70fb9328d05d43"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/vane-drive9-bench/.usage-cache.bin/xl.meta",
+          "bytes": 661,
+          "sha256": "82df52a42e18c5d35464c635b5f76307655469a9188ea19a82dee756640f4115"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/buckets/vane-drive9-bench/.usage-cache.bin.bkp/xl.meta",
+          "bytes": 661,
+          "sha256": "00da61c74993033fd40e3d1f91869e94cab93150cfd139ce478158f92739b1a7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/config/config.json/xl.meta",
+          "bytes": 9811,
+          "sha256": "6659a3eb4d53fce82ac69b473cbb0db02e54bfa733d2bcb90401bf72c84d2695"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/.minio.sys/config/iam/format.json/xl.meta",
+          "bytes": 434,
+          "sha256": "4efc3b4b68546adeb807c0dad4fe36b59c0fffcfbdcc8b6c2b561e59425e93c5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CY9BDC614CM364JPEBW3W/xl.meta",
+          "bytes": 400,
+          "sha256": "fd410f474a693ff2418e51fbbf8bee02af651cb442eeea0a57d1a5d55147d13c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/xl.meta",
+          "bytes": 478,
+          "sha256": "583e22852645ad994a645c8389c06e54ad9ca89683960bec36776782dca784b0"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTDE2DYCFDR7GAXJJNF8S/xl.meta",
+          "bytes": 400,
+          "sha256": "e7eab221af9018466c5a222a1116ba9a4e9ba1ddc09ec84a650ba09cf45bb6b8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CW4FF71V2CBGMEX7ECTS5/xl.meta",
+          "bytes": 400,
+          "sha256": "315d0129986377ce8d857b8eddf24718ca878a254a6fefcb88f713249a6515a3"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/xl.meta",
+          "bytes": 478,
+          "sha256": "eff4bf8f20ab25aa75642dc8909e301c0da0d8818b8d58f11a187b3781844474"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/xl.meta",
+          "bytes": 478,
+          "sha256": "784054e37dc31d22d7a451f31bc78889ae99be96c7a5d65b53b92f8f525dbc73"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CY9BDC614CM364JPEBW3W/1d9b4d2f-ea9a-4aed-b8e1-d2387af2d5ac/part.1",
+          "bytes": 1376721,
+          "sha256": "b57f5046d77719583820a5a83a09d86de8b667e0796e7e3eea8c06d89d7b94dd"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.6",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.2",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.3",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.7",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.5",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.1",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.8",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CWHBJPE7B4J7WPPJB4YDD/348e68ce-4c51-48b3-a105-55879f951503/part.4",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTDE2DYCFDR7GAXJJNF8S/c5ae74c2-e4d8-42bc-ab7d-47984f4d88f6/part.1",
+          "bytes": 1376721,
+          "sha256": "8b9bf3c961dcdc4bb240dcfd8c22770021b9b16e5dfbf77ba1e7d826ed040d42"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CW4FF71V2CBGMEX7ECTS5/ea720dcd-b691-45a8-877c-8b433c16d9d0/part.1",
+          "bytes": 1376721,
+          "sha256": "14a76124683001949dfd0ae1840bd7b1e8bbc46a368a7d4a3b16073a2be8e3db"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.6",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.2",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.3",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.7",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.5",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.1",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.8",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CRMGSX75KA11MY4YZXNG9/3db75bde-8a4b-46a1-8051-026c057a3620/part.4",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.6",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.2",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.3",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.7",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.5",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.1",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.8",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/minio/vane-drive9-bench/e25cc037-2574-4b42-93d1-363a30458365/blobs/01M46CTJ6C1TCNZ2XJHW8FHD1Q/d3d69ff5-0411-4508-a2df-637bfa94d6bc/part.4",
+          "bytes": 8388864,
+          "sha256": "5c6f935ff497835199522d771a2562695a78220a7e633ff7d8f52b5339fe8b1e"
+        }
+      ]
+    },
+    {
+      "path": "/tmp/vane-d9-wd1e16ut",
+      "removed": true
+    }
+  ],
+  "errors": [],
+  "owned": {
+    "data": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb",
+    "runtime": "/tmp/vane-d9-wd1e16ut",
+    "containers": [
+      "vane-drive9-bench-tidb-3910675",
+      "vane-drive9-bench-minio-3910675"
+    ]
+  },
+  "docker_images": {
+    "vane-drive9-bench-tidb-3910675": "sha256:7b692197a6cc4957e41eaa4a3c65238563ef101ec4d6f361684837ab930fb106",
+    "vane-drive9-bench-minio-3910675": "sha256:69b2ec208575b69597784255eec6fa6a2985ee9e1a47f4411a51f7f5fdd193a9"
+  },
+  "tenant_id": "e25cc037-2574-4b42-93d1-363a30458365",
+  "mount_argv": [
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/bin/drive9",
+    "mount",
+    "--foreground",
+    "--mode=fuse",
+    "--server=http://127.0.0.1:19009",
+    "--profile=none",
+    "--durability=fsync",
+    "--trust-process-local-events",
+    "--no-auto-unpack",
+    "--cache-dir=/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/cache",
+    "--write-cache-free-ratio=0.01",
+    "--disk-read-cache-free-ratio=0.01",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount"
+  ],
+  "cache_free_space_floor_override": "1% instead of Drive9 default 10% on the shared 98%-full partition; runner also enforces 2 GiB free before each sample",
+  "mount_line": "drive9 /home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/mount fuse.drive9 rw,nosuid,nodev,relatime,user_id=1002,group_id=0,max_read=1048576 0 0",
+  "measurement_started_utc": "2026-10-05T16:01:16.275507+00:00",
+  "vane_build": {
+    "baseline_commit": "9ee791a625b50a571e0939c7bc4e6b1ebc52e244",
+    "created_epoch": 1791214913.6652896,
+    "flags": "GCC 13.3.0 Release -O3 -DNDEBUG, static SQLite 3.53.2, libfuse 3.14.0",
+    "free_bytes": 32503197696,
+    "baseline_source_sha256": "3b08efcd81261223bac3b0e0623af8e0bdd68fb2a0f99bd2efd3be61672126c2",
+    "baseline_binary_sha256": {
+      "baseline-cli": "7a257bd5a7c2222500276869a92274987dea1f4fcee618bc245d5b043cf6568b",
+      "baseline-mount": "ecea66ee814c0ffbbe36c9ff7be9ded9b11783c08ac375ad3ced828824d5c28a"
+    },
+    "optimized_source_sha256": "9fbe2d0e3d0ce83d592b2410fb7cc979605c99aa740c64ca8571d16e646d256b",
+    "optimized_binary_sha256": {
+      "optimized-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4",
+      "optimized-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+    },
+    "configuration": {
+      "baseline_checkpoint_pages": 1000,
+      "optimized_checkpoint_pages": 4096,
+      "synchronous": "FULL",
+      "metadata_ttl_seconds": 60,
+      "live_file_data": "direct_io; no writeback",
+      "page_cache_kib": 2000
+    }
+  },
+  "vane_binary_sha256": {
+    "mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719",
+    "cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4"
+  },
+  "vane_cache_policy": "direct_io for live file data; kernel attribute/entry TTL 60 seconds; connection-private inode counts; FULL per mutation",
+  "vane_mount_line": "vane-mount /home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/owned-local-_v6_k0pb/vane-mount fuse.vane-mount rw,nosuid,nodev,relatime,user_id=1002,group_id=0,default_permissions 0 0",
+  "scope": "Same-process, same-window alternating VaneFS/Drive9 pairs, three repetitions. Selected remaining costs: sequential write, hot stat, and warmed Git macro suite. Fixture preparation, verification, queue drains and cleanup are outside timers. No agent-owned builds/tests overlap measurements; unrelated host jobs remain active. Durability boundaries differ.",
+  "medians": {
+    "vane_fs": {
+      "macro_find_files": 0.012097722996259108,
+      "macro_git_clone": 1.6556331170140766,
+      "macro_git_diff_dirty": 0.016410001000622287,
+      "macro_git_status_dirty": 0.06544842998846434,
+      "macro_go_build": 0.10768555497634225,
+      "sequential_write": 45.912156845150854,
+      "stat": 110304.89238924604
+    },
+    "drive9": {
+      "macro_find_files": 0.009653387009166181,
+      "macro_git_clone": 3.1352986519923434,
+      "macro_git_diff_dirty": 0.05390518199419603,
+      "macro_git_status_dirty": 0.17705340500106104,
+      "macro_go_build": 0.16882603301201016,
+      "sequential_write": 87.97101338925786,
+      "stat": 143680.16344671365
+    }
+  },
+  "measurement_finished_utc": "2026-10-05T16:04:28.994856+00:00",
+  "status": "PASS",
+  "vane_database_quick_check": [
+    [
+      "ok"
+    ]
+  ],
+  "finished_utc": "2026-10-05T16:05:39.073387+00:00",
+  "free_bytes_after_cleanup": 32421232640,
+  "schema": 1,
+  "local_artifact_hashes": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/minio.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/mount.log",
+      "bytes": 358492,
+      "sha256": "2b98d31995e51c114bd102fa2b1d8a477f9d4efc3086ba4bc673fc189413907e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/results.json",
+      "bytes": 64218,
+      "sha256": "b41d610bcb479219212b57bbaa06cc339bf94aab74b7f00be59bcf47dcebdf19"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/run.log",
+      "bytes": 2484,
+      "sha256": "68a2a9c700aae914db04f41e54d7093007cb8ca5351babbe74f22316cf3e70c9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/run_local.py",
+      "bytes": 20617,
+      "sha256": "ab79229846b4098f13e16905251698378bee6c187751e17d5c52e02bda3afe76"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/server.log",
+      "bytes": 5283674,
+      "sha256": "e9380a956a92aa6e2ce1fb3c3bfe8bcbacaf0d291e25613257e0946568938cd3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/tidb.log",
+      "bytes": 1265957,
+      "sha256": "99fa5906df9248ea406bbb47d9caa4b46077d7048b2d06f68556f7fc2911c307"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/vane-build.json",
+      "bytes": 1080,
+      "sha256": "ba6e5e226c66f392b373cae8d65ab9aaf5fc4f00b47187dfbba49130e7d606f5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/vane-cli",
+      "bytes": 1702552,
+      "sha256": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/vane-mount",
+      "bytes": 1743544,
+      "sha256": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/same-window-20261005/vane-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "removed_data_bytes": 849558666
+}

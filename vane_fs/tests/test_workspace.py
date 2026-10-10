@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 import random
 import sqlite3
 import subprocess
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from vane_fs import CapacityError, ConflictError, StalePreviewError, Workspace
+from vane_fs import CapacityError, ConflictError, Error, StalePreviewError, Workspace
 
 
 @pytest.fixture
@@ -91,6 +92,171 @@ def test_replacement_reuses_unchanged_blocks_and_clears_tail(workspace, database
     session.truncate("/file", len(original))
     assert session.read("/file") == b"a" * 4096 + b"b" + b"\0" * (len(original) - 4097)
     assert main.read("/file") == original
+
+
+@pytest.mark.parametrize("offset", [0, 1, 4095])
+def test_large_sparse_write_preserves_payload_mapping_and_versions(workspace, database_path, offset):
+    block = 4096
+    data = b"".join(bytes([i if i % 5 else 0]) * block for i in range(193)) + b"tail"
+    expected = b"\0" * offset + data
+    main = workspace.checkout()
+    main.write_file("/file", b"")
+    empty = workspace.snapshot()
+    main.write("/file", data, offset)
+    saved = workspace.snapshot()
+    child = workspace.checkout(workspace.fork("main", "child").id)
+    child.truncate("/file", 17)
+    child.truncate("/file", len(expected))
+    child.write("/file", data, offset)
+    with workspace.open_snapshot(empty) as before, workspace.open_snapshot(saved) as frozen:
+        assert before.read("/file") == b""
+        for session in [main, child, frozen]:
+            assert session.read("/file") == expected
+            assert session.read("/file", 63 * block - 3, 4 * block + 7) == expected[63 * block - 3 : 67 * block + 4]
+        workspace.collect_garbage()
+        assert frozen.read("/file") == expected
+    with Workspace(database_path) as reopened:
+        assert reopened.checkout().read("/file") == expected
+        assert reopened.checkout(child.id).read("/file") == expected
+
+
+@pytest.mark.parametrize("table", ["block_payloads", "block_versions"])
+def test_large_write_failure_rolls_back_all_batches(workspace, database_path, table):
+    def sql(script):
+        # Even closing a read-only connection from another SQLite copy can
+        # drop this process's locks. Isolate both inspection and fault injection.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.executescript(sys.argv[2]); "
+                "print(json.dumps([db.execute('SELECT count(*) FROM '+t).fetchone()[0] "
+                "for t in ('inode_versions','dirent_versions','block_versions','block_payloads')])); db.close()",
+                str(database_path),
+                script,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return json.loads(result.stdout)
+
+    main = workspace.checkout()
+    main.write_file("/file", b"before")
+    before = sql("")
+    generation = workspace.branch().generation
+    sql(
+        "CREATE TABLE fault_counter AS SELECT 0 AS writes;"
+        f"CREATE TRIGGER fail_batch BEFORE INSERT ON {table} BEGIN "
+        "UPDATE fault_counter SET writes=writes+1;"
+        "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
+        "THEN RAISE(ABORT,'injected batch failure') END; END;"
+    )
+    data = bytes(range(256)) * (193 * 16)
+    try:
+        with pytest.raises(Error, match="injected batch failure"):
+            main.write("/file", data, offset=8191)
+        assert main.read("/file") == b"before"
+        assert sql("") == before
+        assert workspace.branch().generation == generation
+    finally:
+        sql("DROP TRIGGER fail_batch; DROP TABLE fault_counter;")
+    main.write("/file", data, offset=8191)
+    assert main.read("/file") == b"before" + b"\0" * (8191 - 6) + data
+
+
+def test_concurrent_large_writes_allocate_independent_payloads(workspace, database_path):
+    barrier = threading.Barrier(2)
+
+    def write(index):
+        data = bytes(range(index, index + 193)) * 4096
+        with Workspace(database_path) as connection:
+            session = connection.checkout()
+            barrier.wait(timeout=10)
+            for iteration in range(3):
+                session.write_file(f"/writer-{index}-{iteration}", data)
+        return index, data
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for index, data in executor.map(write, range(2)):
+            for iteration in range(3):
+                assert workspace.checkout().read(f"/writer-{index}-{iteration}") == data
+
+
+def test_range_reads_preserve_sparse_blocks_across_versions(workspace):
+    block = 4096
+    original = b"".join(bytes([index if index % 3 else 0]) * block for index in range(32)) + b"tail"
+    main = workspace.checkout()
+    main.write_file("/file", original)
+    base = workspace.snapshot()
+    child = workspace.checkout(workspace.fork("main", "child").id)
+    expected = bytearray(original)
+    for offset, data in ((block - 3, b"changed" * 1171), (7 * block, b"\0" * (2 * block))):
+        child.write("/file", data, offset=offset)
+        expected[offset : offset + len(data)] = data
+    changed = workspace.snapshot(child.id)
+    main.write("/file", b"parent" * 683, offset=20 * block)
+    parent_expected = bytearray(original)
+    parent_expected[20 * block : 20 * block + 4098] = b"parent" * 683
+    child.truncate("/file", 25 * block + 3)
+    child.truncate("/file", len(original) + block)
+    truncated = bytes(expected[: 25 * block + 3]) + b"\0" * (len(original) + block - (25 * block + 3))
+    with workspace.open_snapshot(base) as frozen, workspace.open_snapshot(changed) as child_frozen:
+        for session, data in (
+            (main, parent_expected),
+            (child, truncated),
+            (frozen, original),
+            (child_frozen, expected),
+        ):
+            assert session.read("/file") == data
+            for offset, size in (
+                (0, 1),
+                (4093, 8197),
+                (6 * block + 7, 4 * block),
+                (len(data) - 5, 100),
+                (len(data), 1),
+            ):
+                assert session.read("/file", offset, size) == data[offset : offset + size]
+            assert session.read("/file", 4095, 0) == b""
+
+
+def test_sparse_range_read_at_maximum_file_size(workspace):
+    main = workspace.checkout()
+    main.write_file("/file", b"")
+    maximum = 2**63 - 1
+    main.write("/file", b"end", offset=maximum - 3)
+    assert main.stat("/file").size == maximum
+    assert main.read("/file", maximum - 7, 100) == b"\0" * 4 + b"end"
+    assert main.read("/file", maximum, 100) == b""
+    main.truncate("/file", maximum - 2)
+    main.truncate("/file", maximum)
+    assert main.read("/file", maximum - 3, 3) == b"e\0\0"
+
+
+@pytest.mark.parametrize("fault", ["missing_payload", "overlapping_versions"])
+def test_range_read_reports_corruption_and_releases_query(workspace, database_path, fault):
+    main = workspace.checkout()
+    data = b"a" * 4096 + b"b" * 4096
+    main.write_file("/file", data)
+    workspace.snapshot()
+    assert main.read("/file") == data
+    with closing(sqlite3.connect(database_path)) as db:
+        if fault == "missing_payload":
+            db.execute("DELETE FROM block_payloads WHERE id=(SELECT payload FROM block_versions WHERE block=1)")
+            message = "Missing block payload"
+        else:
+            db.execute(
+                "INSERT INTO block_versions(inode,block,low,high,writer,deleted,payload) "
+                "SELECT inode,block,(SELECT frontier FROM branches WHERE name='main'),high,writer,deleted,payload "
+                "FROM block_versions WHERE block=1"
+            )
+            message = "Overlapping visible versions"
+        db.commit()
+    for _ in range(2):
+        with pytest.raises(Error, match=message):
+            main.read("/file")
+        assert main.read("/file", 3, 100) == b"a" * 100
 
 
 def test_old_session_refreshes_range_after_fork(workspace, database_path):

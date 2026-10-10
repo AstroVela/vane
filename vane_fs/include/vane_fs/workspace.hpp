@@ -15,6 +15,10 @@ namespace vane_fs {
 
 struct SnapshotPin;
 
+// Strict synchronizes every mutation; Fsync commits immediately for visibility
+// and synchronizes on Sync(), synchronous handle writes, and explicit Close().
+enum class Durability { Strict, Fsync };
+
 enum class ErrorCode {
 	Invalid,
 	NotFound,
@@ -97,12 +101,12 @@ public:
 	                  int64_t mode = 0644);
 	FileStat OpenDirectory(const std::string &path);
 	void CloseFile(int64_t inode, int64_t references = 1);
-	FileStat OpenInode(int64_t inode, bool directory = false, bool truncate = false);
+	FileStat OpenInode(int64_t inode, bool directory = false, bool truncate = false, bool synchronous = false);
 	// Low-level FUSE lookup references are retained until FORGET. Create can
 	// atomically retain both a lookup and an open reference.
 	FileStat LookupInode(int64_t parent, const std::string &name);
 	FileStat CreateNode(int64_t parent, const std::string &name, bool directory, int64_t mode, bool exclusive = true,
-	                    bool truncate = false, int64_t references = 1);
+	                    bool truncate = false, int64_t references = 1, bool synchronous = false);
 	void RemoveNode(int64_t parent, const std::string &name, bool directory);
 	void RenameNode(int64_t parent, const std::string &name, int64_t new_parent, const std::string &new_name,
 	                bool no_replace = false);
@@ -110,7 +114,8 @@ public:
 	FileStat StatInode(int64_t inode);
 	std::vector<std::string> ListDirectoryInode(int64_t inode);
 	std::string ReadInode(int64_t inode, int64_t offset, int64_t size);
-	void WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append = false);
+	void WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append = false,
+	                bool synchronous = false);
 	void TruncateInode(int64_t inode, int64_t size);
 	void SetAttributes(const std::string &path, std::optional<int64_t> mode = {}, std::optional<int64_t> mtime_ns = {},
 	                   int64_t inode = 0, std::optional<int64_t> size = {});
@@ -132,11 +137,14 @@ private:
 
 class Workspace {
 public:
-	explicit Workspace(const std::string &path, int timeout_ms = 5000);
+	explicit Workspace(const std::string &path, int timeout_ms = 5000, Durability durability = Durability::Strict);
 	~Workspace();
 	Workspace(const Workspace &) = delete;
 	Workspace &operator=(const Workspace &) = delete;
 	void Close();
+	// Synchronize all prior commits in this database, including namespace changes.
+	// Failures propagate and can be retried; ordinary handle close is not a barrier.
+	void Sync();
 	std::string Id() const;
 	static std::string SQLiteVersion();
 	BranchInfo GetBranch(const std::string &branch = "main");

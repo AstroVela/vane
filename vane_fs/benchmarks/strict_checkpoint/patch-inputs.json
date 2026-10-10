@@ -1,0 +1,14 @@
+{
+  "src/workspace.cpp": {
+    "baseline": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "candidate": "6b81e6fb739c530f8a5a46f01357fea2d12ecf9ed2d4f59b2e3b399b6cbaa410"
+  },
+  "src/checkpoint.hpp": {
+    "baseline": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "candidate": "ec0ed6f16e2c132eab3462afc11f0458567f66113bd0c6ab36b054ff5585cc5d"
+  },
+  "tests/test_checkpoint.cpp": {
+    "baseline": "cd298919190e5e784c17e554dc7ed540dcc226ffe5d006a171f91156e908148e",
+    "candidate": "135b7525925169dffe6ad53296d9b0f1ac7ae0f452368fa531a8cf3d7d05d814"
+  }
+}

@@ -1,0 +1,5823 @@
+{
+  "started_utc": "2026-10-08T17:56:27.769304+00:00",
+  "config": {
+    "runs": 6,
+    "cache_state": "specified per read phase",
+    "environment": "local",
+    "drop_caches_command": "",
+    "small_count": 128,
+    "stat_count": 1000,
+    "dir_large_count": 1000,
+    "large_mib": 64,
+    "random_reads": 4096,
+    "macro_files": 100,
+    "macro_total_mib": 4,
+    "git_clone_mode": "no-local",
+    "keep_workdirs": false
+  },
+  "drive9_commit": "3334e43d47e00d1411c32defe837a87a969d1e56",
+  "harness_sha256": "352cce87372ea37aba28da8a9fb06ace1b9ff1b5060d8733cdfa0c7260d96629",
+  "runner_sha256": "3f23e9210c09747e81a4a6c6d6417a6de7b25e7b5893c711ee79fd485a521db7",
+  "cli_sha256": "94f85f93d376a950763509a7ce37bb935d349e80cd96af67052c80f1dd4ea74b",
+  "server_sha256": "23fc0651ddac84dcbf6b12ba70fcf8fa9c166e948346144c2947c58e015a155c",
+  "build": {
+    "go": "go1.25.1",
+    "cgo_enabled": false,
+    "make_targets": [
+      "build-server",
+      "build-cli"
+    ],
+    "parallelism": 4
+  },
+  "backend": {
+    "tenant_provider": "local",
+    "metadata": "TiDB v8.5.6 unistore (upstream local development mode, not distributed TiKV)",
+    "large_files": "real MinIO S3 API on loopback, independent owned container and data directory"
+  },
+  "cache_policy": "Writable same-handle read after file fsync, versus reopen after three seconds and two complete warm passes. Explicit per-sample cache protocol; no global eviction. Neither is a cold-storage test.",
+  "trust_process_local_events": true,
+  "default_profile_artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/drive9-local/default-profile/results.json",
+  "durability": "explicit --durability=fsync: fsync waits for remote commit; ordinary write/close may complete before remote upload; upstream write workloads include fsync inside the timer",
+  "profile": "none: all file paths, including .git, go through Drive9 remote persistent storage",
+  "comparison": {
+    "vane_results": "paired_samples in this report",
+    "same_host_and_config": true,
+    "rerun_of": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/results.json",
+    "different_measurement_window": false,
+    "vane_mutation_durability": "Latest VaneFS: WAL/NORMAL with real FULL fsync barriers, per-request immediate transactions",
+    "production_ranking": false
+  },
+  "host": {
+    "platform": "Linux-6.11.0-24-generic-x86_64-with-glibc2.39",
+    "cpus": 36,
+    "isolated": false
+  },
+  "host_telemetry": "host-load.jsonl (one-second CPU, disk, PSI and memory snapshots)",
+  "errors": [],
+  "disk_before": {
+    "total": 1966736678912,
+    "used": 1759216992256,
+    "free": 107539435520
+  },
+  "owned": {
+    "data": "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1",
+    "runtime": "/tmp/vane-d9-15fw8koe",
+    "containers": [
+      "vane-drive9-bench-tidb-976289",
+      "vane-drive9-bench-minio-976289"
+    ]
+  },
+  "docker_images": {
+    "vane-drive9-bench-tidb-976289": "sha256:7b692197a6cc4957e41eaa4a3c65238563ef101ec4d6f361684837ab930fb106",
+    "vane-drive9-bench-minio-976289": "sha256:69b2ec208575b69597784255eec6fa6a2985ee9e1a47f4411a51f7f5fdd193a9"
+  },
+  "tenant_id": "2edd8779-1283-4e24-88fc-a47fe1c9aa11",
+  "mount_argv": [
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/bin/drive9",
+    "mount",
+    "--foreground",
+    "--mode=fuse",
+    "--server=http://127.0.0.1:19009",
+    "--profile=none",
+    "--durability=fsync",
+    "--trust-process-local-events",
+    "--no-auto-unpack",
+    "--cache-dir=/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/cache",
+    "--write-cache-free-ratio=0.01",
+    "--disk-read-cache-free-ratio=0.01",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/mount"
+  ],
+  "cache_free_space_floor_override": "1% cache guard unchanged from prior local comparisons; retain at least 2 GiB additional free headroom",
+  "mount_line": "drive9 /home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/mount fuse.drive9 rw,nosuid,nodev,relatime,user_id=1002,group_id=0,max_read=1048576 0 0",
+  "measurement_started_utc": "2026-10-08T17:56:38.528821+00:00",
+  "vane_build": {
+    "current_commit": "cfcb1cef7a055c62d0e6615fd06174b108666700",
+    "binaries": {
+      "vane-current": "2275479eb0a02a59c31d37d3399a71a560d99d759da23c83ddc2d2b66f427639",
+      "vane-selective": "6acb4ae0f756ef4ad908b2a130b1cd9ed63987abece5e4176cd212e70c29bfb5",
+      "cli-current": "1ffec3f00d13d0fe05b3f168e287ca9aebc0bad0fc606a103fe6c9578c9766b6",
+      "cli-selective": "28e693683b5953079b226a0a5a38784d1d72c756ae6fa0708d8d0da8fa7addf9"
+    },
+    "prototype": "selective publication and OPEN-only checkpoint coalescing"
+  },
+  "vane_cache_policy": "current: live direct_io, disabled writeback, kernel TTL 60 seconds; 16MiB background threshold, 64MiB admission, 16MiB retained WAL; vacant-block batching",
+  "current_mount_argv": [
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/vane-current",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/current.sqlite",
+    "--branch",
+    "main",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/current-mount",
+    "--durability=fsync"
+  ],
+  "selective_mount_argv": [
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/vane-selective",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/selective.sqlite",
+    "--branch",
+    "main",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/owned-local-lga5xzc1/selective-mount",
+    "--durability=fsync"
+  ],
+  "scope": "Six balanced permutations of production SQLite BLOB, experimental selective external staging, and pinned local reference. Each fresh workload directory runs 64/256 MiB writes, explicit read-cache protocols, 512 random overwrites plus fsync, 128 small-file fsyncs and 128 namespace operations plus directory fsync. All scalar samples retained; no owned builds/tests overlap. Backend/cache/durability boundaries differ. Directory fsync on the reference remote namespace returns OK without an additional barrier.",
+  "round_orders": [
+    [
+      "current",
+      "selective",
+      "drive9"
+    ],
+    [
+      "selective",
+      "drive9",
+      "current"
+    ],
+    [
+      "drive9",
+      "current",
+      "selective"
+    ],
+    [
+      "drive9",
+      "selective",
+      "current"
+    ],
+    [
+      "current",
+      "drive9",
+      "selective"
+    ],
+    [
+      "selective",
+      "current",
+      "drive9"
+    ]
+  ],
+  "sample_window_started_epoch": 1791482209.0882041,
+  "medians": {
+    "current": {
+      "mkdir": 1220.9175275930165,
+      "random_read_4k_settled_reopen": 61.733235067978384,
+      "random_read_4k_writable_same_handle": 62.038600577532975,
+      "random_write_4k": 1.5201039800667382,
+      "read_64_settled_reopen": 526.072297494073,
+      "read_64_writable_same_handle": 526.8330440466825,
+      "rename": 1344.026562790424,
+      "rmdir": 1324.7163305720342,
+      "small_file_fsync": 78.33476724344874,
+      "write_256": 88.69827483584544,
+      "write_64": 110.31450370687163
+    },
+    "selective": {
+      "mkdir": 1264.827176424721,
+      "random_read_4k_settled_reopen": 59.03268795799096,
+      "random_read_4k_writable_same_handle": 60.884258974523135,
+      "random_write_4k": 12.443447106462138,
+      "read_64_settled_reopen": 751.6777690731951,
+      "read_64_writable_same_handle": 784.7178996471047,
+      "rename": 1303.606974388867,
+      "rmdir": 1285.9147014564348,
+      "small_file_fsync": 252.05249860426912,
+      "write_256": 121.80955249609106,
+      "write_64": 86.88013742557563
+    },
+    "drive9": {
+      "mkdir": 70.1756327455329,
+      "random_read_4k_settled_reopen": 1208.2670711322546,
+      "random_read_4k_writable_same_handle": 0.35029766840905846,
+      "random_write_4k": 1.8080326546103636,
+      "read_64_settled_reopen": 4906.707471885839,
+      "read_64_writable_same_handle": 218.70753445594286,
+      "rename": 30.791751567175254,
+      "rmdir": 48.41463229500978,
+      "small_file_fsync": 23.37704968140835,
+      "write_256": 108.27251990821995,
+      "write_64": 83.28636657957219
+    }
+  },
+  "measurement_finished_utc": "2026-10-08T18:08:46.148723+00:00",
+  "status": "PASS",
+  "vane_database_quick_check": {
+    "current": [
+      [
+        "ok"
+      ]
+    ],
+    "selective": [
+      [
+        "ok"
+      ]
+    ]
+  },
+  "finished_utc": "2026-10-08T18:10:23.447912+00:00",
+  "free_bytes_after_cleanup": 107509121024,
+  "artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/reference/results.json",
+  "artifact_sha256": "3e967e281e7ad516be7092fb74569c8f4776f09c76d198b5b75adc9ccba4615f",
+  "paired_samples": [
+    {
+      "metric": "write_64",
+      "value": 99.55576026389777,
+      "seconds": 0.6428558210027404,
+      "unit": "MiB/s",
+      "started_epoch": 1791482209.125219,
+      "ended_epoch": 1791482209.7680848,
+      "fsync_seconds": 0.04119225300382823,
+      "close_seconds": 0.00010617601219564676,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.4248046875,
+        1.52978515625,
+        2.15380859375
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.004191346524748951,
+        "p95": 0.0076237599714659154,
+        "max": 0.2930354899726808,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 87.54730007912374,
+      "seconds": 2.9241335800033994,
+      "unit": "MiB/s",
+      "started_epoch": 1791482210.5788057,
+      "ended_epoch": 1791482213.5029461,
+      "fsync_seconds": 0.03819348703837022,
+      "close_seconds": 0.0001028170227073133,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.63134765625,
+        1.57080078125,
+        2.1640625
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.004184894525678828,
+        "p95": 0.006408179004210979,
+        "max": 0.3178944489918649,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 522.5336127899402,
+      "seconds": 0.12248015904333442,
+      "unit": "MiB/s",
+      "started_epoch": 1791482224.346696,
+      "ended_epoch": 1791482224.469184,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.32972106302622706,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.9013671875,
+        1.6279296875,
+        2.1796875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 68.1384425375221,
+      "seconds": 0.23481605103006586,
+      "unit": "MiB/s",
+      "started_epoch": 1791482224.4723682,
+      "ended_epoch": 1791482224.7071905,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.32972106302622706,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.9013671875,
+        1.6279296875,
+        2.1796875
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 526.9941644077717,
+      "seconds": 0.12144347000867128,
+      "unit": "MiB/s",
+      "started_epoch": 1791482227.6295342,
+      "ended_epoch": 1791482227.7509842,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005574190290645,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 65.04683091313892,
+      "seconds": 0.24597662599990144,
+      "unit": "MiB/s",
+      "started_epoch": 1791482227.753195,
+      "ended_epoch": 1791482227.9991782,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005574190290645,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 15.395638425258557,
+      "seconds": 0.12990692199673504,
+      "unit": "MiB/s",
+      "started_epoch": 1791482228.0116005,
+      "ended_epoch": 1791482228.1415124,
+      "fsync_seconds": 0.032132690015714616,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00017428351566195488,
+        "p95": 0.00020634097745642066,
+        "max": 0.00665612198645249,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 242.32629668906702,
+      "seconds": 0.5282134120352566,
+      "unit": "files/s",
+      "started_epoch": 1791482229.1877792,
+      "ended_epoch": 1791482229.715999,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.003738258994417265,
+        "p95": 0.004122353042475879,
+        "max": 0.04287741601001471,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1323.0037475113722,
+      "seconds": 0.09674953698413447,
+      "unit": "ops/s",
+      "started_epoch": 1791482229.8893561,
+      "ended_epoch": 1791482229.986111,
+      "final_directory_fsync_seconds": 0.003730080963578075,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007208460010588169,
+        "p95": 0.0008375549805350602,
+        "max": 0.000948778004385531,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1336.2676241980885,
+      "seconds": 0.09578919498017058,
+      "unit": "ops/s",
+      "started_epoch": 1791482229.9949834,
+      "ended_epoch": 1791482230.0907779,
+      "final_directory_fsync_seconds": 0.015270240954123437,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005967300094198436,
+        "p95": 0.0006927479989826679,
+        "max": 0.0036311959847807884,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1435.491458322114,
+      "seconds": 0.08916806802153587,
+      "unit": "ops/s",
+      "started_epoch": 1791482230.099793,
+      "ended_epoch": 1791482230.188967,
+      "final_directory_fsync_seconds": 0.022094705025665462,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 0,
+      "load": [
+        1.8291015625,
+        1.6171875,
+        2.17333984375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.00048124699969775975,
+        "p95": 0.0007166819996200502,
+        "max": 0.0014528540195897222,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 140.567703800483,
+      "seconds": 0.4552966170012951,
+      "unit": "MiB/s",
+      "started_epoch": 1791482230.2312574,
+      "ended_epoch": 1791482230.686559,
+      "fsync_seconds": 0.20682790997670963,
+      "close_seconds": 0.0001626419834792614,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.84326171875,
+        1.6240234375,
+        2.17236328125
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0031481789774261415,
+        "p95": 0.0055021970183588564,
+        "max": 0.014748540008440614,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 127.75344951042145,
+      "seconds": 2.003859786025714,
+      "unit": "MiB/s",
+      "started_epoch": 1791482231.380235,
+      "ended_epoch": 1791482233.3840988,
+      "fsync_seconds": 0.028102418000344187,
+      "close_seconds": 0.00013141700765118003,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.85595703125,
+        1.63037109375,
+        2.17138671875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0028816300036851317,
+        "p95": 0.005132645019330084,
+        "max": 0.31261221499880776,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 1101.436463995949,
+      "seconds": 0.05810593900969252,
+      "unit": "MiB/s",
+      "started_epoch": 1791482237.8375778,
+      "ended_epoch": 1791482237.8956888,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35138940397882834,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.85595703125,
+        1.63037109375,
+        2.17138671875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 73.90757740502258,
+      "seconds": 0.21648659801576287,
+      "unit": "MiB/s",
+      "started_epoch": 1791482237.900936,
+      "ended_epoch": 1791482238.1174288,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35138940397882834,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.85595703125,
+        1.63037109375,
+        2.17138671875
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 701.0284911836319,
+      "seconds": 0.09129443496931344,
+      "unit": "MiB/s",
+      "started_epoch": 1791482240.9287293,
+      "ended_epoch": 1791482241.0200417,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000572582008317,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 55.3079044301744,
+      "seconds": 0.2892895719851367,
+      "unit": "MiB/s",
+      "started_epoch": 1791482241.0304842,
+      "ended_epoch": 1791482241.3197806,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000572582008317,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 14.539907172708844,
+      "seconds": 0.13755246001528576,
+      "unit": "MiB/s",
+      "started_epoch": 1791482241.339964,
+      "ended_epoch": 1791482241.4775224,
+      "fsync_seconds": 0.026017736992798746,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00020087900338694453,
+        "p95": 0.0002456270158290863,
+        "max": 0.006675347045529634,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 247.60096473845817,
+      "seconds": 0.5169608290307224,
+      "unit": "files/s",
+      "started_epoch": 1791482242.4491901,
+      "ended_epoch": 1791482242.9661558,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.003751073993043974,
+        "p95": 0.004038017999846488,
+        "max": 0.03244734596228227,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1273.1863648571496,
+      "seconds": 0.10053516400512308,
+      "unit": "ops/s",
+      "started_epoch": 1791482243.1622577,
+      "ended_epoch": 1791482243.2627988,
+      "final_directory_fsync_seconds": 0.004238003981299698,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007407549710478634,
+        "p95": 0.0008828499703668058,
+        "max": 0.0011671920074149966,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1288.4092928015282,
+      "seconds": 0.0993473120033741,
+      "unit": "ops/s",
+      "started_epoch": 1791482243.2788906,
+      "ended_epoch": 1791482243.3782423,
+      "final_directory_fsync_seconds": 0.014107902999967337,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006377745303325355,
+        "p95": 0.0007371939718723297,
+        "max": 0.003403969982173294,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1317.9263484463409,
+      "seconds": 0.0971222710213624,
+      "unit": "ops/s",
+      "started_epoch": 1791482243.394214,
+      "ended_epoch": 1791482243.4913406,
+      "final_directory_fsync_seconds": 0.02110389800509438,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 0,
+      "load": [
+        1.787109375,
+        1.61962890625,
+        2.1650390625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005995024694129825,
+        "p95": 0.0007101650116965175,
+        "max": 0.000765698030591011,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 90.26893096463269,
+      "seconds": 0.7089925549807958,
+      "unit": "MiB/s",
+      "started_epoch": 1791482243.585631,
+      "ended_epoch": 1791482244.2946289,
+      "fsync_seconds": 0.49151904095197096,
+      "close_seconds": 0.00014992995420470834,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.20458984375,
+        1.708984375,
+        2.19140625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.00258946800022386,
+        "p95": 0.006354050012305379,
+        "max": 0.01770959800342098,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 110.82531263904399,
+      "seconds": 2.3099416000186466,
+      "unit": "MiB/s",
+      "started_epoch": 1791482245.5610175,
+      "ended_epoch": 1791482247.8709643,
+      "fsync_seconds": 1.598109946004115,
+      "close_seconds": 0.00013120000949129462,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.10791015625,
+        1.69677734375,
+        2.1845703125
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.002130067499820143,
+        "p95": 0.004473125969525427,
+        "max": 0.014060699031688273,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 218.2691824057214,
+      "seconds": 0.2932159240008332,
+      "unit": "MiB/s",
+      "started_epoch": 1791482259.7834308,
+      "ended_epoch": 1791482260.0766551,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3631013559643179,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.419921875,
+        1.7685546875,
+        2.205078125
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.3434558832769105,
+      "seconds": 46.58531351201236,
+      "unit": "MiB/s",
+      "started_epoch": 1791482260.0928617,
+      "ended_epoch": 1791482306.6781833,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3631013559643179,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.35546875,
+        1.85107421875,
+        2.20849609375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 4950.911712912369,
+      "seconds": 0.012926911993417889,
+      "unit": "MiB/s",
+      "started_epoch": 1791482307.509355,
+      "ended_epoch": 1791482307.5222878,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 49.698433091980405,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.35546875,
+        1.85107421875,
+        2.20849609375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 851.6629381311768,
+      "seconds": 0.018786775006446987,
+      "unit": "MiB/s",
+      "started_epoch": 1791482307.531031,
+      "ended_epoch": 1791482307.5498204,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 49.698433091980405,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.35546875,
+        1.85107421875,
+        2.20849609375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.7920004906522187,
+      "seconds": 1.1160711229895242,
+      "unit": "MiB/s",
+      "started_epoch": 1791482307.5840044,
+      "ended_epoch": 1791482308.700081,
+      "fsync_seconds": 0.7190403700224124,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.35546875,
+        1.85107421875,
+        2.20849609375
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 4.417099989950657e-05,
+        "p95": 8.891895413398743e-05,
+        "max": 0.06778951600426808,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 24.581483898363533,
+      "seconds": 5.207171403046232,
+      "unit": "files/s",
+      "started_epoch": 1791482309.998621,
+      "ended_epoch": 1791482315.2057977,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.24658203125,
+        1.8369140625,
+        2.20166015625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.040987365966429934,
+        "p95": 0.04688594402978197,
+        "max": 0.0673465559957549,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 69.84961976064123,
+      "seconds": 1.8325081859948114,
+      "unit": "ops/s",
+      "started_epoch": 1791482319.2922513,
+      "ended_epoch": 1791482321.1247663,
+      "final_directory_fsync_seconds": 0.00010413100244477391,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.5771484375,
+        1.92431640625,
+        2.22607421875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.013917741511249915,
+        "p95": 0.01712532201781869,
+        "max": 0.04288263595663011,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 29.927814572132647,
+      "seconds": 4.2769578009611,
+      "unit": "ops/s",
+      "started_epoch": 1791482321.1481605,
+      "ended_epoch": 1791482325.425124,
+      "final_directory_fsync_seconds": 0.00013387203216552734,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        2.5771484375,
+        1.92431640625,
+        2.22607421875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.03357084799790755,
+        "p95": 0.035740402003284544,
+        "max": 0.04476016300031915,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 51.354579646695015,
+      "seconds": 2.4924748850171454,
+      "unit": "ops/s",
+      "started_epoch": 1791482325.4510424,
+      "ended_epoch": 1791482327.943522,
+      "final_directory_fsync_seconds": 4.131800960749388e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 0,
+      "load": [
+        3.412109375,
+        2.1083984375,
+        2.2841796875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.019173547043465078,
+        "p95": 0.022170306008774787,
+        "max": 0.02455750497756526,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 39.418889952111805,
+      "seconds": 1.6235870689852163,
+      "unit": "MiB/s",
+      "started_epoch": 1791482328.06067,
+      "ended_epoch": 1791482329.6842637,
+      "fsync_seconds": 0.1312475220183842,
+      "close_seconds": 0.00018120300956070423,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.412109375,
+        2.1083984375,
+        2.2841796875
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0033342365350108594,
+        "p95": 0.005261968995910138,
+        "max": 1.2711820210097358,
+        "over_1s": 1
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 121.76464246008413,
+      "seconds": 2.1024165540002286,
+      "unit": "MiB/s",
+      "started_epoch": 1791482330.3712046,
+      "ended_epoch": 1791482332.4736264,
+      "fsync_seconds": 0.08860622998327017,
+      "close_seconds": 0.0001806159853003919,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.21875,
+        2.08984375,
+        2.27685546875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0030404769931919873,
+        "p95": 0.0056139310472644866,
+        "max": 0.29834640002809465,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 765.6159758047355,
+      "seconds": 0.08359282201854512,
+      "unit": "MiB/s",
+      "started_epoch": 1791482336.8530936,
+      "ended_epoch": 1791482336.9366937,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3483757770154625,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.041015625,
+        2.0712890625,
+        2.26953125
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 59.83210087949598,
+      "seconds": 0.2674149789963849,
+      "unit": "MiB/s",
+      "started_epoch": 1791482336.9595623,
+      "ended_epoch": 1791482337.2269828,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3483757770154625,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.041015625,
+        2.0712890625,
+        2.26953125
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 745.9547053290904,
+      "seconds": 0.08579609397565946,
+      "unit": "MiB/s",
+      "started_epoch": 1791482339.9169009,
+      "ended_epoch": 1791482340.0027046,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000564540969208,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.041015625,
+        2.0712890625,
+        2.26953125
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 74.7347859794301,
+      "seconds": 0.21409039699938148,
+      "unit": "MiB/s",
+      "started_epoch": 1791482340.0254977,
+      "ended_epoch": 1791482340.2395942,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000564540969208,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.041015625,
+        2.0712890625,
+        2.26953125
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 12.88649231794133,
+      "seconds": 0.1552012720494531,
+      "unit": "MiB/s",
+      "started_epoch": 1791482340.2717416,
+      "ended_epoch": 1791482340.4269474,
+      "fsync_seconds": 0.05698575702263042,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00017756849410943687,
+        "p95": 0.0002128839842043817,
+        "max": 0.0053751589730381966,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 267.93053632540375,
+      "seconds": 0.4777357659768313,
+      "unit": "files/s",
+      "started_epoch": 1791482341.4198644,
+      "ended_epoch": 1791482341.8976052,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.003575479000573978,
+        "p95": 0.004730701970402151,
+        "max": 0.013312628958374262,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1356.1483109600563,
+      "seconds": 0.09438495698850602,
+      "unit": "ops/s",
+      "started_epoch": 1791482342.0945804,
+      "ended_epoch": 1791482342.1889715,
+      "final_directory_fsync_seconds": 0.006998615979682654,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006768479943275452,
+        "p95": 0.000790352001786232,
+        "max": 0.0009332289919257164,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1306.8604647253044,
+      "seconds": 0.09794465702725574,
+      "unit": "ops/s",
+      "started_epoch": 1791482342.2211144,
+      "ended_epoch": 1791482342.3190632,
+      "final_directory_fsync_seconds": 0.014582536998204887,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006082274776417762,
+        "p95": 0.0007907400140538812,
+        "max": 0.0034522769856266677,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1368.5895394991855,
+      "seconds": 0.09352694603148848,
+      "unit": "ops/s",
+      "started_epoch": 1791482342.3477814,
+      "ended_epoch": 1791482342.4413133,
+      "final_directory_fsync_seconds": 0.021700181008782238,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005600784788839519,
+        "p95": 0.0006752809858880937,
+        "max": 0.0008246760116890073,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 83.60045617002558,
+      "seconds": 0.7655460619716905,
+      "unit": "MiB/s",
+      "started_epoch": 1791482342.5388544,
+      "ended_epoch": 1791482343.3044052,
+      "fsync_seconds": 0.5452636500122026,
+      "close_seconds": 0.00013130297884345055,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.1181640625,
+        2.103515625,
+        2.279296875
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0023528784804511815,
+        "p95": 0.007926121004857123,
+        "max": 0.015427625039592385,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 101.48074249827427,
+      "seconds": 2.522646107012406,
+      "unit": "MiB/s",
+      "started_epoch": 1791482344.6540174,
+      "ended_epoch": 1791482347.1766696,
+      "fsync_seconds": 1.6708338939934038,
+      "close_seconds": 0.00017198501154780388,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.43310546875,
+        2.2001953125,
+        2.30859375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0022813910036347806,
+        "p95": 0.00788370700320229,
+        "max": 0.013580712024122477,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 211.69231638792917,
+      "seconds": 0.30232556897681206,
+      "unit": "MiB/s",
+      "started_epoch": 1791482355.5347748,
+      "ended_epoch": 1791482355.8371077,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36289559199940413,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.958984375,
+        2.330078125,
+        2.35009765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.3508142811418477,
+      "seconds": 45.608177489019,
+      "unit": "MiB/s",
+      "started_epoch": 1791482355.8667705,
+      "ended_epoch": 1791482401.4749572,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36289559199940413,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.3974609375,
+        2.40869140625,
+        2.3759765625
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 4857.947164385476,
+      "seconds": 0.013174289022572339,
+      "unit": "MiB/s",
+      "started_epoch": 1791482402.418987,
+      "ended_epoch": 1791482402.4321659,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.544983186991885,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.3974609375,
+        2.40869140625,
+        2.3759765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 852.6559393866199,
+      "seconds": 0.018764895969070494,
+      "unit": "MiB/s",
+      "started_epoch": 1791482402.4476743,
+      "ended_epoch": 1791482402.4664428,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.544983186991885,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.3974609375,
+        2.40869140625,
+        2.3759765625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.867319288031976,
+      "seconds": 1.071054111002013,
+      "unit": "MiB/s",
+      "started_epoch": 1791482402.5074885,
+      "ended_epoch": 1791482403.5785499,
+      "fsync_seconds": 0.6631107479915954,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.3974609375,
+        2.40869140625,
+        2.3759765625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 4.322550375945866e-05,
+        "p95": 7.977697532624006e-05,
+        "max": 0.06844685797113925,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 23.98300810167307,
+      "seconds": 5.337111986009404,
+      "unit": "files/s",
+      "started_epoch": 1791482404.9931931,
+      "ended_epoch": 1791482410.3303096,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.42919921875,
+        2.4453125,
+        2.3876953125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.04224789151339792,
+        "p95": 0.046236390015110373,
+        "max": 0.07981212000595406,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 70.06377491655616,
+      "seconds": 1.826906987989787,
+      "unit": "ops/s",
+      "started_epoch": 1791482414.3315759,
+      "ended_epoch": 1791482416.1584885,
+      "final_directory_fsync_seconds": 6.115500582382083e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.234375,
+        2.4208984375,
+        2.3798828125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.013925313978688791,
+        "p95": 0.017430965031962842,
+        "max": 0.04317592200823128,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 29.516210032907793,
+      "seconds": 4.336600120994262,
+      "unit": "ops/s",
+      "started_epoch": 1791482416.1953633,
+      "ended_epoch": 1791482420.5319688,
+      "final_directory_fsync_seconds": 6.425101310014725e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.13525390625,
+        2.41357421875,
+        2.37744140625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.03374838404124603,
+        "p95": 0.03638147300807759,
+        "max": 0.040578573010861874,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 49.73943959567825,
+      "seconds": 2.5734105780138634,
+      "unit": "ops/s",
+      "started_epoch": 1791482420.5706027,
+      "ended_epoch": 1791482423.1440191,
+      "final_directory_fsync_seconds": 6.56459596939385e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 1,
+      "load": [
+        3.13525390625,
+        2.41357421875,
+        2.37744140625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0205561829789076,
+        "p95": 0.022519416990689933,
+        "max": 0.02666688896715641,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 112.60437611707877,
+      "seconds": 0.568361570010893,
+      "unit": "MiB/s",
+      "started_epoch": 1791482423.2844315,
+      "ended_epoch": 1791482423.852798,
+      "fsync_seconds": 0.03859184397151694,
+      "close_seconds": 0.00010114000178873539,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.13525390625,
+        2.41357421875,
+        2.37744140625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0042729520064312965,
+        "p95": 0.007922774995677173,
+        "max": 0.1875901899766177,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 89.40351676483624,
+      "seconds": 2.8634220359963365,
+      "unit": "MiB/s",
+      "started_epoch": 1791482424.672933,
+      "ended_epoch": 1791482427.53636,
+      "fsync_seconds": 0.04234917595749721,
+      "close_seconds": 9.297399083152413e-05,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.39599609375,
+        2.49755859375,
+        2.4052734375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.004174841014901176,
+        "p95": 0.0062384920311160386,
+        "max": 0.3158051240025088,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 516.9492975021552,
+      "seconds": 0.12380324397236109,
+      "unit": "MiB/s",
+      "started_epoch": 1791482432.856438,
+      "ended_epoch": 1791482432.9802501,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.34611398400738835,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.39599609375,
+        2.49755859375,
+        2.4052734375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 64.61532161959538,
+      "seconds": 0.24761928903171793,
+      "unit": "MiB/s",
+      "started_epoch": 1791482433.0168734,
+      "ended_epoch": 1791482433.2645004,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.34611398400738835,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.39599609375,
+        2.49755859375,
+        2.4052734375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 622.9101971411969,
+      "seconds": 0.10274354199646041,
+      "unit": "MiB/s",
+      "started_epoch": 1791482436.0370066,
+      "ended_epoch": 1791482436.1397572,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005893030320294,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.2841796875,
+        2.4892578125,
+        2.40283203125
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 74.30737239615627,
+      "seconds": 0.2153218379826285,
+      "unit": "MiB/s",
+      "started_epoch": 1791482436.172135,
+      "ended_epoch": 1791482436.3874612,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005893030320294,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.2841796875,
+        2.4892578125,
+        2.40283203125
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.5368276554260647,
+      "seconds": 1.301382098987233,
+      "unit": "MiB/s",
+      "started_epoch": 1791482436.4134057,
+      "ended_epoch": 1791482437.7147944,
+      "fsync_seconds": 1.155848797003273,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.2841796875,
+        2.4892578125,
+        2.40283203125
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00027026853058487177,
+        "p95": 0.0003646000404842198,
+        "max": 0.012874483014456928,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 40.36287882880987,
+      "seconds": 3.171230688050855,
+      "unit": "files/s",
+      "started_epoch": 1791482438.6742208,
+      "ended_epoch": 1791482441.8454568,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.26123046875,
+        2.498046875,
+        2.40625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0044440015335567296,
+        "p95": 0.1585897029726766,
+        "max": 0.2630849319975823,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1255.7024221890667,
+      "seconds": 0.1019349789712578,
+      "unit": "ops/s",
+      "started_epoch": 1791482442.0847719,
+      "ended_epoch": 1791482442.1867135,
+      "final_directory_fsync_seconds": 0.0032702520256862044,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.26123046875,
+        2.498046875,
+        2.40625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007485980167984962,
+        "p95": 0.0009733570041134953,
+        "max": 0.00226502597797662,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1291.965499788654,
+      "seconds": 0.09907385299447924,
+      "unit": "ops/s",
+      "started_epoch": 1791482442.2274835,
+      "ended_epoch": 1791482442.3265617,
+      "final_directory_fsync_seconds": 0.014984043955337256,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.26123046875,
+        2.498046875,
+        2.40625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006195480236783624,
+        "p95": 0.0007306250045076013,
+        "max": 0.0036315209581516683,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1310.8958353041894,
+      "seconds": 0.0976431510061957,
+      "unit": "ops/s",
+      "started_epoch": 1791482442.3677986,
+      "ended_epoch": 1791482442.4654467,
+      "final_directory_fsync_seconds": 0.022255952993873507,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 1,
+      "load": [
+        3.26123046875,
+        2.498046875,
+        2.40625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000576138001633808,
+        "p95": 0.0007042170036584139,
+        "max": 0.0009312779875472188,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 84.72715527185744,
+      "seconds": 0.7553658540127799,
+      "unit": "MiB/s",
+      "started_epoch": 1791482442.576101,
+      "ended_epoch": 1791482443.331474,
+      "fsync_seconds": 0.5440179720171727,
+      "close_seconds": 0.00019838602747768164,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.26123046875,
+        2.498046875,
+        2.40625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.002368423476582393,
+        "p95": 0.009254608012270182,
+        "max": 0.013456119049806148,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 107.55231792478837,
+      "seconds": 2.3802369390032254,
+      "unit": "MiB/s",
+      "started_epoch": 1791482444.7723804,
+      "ended_epoch": 1791482447.1526232,
+      "fsync_seconds": 1.6114250210230239,
+      "close_seconds": 0.00019069801783189178,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.47412109375,
+        2.56494140625,
+        2.4287109375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.002277693507494405,
+        "p95": 0.005457984982058406,
+        "max": 0.0158478690427728,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 219.45910331663248,
+      "seconds": 0.2916260890197009,
+      "unit": "MiB/s",
+      "started_epoch": 1791482459.3452556,
+      "ended_epoch": 1791482459.6368914,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36080031894380227,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.5966796875,
+        2.60546875,
+        2.44287109375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.3497810556762692,
+      "seconds": 45.742900423996616,
+      "unit": "MiB/s",
+      "started_epoch": 1791482459.680788,
+      "ended_epoch": 1791482505.4236963,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36080031894380227,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.8486328125,
+        2.80322265625,
+        2.51708984375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 4862.50323085931,
+      "seconds": 0.01316194498213008,
+      "unit": "MiB/s",
+      "started_epoch": 1791482506.2626007,
+      "ended_epoch": 1791482506.2757683,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.75942837295588,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.7802734375,
+        2.806640625,
+        2.52001953125
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 1247.9104307284085,
+      "seconds": 0.012821433017961681,
+      "unit": "MiB/s",
+      "started_epoch": 1791482506.2982981,
+      "ended_epoch": 1791482506.3111224,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.75942837295588,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.7802734375,
+        2.806640625,
+        2.52001953125
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.8512655235791515,
+      "seconds": 1.080342054949142,
+      "unit": "MiB/s",
+      "started_epoch": 1791482506.359687,
+      "ended_epoch": 1791482507.4400346,
+      "fsync_seconds": 0.6660488800262101,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.7802734375,
+        2.806640625,
+        2.52001953125
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 3.8352503906935453e-05,
+        "p95": 8.970795897766948e-05,
+        "max": 0.07439826300833374,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 22.771091261143635,
+      "seconds": 5.621162311988883,
+      "unit": "files/s",
+      "started_epoch": 1791482508.6989517,
+      "ended_epoch": 1791482514.3201184,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.87841796875,
+        2.84326171875,
+        2.53369140625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0439611065085046,
+        "p95": 0.05010411102557555,
+        "max": 0.07454380596755072,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 76.6071243730092,
+      "seconds": 1.6708628740161657,
+      "unit": "ops/s",
+      "started_epoch": 1791482518.6093862,
+      "ended_epoch": 1791482520.2802553,
+      "final_directory_fsync_seconds": 7.49640166759491e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.88818359375,
+        2.86279296875,
+        2.5419921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.012765569001203403,
+        "p95": 0.01712078502168879,
+        "max": 0.042515989975072443,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 33.21691016529871,
+      "seconds": 3.8534589569899254,
+      "unit": "ops/s",
+      "started_epoch": 1791482520.3303072,
+      "ended_epoch": 1791482524.1837714,
+      "final_directory_fsync_seconds": 0.00014123303117230535,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.9775390625,
+        2.8984375,
+        2.5556640625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.029577306006103754,
+        "p95": 0.03517323301639408,
+        "max": 0.04218353203032166,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 46.4911012075431,
+      "seconds": 2.7532150599872693,
+      "unit": "ops/s",
+      "started_epoch": 1791482524.233836,
+      "ended_epoch": 1791482526.9870548,
+      "final_directory_fsync_seconds": 0.00010740302968770266,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 2,
+      "load": [
+        3.73876953125,
+        2.86669921875,
+        2.546875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.021456957008922473,
+        "p95": 0.023232701991219074,
+        "max": 0.02671635599108413,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 34.870855345423394,
+      "seconds": 1.835343566024676,
+      "unit": "MiB/s",
+      "started_epoch": 1791482527.1509814,
+      "ended_epoch": 1791482528.9863296,
+      "fsync_seconds": 0.040177257964387536,
+      "close_seconds": 0.00012542703188955784,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.73876953125,
+        2.86669921875,
+        2.546875
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.005301722994772717,
+        "p95": 0.008061843051109463,
+        "max": 1.3588383549940772,
+        "over_1s": 1
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 88.8334881302032,
+      "seconds": 2.8817961040185764,
+      "unit": "MiB/s",
+      "started_epoch": 1791482529.8334873,
+      "ended_epoch": 1791482532.715289,
+      "fsync_seconds": 0.06901095999637619,
+      "close_seconds": 0.00011600402649492025,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.5576171875,
+        2.85498046875,
+        2.54638671875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0041200304694939405,
+        "p95": 0.005667600024025887,
+        "max": 0.3315606180112809,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 531.1324753034247,
+      "seconds": 0.12049724499229342,
+      "unit": "MiB/s",
+      "started_epoch": 1791482537.998271,
+      "ended_epoch": 1791482538.1187758,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3739523619879037,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.5576171875,
+        2.85498046875,
+        2.54638671875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 63.56772901738825,
+      "seconds": 0.2517000410007313,
+      "unit": "MiB/s",
+      "started_epoch": 1791482538.16925,
+      "ended_epoch": 1791482538.4209566,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3739523619879037,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.5576171875,
+        2.85498046875,
+        2.54638671875
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 525.1504305803744,
+      "seconds": 0.12186984199797735,
+      "unit": "MiB/s",
+      "started_epoch": 1791482541.1971827,
+      "ended_epoch": 1791482541.3190596,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005849929875694,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.3525390625,
+        2.82373046875,
+        2.53759765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 58.0774102035939,
+      "seconds": 0.2754943780018948,
+      "unit": "MiB/s",
+      "started_epoch": 1791482541.3763459,
+      "ended_epoch": 1791482541.6518464,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005849929875694,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.3525390625,
+        2.82373046875,
+        2.53759765625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.5486141659903991,
+      "seconds": 1.291477272985503,
+      "unit": "MiB/s",
+      "started_epoch": 1791482541.7147589,
+      "ended_epoch": 1791482543.0062432,
+      "fsync_seconds": 1.0632101200171746,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.3525390625,
+        2.82373046875,
+        2.53759765625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.000240542518440634,
+        "p95": 0.00031872402178123593,
+        "max": 0.10112112999195233,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 47.90478614170282,
+      "seconds": 2.6719668389996514,
+      "unit": "files/s",
+      "started_epoch": 1791482544.1348195,
+      "ended_epoch": 1791482546.8067923,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.32421875,
+        2.82666015625,
+        2.54052734375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.00378124148119241,
+        "p95": 0.08859677199507132,
+        "max": 0.31231650500558317,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1061.879052021756,
+      "seconds": 0.12054103502305225,
+      "unit": "ops/s",
+      "started_epoch": 1791482547.0107796,
+      "ended_epoch": 1791482547.1313262,
+      "final_directory_fsync_seconds": 0.028245155001059175,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.32421875,
+        2.82666015625,
+        2.54052734375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007082379597704858,
+        "p95": 0.0008477270021103323,
+        "max": 0.0020784849766641855,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1458.6089074331298,
+      "seconds": 0.08775484596844763,
+      "unit": "ops/s",
+      "started_epoch": 1791482547.1784227,
+      "ended_epoch": 1791482547.2661815,
+      "final_directory_fsync_seconds": 0.014620987989474088,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.32421875,
+        2.82666015625,
+        2.54052734375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005547960172407329,
+        "p95": 0.0007863970240578055,
+        "max": 0.003650340950116515,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1293.6587727515632,
+      "seconds": 0.09894417499890551,
+      "unit": "ops/s",
+      "started_epoch": 1791482547.3124657,
+      "ended_epoch": 1791482547.4114144,
+      "final_directory_fsync_seconds": 0.022094166022725403,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 2,
+      "load": [
+        3.32421875,
+        2.82666015625,
+        2.54052734375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005370099970605224,
+        "p95": 0.0009832539944909513,
+        "max": 0.0011010360321961343,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 145.48024156476794,
+      "seconds": 0.4399222829961218,
+      "unit": "MiB/s",
+      "started_epoch": 1791482547.5189483,
+      "ended_epoch": 1791482547.9588747,
+      "fsync_seconds": 0.14526553801260889,
+      "close_seconds": 0.00023285002680495381,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.32421875,
+        2.82666015625,
+        2.54052734375
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.003171336487866938,
+        "p95": 0.00706320401513949,
+        "max": 0.055836674000602216,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 121.85446253209798,
+      "seconds": 2.100866842956748,
+      "unit": "MiB/s",
+      "started_epoch": 1791482548.6631703,
+      "ended_epoch": 1791482550.7640424,
+      "fsync_seconds": 0.11903998797060922,
+      "close_seconds": 0.0001337529974989593,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2177734375,
+        2.8125,
+        2.53759765625
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0030316139745991677,
+        "p95": 0.005819456011522561,
+        "max": 0.2893894399749115,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 803.9238819255299,
+      "seconds": 0.07960952701978385,
+      "unit": "MiB/s",
+      "started_epoch": 1791482555.1943762,
+      "ended_epoch": 1791482555.2739928,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3576539069763385,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2177734375,
+        2.8125,
+        2.53759765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 59.56884206354677,
+      "seconds": 0.2685967939905822,
+      "unit": "MiB/s",
+      "started_epoch": 1791482555.32323,
+      "ended_epoch": 1791482555.591833,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3576539069763385,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2001953125,
+        2.81591796875,
+        2.54052734375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 1155.9517219697946,
+      "seconds": 0.05536563403438777,
+      "unit": "MiB/s",
+      "started_epoch": 1791482558.2732167,
+      "ended_epoch": 1791482558.3285904,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005423750262707,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2001953125,
+        2.81591796875,
+        2.54052734375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 69.27798064407477,
+      "seconds": 0.2309536139946431,
+      "unit": "MiB/s",
+      "started_epoch": 1791482558.3724196,
+      "ended_epoch": 1791482558.6033776,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005423750262707,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2001953125,
+        2.81591796875,
+        2.54052734375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 12.000401894982945,
+      "seconds": 0.16666108497884125,
+      "unit": "MiB/s",
+      "started_epoch": 1791482558.6483521,
+      "ended_epoch": 1791482558.8150194,
+      "fsync_seconds": 0.020866142003796995,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2001953125,
+        2.81591796875,
+        2.54052734375
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00025995500618591905,
+        "p95": 0.00034869799856096506,
+        "max": 0.00614086800487712,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 229.16564404814864,
+      "seconds": 0.5585479469737038,
+      "unit": "files/s",
+      "started_epoch": 1791482559.8212872,
+      "ended_epoch": 1791482560.3798418,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.2001953125,
+        2.81591796875,
+        2.54052734375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.003905082499841228,
+        "p95": 0.0054469379829242826,
+        "max": 0.03249924001283944,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1248.0813551825756,
+      "seconds": 0.10255741700530052,
+      "unit": "ops/s",
+      "started_epoch": 1791482560.6321309,
+      "ended_epoch": 1791482560.7346933,
+      "final_directory_fsync_seconds": 0.007925831014290452,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.10400390625,
+        2.80224609375,
+        2.53759765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007326499908231199,
+        "p95": 0.0008797819609753788,
+        "max": 0.0010153279872611165,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1466.7770073867043,
+      "seconds": 0.08726616203784943,
+      "unit": "ops/s",
+      "started_epoch": 1791482560.7906272,
+      "ended_epoch": 1791482560.8778977,
+      "final_directory_fsync_seconds": 0.013650790962856263,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.10400390625,
+        2.80224609375,
+        2.53759765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005454490019474179,
+        "p95": 0.0007881519850343466,
+        "max": 0.0038125430000945926,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1216.7199869991275,
+      "seconds": 0.10520086903125048,
+      "unit": "ops/s",
+      "started_epoch": 1791482560.936067,
+      "ended_epoch": 1791482561.0412736,
+      "final_directory_fsync_seconds": 0.024098697991576046,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 2,
+      "load": [
+        3.10400390625,
+        2.80224609375,
+        2.53759765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005836239724885672,
+        "p95": 0.000981972028966993,
+        "max": 0.0010779419681057334,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 82.97227698911881,
+      "seconds": 0.771341974963434,
+      "unit": "MiB/s",
+      "started_epoch": 1791482561.173885,
+      "ended_epoch": 1791482561.945232,
+      "fsync_seconds": 0.5556271189707331,
+      "close_seconds": 0.00015324901323765516,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.10400390625,
+        2.80224609375,
+        2.53759765625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0022891009866725653,
+        "p95": 0.007414483989123255,
+        "max": 0.014506715000607073,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 108.9899766180078,
+      "seconds": 2.3488398469635285,
+      "unit": "MiB/s",
+      "started_epoch": 1791482563.2853398,
+      "ended_epoch": 1791482565.6341863,
+      "fsync_seconds": 1.6617269460111856,
+      "close_seconds": 0.00019873998826369643,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        4.216796875,
+        3.0380859375,
+        2.61572265625
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.002150084008462727,
+        "p95": 0.004574858001433313,
+        "max": 0.013309216999914497,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 211.485729876234,
+      "seconds": 0.302620890957769,
+      "unit": "MiB/s",
+      "started_epoch": 1791482578.0555902,
+      "ended_epoch": 1791482578.3582182,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.31967922596959397,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        4.7568359375,
+        3.1865234375,
+        2.66845703125
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.35217462830095336,
+      "seconds": 45.4320064940257,
+      "unit": "MiB/s",
+      "started_epoch": 1791482578.4185615,
+      "ended_epoch": 1791482623.8505747,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.31967922596959397,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.68603515625,
+        3.13916015625,
+        2.67724609375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 4791.732221189058,
+      "seconds": 0.013356339011806995,
+      "unit": "MiB/s",
+      "started_epoch": 1791482624.6969414,
+      "ended_epoch": 1791482624.7103024,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.359621028008405,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.68603515625,
+        3.13916015625,
+        2.67724609375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 1168.6237115361007,
+      "seconds": 0.01369131897808984,
+      "unit": "MiB/s",
+      "started_epoch": 1791482624.7451425,
+      "ended_epoch": 1791482624.758838,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.359621028008405,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.68603515625,
+        3.13916015625,
+        2.67724609375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.769806542386639,
+      "seconds": 1.1300670169875957,
+      "unit": "MiB/s",
+      "started_epoch": 1791482624.8223677,
+      "ended_epoch": 1791482625.9524415,
+      "fsync_seconds": 0.7274924200028181,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.79150390625,
+        3.17041015625,
+        2.68994140625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 4.0718994569033384e-05,
+        "p95": 0.00012255198089405894,
+        "max": 0.06481277296552435,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 24.93267359059479,
+      "seconds": 5.133825681987219,
+      "unit": "files/s",
+      "started_epoch": 1791482627.2672045,
+      "ended_epoch": 1791482632.4010353,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.72802734375,
+        3.16748046875,
+        2.69189453125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.038873344485182315,
+        "p95": 0.04613015701761469,
+        "max": 0.07394215802196413,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 70.28749057450963,
+      "seconds": 1.821092188009061,
+      "unit": "ops/s",
+      "started_epoch": 1791482636.5737062,
+      "ended_epoch": 1791482638.394804,
+      "final_directory_fsync_seconds": 8.859200170263648e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.66943359375,
+        3.16455078125,
+        2.69384765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.01379065148648806,
+        "p95": 0.015929382003378123,
+        "max": 0.04365967202465981,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 29.855490645882142,
+      "seconds": 4.2873185880016536,
+      "unit": "ops/s",
+      "started_epoch": 1791482638.4604027,
+      "ended_epoch": 1791482642.7477272,
+      "final_directory_fsync_seconds": 0.00012592703569680452,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.45556640625,
+        3.12841796875,
+        2.6845703125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.03387081349501386,
+        "p95": 0.036222430993802845,
+        "max": 0.03739916498307139,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 53.73151118984636,
+      "seconds": 2.382214777986519,
+      "unit": "ops/s",
+      "started_epoch": 1791482642.8178892,
+      "ended_epoch": 1791482645.2001095,
+      "final_directory_fsync_seconds": 6.457802373915911e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 3,
+      "load": [
+        3.45556640625,
+        3.12841796875,
+        2.6845703125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.018512572976760566,
+        "p95": 0.021862558962311596,
+        "max": 0.03243308298988268,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 36.14233432426778,
+      "seconds": 1.770776603021659,
+      "unit": "MiB/s",
+      "started_epoch": 1791482645.370683,
+      "ended_epoch": 1791482647.1414661,
+      "fsync_seconds": 0.16828349197749048,
+      "close_seconds": 0.0001675260136835277,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        3.4189453125,
+        3.1259765625,
+        2.6865234375
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.00445827646763064,
+        "p95": 0.006132351001724601,
+        "max": 1.2480352349812165,
+        "over_1s": 1
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 125.33857167428589,
+      "seconds": 2.042467825987842,
+      "unit": "MiB/s",
+      "started_epoch": 1791482647.9081123,
+      "ended_epoch": 1791482649.9505863,
+      "fsync_seconds": 0.08921678003389388,
+      "close_seconds": 0.0001522559905424714,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        3.22509765625,
+        3.09033203125,
+        2.67724609375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0030937634874135256,
+        "p95": 0.005827423010487109,
+        "max": 0.29781428998103365,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 759.5296491838938,
+      "seconds": 0.08426267502363771,
+      "unit": "MiB/s",
+      "started_epoch": 1791482654.489949,
+      "ended_epoch": 1791482654.574219,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35026129899779335,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        3.22509765625,
+        3.09033203125,
+        2.67724609375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 58.74011995893161,
+      "seconds": 0.2723862329730764,
+      "unit": "MiB/s",
+      "started_epoch": 1791482654.6332107,
+      "ended_epoch": 1791482654.9056034,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35026129899779335,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        3.22509765625,
+        3.09033203125,
+        2.67724609375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 757.4008328172999,
+      "seconds": 0.0844995109946467,
+      "unit": "MiB/s",
+      "started_epoch": 1791482657.5250857,
+      "ended_epoch": 1791482657.609593,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000487950979732,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 60.31119301348258,
+      "seconds": 0.265290723007638,
+      "unit": "MiB/s",
+      "started_epoch": 1791482657.67156,
+      "ended_epoch": 1791482657.9368563,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000487950979732,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 13.99280930118141,
+      "seconds": 0.1429305550409481,
+      "unit": "MiB/s",
+      "started_epoch": 1791482658.0036635,
+      "ended_epoch": 1791482658.146601,
+      "fsync_seconds": 0.02627305401256308,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00021443050354719162,
+        "p95": 0.0002537050168029964,
+        "max": 0.006627176015172154,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 262.77094941112784,
+      "seconds": 0.48711625195574015,
+      "unit": "files/s",
+      "started_epoch": 1791482659.1451354,
+      "ended_epoch": 1791482659.632257,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0035715945123229176,
+        "p95": 0.004979871970135719,
+        "max": 0.01399390201549977,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1335.3305989298578,
+      "seconds": 0.09585641196463257,
+      "unit": "ops/s",
+      "started_epoch": 1791482659.8934968,
+      "ended_epoch": 1791482659.9893577,
+      "final_directory_fsync_seconds": 0.002137857023626566,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006633114826399833,
+        "p95": 0.0010910030105151236,
+        "max": 0.00116819201502949,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1400.812223968459,
+      "seconds": 0.09137555898632854,
+      "unit": "ops/s",
+      "started_epoch": 1791482660.0621002,
+      "ended_epoch": 1791482660.15348,
+      "final_directory_fsync_seconds": 0.014535648981109262,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005581044824793935,
+        "p95": 0.0008128369809128344,
+        "max": 0.004054820979945362,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1387.5049968119965,
+      "seconds": 0.09225192002486438,
+      "unit": "ops/s",
+      "started_epoch": 1791482660.2185109,
+      "ended_epoch": 1791482660.3107672,
+      "final_directory_fsync_seconds": 0.02092871896456927,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 3,
+      "load": [
+        2.966796875,
+        3.03857421875,
+        2.66259765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005553759692702442,
+        "p95": 0.0006376170204021037,
+        "max": 0.000683966965880245,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 109.42260051674965,
+      "seconds": 0.584888310986571,
+      "unit": "MiB/s",
+      "started_epoch": 1791482660.4286885,
+      "ended_epoch": 1791482661.0135815,
+      "fsync_seconds": 0.0370107619673945,
+      "close_seconds": 0.0001392620033584535,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.9697265625,
+        3.03759765625,
+        2.66455078125
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.005077167967101559,
+        "p95": 0.007660315954126418,
+        "max": 0.18497840996133164,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 90.12377892657308,
+      "seconds": 2.8405377920134924,
+      "unit": "MiB/s",
+      "started_epoch": 1791482661.883369,
+      "ended_epoch": 1791482664.7239122,
+      "fsync_seconds": 0.03911239298759028,
+      "close_seconds": 0.00012691901065409184,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.8115234375,
+        3.00341796875,
+        2.6552734375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.004063672968186438,
+        "p95": 0.006100869970396161,
+        "max": 0.3139317960012704,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 515.3239755763447,
+      "seconds": 0.12419371702708304,
+      "unit": "MiB/s",
+      "started_epoch": 1791482669.8583694,
+      "ended_epoch": 1791482669.9825716,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3475114960456267,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.8115234375,
+        3.00341796875,
+        2.6552734375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 59.43456017676291,
+      "seconds": 0.26920364098623395,
+      "unit": "MiB/s",
+      "started_epoch": 1791482670.0526047,
+      "ended_epoch": 1791482670.3218148,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3475114960456267,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.8115234375,
+        3.00341796875,
+        2.6552734375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 555.0633798821372,
+      "seconds": 0.1153021480422467,
+      "unit": "MiB/s",
+      "started_epoch": 1791482673.0015998,
+      "ended_epoch": 1791482673.116908,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000452538020909,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.90673828125,
+        3.02001953125,
+        2.66259765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 65.59610112896952,
+      "seconds": 0.2439169359859079,
+      "unit": "MiB/s",
+      "started_epoch": 1791482673.183392,
+      "ended_epoch": 1791482673.4273145,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000452538020909,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.90673828125,
+        3.02001953125,
+        2.66259765625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.5033803047074115,
+      "seconds": 1.3303353740484454,
+      "unit": "MiB/s",
+      "started_epoch": 1791482673.4973614,
+      "ended_epoch": 1791482674.8277035,
+      "fsync_seconds": 1.127108731016051,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00020610899082385004,
+        "p95": 0.0002345939865335822,
+        "max": 0.09719022398348898,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 83.86904291369927,
+      "seconds": 1.5261888719978742,
+      "unit": "files/s",
+      "started_epoch": 1791482676.0577936,
+      "ended_epoch": 1791482677.5839884,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0036933064984623343,
+        "p95": 0.07898840704001486,
+        "max": 0.23726948001421988,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1253.0231016816433,
+      "seconds": 0.10215294500812888,
+      "unit": "ops/s",
+      "started_epoch": 1791482677.8339849,
+      "ended_epoch": 1791482677.9361439,
+      "final_directory_fsync_seconds": 0.00725356099428609,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007359950104728341,
+        "p95": 0.0008487340528517962,
+        "max": 0.001082172035239637,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1362.624479117128,
+      "seconds": 0.0939363720244728,
+      "unit": "ops/s",
+      "started_epoch": 1791482678.0056477,
+      "ended_epoch": 1791482678.0995884,
+      "final_directory_fsync_seconds": 0.015014198957942426,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000575951999053359,
+        "p95": 0.0006854039966128767,
+        "max": 0.003906355006620288,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1338.536825839879,
+      "seconds": 0.09562680497765541,
+      "unit": "ops/s",
+      "started_epoch": 1791482678.1464038,
+      "ended_epoch": 1791482678.242034,
+      "final_directory_fsync_seconds": 0.022316405025776476,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 3,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005591755034402013,
+        "p95": 0.000663275015540421,
+        "max": 0.000782692979555577,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 121.34019900709389,
+      "seconds": 0.5274426820105873,
+      "unit": "MiB/s",
+      "started_epoch": 1791482678.3634517,
+      "ended_epoch": 1791482678.8908985,
+      "fsync_seconds": 0.040077437995932996,
+      "close_seconds": 9.826401947066188e-05,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.99462890625,
+        3.03662109375,
+        2.669921875
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.004365134984254837,
+        "p95": 0.00785254203947261,
+        "max": 0.17275961203267798,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 88.31874471730545,
+      "seconds": 2.8985919220140204,
+      "unit": "MiB/s",
+      "started_epoch": 1791482679.7489455,
+      "ended_epoch": 1791482682.6475425,
+      "fsync_seconds": 0.042101868020836264,
+      "close_seconds": 0.00012738798977807164,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.84130859375,
+        3.001953125,
+        2.662109375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.004362631967524067,
+        "p95": 0.00623367796652019,
+        "max": 0.3069827819708735,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 564.9806090767751,
+      "seconds": 0.11327822401653975,
+      "unit": "MiB/s",
+      "started_epoch": 1791482687.94736,
+      "ended_epoch": 1791482688.060645,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3473994769738056,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.84130859375,
+        3.001953125,
+        2.662109375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 59.993701491638504,
+      "seconds": 0.2666946629760787,
+      "unit": "MiB/s",
+      "started_epoch": 1791482688.128476,
+      "ended_epoch": 1791482688.3951757,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3473994769738056,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.84130859375,
+        3.001953125,
+        2.662109375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 511.2958394366759,
+      "seconds": 0.12517215096158907,
+      "unit": "MiB/s",
+      "started_epoch": 1791482691.141593,
+      "ended_epoch": 1791482691.2667727,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000547430012375,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.69384765625,
+        2.96826171875,
+        2.65283203125
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 58.41963922281785,
+      "seconds": 0.27388049999717623,
+      "unit": "MiB/s",
+      "started_epoch": 1791482691.336661,
+      "ended_epoch": 1791482691.6105478,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000547430012375,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.69384765625,
+        2.96826171875,
+        2.65283203125
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.396289998689217,
+      "seconds": 1.4323672030004673,
+      "unit": "MiB/s",
+      "started_epoch": 1791482691.685307,
+      "ended_epoch": 1791482693.1176825,
+      "fsync_seconds": 1.185309684020467,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.69384765625,
+        2.96826171875,
+        2.65283203125
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.0003347439633216709,
+        "p95": 0.00040014099795371294,
+        "max": 0.07812310400186107,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 72.8004915731982,
+      "seconds": 1.7582298860070296,
+      "unit": "files/s",
+      "started_epoch": 1791482694.3479552,
+      "ended_epoch": 1791482696.10619,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.71875,
+        2.96923828125,
+        2.65478515625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0038510020240209997,
+        "p95": 0.0826263100025244,
+        "max": 0.3146379500394687,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1188.81195350439,
+      "seconds": 0.10767051897710189,
+      "unit": "ops/s",
+      "started_epoch": 1791482696.38027,
+      "ended_epoch": 1791482696.487946,
+      "final_directory_fsync_seconds": 0.0040059409802779555,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.71875,
+        2.96923828125,
+        2.65478515625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007867164968047291,
+        "p95": 0.0011329579865559936,
+        "max": 0.0012627699761651456,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1351.7855013827593,
+      "seconds": 0.09468957898207009,
+      "unit": "ops/s",
+      "started_epoch": 1791482696.5611336,
+      "ended_epoch": 1791482696.655828,
+      "final_directory_fsync_seconds": 0.015002811036538333,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.71875,
+        2.96923828125,
+        2.65478515625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005911050247959793,
+        "p95": 0.0006769460160285234,
+        "max": 0.004020103951916099,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1370.7173794337036,
+      "seconds": 0.09338175901211798,
+      "unit": "ops/s",
+      "started_epoch": 1791482696.7028637,
+      "ended_epoch": 1791482696.7962494,
+      "final_directory_fsync_seconds": 0.017656690964940935,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 4,
+      "load": [
+        2.71875,
+        2.96923828125,
+        2.65478515625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0005773734883405268,
+        "p95": 0.0007061060168780386,
+        "max": 0.0008798710186965764,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 81.32882238062417,
+      "seconds": 0.7869288909714669,
+      "unit": "MiB/s",
+      "started_epoch": 1791482696.9245615,
+      "ended_epoch": 1791482697.7114944,
+      "fsync_seconds": 0.5705316220410168,
+      "close_seconds": 0.00015959003940224648,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        2.71875,
+        2.96923828125,
+        2.65478515625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0025186795101035386,
+        "p95": 0.008225555007811636,
+        "max": 0.012937074003275484,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 111.31263848686982,
+      "seconds": 2.299828694027383,
+      "unit": "MiB/s",
+      "started_epoch": 1791482699.0517623,
+      "ended_epoch": 1791482701.351595,
+      "fsync_seconds": 1.590270677988883,
+      "close_seconds": 0.0001369410310871899,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.11767578125,
+        3.0517578125,
+        2.68505859375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0021251589932944626,
+        "p95": 0.006110114976763725,
+        "max": 0.009631214023102075,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 219.14588650616432,
+      "seconds": 0.29204289900371805,
+      "unit": "MiB/s",
+      "started_epoch": 1791482714.2020416,
+      "ended_epoch": 1791482714.4940934,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36113587697036564,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.5087890625,
+        3.13427734375,
+        2.7138671875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.3509686676474157,
+      "seconds": 45.58811505098129,
+      "unit": "MiB/s",
+      "started_epoch": 1791482714.5813096,
+      "ended_epoch": 1791482760.1694329,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.36113587697036564,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        2.88818359375,
+        3.02099609375,
+        2.697265625
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 4984.141860295886,
+      "seconds": 0.01284072600537911,
+      "unit": "MiB/s",
+      "started_epoch": 1791482761.257114,
+      "ended_epoch": 1791482761.2699604,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.573885407007765,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.2177734375,
+        3.08740234375,
+        2.720703125
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 1443.0596191328862,
+      "seconds": 0.011087552993558347,
+      "unit": "MiB/s",
+      "started_epoch": 1791482761.3168206,
+      "ended_epoch": 1791482761.327912,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 48.573885407007765,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.2177734375,
+        3.08740234375,
+        2.720703125
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 0.37480697377592676,
+      "seconds": 5.336080009001307,
+      "unit": "MiB/s",
+      "started_epoch": 1791482761.469504,
+      "ended_epoch": 1791482766.8055906,
+      "fsync_seconds": 4.954074818000663,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.68115234375,
+        3.18603515625,
+        2.7548828125
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 4.447947139851749e-05,
+        "p95": 0.00012781802797690034,
+        "max": 0.05747233598958701,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 22.111782265536938,
+      "seconds": 5.788769012957346,
+      "unit": "files/s",
+      "started_epoch": 1791482768.1478598,
+      "ended_epoch": 1791482773.936635,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.787109375,
+        3.21630859375,
+        2.76708984375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.04348389949882403,
+        "p95": 0.06200009601889178,
+        "max": 0.12133569398429245,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 68.57804890081701,
+      "seconds": 1.8664864639868028,
+      "unit": "ops/s",
+      "started_epoch": 1791482778.182532,
+      "ended_epoch": 1791482780.0490243,
+      "final_directory_fsync_seconds": 0.00012068694923073053,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.7236328125,
+        3.21240234375,
+        2.7685546875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.013986865495098755,
+        "p95": 0.017197919951286167,
+        "max": 0.04433445702306926,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 33.28663059536235,
+      "seconds": 3.845387704030145,
+      "unit": "ops/s",
+      "started_epoch": 1791482780.1300762,
+      "ended_epoch": 1791482783.9754686,
+      "final_directory_fsync_seconds": 6.531801773235202e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.58544921875,
+        3.19189453125,
+        2.76416015625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.029678805003641173,
+        "p95": 0.03471222898224369,
+        "max": 0.0375999910174869,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 46.49033308789818,
+      "seconds": 2.753260548983235,
+      "unit": "ops/s",
+      "started_epoch": 1791482784.0561051,
+      "ended_epoch": 1791482786.8093703,
+      "final_directory_fsync_seconds": 5.603296449407935e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 4,
+      "load": [
+        3.5380859375,
+        3.1884765625,
+        2.765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.02175648749107495,
+        "p95": 0.02356836904073134,
+        "max": 0.024970566970296204,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 134.34138489903944,
+      "seconds": 0.47639824502402917,
+      "unit": "MiB/s",
+      "started_epoch": 1791482787.025882,
+      "ended_epoch": 1791482787.5022852,
+      "fsync_seconds": 0.14348886901279911,
+      "close_seconds": 0.0001522050006315112,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.5380859375,
+        3.1884765625,
+        2.765625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.004114881012355909,
+        "p95": 0.006063608976546675,
+        "max": 0.059782958996947855,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 119.30561244316561,
+      "seconds": 2.145749849965796,
+      "unit": "MiB/s",
+      "started_epoch": 1791482788.2856717,
+      "ended_epoch": 1791482790.431428,
+      "fsync_seconds": 0.08860581298358738,
+      "close_seconds": 0.00015015096869319677,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.33447265625,
+        3.15185546875,
+        2.755859375
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0032338029704988003,
+        "p95": 0.005881349032279104,
+        "max": 0.29997924400959164,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 795.5137600578511,
+      "seconds": 0.08045115397544578,
+      "unit": "MiB/s",
+      "started_epoch": 1791482794.965097,
+      "ended_epoch": 1791482795.0455554,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3153972129803151,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.33447265625,
+        3.15185546875,
+        2.755859375
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 61.93641706955028,
+      "seconds": 0.2583294410142116,
+      "unit": "MiB/s",
+      "started_epoch": 1791482795.116459,
+      "ended_epoch": 1791482795.3747947,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3153972129803151,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.33447265625,
+        3.15185546875,
+        2.755859375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 770.1103425375215,
+      "seconds": 0.0831049740081653,
+      "unit": "MiB/s",
+      "started_epoch": 1791482798.058158,
+      "ended_epoch": 1791482798.1412709,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000448433973361,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.2275390625,
+        3.13232421875,
+        2.75146484375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 57.75418290249934,
+      "seconds": 0.2770362109877169,
+      "unit": "MiB/s",
+      "started_epoch": 1791482798.2132566,
+      "ended_epoch": 1791482798.4902992,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000448433973361,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.2275390625,
+        3.13232421875,
+        2.75146484375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 9.691995552604988,
+      "seconds": 0.20635585201671347,
+      "unit": "MiB/s",
+      "started_epoch": 1791482798.5712993,
+      "ended_epoch": 1791482798.7776618,
+      "fsync_seconds": 0.009498910047113895,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.2275390625,
+        3.13232421875,
+        2.75146484375
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00036319848732091486,
+        "p95": 0.0004291880177333951,
+        "max": 0.009245907014701515,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 256.50403247008006,
+      "seconds": 0.4990174960112199,
+      "unit": "files/s",
+      "started_epoch": 1791482799.7946002,
+      "ended_epoch": 1791482800.2936234,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.2275390625,
+        3.13232421875,
+        2.75146484375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0036718019982799888,
+        "p95": 0.005122406990267336,
+        "max": 0.013329442997928709,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1107.0167441031037,
+      "seconds": 0.11562607402447611,
+      "unit": "ops/s",
+      "started_epoch": 1791482800.6114988,
+      "ended_epoch": 1791482800.7271302,
+      "final_directory_fsync_seconds": 0.01310120802372694,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.048828125,
+        3.0966796875,
+        2.74169921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007977475179359317,
+        "p95": 0.0009092090185731649,
+        "max": 0.0010710249771364033,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1166.8772588381623,
+      "seconds": 0.10969448502874002,
+      "unit": "ops/s",
+      "started_epoch": 1791482800.8070097,
+      "ended_epoch": 1791482800.9167092,
+      "final_directory_fsync_seconds": 0.014221271965652704,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.048828125,
+        3.0966796875,
+        2.74169921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000641432503471151,
+        "p95": 0.0007332999957725406,
+        "max": 0.01366527599748224,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 986.4477948763803,
+      "seconds": 0.12975851399824023,
+      "unit": "ops/s",
+      "started_epoch": 1791482800.970494,
+      "ended_epoch": 1791482801.1002564,
+      "final_directory_fsync_seconds": 0.04680156701942906,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 4,
+      "load": [
+        3.048828125,
+        3.0966796875,
+        2.74169921875
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006536179862450808,
+        "p95": 0.0007482119835913181,
+        "max": 0.0008740950142964721,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 12.75895639951676,
+      "seconds": 5.016084231028799,
+      "unit": "MiB/s",
+      "started_epoch": 1791482801.2457235,
+      "ended_epoch": 1791482806.261813,
+      "fsync_seconds": 3.5182637479738332,
+      "close_seconds": 0.00026036001509055495,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.28515625,
+        3.14501953125,
+        2.75927734375
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.004426981002325192,
+        "p95": 0.006121446029283106,
+        "max": 1.0775056009879336,
+        "over_1s": 1
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 97.69743837809767,
+      "seconds": 2.6203348240233026,
+      "unit": "MiB/s",
+      "started_epoch": 1791482807.119866,
+      "ended_epoch": 1791482809.740206,
+      "fsync_seconds": 0.09117869398323819,
+      "close_seconds": 0.00013035396113991737,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.26220703125,
+        3.142578125,
+        2.7607421875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0032402609940618277,
+        "p95": 0.005801282008178532,
+        "max": 0.3670804770081304,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 773.9220392363583,
+      "seconds": 0.08269566798117012,
+      "unit": "MiB/s",
+      "started_epoch": 1791482814.2277656,
+      "ended_epoch": 1791482814.310468,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3601348790107295,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.26220703125,
+        3.142578125,
+        2.7607421875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 70.9915244660863,
+      "seconds": 0.22537901700707152,
+      "unit": "MiB/s",
+      "started_epoch": 1791482814.3857703,
+      "ended_epoch": 1791482814.6111534,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3601348790107295,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.26220703125,
+        3.142578125,
+        2.7607421875
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 737.5769456355943,
+      "seconds": 0.08677060797344893,
+      "unit": "MiB/s",
+      "started_epoch": 1791482817.2846928,
+      "ended_epoch": 1791482817.3714705,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000546829018276,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 57.04843831168251,
+      "seconds": 0.2804634179919958,
+      "unit": "MiB/s",
+      "started_epoch": 1791482817.4481764,
+      "ended_epoch": 1791482817.7286453,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.000546829018276,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 9.686577889613185,
+      "seconds": 0.2064712659921497,
+      "unit": "MiB/s",
+      "started_epoch": 1791482817.8131955,
+      "ended_epoch": 1791482818.019672,
+      "fsync_seconds": 0.014391222037374973,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.0003449300129432231,
+        "p95": 0.0004974919720552862,
+        "max": 0.008327647054102272,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 226.98394862636923,
+      "seconds": 0.5639165270258673,
+      "unit": "files/s",
+      "started_epoch": 1791482819.0132205,
+      "ended_epoch": 1791482819.5771425,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0039041909913066775,
+        "p95": 0.005740166001487523,
+        "max": 0.04292286600684747,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 1256.4679879922926,
+      "seconds": 0.10187287000007927,
+      "unit": "ops/s",
+      "started_epoch": 1791482819.849808,
+      "ended_epoch": 1791482819.9516864,
+      "final_directory_fsync_seconds": 0.0031446110224351287,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000763707997975871,
+        "p95": 0.0008906290167942643,
+        "max": 0.0009623509831726551,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 1300.3534840524298,
+      "seconds": 0.09843477298272774,
+      "unit": "ops/s",
+      "started_epoch": 1791482820.0357025,
+      "ended_epoch": 1791482820.1341429,
+      "final_directory_fsync_seconds": 0.015231143974233419,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006085054774302989,
+        "p95": 0.000765174045227468,
+        "max": 0.004365691973362118,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 1253.9030544665288,
+      "seconds": 0.10208125703502446,
+      "unit": "ops/s",
+      "started_epoch": 1791482820.2181673,
+      "ended_epoch": 1791482820.3202536,
+      "final_directory_fsync_seconds": 0.021382959035690874,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "selective",
+      "repetition": 5,
+      "load": [
+        3.16064453125,
+        3.12353515625,
+        2.75634765625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000617026467807591,
+        "p95": 0.0007401870097965002,
+        "max": 0.0009525929926894605,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 111.20640689699361,
+      "seconds": 0.5755064099794254,
+      "unit": "MiB/s",
+      "started_epoch": 1791482820.4715943,
+      "ended_epoch": 1791482821.0471056,
+      "fsync_seconds": 0.04078904603375122,
+      "close_seconds": 0.0001186519511975348,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        3.0673828125,
+        3.1044921875,
+        2.751953125
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.004557716514682397,
+        "p95": 0.006418109987862408,
+        "max": 0.2258254400221631,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 88.56306154148767,
+      "seconds": 2.8905956450034864,
+      "unit": "MiB/s",
+      "started_epoch": 1791482821.9501324,
+      "ended_epoch": 1791482824.8407497,
+      "fsync_seconds": 0.03967470797942951,
+      "close_seconds": 0.00013594998745247722,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9013671875,
+        3.0693359375,
+        2.7421875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.004139966476941481,
+        "p95": 0.0066935119684785604,
+        "max": 0.317224433994852,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 531.6560869494331,
+      "seconds": 0.1203785709803924,
+      "unit": "MiB/s",
+      "started_epoch": 1791482830.193418,
+      "ended_epoch": 1791482830.3138041,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35349601902998984,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9013671875,
+        3.0693359375,
+        2.7421875
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 60.509472137677704,
+      "seconds": 0.26442141097504646,
+      "unit": "MiB/s",
+      "started_epoch": 1791482830.3977773,
+      "ended_epoch": 1791482830.6622038,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.35349601902998984,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.90966796875,
+        3.06787109375,
+        2.74365234375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 513.7829214179916,
+      "seconds": 0.12456622696481645,
+      "unit": "MiB/s",
+      "started_epoch": 1791482833.3697855,
+      "ended_epoch": 1791482833.4943593,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005678290035576,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.90966796875,
+        3.06787109375,
+        2.74365234375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 56.95831891327476,
+      "seconds": 0.280907166947145,
+      "unit": "MiB/s",
+      "started_epoch": 1791482833.5786555,
+      "ended_epoch": 1791482833.8595695,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 3.0005678290035576,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.90966796875,
+        3.06787109375,
+        2.74365234375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.3901688357087412,
+      "seconds": 1.4386741729686037,
+      "unit": "MiB/s",
+      "started_epoch": 1791482833.9477556,
+      "ended_epoch": 1791482835.386436,
+      "fsync_seconds": 1.1689426070079207,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": null
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9970703125,
+        3.08349609375,
+        2.75048828125
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 0.00037168804556131363,
+        "p95": 0.00044208200415596366,
+        "max": 0.0795615529641509,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 84.21126200152256,
+      "seconds": 1.519986720988527,
+      "unit": "files/s",
+      "started_epoch": 1791482836.581223,
+      "ended_epoch": 1791482838.1012151,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": null
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9970703125,
+        3.08349609375,
+        2.75048828125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.00353526949766092,
+        "p95": 0.07768616901012138,
+        "max": 0.2679393719881773,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 216.61318329503163,
+      "seconds": 0.5909150959923863,
+      "unit": "ops/s",
+      "started_epoch": 1791482839.1032562,
+      "ended_epoch": 1791482839.694178,
+      "final_directory_fsync_seconds": 0.4277393679949455,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9970703125,
+        3.08349609375,
+        2.75048828125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0007564020052086562,
+        "p95": 0.0009423430310562253,
+        "max": 0.06386230600764975,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 293.5498096023098,
+      "seconds": 0.4360418430296704,
+      "unit": "ops/s",
+      "started_epoch": 1791482839.7837238,
+      "ended_epoch": 1791482840.2197719,
+      "final_directory_fsync_seconds": 0.2657539779902436,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        2.9970703125,
+        3.08349609375,
+        2.75048828125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.0006787950114812702,
+        "p95": 0.0009687059791758657,
+        "max": 0.07969994598533958,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 176.18252841468248,
+      "seconds": 0.7265192590421066,
+      "unit": "ops/s",
+      "started_epoch": 1791482840.3113823,
+      "ended_epoch": 1791482841.0379076,
+      "final_directory_fsync_seconds": 0.49023555003805086,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "current",
+      "repetition": 5,
+      "load": [
+        3.15771484375,
+        3.11572265625,
+        2.7626953125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.000598295999225229,
+        "p95": 0.000733033986762166,
+        "max": 0.15792686998611316,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_64",
+      "value": 13.166679329261772,
+      "seconds": 4.8607548190047964,
+      "unit": "MiB/s",
+      "started_epoch": 1791482841.2289586,
+      "ended_epoch": 1791482846.0897195,
+      "fsync_seconds": 4.634225486952346,
+      "close_seconds": 0.0001721479929983616,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.14501953125,
+        3.11376953125,
+        2.76416015625
+      ],
+      "write_latencies_summary": {
+        "n": 64,
+        "p50": 0.0023903004766907543,
+        "p95": 0.007733808015473187,
+        "max": 0.014539306052029133,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "write_256",
+      "value": 107.55506319843208,
+      "seconds": 2.3801761849899776,
+      "unit": "MiB/s",
+      "started_epoch": 1791482847.5280282,
+      "ended_epoch": 1791482849.9082088,
+      "fsync_seconds": 1.631686898006592,
+      "close_seconds": 0.0001805229694582522,
+      "validation": {
+        "bytes": 268435456,
+        "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+        "remote": {
+          "bytes": 268435456,
+          "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.2939453125,
+        3.1455078125,
+        2.7763671875
+      ],
+      "write_latencies_summary": {
+        "n": 256,
+        "p50": 0.0022926490055397153,
+        "p95": 0.005300952005200088,
+        "max": 0.014842508011497557,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "read_64_writable_same_handle",
+      "value": 227.42408624125352,
+      "seconds": 0.2814125849981792,
+      "unit": "MiB/s",
+      "started_epoch": 1791482857.6198356,
+      "ended_epoch": 1791482857.9012578,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3646571050048806,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.10986328125,
+        3.10986328125,
+        2.7666015625
+      ]
+    },
+    {
+      "metric": "random_read_4k_writable_same_handle",
+      "value": 0.34622335397601833,
+      "seconds": 46.212942646001466,
+      "unit": "MiB/s",
+      "started_epoch": 1791482857.9890025,
+      "ended_epoch": 1791482904.2019515,
+      "cache_protocol": "writable_same_handle",
+      "seconds_from_fsync_to_open": 0.3646571050048806,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.66357421875,
+        3.23828125,
+        2.82568359375
+      ]
+    },
+    {
+      "metric": "read_64_settled_reopen",
+      "value": 5397.091417078372,
+      "seconds": 0.011858239013236016,
+      "unit": "MiB/s",
+      "started_epoch": 1791482905.0420704,
+      "ended_epoch": 1791482905.0539346,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 49.296408287016675,
+      "validation": {
+        "bytes": 67108864,
+        "prewarm_sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2"
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.66357421875,
+        3.23828125,
+        2.82568359375
+      ]
+    },
+    {
+      "metric": "random_read_4k_settled_reopen",
+      "value": 1468.7847857872916,
+      "seconds": 0.010893359023611993,
+      "unit": "MiB/s",
+      "started_epoch": 1791482905.115102,
+      "ended_epoch": 1791482905.1259995,
+      "cache_protocol": "settled_reopen",
+      "seconds_from_fsync_to_open": 49.296408287016675,
+      "validation": {
+        "checked_slices": 4096
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.66357421875,
+        3.23828125,
+        2.82568359375
+      ]
+    },
+    {
+      "metric": "random_write_4k",
+      "value": 1.8240648185685087,
+      "seconds": 1.096452263998799,
+      "unit": "MiB/s",
+      "started_epoch": 1791482905.2131088,
+      "ended_epoch": 1791482906.3095672,
+      "fsync_seconds": 0.6905160939786583,
+      "validation": {
+        "bytes": 67108864,
+        "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6",
+        "remote": {
+          "bytes": 67108864,
+          "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.77099609375,
+        3.267578125,
+        2.83740234375
+      ],
+      "write_latencies_summary": {
+        "n": 512,
+        "p50": 3.8637983379885554e-05,
+        "p95": 6.923696491867304e-05,
+        "max": 0.06079367600614205,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "small_file_fsync",
+      "value": 22.541440177923658,
+      "seconds": 5.678430436993949,
+      "unit": "files/s",
+      "started_epoch": 1791482907.6326408,
+      "ended_epoch": 1791482913.3110774,
+      "validation": {
+        "checked_files": 128,
+        "remote_sample": {
+          "bytes": 4096,
+          "sha256": "c5ad6c3f813a3c9e52fd87130f0dbfe0825d8d9810971d72120cb7e8d6d5879a"
+        }
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.708984375,
+        3.2626953125,
+        2.83837890625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.04418049252126366,
+        "p95": 0.04704237700207159,
+        "max": 0.08238612598506734,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "mkdir",
+      "value": 79.38821338904158,
+      "seconds": 1.612330024014227,
+      "unit": "ops/s",
+      "started_epoch": 1791482917.3895197,
+      "ended_epoch": 1791482919.0018554,
+      "final_directory_fsync_seconds": 4.8027955926954746e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.49169921875,
+        3.22509765625,
+        2.828125
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.012062829977367073,
+        "p95": 0.016250890970695764,
+        "max": 0.041836121992673725,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rename",
+      "value": 31.65568856221786,
+      "seconds": 4.0435070539824665,
+      "unit": "ops/s",
+      "started_epoch": 1791482919.0679073,
+      "ended_epoch": 1791482923.1114197,
+      "final_directory_fsync_seconds": 0.00013742101145908237,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.77294921875,
+        3.2880859375,
+        2.8505859375
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.03089414702844806,
+        "p95": 0.035589831008110195,
+        "max": 0.04274858901044354,
+        "over_1s": 0
+      }
+    },
+    {
+      "metric": "rmdir",
+      "value": 47.08982499434131,
+      "seconds": 2.7182092950097285,
+      "unit": "ops/s",
+      "started_epoch": 1791482923.2069817,
+      "ended_epoch": 1791482925.9251957,
+      "final_directory_fsync_seconds": 9.002303704619408e-05,
+      "validation": {
+        "exact_names_checked": true
+      },
+      "variant": "drive9",
+      "repetition": 5,
+      "load": [
+        3.7109375,
+        3.283203125,
+        2.8515625
+      ],
+      "operation_latencies_summary": {
+        "n": 128,
+        "p50": 0.02144034902448766,
+        "p95": 0.0226946710026823,
+        "max": 0.023289692995604128,
+        "over_1s": 0
+      }
+    }
+  ],
+  "distributions": {
+    "current": {
+      "mkdir": {
+        "n": 6,
+        "median": 1220.9175275930165,
+        "min": 216.61318329503163,
+        "max": 1323.0037475113722,
+        "samples": [
+          1323.0037475113722,
+          1255.7024221890667,
+          1061.879052021756,
+          1253.0231016816433,
+          1188.81195350439,
+          216.61318329503163
+        ]
+      },
+      "random_read_4k_settled_reopen": {
+        "n": 6,
+        "median": 61.733235067978384,
+        "min": 56.95831891327476,
+        "max": 74.30737239615627,
+        "samples": [
+          65.04683091313892,
+          74.30737239615627,
+          58.0774102035939,
+          65.59610112896952,
+          58.41963922281785,
+          56.95831891327476
+        ]
+      },
+      "random_read_4k_writable_same_handle": {
+        "n": 6,
+        "median": 62.038600577532975,
+        "min": 59.43456017676291,
+        "max": 68.1384425375221,
+        "samples": [
+          68.1384425375221,
+          64.61532161959538,
+          63.56772901738825,
+          59.43456017676291,
+          59.993701491638504,
+          60.509472137677704
+        ]
+      },
+      "random_write_4k": {
+        "n": 6,
+        "median": 1.5201039800667382,
+        "min": 1.3901688357087412,
+        "max": 15.395638425258557,
+        "samples": [
+          15.395638425258557,
+          1.5368276554260647,
+          1.5486141659903991,
+          1.5033803047074115,
+          1.396289998689217,
+          1.3901688357087412
+        ]
+      },
+      "read_64_settled_reopen": {
+        "n": 6,
+        "median": 526.072297494073,
+        "min": 511.2958394366759,
+        "max": 622.9101971411969,
+        "samples": [
+          526.9941644077717,
+          622.9101971411969,
+          525.1504305803744,
+          555.0633798821372,
+          511.2958394366759,
+          513.7829214179916
+        ]
+      },
+      "read_64_writable_same_handle": {
+        "n": 6,
+        "median": 526.8330440466825,
+        "min": 515.3239755763447,
+        "max": 564.9806090767751,
+        "samples": [
+          522.5336127899402,
+          516.9492975021552,
+          531.1324753034247,
+          515.3239755763447,
+          564.9806090767751,
+          531.6560869494331
+        ]
+      },
+      "rename": {
+        "n": 6,
+        "median": 1344.026562790424,
+        "min": 293.5498096023098,
+        "max": 1458.6089074331298,
+        "samples": [
+          1336.2676241980885,
+          1291.965499788654,
+          1458.6089074331298,
+          1362.624479117128,
+          1351.7855013827593,
+          293.5498096023098
+        ]
+      },
+      "rmdir": {
+        "n": 6,
+        "median": 1324.7163305720342,
+        "min": 176.18252841468248,
+        "max": 1435.491458322114,
+        "samples": [
+          1435.491458322114,
+          1310.8958353041894,
+          1293.6587727515632,
+          1338.536825839879,
+          1370.7173794337036,
+          176.18252841468248
+        ]
+      },
+      "small_file_fsync": {
+        "n": 6,
+        "median": 78.33476724344874,
+        "min": 40.36287882880987,
+        "max": 242.32629668906702,
+        "samples": [
+          242.32629668906702,
+          40.36287882880987,
+          47.90478614170282,
+          83.86904291369927,
+          72.8004915731982,
+          84.21126200152256
+        ]
+      },
+      "write_256": {
+        "n": 6,
+        "median": 88.69827483584544,
+        "min": 87.54730007912374,
+        "max": 90.12377892657308,
+        "samples": [
+          87.54730007912374,
+          89.40351676483624,
+          88.8334881302032,
+          90.12377892657308,
+          88.31874471730545,
+          88.56306154148767
+        ]
+      },
+      "write_64": {
+        "n": 6,
+        "median": 110.31450370687163,
+        "min": 34.870855345423394,
+        "max": 121.34019900709389,
+        "samples": [
+          99.55576026389777,
+          112.60437611707877,
+          34.870855345423394,
+          109.42260051674965,
+          121.34019900709389,
+          111.20640689699361
+        ]
+      }
+    },
+    "selective": {
+      "mkdir": {
+        "n": 6,
+        "median": 1264.827176424721,
+        "min": 1107.0167441031037,
+        "max": 1356.1483109600563,
+        "samples": [
+          1273.1863648571496,
+          1356.1483109600563,
+          1248.0813551825756,
+          1335.3305989298578,
+          1107.0167441031037,
+          1256.4679879922926
+        ]
+      },
+      "random_read_4k_settled_reopen": {
+        "n": 6,
+        "median": 59.03268795799096,
+        "min": 55.3079044301744,
+        "max": 74.7347859794301,
+        "samples": [
+          55.3079044301744,
+          74.7347859794301,
+          69.27798064407477,
+          60.31119301348258,
+          57.75418290249934,
+          57.04843831168251
+        ]
+      },
+      "random_read_4k_writable_same_handle": {
+        "n": 6,
+        "median": 60.884258974523135,
+        "min": 58.74011995893161,
+        "max": 73.90757740502258,
+        "samples": [
+          73.90757740502258,
+          59.83210087949598,
+          59.56884206354677,
+          58.74011995893161,
+          61.93641706955028,
+          70.9915244660863
+        ]
+      },
+      "random_write_4k": {
+        "n": 6,
+        "median": 12.443447106462138,
+        "min": 9.686577889613185,
+        "max": 14.539907172708844,
+        "samples": [
+          14.539907172708844,
+          12.88649231794133,
+          12.000401894982945,
+          13.99280930118141,
+          9.691995552604988,
+          9.686577889613185
+        ]
+      },
+      "read_64_settled_reopen": {
+        "n": 6,
+        "median": 751.6777690731951,
+        "min": 701.0284911836319,
+        "max": 1155.9517219697946,
+        "samples": [
+          701.0284911836319,
+          745.9547053290904,
+          1155.9517219697946,
+          757.4008328172999,
+          770.1103425375215,
+          737.5769456355943
+        ]
+      },
+      "read_64_writable_same_handle": {
+        "n": 6,
+        "median": 784.7178996471047,
+        "min": 759.5296491838938,
+        "max": 1101.436463995949,
+        "samples": [
+          1101.436463995949,
+          765.6159758047355,
+          803.9238819255299,
+          759.5296491838938,
+          795.5137600578511,
+          773.9220392363583
+        ]
+      },
+      "rename": {
+        "n": 6,
+        "median": 1303.606974388867,
+        "min": 1166.8772588381623,
+        "max": 1466.7770073867043,
+        "samples": [
+          1288.4092928015282,
+          1306.8604647253044,
+          1466.7770073867043,
+          1400.812223968459,
+          1166.8772588381623,
+          1300.3534840524298
+        ]
+      },
+      "rmdir": {
+        "n": 6,
+        "median": 1285.9147014564348,
+        "min": 986.4477948763803,
+        "max": 1387.5049968119965,
+        "samples": [
+          1317.9263484463409,
+          1368.5895394991855,
+          1216.7199869991275,
+          1387.5049968119965,
+          986.4477948763803,
+          1253.9030544665288
+        ]
+      },
+      "small_file_fsync": {
+        "n": 6,
+        "median": 252.05249860426912,
+        "min": 226.98394862636923,
+        "max": 267.93053632540375,
+        "samples": [
+          247.60096473845817,
+          267.93053632540375,
+          229.16564404814864,
+          262.77094941112784,
+          256.50403247008006,
+          226.98394862636923
+        ]
+      },
+      "write_256": {
+        "n": 6,
+        "median": 121.80955249609106,
+        "min": 97.69743837809767,
+        "max": 127.75344951042145,
+        "samples": [
+          127.75344951042145,
+          121.76464246008413,
+          121.85446253209798,
+          125.33857167428589,
+          119.30561244316561,
+          97.69743837809767
+        ]
+      },
+      "write_64": {
+        "n": 6,
+        "median": 86.88013742557563,
+        "min": 12.75895639951676,
+        "max": 145.48024156476794,
+        "samples": [
+          140.567703800483,
+          39.418889952111805,
+          145.48024156476794,
+          36.14233432426778,
+          134.34138489903944,
+          12.75895639951676
+        ]
+      }
+    },
+    "drive9": {
+      "mkdir": {
+        "n": 6,
+        "median": 70.1756327455329,
+        "min": 68.57804890081701,
+        "max": 79.38821338904158,
+        "samples": [
+          69.84961976064123,
+          70.06377491655616,
+          76.6071243730092,
+          70.28749057450963,
+          68.57804890081701,
+          79.38821338904158
+        ]
+      },
+      "random_read_4k_settled_reopen": {
+        "n": 6,
+        "median": 1208.2670711322546,
+        "min": 851.6629381311768,
+        "max": 1468.7847857872916,
+        "samples": [
+          851.6629381311768,
+          852.6559393866199,
+          1247.9104307284085,
+          1168.6237115361007,
+          1443.0596191328862,
+          1468.7847857872916
+        ]
+      },
+      "random_read_4k_writable_same_handle": {
+        "n": 6,
+        "median": 0.35029766840905846,
+        "min": 0.3434558832769105,
+        "max": 0.35217462830095336,
+        "samples": [
+          0.3434558832769105,
+          0.3508142811418477,
+          0.3497810556762692,
+          0.35217462830095336,
+          0.3509686676474157,
+          0.34622335397601833
+        ]
+      },
+      "random_write_4k": {
+        "n": 6,
+        "median": 1.8080326546103636,
+        "min": 0.37480697377592676,
+        "max": 1.867319288031976,
+        "samples": [
+          1.7920004906522187,
+          1.867319288031976,
+          1.8512655235791515,
+          1.769806542386639,
+          0.37480697377592676,
+          1.8240648185685087
+        ]
+      },
+      "read_64_settled_reopen": {
+        "n": 6,
+        "median": 4906.707471885839,
+        "min": 4791.732221189058,
+        "max": 5397.091417078372,
+        "samples": [
+          4950.911712912369,
+          4857.947164385476,
+          4862.50323085931,
+          4791.732221189058,
+          4984.141860295886,
+          5397.091417078372
+        ]
+      },
+      "read_64_writable_same_handle": {
+        "n": 6,
+        "median": 218.70753445594286,
+        "min": 211.485729876234,
+        "max": 227.42408624125352,
+        "samples": [
+          218.2691824057214,
+          211.69231638792917,
+          219.45910331663248,
+          211.485729876234,
+          219.14588650616432,
+          227.42408624125352
+        ]
+      },
+      "rename": {
+        "n": 6,
+        "median": 30.791751567175254,
+        "min": 29.516210032907793,
+        "max": 33.28663059536235,
+        "samples": [
+          29.927814572132647,
+          29.516210032907793,
+          33.21691016529871,
+          29.855490645882142,
+          33.28663059536235,
+          31.65568856221786
+        ]
+      },
+      "rmdir": {
+        "n": 6,
+        "median": 48.41463229500978,
+        "min": 46.49033308789818,
+        "max": 53.73151118984636,
+        "samples": [
+          51.354579646695015,
+          49.73943959567825,
+          46.4911012075431,
+          53.73151118984636,
+          46.49033308789818,
+          47.08982499434131
+        ]
+      },
+      "small_file_fsync": {
+        "n": 6,
+        "median": 23.37704968140835,
+        "min": 22.111782265536938,
+        "max": 24.93267359059479,
+        "samples": [
+          24.581483898363533,
+          23.98300810167307,
+          22.771091261143635,
+          24.93267359059479,
+          22.111782265536938,
+          22.541440177923658
+        ]
+      },
+      "write_256": {
+        "n": 6,
+        "median": 108.27251990821995,
+        "min": 101.48074249827427,
+        "max": 111.31263848686982,
+        "samples": [
+          110.82531263904399,
+          101.48074249827427,
+          107.55231792478837,
+          108.9899766180078,
+          111.31263848686982,
+          107.55506319843208
+        ]
+      },
+      "write_64": {
+        "n": 6,
+        "median": 83.28636657957219,
+        "min": 13.166679329261772,
+        "max": 90.26893096463269,
+        "samples": [
+          90.26893096463269,
+          83.60045617002558,
+          84.72715527185744,
+          82.97227698911881,
+          81.32882238062417,
+          13.166679329261772
+        ]
+      }
+    }
+  },
+  "host_summary": {
+    "sample_count": 863,
+    "active_cpu_percent": {
+      "n": 862,
+      "p50": 6.562457163418702,
+      "p95": 14.25753733446041,
+      "max": 18.46153846153846
+    },
+    "iowait_percent": {
+      "n": 862,
+      "p50": 0.0281214848143982,
+      "p95": 4.881450488145049,
+      "max": 21.342657342657343
+    },
+    "minimum_available_memory_mib": 53334.390625,
+    "maximum_dirty_mib": 214.46484375,
+    "maximum_writeback_mib": 96.0078125,
+    "scope": "Whole window, including monitor baseline, untimed work and unrelated host activity; not candidate-attributed."
+  },
+  "validation_counts": {
+    "scalar_samples": 198,
+    "random_read_slices": 147456,
+    "small_files_checked": 2304,
+    "sha256_file_results": 54,
+    "remote_content_results": 24
+  },
+  "read_path_diagnosis": {
+    "status": "PASS",
+    "rows": [
+      {
+        "variant": "current",
+        "protocol": "writable",
+        "phase": "warm-1",
+        "read_requests": 129
+      },
+      {
+        "variant": "current",
+        "protocol": "writable",
+        "phase": "sequential",
+        "read_requests": 129
+      },
+      {
+        "variant": "current",
+        "protocol": "writable",
+        "phase": "random",
+        "read_requests": 4096
+      },
+      {
+        "variant": "current",
+        "protocol": "settled",
+        "phase": "warm-1",
+        "read_requests": 129
+      },
+      {
+        "variant": "current",
+        "protocol": "settled",
+        "phase": "warm-2",
+        "read_requests": 129
+      },
+      {
+        "variant": "current",
+        "protocol": "settled",
+        "phase": "sequential",
+        "read_requests": 129
+      },
+      {
+        "variant": "current",
+        "protocol": "settled",
+        "phase": "random",
+        "read_requests": 4096
+      },
+      {
+        "variant": "selective",
+        "protocol": "writable",
+        "phase": "warm-1",
+        "read_requests": 129
+      },
+      {
+        "variant": "selective",
+        "protocol": "writable",
+        "phase": "sequential",
+        "read_requests": 129
+      },
+      {
+        "variant": "selective",
+        "protocol": "writable",
+        "phase": "random",
+        "read_requests": 4096
+      },
+      {
+        "variant": "selective",
+        "protocol": "settled",
+        "phase": "warm-1",
+        "read_requests": 129
+      },
+      {
+        "variant": "selective",
+        "protocol": "settled",
+        "phase": "warm-2",
+        "read_requests": 129
+      },
+      {
+        "variant": "selective",
+        "protocol": "settled",
+        "phase": "sequential",
+        "read_requests": 129
+      },
+      {
+        "variant": "selective",
+        "protocol": "settled",
+        "phase": "random",
+        "read_requests": 4096
+      },
+      {
+        "variant": "drive9",
+        "protocol": "writable",
+        "phase": "warm-1",
+        "read_requests": 129
+      },
+      {
+        "variant": "drive9",
+        "protocol": "writable",
+        "phase": "sequential",
+        "read_requests": 129
+      },
+      {
+        "variant": "drive9",
+        "protocol": "writable",
+        "phase": "random",
+        "read_requests": 4096
+      },
+      {
+        "variant": "drive9",
+        "protocol": "settled",
+        "phase": "warm-1",
+        "read_requests": 512
+      },
+      {
+        "variant": "drive9",
+        "protocol": "settled",
+        "phase": "warm-2",
+        "read_requests": 0
+      },
+      {
+        "variant": "drive9",
+        "protocol": "settled",
+        "phase": "sequential",
+        "read_requests": 0
+      },
+      {
+        "variant": "drive9",
+        "protocol": "settled",
+        "phase": "random",
+        "read_requests": 0
+      }
+    ],
+    "note": "Writable handles issue FUSE READ requests; settled readonly Drive9 measured reads hit kernel cache. Instrumented run is separate from throughput.",
+    "open_flags": {
+      "writable": {
+        "drive9": 1
+      },
+      "settled": {
+        "drive9": 2
+      }
+    },
+    "claims_checked": true,
+    "artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/conditional-staging-20261008T165903Z/cache-diagnosis-writable/results.json",
+    "artifact_sha256": "52070cf638f23c44e477335003137cacc6e2b25ef3c6ef79af908d4be3be133e"
+  },
+  "superseded_protocol": "The first debug run showed immediate readonly reopen already using KEEP_CACHE; its results/logs are retained in cache-diagnosis. Final comparison uses O_RDWR for the writable case and O_RDONLY after settling/two warm passes for the cached case."
+}
