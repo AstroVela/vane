@@ -222,3 +222,37 @@ def test_cuda_output_can_feed_cpu_udf_under_one_task_and_byte_budget(tmp_path, c
         rows = connection.execute("SELECT host_value(gpu_encode(i)) FROM range(4) r(i) ORDER BY i").fetchall()
         assert rows == [(28,), (36,), (44,), (52,)]
         assert_idle(runtime)
+
+
+def test_real_cuda_table_actor_and_native_sink(monkeypatch, tmp_path, cuda_devices):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from vane.execution import local_gpu_devices
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    devices = local_gpu_devices.discover_gpu_devices()
+    if not devices:
+        pytest.skip("CUDA device required")
+
+    class CudaActor:
+        def __init__(self):
+            import torch
+
+            self.torch = torch
+            assert torch.cuda.device_count() == 1
+            self.weight = torch.tensor(2, device="cuda")
+
+        def __call__(self, table):
+            values = self.torch.tensor(table.column("x").to_pylist(), device="cuda")
+            return pa.table({"x": (values * self.weight).cpu().tolist()})
+
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT i AS x FROM range(17) t(i)").map_batches(
+            CudaActor, schema={"x": vane.sqltypes.BIGINT}, actor_number=1, gpus=1, batch_size=8
+        )
+        relation.write_parquet(str(tmp_path / "cuda.parquet"))
+    assert sorted(pq.read_table(tmp_path / "cuda.parquet").column("x").to_pylist()) == list(range(0, 34, 2))
+    assert not local_gpu_devices._owners.occupied
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert local_gpu_devices.discover_gpu_devices() == ()
