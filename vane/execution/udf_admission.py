@@ -19,6 +19,11 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from vane.execution.byte_budget import (
+    DEFAULT_RESOURCE_RESERVATION_RATIO,
+    allocate_resource_reservations,
+    resource_budget_remaining,
+)
 from vane.execution.resources import ResourceVector
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_local_memory import LocalTaskMemory
@@ -146,6 +151,16 @@ def _notify_slot_wakeups(wakeups: list[Callable[[], None]]) -> None:
         raise error
 
 
+@dataclass(eq=False)
+class _LocalTaskMemoryStage:
+    """One admission owner; worker pools share observations, not allowances."""
+
+    profile: LocalTaskMemory
+    resources: ResourceVector
+    inflight: int = 0
+    closed: bool = False
+
+
 class LocalExecutionCapacity:
     """Process resources shared by local task pools and resident actors.
 
@@ -185,6 +200,7 @@ class LocalExecutionCapacity:
         self._turn_remaining = 0
         self._deferred_guards: set[Callable[[], bool]] = set()
         self._task_memory_budget = task_memory_budget
+        self._memory_stages: set[_LocalTaskMemoryStage] = set()
         self._available_memory = available_memory
         self._memory_headroom = task_memory_budget * 2
         self._memory_sample_time = 0.0
@@ -226,46 +242,91 @@ class LocalExecutionCapacity:
             if self.resource_limit is not None and not needed.fits_within(self.resource_limit):
                 raise LocalProcessCapacityError("local task progress exceeds available node CPU/heap resource capacity")
             self._progress.add(progress)
+            self._memory_stages.update(progress.memory_stages.values())
         return progress
 
-    def _memory_stages_locked(self) -> dict[LocalTaskMemory, tuple[int, int]]:
-        stages: dict[LocalTaskMemory, tuple[int, int]] = {}
-        for query in self._progress:
-            for node, profile in query.memory.items():
-                total, idle = stages.get(profile, (0, 0))
-                stages[profile] = total + 1, idle + (query.active[node] == 0)
-        for pool in self._pools:
-            pool_profile = pool._memory
-            if pool_profile is None:
-                continue
-            # Direct Python executors have no prepared plan. Each independent
-            # authority must still be able to start its first task.
-            standalone = [a for a in pool._authorities if a._progress is None]
-            total, idle = stages.get(pool_profile, (0, 0))
-            stages[pool_profile] = total + len(standalone), idle + sum(a._memory_inflight == 0 for a in standalone)
-        return stages
-
-    def _memory_limit_locked(self, profile: LocalTaskMemory) -> tuple[int, int]:
-        stages = self._memory_stages_locked()
-        count, idle = stages.get(profile, (1, 0))
-        floor = max(1, count)
+    def _memory_budget_locked(
+        self,
+    ) -> tuple[int, dict[_LocalTaskMemoryStage, int], dict[_LocalTaskMemoryStage, int | float]]:
+        """Use Ray's per-unit baselines, protected surplus and shared pool."""
         budget = max(0, self._task_memory_budget - self._resources.heap_bytes - self._protected_heap_locked())
-        share = budget * floor // max(floor, sum(max(1, n) for n, _ in stages.values()))
-        limit = max(floor, min(floor + profile.completed, share // profile.estimate_bytes))
+        usage = {stage: stage.inflight * stage.profile.estimate_bytes for stage in self._memory_stages}
+        baselines = {stage: stage.profile.estimate_bytes for stage in self._memory_stages if not stage.closed}
+        maxima: dict[_LocalTaskMemoryStage, int] = {}
+        for stage, estimate in baselines.items():
+            concurrency = min(1 + stage.profile.completed, budget // estimate)
+            if self._max_slots is not None:
+                concurrency = min(concurrency, self._max_slots)
+            if self.resource_limit is not None and stage.resources.cpu > 0:
+                concurrency = min(concurrency, int((self.resource_limit.cpu + 1e-9) / stage.resources.cpu))
+            maxima[stage] = concurrency * estimate
+        reserved = allocate_resource_reservations(
+            baselines,
+            maxima,
+            limit=budget,
+            reservation_ratio=DEFAULT_RESOURCE_RESERVATION_RATIO,
+            integral=True,
+        )
+        return budget, usage, reserved
+
+    def _memory_pressure_locked(self, profile: LocalTaskMemory) -> bool:
         if self._available_memory is not None:
             now = time.monotonic()
             if now - self._memory_sample_time >= 0.1:
                 self._memory_headroom = self._available_memory()
                 self._memory_sample_time = now
-            # Under pressure only admit the progress minimum. No waiting task
-            # loses its heap/worker; downstream consumers retain their credit.
-            if self._memory_headroom < self._task_memory_budget // 4 + profile.estimate_bytes:
-                limit = floor
-        return limit, idle
+            return self._memory_headroom < self._task_memory_budget // 4 + profile.estimate_bytes
+        return False
+
+    def _can_acquire_memory_locked(self, stage: _LocalTaskMemoryStage) -> bool:
+        if stage.closed:
+            return False
+        # Measurements and external pressure can shrink a soft budget while
+        # producers retain their heaps. Preserve one task per prepared stage
+        # so the downstream consumer can still drain those producers.
+        if stage.inflight == 0:
+            return True
+        profile = stage.profile
+        if stage.inflight >= 1 + profile.completed or self._memory_pressure_locked(profile):
+            return False
+        budget, usage, reserved = self._memory_budget_locked()
+        amount = profile.estimate_bytes
+        return sum(usage.values()) + amount <= budget and amount <= resource_budget_remaining(
+            stage, usage=usage, reserved=reserved, limit=budget
+        )
+
+    def _memory_limit_locked(self, profile: LocalTaskMemory) -> int:
+        """Bound a pool's idle cache by the capacity its stages could acquire."""
+        budget, usage, reserved = self._memory_budget_locked()
+        stages = {stage for stage in reserved if stage.profile is profile}
+        floor = len(stages)
+        if self._memory_pressure_locked(profile):
+            return floor
+        # Treat this pool's stages as one prospective cache owner. Reuse the
+        # admission arithmetic without charging its current tasks twice.
+        cache_usage: dict[object, int | float] = {
+            stage: amount for stage, amount in usage.items() if stage not in stages
+        }
+        other_usage = sum(cache_usage.values())
+        cache_usage[profile] = 0
+        cache_reserved: dict[object, int | float] = {
+            stage: amount for stage, amount in reserved.items() if stage not in stages
+        }
+        cache_reserved[profile] = sum(reserved[stage] for stage in stages)
+        available = min(
+            max(0, budget - other_usage),
+            resource_budget_remaining(profile, usage=cache_usage, reserved=cache_reserved, limit=budget),
+        )
+        return max(floor, min(floor * (1 + profile.completed), int(available) // profile.estimate_bytes))
+
+    def _close_memory_stage_locked(self, stage: _LocalTaskMemoryStage) -> None:
+        stage.closed = True
+        if stage.inflight == 0:
+            self._memory_stages.discard(stage)
 
     def task_memory_limit(self, profile: LocalTaskMemory) -> int:
         with self._lock:
-            return self._memory_limit_locked(profile)[0]
+            return self._memory_limit_locked(profile)
 
     def observe_task_memory(self, profile: LocalTaskMemory, peak_bytes: int) -> None:
         with self._lock:
@@ -347,6 +408,7 @@ class LocalExecutionCapacity:
 
     def resource_snapshot(self) -> dict[str, Any]:
         with self._lock:
+            memory_budget, memory_usage, memory_reserved = self._memory_budget_locked()
             return {
                 "limit": None if self.resource_limit is None else self.resource_limit.to_dict(),
                 "usage": self._resources.to_dict(),
@@ -354,6 +416,15 @@ class LocalExecutionCapacity:
                 "resuming_tasks": len(self._resuming),
                 "observed_task_memory": {
                     "budget_bytes": self._task_memory_budget,
+                    "available_budget_bytes": memory_budget,
+                    "usage_bytes": sum(memory_usage.values()),
+                    "retired_usage_bytes": sum(amount for stage, amount in memory_usage.items() if stage.closed),
+                    "reserved_bytes": sum(memory_reserved.values()),
+                    "shared_pool_bytes": max(0, memory_budget - sum(memory_reserved.values())),
+                    "shared_used_bytes": sum(
+                        max(0, memory_usage[stage] - amount) for stage, amount in memory_reserved.items()
+                    ),
+                    "stages": len(memory_reserved),
                     "pools": {
                         pool._prefix: {
                             "peak_bytes": pool._memory.peak_bytes,
@@ -472,6 +543,9 @@ class LocalTaskProgress:
         self.memory = dict(memory or {})
         if not self.memory.keys() <= self.requirements.keys():
             raise ValueError("memory profiles require prepared task nodes")
+        self.memory_stages = {
+            node: _LocalTaskMemoryStage(profile, self.requirements[node]) for node, profile in self.memory.items()
+        }
         self.active = {node: 0 for node in requirements}
         self.total_heap = sum(resources.heap_bytes for resources in requirements.values())
         self.cpu_floor = max((resources.cpu for resources in requirements.values()), default=0.0)
@@ -492,6 +566,8 @@ class LocalTaskProgress:
                 return
             self.closed = True
             self.capacity._progress.remove(self)
+            for stage in self.memory_stages.values():
+                self.capacity._close_memory_stage_locked(stage)
             wakeups = self.capacity._dispatch_locked()
         _notify_slot_wakeups(wakeups)
 
@@ -643,13 +719,8 @@ class LocalExecutionSlotPool:
             return None
         if self._memory is not None:
             assert capacity is not None and authority is not None
-            limit, idle = capacity._memory_limit_locked(self._memory)
-            credit = (
-                not progress.query.active[progress.node_id] if progress is not None else authority._memory_inflight == 0
-            )
-            # A smaller learned limit or new external pressure cannot revoke
-            # the first consumer's progress credit after producers are running.
-            if not credit and self._memory.inflight + 1 + idle > limit:
+            assert authority._memory_stage is not None
+            if not capacity._can_acquire_memory_locked(authority._memory_stage):
                 return None
         if capacity is not None:
             if capacity._dispatch_requested and not capacity._dispatching:
@@ -682,8 +753,9 @@ class LocalExecutionSlotPool:
             return None
         if self._memory is not None:
             assert authority is not None
+            assert authority._memory_stage is not None
             self._memory.inflight += 1
-            authority._memory_inflight += 1
+            authority._memory_stage.inflight += 1
         if self._dispatching:
             self._turn_remaining -= 1
         self._deferred_guards.clear()
@@ -813,6 +885,7 @@ class LocalExecutionSlotPool:
                 if self._execution_capacity is not None:
                     self._execution_capacity._return_ready_locked(self._resources, authority._progress, authority)
             authority._state = "closed"
+            authority._close_memory_locked()
             authority._request_id = ""
             authority._retained_input_bytes = 0
             authority._ready_slot = None
@@ -839,6 +912,7 @@ class LocalExecutionSlotPool:
                 if authority._ready_slot is not None and self._execution_capacity is not None:
                     self._execution_capacity._return_ready_locked(self._resources, authority._progress, authority)
                 authority._state = "closed"
+                authority._close_memory_locked()
                 authority._request_id = ""
                 authority._retained_input_bytes = 0
                 authority._ready_slot = None
@@ -877,7 +951,7 @@ class LocalSlotAdmissionAuthority:
             raise ValueError("slot_pool cannot be combined with max_slots or execution_slot_prefix")
         self._pool = slot_pool
         self._progress = progress
-        self._memory_inflight = 0
+        self._memory_stage: _LocalTaskMemoryStage | None = None
         self._state = "idle"
         self._request_id = ""
         self._retained_input_bytes = 0
@@ -898,11 +972,30 @@ class LocalSlotAdmissionAuthority:
             ):
                 raise ValueError("task progress binding does not match its pool resources")
             self._pool._authorities.add(self)
+            if self._pool._memory is not None:
+                capacity = self._pool._execution_capacity
+                assert capacity is not None
+                if progress is not None:
+                    self._memory_stage = progress.query.memory_stages[progress.node_id]
+                else:
+                    self._memory_stage = _LocalTaskMemoryStage(self._pool._memory, self._pool._resources)
+                    capacity._memory_stages.add(self._memory_stage)
 
     def _release_memory_locked(self) -> None:
         if self._pool._memory is not None:
             self._pool._memory.inflight -= 1
-            self._memory_inflight -= 1
+            stage = self._memory_stage
+            capacity = self._pool._execution_capacity
+            assert stage is not None and capacity is not None
+            stage.inflight -= 1
+            if stage.closed and stage.inflight == 0:
+                capacity._memory_stages.discard(stage)
+
+    def _close_memory_locked(self) -> None:
+        if self._memory_stage is not None and self._progress is None:
+            capacity = self._pool._execution_capacity
+            assert capacity is not None
+            capacity._close_memory_stage_locked(self._memory_stage)
 
     @property
     def active_lease_count(self) -> int:

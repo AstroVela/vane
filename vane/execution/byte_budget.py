@@ -12,17 +12,21 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
+from typing import TypeVar
+
+_Unit = TypeVar("_Unit")
+DEFAULT_RESOURCE_RESERVATION_RATIO = 0.5
 
 
 def allocate_resource_reservations(
-    baselines: Mapping[str, int | float],
-    maxima: Mapping[str, int | float],
+    baselines: Mapping[_Unit, int | float],
+    maxima: Mapping[_Unit, int | float],
     *,
     limit: int | float,
     reservation_ratio: float,
     integral: bool,
     arithmetic_tolerance: float = 0.0,
-) -> dict[str, int | float]:
+) -> dict[_Unit, int | float]:
     """Protect baselines plus equal surplus, or apportion a smaller budget.
 
     Maxima cap each reservation; unused and rounded capacity stays shared.
@@ -43,6 +47,25 @@ def allocate_resource_reservations(
     if integral:
         reserved = {key: math.floor(value) for key, value in reserved.items()}
     return reserved
+
+
+def resource_budget_remaining(
+    unit: _Unit,
+    *,
+    usage: Mapping[_Unit, int | float],
+    reserved: Mapping[_Unit, int | float],
+    limit: int | float,
+) -> int | float:
+    """Return a unit's unused protection plus the remaining shared pool.
+
+    Other units' protected capacity is never borrowed. Existing shared debt
+    does not revoke this unit's unused protection. Callers independently check
+    total capacity, eligibility and bounded progress before granting a lease.
+    """
+    protected = max(0, reserved[unit] - usage[unit])
+    shared_pool = max(0, limit - sum(reserved.values()))
+    shared_used = sum(max(0, usage[key] - value) for key, value in reserved.items())
+    return protected + max(0, shared_pool - shared_used)
 
 
 @dataclass(frozen=True)

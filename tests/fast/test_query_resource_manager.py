@@ -252,6 +252,75 @@ def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None,
     )
 
 
+@pytest.mark.parametrize("budget_gib", [3, 6, 9])
+@pytest.mark.parametrize("shared_profile", [False, True])
+def test_local_observed_heap_and_ray_declared_heap_share_reservations_and_admission(budget_gib, shared_profile):
+    from vane.execution.udf_admission import LocalExecutionCapacity, LocalExecutionSlotPool
+    from vane.execution.udf_local_memory import LocalTaskMemory
+
+    gib = 1024**3
+    profiles = [LocalTaskMemory(peak_bytes=peak, completed=100) for peak in (gib, gib // 8, gib // 8)]
+    if shared_profile:
+        profiles[2] = profiles[1]
+    keys = [f"resource:q:udf:{index}" for index in range(3)]
+    units = [
+        _unit(
+            key,
+            inputs=keys[index - 1 : index],
+            resources=_r(cpu=1, heap=profile.estimate_bytes),
+            target=0,
+            blocks=0,
+        )
+        for index, (key, profile) in enumerate(zip(keys, profiles, strict=True))
+    ]
+    ray = _manager(*units, resources=_r(cpu=8, heap=budget_gib * gib))
+    _ready(ray, *keys)
+    local = LocalExecutionCapacity(
+        max_slots=None,
+        resource_limit=_r(cpu=8, heap=20 * gib),
+        task_memory_budget=budget_gib * gib,
+    )
+    progress = local.reserve_task_progress(
+        {key: _r(cpu=1) for key in keys}, memory=dict(zip(keys, profiles, strict=True))
+    )
+    pools = [
+        LocalExecutionSlotPool(
+            max_slots=8,
+            execution_slot_prefix=key,
+            execution_capacity=local,
+            resources=_r(cpu=1),
+            memory=profile,
+        )
+        for key, profile in zip(keys, profiles, strict=True)
+    ]
+    authorities = [pool.create_task_authority(progress.bind(key)) for key, pool in zip(keys, pools, strict=True)]
+    live = []
+    ray_leases = []
+    try:
+        with ray._lock, local._lock:
+            _, ray_reserved, _ = ray._dimension_reservations_locked("heap_bytes", requested_unit_id=None)
+            _, _, local_reserved = local._memory_budget_locked()
+            assert ray_reserved == {key: local_reserved[progress.memory_stages[key]] for key in keys}
+        for sequence, index in enumerate((0, 0, 0, 1, 2, 2, 1, 0)):
+            ray_grant = ray.try_acquire_task(_task(keys[index], sequence))
+            if ray_grant.granted:
+                ray_leases.append(ray_grant.lease)
+            local_lease = authorities[index].try_acquire(0)
+            if local_lease is not None:
+                live.append(local_lease)
+            assert (local_lease is not None) == ray_grant.granted
+        assert local.resource_snapshot()["observed_task_memory"]["usage_bytes"] == ray.snapshot()["usage"]["heap_bytes"]
+    finally:
+        for lease in ray_leases:
+            ray.release_task_lease(lease.lease_id, attempt_id=lease.attempt_id)
+        for lease in live:
+            lease.release()
+        for pool in pools:
+            pool.close()
+        progress.shutdown()
+    assert not local._memory_stages
+
+
 def test_native_copy_estimate_is_per_task_and_completion_charges_exact_metadata():
     mib = 1024**2
     native = _unit("resource:f:scan", backend="ray_worker", target=128 * mib)
