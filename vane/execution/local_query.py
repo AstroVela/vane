@@ -50,7 +50,9 @@ class _NativePlan:
 class _NativeQuery:
     def __init__(self, request: LocalModelRequest) -> None:
         self.request = request
-        self.track_graph = request._runtime._track_graph
+        # The default admission policy always needs topology, independently of
+        # whether the caller requested detailed graph diagnostics.
+        self.track_graph = True
         self._binding = _NativeRequestCancellation(request._cancellation)
         self._prepared = False
 

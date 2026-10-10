@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import math
 import os
+import sys
+from pathlib import Path
+
+import psutil
 
 from vane.execution.resources import ResourceVector
-from vane.execution.udf_local_memory import available_process_memory
 
 
 class LocalProcessCapacityError(ValueError):
@@ -32,3 +35,23 @@ def local_task_capacity(resources: ResourceVector, limit: ResourceVector) -> int
     if resources.heap_bytes:
         slots = min(slots, limit.heap_bytes // resources.heap_bytes)
     return max(1, slots)
+
+
+def available_process_memory() -> int:
+    """Host headroom, also bounded by each containing Linux cgroup v2."""
+    available = int(psutil.virtual_memory().available)
+    if sys.platform == "linux":
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if not line.startswith("0::"):
+                continue
+            root = Path("/sys/fs/cgroup")
+            directory = root / line[3:].lstrip("/")
+            while directory.is_relative_to(root):
+                limit_file = directory / "memory.max"
+                if limit_file.exists():
+                    limit = limit_file.read_text().strip()
+                    if limit != "max":
+                        used = int((directory / "memory.current").read_text())
+                        available = min(available, max(0, int(limit) - used))
+                directory = directory.parent
+    return available

@@ -232,7 +232,9 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     subprocess_exec._shutdown_global_task_runtime()
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=3, heap_bytes=1024**3))
+    # Ray's default protected shares reserve downstream progress too. Four
+    # CPUs leave room for two upstream calls with a second task operator.
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=4, heap_bytes=1024**3))
     monkeypatch.setattr(subprocess_exec, "_GLOBAL_TASK_RUNTIME", runtime)
     source_path = tmp_path / "one-row-group.parquet"
     pq.write_table(pa.table({"x": list(range(8192))}), source_path, row_group_size=8192)

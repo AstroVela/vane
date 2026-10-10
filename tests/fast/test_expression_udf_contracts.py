@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.local_admission_helpers import linear_metadata
+
 
 @pytest.fixture
 def sql_udf_contract_connection():
@@ -405,9 +407,12 @@ def test_actor_gpu_reservation_follows_resolved_backend(
         monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", FakeLocalPool)
         pools, _ = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(
             nodes,
+            resource_graph=linear_metadata(nodes),
             plan_identity=f"gpu-order-{decorator_runner}-{resolved_runner}",
         )
-        assert len(pools) == 1
+        assert len(pools) == 2
+        for owner in reversed(pools):
+            owner.shutdown()
         assert len(created) == 1
         assert created[0][0] == payload
         return

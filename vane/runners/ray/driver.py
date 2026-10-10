@@ -40,6 +40,7 @@ RayTaskResult = require_ray_cxx_attr(
 )
 
 from vane.event_loop import set_event_loop
+from vane.execution.admission_ledger import BoundedReplayMap
 from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import (
     FteTaskAttemptId,
@@ -48,7 +49,6 @@ from vane.runners.fte import (
 )
 from vane.runners.fte.fte_failures import _normalize_failure_payload, _safe_failure_message
 from vane.runners.progress import ProgressRenderer, progress_enabled
-from vane.runners.ray.admission_ledger import BoundedReplayMap
 from vane.runners.ray.query_runtime_protocol import (
     RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
     query_runtime_actor_name,
@@ -2833,7 +2833,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _sum_node_capacity(node_capacities: tuple[Any, ...]) -> Any:
-        from vane.runners.ray.query_resource_graph import ResourceVector
+        from vane.execution.query_resource_spec import ResourceVector
 
         total = ResourceVector()
         for node in node_capacities:
@@ -2841,23 +2841,16 @@ class RayQueryDriverActor:
         return total
 
     def _create_query_resource_coordinator(self) -> Any:
-        from vane.runners.ray.cluster_resource_coordinator import (
+        from vane.execution.cluster_resource_policy import (
             ClusterQueryResourceCoordinator,
-            read_ray_node_capacities,
+            query_coordinator_timing,
         )
+        from vane.runners.ray.node_resource_capacity import read_ray_node_capacities
 
         object_store_fraction = float(os.environ.get("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5"))
         heap_reserve = int(os.environ.get("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE", "0"))
-        heartbeat_timeout = float(os.environ.get("VANE_QUERY_HEARTBEAT_TIMEOUT_S", "30"))
-        if heartbeat_timeout <= 0:
-            raise ValueError("VANE_QUERY_HEARTBEAT_TIMEOUT_S must be positive")
+        heartbeat_timeout, maintenance_interval = query_coordinator_timing(os.environ)
         self._query_resource_heartbeat_timeout_s = heartbeat_timeout
-        default_interval = min(5.0, heartbeat_timeout / 3.0)
-        maintenance_interval = float(os.environ.get("VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S", str(default_interval)))
-        if maintenance_interval <= 0 or maintenance_interval >= heartbeat_timeout:
-            raise ValueError(
-                "VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S must be positive and less than VANE_QUERY_HEARTBEAT_TIMEOUT_S"
-            )
         self._query_resource_maintenance_interval_s = maintenance_interval
         capacities = read_ray_node_capacities(
             ray,
@@ -2872,7 +2865,7 @@ class RayQueryDriverActor:
 
     def _synchronize_query_allocations(self) -> None:
         """Commit coordinator allocations into every local query manager."""
-        from vane.runners.ray.query_resource_graph import QueryAllocation
+        from vane.execution.query_resource_spec import QueryAllocation
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         snapshot = self._query_resource_coordinator.snapshot()
@@ -2910,7 +2903,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _read_query_node_capacities() -> tuple[Any, ...]:
-        from vane.runners.ray.cluster_resource_coordinator import read_ray_node_capacities
+        from vane.runners.ray.node_resource_capacity import read_ray_node_capacities
 
         return read_ray_node_capacities(
             ray,
@@ -2930,8 +2923,8 @@ class RayQueryDriverActor:
         transiently unavailable, the last complete Ray snapshot remains valid
         for this cycle while active query heartbeats and usage still advance.
         """
-        from vane.runners.ray.query_resource_graph import ResourceVector
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
+        from vane.execution.query_resource_spec import ResourceVector
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         timestamp = time.monotonic() if now is None else float(now)
@@ -3831,7 +3824,7 @@ class RayQueryDriverActor:
 
     def _fail_query_admission_requests(self, query_id: str) -> None:
         """Resolve every pending request before its query manager disappears."""
-        from vane.runners.ray.query_resource_manager import (
+        from vane.execution.query_resource_policy import (
             OutputBlockGrant,
             TaskGrant,
         )
@@ -3886,7 +3879,7 @@ class RayQueryDriverActor:
         loop.call_soon(self._run_query_task_admission_pump, query_key)
 
     def _run_query_task_admission_pump(self, query_id: str) -> None:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -4020,7 +4013,7 @@ class RayQueryDriverActor:
         loop.call_soon(self._run_query_output_admission_pump, query_key)
 
     def _run_query_output_admission_pump(self, query_id: str) -> None:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -4165,7 +4158,7 @@ class RayQueryDriverActor:
         *,
         allow_inactive_generation: bool = False,
     ) -> tuple[str, Any, dict[str, Any], bool]:
-        from vane.runners.ray.query_resource_manager import OutputBlockRequest
+        from vane.execution.query_resource_policy import OutputBlockRequest
 
         values = self._strict_lease_request(
             payload,
@@ -4212,7 +4205,7 @@ class RayQueryDriverActor:
         self,
         payload: dict[str, Any],
     ) -> tuple[str, Any, dict[str, Any], str]:
-        from vane.runners.ray.query_resource_manager import TaskRequest
+        from vane.execution.query_resource_policy import TaskRequest
 
         raw_values = dict(payload)
         generation_capability = str(raw_values.pop("query_generation_capability", "") or "").strip()
@@ -4238,7 +4231,7 @@ class RayQueryDriverActor:
 
     async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one task lease through the query's serialized admission pump."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
@@ -4412,7 +4405,7 @@ class RayQueryDriverActor:
 
     def _mark_query_execution_quiesced(self, query_id: str) -> None:
         """Retire only task leases explicitly transferred to query teardown."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
 
         self._ensure_query_resource_admission_state()
         query_key = str(query_id)
@@ -4447,7 +4440,7 @@ class RayQueryDriverActor:
         attempt_id: str,
     ) -> dict[str, Any]:
         """Release one lease only after its submitted Ray call is terminal."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_key = str(request_id)
@@ -4636,7 +4629,7 @@ class RayQueryDriverActor:
         attempt_id: str,
     ) -> dict[str, Any]:
         """Transfer a cancelled task without a completion ref to query teardown."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
@@ -4732,7 +4725,7 @@ class RayQueryDriverActor:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
@@ -4861,7 +4854,7 @@ class RayQueryDriverActor:
         lease_id: str,
         attempt_id: str,
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         self._ensure_query_resource_admission_state()
@@ -4953,7 +4946,7 @@ class RayQueryDriverActor:
 
     async def acquire_query_output_block_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one produced block through the query's admission pump."""
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, _generation_is_active = self._parse_output_block_lease_request(payload)
@@ -5124,7 +5117,7 @@ class RayQueryDriverActor:
         lease_id: str,
         query_id: str = "",
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         self._ensure_query_resource_admission_state()
@@ -5183,7 +5176,7 @@ class RayQueryDriverActor:
         return {"released": True}
 
     async def cancel_query_output_block_lease_request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_is_active = self._parse_output_block_lease_request(
@@ -5348,7 +5341,7 @@ class RayQueryDriverActor:
         self,
         prepared: _PreparedQueryResourceRegistration,
     ) -> tuple[Any, Any]:
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
         from vane.runners.ray.query_resource_runtime import (
             register_query_resource_graph,
             release_query_resource_manager,
@@ -5515,7 +5508,7 @@ class RayQueryDriverActor:
     ) -> None:
         """Retire the old phase and recompute reservation for the new frontier."""
 
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -5556,7 +5549,7 @@ class RayQueryDriverActor:
                     eligible_unit_ids=eligible,
                 )
                 observed_usage = manager.snapshot()["soft_allocation_usage"]
-                from vane.runners.ray.query_resource_graph import ResourceVector
+                from vane.execution.query_resource_spec import ResourceVector
 
                 phase_allocation = self._query_resource_coordinator.refresh_query(
                     query_key,

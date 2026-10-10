@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vane.runners.ray.admission_ledger import BoundedReplayMap
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.admission_ledger import BoundedReplayMap
+from vane.execution.query_resource_spec import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -467,7 +467,7 @@ def test_driver_resource_change_event_drives_fte_owner_without_polling(monkeypat
 
 def test_resource_release_resumes_phase_off_the_driver_event_loop(monkeypatch):
     import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.execution.query_resource_policy import TaskRequest
 
     async def scenario():
         query_id = "query-phase-completion-wake"
@@ -2527,6 +2527,7 @@ def test_owner_loop_sync_fence_timeout_isolated_to_query_until_callback_settles(
 
 
 def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
+    import vane.execution.query_resource_demand as resource_demand
     import vane.runners.ray.query_resource_graph_builder as graph_builder
     from vane.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
@@ -2560,7 +2561,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
         lambda _metadata: graph,
     )
     monkeypatch.setattr(
-        graph_builder,
+        resource_demand,
         "build_query_demand",
         lambda _graph, _capacity: "demand",
     )
@@ -2604,6 +2605,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
 
 
 def test_query_registration_retains_failed_coordinator_release_for_retry(monkeypatch):
+    import vane.execution.query_resource_demand as resource_demand
     import vane.runners.ray.query_resource_graph_builder as graph_builder
     from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
@@ -2635,7 +2637,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
             return True
 
     monkeypatch.setattr(graph_builder, "build_query_resource_graph", lambda _metadata: graph)
-    monkeypatch.setattr(graph_builder, "build_query_demand", lambda _graph, _capacity: "demand")
+    monkeypatch.setattr(resource_demand, "build_query_demand", lambda _graph, _capacity: "demand")
 
     from vane.runners.ray.driver import RayQueryDriverActor
 

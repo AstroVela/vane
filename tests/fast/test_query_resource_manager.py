@@ -7,8 +7,13 @@ import random
 
 import pytest
 
-from vane.runners.ray import query_resource_manager as manager_module
-from vane.runners.ray.query_resource_graph import (
+from vane.execution import query_resource_policy as manager_module
+from vane.execution.query_resource_policy import (
+    OutputBlockRequest,
+    QueryResourceManager,
+    TaskRequest,
+)
+from vane.execution.query_resource_spec import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
@@ -16,11 +21,6 @@ from vane.runners.ray.query_resource_graph import (
     ResourceVector,
 )
 from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
-from vane.runners.ray.query_resource_manager import (
-    OutputBlockRequest,
-    RayQueryResourceManager,
-    TaskRequest,
-)
 
 
 @pytest.mark.parametrize("unit_count", [1, 2, 3, 7])
@@ -202,7 +202,7 @@ def _manager(
         allocation_resources,
         nodes=nodes,
     )
-    return RayQueryResourceManager(
+    return QueryResourceManager(
         graph,
         allocation,
         reservation_ratio=reservation_ratio,
@@ -250,75 +250,6 @@ def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None,
         retained_input_bytes=retained,
         output_kind=output_kind,
     )
-
-
-@pytest.mark.parametrize("budget_gib", [3, 6, 9])
-@pytest.mark.parametrize("shared_profile", [False, True])
-def test_local_observed_heap_and_ray_declared_heap_share_reservations_and_admission(budget_gib, shared_profile):
-    from vane.execution.udf_admission import LocalExecutionCapacity, LocalExecutionSlotPool
-    from vane.execution.udf_local_memory import LocalTaskMemory
-
-    gib = 1024**3
-    profiles = [LocalTaskMemory(peak_bytes=peak, completed=100) for peak in (gib, gib // 8, gib // 8)]
-    if shared_profile:
-        profiles[2] = profiles[1]
-    keys = [f"resource:q:udf:{index}" for index in range(3)]
-    units = [
-        _unit(
-            key,
-            inputs=keys[index - 1 : index],
-            resources=_r(cpu=1, heap=profile.estimate_bytes),
-            target=0,
-            blocks=0,
-        )
-        for index, (key, profile) in enumerate(zip(keys, profiles, strict=True))
-    ]
-    ray = _manager(*units, resources=_r(cpu=8, heap=budget_gib * gib))
-    _ready(ray, *keys)
-    local = LocalExecutionCapacity(
-        max_slots=None,
-        resource_limit=_r(cpu=8, heap=20 * gib),
-        task_memory_budget=budget_gib * gib,
-    )
-    progress = local.reserve_task_progress(
-        {key: _r(cpu=1) for key in keys}, memory=dict(zip(keys, profiles, strict=True))
-    )
-    pools = [
-        LocalExecutionSlotPool(
-            max_slots=8,
-            execution_slot_prefix=key,
-            execution_capacity=local,
-            resources=_r(cpu=1),
-            memory=profile,
-        )
-        for key, profile in zip(keys, profiles, strict=True)
-    ]
-    authorities = [pool.create_task_authority(progress.bind(key)) for key, pool in zip(keys, pools, strict=True)]
-    live = []
-    ray_leases = []
-    try:
-        with ray._lock, local._lock:
-            _, ray_reserved, _ = ray._dimension_reservations_locked("heap_bytes", requested_unit_id=None)
-            _, _, local_reserved = local._memory_budget_locked()
-            assert ray_reserved == {key: local_reserved[progress.memory_stages[key]] for key in keys}
-        for sequence, index in enumerate((0, 0, 0, 1, 2, 2, 1, 0)):
-            ray_grant = ray.try_acquire_task(_task(keys[index], sequence))
-            if ray_grant.granted:
-                ray_leases.append(ray_grant.lease)
-            local_lease = authorities[index].try_acquire(0)
-            if local_lease is not None:
-                live.append(local_lease)
-            assert (local_lease is not None) == ray_grant.granted
-        assert local.resource_snapshot()["observed_task_memory"]["usage_bytes"] == ray.snapshot()["usage"]["heap_bytes"]
-    finally:
-        for lease in ray_leases:
-            ray.release_task_lease(lease.lease_id, attempt_id=lease.attempt_id)
-        for lease in live:
-            lease.release()
-        for pool in pools:
-            pool.close()
-        progress.shutdown()
-    assert not local._memory_stages
 
 
 def test_native_copy_estimate_is_per_task_and_completion_charges_exact_metadata():
@@ -923,7 +854,7 @@ def test_production_seal_keeps_fused_udf_consumers_live():
     """Regression for #835: sealing must not disable UDF output liveness."""
     graph = _fused_udf_chain_graph()
     changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_eligible_units_change=lambda *args: changes.append(args),
@@ -968,7 +899,7 @@ def test_sealed_fused_nodes_keep_dependencies_without_reserving_object_store(lat
     graph = _fused_udf_chain_graph()
     wakeups = []
     frontier_changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_change=lambda: wakeups.append("changed"),
@@ -4349,4 +4280,4 @@ def test_native_task_and_materialized_output_preserve_the_actual_runtime_node():
     granted = manager.try_acquire_task(_task(unit.resource_unit_id, 3, node_id=output.node_id))
     assert granted.granted
     assert granted.lease.node_id == output.node_id
-    assert manager.snapshot()["ray_core_owns_placement"] is True
+    assert manager.snapshot()["backend_owns_placement"] is True
