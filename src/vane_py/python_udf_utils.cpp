@@ -334,7 +334,7 @@ Value BuildPythonUDFPayload(
     const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
-    const Optional<py::object> &output_target_max_bytes, bool flat_map, bool registered_local_model) {
+    const Optional<py::object> &output_target_max_bytes, bool flat_map) {
 	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
@@ -350,10 +350,10 @@ Value BuildPythonUDFPayload(
 	auto gpus_value = ParseOptionalNonNegativeDouble(gpus, "map_batches(gpus=...)");
 	auto memory_bytes_value = ParseOptionalPositiveIdx(memory_bytes, "memory_bytes");
 	const bool is_ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
-	const bool local_gpu_model = registered_local_model && execution_backend == "subprocess_actor" &&
-	                             gpus_value.first && gpus_value.second == 1.0;
-	if (gpus_value.first && gpus_value.second > 0.0 && !is_ray_backend && !local_gpu_model) {
-		throw InvalidInputException("GPU resources require a Ray UDF backend");
+	const bool local_gpu_actor =
+	    execution_backend == "subprocess_actor" && gpus_value.first && gpus_value.second == 1.0;
+	if (gpus_value.first && gpus_value.second > 0.0 && !is_ray_backend && !local_gpu_actor) {
+		throw InvalidInputException("local GPU UDFs require an actor with exactly one GPU per replica");
 	}
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	auto output_batch_size_value = ParseOptionalPositiveIdx(output_batch_size, "output_batch_size");
@@ -597,8 +597,7 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	auto payload =
 	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), model_backend, default_parallelism,
 	                          model_cpus, gpus, model_memory, batch_size, py::none(), py::none(), py::none(),
-	                          actor_number, model_batch_bytes, py::none(), py::none(), /*flat_map=*/false,
-	                          /*registered_local_model=*/!model_cpus.is_none());
+	                          actor_number, model_batch_bytes, py::none(), py::none(), /*flat_map=*/false);
 	const bool ray_backend = model_backend == "ray_task" || model_backend == "ray_actor";
 
 	fields.emplace_back("payload_version", Value::BIGINT(1));

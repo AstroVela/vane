@@ -531,6 +531,8 @@ def test_callback_completion_keeps_registry_cleanup_owned(harness, monkeypatch):
     assert _result(executor).to_pydict() == {"x": [7]}
     h.registry.close(timeout=15, kill=True)
     assert _demand(pool) == 0
+    assert pool._resident_release is None
+    assert pool._gpu_reservation is None
 
 
 def test_cancelling_a_submitted_future_before_it_runs_retires_device_demand(harness, tmp_path):
