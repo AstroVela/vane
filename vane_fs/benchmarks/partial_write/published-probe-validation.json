@@ -1,0 +1,82 @@
+{
+  "status": "PASS",
+  "source_sha256": "ee30e3537925ca342fdf2a58125bf70f5fcc50d1ef9b5ecf6f797ba8a46d2800",
+  "runs": [
+    {
+      "variant": "baseline",
+      "build_argv": [
+        "g++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/baseline/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/alignment_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/baseline/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_prepare_v2",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_finalize",
+        "-Wl,--wrap=sqlite3_exec",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/baseline-published-probe"
+      ],
+      "binary_sha256": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d",
+      "wrapped_sql_steps": 16752,
+      "status": "PASS"
+    },
+    {
+      "variant": "updated",
+      "build_argv": [
+        "g++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/alignment_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_prepare_v2",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_finalize",
+        "-Wl,--wrap=sqlite3_exec",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/updated-published-probe"
+      ],
+      "binary_sha256": "96859ef32abfbf7273f0e8f39c0e971391ac1ef3feeaa557ff68cc12eb6ead5d",
+      "wrapped_sql_steps": 592,
+      "status": "PASS"
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/owned-published-probe-mhpoce4d",
+      "files": {
+        "db.sqlite": {
+          "bytes": 20189184,
+          "sha256": "b6f1bbbfc02320674c3da9e71a335b1ec32253dfa2355c38e3212e0692f03093"
+        }
+      },
+      "process_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/owned-published-probe-bvw1ufe2",
+      "files": {
+        "db.sqlite": {
+          "bytes": 20189184,
+          "sha256": "1035b30d71ecdb3e0bc8eedc1be081854a5e3d762b59c07cab84c619d07ce861"
+        }
+      },
+      "process_stopped": true
+    }
+  ]
+}
