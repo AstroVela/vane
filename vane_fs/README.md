@@ -505,3 +505,9 @@ The [WAL writeback investigation](benchmarks/staged_payload/block_sync/README.md
 separates page writeback from final durability barriers. Whole-device flush
 counters and thread waits explain remaining slow samples and show why an extra
 writeback wait does not remove the fsync tail.
+
+The [production BLOB synchronization comparison](benchmarks/production_sync/README.md)
+evaluates the SQLite build option on the existing v2 format in strict and fsync
+modes, with matched builds, syscall fault injection and cross-build database
+compatibility checks. It retains slow samples and leaves the production default
+unchanged.
