@@ -523,7 +523,9 @@ def test_overflow_retirement_keeps_cleanup_owner_until_process_exits(
         executor.submit(table)
 
     def expand(table):
-        return pa.table({"blob": [b"x" * 16_384]})
+        # Fit the 10,000-byte hard limit but wait for the held 5,000 bytes.
+        # An oversized single block is rejected instead of entering a wait.
+        return pa.table({"blob": [b"x" * 8192]})
 
     def identity(table):
         return table
