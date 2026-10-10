@@ -43,6 +43,7 @@ from vane.execution.udf_worker_metrics import WorkerMetrics
 if TYPE_CHECKING:
     from vane.execution.local_query_admission import LocalQueryAdmission
     from vane.execution.udf_local_request import LocalModelRequest
+    from vane.execution.udf_shm_store import LocalQueryShmStore
     from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
 
@@ -278,6 +279,7 @@ class LocalModelRuntime:
         | QueryExecutorCleanup
         | PreparedLocalResourceGraph
         | LocalQueryAdmission
+        | LocalQueryShmStore
     ]:
         """Validate bindings, acquire query resources, and publish their handles.
 
@@ -322,6 +324,7 @@ class LocalModelRuntime:
         | QueryExecutorCleanup
         | PreparedLocalResourceGraph
         | LocalQueryAdmission
+        | LocalQueryShmStore
     ]:
         from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
         from vane.execution.udf_subprocess import (

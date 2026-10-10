@@ -2152,7 +2152,7 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_plan(plan, conn="conn")
 
     try:
-        assert len(created) == 3
+        assert len(created) == 4
         assert created_args[0][1] == 3
         assert isinstance(created[2], LocalTaskProgress)
         assert set(handles_map) == {"7", "8"}
@@ -2224,7 +2224,7 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
     )
 
     try:
-        assert len(created) == 3
+        assert len(created) == 4
         assert created_args[0][1] == 2
         assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
         assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
@@ -2305,8 +2305,9 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
         nodes, resource_graph=linear_metadata(nodes)
     )
 
-    assert len(created) == 1
-    created[0].shutdown()
+    assert len(created) == 2
+    for resource in reversed(created):
+        resource.shutdown()
     assert handles_map == {
         "4": {
             "session_config": session_config,
@@ -3490,14 +3491,15 @@ def test_subprocess_error_propagates_and_closes_worker():
         assert isinstance(result, RuntimeError)
         assert "bad edge udf" in str(result)
         assert original_proc.poll() is not None
-        replacement_proc = executor._proc
-        assert replacement_proc is not None
-        assert replacement_proc.poll() is None
-        assert replacement_proc.pid != original_pid
+        assert executor._proc is None
 
         _submit_with_admission(executor, pa.table({"x": [2]}))
         replacement_result = _wait_for_results(executor, 1, timeout_s=10.0)[0]
         assert replacement_result.to_pydict() == {"y": [2]}
+        replacement_proc = executor._proc
+        assert replacement_proc is not None
+        assert replacement_proc.poll() is None
+        assert replacement_proc.pid != original_pid
     finally:
         executor.close(kill=True)
         pool.shutdown(kill=True)
@@ -4804,7 +4806,7 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     pool._executor = FakeExecutor()
     pool.admission_slots = FakeAdmissionSlots()
 
-    def spawn_worker(worker_idx):
+    def spawn_worker(worker_idx, *, startup_cancellation=None):
         assert worker_idx == 0
         spawn_entered.set()
         assert allow_spawn_return.wait(timeout=5.0)
@@ -4929,7 +4931,7 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     pool._executor = FakeExecutor()
     pool.admission_slots = FakeAdmissionSlots()
 
-    def spawn_worker(worker_idx):
+    def spawn_worker(worker_idx, *, startup_cancellation=None):
         assert worker_idx == 0
         pool._track_replacing_executor(worker_idx, provisional_worker)
         startup_observed.set()
@@ -5376,7 +5378,7 @@ def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_unti
     pool._cleanup_pending_executor = None
     pool.admission_slots = admission_slots
 
-    def fail_spawn(worker_idx):
+    def fail_spawn(worker_idx, *, startup_cancellation=None):
         pool._track_replacing_executor(worker_idx, provisional_worker)
         raise subprocess_exec._SubprocessStartupCleanupError("planned provisional cleanup failure")
 
@@ -5519,7 +5521,7 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     pool._aborting_workers = set()
     pool._idle_workers = deque([(0, 0)])
     pool._workers = [lost_worker]
-    pool._spawn_worker = lambda worker_idx: replacement
+    pool._spawn_worker = lambda worker_idx, **kwargs: replacement
 
     def lose_actor(worker):
         worker.reusable = False
@@ -5531,14 +5533,16 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
 
     assert first_scope.finished
     assert lost_worker.close_calls == [True]
-    assert pool._workers == [replacement]
-    assert pool._worker_generations == [1]
-    assert list(pool._idle_workers) == [(0, 1)]
+    assert pool._workers == [lost_worker]
+    assert pool._worker_generations == [0]
+    assert list(pool._idle_workers) == [(0, 0)]
     assert pool._terminal_error is None
 
     second_scope = ExecutionCancellationScope("test-executor", 2)
     assert pool._run(lambda worker: worker.name, second_scope) == "replacement"
     assert second_scope.finished
+    assert pool._workers == [replacement]
+    assert pool._worker_generations == [1]
     assert list(pool._idle_workers) == [(0, 1)]
 
 
@@ -9409,7 +9413,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
     captured: list[pa.Table] = []
 
     def make_descriptor(blocks, *, allocation, grant_id):
-        tables = [pa.ipc.open_stream(block.ipc).read_all() for block in blocks]
+        tables = [block.table for block in blocks]
         captured.extend(tables)
         return {
             "block_refs": [],
@@ -9471,7 +9475,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
             return [pa.table({"rows": [self.input_rows]})]
 
     def make_descriptor(blocks, *, allocation, grant_id):
-        table = pa.ipc.open_stream(blocks[0].ipc).read_all()
+        table = blocks[0].table
         assert grant_id == 88
         return {
             "grant_id": grant_id,

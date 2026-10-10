@@ -443,7 +443,7 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
         else:
             resources = runtime.prepare(plan, {"1": "model"})
             try:
-                assert len(resources) == 4
+                assert len(resources) == 5
                 assert any(isinstance(owner, ModelPoolBorrow) for owner in resources)
                 assert pools[1] in resources
                 progress = next(owner for owner in resources if isinstance(owner, LocalTaskProgress))
@@ -1293,7 +1293,7 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
             track_data=tracking != "tasks",
         )
         resources = runtime.prepare(plan, {}, conn=connection)
-        assert len(resources) == (4 if tracking == "both" else 3)
+        assert len(resources) == (5 if tracking == "both" else 4)
         assert any(
             isinstance(owner, QueryDataScope if tracking == "data" else QueryTaskAdmission) for owner in resources
         )

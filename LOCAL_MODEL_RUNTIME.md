@@ -1528,9 +1528,13 @@ a capacity error instead of waiting cyclically. Explicit byte envelopes retain
 their strict capacity error. Reduce input/output block sizes, release retained
 views, or increase the store capacity when the working set cannot fit.
 
-On Linux, closing the last worker decommits wholly free pages. Returned Arrow
-views remain valid after runtime shutdown; the arena closes after the last view
-is released. Cleanup failures retain the store for retry. Normal interpreter
+Outputs are measured with a counting IPC stream before byte admission, then
+serialized directly into the granted arena region. Publication requires the
+exact measured size; no intermediate payload buffer is copied into the arena.
+
+On Linux, releasing the last worker and query owner decommits wholly free pages.
+Returned Arrow views remain valid after runtime shutdown; the arena closes after
+the last view is released. Cleanup failures retain the store for retry. Normal interpreter
 exit unlinks arenas owned by that process even when views remain alive, without
 invalidating their mappings for later exit callbacks. Forked children do not
 reclaim inherited parent allocations or arenas. Allocation-lease release and
@@ -2085,10 +2089,14 @@ when `track_data`, `track_graph`, and explicit runtime limits are omitted.
 Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
 soft budgets, split those budgets between live queries, and preserve downstream
 operator reservations with the common bounded liveness policy. Local capacity
-comes from the node and shared-memory transport; Ray capacity comes from its
-cluster. Their actual object storage and physical placement remain backend
-responsibilities. DuckDB schedules local native operators and supplies their
-materialization ordering; local UDF concurrency does not depend on pipeline
+uses the physical shared-memory arena, with the query fraction applied once.
+Query preparation pins that arena before task workers start, so later workers
+use the capacity admitted for the query. The transport reference budget is a
+separate constraint and does not reduce the query capacity a second time; an
+unbounded transport limit still leaves the physical query budget in place.
+Ray capacity comes from its cluster. Their actual object storage and physical
+placement remain backend responsibilities. DuckDB schedules local native
+operators and supplies their materialization ordering; local UDF concurrency does not depend on pipeline
 width or the number of Parquet row groups.
 
 `VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
@@ -2099,6 +2107,9 @@ device identities, including when models expose overlapping device subsets.
 Actor prefetch defaults to two admitted calls per replica, with one executing
 call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
 queues preserve per-replica submission order and cancellation ownership.
+Failed or cancelled workers are cleaned up before their invocation completes;
+their replacements initialize on the next invocation. Cancellation interrupts
+that replacement startup without waiting for the model to finish loading.
 Execution completion returns the task/actor slot immediately; managed output
 bytes remain charged through queued results, zero-copy Arrow/NumPy views,
 remote readers, and inherited views protected by the shared-memory store.

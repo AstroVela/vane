@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -39,8 +40,7 @@ def _input(store, values, *, track_budget=False):
     allocation = lease.allocation
     region = store.buffer(allocation)
     try:
-        region[:8] = len(block.ipc).to_bytes(8, "little")
-        region[8:] = memoryview(block.ipc).cast("B")
+        block.write_to(region)
     except BaseException:
         lease.release()
         raise
@@ -49,6 +49,97 @@ def _input(store, values, *, track_budget=False):
     return refs.LocalShmBlockRef(
         f"{allocation.identity}:0", allocation.size, budget_bytes=None if track_budget else 0, allocation_lease=lease
     )
+
+
+@pytest.mark.parametrize("kind", ["sliced", "chunked", "dictionary", "nested", "tensor", "empty", "no_columns"])
+def test_direct_ipc_matches_stream_size_and_preserves_all_buffers(monkeypatch, kind):
+    if kind == "sliced":
+        table = pa.table({"x": [1, None, 3], "s": ["one", "two", None]}).slice(1)
+    elif kind == "chunked":
+        table = pa.table({"x": pa.chunked_array([[1, None], [3, 4]]), "y": ["a", "b", "c", "d"]})
+    elif kind == "dictionary":
+        table = pa.table(
+            {"x": pa.chunked_array([pa.array(["a", "b"]).dictionary_encode(), pa.array(["c"]).dictionary_encode()])}
+        )
+    elif kind == "nested":
+        table = pa.table({"x": [[{"value": "a"}], None, [{"value": None}, {"value": "b"}]]})
+    elif kind == "tensor":
+        import numpy as np
+
+        table = pa.table(
+            {"x": pa.FixedShapeTensorArray.from_numpy_ndarray(np.arange(256, dtype=np.float32).reshape(4, 8, 8))}
+        )
+    elif kind == "empty":
+        table = pa.table({"x": pa.array([], type=pa.list_(pa.int64()))})
+    else:
+        table = pa.table({})
+    table = table.replace_schema_metadata({b"description": b"direct IPC regression"})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    expected = sink.getvalue().to_pybytes()
+
+    def unexpected_buffer(*args, **kwargs):
+        pytest.fail("output preparation allocated an intermediate IPC buffer")
+
+    monkeypatch.setattr(pa, "BufferOutputStream", unexpected_buffer)
+    block = refs.prepare_local_shm_block(table)
+    assert block.ipc_size_bytes == len(expected) + 8
+    backing = bytearray(b"prefix!!" + b"\x00" * block.ipc_size_bytes + b"suffix!!")
+    with memoryview(backing)[8:-8] as region:
+        block.write_to(region)
+        assert int.from_bytes(region[:8], "little") == len(expected)
+        assert bytes(region[8:]) == expected
+        actual = pa.ipc.open_stream(region[8:]).read_all()
+        assert actual.equals(table, check_metadata=True)
+        del actual
+    assert backing[:8] == b"prefix!!" and backing[-8:] == b"suffix!!"
+
+
+@pytest.mark.parametrize("size_delta", [-8, 8])
+def test_direct_ipc_size_failure_does_not_leave_an_exported_mapping(monkeypatch, size_delta):
+    block = refs.prepare_local_shm_block(pa.table({"x": [11, 22, 33]}))
+    block = replace(block, ipc_size_bytes=block.ipc_size_bytes + size_delta)
+    created = []
+    create = refs._create_shm
+
+    def capture(*args, **kwargs):
+        shm = create(*args, **kwargs)
+        created.append(shm)
+        return shm
+
+    monkeypatch.setattr(refs, "_create_shm", capture)
+    with pytest.raises((pa.ArrowException, OSError, ValueError)) as error:
+        refs.make_local_shm_descriptor_from_block(block)
+    assert not isinstance(error.value, BufferError)
+    assert len(created) == 1
+    # Keep the exception alive: its traceback must not pin the writer's buffer.
+    assert created[0]._buf is None
+    assert not (Path("/dev/shm") / created[0].name).exists()
+
+
+def test_query_arena_pin_survives_last_worker_and_retries_failed_cleanup(monkeypatch):
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64KiB")
+    query = storage.LocalQueryShmStore()
+    worker = storage.current_store("query-owner-test")
+    assert worker is query.store
+    worker.remove_client("query-owner-test")
+    assert not worker._closed
+    remove = worker.remove_client
+
+    def fail_once(client_id):
+        monkeypatch.setattr(worker, "remove_client", remove)
+        raise RuntimeError("injected arena cleanup failure")
+
+    monkeypatch.setattr(worker, "remove_client", fail_once)
+    try:
+        with pytest.raises(RuntimeError, match="arena cleanup failure"):
+            query.shutdown()
+        assert query.cleanup_pending()
+    finally:
+        query.shutdown()
+    assert not query.cleanup_pending()
+    assert worker._closed
 
 
 def test_reuse_coalesces_free_blocks_and_rejects_stale_generation(store):
@@ -285,8 +376,7 @@ if pooled:
     lease = store.allocate(block.ipc_size_bytes)
     allocation = lease.allocation
     region = store.buffer(allocation)
-    region[:8] = len(block.ipc).to_bytes(8, 'little')
-    region[8:] = memoryview(block.ipc).cast('B')
+    block.write_to(region)
     region.release()
     ref = refs.LocalShmBlockRef(f'{allocation.identity}:0', allocation.size, budget_bytes=0, allocation_lease=lease)
     name = allocation.shm_name
@@ -390,8 +480,7 @@ def make_ref(values):
     lease = store.allocate(block.ipc_size_bytes)
     allocation = lease.allocation
     region = store.buffer(allocation)
-    region[:8] = len(block.ipc).to_bytes(8, 'little')
-    region[8:] = memoryview(block.ipc).cast('B')
+    block.write_to(region)
     region.release()
     return refs.LocalShmBlockRef(f'{allocation.identity}:0', allocation.size,
                                 budget_bytes=0, allocation_lease=lease)

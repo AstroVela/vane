@@ -58,9 +58,11 @@ def _wait(predicate):
         time.sleep(0.01)
 
 
-def _call(pool):
+def _call(pool, *, actor_index=None):
     scope = ExecutionCancellationScope("gpu-test", 1)
     authority = pool.create_admission_authority()
+    if actor_index is not None:
+        authority.select_actor(actor_index)
     authority.request(0)
     admission = authority.take(0)
 
@@ -74,6 +76,89 @@ def _call(pool):
         scope.finish()
         admission.release()
         authority.close()
+
+
+@pytest.mark.parametrize("gpu", [False, True])
+def test_cancelled_actor_finishes_without_reloading_and_next_startup_is_cancellable(tmp_path, gpu):
+    constructors = tmp_path / "constructors"
+    constructors.mkdir()
+    release = tmp_path / "release"
+
+    class Model:
+        def __init__(self):
+            (constructors / str(os.getpid())).touch()
+            if len(list(constructors.iterdir())) > 1:
+                deadline = time.monotonic() + 30
+                while not release.exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("replacement constructor was not released")
+                    time.sleep(0.01)
+
+        def __call__(self, table):
+            return pa.table({"pid": [os.getpid()]})
+
+    pool = udf_subprocess.LocalSubprocessActorPool(
+        _payload(Model, gpus=int(gpu)), 1, _gpu_devices=DEVICES[:1] if gpu else None
+    )
+    admissions = []
+    scopes = []
+
+    def submit(fn):
+        scope = ExecutionCancellationScope("cancel-replacement", len(scopes) + 1)
+        scopes.append(scope)
+        authority = pool.create_admission_authority()
+        authority.request(0)
+        admission = authority.take(0)
+        admissions.append((authority, admission))
+        return scope, pool.submit(lambda worker: fn(worker, scope), scope, admission=admission)
+
+    def release_admission():
+        authority, admission = admissions.pop()
+        admission.release()
+        authority.close()
+
+    def cancel(worker, scope):
+        scope.cancel()
+        pool.abort_scopes({scope})
+        scope.raise_if_cancelled("test actor cancellation")
+
+    try:
+        original = pool._workers[0]
+        original_proc = original._proc
+        _, first = submit(cancel)
+        with pytest.raises(ExecutionCancelledError):
+            first.result(timeout=10)
+        assert original._cleanup_finished
+        assert original_proc.poll() is not None
+        assert len(list(constructors.iterdir())) == 1
+        release_admission()
+
+        # Only the next invocation reloads the model. Cancelling that invocation
+        # must interrupt the provisional constructor without poisoning the pool.
+        second_scope, second = submit(lambda worker, scope: worker._proc.pid)
+        _wait(lambda: len(list(constructors.iterdir())) == 2)
+        provisional = pool._replacing_executors[0]
+        provisional_proc = provisional._proc
+        second_scope.cancel()
+        with pytest.raises(ExecutionCancelledError):
+            second.result(timeout=10)
+        assert provisional._cleanup_finished
+        assert provisional_proc.poll() is not None
+        assert pool._terminal_error is None
+        release_admission()
+        assert not pool.cleanup_pending()
+
+        release.touch()
+        output = _call(pool)
+        assert output.column("pid")[0].as_py() != original_proc.pid
+        assert len(list(constructors.iterdir())) == 3
+    finally:
+        release.touch()
+        for scope in scopes:
+            scope.cancel()
+        while admissions:
+            release_admission()
+        pool.shutdown(kill=True)
 
 
 @pytest.mark.parametrize("devices", [[], "0", ["0"], ["GPU-aaaa"], ["MIG-aaaa"], [DEVICES[0], DEVICES[0].upper()]])
@@ -149,7 +234,7 @@ def test_fixed_devices_reuse_and_replacement_preserve_environment_and_reservatio
             assert first.pool is second.pool
             pool = first.pool
             before = pool.device_snapshot()
-            rows = [_call(pool).to_pylist()[0] for _ in range(2)]
+            rows = [_call(pool, actor_index=index).to_pylist()[0] for index in range(2)]
             assert {row["device"] for row in rows} == set(DEVICES)
             assert {row["pid"] for row in rows} == set(pool.worker_pids())
             assert {row["config"] for row in rows} == {"captured"}

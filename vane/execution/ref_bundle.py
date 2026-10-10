@@ -1743,38 +1743,59 @@ def make_local_shm_ref_bundle_result(
 
 @dataclass(frozen=True)
 class PreparedLocalShmBlock:
-    ipc: pa.Buffer
+    table: pa.Table
+    ipc_size_bytes: int
     names: list[str]
     num_rows: int
     size_bytes: int
 
-    @property
-    def ipc_size_bytes(self) -> int:
-        return _IPC_HEADER_SIZE + len(self.ipc)
+    def write_to(self, region: memoryview) -> None:
+        """Serialize directly into the exact region admitted for this block."""
+        if len(region) != self.ipc_size_bytes:
+            raise ValueError("output block does not match its shared-memory region")
+        sink = pa.FixedSizeBufferWriter(pa.py_buffer(region))
+        writer = None
+        try:
+            with sink:
+                sink.write((self.ipc_size_bytes - _IPC_HEADER_SIZE).to_bytes(_IPC_HEADER_SIZE, "little"))
+                with pa.ipc.new_stream(sink, self.table.schema) as writer:
+                    writer.write_table(self.table)
+                if sink.tell() != self.ipc_size_bytes:
+                    raise ValueError("serialized output size changed after admission")
+        finally:
+            # A retained exception traceback must not keep our mapping exported.
+            del writer, sink
 
 
 def prepare_local_shm_block(table: pa.Table) -> PreparedLocalShmBlock:
-    """Serialize once, before admission, retaining the Arrow buffer without a bytes copy."""
+    """Count IPC bytes before admission without allocating a payload buffer."""
     table = _ensure_table(table)
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
+    with pa.MockOutputStream() as sink:
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        required = _IPC_HEADER_SIZE + sink.size()
     return PreparedLocalShmBlock(
-        sink.getvalue(), list(table.schema.names), table.num_rows, int(estimate_table_bytes(table))
+        table, required, list(table.schema.names), table.num_rows, int(estimate_table_bytes(table))
     )
 
 
 def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | None = None) -> dict[str, Any]:
     """Create a worker-safe local shm descriptor for a single Arrow table block."""
-    return make_local_shm_descriptor_from_ipc(prepare_local_shm_block(table), grant_id=grant_id)
+    return make_local_shm_descriptor_from_block(prepare_local_shm_block(table), grant_id=grant_id)
 
 
-def make_local_shm_descriptor_from_ipc(block: PreparedLocalShmBlock, *, grant_id: int | None = None) -> dict[str, Any]:
-    """Publish exactly the IPC buffer whose size was admitted by the caller."""
+def make_local_shm_descriptor_from_block(
+    block: PreparedLocalShmBlock, *, grant_id: int | None = None
+) -> dict[str, Any]:
+    """Publish a block only after writing its admitted IPC bytes."""
     required = block.ipc_size_bytes
     shm = _create_shm(required, track=False)
     try:
-        _write_ipc_to_shm(shm, block.ipc)
+        region = _require_shm_buffer(shm)[:required]
+        try:
+            block.write_to(region)
+        finally:
+            region.release()
         metadata = {
             "provider": LOCAL_SHM_PROVIDER,
             "num_rows": block.num_rows,
@@ -1823,8 +1844,7 @@ def make_pooled_shm_descriptor(
         start = slot.offset + offset
         region = mapping.shm.buf[start : start + size]
         try:
-            region[:_IPC_HEADER_SIZE] = len(block.ipc).to_bytes(_IPC_HEADER_SIZE, "little")
-            region[_IPC_HEADER_SIZE:] = memoryview(block.ipc).cast("B")
+            block.write_to(region)
         finally:
             region.release()
         descriptor = {
