@@ -495,3 +495,8 @@ ordered durable publication and coordinated garbage collection. It compares
 the stock backend with external payloads and a checkpoint batching follow-up,
 including fault injection and allocation aging. These prototypes use a separate
 experimental format; the production storage format and defaults remain unchanged.
+
+The [SQLite synchronization experiment](benchmarks/staged_payload/wal_sync/README.md)
+isolates WAL growth and reuse from the Unix VFS sync primitive. It includes
+matched SQLite builds, actual syscall failure/retry tests and monitored FUSE
+comparisons after garbage collection.
