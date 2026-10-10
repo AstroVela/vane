@@ -1222,7 +1222,7 @@ def _acquire_fte_partition_task_lease(
     partition_id: int,
     node_id: str,
 ) -> Any:
-    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.execution.query_resource_policy import TaskRequest
     from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
     with _FTE_REGISTRY_LOCK:

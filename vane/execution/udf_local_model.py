@@ -41,7 +41,9 @@ from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTask
 from vane.execution.udf_worker_metrics import WorkerMetrics
 
 if TYPE_CHECKING:
+    from vane.execution.local_query_admission import LocalQueryAdmission
     from vane.execution.udf_local_request import LocalModelRequest
+    from vane.execution.udf_shm_store import LocalQueryShmStore
     from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
 
@@ -276,6 +278,8 @@ class LocalModelRuntime:
         | QueryInputCleanup
         | QueryExecutorCleanup
         | PreparedLocalResourceGraph
+        | LocalQueryAdmission
+        | LocalQueryShmStore
     ]:
         """Validate bindings, acquire query resources, and publish their handles.
 
@@ -319,6 +323,8 @@ class LocalModelRuntime:
         | QueryInputCleanup
         | QueryExecutorCleanup
         | PreparedLocalResourceGraph
+        | LocalQueryAdmission
+        | LocalQueryShmStore
     ]:
         from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
         from vane.execution.udf_subprocess import (
@@ -372,6 +378,8 @@ class LocalModelRuntime:
                 raise ValueError("UDF node already has a local resource graph binding")
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
+            if "local_query_admission" in options:
+                raise ValueError("UDF node already has a query resource policy")
             if "local_task_progress" in options:
                 raise ValueError("UDF node already has a task progress binding")
             if "local_data_scope" in options:
@@ -392,9 +400,15 @@ class LocalModelRuntime:
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
         graph_scope = None
+        policy_metadata = (
+            LocalResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=conn)
+            if nodes or self._track_graph
+            else None
+        )
         if self._track_graph:
+            assert policy_metadata is not None
             graph_scope = PreparedLocalResourceGraph(
-                LocalResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=conn),
+                policy_metadata,
                 release=self._release_graph,
                 data_ledger=self._data_ledger,
             )
@@ -466,6 +480,7 @@ class LocalModelRuntime:
                     options["local_data_scope"] = data_query
             resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
                 list(nodes.values()),
+                resource_graph=policy_metadata,
                 plan_identity=id(plan),
                 session_id=self._session_id,
                 set_handles=lambda options: plan.set_udf_actor_handles(

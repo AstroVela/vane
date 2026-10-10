@@ -42,7 +42,7 @@ def _registered_low_level_plan(
     refresh_phase_allocation=False,
 ):
     """Exercise the internal C++ runner under the mandatory graph contract."""
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         ResourceVector,
     )
@@ -477,13 +477,13 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
 
 
 def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_policy import TaskRequest
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
         ResourceVector,
     )
-    from vane.runners.ray.query_resource_manager import TaskRequest
     from vane.runners.ray.query_resource_runtime import (
         register_query_resource_graph,
         release_query_resource_manager,
@@ -730,7 +730,7 @@ def _bind_test_query_resource_owner(
     *,
     query_id: str | None = None,
 ):
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,

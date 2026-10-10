@@ -7,8 +7,13 @@ import random
 
 import pytest
 
-from vane.runners.ray import query_resource_manager as manager_module
-from vane.runners.ray.query_resource_graph import (
+from vane.execution import query_resource_policy as manager_module
+from vane.execution.query_resource_policy import (
+    OutputBlockRequest,
+    QueryResourceManager,
+    TaskRequest,
+)
+from vane.execution.query_resource_spec import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
@@ -16,11 +21,6 @@ from vane.runners.ray.query_resource_graph import (
     ResourceVector,
 )
 from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
-from vane.runners.ray.query_resource_manager import (
-    OutputBlockRequest,
-    RayQueryResourceManager,
-    TaskRequest,
-)
 
 
 @pytest.mark.parametrize("unit_count", [1, 2, 3, 7])
@@ -202,7 +202,7 @@ def _manager(
         allocation_resources,
         nodes=nodes,
     )
-    return RayQueryResourceManager(
+    return QueryResourceManager(
         graph,
         allocation,
         reservation_ratio=reservation_ratio,
@@ -854,7 +854,7 @@ def test_production_seal_keeps_fused_udf_consumers_live():
     """Regression for #835: sealing must not disable UDF output liveness."""
     graph = _fused_udf_chain_graph()
     changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_eligible_units_change=lambda *args: changes.append(args),
@@ -899,7 +899,7 @@ def test_sealed_fused_nodes_keep_dependencies_without_reserving_object_store(lat
     graph = _fused_udf_chain_graph()
     wakeups = []
     frontier_changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_change=lambda: wakeups.append("changed"),
@@ -4280,4 +4280,4 @@ def test_native_task_and_materialized_output_preserve_the_actual_runtime_node():
     granted = manager.try_acquire_task(_task(unit.resource_unit_id, 3, node_id=output.node_id))
     assert granted.granted
     assert granted.lease.node_id == output.node_id
-    assert manager.snapshot()["ray_core_owns_placement"] is True
+    assert manager.snapshot()["backend_owns_placement"] is True

@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import vane
+from tests.local_admission_helpers import linear_metadata
 from vane import pickle as vane_pickle
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
@@ -68,6 +69,9 @@ class _Plan:
 
     def collect_udf_nodes(self, conn=None):
         return self.nodes
+
+    def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+        return linear_metadata(self.nodes)
 
     def set_udf_actor_handles(self, options, conn=None):
         self.options = options["one"]

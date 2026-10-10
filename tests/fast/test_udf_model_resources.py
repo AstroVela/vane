@@ -118,11 +118,11 @@ def test_exclusive_reservation_survives_partial_initialization_cleanup_failure()
 
 
 def test_shared_resources_preserve_ray_type_identity_and_pickle_compatibility():
-    from vane.runners.ray.query_resource_graph import ResourceVector as RayResourceVector
+    from vane.execution.query_resource_spec import ResourceVector as RayResourceVector
 
     assert RayResourceVector is ResourceVector
     # A protocol-zero reference written before the class moved still resolves.
-    assert vane_pickle.loads(b"cvane.runners.ray.query_resource_graph\nResourceVector\n.") is ResourceVector
+    assert vane_pickle.loads(b"cvane.execution.query_resource_spec\nResourceVector\n.") is ResourceVector
     value = ResourceVector(cpu=0.25, heap_bytes=123)
     assert vane_pickle.loads(vane_pickle.dumps(value)) == value
 

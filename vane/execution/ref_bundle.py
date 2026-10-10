@@ -24,7 +24,13 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._common import estimate_table_bytes
-from vane.execution.udf_data_lease import DataAllocation, OutputDataLeaseOwner, TaskDataScope
+from vane.execution.data_lifecycle import (
+    ForkableOutputLease,
+    OutputBlockLeaseOwner,
+    OutputLeaseSet,
+    RetainedOutputLease,
+)
+from vane.execution.udf_data_lease import DataAllocation, TaskDataScope
 from vane.execution.udf_shm_store import (
     ShmAllocation,
     StoreLease,
@@ -44,10 +50,8 @@ _TRUTHY_FALSE_VALUES = ("", "0", "false", "no", "off")
 _RAY_LIKE_OBJECT_STORE_MEMORY_FRACTION = 0.3
 _RAY_LIKE_SHM_MEMORY_FRACTION = 0.95
 _RAY_LIKE_OBJECT_STORE_MAX_BYTES = 200 * _GIB
-_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION = 0.75
-_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES = 16 * _MIB
 _deferred_shm_close_lock = threading.Lock()
-_deferred_shm_closes: list[tuple[shared_memory.SharedMemory, OutputDataLeaseOwner | None]] = []
+_deferred_shm_closes: list[tuple[shared_memory.SharedMemory, ForkableOutputLease | None]] = []
 _shm_debug_lock = threading.Lock()
 _shm_debug_seq = 0
 _local_shm_budget_cond = threading.Condition()
@@ -338,29 +342,6 @@ class LocalShmBudgetManager:
                 return True
             usage = self._usage_locked()
             return usage <= 0 or usage + requested <= limit
-
-    def can_admit_output_submit(self, size: int, *, projected_output_bytes: int = 0) -> bool:
-        requested = max(0, int(size))
-        if requested <= 0:
-            return True
-        projected = max(0, int(projected_output_bytes))
-        with self._cond:
-            limit = self._limit_locked()
-            if limit <= 0:
-                return True
-            if requested < _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES:
-                return True
-            usage = self._usage_locked() + projected
-            if requested > limit:
-                return usage <= 0
-            if usage > 0 and usage + requested > limit:
-                return False
-            if usage <= 0:
-                return True
-            soft_limit = int(limit * _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION)
-            soft_limit = max(1, min(limit, soft_limit))
-            soft_limit = max(soft_limit, min(limit, requested))
-            return usage + requested <= soft_limit
 
     def acquire_allocation(
         self,
@@ -1094,13 +1075,6 @@ def can_claim_local_shm_ref_output_budget(size: int) -> bool:
     return _LOCAL_SHM_BUDGET_MANAGER.can_claim_output(size)
 
 
-def can_admit_local_shm_ref_output_submit(size: int, *, projected_output_bytes: int = 0) -> bool:
-    return _LOCAL_SHM_BUDGET_MANAGER.can_admit_output_submit(
-        size,
-        projected_output_bytes=projected_output_bytes,
-    )
-
-
 def _acquire_local_shm_ref_budget(
     size: int,
     *,
@@ -1210,7 +1184,7 @@ def _ipc_payload_bounds(shm: shared_memory.SharedMemory, size: int | None = None
     return _IPC_HEADER_SIZE, required
 
 
-def _close_or_defer_shm(shm: shared_memory.SharedMemory, *, data_lease: OutputDataLeaseOwner | None = None) -> None:
+def _close_or_defer_shm(shm: shared_memory.SharedMemory, *, data_lease: ForkableOutputLease | None = None) -> None:
     try:
         shm.close()
     except BufferError:
@@ -1238,7 +1212,7 @@ def _retry_deferred_shm_closes() -> None:
 class _LocalShmBufferOwner:
     """Own a shm mapping through the lifetime of a PyArrow foreign buffer."""
 
-    def __init__(self, shm: shared_memory.SharedMemory, data_lease: OutputDataLeaseOwner | None = None) -> None:
+    def __init__(self, shm: shared_memory.SharedMemory, data_lease: ForkableOutputLease | None = None) -> None:
         self._shm: shared_memory.SharedMemory | None = shm
         self._data_lease = data_lease
         self._closed = False
@@ -1261,7 +1235,7 @@ class _LocalShmBufferOwner:
 
 
 class _PooledShmBufferOwner:
-    def __init__(self, lease: Any, mapping: Any, data_lease: OutputDataLeaseOwner | None) -> None:
+    def __init__(self, lease: Any, mapping: Any, data_lease: ForkableOutputLease | None) -> None:
         self.lease = lease
         self.mapping = mapping
         self.data_lease = data_lease
@@ -1282,7 +1256,7 @@ def _arrow_table_from_pooled_shm(
     *,
     offset: int,
     size: int,
-    data_lease: OutputDataLeaseOwner | None = None,
+    data_lease: ForkableOutputLease | None = None,
     on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> pa.Table:
     owner = _PooledShmBufferOwner(lease, None, data_lease)
@@ -1327,7 +1301,7 @@ def _arrow_table_from_local_shm_zero_copy(
     name: str,
     size: int,
     *,
-    data_lease: OutputDataLeaseOwner | None = None,
+    data_lease: ForkableOutputLease | None = None,
     on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> pa.Table:
     shm = None
@@ -1484,7 +1458,10 @@ class LocalShmBlockRef:
         self._on_decode_error = on_decode_error
         self._allocation_lease = allocation_lease
         self._allocation_offset = allocation_offset
-        self._data_lease: OutputDataLeaseOwner | None = None
+        self._data_lease: ForkableOutputLease | None = None
+        self._query_output_lease: RetainedOutputLease | None = None
+        self._query_output_pooled = False
+        self._query_output_finalizer: Any = None
         self._data_finalizer: weakref.finalize[[], LocalShmBlockRef] | None = None
         if not self.owner:
             self._budget_bytes = 0
@@ -1529,7 +1506,19 @@ class LocalShmBlockRef:
     def to_table(self, *, on_decode_error: Callable[[BaseException], None] | None = None) -> pa.Table:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
-        lease = self._data_lease.fork() if self._data_lease is not None else None
+        owners = []
+        try:
+            if self._data_lease is not None:
+                owners.append(self._data_lease.fork())
+            if self._query_output_lease is not None and not self._query_output_pooled:
+                owners.append(self._query_output_lease.fork())
+        except BaseException as error:
+            try:
+                OutputLeaseSet(tuple(owners)).release()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        lease = OutputLeaseSet(tuple(owners)) if owners else None
         handler = self._on_decode_error
         if on_decode_error is not None:
             producer_handler = handler
@@ -1560,7 +1549,7 @@ class LocalShmBlockRef:
             )
         return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease, on_decode_error=handler)
 
-    def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
+    def attach_data_lease(self, lease: ForkableOutputLease) -> None:
         if self._closed or self._data_lease is not None:
             raise RuntimeError("local shared-memory ref is released or already has a data lease")
         self._data_lease = lease
@@ -1568,9 +1557,27 @@ class LocalShmBlockRef:
         # return the transport budget while consumers still retain the data.
         self._data_finalizer = weakref.finalize(self, lease.release)
 
+    def attach_query_output_lease(self, lease: OutputBlockLeaseOwner) -> None:
+        if self._closed or self._query_output_lease is not None:
+            raise RuntimeError("local shared-memory ref already owns a query output lease or is closed")
+        owner = RetainedOutputLease(lease)
+        if isinstance(self._allocation_lease, StoreLease):
+            # The physical allocation includes remote readers, Arrow/NumPy
+            # views and fork pins. None may be released by a descriptor ACK.
+            def release_policy_bytes() -> None:
+                owner.release()
+
+            self._allocation_lease.store.retain_budget(self._allocation_lease.allocation, release_policy_bytes)
+            self._query_output_pooled = True
+        else:
+            self._query_output_finalizer = weakref.finalize(self, owner.release)
+        self._query_output_lease = owner
+
     def transition_data_lease(self, state: str) -> None:
         if self._data_lease is not None:
             self._data_lease.transition_to(state)
+        if self._query_output_lease is not None:
+            self._query_output_lease.transition_to(state)
 
     def release_budget(self) -> int:
         if self._closed:
@@ -1611,6 +1618,9 @@ class LocalShmBlockRef:
             data_finalizer = getattr(self, "_data_finalizer", None)
             if data_finalizer is not None:
                 data_finalizer()
+            query_finalizer = getattr(self, "_query_output_finalizer", None)
+            if query_finalizer is not None:
+                query_finalizer()
 
     def __del__(self) -> None:
         try:
@@ -1733,38 +1743,63 @@ def make_local_shm_ref_bundle_result(
 
 @dataclass(frozen=True)
 class PreparedLocalShmBlock:
-    ipc: pa.Buffer
+    table: pa.Table
+    ipc_size_bytes: int
     names: list[str]
     num_rows: int
     size_bytes: int
 
-    @property
-    def ipc_size_bytes(self) -> int:
-        return _IPC_HEADER_SIZE + len(self.ipc)
+    def write_to(self, region: memoryview) -> None:
+        """Serialize directly into the exact region admitted for this block."""
+        if len(region) != self.ipc_size_bytes:
+            raise ValueError("output block does not match its shared-memory region")
+        sink = pa.FixedSizeBufferWriter(pa.py_buffer(region))
+        writer = None
+        try:
+            with sink:
+                # Match Ray's copy policy for each buffer, not the total IPC size.
+                sink.set_memcopy_threads(6)
+                sink.set_memcopy_blocksize(64)
+                sink.set_memcopy_threshold(_MIB)
+                sink.write((self.ipc_size_bytes - _IPC_HEADER_SIZE).to_bytes(_IPC_HEADER_SIZE, "little"))
+                with pa.ipc.new_stream(sink, self.table.schema) as writer:
+                    writer.write_table(self.table)
+                if sink.tell() != self.ipc_size_bytes:
+                    raise ValueError("serialized output size changed after admission")
+        finally:
+            # A retained exception traceback must not keep our mapping exported.
+            del writer, sink
 
 
 def prepare_local_shm_block(table: pa.Table) -> PreparedLocalShmBlock:
-    """Serialize once, before admission, retaining the Arrow buffer without a bytes copy."""
+    """Count IPC bytes before admission without allocating a payload buffer."""
     table = _ensure_table(table)
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
+    with pa.MockOutputStream() as sink:
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        required = _IPC_HEADER_SIZE + sink.size()
     return PreparedLocalShmBlock(
-        sink.getvalue(), list(table.schema.names), table.num_rows, int(estimate_table_bytes(table))
+        table, required, list(table.schema.names), table.num_rows, int(estimate_table_bytes(table))
     )
 
 
 def make_local_shm_ref_bundle_descriptor(table: pa.Table, *, grant_id: int | None = None) -> dict[str, Any]:
     """Create a worker-safe local shm descriptor for a single Arrow table block."""
-    return make_local_shm_descriptor_from_ipc(prepare_local_shm_block(table), grant_id=grant_id)
+    return make_local_shm_descriptor_from_block(prepare_local_shm_block(table), grant_id=grant_id)
 
 
-def make_local_shm_descriptor_from_ipc(block: PreparedLocalShmBlock, *, grant_id: int | None = None) -> dict[str, Any]:
-    """Publish exactly the IPC buffer whose size was admitted by the caller."""
+def make_local_shm_descriptor_from_block(
+    block: PreparedLocalShmBlock, *, grant_id: int | None = None
+) -> dict[str, Any]:
+    """Publish a block only after writing its admitted IPC bytes."""
     required = block.ipc_size_bytes
     shm = _create_shm(required, track=False)
     try:
-        _write_ipc_to_shm(shm, block.ipc)
+        region = _require_shm_buffer(shm)[:required]
+        try:
+            block.write_to(region)
+        finally:
+            region.release()
         metadata = {
             "provider": LOCAL_SHM_PROVIDER,
             "num_rows": block.num_rows,
@@ -1813,8 +1848,7 @@ def make_pooled_shm_descriptor(
         start = slot.offset + offset
         region = mapping.shm.buf[start : start + size]
         try:
-            region[:_IPC_HEADER_SIZE] = len(block.ipc).to_bytes(_IPC_HEADER_SIZE, "little")
-            region[_IPC_HEADER_SIZE:] = memoryview(block.ipc).cast("B")
+            block.write_to(region)
         finally:
             region.release()
         descriptor = {
@@ -2446,7 +2480,6 @@ __all__ = [
     "InvalidLocalShmReferenceError",
     "LocalShmBlockRef",
     "LocalShmBudgetManager",
-    "can_admit_local_shm_ref_output_submit",
     "can_claim_local_shm_ref_output_budget",
     "cancel_local_shm_input_lease",
     "claim_local_shm_ref_output_budget",

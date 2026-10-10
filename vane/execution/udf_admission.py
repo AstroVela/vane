@@ -531,13 +531,23 @@ class LocalExecutionSlotPool:
     def create_task_authority(self, progress: LocalTaskProgressBinding | None = None) -> LocalSlotAdmissionAuthority:
         return LocalSlotAdmissionAuthority(slot_pool=self, progress=progress)
 
+    def _select_slot_locked(self, authority: LocalSlotAdmissionAuthority | None) -> int | None:
+        return self._available_slots[0] if self._available_slots else None
+
     def _try_take_slot_locked(
-        self, source: int = 0, guard: Callable[[], bool] | None = None, progress: LocalTaskProgressBinding | None = None
+        self,
+        source: int = 0,
+        guard: Callable[[], bool] | None = None,
+        progress: LocalTaskProgressBinding | None = None,
+        authority: LocalSlotAdmissionAuthority | None = None,
     ) -> int | None:
         capacity = self._execution_capacity
         if not self._available_slots or (
             capacity is not None and not capacity._can_acquire_locked(self._resources, progress)
         ):
+            return None
+        slot = self._select_slot_locked(authority)
+        if slot is None:
             return None
         if capacity is not None:
             if capacity._dispatch_requested and not capacity._dispatching:
@@ -583,14 +593,15 @@ class LocalExecutionSlotPool:
                 capacity._turn_remaining -= 1
             capacity._pools.pop(self)
             capacity._pools[self] = None
-        return self._available_slots.popleft()
+        self._available_slots.remove(slot)
+        return slot
 
     def _dispatch_waiters_locked(self) -> list[Callable[[], None]]:
         wakeups: list[Callable[[], None]] = []
         for authority in tuple(self._waiters):
             if self._closed:
                 break
-            slot = self._try_take_slot_locked(progress=authority._progress)
+            slot = self._try_take_slot_locked(progress=authority._progress, authority=authority)
             if slot is None:
                 continue
             self._waiters.remove(authority)
@@ -790,6 +801,9 @@ class LocalSlotAdmissionAuthority:
         with self._pool._lock:
             self._wakeup = callback
 
+    def select_actor(self, actor_index: int) -> None:
+        raise ValueError("task admission has no actor replica")
+
     def register_capacity_wakeup(self, callback: Callable[[], None]) -> None:
         with self._pool._lock:
             if self._state != "closed":
@@ -814,7 +828,7 @@ class LocalSlotAdmissionAuthority:
             if self._state != "idle":
                 raise RuntimeError("cannot combine capacity acquisition with a pending local request")
             source = id(self._capacity_wakeup) if self._capacity_wakeup is not None else 0
-            slot = self._pool._try_take_slot_locked(source, guard, self._progress)
+            slot = self._pool._try_take_slot_locked(source, guard, self._progress, self)
             if slot is None:
                 return None
             self._sequence += 1
@@ -842,7 +856,7 @@ class LocalSlotAdmissionAuthority:
             self._sequence += 1
             self._request_id = f"request:local:{self._pool._prefix}:{self._sequence}"
             self._retained_input_bytes = retained
-            self._ready_slot = self._pool._try_take_slot_locked(progress=self._progress)
+            self._ready_slot = self._pool._try_take_slot_locked(progress=self._progress, authority=self)
             if self._ready_slot is not None:
                 self._state = "ready"
             else:
@@ -889,6 +903,12 @@ class LocalSlotAdmissionAuthority:
         reservation = (
             None if capacity is None else _LocalExecutionReservation(capacity, self._pool._resources, self._progress)
         )
+
+        def complete() -> None:
+            if reservation is not None:
+                reservation.complete()
+            self._pool._release(lease_id)
+
         return AdmissionLease(
             request_id=request_id,
             retained_input_bytes=retained,
@@ -898,7 +918,7 @@ class LocalSlotAdmissionAuthority:
                 "slot_index": slot,
             },
             _release_callback=lambda: self._pool._release(lease_id),
-            _execution_finished_callback=None if reservation is None else reservation.complete,
+            _execution_finished_callback=complete,
             _capacity_wait_context=None if reservation is None else reservation.suspend,
         )
 

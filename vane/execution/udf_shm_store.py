@@ -686,6 +686,25 @@ def current_store(client_id: str) -> LocalShmStore:
         return _current_store
 
 
+class LocalQueryShmStore:
+    """Pin the physical arena used to size a query, before task workers start."""
+
+    def __init__(self) -> None:
+        self._owner_pid = os.getpid()
+        self._client_id = uuid.uuid4().hex
+        self.store = current_store(self._client_id)
+        self._closed = False
+
+    def shutdown(self, *, kill: bool = False) -> None:
+        if self._owner_pid != os.getpid() or self._closed:
+            return
+        self.store.remove_client(self._client_id)
+        self._closed = True
+
+    def cleanup_pending(self) -> bool:
+        return self._owner_pid == os.getpid() and not self._closed
+
+
 def _unlink_owned_stores_at_exit() -> None:
     # Do not acquire the registry lock: a forked child can inherit it from a
     # thread that no longer exists. Each arena checks its owning PID first.

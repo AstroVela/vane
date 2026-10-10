@@ -1202,7 +1202,31 @@ available system memory. `cpus` can be fractional; `memory_bytes` is an optional
 per-process heap reservation. These declarations govern admission, not OS CPU or
 RSS enforcement.
 Shared-memory flow remains governed by its separate transport and data budgets.
-The host-memory estimate does not detect container memory limits.
+On Linux with cgroup v2, available process memory also respects containing
+cgroup limits.
+
+Tasks without `memory_bytes` have zero declared heap commitment, matching
+Ray. Worker RSS, including mapped shared memory and past high-water marks,
+does not create a separate local concurrency cap or calibration phase. Declare
+`memory_bytes` when a known per-process heap reservation is required.
+
+Default local admission uses the same query resource manager, query budget
+allocator, downstream reservations, and pending-output accounting as Ray.
+The node's process capacity still governs physical placement; shared-memory
+allocations keep their transport limits. Additional `task_limit` and
+`data_limit` settings remain explicit application constraints.
+
+Execution completion returns task and actor slots independently of result
+consumption. Retained results and zero-copy views keep their output-byte
+charges until storage is released. Query shutdown waits for execution cleanup
+to return these policy leases; failed cleanup keeps its owner for retry.
+Process-resource snapshots report declared commitments, and query policy
+snapshots report task, output, reservation, and shared-budget usage.
+
+Retiring an idle task worker tolerates an exit deadline after a successful
+close acknowledgement only if forced termination, reaping and all resource
+cleanup succeed. Protocol errors and failed cleanup remain errors and retain
+their cleanup owner for retry.
 
 Native scan width controls native pipeline work only. It does not set the number
 of UDF workers: a single Parquet row group and one native thread can submit
@@ -1504,9 +1528,16 @@ a capacity error instead of waiting cyclically. Explicit byte envelopes retain
 their strict capacity error. Reduce input/output block sizes, release retained
 views, or increase the store capacity when the working set cannot fit.
 
-On Linux, closing the last worker decommits wholly free pages. Returned Arrow
-views remain valid after runtime shutdown; the arena closes after the last view
-is released. Cleanup failures retain the store for retry. Normal interpreter
+Outputs are measured with a counting IPC stream before byte admission, then
+serialized directly into the granted arena region. Publication requires the
+exact measured size; no intermediate payload buffer is copied into the arena.
+The output writer matches Ray's large-buffer copy policy: individual writes
+larger than 1 MiB use six copy threads and 64-byte blocks. Smaller writes remain
+serial. The copy completes before the result descriptor is published.
+
+On Linux, releasing the last worker and query owner decommits wholly free pages.
+Returned Arrow views remain valid after runtime shutdown; the arena closes after
+the last view is released. Cleanup failures retain the store for retry. Normal interpreter
 exit unlinks arenas owned by that process even when views remain alive, without
 invalidating their mappings for later exit callbacks. Forked children do not
 reclaim inherited parent allocations or arenas. Allocation-lease release and
@@ -2050,7 +2081,44 @@ Row-preserving calls keep their row-count validation and fused output contract.
 Local IPC transport and Ray's object store remain different implementations;
 this change does not imply equal throughput or equal memory budgets.
 
-Common byte-accounting tests also verify the intentional backend differences:
+Local subprocess and Ray execution now use `QueryResourceManager` and
+`ClusterQueryResourceCoordinator` from `vane.execution` for default admission.
+Both charge declared CPU/GPU/heap, retained task inputs, managed outputs, and
+the same dynamically learned pending-generator window. An undeclared UDF heap
+commitment is zero; worker RSS high-water marks do not become an additional
+local concurrency limit. Native plan preparation installs this policy even
+when `track_data`, `track_graph`, and explicit runtime limits are omitted.
+
+Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
+soft budgets, split those budgets between live queries, and preserve downstream
+operator reservations with the common bounded liveness policy. Local capacity
+uses the physical shared-memory arena, with the query fraction applied once.
+Query preparation pins that arena before task workers start, so later workers
+use the capacity admitted for the query. The transport reference budget is a
+separate constraint and does not reduce the query capacity a second time; an
+unbounded transport limit still leaves the physical query budget in place.
+Ray capacity comes from its cluster. Their actual object storage and physical
+placement remain backend responsibilities. DuckDB schedules local native
+operators and supplies their materialization ordering; local UDF concurrency does not depend on pipeline
+width or the number of Parquet row groups.
+
+`VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
+`VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S` configure the same reservation and
+refresh policy for both runners. Concurrent local queries count distinct GPU
+device identities, including when models expose overlapping device subsets.
+
+Actor prefetch defaults to two admitted calls per replica, with one executing
+call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
+queues preserve per-replica submission order and cancellation ownership.
+Failed or cancelled workers are cleaned up before their invocation completes;
+their replacements initialize on the next invocation. Cancellation interrupts
+that replacement startup without waiting for the model to finish loading.
+Execution completion returns the task/actor slot immediately; managed output
+bytes remain charged through queued results, zero-copy Arrow/NumPy views,
+remote readers, and inherited views protected by the shared-memory store.
+
+Explicit local `DataAdmissionLimits` remain an additional application limit.
+Their byte-accounting tests verify these differences from default soft admission:
 Local preserves a complete task envelope even at a zero reservation ratio;
 Ray's object-store reservation baseline stays zero. Both charge retained output
 after its producing unit retires. Matching full reservation settings share the
