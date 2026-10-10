@@ -1,0 +1,333 @@
+diff --git a/vane_fs/src/checkpoint.hpp b/vane_fs/src/checkpoint.hpp
+index 39a933d3af..508fda76b3 100644
+--- a/vane_fs/src/checkpoint.hpp
++++ b/vane_fs/src/checkpoint.hpp
+@@ -15,7 +15,7 @@
+ 
+ namespace vane_fs {
+ 
+-// Only fsync-mode connections use this worker. The writer still commits each
++// Both durability modes use this worker. The writer still commits each
+ // operation, and FULL barriers remain on that connection. Checkpoint errors
+ // are reported before a subsequent mutation/barrier, never from the WAL hook:
+ // returning an error from that hook would report failure AFTER committing.
+diff --git a/vane_fs/src/workspace.cpp b/vane_fs/src/workspace.cpp
+index bd25918918..94f8d9a9ca 100644
+--- a/vane_fs/src/workspace.cpp
++++ b/vane_fs/src/workspace.cpp
+@@ -26,7 +26,6 @@
+ namespace vane_fs {
+ namespace {
+ constexpr int64_t BLOCK_SIZE = 4096;
+-constexpr int WAL_CHECKPOINT_PAGES = 4096;
+ constexpr int APPLICATION_ID = 0x56465331;
+ 
+ [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
+@@ -773,9 +772,9 @@ public:
+ 					Fail(ErrorCode::Storage, "Could not enable SQLite WAL");
+ 				}
+ 			}
+-			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
+-			// Strict mode also synchronizes every WAL commit before returning.
+-			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
++			// The worker installed after registration handles checkpoint I/O.
++			// Strict writes still synchronize every WAL commit on this connection.
++			Check(db, sqlite3_wal_autocheckpoint(db, 0));
+ 			Exec(db, "BEGIN IMMEDIATE");
+ 			ValidateIdentity();
+ 			Initialize();
+@@ -806,16 +805,15 @@ UPDATE format SET version=2;
+ 			}
+ 			Exec(db, "COMMIT");
+ 			owner_committed = true;
+-			if (durability == Durability::Fsync) {
++			if (durability == Durability::Fsync)
+ 				Exec(db, "PRAGMA synchronous=NORMAL");
+-				// Reuse a modest WAL allocation after restart, including after a
+-				// single transaction temporarily exceeds the admission budget.
+-				Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
+-				Statement pages(db, "PRAGMA page_size");
+-				pages.Step();
+-				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
+-				sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+-			}
++			// Reuse a modest WAL allocation after restart, including after a
++			// single transaction temporarily exceeds the admission budget.
++			Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
++			Statement pages(db, "PRAGMA page_size");
++			pages.Step();
++			checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
++			sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+ 		} catch (...) {
+ 			checkpointer.reset();
+ 			if (db) {
+diff --git a/vane_fs/tests/test_checkpoint.cpp b/vane_fs/tests/test_checkpoint.cpp
+index 5c39dc1eb5..d40b5247b2 100644
+--- a/vane_fs/tests/test_checkpoint.cpp
++++ b/vane_fs/tests/test_checkpoint.cpp
+@@ -73,6 +73,8 @@ struct Inspector {
+ // foreground FULL barriers remain real, successful storage operations.
+ static auto foreground = std::this_thread::get_id();
+ static std::atomic<int> background_writes {0}, faults {0};
++static std::atomic<int> foreground_database_writes {0}, foreground_wal_syncs {0};
++static std::atomic<bool> fail_foreground_sync {false};
+ static std::atomic<int> main_opens {0}, fail_open_at {-1};
+ static std::atomic<bool> fail_background {false}, pause_background {false}, paused {false};
+ struct FileHooks {
+@@ -91,6 +93,8 @@ static int Write(sqlite3_file *file, const void *data, int size, sqlite3_int64 o
+ 		auto &hook = files.at(file);
+ 		original = hook.original;
+ 		background = (hook.flags & SQLITE_OPEN_MAIN_DB) && std::this_thread::get_id() != foreground;
++		if ((hook.flags & SQLITE_OPEN_MAIN_DB) && !background)
++			++foreground_database_writes;
+ 	}
+ 	if (background) {
+ 		++background_writes;
+@@ -106,6 +110,22 @@ static int Write(sqlite3_file *file, const void *data, int size, sqlite3_int64 o
+ 	}
+ 	return original->xWrite(file, data, size, offset);
+ }
++static int Sync(sqlite3_file *file, int flags) {
++	const sqlite3_io_methods *original;
++	bool foreground_wal;
++	{
++		std::lock_guard<std::mutex> lock(files_mutex);
++		auto &hook = files.at(file);
++		original = hook.original;
++		foreground_wal = (hook.flags & SQLITE_OPEN_WAL) && std::this_thread::get_id() == foreground;
++	}
++	if (foreground_wal) {
++		++foreground_wal_syncs;
++		if (fail_foreground_sync.exchange(false))
++			return SQLITE_IOERR_FSYNC;
++	}
++	return original->xSync(file, flags);
++}
+ static int CloseFile(sqlite3_file *file) {
+ 	{
+ 		std::lock_guard<std::mutex> lock(files_mutex);
+@@ -122,6 +142,7 @@ static int Open(sqlite3_vfs *, const char *name, sqlite3_file *file, int flags,
+ 		std::lock_guard<std::mutex> lock(files_mutex);
+ 		auto &hook = files.emplace(file, FileHooks {*file->pMethods, file->pMethods, flags}).first->second;
+ 		hook.methods.xWrite = Write;
++		hook.methods.xSync = Sync;
+ 		hook.methods.xClose = CloseFile;
+ 		file->pMethods = &hook.methods;
+ 	}
+@@ -141,9 +162,50 @@ struct Hooks {
+ 	}
+ };
+ 
+-static void CheckStartupFailure(const std::string &path) {
++static void CheckForegroundDurability(const std::string &path, Durability durability) {
++	Workspace workspace(path, 100, durability);
++	struct Pause {
++		Pause() {
++			paused = false;
++			pause_background = true;
++		}
++		~Pause() {
++			pause_background = false;
++			fail_foreground_sync = false;
++		}
++	} pause_worker;
++	auto session = workspace.Checkout();
++	auto writes = foreground_database_writes.load();
++	auto syncs = foreground_wal_syncs.load();
++	session->WriteFile("/file", std::string(32 * MIB, 'd'));
++	Require(foreground_database_writes == writes, "Checkpoint copied database pages on the mutation thread");
++	if (durability == Durability::Strict)
++		Require(foreground_wal_syncs > syncs, "Strict write did not synchronize before acknowledgement");
++	Wait([] { return paused.load(); });
++	syncs = foreground_wal_syncs.load();
++	session->Write("/file", "ok", 0);
++	Require((foreground_wal_syncs > syncs) == (durability == Durability::Strict),
++	        "Paused checkpoint changed ordinary write durability");
++	// A stuck checkpoint must neither perform nor absorb foreground barriers.
++	fail_foreground_sync = true;
++	Expect(ErrorCode::Storage, [&] {
++		if (durability == Durability::Strict)
++			session->Write("/file", "no", 0);
++		else
++			workspace.Sync();
++	});
++	Require(!fail_foreground_sync, "Foreground WAL sync fault was not reached");
++	Require(session->Read("/file", 0, 2) == "ok", "Failed foreground barrier changed acknowledged bytes");
++	syncs = foreground_wal_syncs.load();
++	workspace.Sync();
++	Require(foreground_wal_syncs > syncs, "Retry missed the foreground WAL barrier");
++	pause_background = false;
++	workspace.Close();
++}
++
++static void CheckStartupFailure(const std::string &path, Durability durability) {
+ 	fail_open_at = main_opens + 2; // Allow writer registration, reject worker connection.
+-	Expect(ErrorCode::Storage, [&] { Workspace workspace(path, 30, Durability::Fsync); });
++	Expect(ErrorCode::Storage, [&] { Workspace workspace(path, 30, durability); });
+ 	fail_open_at = -1;
+ 	Workspace recovered(path);
+ 	Require(recovered.RecoverOwners().owners == 1, "Failed worker startup left an unrecoverable owner");
+@@ -151,8 +213,8 @@ static void CheckStartupFailure(const std::string &path) {
+ 	recovered.Close();
+ }
+ 
+-static void CheckProgress(const std::string &path) {
+-	Workspace workspace(path, 1000, Durability::Fsync);
++static void CheckProgress(const std::string &path, Durability durability) {
++	Workspace workspace(path, 1000, durability);
+ 	auto session = workspace.Checkout();
+ 	session->WriteFile("/file", "base");
+ 	auto snapshot = workspace.OpenSnapshot(workspace.Snapshot());
+@@ -177,13 +239,13 @@ static void CheckProgress(const std::string &path) {
+ 	workspace.Close();
+ }
+ 
+-static void CheckPinnedReader(const std::string &path, int page_size) {
++static void CheckPinnedReader(const std::string &path, int page_size, Durability durability) {
+ 	{
+ 		Inspector inspector(path);
+ 		inspector.SQL(page_size == 8192 ? "PRAGMA page_size=8192; VACUUM" : "PRAGMA page_size=4096; VACUUM");
+ 	}
+-	Workspace workspace(path, 30, Durability::Fsync);
+-	Workspace other(path, 30, Durability::Fsync);
++	Workspace workspace(path, 30, durability);
++	Workspace other(path, 30, durability);
+ 	auto session = workspace.Checkout();
+ 	auto second = other.Checkout();
+ 	session->WriteFile("/file", "");
+@@ -222,8 +284,8 @@ static void CheckPinnedReader(const std::string &path, int page_size) {
+ 	other.Close();
+ }
+ 
+-static void CheckErrors(const std::string &path) {
+-	Workspace workspace(path, 30, Durability::Fsync);
++static void CheckErrors(const std::string &path, Durability durability) {
++	Workspace workspace(path, 30, durability);
+ 	auto session = workspace.Checkout();
+ 	faults = 0;
+ 	fail_background = true;
+@@ -250,8 +312,8 @@ static void CheckErrors(const std::string &path) {
+ 	Require(reopened.Checkout()->Read("/retry", 31 * MIB) == std::string(MIB, 'r'), "Close retry lost bytes");
+ }
+ 
+-static void CheckBackfilledReader(const std::string &path) {
+-	Workspace workspace(path, 30, Durability::Fsync);
++static void CheckBackfilledReader(const std::string &path, Durability durability) {
++	Workspace workspace(path, 30, durability);
+ 	struct Pause {
+ 		Pause() {
+ 			paused = false;
+@@ -281,8 +343,8 @@ static void CheckBackfilledReader(const std::string &path) {
+ 	workspace.Close();
+ }
+ 
+-static void CheckConcurrentWriters(const std::string &path) {
+-	Workspace first(path, 2000, Durability::Fsync), second(path, 2000, Durability::Fsync);
++static void CheckConcurrentWriters(const std::string &path, Durability durability, Durability other_mode) {
++	Workspace first(path, 2000, durability), second(path, 2000, other_mode);
+ 	auto a = first.Checkout(), b = second.Checkout();
+ 	a->WriteFile("/a", "");
+ 	b->WriteFile("/b", "");
+@@ -320,8 +382,8 @@ static void CheckConcurrentWriters(const std::string &path) {
+ 	second.Close();
+ }
+ 
+-static void CheckSlowCheckpoint(const std::string &path) {
+-	Workspace workspace(path, 10, Durability::Fsync);
++static void CheckSlowCheckpoint(const std::string &path, Durability durability) {
++	Workspace workspace(path, 10, durability);
+ 	struct Pause {
+ 		Pause() {
+ 			paused = false;
+@@ -354,8 +416,8 @@ static void CheckSlowCheckpoint(const std::string &path) {
+ 	workspace.Close();
+ }
+ 
+-static void CheckFork(const std::string &path) {
+-	auto workspace = std::make_unique<Workspace>(path, 100, Durability::Fsync);
++static void CheckFork(const std::string &path, Durability durability) {
++	auto workspace = std::make_unique<Workspace>(path, 100, durability);
+ 	auto session = workspace->Checkout();
+ 	auto child = fork();
+ 	Require(child >= 0, "Forking inherited workspace");
+@@ -376,7 +438,7 @@ static void CheckFork(const std::string &path) {
+ 	workspace->Close();
+ }
+ 
+-static void CheckCrash(const std::string &path) {
++static void CheckCrash(const std::string &path, Durability durability) {
+ 	int descriptors[2];
+ 	Require(pipe(descriptors) == 0, "Creating crash pipe");
+ 	auto child = fork();
+@@ -384,13 +446,15 @@ static void CheckCrash(const std::string &path) {
+ 	if (child == 0) {
+ 		close(descriptors[0]);
+ 		try {
+-			Workspace workspace(path, 1000, Durability::Fsync);
++			Workspace workspace(path, 1000, durability);
+ 			paused = false;
+ 			pause_background = true;
+ 			auto session = workspace.Checkout();
+ 			session->WriteFile("/file", std::string(32 * MIB, 'c'));
+ 			Wait([] { return paused.load(); });
+-			workspace.Sync();
++			// Strict must survive on its acknowledged write, without another barrier.
++			if (durability == Durability::Fsync)
++				workspace.Sync();
+ 			char ready = 'x';
+ 			if (write(descriptors[1], &ready, 1) != 1)
+ 				_exit(2);
+@@ -421,26 +485,33 @@ int main() {
+ 	try {
+ 		std::filesystem::create_directory(root);
+ 		Hooks hooks;
+-		std::cout << "CheckStartupFailure" << std::endl;
+-		CheckStartupFailure((root / "startup.sqlite").string());
+-		std::cout << "CheckProgress" << std::endl;
+-		CheckProgress((root / "progress.sqlite").string());
+-		std::cout << "CheckPinnedReader" << std::endl;
+-		CheckPinnedReader((root / "pinned.sqlite").string(), 4096);
+-		std::cout << "CheckPinnedReader" << std::endl;
+-		CheckPinnedReader((root / "pinned-8k.sqlite").string(), 8192);
+-		std::cout << "CheckErrors" << std::endl;
+-		CheckErrors((root / "errors.sqlite").string());
+-		std::cout << "CheckBackfilledReader" << std::endl;
+-		CheckBackfilledReader((root / "backfilled.sqlite").string());
+-		std::cout << "CheckConcurrentWriters" << std::endl;
+-		CheckConcurrentWriters((root / "concurrent.sqlite").string());
+-		std::cout << "CheckSlowCheckpoint" << std::endl;
+-		CheckSlowCheckpoint((root / "slow.sqlite").string());
+-		std::cout << "CheckFork" << std::endl;
+-		CheckFork((root / "fork.sqlite").string());
+-		std::cout << "CheckCrash" << std::endl;
+-		CheckCrash((root / "crash.sqlite").string());
++		for (auto mode : {Durability::Strict, Durability::Fsync}) {
++			auto prefix = root / (mode == Durability::Strict ? "strict" : "fsync");
++			std::filesystem::create_directory(prefix);
++			std::cout << prefix.filename() << " foreground durability" << std::endl;
++			CheckForegroundDurability((prefix / "foreground.sqlite").string(), mode);
++			std::cout << "CheckStartupFailure" << std::endl;
++			CheckStartupFailure((prefix / "startup.sqlite").string(), mode);
++			std::cout << "CheckProgress" << std::endl;
++			CheckProgress((prefix / "progress.sqlite").string(), mode);
++			std::cout << "CheckPinnedReader" << std::endl;
++			CheckPinnedReader((prefix / "pinned.sqlite").string(), 4096, mode);
++			CheckPinnedReader((prefix / "pinned-8k.sqlite").string(), 8192, mode);
++			std::cout << "CheckErrors" << std::endl;
++			CheckErrors((prefix / "errors.sqlite").string(), mode);
++			std::cout << "CheckBackfilledReader" << std::endl;
++			CheckBackfilledReader((prefix / "backfilled.sqlite").string(), mode);
++			std::cout << "CheckConcurrentWriters" << std::endl;
++			CheckConcurrentWriters((prefix / "concurrent.sqlite").string(), mode, mode);
++			std::cout << "CheckSlowCheckpoint" << std::endl;
++			CheckSlowCheckpoint((prefix / "slow.sqlite").string(), mode);
++			std::cout << "CheckFork" << std::endl;
++			CheckFork((prefix / "fork.sqlite").string(), mode);
++			std::cout << "CheckCrash" << std::endl;
++			CheckCrash((prefix / "crash.sqlite").string(), mode);
++		}
++		std::cout << "CheckMixedWriters" << std::endl;
++		CheckConcurrentWriters((root / "mixed.sqlite").string(), Durability::Strict, Durability::Fsync);
+ 		std::filesystem::remove_all(root);
+ 		std::cout << "Background progress, budgets, errors, retry, fork and crash recovery passed\n";
+ 		return 0;

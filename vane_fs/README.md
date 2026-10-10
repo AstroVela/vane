@@ -99,6 +99,11 @@ it is not a default performance recommendation. The
 [strict-mode diagnosis](benchmarks/strict_sync/README.md) locates the remaining
 waits in per-mutation WAL synchronization and checkpoint I/O.
 
+The [strict background-checkpoint experiment](benchmarks/strict_checkpoint/README.md)
+retains a tested C++ candidate that reuses the fsync worker. It is not enabled:
+frequent small checkpoints regress several workloads despite faster large
+writes. The report includes the patch, reproduction steps and complete results.
+
 ## Native commands and Linux mounts
 
 `build/core/vane-fs` provides `init`, `branches`, `fork SOURCE NAME`,
