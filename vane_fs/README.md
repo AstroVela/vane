@@ -500,3 +500,8 @@ The [SQLite synchronization experiment](benchmarks/staged_payload/wal_sync/READM
 isolates WAL growth and reuse from the Unix VFS sync primitive. It includes
 matched SQLite builds, actual syscall failure/retry tests and monitored FUSE
 comparisons after garbage collection.
+
+The [WAL writeback investigation](benchmarks/staged_payload/block_sync/README.md)
+separates page writeback from final durability barriers. Whole-device flush
+counters and thread waits explain remaining slow samples and show why an extra
+writeback wait does not remove the fsync tail.
