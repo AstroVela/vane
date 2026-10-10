@@ -377,6 +377,21 @@ join point.
 
 Set `DUCKDB_DISTRIBUTED_DEBUG=1`. Native debug output uses `DistributedDebugStream()` and appears in Ray worker error logs, normally below `/tmp/ray/session_latest/logs/worker-*.err`. Plain C `stdout` output is not reliably captured by Ray workers.
 
+Ray UDF pools return pending handles during executor construction; task admission
+waits for the first initialized actor without blocking native startup. The default
+initialization limit is 300 seconds, including time waiting for Ray capacity.
+Set `VANE_RAY_ACTOR_INIT_TIMEOUT_S` to a finite positive number on the client
+before opening its Ray runtime to change this limit. Shorter query/ObjectRef
+deadlines still apply. Resource maintenance reports the expired pool's requested
+CPU/GPU resources and terminates its actors; it never switches execution backends.
+
+A client that stops heartbeating is reclaimed after
+`VANE_RAY_CLIENT_LEASE_TIMEOUT_S` (60 seconds by default). Reclamation fences
+its queries and terminates their UDF actors before joining native operations,
+so an abandoned GPU actor cannot prevent session teardown. Failed termination
+retains ownership and is retried; connections and resource leases remain owned
+until normal teardown completes.
+
 ## Release artifacts
 
 Build and validate an sdist before opening a release pull request:

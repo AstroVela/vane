@@ -11,7 +11,7 @@ import textwrap
 import threading
 import types
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -1100,7 +1100,8 @@ def test_actor_pool_opens_after_first_ray_core_actor_becomes_ready(monkeypatch):
     assert ready == {1: "node-b"}
     assert pool.actor_node_ids == ["", "node-b", ""]
     assert pool._confirmed_ready == {1}
-    assert wait_calls[0][1:] == (1, None)
+    assert wait_calls[0][1] == 1
+    assert 0 < wait_calls[0][2] <= 300
     assert wait_calls[1][1:] == (2, 0)
 
 
@@ -1664,6 +1665,7 @@ def test_actor_activation_rechecks_phase_after_slow_pool_creation(monkeypatch):
             "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
         },
         _query_allocations={"q1": object()},
+        _query_terminal_errors={},
         _query_udf_actor_nodes={
             "q1": {
                 resource_unit_id: {
@@ -1745,6 +1747,7 @@ def test_actor_activation_cleans_up_when_atomic_slot_publication_is_fenced(monke
             "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
         },
         _query_allocations={"q1": object()},
+        _query_terminal_errors={},
         _query_udf_actor_nodes={
             "q1": {
                 resource_unit_id: {
@@ -1900,127 +1903,22 @@ def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypa
     assert activation_count == 1
 
 
-def test_phase_retirement_cancels_pending_actor_readiness_without_deadlock(
-    monkeypatch,
-):
-    import vane.execution.udf_ray as udf_ray
-    import vane.runners.ray.query_resource_runtime as resource_runtime
-    from vane.runners.ray.driver import RayQueryDriverActor
-
-    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
-    resource_unit_id = "resource:q1:actor"
-    readiness_entered = threading.Event()
-    actor_killed = threading.Event()
-    submitted = []
-    retirements = []
-
-    class _Manager:
-        def current_eligible_resource_unit_ids(self):
-            return (resource_unit_id,)
-
-        def set_submitted_actor_slots(self, unit_id, actor_indices):
-            submitted.append((unit_id, set(actor_indices)))
-
-        def begin_actor_pool_retirement(self, unit_id):
-            retirements.append(("begin", unit_id))
-            return True
-
-        def complete_actor_pool_retirement(self, unit_id):
-            retirements.append(("complete", unit_id))
-            return True
-
-    manager = _Manager()
-    monkeypatch.setattr(
-        resource_runtime,
-        "get_query_resource_manager",
-        lambda _query_id: manager,
+def test_activation_returns_pending_handles_and_retirement_ignores_late_readiness(monkeypatch):
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    result = runner._activate_query_udf_actor_pool_sync(
+        {"query_id": "q1", "resource_unit_id": "resource:q1:actor", "physical_node_id": "node-1"},
+        _QUERY_GENERATION_CAPABILITY,
     )
-
-    def shutdown():
-        pool.actors = []
-        actor_killed.set()
-
-    pool = SimpleNamespace(
-        actors=["actor-0"],
-        actor_node_ids=[""],
-        _init_refs=[object()],
-        shutdown=shutdown,
-    )
-    monkeypatch.setattr(
-        udf_ray,
-        "prepare_actor_pools_for_nodes",
-        lambda *_args, **_kwargs: (
-            [pool],
-            {
-                "node-1": {
-                    "actor_handles": ["actor-0"],
-                    "actor_node_ids": [""],
-                    "actor_dispatch_indices": [],
-                    "actor_init_refs": list(pool._init_refs),
-                }
-            },
-        ),
-    )
-
-    def wait_for_first_ready(_pool):
-        readiness_entered.set()
-        assert actor_killed.wait(timeout=5)
-        raise RuntimeError("pending actor was killed during phase retirement")
-
-    monkeypatch.setattr(
-        udf_ray,
-        "wait_for_first_actor_pool_ready",
-        wait_for_first_ready,
-    )
-    runner = SimpleNamespace(
-        _query_resource_lock=threading.RLock(),
-        _session_lock=threading.RLock(),
-        _query_resource_graphs={
-            "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
-        },
-        _query_allocations={"q1": object()},
-        _query_udf_actor_nodes={"q1": {resource_unit_id: {"node_id": "node-1"}}},
-        _query_udf_session_configs={"q1": {}},
-        _plan_session_ids={"q1": "session-1"},
-        _active_udf_actor_by_unit={"q1": {}},
-        _active_udf_actors=[],
-        _active_udf_actors_by_plan={},
-        _driver_handle=object(),
-    )
-    activation_errors = []
-
-    def activate():
-        try:
-            runner_cls._activate_query_udf_actor_pool_sync(
-                runner,
-                {
-                    "query_id": "q1",
-                    "resource_unit_id": resource_unit_id,
-                    "physical_node_id": "node-1",
-                },
-                _QUERY_GENERATION_CAPABILITY,
-            )
-        except BaseException as exc:
-            activation_errors.append(exc)
-
-    activation_thread = threading.Thread(target=activate)
-    activation_thread.start()
-    assert readiness_entered.wait(timeout=5)
-
-    runner_cls._retire_udf_actor_pools_outside_phase(runner, "q1", ())
-    activation_thread.join(timeout=5)
-
-    assert activation_thread.is_alive() is False
-    assert len(activation_errors) == 1
-    assert "pending actor was killed" in str(activation_errors[0])
-    assert submitted == [(resource_unit_id, {0})]
-    assert retirements == [
-        ("begin", resource_unit_id),
-        ("complete", resource_unit_id),
-    ]
-    assert runner._active_udf_actor_by_unit["q1"] == {}
+    assert result["actor_handles"] == ["actor-0"]
+    assert result["actor_dispatch_indices"] == []
+    assert not init.done()
+    runner._retire_udf_actor_pools_outside_phase("q1", ())
+    init.set_result("node-a")
+    assert pool._confirmed_ready == set()
+    assert pool.actors == []
     assert runner._active_udf_actors == []
-    assert "q1" not in runner._active_udf_actors_by_plan
+    assert runner._active_udf_actors_by_plan == {}
+    assert runner._query_terminal_errors == {}
 
 
 def test_actor_activation_retains_unpublished_pool_when_shutdown_fails(monkeypatch):
@@ -2071,6 +1969,7 @@ def test_actor_activation_retains_unpublished_pool_when_shutdown_fails(monkeypat
             "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
         },
         _query_allocations={"q1": object()},
+        _query_terminal_errors={},
         _query_udf_actor_nodes={"q1": {resource_unit_id: {"node_id": "node-1"}}},
         _query_udf_session_configs={"q1": {}},
         _plan_session_ids={"q1": "session-1"},
@@ -2130,6 +2029,7 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
         actors=["actor-0"],
         actor_node_ids=[""],
         _init_refs=[object()],
+        _confirmed_ready=set(),
         shutdown=shutdown,
     )
     monkeypatch.setattr(
@@ -2147,11 +2047,7 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
             },
         ),
     )
-    monkeypatch.setattr(
-        udf_ray,
-        "wait_for_first_actor_pool_ready",
-        lambda _pool: (_ for _ in ()).throw(RuntimeError("planned readiness failure")),
-    )
+
     runner = SimpleNamespace(
         _query_resource_lock=threading.RLock(),
         _session_lock=threading.RLock(),
@@ -2159,6 +2055,7 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
             "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
         },
         _query_allocations={"q1": object()},
+        _query_terminal_errors={},
         _query_udf_actor_nodes={"q1": {resource_unit_id: {"node_id": "node-1"}}},
         _query_udf_session_configs={"q1": {}},
         _plan_session_ids={"q1": "session-1"},
@@ -2166,6 +2063,9 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
         _driver_handle=object(),
+        _watch_query_udf_actor_pool_readiness=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("planned readiness watcher failure")
+        ),
     )
 
     with pytest.raises(
@@ -2241,11 +2141,7 @@ def test_actor_readiness_close_failure_releases_terminated_pool(monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(
-        udf_ray,
-        "wait_for_first_actor_pool_ready",
-        lambda _pool: (_ for _ in ()).throw(RuntimeError("planned readiness failure")),
-    )
+
     runner = SimpleNamespace(
         _query_resource_lock=threading.RLock(),
         _session_lock=threading.RLock(),
@@ -2253,6 +2149,7 @@ def test_actor_readiness_close_failure_releases_terminated_pool(monkeypatch):
             "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
         },
         _query_allocations={"q1": object()},
+        _query_terminal_errors={},
         _query_udf_actor_nodes={"q1": {resource_unit_id: {"node_id": "node-1"}}},
         _query_udf_session_configs={"q1": {}},
         _plan_session_ids={"q1": "session-1"},
@@ -2260,6 +2157,9 @@ def test_actor_readiness_close_failure_releases_terminated_pool(monkeypatch):
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
         _driver_handle=object(),
+        _watch_query_udf_actor_pool_readiness=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("planned readiness watcher failure")
+        ),
     )
 
     with pytest.raises(
@@ -3101,5 +3001,134 @@ def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch)
     )
 
     assert [ref for ref, _timeout in fake_ray.future_calls] == init_refs
-    assert all(timeout is None for _ref, timeout in fake_ray.future_calls)
+    assert all(0 < timeout <= 300 for _ref, timeout in fake_ray.future_calls)
     assert handles_map["0"]["actor_dispatch_indices"] == [0, 1]
+
+
+def _pending_pool_driver(monkeypatch):
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    init = Future()
+    manager = SimpleNamespace(
+        current_eligible_resource_unit_ids=lambda: ("resource:q1:actor",),
+        set_submitted_actor_slots=lambda *_args: None,
+        set_ready_actor_slots=lambda *_args: None,
+        begin_actor_pool_retirement=lambda *_args: True,
+        complete_actor_pool_retirement=lambda *_args: True,
+        fail=lambda message: failures.append(message),
+    )
+    failures = []
+    manager.failures = failures
+    pool = SimpleNamespace(
+        actors=["actor-0"],
+        actor_node_ids=[""],
+        _confirmed_ready=set(),
+        _init_refs=[SimpleNamespace(future=lambda: init)],
+        _payload={"cpus": 1, "gpus": 1},
+        _resolve_actor_num_cpus=lambda payload: float(payload["cpus"]),
+    )
+    pool.shutdown = lambda **_kwargs: pool.actors.clear()
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _: manager)
+    monkeypatch.setattr(
+        udf_ray,
+        "prepare_actor_pools_for_nodes",
+        lambda *_args, **_kwargs: ([pool], {"node-1": {"actor_handles": list(pool.actors)}}),
+    )
+    runner = cls.__new__(cls)
+    runner._query_resource_lock = threading.RLock()
+    runner._session_lock = threading.RLock()
+    runner._query_resource_graphs = {"q1": SimpleNamespace(unit_by_id=lambda _: SimpleNamespace(backend="ray_actor"))}
+    runner._query_allocations = {"q1": object()}
+    runner._query_terminal_errors = {}
+    runner._query_udf_actor_nodes = {"q1": {"resource:q1:actor": {"node_id": "node-1"}}}
+    runner._query_udf_session_configs = {"q1": {}}
+    runner._plan_session_ids = {"q1": "session-1"}
+    runner._active_udf_actor_by_unit = {}
+    runner._active_udf_actors = []
+    runner._active_udf_actors_by_plan = {}
+    runner._driver_handle = object()
+    return runner, manager, pool, init
+
+
+def _activate_pending_pool(runner):
+    return runner._activate_query_udf_actor_pool_sync(
+        {"query_id": "q1", "resource_unit_id": "resource:q1:actor", "physical_node_id": "node-1"},
+        _QUERY_GENERATION_CAPABILITY,
+    )
+
+
+def test_pending_actor_deadline_fails_query_and_kills_pool(monkeypatch):
+    monkeypatch.setenv("VANE_RAY_ACTOR_INIT_TIMEOUT_S", "0.05")
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline - 0.001)
+    assert not manager.failures
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline)
+    assert len(manager.failures) == 1
+    assert "timed out after 0.05s" in manager.failures[0]
+    assert "CPU=1, GPU=1 per actor" in manager.failures[0]
+    assert pool.actors == []
+    assert runner._active_udf_actors == []
+    init.set_result("late-node")
+    assert not pool._confirmed_ready
+    with pytest.raises(RuntimeError, match="initialization timed out"):
+        _activate_pending_pool(runner)
+
+
+def test_first_ready_actor_disarms_initialization_deadline(monkeypatch):
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    init.set_result("node-a")
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline + 1)
+    assert not manager.failures
+    assert pool.actors == ["actor-0"]
+    assert pool._confirmed_ready == {0}
+
+
+def test_deadline_kill_failure_preserves_ownership_and_is_retried(monkeypatch):
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    attempts = []
+
+    def shutdown(*, kill):
+        assert kill
+        attempts.append(kill)
+        if len(attempts) == 1:
+            raise RuntimeError("kill unavailable")
+        pool.actors.clear()
+
+    pool.shutdown = shutdown
+    with pytest.raises(RuntimeError, match="kill unavailable"):
+        runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline)
+    assert runner._active_udf_actors == [pool]
+    assert runner._active_udf_actors_by_plan == {"q1": [pool]}
+    init.set_exception(RuntimeError("late init failure"))
+    assert not pool._vane_init_errors
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline + 1)
+    assert attempts == [True, True]
+    assert runner._active_udf_actors == []
+
+
+def test_retired_pool_deadline_does_not_fail_query(monkeypatch):
+    runner, manager, old_pool, _ = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    old_pool._vane_retired = True
+    runner._expire_pending_udf_actor_pools(now=old_pool._vane_init_deadline + 1)
+    assert not manager.failures
+
+
+def test_first_ready_callback_after_deadline_cannot_admit_actor(monkeypatch):
+    import vane.runners.ray.driver as driver
+
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    monkeypatch.setattr(driver.time, "monotonic", lambda: pool._vane_init_deadline + 0.01)
+    init.set_result("late-node")
+    assert not pool._confirmed_ready
+    assert len(manager.failures) == 1
+    assert "initialization timed out" in manager.failures[0]
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline + 0.1)
+    assert pool.actors == []
