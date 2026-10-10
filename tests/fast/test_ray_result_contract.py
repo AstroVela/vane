@@ -360,6 +360,7 @@ def _make_local_query_driver_actor():
     runner._leased_result_partition_refs = {}
     runner._result_partition_ref_counters = {}
     runner._query_resource_graphs = {}
+    runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
     runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
@@ -636,6 +637,7 @@ def test_maintenance_loops_continue_after_pre311_asyncio_timeout(
             runner._query_resource_maintenance_error = ""
             runner._query_resource_maintenance_failures = 0
             runner._maintain_query_resources_once = lambda: maintenance_calls.append(None)
+            runner._expire_pending_udf_actor_pools = lambda **_kwargs: None
             maintenance_loop = runner_cls._query_resource_maintenance_loop
 
         wait_calls = 0
@@ -7614,7 +7616,8 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
         )
 
 
-def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery():
+@pytest.mark.parametrize("fail_during_read", [False, True])
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(fail_during_read):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
     query_id = "query-placement-lost"
@@ -7622,7 +7625,16 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
+    message = "Ray actor UDF pool initialization failed"
+    if fail_during_read:
+
+        def next_nowait():
+            runner._query_terminal_errors[query_id] = message
+            raise RuntimeError("FTE task lease rejection: query_failed")
+
+        runner.curr_streams[plan_id].next_nowait = next_nowait
+    else:
+        runner._query_terminal_errors[query_id] = message
     teardown_calls = []
 
     def _teardown(actual_plan_id):
@@ -13055,3 +13067,76 @@ def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypat
         ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
         ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
     ]
+
+
+def test_expired_client_kills_udf_actor_before_joining_active_operation():
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-udf-startup"
+    _bind_test_plan_session(runner, plan_id)
+    actor_killed = threading.Event()
+    operation_started = threading.Event()
+    session = runner._sessions[_TEST_SESSION_ID]
+    events = []
+
+    class Pool:
+        actors = [object()]
+        _vane_retired = False
+
+        def shutdown(self, *, kill):
+            assert kill is True
+            assert session.connection.closed is False
+            events.append("kill")
+            self.actors = []
+            actor_killed.set()
+
+    pool = Pool()
+    runner._active_udf_actors = [pool]
+    runner._active_udf_actors_by_plan = {plan_id: [pool]}
+    runner._active_udf_actor_by_unit = {plan_id: {"actor": pool}}
+
+    def cleanup(actual_plan_id):
+        assert actual_plan_id == plan_id
+        assert session.active_operations == 0
+        events.append("teardown")
+        session.plan_ids.discard(plan_id)
+        runner._plan_session_ids.pop(plan_id)
+
+    runner._cleanup_finished_plan = cleanup
+
+    def native_operation():
+        operation_started.set()
+        assert actor_killed.wait(timeout=5)
+        assert session.connection.closed is False
+        events.append("operation-exit")
+
+    async def expire():
+        async def operation():
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+            try:
+                await driver._run_in_executor_with_owned_side_effects(
+                    runner._get_driver_native_executor(),
+                    native_operation,
+                )
+            finally:
+                cls._end_session_operation(session)
+
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(operation_started.wait, 2)
+        runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1
+        assert cls._mark_expired_client_leases(runner, now=1) == (_TEST_RUNTIME_OWNER_ID,)
+        assert (
+            await asyncio.wait_for(
+                cls._detach_client_owner(runner, _TEST_RUNTIME_OWNER_ID, expired=True),
+                timeout=5,
+            )
+            is False
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(expire())
+    assert events == ["kill", "operation-exit", "teardown"]
+    assert session.connection.closed is True
+    assert runner._active_udf_actors == []

@@ -468,6 +468,17 @@ class _PreparedQueryResourceRegistration:
     capacity_snapshot_started_at: float
 
 
+def _udf_actor_init_timeout_message(query_id: str, unit_id: str, pool: UDFActorPoolBase) -> str:
+    payload = pool._payload
+    return (
+        f"Ray actor UDF pool initialization timed out after {pool._vane_init_timeout:g}s "
+        f"for {query_id}/{unit_id}; requested {len(pool.actors)} actor(s), "
+        f"CPU={pool._resolve_actor_num_cpus(payload):g}, "
+        f"GPU={float(payload.get('gpus', 0)):g} per actor. "
+        "No actor became ready; check Ray resource availability and actor initialization."
+    )
+
+
 @dataclass
 class _PlanLifecycle:
     """Own one plan from preparation until deterministic teardown."""
@@ -2741,6 +2752,13 @@ class RayQueryDriverActor:
                     return
                 session.close_in_progress = True
             try:
+                with self._session_lock:
+                    lease = self._client_leases.get(owner_key)
+                    expired = lease is not None and lease.state == "expired"
+                if expired:
+                    with session.condition:
+                        abandoned_plans = tuple(session.plan_ids)
+                    self._reclaim_expired_session_udf_pools(abandoned_plans)
                 with session.condition:
                     while session.active_operations > 0:
                         session.condition.wait()
@@ -2947,6 +2965,7 @@ class RayQueryDriverActor:
         interval = float(self._query_resource_maintenance_interval_s)
         while not stop.is_set():
             try:
+                await asyncio.to_thread(self._expire_pending_udf_actor_pools, now=time.monotonic())
                 await asyncio.to_thread(self._maintain_query_resources_once)
                 self._query_resource_maintenance_error = ""
             except asyncio.CancelledError:
@@ -5723,15 +5742,69 @@ class RayQueryDriverActor:
             self._active_udf_actor_by_unit.setdefault(plan_id, {})
         return []
 
+    def _reclaim_expired_session_udf_pools(self, plan_ids: tuple[str, ...]) -> None:
+        """Fence abandoned work and free actors before joining native callers."""
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        for plan_id in plan_ids:
+            with _query_udf_actor_lifecycle_lock(self, plan_id):
+                with self._session_lock:
+                    lifecycle = self._plan_lifecycles.get(plan_id)
+                    if lifecycle is None:
+                        continue
+                    lifecycle.request_close()
+                    query_id = self._plan_query_ids.get(plan_id, plan_id)
+                message = f"Ray UDF execution cancelled because its client lease expired: {plan_id}"
+                with self._query_resource_lock:
+                    if query_id in self._query_resource_graphs:
+                        self._query_terminal_errors.setdefault(query_id, message)
+                        get_query_resource_manager(query_id).fail(message)
+                # Do not release QRM leases or close the native connection here.
+                # Normal teardown still joins execution and owns those steps.
+                self._cleanup_udf_actor_pools(plan_id, force=True)
+
+    def _expire_pending_udf_actor_pools(self, *, now: float) -> None:
+        """Bound Ray placement/initialization waits, retrying failed kills."""
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        with self._session_lock:
+            pending = [
+                (query_id, unit_id, pool)
+                for query_id, pools in self._active_udf_actor_by_unit.items()
+                for unit_id, pool in pools.items()
+                if pool._vane_init_deadline <= now
+            ]
+        errors: list[BaseException] = []
+        for query_id, unit_id, pool in pending:
+            with _query_udf_actor_lifecycle_lock(self, query_id):
+                with self._session_lock:
+                    if self._active_udf_actor_by_unit.get(query_id, {}).get(unit_id) is not pool:
+                        continue
+                    if not pool._vane_init_timed_out:
+                        if pool._vane_retired or pool._confirmed_ready:
+                            continue
+                        pool._vane_init_timed_out = True
+                        pool._vane_retired = True
+                    message = _udf_actor_init_timeout_message(query_id, unit_id, pool)
+                with self._query_resource_lock:
+                    self._query_terminal_errors.setdefault(query_id, message)
+                    get_query_resource_manager(query_id).fail(message)
+                try:
+                    self._cleanup_udf_actor_pools(query_id, force=True)
+                except BaseException as exc:
+                    _append_query_cleanup_error(errors, exc)
+        if errors:
+            raise RuntimeError(
+                "timed-out Ray UDF actor cleanup failed: " + "; ".join(_safe_exception_summary(exc) for exc in errors)
+            ) from errors[0]
+
     def _activate_query_udf_actor_pool_sync(
         self,
         locator: dict[str, str],
         query_generation_capability: str,
     ) -> dict[str, Any]:
-        from vane.execution.udf_ray import (
-            prepare_actor_pools_for_nodes,
-            wait_for_first_actor_pool_ready,
-        )
+        from vane.execution.udf_ray import prepare_actor_pools_for_nodes
+        from vane.execution.udf_ray_actor_pool import _actor_init_timeout_s
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_id = str(locator["query_id"])
@@ -5746,9 +5819,13 @@ class RayQueryDriverActor:
             if unit.backend != "ray_actor":
                 raise ValueError(f"resource unit is not a Ray actor pool: {resource_unit_id}")
             manager = get_query_resource_manager(query_id)
+        init_timeout = _actor_init_timeout_s()
+        init_deadline = time.monotonic() + init_timeout
         lifecycle_lock = _query_udf_actor_lifecycle_lock(self, query_id)
         with lifecycle_lock:
             with self._session_lock:
+                if query_id in self._query_terminal_errors:
+                    raise RuntimeError(self._query_terminal_errors[query_id])
                 if (
                     query_id not in self._query_udf_actor_nodes
                     or plan_id not in self._plan_session_ids
@@ -5815,6 +5892,9 @@ class RayQueryDriverActor:
             pool._vane_retired = False
             pool._vane_readiness_futures = []
             pool._vane_init_errors = {}
+            pool._vane_init_deadline = init_deadline
+            pool._vane_init_timeout = init_timeout
+            pool._vane_init_timed_out = False
 
             phase_activation_error: BaseException | None = None
             with self._session_lock:
@@ -5857,8 +5937,13 @@ class RayQueryDriverActor:
                 )
                 raise phase_activation_error
         try:
-            ready_nodes = wait_for_first_actor_pool_ready(pool)
+            # Native executor construction can hold execution locks shared by
+            # other queries. Never wait there for Ray to schedule the first
+            # actor. QRM gates task dispatch until a readiness callback arrives.
+            self._watch_query_udf_actor_pool_readiness(query_id, resource_unit_id, pool, manager)
             with self._session_lock:
+                if pool._vane_init_timed_out:
+                    raise TimeoutError(_udf_actor_init_timeout_message(query_id, resource_unit_id, pool))
                 if (
                     bool(getattr(pool, "_vane_retired", False))
                     or self._active_udf_actor_by_unit.get(plan_id, {}).get(resource_unit_id) is not pool
@@ -5868,16 +5953,9 @@ class RayQueryDriverActor:
                     raise RuntimeError(
                         f"query phase ended while activating Ray actor UDF pool: {query_id}/{resource_unit_id}"
                     )
-                manager.set_ready_actor_slots(resource_unit_id, ready_nodes)
-            self._watch_query_udf_actor_pool_readiness(
-                query_id,
-                resource_unit_id,
-                pool,
-                manager,
-            )
-            options["actor_node_ids"] = list(pool.actor_node_ids)
-            options["actor_dispatch_indices"] = sorted(ready_nodes)
-            options["actor_init_refs"] = list(pool._init_refs)
+                options["actor_node_ids"] = list(pool.actor_node_ids)
+                options["actor_dispatch_indices"] = sorted(pool._confirmed_ready)
+                options["actor_init_refs"] = list(pool._init_refs)
             return {
                 key: options[key]
                 for key in (
@@ -5943,7 +6021,7 @@ class RayQueryDriverActor:
         pool: UDFActorPoolBase,
         manager: Any,
     ) -> None:
-        """Publish actors that Ray Core schedules after the first pool slot."""
+        """Publish each actor as Ray Core schedules it, without blocking startup."""
 
         def actor_ready(actor_index: int, future: Any) -> None:
             try:
@@ -5971,20 +6049,30 @@ class RayQueryDriverActor:
                 manager.fail(message)
                 return
 
+            message = ""
             with self._session_lock:
                 if (
                     bool(getattr(pool, "_vane_retired", False))
                     or self._active_udf_actor_by_unit.get(query_id, {}).get(resource_unit_id) is not pool
                 ):
                     return
-                pool.actor_node_ids[actor_index] = node_id
-                pool._confirmed_ready.add(actor_index)
-                ready_nodes = {
-                    ready_index: str(pool.actor_node_ids[ready_index])
-                    for ready_index in sorted(pool._confirmed_ready)
-                    if str(pool.actor_node_ids[ready_index]).strip()
-                }
-                manager.set_ready_actor_slots(resource_unit_id, ready_nodes)
+                if not pool._confirmed_ready and time.monotonic() >= pool._vane_init_deadline:
+                    pool._vane_init_timed_out = True
+                    pool._vane_retired = True
+                    message = _udf_actor_init_timeout_message(query_id, resource_unit_id, pool)
+                else:
+                    pool.actor_node_ids[actor_index] = node_id
+                    pool._confirmed_ready.add(actor_index)
+                    ready_nodes = {
+                        ready_index: str(pool.actor_node_ids[ready_index])
+                        for ready_index in sorted(pool._confirmed_ready)
+                        if str(pool.actor_node_ids[ready_index]).strip()
+                    }
+                    manager.set_ready_actor_slots(resource_unit_id, ready_nodes)
+            if message:
+                with self._query_resource_lock:
+                    self._query_terminal_errors.setdefault(query_id, message)
+                manager.fail(message)
 
         readiness_futures: list[Any] = []
         for actor_index, init_ref in enumerate(pool._init_refs):
@@ -6229,7 +6317,7 @@ class RayQueryDriverActor:
                 with self._session_lock:
                     pool._vane_retired = True
                 try:
-                    if force:
+                    if force or getattr(pool, "_vane_init_timed_out", False):
                         pool.shutdown(kill=True)
                     else:
                         pool.shutdown()
@@ -8320,6 +8408,16 @@ class RayQueryDriverActor:
                 )
                 return None
             except RuntimeError as e:
+                # A terminal actor failure can arrive while next_nowait waits.
+                # FTE then reports only query_failed; retain the driver's cause
+                # and run the same teardown as a failure observed before read.
+                if query_id in self._query_terminal_errors:
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
+                        self._finish_terminal_query,
+                        str(plan_id),
+                        query_id,
+                    )
                 # pybind11 wraps StopIteration in RuntimeError
                 if "StopIteration" in str(e):
                     await _run_in_executor_with_owned_side_effects(

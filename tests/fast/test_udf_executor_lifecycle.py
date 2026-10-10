@@ -1542,6 +1542,7 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
     actors._owns_actors = True
+    actors._confirmed_ready = {0, 1}
     actors.actors = ["actor-0", "actor-1"]
 
     with pytest.raises(RuntimeError, match="transient kill failure"):
@@ -1600,6 +1601,7 @@ def test_udf_actor_shutdown_closes_executors_before_killing_actors(monkeypatch, 
     monkeypatch.setitem(sys.modules, "ray", FakeRay())
     actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
     actors._owns_actors = True
+    actors._confirmed_ready = {0, 1}
     actors.actors = [Actor("actor-0"), Actor("actor-1")]
 
     if close_fails:
@@ -1659,6 +1661,7 @@ def test_udf_actor_shutdown_settles_every_submitted_close_after_one_fails(monkey
     monkeypatch.setitem(sys.modules, "ray", FakeRay())
     actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
     actors._owns_actors = True
+    actors._confirmed_ready = {0, 1}
     actors.actors = [
         Actor("actor-0", close_error=RuntimeError("planned first close failure")),
         Actor("actor-1"),
@@ -9829,14 +9832,14 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
     assert all(ref._closed for ref in refs)
 
 
-def test_ray_actor_init_waits_for_ray_core_capacity_without_default_timeout(monkeypatch):
+def test_ray_actor_init_has_finite_default_timeout(monkeypatch):
     import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
     monkeypatch.delenv("VANE_RAY_ACTOR_INIT_TIMEOUT_S", raising=False)
 
-    assert actor_pool_mod._actor_init_timeout_s() is None
+    assert actor_pool_mod._actor_init_timeout_s() == 300.0
 
 
 def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):
@@ -10153,3 +10156,40 @@ def test_subprocess_actor_destructor_finishes_before_graceful_close_ack(monkeypa
             pool.shutdown(kill=True)
 
     assert marker_path.read_text() == "cleaned"
+
+
+def test_unready_actor_is_killed_without_close_rpc_even_after_partial_cleanup(monkeypatch):
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    killed = []
+    closed = []
+    pending = types.SimpleNamespace(
+        close_executor=types.SimpleNamespace(remote=lambda: pytest.fail("unready actor cannot execute close"))
+    )
+
+    def close():
+        closed.append(True)
+        future = Future()
+        future.set_result(None)
+        return types.SimpleNamespace(future=lambda: future)
+
+    ready = types.SimpleNamespace(close_executor=types.SimpleNamespace(remote=close))
+
+    def kill(actor, **_kwargs):
+        killed.append(actor)
+        if actor is pending and len(killed) == 2:
+            raise RuntimeError("retry pending actor kill")
+
+    monkeypatch.setitem(sys.modules, "ray", types.SimpleNamespace(kill=kill))
+    pool = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    pool._owns_actors = True
+    pool.actors = [ready, pending]
+    pool._confirmed_ready = {0}
+    with pytest.raises(RuntimeError, match="retry pending actor kill"):
+        pool.shutdown()
+    assert pool._confirmed_ready == set()
+    assert len(pool.actors) == 1
+    assert pool.actors[0] is pending
+    pool.shutdown()
+    assert pool.actors == []
+    assert closed == [True]
