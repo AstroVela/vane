@@ -113,6 +113,11 @@ commits fixed. It removes repeated growth during reuse and improves common
 small-write costs, but cold-write and random-write stalls remain. The report
 includes initialization, shutdown and retained-space costs; the candidate is
 not enabled by default.
+The [allocation and fsync-worker evaluation](benchmarks/checkpoint_headroom/README.md)
+tests allocation hints, unbackfilled-work batching, and early checkpoints near
+the admission budget. Neither worker candidate is adopted: fewer background
+syncs shift work into foreground barriers, and plain fresh/post-GC comparisons
+retain large-write and metadata regressions.
 
 ## Native commands and Linux mounts
 
