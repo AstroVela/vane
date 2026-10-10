@@ -23,7 +23,6 @@ from vane.ai.provider import _safe_provider_execution_error
             "mem_fraction_static=0.3, required above 0.346",
         ),
         (RuntimeError("CUDA out of memory. private request content"), "CUDA memory allocation failed"),
-        (RuntimeError("CUDNN_STATUS_NOT_INITIALIZED private payload"), "cuDNN initialization failed"),
         (MemoryError("private allocation description"), "memory allocation failed"),
     ],
 )

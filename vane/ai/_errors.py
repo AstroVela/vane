@@ -143,10 +143,6 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
             "CUDA memory allocation failed; check model and worker GPU memory budgets"
         ):
             return "CUDA memory allocation failed; check model and worker GPU memory budgets"
-        if "CUDNN_STATUS_NOT_INITIALIZED" in message or canonical(
-            "cuDNN initialization failed; check the CUDA, cuDNN and PyTorch installation"
-        ):
-            return "cuDNN initialization failed; check the CUDA, cuDNN and PyTorch installation"
     return None
 
 
