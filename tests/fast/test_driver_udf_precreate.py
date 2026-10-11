@@ -3235,3 +3235,103 @@ def test_first_ready_callback_after_deadline_cannot_admit_actor(monkeypatch):
     assert "initialization timed out" in manager.failures[0]
     runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline + 0.1)
     assert pool.actors == []
+
+
+@pytest.mark.parametrize("refresh_fails", [False, True])
+def test_failed_actor_cleanup_does_not_starve_resource_maintenance(monkeypatch, refresh_fails):
+    runner, manager, pool, _ = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    pool._vane_init_deadline = 0
+    cleanup_fails = True
+    calls = []
+
+    def shutdown(*, kill):
+        assert kill is True
+        if cleanup_fails:
+            raise RuntimeError("transient actor kill failure")
+        pool.actors.clear()
+
+    def refresh():
+        calls.append("refresh")
+        if refresh_fails:
+            raise ValueError("resource refresh unavailable")
+
+    pool.shutdown = shutdown
+    runner._maintain_query_resources_once = refresh
+    runner._query_resource_maintenance_interval_s = 0.001
+    runner._query_resource_maintenance_error = ""
+    runner._query_resource_maintenance_failures = 0
+    original_expire = runner._expire_pending_udf_actor_pools
+
+    async def run_cycles(count):
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        runner._query_resource_maintenance_stop = stop
+        iterations = 0
+
+        def expire(**kwargs):
+            nonlocal iterations
+            calls.append("cleanup")
+            try:
+                original_expire(**kwargs)
+            finally:
+                iterations += 1
+                if iterations == count:
+                    loop.call_soon_threadsafe(stop.set)
+
+        runner._expire_pending_udf_actor_pools = expire
+        await asyncio.wait_for(runner._query_resource_maintenance_loop(), timeout=5)
+
+    asyncio.run(run_cycles(3))
+    assert calls == ["cleanup", "refresh"] * 3
+    assert runner._active_udf_actors_by_plan == {"q1": [pool]}
+    assert runner._udf_actor_timeout_cleanup_pending == {"q1"}
+    assert runner._query_resource_maintenance_failures == 3
+    error = runner._query_resource_maintenance_error
+    assert "UDF actor cleanup:" in error
+    assert "transient actor kill failure" in error
+    assert ("resource refresh: ValueError: resource refresh unavailable" in error) is refresh_fails
+    assert len(manager.failures) == 1
+
+    cleanup_fails = False
+    asyncio.run(run_cycles(1))
+    assert calls == ["cleanup", "refresh"] * 4
+    assert runner._active_udf_actors_by_plan == {}
+    assert runner._udf_actor_timeout_cleanup_pending == set()
+    expected_error = "resource refresh: ValueError: resource refresh unavailable" if refresh_fails else ""
+    assert runner._query_resource_maintenance_error == expected_error
+    failure_count = 4 if refresh_fails else 3
+    assert runner._query_resource_maintenance_failures == failure_count
+
+    refresh_fails = False
+    asyncio.run(run_cycles(1))
+    assert calls == ["cleanup", "refresh"] * 5
+    assert runner._query_resource_maintenance_error == ""
+    assert runner._query_resource_maintenance_failures == failure_count
+
+
+@pytest.mark.parametrize("cancel_stage", ["cleanup", "refresh"])
+def test_resource_maintenance_propagates_cancellation(monkeypatch, cancel_stage):
+    runner, _, _, _ = _pending_pool_driver(monkeypatch)
+    calls = []
+
+    def maintain(stage, **_kwargs):
+        calls.append(stage)
+        if stage == cancel_stage:
+            raise asyncio.CancelledError
+
+    runner._expire_pending_udf_actor_pools = lambda **kwargs: maintain("cleanup", **kwargs)
+    runner._maintain_query_resources_once = lambda: maintain("refresh")
+    runner._query_resource_maintenance_interval_s = 0.001
+    runner._query_resource_maintenance_error = ""
+    runner._query_resource_maintenance_failures = 0
+
+    async def scenario():
+        runner._query_resource_maintenance_stop = asyncio.Event()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner._query_resource_maintenance_loop(), timeout=5)
+
+    asyncio.run(scenario())
+    assert calls == (["cleanup"] if cancel_stage == "cleanup" else ["cleanup", "refresh"])
+    assert runner._query_resource_maintenance_error == ""
+    assert runner._query_resource_maintenance_failures == 0

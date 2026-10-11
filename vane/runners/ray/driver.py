@@ -2965,15 +2965,24 @@ class RayQueryDriverActor:
             raise RuntimeError("query resource maintenance stop event is not initialized")
         interval = float(self._query_resource_maintenance_interval_s)
         while not stop.is_set():
+            errors: list[str] = []
             try:
                 await asyncio.to_thread(self._expire_pending_udf_actor_pools, now=time.monotonic())
-                await asyncio.to_thread(self._maintain_query_resources_once)
-                self._query_resource_maintenance_error = ""
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
+                errors.append(f"UDF actor cleanup: {_safe_exception_summary(exc)}")
+            # A failed actor kill must not starve capacity, usage, and allocation
+            # refreshes for every other query sharing this driver.
+            try:
+                await asyncio.to_thread(self._maintain_query_resources_once)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                errors.append(f"resource refresh: {_safe_exception_summary(exc)}")
+            if errors:
                 self._query_resource_maintenance_failures += 1
-                self._query_resource_maintenance_error = f"{type(exc).__name__}: {exc}"
+            self._query_resource_maintenance_error = _bounded_diagnostic_text("; ".join(errors))
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except (TimeoutError, asyncio.TimeoutError):
