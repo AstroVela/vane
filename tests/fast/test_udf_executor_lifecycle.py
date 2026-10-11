@@ -893,6 +893,7 @@ def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
 
 def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch):
     import vane.execution.vllm as vllm
+    from vane.ai import DiagnosticError, summarize_error
 
     class FakeRef:
         def __init__(self, value=None, exc: Exception | None = None):
@@ -951,8 +952,10 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
 
     executor.submit(None, ["a", "b"], pa.table({"x": [1, 2]}))
 
-    with pytest.raises(RuntimeError, match="actor submit failed after dispatch"):
+    with pytest.raises(DiagnosticError) as caught:
         executor.take_ready_result()
+    assert summarize_error(caught.value).split("; cleanup: ", 1)[0] == "RuntimeError"
+    assert "actor submit failed after dispatch" not in str(caught.value)
     assert executor._inflight_per_actor == [0]
     assert executor._submit_per_actor == [0]
 
@@ -1240,6 +1243,7 @@ def _new_remote_vllm_error_executor(vllm, monkeypatch, *, release_count=0):
 
 def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(monkeypatch):
     import vane.execution.vllm as vllm
+    from vane.ai import DiagnosticError, summarize_error
 
     cancelled = []
 
@@ -1290,8 +1294,9 @@ def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(
     monkeypatch.setitem(sys.modules, "ray", FakeRay())
     monkeypatch.setattr(vllm, "configured_ray_get_timeout_s", lambda: 0.125)
 
-    with pytest.raises(RuntimeError, match="vllm remote task failed: RuntimeError: vllm remote wait exceeded"):
+    with pytest.raises(DiagnosticError) as caught:
         executor.wait_for_result()
+    assert summarize_error(caught.value).split(" <- ", 1)[0] == "RuntimeError: vllm remote wait exceeded query deadline"
 
     assert condition.timeout == pytest.approx(0.125)
     assert cancelled == [wait_ref]

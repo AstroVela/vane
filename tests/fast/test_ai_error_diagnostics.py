@@ -312,6 +312,109 @@ def test_cleanup_snapshot_does_not_trust_nested_raw_error_bodies():
         assert "private" not in summary and "errno=28" not in summary
 
 
+def _long_diagnostic_cause(kind):
+    from vane.ai._client_config import ProviderClientConfigurationError
+
+    errors = [TypeError("got an unexpected keyword argument 'max_model_len'")]
+    if kind == "technical":
+        errors.extend(
+            [
+                ValueError(
+                    "Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.123456. "
+                    "Raise --mem-fraction-static above 0.999999."
+                ),
+                ProviderClientConfigurationError(
+                    "Anthropic api_key or auth_token was not configured on the application before creating the provider/descriptor"
+                ),
+                RuntimeError(
+                    "vllm actor finished without returning all submitted results: "
+                    "actor_idx=1234567890123456 submitted=1234567890123456 received=1234567890123455"
+                ),
+            ]
+        )
+    else:
+        for index in range(4):
+            error = type("SDKError" + str(index) + "E" * 119, (Exception,), {})("private payload")
+            for field in ("status_code", "status", "code", "errno"):
+                setattr(error, field, 999999)
+            errors.append(error)
+    for previous, current in zip(errors, errors[1:]):
+        current.__cause__ = previous
+    return errors[-1]
+
+
+@pytest.mark.parametrize("kind", ["technical", "numeric"])
+@pytest.mark.parametrize("long_section", ["primary", "cleanup"])
+def test_long_diagnostics_keep_cleanup_across_repeated_transports(kind, long_section):
+    from vane.execution._subprocess_error import capture_cleanup
+
+    primary = _long_diagnostic_cause(kind)
+    cleanup = OSError(errno.EIO, "private cleanup path")
+    if long_section == "cleanup":
+        last = primary
+        while last.__cause__ is not None:
+            last = last.__cause__
+        last.__cause__ = cleanup
+        cleanup = primary
+        primary = TypeError("got an unexpected keyword argument 'max_model_len'")
+    diagnostic = capture_cleanup("worker failure", primary, cleanup)
+    expected = diagnostic.summary
+    assert len(expected) <= 512
+    cause, secondary = expected.split("; cleanup: ")
+    assert "max_model_len" in cause and "errno=5" not in cause
+    assert "OSError (errno=5)" in secondary and "private" not in expected
+    for _ in range(3):
+        serialized = pickle.dumps(diagnostic)
+        assert b"private" not in serialized
+        restored = pickle.loads(serialized)
+        for candidate in (diagnostic, restored, native_error(restored)):
+            assert summarize_error(candidate) == expected
+        diagnostic = DiagnosticError("query wrapper", native_error(restored))
+
+
+@pytest.mark.parametrize("max_chars", [64, 80, 128, 256, 512, 4096])
+@pytest.mark.parametrize("kind", ["technical", "numeric", "long_type"])
+@pytest.mark.parametrize("with_cleanup", [False, True])
+def test_diagnostic_budgets_produce_complete_parseable_items(max_chars, kind, with_cleanup):
+    from vane.ai.provider import _SafeProviderError
+
+    error = (
+        type("E" * 128, (Exception,), {})("private payload") if kind == "long_type" else _long_diagnostic_cause(kind)
+    )
+    if with_cleanup:
+        error.cleanup_errors = (
+            OSError(errno.EIO, "private path"),
+            _long_diagnostic_cause("technical"),
+            OSError(errno.ENOSPC, "private path"),
+        )
+    summary = summarize_error(error, max_chars=max_chars)
+    assert len(summary) <= max_chars and "private" not in summary
+    if with_cleanup:
+        assert "OSError (errno=5)" in summary.split("; cleanup: ")[1]
+    # Provider wrappers consume this same canonical grammar. Re-parsing a
+    # bounded snapshot must not change types or lose its cleanup section.
+    wrapped = _SafeProviderError(summary)
+    assert summarize_error(wrapped, max_chars=max_chars) == summary
+    capability = ProviderCapabilityError("fixture", "model", "embed", original_error=wrapped)
+    assert summarize_error(native_error(pickle.loads(pickle.dumps(capability))), max_chars=max_chars) == summary
+
+
+def test_diagnostic_item_budget_reserves_cleanup_during_transport():
+    from vane.ai.provider import _SafeProviderError
+    from vane.execution._subprocess_error import capture_cleanup
+
+    # Sixty-four short causes fit the character budget, but an appended cleanup
+    # would exceed the parser's item budget unless the producer reserves space.
+    original = _SafeProviderError(" <- ".join(f"E{index}" for index in range(64)))
+    diagnostic = capture_cleanup("worker failure", original, OSError(errno.EIO, "private path"))
+    for _ in range(3):
+        primary, cleanup = summarize_error(diagnostic).split("; cleanup: ")
+        assert primary.startswith("E0 <- E1")
+        assert cleanup == "OSError (errno=5)"
+        assert summarize_error(native_error(diagnostic)) == diagnostic.summary
+        diagnostic = DiagnosticError("query", native_error(pickle.loads(pickle.dumps(diagnostic))))
+
+
 def test_cleanup_exception_does_not_replace_initialization_cause():
     try:
         try:

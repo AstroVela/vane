@@ -57,6 +57,7 @@ _REMOTE_RESULT_COUNTS = re.compile(
     r"actor_idx=[0-9]{1,16} submitted=[0-9]{1,16} received=[0-9]{1,16}(?![0-9])"
 )
 _DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
+_MAX_DIAGNOSTIC_ITEMS = 64
 _SAFE_ERROR_DETAILS = {
     "distributed Ray UDF payload requires query_id": "RuntimeError",
     "distributed Ray UDF payload requires pre-registered resource_unit_id": "RuntimeError",
@@ -226,7 +227,7 @@ def _summary_parts(message: str) -> tuple[list[str], list[str]]:
         return [f"{name}: {message}"], []
     chains: list[list[str]] = [[]]
     position = 0
-    for _ in range(64):
+    for _ in range(_MAX_DIAGNOSTIC_ITEMS):
         match = _TYPE.match(message, position)
         if match is None:
             break
@@ -416,6 +417,27 @@ def _exception_chain(error: BaseException) -> Iterator[BaseException]:
         current = following
 
 
+def _bounded_chain(parts: list[str], max_chars: int) -> list[str]:
+    """Keep complete atoms so another transport can still read the chain."""
+    result: list[str] = []
+    size = 0
+    for part in parts:
+        next_size = size + (4 if result else 0) + len(part)
+        if next_size > max_chars:
+            if not result:
+                # A very small caller budget can exclude even the root atom.
+                # Drop its optional detail, never part of a status or name.
+                match = _TYPE.match(part)
+                name = match[0] if match else "Exception"
+                if len(name) > max_chars:
+                    name = "Exception"
+                return [name] if len(name) <= max_chars else []
+            break
+        result.append(part)
+        size = next_size
+    return result
+
+
 def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
     """Return bounded root-cause and cleanup diagnostics safe for API responses.
 
@@ -460,9 +482,18 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
                     add_cleanup(" <- ".join(parts))
                     for summary in nested_cleanup:
                         add_cleanup(summary)
-    result = " <- ".join(summaries)
-    if cleanup:
-        suffix = "; cleanup: " + "; ".join(cleanup)
-        suffix = suffix[: max_chars // 2]
-        result = result[: max_chars - len(suffix)] + suffix
-    return result if len(result) <= max_chars else result[: max_chars - 1] + "…"
+    # Reserve up to half the budget for cleanup. Both sections must end at
+    # complete atoms: slicing inside a detail makes the next parser stop before
+    # it reaches the cleanup separator, even when that separator is intact.
+    suffix = ""
+    remaining_items = _MAX_DIAGNOSTIC_ITEMS
+    for summary in cleanup:
+        separator = "; cleanup: " if not suffix else "; "
+        parts, _ = _summary_parts(summary)
+        # Leave at least one slot for the primary cause in the parser's budget.
+        rendered = _bounded_chain(parts[: remaining_items - 1], max_chars // 2 - len(suffix) - len(separator))
+        if not rendered:
+            break
+        suffix += separator + " <- ".join(rendered)
+        remaining_items -= len(rendered)
+    return " <- ".join(_bounded_chain(summaries[:remaining_items], max_chars - len(suffix))) + suffix
