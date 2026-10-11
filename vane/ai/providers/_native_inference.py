@@ -17,7 +17,7 @@ import json
 import math
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -633,12 +633,14 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         # the enclosing Arrow batch must never replay successful siblings.
         from vane.ai.functions import _log_substituted_failure, _retry_call_async
 
-        async def invoke(value: Any) -> Any:
+        async def invoke(value: Any, check_stopped: Callable[[], None]) -> Any:
+            def request() -> Awaitable[Any]:
+                check_stopped()
+                return self._embed(kind, value)
+
             try:
                 result = await _retry_call_async(
-                    self._embed,
-                    kind,
-                    value,
+                    request,
                     max_retries=getattr(self, "_request_max_retries", 0),
                     on_error="raise",
                 )

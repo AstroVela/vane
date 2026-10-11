@@ -181,9 +181,10 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
         on_error = getattr(self, "_request_on_error", "raise")
         validate = getattr(self, "_validate_vector", lambda value: value)
 
-        async def invoke(indices: list[int], texts: list[str]) -> None:
+        async def invoke(indices: list[int], texts: list[str], check_stopped: Callable[[], None]) -> None:
             failure: Exception | None = None
             for attempt in range(retries + 1):
+                check_stopped()
                 wait = None
                 started = time.monotonic()
                 self.metrics.requests += 1
@@ -235,15 +236,15 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
                 and not _is_request_wide_error(failure)
             ):
                 middle = len(texts) // 2
-                await invoke(indices[:middle], texts[:middle])
-                await invoke(indices[middle:], texts[middle:])
+                await invoke(indices[:middle], texts[:middle], check_stopped)
+                await invoke(indices[middle:], texts[middle:], check_stopped)
                 return
             self.metrics.failed_inputs += len(texts)
             _log_substituted_failure(failure, on_error="ignore")
 
-        async def dispatch(batch: tuple[list[int], list[str]]) -> None:
+        async def dispatch(batch: tuple[list[int], list[str]], check_stopped: Callable[[], None]) -> None:
             self.metrics.queue_seconds += time.monotonic() - queued_at
-            await invoke(*batch)
+            await invoke(*batch, check_stopped)
 
         try:
             await map_async_ordered(

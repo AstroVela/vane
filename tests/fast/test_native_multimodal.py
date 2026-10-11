@@ -236,6 +236,41 @@ def test_native_embedding_retries_only_the_failed_request(family, sdk):
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
+def test_native_embedding_terminal_failure_stops_sibling_retries(family, sdk):
+    import pyarrow as pa
+
+    from vane.ai.functions import RetryAfterError, _EmbedTextBatch
+    from vane.execution._async_runtime import AsyncRuntime
+
+    calls = []
+    ready = asyncio.Event()
+
+    async def request(value):
+        index = len(calls)
+        calls.append(value)
+        if index == 0:
+            await ready.wait()
+            raise ValueError("terminal input failure")
+        ready.set()
+        raise RetryAfterError(0, status=503)
+
+    sdk.on_embedding = request
+    descriptor = load_provider(family).get_text_embedder(
+        model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": 2}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "embedding", 2, max_retries=3)
+    runtime = AsyncRuntime()
+    wrapper.bind_async_runtime(runtime.run)
+    try:
+        with pytest.raises(RuntimeError, match="upstream error: ValueError"):
+            wrapper(pa.table({"text": ["fatal", "retry", "queued"]}))
+        assert len(calls) == sdk.requests_closed == 2
+    finally:
+        wrapper.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("failure", ["request", "vector"])
 def test_native_embedding_ignore_preserves_successful_rows(family, failure, sdk):
     import pyarrow as pa

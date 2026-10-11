@@ -1474,12 +1474,16 @@ class _PromptBatch:
         max_retries = self._max_retries
         on_error = self._on_error
 
-        async def invoke(index: int) -> str | None:
+        async def invoke(index: int, check_stopped: Callable[[], None]) -> str | None:
+            def request(messages: tuple[Any, ...]) -> Any:
+                check_stopped()
+                return prompter.prompt(messages)
+
             capability_error: ProviderCapabilityError | None = None
             provider_error: Exception | None = None
             try:
                 result = await _retry_call_async(
-                    prompter.prompt,
+                    request,
                     row_messages[index],
                     max_retries=max_retries,
                     on_error=on_error,
