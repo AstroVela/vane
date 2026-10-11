@@ -1451,6 +1451,50 @@ def test_remote_executor_preserves_actor_diagnostics_and_cleanup(monkeypatch, en
     executor.shutdown()
 
 
+@pytest.mark.parametrize("failure", ["deadline", "no_pending_refs", "missing_results"])
+def test_remote_executor_framework_failures_keep_their_explanation(monkeypatch, failure):
+    import vane.execution.vllm as vllm
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+    executor.finished_submitting()
+    assert executor.take_ready_result() is None
+    if failure == "deadline":
+        monkeypatch.setattr(vllm, "configured_ray_get_timeout_s", lambda: 0)
+        expected = "vllm remote wait exceeded query deadline"
+    elif failure == "no_pending_refs":
+        # Inject a lost wait reference after normal submission. The lifecycle
+        # guard must explain this invariant failure rather than hide its cause.
+        executor._wait_refs_by_actor = [None]
+        monkeypatch.setattr(executor, "_ensure_remote_wait_refs", lambda: None)
+        expected = "vllm remote wait has no pending actor wait refs before completion"
+    else:
+        actor.wait_refs[0].set_result(False)
+        expected = "vllm actor finished without returning all submitted results: actor_idx=0 submitted=1 received=0"
+    try:
+        for operation in (executor.wait_for_result, executor.take_ready_result, executor.all_tasks_finished):
+            with pytest.raises(DiagnosticError) as caught:
+                operation()
+            for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+                assert expected in summarize_error(error)
+        assert actor.aborted == [executor._executor_id]
+        assert router.inflight == [0]
+    finally:
+        executor.shutdown()
+
+
 def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeypatch):
     import vane.execution.vllm as vllm
 

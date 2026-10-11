@@ -339,9 +339,10 @@ def test_late_actor_initialization_failure_survives_query_transport(
         ray.kill(coordinator)
 
 
-@pytest.mark.parametrize("kind", ["unknown", "unavailable", "terminal_cleanup"])
+@pytest.mark.parametrize("kind", ["unknown", "unavailable", "terminal_cleanup", "nested_cleanup"])
 def test_copy_and_terminal_cleanup_diagnostics_survive_real_ray(diagnostic_query_runtime, kind):
     import ray
+    from ray import cloudpickle
 
     from vane.ai import summarize_error
 
@@ -351,6 +352,7 @@ def test_copy_and_terminal_cleanup_diagnostics_survive_real_ray(diagnostic_query
         from types import SimpleNamespace
 
         from vane.ai import DiagnosticError
+        from vane.execution._subprocess_error import capture_cleanup
         from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
         from vane.runners.ray.driver import RayQueryDriverActor, _QueryCleanupDiagnostic
 
@@ -359,7 +361,10 @@ def test_copy_and_terminal_cleanup_diagnostics_survive_real_ray(diagnostic_query
             TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
         )
         cleanup = OSError(errno.EIO, "private cleanup path")
-        if kind == "terminal_cleanup":
+        if kind == "nested_cleanup":
+            primary = capture_cleanup("worker cleanup failed", primary, cleanup)
+            cleanup = OSError(errno.ENOSPC, "private query teardown")
+        if kind in {"terminal_cleanup", "nested_cleanup"}:
 
             @ray.remote(num_cpus=0)
             def failed_cleanup():
@@ -383,10 +388,14 @@ def test_copy_and_terminal_cleanup_diagnostics_survive_real_ray(diagnostic_query
 
     with pytest.raises(ray.exceptions.RayTaskError) as caught:
         ray.get(fail.remote(), timeout=30)
-    summary = summarize_error(caught.value)
-    assert "max_model_len" in summary and "cleanup: OSError (errno=5)" in summary
-    assert "private" not in summary
-    if kind != "terminal_cleanup":
+    for error in (caught.value, cloudpickle.loads(cloudpickle.dumps(caught.value))):
+        summary = summarize_error(error)
+        assert "max_model_len" in summary and "cleanup: OSError (errno=5)" in summary
+        assert "private" not in summary
+        if kind == "nested_cleanup":
+            primary, cleanup = summary.split("; cleanup: ")
+            assert "errno=" not in primary and "errno=28" in cleanup
+    if kind in {"unknown", "unavailable"}:
         assert caught.value.cause.operation_id == "operation"
         assert caught.value.cause.safe_to_retry is False
         if kind == "unavailable":

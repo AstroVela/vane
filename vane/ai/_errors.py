@@ -52,10 +52,16 @@ _SAFE_MEMORY = re.compile(
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
+_REMOTE_RESULT_COUNTS = re.compile(
+    r"vllm actor finished without returning all submitted results: "
+    r"actor_idx=[0-9]{1,16} submitted=[0-9]{1,16} received=[0-9]{1,16}(?![0-9])"
+)
 _DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
-_SAFE_PROVIDER_DETAILS = {
+_SAFE_ERROR_DETAILS = {
     "distributed Ray UDF payload requires query_id": "RuntimeError",
     "distributed Ray UDF payload requires pre-registered resource_unit_id": "RuntimeError",
+    "vllm remote wait exceeded query deadline": "RuntimeError",
+    "vllm remote wait has no pending actor wait refs before completion": "RuntimeError",
     **{
         f"{provider} {detail}": "RuntimeError"
         for provider in ("vllm", "sglang")
@@ -144,7 +150,7 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     def canonical(expected: str) -> bool:
         return message == expected or (transported and message.startswith(expected))
 
-    for explanation, name in _SAFE_PROVIDER_DETAILS.items():
+    for explanation, name in _SAFE_ERROR_DETAILS.items():
         if error_type == name and canonical(explanation):
             return explanation
     if error_type == "TypeError":
@@ -165,6 +171,9 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     if error_type in {"OutOfMemoryError", "OutOfMemoryException", "MemoryError"}:
         return "memory allocation failed; check model and worker memory budgets"
     if error_type == "RuntimeError":
+        match = _REMOTE_RESULT_COUNTS.match(message) if transported else _REMOTE_RESULT_COUNTS.fullmatch(message)
+        if match:
+            return match[0]
         if "CUDA out of memory" in message or canonical(
             "CUDA memory allocation failed; check model and worker GPU memory budgets"
         ):
@@ -211,13 +220,12 @@ def _numeric_details(error: BaseException) -> list[str]:
     return details
 
 
-def _transported_summary(message: str) -> str:
+def _summary_parts(message: str) -> tuple[list[str], list[str]]:
     """Read complete canonical atoms, retaining cause/cleanup boundaries."""
-    if name := _SAFE_PROVIDER_DETAILS.get(message):
-        return f"{name}: {message}"
-    parts = []
-    position, cleanup_count = 0, 0
-    separator = ""
+    if name := _SAFE_ERROR_DETAILS.get(message):
+        return [f"{name}: {message}"], []
+    chains: list[list[str]] = [[]]
+    position = 0
     for _ in range(64):
         match = _TYPE.match(message, position)
         if match is None:
@@ -237,19 +245,25 @@ def _transported_summary(message: str) -> str:
             if detail and tail.startswith(detail):
                 rendered += ": " + detail
                 position += 2 + len(detail)
-        parts.append(separator + rendered)
+        chains[-1].append(rendered)
         if message.startswith(" <- ", position):
             separator = " <- "
-        elif not cleanup_count and message.startswith("; cleanup: ", position):
+        elif len(chains) < 4 and message.startswith("; cleanup: ", position):
             separator = "; cleanup: "
-            cleanup_count = 1
-        elif 0 < cleanup_count < 3 and message.startswith("; ", position):
+            chains.append([])
+        elif 1 < len(chains) < 4 and message.startswith("; ", position):
             separator = "; "
-            cleanup_count += 1
+            chains.append([])
         else:
             break
         position += len(separator)
-    return "".join(parts) or "ProviderError"
+    return chains[0] or ["ProviderError"], [" <- ".join(chain) for chain in chains[1:] if chain]
+
+
+def _transported_summary(message: str) -> str:
+    primary, cleanup = _summary_parts(message)
+    result = " <- ".join(primary)
+    return result + "; cleanup: " + "; ".join(cleanup) if cleanup else result
 
 
 def _is_exception(error: BaseException, module_name: str, *names: str) -> bool:
@@ -415,19 +429,38 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
         raise ValueError("max_chars must be between 64 and 4096")
     summaries: list[str] = []
     cleanup: list[str] = []
-    for current in _exception_chain(error):
-        summary = _summary(current)
-        if summary not in summaries:
-            summaries.append(summary)
+
+    def add_cleanup(summary: str) -> None:
+        if summary not in cleanup and len(cleanup) < 3:
+            cleanup.append(summary)
+
+    # Merge root-to-wrapper so cleanup already captured by a worker stays
+    # separate from the cause chain and precedes any later query teardown.
+    # Rewrapping must produce one canonical cleanup section, not nest another
+    # section inside an exception atom or attribute later errno to the root.
+    for current in reversed(list(_exception_chain(error))):
+        primary, captured_cleanup = _summary_parts(_summary(current))
+        for summary in primary:
+            if summary not in summaries:
+                summaries.append(summary)
+        for summary in captured_cleanup:
+            add_cleanup(summary)
         failures = _attributes(current).get("cleanup_errors", ())
         if type(failures) in (tuple, list):
             for failure in failures[:3]:
                 if isinstance(failure, BaseException) and len(cleanup) < 3:
                     # At most three cleanup chains of sixteen nodes; do not
                     # recurse into cleanup_errors (which can contain cycles).
-                    parts = list(dict.fromkeys(_summary(cause) for cause in _exception_chain(failure)))
-                    cleanup.append(" <- ".join(reversed(parts)))
-    result = " <- ".join(reversed(summaries))
+                    parts: list[str] = []
+                    nested_cleanup: list[str] = []
+                    for cause in reversed(list(_exception_chain(failure))):
+                        primary, captured_cleanup = _summary_parts(_summary(cause))
+                        parts.extend(part for part in primary if part not in parts)
+                        nested_cleanup.extend(captured_cleanup)
+                    add_cleanup(" <- ".join(parts))
+                    for summary in nested_cleanup:
+                        add_cleanup(summary)
+    result = " <- ".join(summaries)
     if cleanup:
         suffix = "; cleanup: " + "; ".join(cleanup)
         suffix = suffix[: max_chars // 2]

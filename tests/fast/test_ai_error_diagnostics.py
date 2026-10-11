@@ -251,6 +251,67 @@ def test_cleanup_chain_is_bounded_and_does_not_trust_ray_error_bodies():
     assert "RuntimeError" in message and "private" not in message and len(message) <= 64
 
 
+@pytest.mark.parametrize("runner", ["local", "ray"])
+def test_worker_and_query_cleanup_diagnostics_merge_across_transports(runner):
+    from vane.execution._subprocess_error import capture_cleanup
+    from vane.runners.local.runner import _local_write_diagnostic
+    from vane.runners.ray.driver import _capture_datasink_diagnostic
+
+    diagnostic = capture_cleanup(
+        "worker execution and close failed",
+        TypeError("got an unexpected keyword argument 'max_model_len'"),
+        OSError(errno.EIO, "private worker cleanup"),
+    )
+    expected_errno = [errno.EIO]
+    for number in (errno.ENOSPC, errno.EACCES):
+        teardown = OSError(number, "private query teardown")
+        if runner == "local":
+            diagnostic = _local_write_diagnostic(diagnostic, [teardown])
+        else:
+            result = {"outcome_unknown": True, "outcome_diagnostic": diagnostic}
+            _capture_datasink_diagnostic(result, cleanup_error=teardown)
+            diagnostic = result["outcome_diagnostic"]
+        expected_errno.append(number)
+        for _ in range(3):
+            serialized = pickle.dumps(diagnostic)
+            assert b"private" not in serialized
+            diagnostic = pickle.loads(serialized)
+            for candidate in (diagnostic, native_error(diagnostic)):
+                summary = summarize_error(candidate)
+                primary, cleanup = summary.split("; cleanup: ")
+                assert "max_model_len" in primary and "errno=" not in primary
+                for value in expected_errno:
+                    assert cleanup.count(f"errno={value})") == 1
+                assert "private" not in summary and len(summary) <= 512
+            diagnostic = DiagnosticError("outer transport", native_error(diagnostic))
+
+
+def test_cleanup_snapshot_merging_is_bounded_and_keeps_one_section():
+    from vane.execution._subprocess_error import capture_cleanup
+
+    diagnostic = TypeError("got an unexpected keyword argument 'max_model_len'")
+    for number in range(100, 120):
+        diagnostic = capture_cleanup("cleanup", diagnostic, OSError(number, "private path"))
+        diagnostic = pickle.loads(pickle.dumps(diagnostic))
+    summary = summarize_error(diagnostic)
+    primary, cleanup = summary.split("; cleanup: ")
+    assert "max_model_len" in primary and "errno=" not in primary
+    assert cleanup == "OSError (errno=100); OSError (errno=101); OSError (errno=102)"
+    assert len(summary) <= 512 and "private" not in summary
+
+
+def test_cleanup_snapshot_does_not_trust_nested_raw_error_bodies():
+    from vane.execution._subprocess_error import capture_cleanup
+
+    raw = RuntimeError("RuntimeError; cleanup: private_fixture_token (errno=28)")
+    diagnostic = capture_cleanup("worker cleanup", ConnectionError("private source"), raw)
+    diagnostic = capture_cleanup("query cleanup", diagnostic, OSError(errno.EIO, "private query path"))
+    for candidate in (diagnostic, native_error(pickle.loads(pickle.dumps(diagnostic)))):
+        summary = summarize_error(candidate)
+        assert "ConnectionError" in summary and "errno=5" in summary
+        assert "private" not in summary and "errno=28" not in summary
+
+
 def test_cleanup_exception_does_not_replace_initialization_cause():
     try:
         try:
@@ -650,6 +711,23 @@ def test_known_safe_provider_explanations_do_not_admit_arbitrary_suffixes():
     for message in ("sglang returned no outputs private_token", "private_token returned no outputs"):
         assert "returned no outputs" not in summarize_error(RuntimeError(message))
     assert "private_token" not in summarize_error(_SafeProviderError("sglang returned no outputs private_token"))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "vllm remote wait exceeded query deadline",
+        "vllm remote wait has no pending actor wait refs before completion",
+        "vllm actor finished without returning all submitted results: actor_idx=0 submitted=2 received=1",
+    ],
+)
+def test_framework_diagnostics_keep_only_complete_safe_explanations(message):
+    diagnostic = DiagnosticError("native executor", RuntimeError(message))
+    for candidate in (diagnostic, pickle.loads(pickle.dumps(diagnostic)), native_error(diagnostic)):
+        assert message in summarize_error(candidate)
+    for forged in ("private " + message, message + " private", message.replace("actor_idx=0", "actor_idx=private")):
+        if forged != message:
+            assert summarize_error(RuntimeError(forged)) == "RuntimeError"
 
 
 def test_ray_metadata_requires_a_real_diagnostic_exception():
