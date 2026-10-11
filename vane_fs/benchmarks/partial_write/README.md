@@ -6,6 +6,11 @@ Production C++ sources, the shared SQLite SDK and the installed component retain
 their baseline hashes. The complete implementation and tests are preserved in
 [partial-write.patch](partial-write.patch).
 
+The [acceptance follow-up](acceptance/README.md) separates plain native and FUSE
+software costs on tmpfs from a new ext4 comparison with fixed buffer alignment.
+It also records admission mutex waits separately from SQLite checkpoint calls.
+Those measurement windows remain separate from the results below.
+
 ## Root cause and candidate
 
 `WriteBytes` checks whether an entire replacement range is vacant. If a partial
