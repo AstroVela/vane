@@ -30,6 +30,7 @@ class JevOptions(TypedDict, total=False):
 
 
 class MultimodalEmbedOptions(TypedDict, total=False):
+    max_concurrency_per_actor: int
     instruction: str
     max_frames: int
     max_input_bytes: int
@@ -103,9 +104,8 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
-    # Remote embedding request scheduling (OpenAI and Google).
+    # Remote embedding request batching (OpenAI and Google).
     request_batch_size: int
-    max_concurrency_per_actor: int
 
     # Retrieval encoding and explicit long-input handling.
     input_type: Literal["query", "document"]
@@ -197,6 +197,7 @@ _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "ch
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
 _NATIVE_EMBED_OPTIONS = frozenset(
     {
+        "max_concurrency_per_actor",
         "instruction",
         "max_frames",
         "max_input_bytes",
