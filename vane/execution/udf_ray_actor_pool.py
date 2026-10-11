@@ -134,6 +134,11 @@ def _with_actor_thread_env(
 
 
 class UDFActorPoolBase:
+    # Set by the query driver when it registers ownership of the pool.
+    _vane_init_deadline: float
+    _vane_init_timeout: float
+    _vane_init_timed_out: bool
+
     def __init__(
         self,
         payload: dict[str, Any],
@@ -180,6 +185,11 @@ class UDFActorPoolBase:
 
         self.actors: list[Any] = []
         self._init_refs: list[Any] = []
+        self._confirmed_ready: set[int] = set()
+        self._vane_retired = False
+        self._vane_location_nonce = ""
+        self._vane_readiness_futures: list[Any] = []
+        self._vane_init_errors: dict[int, BaseException] = {}
         try:
             for actor_index in range(concurrency):
                 self.actors.append(Actor.options(**actor_options[actor_index]).remote())
@@ -197,11 +207,6 @@ class UDFActorPoolBase:
                     creation_error=creation_error,
                 ) from creation_error
             raise
-        self._confirmed_ready: set[int] = set()
-        self._vane_retired = False
-        self._vane_location_nonce = ""
-        self._vane_readiness_futures: list[Any] = []
-        self._vane_init_errors: dict[int, BaseException] = {}
 
     @staticmethod
     def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
@@ -274,6 +279,10 @@ class UDFActorPoolBase:
         if not kill and actors:
             close_refs: list[tuple[int, Any]] = []
             for actor_index, actor in enumerate(actors):
+                # An actor still waiting for capacity cannot run a close RPC.
+                # It has never been eligible for UDF work; terminate it directly.
+                if actor_index not in self._confirmed_ready:
+                    continue
                 try:
                     close_refs.append((actor_index, actor.close_executor.remote()))
                 except BaseException as exc:
@@ -304,8 +313,11 @@ class UDFActorPoolBase:
 
         kill_errors: list[str] = []
         remaining_actors: list[Any] = []
+        remaining_ready: set[int] = set()
         for actor_index, actor in enumerate(actors):
             if actor_index in close_failed_indices:
+                if actor_index in self._confirmed_ready:
+                    remaining_ready.add(len(remaining_actors))
                 remaining_actors.append(actor)
                 continue
             try:
@@ -315,8 +327,11 @@ class UDFActorPoolBase:
                     kill_errors,
                     _actor_cleanup_failure("kill", actor_index, exc),
                 )
+                if actor_index in self._confirmed_ready:
+                    remaining_ready.add(len(remaining_actors))
                 remaining_actors.append(actor)
         self.actors = remaining_actors
+        self._confirmed_ready = remaining_ready
         if not remaining_actors:
             self._init_refs = []
             self._payload_ref = None
@@ -366,8 +381,12 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
     return value
 
 
-def _actor_init_timeout_s() -> float | None:
-    return configured_ray_get_timeout_s(_positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S"))
+def _actor_init_timeout_s() -> float:
+    # Ray may wait indefinitely for capacity. Bound first readiness even when
+    # neither a query deadline nor an ObjectRef timeout was configured.
+    timeout = configured_ray_get_timeout_s(_positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S", 300.0))
+    assert timeout is not None
+    return timeout
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -412,10 +431,7 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
     timeout_s: float | None = None
     try:
         timeout_s = _actor_init_timeout_s()
-        if timeout_s is None:
-            resolved_node_ids = resolve_object_refs_blocking(refs)
-        else:
-            resolved_node_ids = resolve_object_refs_blocking(refs, timeout=timeout_s)
+        resolved_node_ids = resolve_object_refs_blocking(refs, timeout=timeout_s)
         node_ids = [str(node_id or "").strip() for node_id in resolved_node_ids]
         if len(node_ids) != len(actors) or any(not node_id for node_id in node_ids):
             raise RuntimeError("UDF actor initialization did not return one Ray node_id per actor")

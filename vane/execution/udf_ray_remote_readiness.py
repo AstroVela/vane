@@ -148,20 +148,10 @@ class RemoteUDFActorReadinessMixin:
                 continue
             self._mark_actor_ready(actor_idx)
 
-    def _wait_for_ready_actor(self) -> None:
-        self._refresh_actor_readiness()
-        if self._ready_actor_indices:
-            return
-
-        err_preview = ", ".join(f"{idx}:{msg}" for idx, msg in sorted(self._actor_init_errors.items())[:3])
-        if err_preview:
-            err_preview = f" init_errors=[{err_preview}]"
-        raise RuntimeError(
-            "udf ray actor pool has no ready actors: "
-            f"total={len(self.actors)} ready=0 pending_ready={len(self._pending_ready_refs)}.{err_preview}"
-        )
-
     def _pick_ready_actor_on_node(self, node_id: str, actor_index: int) -> tuple[int, Any]:
+        # Admission identifies the initialized actor. The local ready set can
+        # still be empty until its notification runs, so inspect that actor's
+        # init ref below before deciding whether the lease can be consumed.
         self._refresh_actor_readiness()
         node_key = str(node_id).strip()
         if not node_key:
@@ -173,16 +163,15 @@ class RemoteUDFActorReadinessMixin:
             raise RuntimeError(f"UDF actor lease has invalid actor_index={actor_idx}")
         if actor_idx not in self._ready_actor_set and actor_idx < len(self._actors_obj._init_refs):
             # The driver only publishes a slot after this init ref resolves.
-            # Its callback and this executor's callback run independently, so
-            # close the small notification race before consuming the lease.
+            # Ray delivers the result independently to each process, so even
+            # the executor's local Future may still be pending after admission.
+            # Resolve the leased actor's result through the deadline-aware,
+            # interruptible bridge instead of checking its notification state.
             init_ref = self._actors_obj._init_refs[actor_idx]
-            future_method = getattr(init_ref, "future", None)
-            future = future_method() if callable(future_method) else None
-            if future is not None and future.done():
-                resolved_node_id = str(self._resolve_object_ref(init_ref) or "").strip()
-                self._actor_node_ids[actor_idx] = resolved_node_id
-                self._actors_obj.actor_node_ids[actor_idx] = resolved_node_id
-                self._mark_actor_ready(actor_idx)
+            resolved_node_id = str(self._resolve_object_ref(init_ref) or "").strip()
+            self._actor_node_ids[actor_idx] = resolved_node_id
+            self._actors_obj.actor_node_ids[actor_idx] = resolved_node_id
+            self._mark_actor_ready(actor_idx)
         if self._actor_node_ids[actor_idx] != node_key:
             # The signed query lease is newer than this executor's immutable
             # activation snapshot when Ray has reconstructed the actor on

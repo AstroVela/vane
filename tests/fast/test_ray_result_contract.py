@@ -361,11 +361,13 @@ def _make_local_query_driver_actor():
     runner._leased_result_partition_refs = {}
     runner._result_partition_ref_counters = {}
     runner._query_resource_graphs = {}
+    runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
     runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._udf_actor_timeout_cleanup_pending = set()
     runner._active_udf_actor_by_unit = {}
     runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}
@@ -637,6 +639,7 @@ def test_maintenance_loops_continue_after_pre311_asyncio_timeout(
             runner._query_resource_maintenance_error = ""
             runner._query_resource_maintenance_failures = 0
             runner._maintain_query_resources_once = lambda: maintenance_calls.append(None)
+            runner._expire_pending_udf_actor_pools = lambda **_kwargs: None
             maintenance_loop = runner_cls._query_resource_maintenance_loop
 
         wait_calls = 0
@@ -7753,8 +7756,10 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
 
 
 @pytest.mark.parametrize("during_poll", [False, True])
-def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(during_poll):
+@pytest.mark.parametrize("failure", ["provider", "timeout"])
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(during_poll, failure):
     from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
@@ -7763,10 +7768,13 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    terminal_error = DiagnosticError(
-        "Ray actor UDF pool initialization failed",
-        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
-    )
+    if failure == "provider":
+        terminal_error = DiagnosticError(
+            "Ray actor UDF pool initialization failed",
+            TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+        )
+    else:
+        terminal_error = TimeoutError("Ray actor UDF pool initialization timed out: CPU=1, GPU=1 per actor")
     if during_poll:
 
         def failed_poll():
@@ -7785,22 +7793,28 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     runner._teardown_plan_resources = _teardown
 
-    with pytest.raises(DiagnosticError, match="Ray actor UDF pool initialization failed") as caught:
-        asyncio.run(
-            cls.get_next_partition(
-                runner,
-                _TEST_RUNTIME_OWNER_ID,
-                _TEST_SESSION_ID,
-                plan_id,
+    try:
+        with pytest.raises(type(terminal_error), match="Ray actor UDF pool initialization") as caught:
+            asyncio.run(
+                cls.get_next_partition(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    plan_id,
+                )
             )
-        )
+    finally:
+        release_query_resource_manager(query_id, reason="test_complete")
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
-    assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(caught.value)))
-    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
-
-    release_query_resource_manager(query_id, reason="test_complete")
+    # asyncio bridges concurrent Future timeouts into a new TimeoutError.
+    assert type(caught.value) is type(terminal_error)
+    restored = pickle.loads(pickle.dumps(caught.value))
+    if failure == "provider":
+        assert "max_model_len" in summarize_error(restored)
+    else:
+        assert str(restored) == str(terminal_error)
 
 
 def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
@@ -13246,3 +13260,76 @@ def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypat
         ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
         ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
     ]
+
+
+def test_expired_client_kills_udf_actor_before_joining_active_operation():
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-udf-startup"
+    _bind_test_plan_session(runner, plan_id)
+    actor_killed = threading.Event()
+    operation_started = threading.Event()
+    session = runner._sessions[_TEST_SESSION_ID]
+    events = []
+
+    class Pool:
+        actors = [object()]
+        _vane_retired = False
+
+        def shutdown(self, *, kill):
+            assert kill is True
+            assert session.connection.closed is False
+            events.append("kill")
+            self.actors = []
+            actor_killed.set()
+
+    pool = Pool()
+    runner._active_udf_actors = [pool]
+    runner._active_udf_actors_by_plan = {plan_id: [pool]}
+    runner._active_udf_actor_by_unit = {plan_id: {"actor": pool}}
+
+    def cleanup(actual_plan_id):
+        assert actual_plan_id == plan_id
+        assert session.active_operations == 0
+        events.append("teardown")
+        session.plan_ids.discard(plan_id)
+        runner._plan_session_ids.pop(plan_id)
+
+    runner._cleanup_finished_plan = cleanup
+
+    def native_operation():
+        operation_started.set()
+        assert actor_killed.wait(timeout=5)
+        assert session.connection.closed is False
+        events.append("operation-exit")
+
+    async def expire():
+        async def operation():
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+            try:
+                await driver._run_in_executor_with_owned_side_effects(
+                    runner._get_driver_native_executor(),
+                    native_operation,
+                )
+            finally:
+                cls._end_session_operation(session)
+
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(operation_started.wait, 2)
+        runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1
+        assert cls._mark_expired_client_leases(runner, now=1) == (_TEST_RUNTIME_OWNER_ID,)
+        assert (
+            await asyncio.wait_for(
+                cls._detach_client_owner(runner, _TEST_RUNTIME_OWNER_ID, expired=True),
+                timeout=5,
+            )
+            is False
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(expire())
+    assert events == ["kill", "operation-exit", "teardown"]
+    assert session.connection.closed is True
+    assert runner._active_udf_actors == []
