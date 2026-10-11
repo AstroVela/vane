@@ -88,10 +88,12 @@ it does not establish an overall production performance improvement.
 
 ## Physical-storage result
 
-The host has one physical disk, with ext4 on `/dev/sda2`, and approximately
-95 GiB free at the start. No separate physical device was available for an
-independent storage comparison. The tmpfs and ext4 windows use the same libraries,
-SDK and application workload, but their measurements are kept separate.
+The host owner confirms that this is a dedicated machine. It has one physical
+disk, with ext4 on `/dev/sda2`, and approximately 95 GiB free at the start.
+No separate physical device was available for an independent storage comparison.
+The tmpfs and ext4 windows use the same libraries, SDK and application workload,
+but their measurements are kept separate. Neither the dedicated deployment nor
+the aggregate host counters identify the cause of a particular storage stall.
 
 Plain ext4 FUSE medians, including every sample:
 
@@ -140,10 +142,12 @@ both variants: 32 callbacks of 1,048,528 bytes at block-aligned offsets,
 confounder in this comparison.
 
 One aged candidate stream waits 6.273 s acquiring the admission mutex. The wait
-spans two worker PASSIVE checkpoints; during the second, WAL fsync takes 3.670 s
-and database fsync takes 1.735 s. This directly measures waiting that would be
-missed by timing only the subsequent SQLite RESTART call. Other baseline and
-candidate phases wait in WAL synchronization, including baseline overwrite
+spans two worker PASSIVE checkpoints: the worker reacquires the mutex for the
+second checkpoint before the waiting writer obtains it. During that second
+checkpoint, WAL fsync takes 3.670 s and database fsync takes 1.735 s.
+This directly measures waiting that would be missed by timing only the subsequent
+SQLite RESTART call. Other baseline and candidate phases wait in WAL
+synchronization, including baseline overwrite
 WAL fsync calls of 1.315 s. The separate diagnostic does not reproduce every
 plain-window slowdown, so it does not causally explain each failed sample.
 Nested admission, checkpoint and sync durations overlap and must not be added.
@@ -154,9 +158,22 @@ barriers exceed one second; the maximum is 2.852 s before the FUSE window and
 of stall in the same session. That does not identify its kernel/device cause,
 attribute it to another workload, or prove that the candidate cannot regress.
 
+Re-examining the preserved whole-device counters during these slow calls shows
+3.630 s of device activity and 64.859 MiB of completed writes during that 3.670 s
+WAL fsync. The 3.470 s ordinary-file database fsync spans 3.081 s of device
+activity and 64.703 MiB of completed writes. Low aggregate CPU use therefore does
+not establish an idle storage device during synchronization. These are
+[whole-device counters](https://github.com/torvalds/linux/blob/v6.11/Documentation/block/stat.rst),
+not process-attributed I/O; their deltas do not distinguish our requests from
+other requests or isolate filesystem, queueing and device-internal delays.
+
 **Decision:** preserve the candidate and its verified software benefit without
-enabling it. The fixed acceptance gates fail. Further storage acceptance needs
-an independent physical device or machine; this round stops without another
+enabling it. The fixed acceptance gates fail. Further investigation can proceed
+on this dedicated host, separating checkpoint admission/scheduling from storage
+synchronization. Writer priority is a hypothesis to evaluate: it could move the
+remaining checkpoint work onto the writer rather than remove its I/O cost.
+A different physical device or machine is an optional cross-check, not a
+prerequisite for continuing evaluation. This round stops without another
 checkpoint-parameter trial or selectively repeating unfavorable samples.
 
 ## Validation
