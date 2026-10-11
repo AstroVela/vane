@@ -275,7 +275,7 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 内部入口 compile_fragment_graph 接收连接、SQL、query_id 和不可变 FragmentCompileOptions。选项只有分区数及可选的 HASH 输出列位置，不包含执行策略、worker 地址或 exchange store。连接锁覆盖读取绑定与优化设置的过程；编译器直接调用 Parser、Planner/Binder、Optimizer 和 PhysicalPlanGenerator，不创建 executor 或提交 task。需要准备提交时使用 prepare_ray_query，它在同一连接锁内完成快照与构图。
 
-[native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 支持单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter、projection，以及 P4 的聚合、等值 hash join、ORDER BY/TopN 和全局 LIMIT。标量与聚合函数先按已验收的内置集合检查，用户函数在常量折叠前拒绝；相关子查询、窗口及媒体扩展类型仍拒绝。普通本地查询继续由原生查询入口处理，不调用该编译器。
+[native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 支持单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter、projection，以及聚合、等值 hash join、ORDER BY/TopN、全局 LIMIT、子查询和非递归物化 CTE。确定性内置标量函数按来源与稳定性检查，聚合仍按支持集合检查；用户函数在常量折叠前拒绝。共享状态的规划边界见下文；窗口及媒体扩展类型仍拒绝。普通本地查询继续由原生查询入口处理，不调用该编译器。
 
 解析树检查之后，编译器通过当前 Planner 的 catalog lookup callback 校验实际解析到的函数和宏必须为内置项。`current_user` 等 SQL value function 在解析时可能是列引用，绑定时才转为函数；这一检查发生在宏展开、表函数参数求值之前，并由子 Binder 继承，覆盖限定名、嵌套表达式和表子查询。内置宏间接解析到的用户函数同样被拒绝，不能依赖最终的只读属性检查或事务回滚来撤销 `nextval()` 等副作用。普通列和别名按 Binder 的实际解析结果处理，允许与被覆盖的函数同名；检查只属于这次规划，不改变后续原生查询行为。
 
@@ -872,10 +872,21 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | BROADCAST | P4 自动选择小 build 广播；消费者独立关闭 | 基于实测调整代价模型 |
 | LIMIT | P4 全局 LIMIT/OFFSET，支持提前关闭 | 分布式 LIMIT pushdown 优化 |
 | ORDER BY、TopN | P4 单根全局排序及 partial/final TopN | 排序性能和 spill 基准 |
-| window、ASOF、MARK、delim 等复杂算子 | 明确拒绝 | 按语义和分布式计划逐项扩展 |
+| 标量子查询、EXISTS、IN/NOT IN、ANY/ALL | 原生 MARK/SINGLE 与 delimiter 执行语义 | 优化带全局摘要的分布式 MARK |
+| 非递归物化 CTE | 工作表和全部消费者保留在同一原生执行单元 | 独立的跨 worker 共享物化设计 |
+| CROSS_PRODUCT、nested-loop join | 收集输入后执行完整连接 | 按代价与连接语义扩展分布式规则 |
+| window、ASOF 等复杂算子 | 明确拒绝 | 按语义和分布式计划逐项扩展 |
 | 递归 CTE 与迭代反馈 | 明确拒绝 | 需要独立的反馈执行设计 |
 | Python、AI 与 GPU UDF | 明确拒绝 | 按 backend 验证资源、取消、类型及 FTE 重放能力 |
 | COPY、DataSink、DML 与扩展写入 | 明确拒绝 | 独立定义写入提交和副作用语义 |
+
+### 子查询与共享状态的原生执行边界
+
+编译器先遍历完整 SQL，包括表达式中的子查询、表子查询及 CTE 定义，再进入绑定。确定性内置 scalar function 按 catalog 来源和稳定性检查，不再维护函数名白名单。用户宏、UDF、带副作用及仅查询内稳定的函数继续拒绝；Binder 生成的标量子查询多行检查保留原生异常。所有文件引用在任何快照复制前完成展开，优化前的数据源依赖仍参与 worker 快照校验。
+
+普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter 及 MARK/SINGLE 连接包含共享工作表或全局 NULL/基数语义，作为一个单分区原生子树序列化。子树内可独立执行的输入继续递归规划，经显式 GATHER 输入端口送入；文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+
+这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。没有切换回 local 或旧 FTE manager 的路径。第一版以完整组语义为先，相关子查询、CTE 消费及 MARK/SINGLE 的执行单元只有一个分区，可能成为性能瓶颈。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。
 
 P4 使用 `vane.analytical-types:4`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 

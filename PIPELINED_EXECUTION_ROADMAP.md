@@ -2,7 +2,22 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-## 当前增量：SF10 执行吞吐
+## 当前增量：TPC-H SQL 覆盖
+
+目标是让相同 Parquet SQL 在 local、Ray pipelined、Ray FTE 执行全部 22 条查询并核对完整结果，不引入旧 runner fallback。
+
+- [x] 将函数名白名单改为确定性内置 scalar function 检查；允许优化器处理逗号连接和子查询。
+- [x] 为 CTE、delimiter、MARK/SINGLE 保留完整原生状态边界，独立输入继续走 fragment/exchange。
+- [x] 递归校验子查询中的函数及数据源，保留优化依赖；传递标量子查询多行设置。
+- [x] 增加 NULL/空输入、相关查询、多行错误、CTE 生命周期和两种 Ray 模式的回归用例。
+- [x] 连续两轮静态审查后统一构建，执行相关回归。
+- [ ] 实际执行 SF10 全部 22 条并核对 local 结果、记录时序及资源清理。
+
+共享状态单元暂以单分区执行，性能范围见[子查询与共享状态的原生执行边界](PIPELINED_EXECUTION_DESIGN.md#子查询与共享状态的原生执行边界)。未通过实际执行前不计为已验收。
+
+2026-10-12：相关非 Ray 1,093 项、真实 Ray 92 项通过，23 项因缺少可选依赖 fsspec 跳过。构建后的回归补齐了空外层输入消除 delimiter 后的相关 hash join；原有聚合拒绝消息已复测。未运行全量 fast/release。SF10 全部 22 条已通过原生编译和 round-trip，完整分布式结果验收继续进行。
+
+## 已完成增量：SF10 执行吞吐
 
 针对单文件 SF10 Q1/Q6 暴露的明细交换、小帧、重复全文哈希和空闲 worker：
 

@@ -30,6 +30,9 @@ struct PlanNode {
 	string native_operator;
 	string source_id;
 	vector<PlanNode> children;
+	// A native subtree with shared CTE/delimiter state. Its children declare
+	// external input ports, all bound within this one serialization scope.
+	bool scoped = false;
 	void Serialize(Serializer &serializer) const;
 	static PlanNode Deserialize(Deserializer &deserializer);
 };
@@ -80,7 +83,8 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
                       const vector<idx_t> &hash_columns, const string &snapshot_directory = "", idx_t source_budget = 0,
                       idx_t *source_bytes = nullptr);
 
-using InputFactory = std::function<PhysicalOperator &(PhysicalPlan &, const string &, const vector<LogicalType> &)>;
+using InputFactory =
+    std::function<unique_ptr<PhysicalOperator>(PhysicalPlan &, const string &, const vector<LogicalType> &)>;
 using SourceAssignments = unordered_map<string, vector<string>>;
 
 // All input ports and source assignments must be bound explicitly. Loading is

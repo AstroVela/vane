@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_inputs.hpp"
 
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/render_tree.hpp"
@@ -109,25 +110,29 @@ struct CTESerializationState : public SerializationData::CustomData {
 		return "cte_state";
 	}
 
-	void Reset() {
-		working_tables.clear();
-		cte_ops.clear();
-	}
-
 	unordered_map<idx_t, shared_ptr<ColumnDataCollection>> working_tables;
 	unordered_map<idx_t, PhysicalCTE *> cte_ops;
 };
 
-static CTESerializationState &GetOrCreateCTEState(SerializationData &data) {
-	auto state_ptr = data.TryGetCustom<CTESerializationState>();
-	if (state_ptr) {
-		return *state_ptr;
+class CTEDeserializationGuard {
+public:
+	explicit CTEDeserializationGuard(SerializationData &data_p) : data(data_p) {
+		if (!data.TryGetCustom<CTESerializationState>()) {
+			data.SetCustom(state);
+			active = true;
+		}
 	}
-	static thread_local CTESerializationState state;
-	state.Reset();
-	data.SetCustom(state);
-	return state;
-}
+	~CTEDeserializationGuard() {
+		if (active) {
+			data.UnsetCustom<CTESerializationState>();
+		}
+	}
+
+private:
+	SerializationData &data;
+	CTESerializationState state;
+	bool active = false;
+};
 
 static void GatherDelimScans(PhysicalOperator &op, vector<const_reference<PhysicalOperator>> &delim_scans,
                              optional_idx delim_idx) {
@@ -137,8 +142,8 @@ static void GatherDelimScans(PhysicalOperator &op, vector<const_reference<Physic
 			delim_scans.push_back(op);
 		}
 	}
-	for (auto &child : op.children) {
-		GatherDelimScans(child, delim_scans, delim_idx);
+	for (auto &child : op.GetChildren()) {
+		GatherDelimScans(const_cast<PhysicalOperator &>(child.get()), delim_scans, delim_idx);
 	}
 }
 
@@ -747,6 +752,17 @@ void PhysicalOperator::SerializeNode(Serializer &serializer) const {
 void PhysicalOperator::SerializeInternal(Serializer &serializer, bool include_children) const {
 	auto &data = serializer.GetSerializationData();
 	DynamicFilterSerializationGuard guard(data);
+	if (auto inputs = data.TryGetCustom<PhysicalPlanInputBindings>()) {
+		auto input = inputs->names.find(this);
+		if (input != inputs->names.end()) {
+			serializer.WriteProperty(100, "type", PhysicalOperatorType::EXTENSION);
+			serializer.WriteProperty(101, "types", types);
+			serializer.WriteProperty(102, "estimated_cardinality", estimated_cardinality);
+			serializer.WriteProperty(103, "input_port", input->second);
+			serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
+			return;
+		}
+	}
 
 	// Write common fields
 	serializer.WriteProperty(100, "type", type);
@@ -769,6 +785,7 @@ void PhysicalOperator::SerializeOperatorData(Serializer &serializer) const {
 unique_ptr<PhysicalOperator> PhysicalOperator::Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan) {
 	auto &data = deserializer.GetSerializationData();
 	DynamicFilterSerializationGuard guard(data);
+	CTEDeserializationGuard cte_guard(data);
 	PhysicalPlanDeserializationState physical_inputs(data);
 
 	// Read common fields
@@ -782,6 +799,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::Deserialize(Deserializer &deseria
 
 	// Read and deserialize children
 	deserializer.ReadList(198, "children", [&](Deserializer::List &list, idx_t /*i*/) {
+		if (op_type == PhysicalOperatorType::EXTENSION) {
+			throw SerializationException("external physical input cannot have children");
+		}
 		list.ReadObject([&](Deserializer &child_deserializer) {
 			auto child = Deserialize(child_deserializer, physical_plan);
 			PhysicalOperator *child_ptr = child.get();
@@ -799,6 +819,21 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
                                                                        vector<LogicalType> types,
                                                                        idx_t estimated_cardinality) {
 	switch (op_type) {
+	case PhysicalOperatorType::EXTENSION: {
+		auto inputs = deserializer.GetSerializationData().TryGetCustom<PhysicalPlanInputBindings>();
+		if (!inputs || !inputs->bind) {
+			throw SerializationException("external physical input requires an explicit binding");
+		}
+		auto port = deserializer.ReadProperty<string>(103, "input_port");
+		if (port.empty()) {
+			throw SerializationException("external physical input has an empty port");
+		}
+		auto result = inputs->bind(physical_plan, port, types);
+		if (!result || result->types != types || !result->children.empty()) {
+			throw SerializationException("external physical input binding has invalid schema or children");
+		}
+		return result;
+	}
 	case PhysicalOperatorType::PROJECTION: {
 		// Read projection-specific field: select_list
 		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
@@ -1003,7 +1038,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto working_table = make_shared_ptr<ColumnDataCollection>(context, working_table_types);
 		cte->working_table = working_table;
 
-		auto &state = GetOrCreateCTEState(deserializer.GetSerializationData());
+		auto &state = deserializer.GetSerializationData().GetCustom<CTESerializationState>();
 		state.working_tables[table_index] = working_table;
 		state.cte_ops[table_index] = cte.get();
 		return unique_ptr<PhysicalOperator>(std::move(cte));
@@ -1031,7 +1066,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		scan->source_node_id = deserializer.ReadPropertyWithDefault<optional_idx>(107, "source_node_id");
 		if (op_type == PhysicalOperatorType::CTE_SCAN || op_type == PhysicalOperatorType::RECURSIVE_CTE_SCAN ||
 		    op_type == PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN) {
-			auto &state = GetOrCreateCTEState(deserializer.GetSerializationData());
+			auto &state = deserializer.GetSerializationData().GetCustom<CTESerializationState>();
 			auto cte_it = state.cte_ops.find(cte_index);
 			if (cte_it != state.cte_ops.end()) {
 				cte_it->second->cte_scans.push_back(*scan);

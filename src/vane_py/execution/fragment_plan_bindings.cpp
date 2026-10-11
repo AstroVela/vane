@@ -200,8 +200,8 @@ py::dict InspectFragment(DuckDBPyConnection &connection, const string &payload) 
 		}
 		auto plan = Load(
 		    context, fragment,
-		    [](PhysicalPlan &owner, const string &, const vector<LogicalType> &types) -> PhysicalOperator & {
-			    return owner.Make<UnboundFragmentInput>(types);
+		    [](PhysicalPlan &owner, const string &, const vector<LogicalType> &types) -> unique_ptr<PhysicalOperator> {
+			    return make_uniq<UnboundFragmentInput>(owner, types);
 		    },
 		    assignments);
 	}
@@ -266,15 +266,15 @@ py::list ExecuteFragmentForTest(DuckDBPyConnection &connection, const string &pa
 	std::set<string> used_inputs;
 	auto plan = Load(
 	    context, fragment,
-	    [&](PhysicalPlan &owner, const string &port, const vector<LogicalType> &types) -> PhysicalOperator & {
+	    [&](PhysicalPlan &owner, const string &port, const vector<LogicalType> &types) -> unique_ptr<PhysicalOperator> {
 		    if (!input_rows.contains(py::str(port))) {
 			    throw InvalidInputException("missing fragment input %s", port);
 		    }
 		    used_inputs.insert(port);
 		    auto collection = RowsToCollection(context, types, input_rows[py::str(port)].cast<py::list>());
 		    auto count = collection->Count();
-		    return owner.Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, count,
-		                                              std::move(collection));
+		    return make_uniq<PhysicalColumnDataScan>(owner, types, PhysicalOperatorType::COLUMN_DATA_SCAN, count,
+		                                             std::move(collection));
 	    },
 	    assignments);
 	if (used_inputs.size() != input_rows.size()) {

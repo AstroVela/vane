@@ -10,6 +10,11 @@
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/physical_plan_inputs.hpp"
+#include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
@@ -52,13 +57,14 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 
+#include <algorithm>
 #include <set>
 
 namespace duckdb {
 namespace vane_execution {
 namespace {
 
-constexpr idx_t FORMAT_VERSION = 1;
+constexpr idx_t FORMAT_VERSION = 2;
 constexpr idx_t MAX_PARTITIONS = 2147483647;
 constexpr const char *PARQUET_CAPABILITY = "vane.parquet-scan:1";
 constexpr const char *PARQUET_CODEC = "vane.parquet-file:1";
@@ -178,6 +184,7 @@ void PlanNode::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(3, "operator", native_operator);
 	serializer.WriteProperty(4, "source_id", source_id);
 	serializer.WriteProperty(5, "children", children);
+	serializer.WriteProperty(6, "scoped", scoped);
 }
 
 PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
@@ -187,13 +194,25 @@ PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
 	result.native_operator = deserializer.ReadProperty<string>(3, "operator");
 	result.source_id = deserializer.ReadProperty<string>(4, "source_id");
 	result.children = deserializer.ReadProperty<vector<PlanNode>>(5, "children");
+	result.scoped = deserializer.ReadProperty<bool>(6, "scoped");
 	CheckTypes(result.types);
 	if (!result.input_port.empty()) {
-		if (!result.native_operator.empty() || !result.source_id.empty() || !result.children.empty()) {
+		if (!result.native_operator.empty() || !result.source_id.empty() || !result.children.empty() || result.scoped) {
 			throw SerializationException("fragment input port contains operator state");
 		}
 	} else if (result.native_operator.empty()) {
 		throw SerializationException("fragment node has no native operator");
+	}
+	if (result.scoped) {
+		if (!result.source_id.empty()) {
+			throw SerializationException("scoped fragment cannot contain an implicit source");
+		}
+		std::set<string> ports;
+		for (auto &child : result.children) {
+			if (child.input_port.empty() || !ports.insert(child.input_port).second) {
+				throw SerializationException("scoped fragment requires distinct explicit input ports");
+			}
+		}
 	}
 	return result;
 }
@@ -253,6 +272,10 @@ void CheckScanColumns(const string &name, const vector<ColumnIndex> &column_ids)
 
 void CheckFunctionOrigin(CatalogEntry &entry) {
 	switch (entry.type) {
+	case CatalogType::TABLE_ENTRY:
+	case CatalogType::VIEW_ENTRY:
+		throw NotImplementedException(
+		    "fragment compiler requires explicit range or Parquet sources, or CTE references");
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
 	case CatalogType::TABLE_FUNCTION_ENTRY:
 	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
@@ -270,51 +293,52 @@ void CheckFunctionOrigin(CatalogEntry &entry) {
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
-		static const std::set<string> scalar_functions = {"+",
-		                                                  "-",
-		                                                  "*",
-		                                                  "/",
-		                                                  "//",
-		                                                  "%",
-		                                                  "||",
-		                                                  "abs",
-		                                                  "lower",
-		                                                  "upper",
-		                                                  "length",
-		                                                  "hash",
-		                                                  "starts_with",
-		                                                  "contains",
-		                                                  "list_value",
-		                                                  "struct_pack",
-		                                                  "struct_extract",
-		                                                  "list_extract",
-		                                                  "map",
-		                                                  "array_value",
-		                                                  "date_part",
-		                                                  "date_trunc",
-		                                                  "extract"};
 		static const std::set<string> aggregates = {"count", "count_star", "sum", "avg", "min", "max"};
 		const auto name = StringUtil::Lower(function.function_name);
 		const bool scan = SupportedScan(name);
 		const bool aggregate = aggregates.count(name);
-		if (!scan && !aggregate && !scalar_functions.count(name)) {
+		auto entry = Catalog::GetEntry(context, function.catalog, function.schema,
+		                               EntryLookupInfo(scan        ? CatalogType::TABLE_FUNCTION_ENTRY
+		                                               : aggregate ? CatalogType::AGGREGATE_FUNCTION_ENTRY
+		                                                           : CatalogType::SCALAR_FUNCTION_ENTRY,
+		                                               name),
+		                               OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
 			throw NotImplementedException("fragment compiler does not support function %s", name);
 		}
-		auto &entry = Catalog::GetEntry(context,
-		                                scan        ? CatalogType::TABLE_FUNCTION_ENTRY
-		                                : aggregate ? CatalogType::AGGREGATE_FUNCTION_ENTRY
-		                                            : CatalogType::SCALAR_FUNCTION_ENTRY,
-		                                function.catalog, function.schema, name);
-		CheckFunctionOrigin(entry);
+		CheckFunctionOrigin(*entry);
+		if (!scan && !aggregate) {
+			if (entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+				throw NotImplementedException("fragment compiler does not support function %s", name);
+			}
+			// Check before binding can evaluate table arguments. Function names do
+			// not define portability; native binding and serialization do.
+			for (auto &overload : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
+				if (overload.GetStability() != FunctionStability::CONSISTENT) {
+					throw NotImplementedException(
+					    "fragment compiler requires expressions consistent across tasks and attempts: %s", name);
+				}
+			}
+		}
 	}
-	// A subquery expression can hide functions from ordinary expression traversal.
-	// Table subqueries are visited by EnumerateQueryNodeChildren instead.
-	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
-	    expression.GetExpressionClass() == ExpressionClass::PARAMETER) {
-		throw NotImplementedException("fragment compiler does not support subquery expressions or parameters");
+	if (expression.GetExpressionClass() == ExpressionClass::PARAMETER) {
+		throw NotImplementedException("fragment compiler does not support parameters");
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expression, [&](ParsedExpression &child) { CheckParsedExpression(context, child); });
+}
+
+// DuckDB's ordinary expression visitor only visits an IN/ANY comparison
+// child, not its query. Walk both to validate/freeze every source before bind.
+void VisitParsedQuery(QueryNode &query, const std::function<void(ParsedExpression &)> &expressions,
+                      const std::function<void(TableRef &)> &tables) {
+	std::function<void(ParsedExpression &)> visit = [&](ParsedExpression &expression) {
+		expressions(expression);
+		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			VisitParsedQuery(*expression.Cast<SubqueryExpression>().subquery->node, expressions, tables);
+		}
+		ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) { visit(child); });
+	};
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    query, [&](unique_ptr<ParsedExpression> &expression) { visit(*expression); }, tables);
 }
 
 SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data,
@@ -367,6 +391,13 @@ public:
 		case LogicalOperatorType::LOGICAL_CHUNK_GET:
 		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+		case LogicalOperatorType::LOGICAL_DELIM_GET:
+		case LogicalOperatorType::LOGICAL_CTE_REF:
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
 		case LogicalOperatorType::LOGICAL_ORDER_BY:
 		case LogicalOperatorType::LOGICAL_TOP_N:
 		case LogicalOperatorType::LOGICAL_LIMIT:
@@ -379,8 +410,12 @@ public:
 
 	void VisitExpression(unique_ptr<Expression> *expression) override {
 		// Query-stable functions (e.g. CURRENT_TIMESTAMP) also change across tasks
-		// and retries. Reject them before optional constant folding can hide them.
-		if (!(*expression)->IsConsistent()) {
+		// and retries. Inspect each function before optional constant folding.
+		// Binder's scalar-subquery cardinality check uses error(), marked volatile
+		// only to defer its exception until the branch is actually evaluated.
+		if ((*expression)->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+		    (*expression)->Cast<BoundFunctionExpression>().function.GetStability() != FunctionStability::CONSISTENT &&
+		    (*expression)->Cast<BoundFunctionExpression>().function.name != "error") {
 			throw NotImplementedException(
 			    "fragment compiler requires expressions consistent across tasks and attempts");
 		}
@@ -388,7 +423,7 @@ public:
 	}
 };
 
-void CheckOperator(PhysicalOperator &op, idx_t children) {
+void CheckOperator(PhysicalOperator &op, idx_t children, bool scoped = false) {
 	CheckTypes(op.types);
 	switch (op.type) {
 	case PhysicalOperatorType::PROJECTION:
@@ -401,7 +436,7 @@ void CheckOperator(PhysicalOperator &op, idx_t children) {
 	case PhysicalOperatorType::TOP_N:
 	case PhysicalOperatorType::STREAMING_LIMIT:
 	case PhysicalOperatorType::LIMIT:
-		if (children == 1) {
+		if (children == 1 || (scoped && children == 0 && op.type == PhysicalOperatorType::HASH_GROUP_BY)) {
 			return;
 		}
 		break;
@@ -411,9 +446,30 @@ void CheckOperator(PhysicalOperator &op, idx_t children) {
 			if (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
 			    join.join_type == JoinType::RIGHT || join.join_type == JoinType::OUTER ||
 			    join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI ||
-			    join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+			    join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI ||
+			    join.join_type == JoinType::SINGLE || join.join_type == JoinType::MARK) {
 				return;
 			}
+		}
+		break;
+	case PhysicalOperatorType::CROSS_PRODUCT:
+	case PhysicalOperatorType::NESTED_LOOP_JOIN:
+	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
+	case PhysicalOperatorType::CTE:
+		if (children == 2) {
+			return;
+		}
+		break;
+	case PhysicalOperatorType::LEFT_DELIM_JOIN:
+	case PhysicalOperatorType::RIGHT_DELIM_JOIN:
+		if (children == 1) {
+			return;
+		}
+		break;
+	case PhysicalOperatorType::DELIM_SCAN:
+	case PhysicalOperatorType::CTE_SCAN:
+		if (scoped && children == 0) {
+			return;
 		}
 		break;
 	case PhysicalOperatorType::DUMMY_SCAN:
@@ -624,6 +680,17 @@ public:
 
 	DistributedSubtree Build(PhysicalOperator &op) {
 		CheckOperator(op, op.children.size());
+		switch (op.type) {
+		case PhysicalOperatorType::CTE:
+		case PhysicalOperatorType::LEFT_DELIM_JOIN:
+		case PhysicalOperatorType::RIGHT_DELIM_JOIN:
+		case PhysicalOperatorType::CROSS_PRODUCT:
+		case PhysicalOperatorType::NESTED_LOOP_JOIN:
+		case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
+			return Scoped(op);
+		default:
+			break;
+		}
 		if (op.children.empty()) {
 			DistributedSubtree result;
 			result.fragment.root = EncodeNode(context, op, result.fragment, partitions);
@@ -631,7 +698,15 @@ public:
 			return result;
 		}
 		if (op.type == PhysicalOperatorType::HASH_JOIN) {
-			return Join(op.Cast<PhysicalHashJoin>());
+			auto &join = op.Cast<PhysicalHashJoin>();
+			// MARK requires global NULL/empty-build knowledge. SINGLE must see
+			// all matching rows before checking scalar-subquery cardinality.
+			// Delimiter elimination can leave correlated metadata on an ordinary
+			// join, including when its outer input is empty. Keep its native scope.
+			if (join.join_type == JoinType::MARK || join.join_type == JoinType::SINGLE || !join.delim_types.empty()) {
+				return Scoped(op);
+			}
+			return Join(join);
 		}
 		auto child = Build(op.children[0]);
 		switch (op.type) {
@@ -700,6 +775,77 @@ private:
 	idx_t partitions;
 	idx_t next_exchange = 0;
 
+	bool HasScopedState(const PhysicalOperator &op) {
+		if (op.type == PhysicalOperatorType::DELIM_SCAN || op.type == PhysicalOperatorType::CTE_SCAN ||
+		    op.type == PhysicalOperatorType::COLUMN_DATA_SCAN) {
+			return true;
+		}
+		for (auto &child : op.GetChildren()) {
+			if (HasScopedState(child.get())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	DistributedSubtree Scoped(PhysicalOperator &root) {
+		DistributedSubtree result;
+		result.fragment.partition_count = 1;
+		auto &node = result.fragment.root;
+		node.types = root.types;
+		node.scoped = true;
+		PhysicalPlanInputBindings bindings;
+		std::set<const PhysicalOperator *> visited;
+		std::function<void(PhysicalOperator &)> visit = [&](PhysicalOperator &op) {
+			if (!visited.insert(&op).second) {
+				return;
+			}
+			CheckOperator(op, op.children.size(), true);
+			// Keep delimiter caches and CTE consumers with their owner. Every
+			// independent input still goes through the distributed planner and
+			// explicit source assignments; no hidden scan is serialized here.
+			if (&op != &root && !HasScopedState(op) &&
+			    (op.type == PhysicalOperatorType::TABLE_SCAN || !op.children.empty())) {
+				auto input = Exchange(Build(op), "gather", 1);
+				bindings.names.emplace(&op, input.fragment.root.input_port);
+				node.children.push_back(std::move(input.fragment.root));
+				for (auto &edge : input.incoming) {
+					result.incoming.push_back(std::move(edge));
+				}
+				return;
+			}
+			if (op.type == PhysicalOperatorType::HASH_JOIN) {
+				auto &join = op.Cast<PhysicalHashJoin>();
+				join.filter_pushdown.reset();
+				join.join_stats.clear();
+			} else if (op.type == PhysicalOperatorType::TOP_N) {
+				op.Cast<PhysicalTopN>().dynamic_filter.reset();
+			}
+			vector<unique_ptr<Expression>> *aggregates = nullptr;
+			if (op.type == PhysicalOperatorType::HASH_GROUP_BY) {
+				aggregates = &op.Cast<PhysicalHashAggregate>().grouped_aggregate_data.aggregates;
+			} else if (op.type == PhysicalOperatorType::PERFECT_HASH_GROUP_BY) {
+				aggregates = &op.Cast<PhysicalPerfectHashAggregate>().aggregates;
+			} else if (op.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+				aggregates = &op.Cast<PhysicalUngroupedAggregate>().aggregates;
+			}
+			if (aggregates) {
+				for (auto &aggregate : *aggregates) {
+					WidenAggregate(aggregate->Cast<BoundAggregateExpression>());
+				}
+			}
+			for (auto &child : op.GetChildren()) {
+				visit(const_cast<PhysicalOperator &>(child.get()));
+			}
+		};
+		visit(root);
+		node.native_operator = Encode([&](Serializer &serializer) {
+			serializer.GetSerializationData().SetCustom(bindings);
+			root.Serialize(serializer);
+		});
+		return result;
+	}
+
 	PlanNode Node(PhysicalOperator &op) {
 		PlanNode node;
 		node.types = op.types;
@@ -750,6 +896,30 @@ private:
 		Wrap(projection, child);
 		return columns;
 	}
+	bool WidenAggregate(BoundAggregateExpression &aggregate) {
+		// A sorted wrapper owns a different state and bind payload. Its order is
+		// already fixed; never replace only its function while retaining that state.
+		if (aggregate.function.HasStateDestructorCallback() || aggregate.children.size() != 1) {
+			return false;
+		}
+		auto &name = aggregate.function.name;
+		if (name == "avg" && aggregate.children[0]->return_type.id() == LogicalTypeId::INTERVAL) {
+			aggregate.function = WideIntervalAvgFunction();
+			return true;
+		}
+		if (aggregate.children[0]->return_type.InternalType() != PhysicalType::INT128) {
+			return false;
+		}
+		if (name == "sum" || name == "sum_no_overflow") {
+			aggregate.function = WideIntegerSumFunction(aggregate.children[0]->return_type);
+			return true;
+		}
+		if (name == "avg") {
+			aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
+			return true;
+		}
+		return false;
+	}
 	PhysicalOperator &MakeAggregate(vector<unique_ptr<Expression>> groups, vector<unique_ptr<Expression>> aggregates) {
 		vector<LogicalType> types;
 		for (auto &group : groups) {
@@ -789,32 +959,9 @@ private:
 			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
 				split = false;
 			}
-			// Export private state, not a finalized SQL subtotal. 128-bit inputs
-			// need the wide accumulator on both sides of the exchange: a partition
-			// may exceed the SQL range even when the final group fits.
-			if ((name == "sum" || name == "sum_no_overflow") &&
-			    (aggregate.return_type.id() == LogicalTypeId::DECIMAL ||
-			     aggregate.children[0]->return_type.id() == LogicalTypeId::HUGEINT)) {
-				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
-					// Whole-group input can still arrive with all positive values
-					// first. Widen the private state and check range at finalization.
-					aggregate.function = WideIntegerSumFunction(aggregate.children[0]->return_type);
-					wide_aggregate = true;
-				}
-			}
-			// AVG merges its native sum/count state and finalizes once, preserving
-			// decimal scaling and temporal rounding instead of dividing DOUBLEs.
-			if (name == "avg" && (aggregate.return_type != LogicalType::DOUBLE ||
-			                      (aggregate.children[0]->return_type.id() != LogicalTypeId::FLOAT &&
-			                       aggregate.children[0]->return_type.id() != LogicalTypeId::DOUBLE))) {
-				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
-					aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
-					wide_aggregate = true;
-				} else if (aggregate.children[0]->return_type.id() == LogicalTypeId::INTERVAL) {
-					aggregate.function = WideIntervalAvgFunction();
-					wide_aggregate = true;
-				}
-			}
+			// Wide native state also handles whole groups arriving in a different
+			// order. Finalization, rather than a partial subtotal, checks range.
+			wide_aggregate = WidenAggregate(aggregate) || wide_aggregate;
 		}
 		if (child.fragment.partition_count == 1) {
 			if (wide_aggregate) {
@@ -933,8 +1080,8 @@ void StageFileArguments(ClientContext &context, SelectStatement &select, const s
 	auto &fs = FileSystem::GetFileSystem(context);
 	// Expand every scan before writing: the snapshot directory can be inside a
 	// recursive input glob. Keep repeated references in their original order.
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    *select.node, [](unique_ptr<ParsedExpression> &) {},
+	VisitParsedQuery(
+	    *select.node, [](ParsedExpression &) {},
 	    [&](TableRef &ref) {
 		    if (ref.type != TableReferenceType::TABLE_FUNCTION) {
 			    return;
@@ -1043,13 +1190,12 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 	idx_t used = 0;
 	context.RunFunctionInTransaction([&]() {
 		auto &select = parser.statements[0]->Cast<SelectStatement>();
-		ParsedExpressionIterator::EnumerateQueryNodeChildren(
-		    *select.node,
-		    [&](unique_ptr<ParsedExpression> &expression) { CheckParsedExpression(context, *expression); },
+		VisitParsedQuery(
+		    *select.node, [&](ParsedExpression &expression) { CheckParsedExpression(context, expression); },
 		    [](TableRef &ref) {
 			    if (ref.type != TableReferenceType::EMPTY_FROM && ref.type != TableReferenceType::TABLE_FUNCTION &&
 			        ref.type != TableReferenceType::SUBQUERY && ref.type != TableReferenceType::EXPRESSION_LIST &&
-			        ref.type != TableReferenceType::JOIN) {
+			        ref.type != TableReferenceType::JOIN && ref.type != TableReferenceType::BASE_TABLE) {
 				    throw NotImplementedException("fragment compiler requires explicit range or Parquet sources");
 			    }
 		    });
@@ -1108,20 +1254,70 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		if (!inputs || !used_inputs.insert(node.input_port).second) {
 			throw InvalidInputException("fragment input %s must be bound exactly once", node.input_port);
 		}
-		auto &input = inputs(plan, node.input_port, node.types);
-		if (input.types != node.types) {
+		auto input = inputs(plan, node.input_port, node.types);
+		if (!input || input->types != node.types) {
 			throw InvalidInputException("fragment input %s schema mismatch", node.input_port);
 		}
-		return input;
+		auto &result = *input;
+		plan.TakeOwnership(std::move(input));
+		return result;
 	}
 	unique_ptr<PhysicalOperator> op;
 	bound_parameter_map_t parameters;
+	PhysicalPlanInputBindings bindings;
+	std::set<const PhysicalOperator *> bound_inputs;
+	std::set<string> scoped_ports;
+	if (node.scoped) {
+		bindings.bind = [&](PhysicalPlan &owner, const string &port,
+		                    const vector<LogicalType> &types) -> unique_ptr<PhysicalOperator> {
+			auto declared = std::find_if(node.children.begin(), node.children.end(),
+			                             [&](const PlanNode &child) { return child.input_port == port; });
+			if (!inputs || declared == node.children.end() || declared->types != types ||
+			    !used_inputs.insert(port).second) {
+				throw SerializationException("scoped fragment input %s has no unique matching declaration", port);
+			}
+			auto input = inputs(owner, port, types);
+			if (input) {
+				bound_inputs.insert(input.get());
+			}
+			scoped_ports.insert(port);
+			return input;
+		};
+	}
 	Decode(node.native_operator, [&](BinaryDeserializer &deserializer) {
 		deserializer.Set<ClientContext &>(context);
 		deserializer.Set<DatabaseInstance &>(DatabaseInstance::GetDatabase(context));
 		deserializer.Set<bound_parameter_map_t &>(parameters);
+		if (node.scoped) {
+			deserializer.GetSerializationData().SetCustom(bindings);
+		}
 		op = PhysicalOperator::Deserialize(deserializer, plan);
 	});
+	if (node.scoped) {
+		if (op->types != node.types || scoped_ports.size() != node.children.size()) {
+			throw SerializationException("scoped fragment has mismatched output or unused inputs");
+		}
+		std::set<const PhysicalOperator *> checked;
+		std::function<void(const PhysicalOperator &)> check = [&](const PhysicalOperator &entry) {
+			if (bound_inputs.count(&entry) || !checked.insert(&entry).second) {
+				return;
+			}
+			if (entry.type == PhysicalOperatorType::TABLE_SCAN) {
+				throw SerializationException("scoped fragment contains an implicit scan without source assignments");
+			}
+			CheckOperator(const_cast<PhysicalOperator &>(entry), entry.children.size(), true);
+			if (entry.type == PhysicalOperatorType::CTE_SCAN && !entry.Cast<PhysicalColumnDataScan>().collection) {
+				throw SerializationException("scoped fragment CTE scan has no owning materialization");
+			}
+			for (auto &child : entry.GetChildren()) {
+				check(child.get());
+			}
+		};
+		check(*op);
+		auto &result = *op;
+		plan.TakeOwnership(std::move(op));
+		return result;
+	}
 	if (!op->children.empty() || op->types != node.types) {
 		throw SerializationException("fragment node contains unexpected children or schema");
 	}
@@ -1265,6 +1461,7 @@ const vector<string> &ConnectionSettings() {
 	                                     "default_order",
 	                                     "default_null_order",
 	                                     "preserve_identifier_case",
+	                                     "scalar_subquery_error_on_multiple_rows",
 	                                     "max_expression_depth",
 	                                     "disabled_optimizers",
 	                                     "TimeZone",
