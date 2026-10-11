@@ -102,6 +102,7 @@ from vane.execution.udf_process_group import WorkerProcessGroup
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_shm_store import LocalQueryShmStore, LocalShmStoreCapacityError, ParentShmPeer
 from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
+from vane.execution.udf_threading import subprocess_actor_thread_env
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
@@ -1899,12 +1900,12 @@ def _payload_subprocess_mode(payload: dict[str, Any]) -> str:
 
 
 def _worker_env_for_pool_index(payload: dict[str, Any], worker_idx: int, pool_size: int) -> dict[str, str]:
-    _payload_subprocess_mode(payload)
+    mode = _payload_subprocess_mode(payload)
     env = {
         "VANE_SUBPROCESS_WORKER_INDEX": str(int(worker_idx)),
         "VANE_SUBPROCESS_POOL_SIZE": str(int(pool_size)),
     }
-    env.update(_worker_thread_env(payload))
+    env.update(subprocess_actor_thread_env(payload) if mode == "actor" else _worker_thread_env(payload))
     return env
 
 
