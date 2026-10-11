@@ -712,6 +712,21 @@ class _AsyncResultStreamState:
     read_lock: asyncio.Lock
 
 
+def _next_native_partition(stream: Any) -> Any:
+    try:
+        return stream.next_nowait()
+    except RuntimeError as error:
+        from vane.ai._errors import _native_query_diagnostic
+
+        # The native result stream is the producer of this envelope. Capture
+        # its diagnostic here; Ray's wrapper alone cannot establish provenance.
+        diagnostic = _native_query_diagnostic(error)
+        if diagnostic is None:
+            raise
+    # Do not retain the native message/traceback in the public exception chain.
+    raise diagnostic from None
+
+
 @dataclass
 class _ClientOwnerLease:
     lease_token: str
@@ -8299,7 +8314,7 @@ class RayQueryDriverActor:
                 async with stream_state.read_lock:
                     try:
                         while True:
-                            next_item = stream.next_nowait()
+                            next_item = _next_native_partition(stream)
                             if next_item is not None:
                                 break
                             stream_state.ready.clear()

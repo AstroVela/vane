@@ -401,8 +401,12 @@ Worker integrations should raise `vane.ai.DiagnosticError(operation, error)`
 outside the original exception handler. It captures a sanitized summary and
 retains its type through pickle and structured Ray error metadata. Raw SDK
 messages are never interpreted as diagnostic envelopes, even if they contain
-`upstream error:` or forged diagnostic headers. Native decoding is restricted to
-typed query/transport errors and their complete UDF envelopes; descriptions and
-model identifiers cannot replace the encoded summary.
+`upstream error:` or forged diagnostic headers. The Ray driver captures a typed
+diagnostic directly at the native result-stream boundary, before Ray serializes
+it. A Ray wrapper never authorizes decoding a plain `RuntimeError` body. Native
+decoding is restricted to native exceptions and the result-stream producer;
+descriptions and model identifiers cannot replace the encoded summary. Known
+safe provider failures such as `vllm returned no outputs` retain their explanation
+through wrapping and transport using a closed vocabulary.
 Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and the
 isolated single-CPU Ray diagnostic regression.

@@ -52,6 +52,20 @@ _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
 _DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
+_SAFE_PROVIDER_DETAILS = {
+    **{
+        f"{provider} {detail}": "RuntimeError"
+        for provider in ("vllm", "sglang")
+        for detail in ("returned no outputs", "engine not initialized")
+    },
+    **{
+        f"{provider} API key was not configured on the application before creating the provider/descriptor": "ProviderClientConfigurationError"
+        for provider in ("Google", "OpenAI", "TypeSafe")
+    },
+    "Anthropic api_key or auth_token was not configured on the application before creating the provider/descriptor": "ProviderClientConfigurationError",
+    "Google Vertex credentials require an explicit application project": "ProviderClientConfigurationError",
+    "Google credentials must be a google.auth.credentials.Credentials object": "ProviderClientConfigurationError",
+}
 
 
 class DiagnosticError(RuntimeError):
@@ -127,6 +141,9 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     def canonical(expected: str) -> bool:
         return message == expected or (transported and message.startswith(expected))
 
+    for explanation, name in _SAFE_PROVIDER_DETAILS.items():
+        if error_type == name and canonical(explanation):
+            return explanation
     if error_type == "TypeError":
         match = _UNEXPECTED.fullmatch(message)
         if match:
@@ -193,6 +210,8 @@ def _numeric_details(error: BaseException) -> list[str]:
 
 def _transported_summary(message: str) -> str:
     """Read complete canonical atoms, retaining cause/cleanup boundaries."""
+    if name := _SAFE_PROVIDER_DETAILS.get(message):
+        return f"{name}: {message}"
     parts = []
     position, cleanup_count = 0, 0
     separator = ""
@@ -267,7 +286,20 @@ def _native_summary(message: str) -> str | None:
     return None
 
 
-def _summary(error: BaseException, *, ray_transport: bool = False) -> str:
+def _native_query_diagnostic(error: BaseException) -> DiagnosticError | None:
+    """Capture a native stream failure at the producer, before Ray flattens it.
+
+    Call only at a native query operation boundary. A generic RuntimeError or
+    RayTaskError is not proof that its message came from the native runtime.
+    """
+    summary = _native_summary(_message(error))
+    if summary is None:
+        return None
+    message = _diagnostic_message(summary, f"Native query failed; upstream error: {summary}")
+    return _restore_diagnostic_error(message, summary)
+
+
+def _summary(error: BaseException) -> str:
     attributes = _attributes(error)
     if isinstance(error, DiagnosticError) and type(summary := attributes.get("summary")) is str:
         return _transported_summary(summary)
@@ -284,7 +316,7 @@ def _summary(error: BaseException, *, ray_transport: bool = False) -> str:
         return encoded if encoded is not None else _transported_summary(message)
     name = _type_name(error)
     message = _message(error)
-    if _is_exception(error, "vane._native", "Error") or (ray_transport and type(error) is RuntimeError):
+    if _is_exception(error, "vane._native", "Error"):
         transported = _native_summary(message)
         if transported is not None:
             return transported
@@ -310,13 +342,11 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
     current = error
     summaries: list[str] = []
     cleanup: list[str] = []
-    ray_transport = False
     for _ in range(16):
         if id(current) in seen:
             break
         seen.add(id(current))
-        ray_transport = ray_transport or _is_exception(current, "ray.exceptions", "RayTaskError", "ActorDiedError")
-        summary = _summary(current, ray_transport=ray_transport)
+        summary = _summary(current)
         if summary not in summaries:
             summaries.append(summary)
         attrs = _attributes(current)

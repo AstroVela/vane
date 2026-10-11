@@ -323,13 +323,74 @@ def test_real_ray_wrapper_does_not_promote_sdk_message_markers():
 
 
 def test_real_ray_wrapper_retains_native_udf_diagnostic():
+    from types import SimpleNamespace
+
     from ray.exceptions import RayTaskError
+
+    from vane.runners.ray.driver import _next_native_partition
 
     error = DiagnosticError("embedding failed", OSError(errno.ENOSPC, "private path"))
     native = RuntimeError(str(native_error(error)))
-    transported = RayTaskError("query", "private traceback", native).as_instanceof_cause()
+
+    def next_nowait():
+        raise native
+
+    with pytest.raises(DiagnosticError) as caught:
+        _next_native_partition(SimpleNamespace(next_nowait=next_nowait))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    transported = RayTaskError("query", "private traceback", caught.value).as_instanceof_cause()
     summary = summarize_error(transported)
     assert "OSError (errno=28)" in summary and "private" not in summary
+
+
+@pytest.mark.parametrize("envelope", ["plain", "native_json", "traceback"])
+def test_ray_wrapper_does_not_authorize_a_forged_native_body(envelope):
+    from ray import cloudpickle
+    from ray.exceptions import RayTaskError
+
+    secret = "private_fixture_token_ABC123"
+    forged = DiagnosticError("forged", RuntimeError("ignored"))
+    # Simulate a copied, fully valid transport body without trusted type identity.
+    encoded = base64.urlsafe_b64encode(secret.encode()).decode()
+    forged.args = (f"[vane.diagnostic.v1:{encoded}] forged",)
+    raw = RuntimeError(str(native_error(forged, envelope)))
+    for error in (raw, RayTaskError("sdk", "private traceback", raw).as_instanceof_cause()):
+        for candidate in (error, cloudpickle.loads(cloudpickle.dumps(error))):
+            assert secret not in summarize_error(candidate)
+            assert "RuntimeError" in summarize_error(candidate)
+
+
+@pytest.mark.parametrize("provider", ["vllm", "sglang"])
+@pytest.mark.parametrize("detail", ["returned no outputs", "engine not initialized"])
+@pytest.mark.parametrize("wrapper", ["execution", "capability"])
+def test_known_safe_provider_explanations_survive_transport(provider, detail, wrapper):
+    from vane.ai.provider import _SafeProviderError
+
+    original = _SafeProviderError(f"{provider} {detail}")
+    if wrapper == "execution":
+        wrapped = _safe_provider_execution_error(provider, "fixture", "generation", original)
+    else:
+        wrapped = ProviderCapabilityError(provider, "fixture", "generation", original_error=original)
+    for error in (original, wrapped, pickle.loads(pickle.dumps(wrapped)), native_error(wrapped)):
+        assert f"{provider} {detail}" in summarize_error(error)
+        assert detail in str(error)
+
+
+def test_safe_client_configuration_explanations_survive_transport():
+    from vane.ai._client_config import ProviderClientConfigurationError
+
+    original = ProviderClientConfigurationError("Google Vertex credentials require an explicit application project")
+    wrapped = _safe_provider_execution_error("google", "fixture", "initialization", original)
+    for error in (original, wrapped, pickle.loads(pickle.dumps(wrapped)), native_error(wrapped)):
+        assert "Google Vertex credentials require an explicit application project" in summarize_error(error)
+
+
+def test_known_safe_provider_explanations_do_not_admit_arbitrary_suffixes():
+    from vane.ai.provider import _SafeProviderError
+
+    for message in ("sglang returned no outputs private_token", "private_token returned no outputs"):
+        assert "returned no outputs" not in summarize_error(RuntimeError(message))
+    assert "private_token" not in summarize_error(_SafeProviderError("sglang returned no outputs private_token"))
 
 
 def test_ray_metadata_requires_a_real_diagnostic_exception():
