@@ -14,7 +14,7 @@ import pytest
 
 @pytest.mark.real_ray
 @pytest.mark.ray_cluster_owner
-@pytest.mark.parametrize("scenario", ["concurrent", "timeout", "crashed_client"])
+@pytest.mark.parametrize("scenario", ["concurrent", "timeout", "crashed_client", "delayed_ready"])
 def test_ray_udf_resource_lifecycle(scenario, tmp_path):
     pytest.importorskip("ray")
     script = textwrap.dedent(
@@ -38,7 +38,31 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
         os.environ["VANE_RAY_CLIENT_LEASE_TIMEOUT_S"] = "5"
         os.environ["VANE_RAY_CLIENT_HEARTBEAT_INTERVAL_S"] = "0.5"
         os.environ["VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S"] = "0.1"
+
+        def defer_executor_notifications():
+            from vane.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
+
+            prime = RemoteUDFActorReadinessMixin._prime_actor_readiness
+
+            def prime_pending(self):
+                assert not self._actors_obj._confirmed_ready
+                prime(self)
+                (root / "executor_pending").touch()
+
+            def defer(self, ref):
+                # Keep notifications undelivered for the whole query. Driver
+                # admission still observes the real init ObjectRef normally.
+                (root / "notification_deferred").touch()
+
+            RemoteUDFActorReadinessMixin._prime_actor_readiness = prime_pending
+            RemoteUDFActorReadinessMixin._notify_ready_ref_ready = defer
+
+        runtime_env = {}
+        if scenario == "delayed_ready":
+            os.environ["VANE_UDF_EAGER_WARM_UP"] = "1"
+            runtime_env["worker_process_setup_hook"] = defer_executor_notifications
         info = ray.init(num_cpus=8, num_gpus=1, include_dashboard=False,
+                        runtime_env=runtime_env,
                         **ray_test_object_store_options())
 
         def wait_until(check, timeout=40):
@@ -50,6 +74,12 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
 
         def query(hold=False):
             class Identity:
+                def __init__(self):
+                    if scenario == "delayed_ready":
+                        # Deterministically return pending activation handles
+                        # before completing the actor's real initialization.
+                        wait_until(lambda: (root / "executor_pending").exists())
+
                 def __call__(self, table):
                     if hold:
                         (root / "entered").touch()
@@ -78,7 +108,11 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
         crashed_client = None
         blocker = None
         try:
-            if scenario == "concurrent":
+            if scenario == "delayed_ready":
+                assert query() == [(42,)]
+                assert (root / "executor_pending").exists()
+                wait_until(lambda: (root / "notification_deferred").exists())
+            elif scenario == "concurrent":
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     first = executor.submit(query, True)
                     wait_until(lambda: (root / "entered").exists())

@@ -380,6 +380,10 @@ Set `DUCKDB_DISTRIBUTED_DEBUG=1`. Native debug output uses `DistributedDebugStre
 Ray UDF pools return pending handles during executor construction; task admission
 waits for the first initialized actor without blocking native startup. The default
 initialization limit is 300 seconds, including time waiting for Ray capacity.
+After admission, both table and ref-bundle submission resolve the leased actor's
+initialization result even if its local delivery or readiness notification is
+delayed. This wait honors query interruption and query/ObjectRef deadlines; an
+empty local ready set alone must not reject an admitted task.
 Set `VANE_RAY_ACTOR_INIT_TIMEOUT_S` to a finite positive number on the client
 before opening its Ray runtime to change this limit. Shorter query/ObjectRef
 deadlines still apply. Resource maintenance reports the expired pool's requested
