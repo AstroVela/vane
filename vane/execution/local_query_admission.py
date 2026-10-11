@@ -38,7 +38,6 @@ from vane.execution.resource_graph_metadata import (
 )
 from vane.execution.resources import ResourceVector
 from vane.execution.udf_admission import AdmissionAuthority, AdmissionLease, LocalSlotAdmissionAuthority
-from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_local_actor_admission import LocalActorExecutionSlotPool
 from vane.execution.udf_resource_policy import udf_resource_spec
 
@@ -121,11 +120,91 @@ def build_local_admission_graph(
     return replace(graph, plan_digest=graph.normalized_digest()), by_binding
 
 
-@dataclass
-class _OutputWait:
-    request: OutputBlockRequest
-    ready: threading.Event
-    lease: OutputBlockLease | None = None
+class LocalOutputAdmission:
+    """Retain a producer identity until a capacity-authorized output read.
+
+    Buffered generator blocks are covered by the task's pending-output
+    estimate. Only ``request`` exposes their exact bytes to query admission.
+    The query pump grants requests without blocking a worker or native reader.
+    """
+
+    def __init__(self, query: LocalQueryAdmission, request: OutputBlockRequest) -> None:
+        self.query = query
+        self.request_spec = request
+        self._requested = False
+        self._closed = False
+        self._lease: OutputBlockLease | None = None
+        self._wakeup: Callable[[], None] | None = None
+
+    def request(self, wakeup: Callable[[], None]) -> None:
+        query = self.query
+        if query.owner_pid != os.getpid():
+            raise RuntimeError("local output admission belongs to another process")
+        with query._lock:
+            query._raise_error_locked()
+            if self._closed:
+                raise RuntimeError("local output admission is closed")
+            if self._requested:
+                return
+            self._wakeup = wakeup
+            grant = query.manager.try_acquire_output_block(self.request_spec)
+            if grant.fatal:
+                raise RuntimeError(f"local output admission failed: {grant.blocked_reason}")
+            if grant.granted:
+                assert grant.lease is not None
+                self._lease = grant.lease
+            else:
+                error = query.manager.note_output_waiting(self.request_spec)
+                if error is not None:
+                    raise RuntimeError(f"local output identity failed: {error}")
+                query._outputs[self.request_spec.block_id] = self
+            self._requested = True
+        query._event.set()
+
+    def take(self) -> OutputBlockLeaseOwner | None:
+        query = self.query
+        if query.owner_pid != os.getpid():
+            raise RuntimeError("local output admission belongs to another process")
+        with query._lock:
+            query._raise_error_locked()
+            if self._closed:
+                raise RuntimeError("local output admission is closed")
+            if self._lease is None:
+                return None
+            owner = OutputBlockLeaseOwner(query.manager, self._lease)
+            self._lease = None
+            self._close_locked()
+            return owner
+
+    def _notify(self) -> None:
+        if self.query.owner_pid != os.getpid():
+            return
+        with self.query._lock:
+            callback = self._wakeup if not self._closed else None
+        if callback is not None:
+            callback()
+
+    def _close_locked(self) -> None:
+        if self._closed:
+            self.query._maybe_finish_task_locked(self.request_spec.task_lease_id)
+            return
+        query = self.query
+        request = self.request_spec
+        query.manager.remove_output_waiter(request.block_id)
+        if self._lease is not None:
+            query.manager.release_output_block(self._lease.lease_id)
+            self._lease = None
+        query._outputs.pop(request.block_id, None)
+        query._buffered_outputs.pop(request.block_id, None)
+        self._closed = True
+        self._wakeup = None
+        query._maybe_finish_task_locked(request.task_lease_id)
+
+    def close(self) -> None:
+        if self.query.owner_pid != os.getpid():
+            return
+        with self.query._lock:
+            self._close_locked()
 
 
 @dataclass(frozen=True)
@@ -157,8 +236,10 @@ class LocalQueryAdmission:
         self._error: BaseException | None = None
         self._authorities: set[LocalQueryAdmissionAuthority] = set()
         self._pending: dict[tuple[str, str], LocalQueryAdmissionAuthority] = {}
-        self._outputs: dict[str, _OutputWait] = {}
+        self._outputs: dict[str, LocalOutputAdmission] = {}
+        self._buffered_outputs: dict[str, LocalOutputAdmission] = {}
         self._live_tasks: dict[str, str] = {}
+        self._finished_tasks: dict[str, TaskLease] = {}
         self._producers: dict[str, list[LocalQueryAdmissionAuthority]] = {}
         self._completed_units: set[str] = set()
         self._published_actors: set[str] = set()
@@ -237,9 +318,12 @@ class LocalQueryAdmission:
                 with self._lock:
                     self._error = exc
                     authorities = tuple(self._authorities)
-                    outputs = tuple(self._outputs.values())
+                    outputs = tuple(self._buffered_outputs.values())
                 for output in outputs:
-                    output.ready.set()
+                    try:
+                        output._notify()
+                    except BaseException:
+                        pass
                 for authority in authorities:
                     try:
                         authority._notify()
@@ -258,9 +342,9 @@ class LocalQueryAdmission:
         # Native/user callbacks may immediately submit more work. Invoke them
         # after both the per-query pump and shared coordinator locks are gone.
         error = None
-        for authority in notifications:
+        for notify in notifications:
             try:
-                authority._notify()
+                notify()
             except BaseException as exc:
                 error = error or exc
         if error is not None:
@@ -281,10 +365,10 @@ class LocalQueryAdmission:
                     self.manager.set_ready_actor_slots(unit_id, {i: "local" for i in range(unit.actor_pool_size)})
                     self._published_actors.add(unit_id)
 
-    def _pump(self) -> set[LocalQueryAdmissionAuthority]:
+    def _pump(self) -> set[Callable[[], None]]:
         # Policy callbacks only set the event. User/native wakeups and backend
         # acquisition run outside the policy manager's lock.
-        notifications: set[LocalQueryAdmissionAuthority] = set()
+        notifications: set[Callable[[], None]] = set()
         while True:
             changed = False
             frontier = self.manager.pending_allocation_frontier()
@@ -310,8 +394,9 @@ class LocalQueryAdmission:
                             if waiter is None:
                                 self.manager.release_output_block(output_grant.lease.lease_id)
                             else:
-                                waiter.lease = output_grant.lease
-                                waiter.ready.set()
+                                waiter._lease = output_grant.lease
+                                self._outputs.pop(output_request.block_id)
+                                notifications.add(waiter._notify)
                         changed = True
             with self._lock:
                 candidates = set(self._pending)
@@ -343,17 +428,18 @@ class LocalQueryAdmission:
                 changed = prepared or changed
                 if prepared or authority._backend_changed.is_set():
                     authority._backend_changed.clear()
-                    notifications.add(authority)
+                    notifications.add(authority._notify)
             if not changed:
                 return notifications
 
-    def own_output(
+    def buffer_output(
         self,
         task: TaskLease,
         size_bytes: int,
-        scope: ExecutionCancellationScope,
-        admission: AdmissionLease,
-    ) -> OutputBlockLeaseOwner:
+    ) -> LocalOutputAdmission:
+        """Retain task ownership without requesting consumer output capacity."""
+        if self.owner_pid != os.getpid():
+            raise RuntimeError("local output admission belongs to another process")
         request = OutputBlockRequest(
             query_id=self.graph.query_id,
             producer_unit_id=task.resource_unit_id,
@@ -362,47 +448,31 @@ class LocalQueryAdmission:
             block_id=uuid.uuid4().hex,
             size_bytes=size_bytes,
         )
-        waiter = _OutputWait(request, threading.Event())
-        unregister = scope.register_cancel_wakeup(waiter.ready.set)
-        try:
-            with self._lock:
-                self._raise_error_locked()
-                scope.raise_if_cancelled("local query output admission")
-                grant = self.manager.try_acquire_output_block(request)
-                if grant.fatal:
-                    raise RuntimeError(f"local output admission failed: {grant.blocked_reason}")
-                if grant.granted:
-                    assert grant.lease is not None
-                    return OutputBlockLeaseOwner(self.manager, grant.lease)
-                self._outputs[request.block_id] = waiter
-                error = self.manager.note_output_waiting(request)
-                if error is not None:
-                    raise RuntimeError(f"local output identity failed: {error}")
-            self._event.set()
-            with admission.suspend_for_wait(scope):
-                waiter.ready.wait()
-            scope.raise_if_cancelled("local query output admission")
-            with self._lock:
-                self._raise_error_locked()
-                assert waiter.lease is not None
-                owner = OutputBlockLeaseOwner(self.manager, waiter.lease)
-                waiter.lease = None
-                return owner
-        finally:
-            unregister()
-            with self._lock:
-                self._outputs.pop(request.block_id, None)
-                self.manager.remove_output_waiter(request.block_id)
-                if waiter.lease is not None:
-                    self.manager.release_output_block(waiter.lease.lease_id)
+        with self._lock:
+            self._raise_error_locked()
+            if task.lease_id not in self._live_tasks or task.lease_id in self._finished_tasks:
+                raise RuntimeError("local output producer already finished")
+            output = LocalOutputAdmission(self, request)
+            self._buffered_outputs[request.block_id] = output
+            return output
 
     def finish_task(self, lease: TaskLease) -> None:
         with self._lock:
             if lease.lease_id not in self._live_tasks:
                 return
-            self._live_tasks.pop(lease.lease_id)
-            self.manager.release_task_lease(lease.lease_id, attempt_id=lease.attempt_id)
-            self._finish_unit_locked(lease.resource_unit_id)
+            self._finished_tasks[lease.lease_id] = lease
+            self._maybe_finish_task_locked(lease.lease_id)
+
+    def _maybe_finish_task_locked(self, lease_id: str) -> None:
+        if lease_id not in self._finished_tasks:
+            return
+        if any(output.request_spec.task_lease_id == lease_id for output in self._buffered_outputs.values()):
+            return
+        unit_id = self._live_tasks[lease_id]
+        self.manager.release_task_lease(lease_id, attempt_id=self._finished_tasks[lease_id].attempt_id)
+        self._live_tasks.pop(lease_id)
+        self._finished_tasks.pop(lease_id)
+        self._finish_unit_locked(unit_id)
 
     def _finish_unit_locked(self, unit_id: str) -> None:
         if unit_id in self._completed_units or unit_id in self._live_tasks.values():
@@ -421,12 +491,15 @@ class LocalQueryAdmission:
         with self._lock:
             self._closed = True
             authorities = tuple(self._authorities)
-            outputs = tuple(self._outputs.values())
+            outputs = tuple(self._buffered_outputs.values())
             self.manager.close_admission()
         self._event.set()
-        for output in outputs:
-            output.ready.set()
         cleanup_error = None
+        for output in outputs:
+            try:
+                output._notify()
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
         for authority in authorities:
             try:
                 authority.close()
@@ -447,7 +520,7 @@ class LocalQueryAdmission:
         if self.owner_pid != os.getpid():
             return False
         with self._lock:
-            return bool(self._authorities or self._live_tasks or self._outputs)
+            return bool(self._authorities or self._live_tasks or self._buffered_outputs)
 
 
 class LocalQueryAdmissionAuthority:

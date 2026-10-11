@@ -1489,6 +1489,19 @@ The window belongs to the invocation, not the reusable worker. Cancellation
 wakes a blocked producer, and the worker must complete its terminal protocol
 and cleanup before reuse.
 
+The local reader, like the Ray collector, requests exact-byte query output
+admission only after native DATA capacity is available. Receiving a worker's
+descriptor does not request that grant. A pending grant wakes the reader
+asynchronously; it does not block the worker response loop or the native
+scheduler. Other invocations' terminal events can still advance, while each
+invocation's terminal event stays behind its own output blocks.
+
+Worker completion returns physical execution capacity independently of the
+reader. Unread blocks retain their producer's query task lease and pending
+output estimate until they are admitted or discarded. Admitted output leases
+then retain exact bytes until their descriptors and zero-copy views are
+released, even after the producer and query have closed.
+
 Stream permits do not release storage or task resources. Pooled allocations
 remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
 fork pin retains them. The input ACK records the consuming dependency without

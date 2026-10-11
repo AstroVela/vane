@@ -255,16 +255,16 @@ def test_cancelled_response_never_contaminates_the_next_invocation(
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_worker_serializes_each_output_once_and_admits_exact_published_size(monkeypatch, streaming, pooled_shm_worker):
+def test_worker_measures_then_writes_each_output_once_with_exact_admission(monkeypatch, streaming, pooled_shm_worker):
     from vane.execution import udf_subprocess_worker as worker
 
     table = pa.table({"blob": [b"x" * 4096]})
     serialized, grants, sent = [], [], []
     new_stream = pa.ipc.new_stream
 
-    def serialize(*args, **kwargs):
-        serialized.append(True)
-        return new_stream(*args, **kwargs)
+    def serialize(sink, *args, **kwargs):
+        serialized.append((type(sink), len(grants)))
+        return new_stream(sink, *args, **kwargs)
 
     class Executor:
         _payload = {"call_mode": "map_batches"} if streaming else {}
@@ -290,7 +290,9 @@ def test_worker_serializes_each_output_once_and_admits_exact_published_size(monk
     chunks = [payload for kind, payload in sent if kind == worker._MSG_REF_BUNDLE_CHUNK]
     descriptor = vane_pickle.loads(chunks[0] if streaming else payload)
     try:
-        assert serialized == [True]
+        # Measuring IPC size allocates no payload buffer. Only the second
+        # stream writes bytes, after the exact storage grant is acquired.
+        assert serialized == [(pa.MockOutputStream, 0), (pa.FixedSizeBufferWriter, 1)]
         assert grants == [descriptor["metadata"][0]["ipc_size_bytes"]]
         assert descriptor["grant_id"] == 9
         if streaming:

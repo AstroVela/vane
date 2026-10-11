@@ -18,7 +18,6 @@ from vane.execution.query_resource_policy import OutputBlockRequest, QueryResour
 from vane.execution.query_resource_spec import QueryAllocation, QueryResourceGraph
 from vane.execution.resources import ResourceVector
 from vane.execution.udf_admission import LocalExecutionCapacity, LocalExecutionSlotPool
-from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_local_actor_admission import LocalActorExecutionSlotPool
 from vane.execution.udf_resource_policy import udf_resource_spec
 
@@ -56,6 +55,18 @@ def _take(authority, retained=16):
     if not authority.state()["available"]:
         assert ready.wait(3), authority.state()
     return authority.take(retained)
+
+
+def _own_output(query, lease, size):
+    output = query.buffer_output(lease.lease["query_policy_task"], size)
+    ready = threading.Event()
+    output.request(ready.set)
+    owner = output.take()
+    if owner is None:
+        assert ready.wait(3)
+        owner = output.take()
+    assert owner is not None
+    return owner
 
 
 @pytest.mark.parametrize("transport_limit", ["auto", "4MiB", "unbounded"])
@@ -303,34 +314,23 @@ def test_shared_actor_pool_uses_idle_replica_across_query_policies():
         pool.close()
 
 
-def test_cancel_queued_output_wakes_and_preserves_other_query_owners():
+def test_cancel_queued_output_is_nonblocking_and_preserves_other_query_owners():
     graph, bindings = _graph()
     query = LocalQueryAdmission(graph, _allocation(store=1))
     pool = LocalExecutionSlotPool(max_slots=2, execution_slot_prefix="task")
     authority = _authority(query, bindings["0"], pool)
     lease = _take(authority)
-    scope = ExecutionCancellationScope("output-test", 1)
-    first = query.own_output(lease.lease["query_policy_task"], 100, scope, lease)
-    errors = []
-    started = threading.Event()
-
-    def wait_output():
-        started.set()
-        try:
-            query.own_output(lease.lease["query_policy_task"], 100, scope, lease)
-        except BaseException as error:
-            errors.append(error)
-
-    waiter = threading.Thread(target=wait_output)
-    waiter.start()
-    assert started.wait(3)
-    scope.cancel("test cancellation")
-    waiter.join(3)
+    first = _own_output(query, lease, 100)
+    second = query.buffer_output(lease.lease["query_policy_task"], 100)
     try:
-        assert not waiter.is_alive()
-        assert errors and "cancel" in str(errors[0]).lower()
+        second.request(lambda: None)
+        assert second.take() is None
+        assert query.snapshot()["units"][bindings["0"]]["pending_output_count"] == 1
+        second.close()
+        assert query.snapshot()["units"][bindings["0"]]["pending_output_count"] == 0
         assert query.snapshot()["usage"]["object_store_bytes"] >= 100
     finally:
+        second.close()
         first.release()
         lease.release()
         authority.close()
@@ -349,7 +349,7 @@ def test_query_output_bytes_follow_zero_copy_view_after_task_and_query_close():
     result = make_local_shm_ref_bundle_result(pa.table({"x": list(range(2048))}))
     ref = result[1][0]
     size = ref.size
-    owner = query.own_output(lease.lease["query_policy_task"], size, ExecutionCancellationScope("view", 1), lease)
+    owner = _own_output(query, lease, size)
     ref.attach_query_output_lease(owner)
     view = ref.to_table()
     ref.release()
@@ -484,7 +484,7 @@ def test_production_completion_waits_for_active_execution_but_retains_output_byt
     pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
     authority = _authority(query, bindings["0"], pool)
     lease = _take(authority)
-    owner = query.own_output(lease.lease["query_policy_task"], 50, ExecutionCancellationScope("finish", 1), lease)
+    owner = _own_output(query, lease, 50)
     try:
         authority.finished_submitting()
         assert bindings["0"] not in query._completed_units
@@ -496,6 +496,117 @@ def test_production_completion_waits_for_active_execution_but_retains_output_byt
     finally:
         owner.release()
         lease.release()
+        query.shutdown()
+        pool.close()
+
+
+@pytest.mark.parametrize("finish", ["read", "cancel"])
+def test_unread_output_retains_policy_identity_after_execution_finishes(finish):
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation())
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    authority = _authority(query, bindings["0"], pool)
+    lease = _take(authority)
+    output = query.buffer_output(lease.lease["query_policy_task"], 50)
+    owner = None
+    try:
+        authority.finished_submitting()
+        lease.complete_execution()
+        assert pool.active_lease_count == 0
+        state = query.snapshot()["units"][bindings["0"]]
+        assert state["num_task_outputs_generated"] == state["pending_output_count"] == 0
+        assert state["num_tasks_finished"] == 0
+        assert bindings["0"] not in query._completed_units
+        if finish == "read":
+            output.request(lambda: None)
+            owner = output.take()
+            assert owner is not None
+            assert query.snapshot()["usage"]["object_store_bytes"] == 50
+        else:
+            output.close()
+            assert query.snapshot()["usage"]["object_store_bytes"] == 0
+        assert bindings["0"] in query._completed_units
+        assert query.snapshot()["units"][bindings["0"]]["num_tasks_finished"] == 1
+    finally:
+        output.close()
+        if owner is not None:
+            owner.release()
+        lease.release()
+        query.shutdown()
+        pool.close()
+
+
+def test_output_wakeup_runs_outside_admission_and_coordinator_locks():
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation(store=1), coordinator=LocalQueryCoordinator())
+    pool = LocalExecutionSlotPool(max_slots=2, execution_slot_prefix="task")
+    authority = _authority(query, bindings["0"], pool)
+    lease = _take(authority)
+    first = _own_output(query, lease, 100)
+    second = query.buffer_output(lease.lease["query_policy_task"], 100)
+    notified = threading.Event()
+    owners = []
+    failures = []
+
+    def wakeup():
+        def consume():
+            try:
+                owners.append(second.take())
+                query._drive()
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=consume)
+        thread.start()
+        thread.join(2)
+        if thread.is_alive():
+            failures.append("output callback retained an admission lock")
+        notified.set()
+
+    try:
+        second.request(wakeup)
+        assert second.take() is None
+        first.release()
+        assert notified.wait(3)
+        assert not failures
+        assert len(owners) == 1 and owners[0] is not None
+    finally:
+        first.release()
+        second.close()
+        for owner in owners:
+            if owner is not None:
+                owner.release()
+        lease.release()
+        authority.close()
+        query.shutdown()
+        pool.close()
+
+
+@pytest.mark.parametrize("take_grant", [False, True])
+def test_cancelling_granted_output_releases_exact_lease_once(take_grant):
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation())
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    authority = _authority(query, bindings["0"], pool)
+    lease = _take(authority)
+    output = query.buffer_output(lease.lease["query_policy_task"], 50)
+    owner = None
+    try:
+        output.request(lambda: None)
+        lease.complete_execution()
+        if take_grant:
+            owner = output.take()
+            assert owner is not None
+        output.close()
+        output.close()
+        assert query.snapshot()["usage"]["object_store_bytes"] == (50 if take_grant else 0)
+        assert not query._buffered_outputs
+    finally:
+        output.close()
+        if owner is not None:
+            owner.release()
+        lease.release()
+        authority.close()
         query.shutdown()
         pool.close()
 

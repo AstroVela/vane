@@ -6043,6 +6043,8 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
@@ -6195,6 +6197,8 @@ def test_subprocess_wakeup_callback_errors_are_reported_on_ready_result_take():
     executor._wakeup = lambda: (_ for _ in ()).throw(RuntimeError("wakeup failed"))
     executor._queue = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._wakeup_error = None
 
@@ -9628,6 +9632,8 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9695,6 +9701,8 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
         ]
     )
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = lambda: events.append("unregister")
     executor._execution_scopes_lock = threading.Lock()
@@ -9924,6 +9932,8 @@ def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypa
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9973,6 +9983,8 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._task_futures_cv = threading.Condition()
@@ -10038,6 +10050,8 @@ def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -10114,6 +10128,8 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     executor._pending_lock = threading.Lock()
     executor._pending_batches = 0
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._queue = deque()
     executor._result_admissions = deque()
@@ -10168,6 +10184,8 @@ def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
@@ -10216,6 +10234,8 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
     executor._queue = deque([(ref_bundle.SUBMIT_RESULT_MARKER, 41, result)])
     executor._result_admissions = deque([admission])
     executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
