@@ -3335,3 +3335,135 @@ def test_resource_maintenance_propagates_cancellation(monkeypatch, cancel_stage)
     assert calls == (["cleanup"] if cancel_stage == "cleanup" else ["cleanup", "refresh"])
     assert runner._query_resource_maintenance_error == ""
     assert runner._query_resource_maintenance_failures == 0
+
+
+@pytest.mark.parametrize("busy_state", ["closing_ready", "pending", "cleanup_retry"])
+def test_busy_query_cleanup_does_not_block_other_timeouts_or_resource_refresh(monkeypatch, busy_state):
+    from vane.runners.ray.driver import _query_udf_actor_lifecycle_lock
+
+    runner, _, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    if busy_state == "closing_ready":
+        init.set_result("node-a")
+    pool._vane_init_deadline = 0
+    if busy_state == "cleanup_retry":
+
+        def fail_shutdown(*, kill):
+            assert kill is True
+            raise RuntimeError("retry this actor kill")
+
+        pool.shutdown = fail_shutdown
+        with pytest.raises(RuntimeError, match="retry this actor kill"):
+            runner._expire_pending_udf_actor_pools(now=1)
+        pool.shutdown = lambda **_kwargs: pool.actors.clear()
+
+    second_pool = SimpleNamespace(
+        actors=["actor-q2"],
+        _confirmed_ready=set(),
+        _vane_retired=False,
+        _vane_init_deadline=0,
+        _vane_init_timeout=0.01,
+        _vane_init_timed_out=False,
+        _payload={"cpus": 1, "gpus": 1},
+        _resolve_actor_num_cpus=lambda payload: payload["cpus"],
+    )
+
+    def shutdown_second(*, kill):
+        assert kill is True
+        second_pool.actors.clear()
+
+    second_pool.shutdown = shutdown_second
+    runner._active_udf_actor_by_unit["q2"] = {"resource:q2:actor": second_pool}
+    runner._active_udf_actors.append(second_pool)
+    runner._active_udf_actors_by_plan["q2"] = [second_pool]
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    refresh_called = threading.Event()
+    errors = []
+
+    def wait_for_release():
+        lock_held.set()
+        assert release_lock.wait(10)
+
+    def close_ready():
+        wait_for_release()
+        pool.actors.clear()
+
+    def hold_query_lock():
+        try:
+            if busy_state == "closing_ready":
+                pool.shutdown = close_ready
+                runner._cleanup_udf_actor_pools("q1")
+            else:
+                with _query_udf_actor_lifecycle_lock(runner, "q1"):
+                    wait_for_release()
+        except BaseException as exc:
+            errors.append(exc)
+
+    owner = threading.Thread(target=hold_query_lock)
+    owner.start()
+    runner._query_resource_maintenance_interval_s = 0.001
+    runner._query_resource_maintenance_error = ""
+    runner._query_resource_maintenance_failures = 0
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        runner._query_resource_maintenance_stop = stop
+
+        def refresh():
+            refresh_called.set()
+            loop.call_soon_threadsafe(stop.set)
+
+        runner._maintain_query_resources_once = refresh
+        task = asyncio.create_task(runner._query_resource_maintenance_loop())
+        try:
+            assert await asyncio.to_thread(refresh_called.wait, 2), "resource refresh waited for q1's cleanup lock"
+            assert second_pool.actors == [], "q2 timeout waited for q1's cleanup lock"
+            assert pool.actors == ["actor-0"]
+            assert runner._active_udf_actors_by_plan == {"q1": [pool]}
+            expected_pending = {"q1"} if busy_state == "cleanup_retry" else set()
+            assert runner._udf_actor_timeout_cleanup_pending == expected_pending
+        finally:
+            release_lock.set()
+            await asyncio.to_thread(owner.join, 5)
+            await asyncio.wait_for(task, timeout=5)
+
+    try:
+        assert lock_held.wait(5)
+        asyncio.run(scenario())
+    finally:
+        release_lock.set()
+        owner.join(5)
+    assert not owner.is_alive()
+    assert not errors
+    assert runner._query_resource_maintenance_failures == 0
+    # Deferred expiry and kill retries remain live and complete once the lock is free.
+    runner._expire_pending_udf_actor_pools(now=1)
+    assert pool.actors == []
+    assert runner._active_udf_actors_by_plan == {}
+    assert runner._udf_actor_timeout_cleanup_pending == set()
+
+
+@pytest.mark.parametrize("new_state", ["ready", "retired"])
+def test_timeout_scan_rechecks_pool_state_after_snapshot(monkeypatch, new_state):
+    import vane.runners.ray.driver as driver
+
+    runner, manager, pool, _ = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    original_lock = driver._query_udf_actor_lifecycle_lock
+
+    def change_state(owner, query_id):
+        lock = original_lock(owner, query_id)
+        with runner._session_lock:
+            if new_state == "ready":
+                pool._confirmed_ready.add(0)
+            else:
+                pool._vane_retired = True
+        return lock
+
+    monkeypatch.setattr(driver, "_query_udf_actor_lifecycle_lock", change_state)
+    runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline)
+    assert not manager.failures
+    assert pool.actors == ["actor-0"]
+    assert runner._udf_actor_timeout_cleanup_pending == set()
