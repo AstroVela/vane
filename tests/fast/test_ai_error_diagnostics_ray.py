@@ -107,8 +107,46 @@ def _diagnostic_failure(forged):
     return fail
 
 
+def _diagnostic_sink():
+    from vane.datasink import BoundDataSink, DataSink, DataSinkExecutionOptions, DataSinkWorker, WriteResult
+
+    class Worker(DataSinkWorker):
+        def write(self, table):
+            return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+    class Bound(BoundDataSink):
+        @property
+        def execution_options(self):
+            return DataSinkExecutionOptions(worker_count=1, cpus=1)
+
+        def open_worker(self, context):
+            return Worker()
+
+    class Sink(DataSink):
+        def bind(self, schema):
+            return Bound()
+
+    return Sink()
+
+
+def _assert_datasink_failure(error, forged):
+    import pickle
+
+    from vane.ai import summarize_error
+    from vane.datasink import DataSinkWriteError, WriteOutcome
+
+    for _ in range(2):
+        assert isinstance(error, DataSinkWriteError) and error.outcome is WriteOutcome.UNKNOWN
+        assert error.operation_id == "diagnostic-datasink"
+        summary = summarize_error(error)
+        assert "private" not in summary
+        if not forged:
+            assert "max_model_len" in summary
+        error = pickle.loads(pickle.dumps(error))
+
+
 @pytest.mark.parametrize("stage", ["initialization", "batch"])
-@pytest.mark.parametrize("output", ["fetchall", "parquet"])
+@pytest.mark.parametrize("output", ["fetchall", "parquet", "datasink"])
 @pytest.mark.parametrize("forged", [False, True])
 def test_query_failure_survives_initialization_and_copy(
     monkeypatch, tmp_path, diagnostic_query_runtime, stage, output, forged
@@ -143,15 +181,19 @@ def test_query_failure_survives_initialization_and_copy(
         with pytest.raises(Exception) as caught:
             if output == "parquet":
                 relation.write_parquet(str(tmp_path / "result.parquet"))
+            elif output == "datasink":
+                relation.write_datasink(_diagnostic_sink(), operation_id="diagnostic-datasink")
             else:
                 relation.fetchall()
         summary = summarize_error(caught.value)
         assert summary and "private" not in summary
         if not forged:
             assert "max_model_len" in summary and "TypeError" in summary
+        if output == "datasink":
+            _assert_datasink_failure(caught.value, forged)
 
 
-@pytest.mark.parametrize("output", ["fetchall", "parquet"])
+@pytest.mark.parametrize("output", ["fetchall", "parquet", "datasink"])
 @pytest.mark.parametrize("forged", [False, True])
 def test_late_actor_initialization_failure_survives_query_transport(
     monkeypatch, tmp_path, diagnostic_query_runtime, output, forged
@@ -207,12 +249,16 @@ def test_late_actor_initialization_failure_survives_query_transport(
             with pytest.raises(Exception) as caught:
                 if output == "parquet":
                     relation.write_parquet(str(tmp_path / "late-init.parquet"))
+                elif output == "datasink":
+                    relation.write_datasink(_diagnostic_sink(), operation_id="diagnostic-datasink")
                 else:
                     relation.fetchall()
             summary = summarize_error(caught.value)
             assert summary and "private" not in summary
             if not forged:
                 assert "max_model_len" in summary and "TypeError" in summary
+            if output == "datasink":
+                _assert_datasink_failure(caught.value, forged)
     finally:
         ray.kill(coordinator)
 

@@ -1766,8 +1766,14 @@ def test_query_driver_marks_unknown_result_when_cancelled_during_teardown(monkey
     assert plan_id not in runner._plan_lifecycles
 
 
-def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outcome(monkeypatch):
-    from vane.ai import DiagnosticError
+@pytest.mark.parametrize("returned", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outcome(
+    monkeypatch, returned, cleanup_failure
+):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "datasink-late-initialization"
@@ -1781,10 +1787,22 @@ def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outco
                 "Ray actor UDF pool initialization failed",
                 TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
             )
+            if returned:
+                return {
+                    "outcome_unknown": True,
+                    "outcome_aborted": False,
+                    "outcome_cancelled": False,
+                    "outcome_error": "FTE worker reservation failed: query_failed",
+                    "write_results": [],
+                    "data_sink_cleanup_warnings": [],
+                }
             raise RuntimeError("FTE worker reservation failed: query_failed")
 
     def teardown(_self, actual_plan_id, expected_lifecycle):
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            cleanup = RayTaskError("close", "private traceback", OSError(5, "private path"))
+            raise driver._QueryCleanupDiagnostic("private cleanup", (cleanup,))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1799,7 +1817,10 @@ def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outco
     assert result["outcome_unknown"] is True
     assert result["outcome_aborted"] is False
     assert result["outcome_cancelled"] is False
-    assert "max_model_len" in result["outcome_error"]
+    summary = summarize_error(pickle.loads(pickle.dumps(result["outcome_diagnostic"])))
+    assert "max_model_len" in summary and "private" not in summary
+    if cleanup_failure:
+        assert "cleanup: OSError (errno=5)" in summary
 
 
 def test_query_driver_marks_failed_execution_when_cancelled_during_cleanup(monkeypatch):

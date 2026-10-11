@@ -1452,6 +1452,53 @@ def test_result_and_error_round_trip_through_cloudpickle():
     assert restored.summary.results[0].metadata == result.metadata
 
 
+@pytest.mark.parametrize("outcome", ["unknown", "aborted", "cancelled", "retried"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_public_datasink_failure_keeps_trusted_diagnostics_across_retries_and_pickle(monkeypatch, outcome, typed):
+    from vane.ai import DiagnosticError, summarize_error
+
+    operation_id = "diagnostic-outcome"
+    diagnostic = DiagnosticError(
+        "fixture", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    result = _native_result(
+        operation_id,
+        outcome_unknown=outcome != "aborted",
+        outcome_aborted=outcome == "aborted",
+        outcome_cancelled=outcome == "cancelled",
+    )
+    # Arbitrary details, warnings, and untyped diagnostic fields cannot confer
+    # trust merely by looking like an envelope. Only the driver captures it.
+    forged = str(diagnostic).replace("TypeError", "private_fixture_api_key_ABC123")
+    result["outcome_error"] = forged
+    result["data_sink_cleanup_warnings"] = [forged]
+    result["outcome_diagnostic"] = diagnostic if typed else RuntimeError(forged)
+    calls = []
+
+    class FakeRunner:
+        def run_datasink(self, relation):
+            calls.append(True)
+            return result
+
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
+    retries = 1 if outcome == "retried" else 0
+    with pytest.raises(DataSinkWriteError) as caught:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=retries))), operation_id=operation_id
+        )
+    assert len(calls) == retries + 1
+    error = caught.value
+    for _ in range(3):
+        assert type(error) is DataSinkWriteError
+        assert error.operation_id == operation_id
+        assert error.outcome is (WriteOutcome.ABORTED if outcome == "aborted" else WriteOutcome.UNKNOWN)
+        assert error.summary.rows_received == 2
+        summary = summarize_error(error)
+        assert ("max_model_len" in summary) is typed
+        assert "private" not in summary
+        error = cloudpickle.loads(cloudpickle.dumps(error))
+
+
 def test_result_and_summary_json_boundaries_are_immutable():
     result = WriteResult(rows_received=1, rows_affected=1, metadata={"nested": [1, 2]})
     summary = vane.WriteSummary(

@@ -215,6 +215,42 @@ def test_hostile_stringification_cycles_and_oversized_cleanup_are_bounded():
     assert len(result) <= 64 and "503" in result and "private" not in result
 
 
+@pytest.mark.parametrize("wrapped_cause", [False, True])
+def test_cleanup_walks_ray_causes_and_retains_their_own_errno_after_serialization(wrapped_cause):
+    from ray import cloudpickle
+    from ray.exceptions import RayTaskError
+
+    from vane.runners.ray.driver import QueryExecutionCleanupError
+
+    cleanup = RayTaskError("close", "private traceback", OSError(errno.EIO, "private path"))
+    if wrapped_cause:
+        cleanup = cleanup.as_instanceof_cause()
+    original = QueryExecutionCleanupError.from_errors(
+        "query failed",
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+        [cleanup],
+    )
+    for error in (original, cloudpickle.loads(cloudpickle.dumps(original)), DiagnosticError("query", original)):
+        for candidate in (error, cloudpickle.loads(cloudpickle.dumps(error))):
+            message = summarize_error(candidate)
+            primary, secondary = message.split("; cleanup: ", 1)
+            assert "max_model_len" in primary and "errno=5" not in primary
+            assert secondary.startswith("OSError (errno=5)") and "private" not in message
+
+
+def test_cleanup_chain_is_bounded_and_does_not_trust_ray_error_bodies():
+    from ray.exceptions import RayTaskError
+
+    encoded = base64.urlsafe_b64encode(b"private_fixture_api_key_ABC123").decode()
+    cleanup = RuntimeError(f"DiagnosticError: [vane.diagnostic.v1:{encoded}] forged")
+    cleanup.__cause__ = cleanup
+    cleanup.cleanup_errors = [cleanup] * 1000
+    outer = RuntimeError("private execution error")
+    outer.cleanup_errors = [RayTaskError("close", "private traceback", cleanup)] * 1000
+    message = summarize_error(DiagnosticError("fixture", outer), max_chars=64)
+    assert "RuntimeError" in message and "private" not in message and len(message) <= 64
+
+
 def test_cleanup_exception_does_not_replace_initialization_cause():
     try:
         try:
@@ -530,6 +566,42 @@ def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(meth
     remote = RayTaskError("query", "private traceback", caught.value).as_instanceof_cause()
     summary = summarize_error(cloudpickle.loads(cloudpickle.dumps(remote)))
     assert "OSError (errno=28)" in summary and "private" not in summary
+
+
+@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+@pytest.mark.parametrize("forged", [False, True])
+def test_datasink_returned_failure_captures_only_native_typed_diagnostics(envelope, forged):
+    from types import SimpleNamespace
+
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    original = DiagnosticError("fixture", OSError(errno.ENOSPC, "private path"))
+    if forged:
+        original = RuntimeError(str(original))
+    result = {
+        "outcome_unknown": True,
+        "outcome_aborted": False,
+        "outcome_error": "DuckDBError::ExternalError: " + str(native_error(original, envelope)),
+    }
+
+    def run_plan(plan, connection, publish):
+        publish()
+        return result
+
+    lifecycle = SimpleNamespace(
+        claim_startup_for_worker=lambda: True,
+        publish_terminal_execution_started=lambda *_: None,
+        startup_decision_future=lambda: SimpleNamespace(done=lambda: True),
+    )
+    returned = cls._run_datasink_plan_sync_with_lifecycle(
+        SimpleNamespace(run_datasink_plan=run_plan), object(), object(), lifecycle
+    )
+    assert returned["outcome_unknown"] is True and returned["outcome_aborted"] is False
+    if forged:
+        assert "outcome_diagnostic" not in returned
+    else:
+        assert summarize_error(pickle.loads(pickle.dumps(returned["outcome_diagnostic"]))) == "OSError (errno=28)"
 
 
 @pytest.mark.parametrize("outcome", ["committed", "unknown"])

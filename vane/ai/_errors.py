@@ -10,6 +10,7 @@ import binascii
 import json
 import re
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 _ENGINE_OPTIONS = frozenset(
@@ -215,7 +216,7 @@ def _transported_summary(message: str) -> str:
     parts = []
     position, cleanup_count = 0, 0
     separator = ""
-    for _ in range(19):
+    for _ in range(64):
         match = _TYPE.match(message, position)
         if match is None:
             break
@@ -269,6 +270,7 @@ def _native_invalid_input_message(message: str) -> str | None:
 
 def _native_summary(message: str) -> str | None:
     """Decode only complete native UDF envelopes, never search arbitrary text."""
+    message = message.removeprefix("DuckDBError::ExternalError: ")
     prefix = "FTE query wait failed: FTE query failed: Execution failed: "
     if message.startswith(prefix):
         nested = _native_invalid_input_message(message[len(prefix) :])
@@ -339,34 +341,16 @@ def _summary(error: BaseException) -> str:
     return f"{name} ({', '.join(details)})" if details else name
 
 
-def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
-    """Return bounded root-cause and cleanup diagnostics safe for API responses.
-
-    Unknown messages retain their exception type; known technical messages are
-    reconstructed from a closed vocabulary. Follows bounded Python/Ray chains
-    without importing Ray, inspecting tracebacks or invoking exception __str__.
-    """
-    if not isinstance(error, BaseException):
-        raise TypeError("error must be an exception")
-    if type(max_chars) is not int or not 64 <= max_chars <= 4096:
-        raise ValueError("max_chars must be between 64 and 4096")
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    """Walk one bounded cause chain, equally for execution and cleanup."""
     seen: set[int] = set()
     current = error
-    summaries: list[str] = []
-    cleanup: list[str] = []
     for _ in range(16):
         if id(current) in seen:
             break
         seen.add(id(current))
-        summary = _summary(current)
-        if summary not in summaries:
-            summaries.append(summary)
+        yield current
         attrs = _attributes(current)
-        failures = attrs.get("cleanup_errors", ())
-        if type(failures) in (tuple, list):
-            for failure in failures[:3]:
-                if isinstance(failure, BaseException) and len(cleanup) < 3:
-                    cleanup.append(_summary(failure))
         following = next(
             (
                 attrs[key]
@@ -390,6 +374,33 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
         if following is None:
             break
         current = following
+
+
+def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
+    """Return bounded root-cause and cleanup diagnostics safe for API responses.
+
+    Unknown messages retain their exception type; known technical messages are
+    reconstructed from a closed vocabulary. Follows bounded Python/Ray chains
+    without importing Ray, inspecting tracebacks or invoking exception __str__.
+    """
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be an exception")
+    if type(max_chars) is not int or not 64 <= max_chars <= 4096:
+        raise ValueError("max_chars must be between 64 and 4096")
+    summaries: list[str] = []
+    cleanup: list[str] = []
+    for current in _exception_chain(error):
+        summary = _summary(current)
+        if summary not in summaries:
+            summaries.append(summary)
+        failures = _attributes(current).get("cleanup_errors", ())
+        if type(failures) in (tuple, list):
+            for failure in failures[:3]:
+                if isinstance(failure, BaseException) and len(cleanup) < 3:
+                    # At most three cleanup chains of sixteen nodes; do not
+                    # recurse into cleanup_errors (which can contain cycles).
+                    parts = list(dict.fromkeys(_summary(cause) for cause in _exception_chain(failure)))
+                    cleanup.append(" <- ".join(reversed(parts)))
     result = " <- ".join(reversed(summaries))
     if cleanup:
         suffix = "; cleanup: " + "; ".join(cleanup)

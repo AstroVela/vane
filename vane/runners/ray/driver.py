@@ -729,6 +729,30 @@ def _run_native_query(operation: Callable[..., Any], *args: Any) -> Any:
     raise diagnostic from None
 
 
+def _capture_datasink_diagnostic(
+    result: dict[str, Any],
+    primary_error: BaseException | None = None,
+    cleanup_error: BaseException | None = None,
+) -> None:
+    """Carry typed diagnostics without changing the native write outcome."""
+    if result.get("outcome_unknown") is not True and result.get("outcome_aborted") is not True:
+        return
+    from vane.ai import DiagnosticError
+
+    existing = result.get("outcome_diagnostic")
+    if isinstance(existing, DiagnosticError) and (
+        primary_error is None or isinstance(primary_error, asyncio.CancelledError)
+    ):
+        primary_error = existing
+    if cleanup_error is not None:
+        failures = cleanup_error.diagnostics if isinstance(cleanup_error, _QueryCleanupDiagnostic) else (cleanup_error,)
+        primary_error = QueryExecutionCleanupError(
+            "DataSink cleanup failed", primary_error=primary_error, cleanup_errors=failures
+        )
+    if primary_error is not None:
+        result["outcome_diagnostic"] = DiagnosticError("DataSink execution", primary_error)
+
+
 @dataclass
 class _ClientOwnerLease:
     lease_token: str
@@ -7142,6 +7166,14 @@ class RayQueryDriverActor:
             )
             lifecycle.fail_startup(startup_contract_error)
             raise startup_contract_error
+        if isinstance(result, dict) and isinstance(detail := result.get("outcome_error"), str) and detail:
+            from vane.ai._errors import _native_query_diagnostic
+
+            # Unlike COPY, native DataSink can return a failed outcome rather
+            # than raise. Only this native producer boundary may decode it.
+            diagnostic = _native_query_diagnostic(RuntimeError(detail))
+            if diagnostic is not None:
+                _capture_datasink_diagnostic(result, diagnostic)
         return result
 
     def _ensure_copy_operation_state(self) -> None:
@@ -7893,6 +7925,7 @@ class RayQueryDriverActor:
                 add_cleanup_warning(public_result, "DataSink execution finalization", primary_error)
                 if teardown_error is not None:
                     add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
+                _capture_datasink_diagnostic(public_result, primary_error, teardown_error)
                 return public_result
             if execution_started:
                 detail = self._copy_cleanup_warning("DataSink execution", primary_error)
@@ -7907,6 +7940,7 @@ class RayQueryDriverActor:
                 }
                 if teardown_error is not None:
                     add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
+                _capture_datasink_diagnostic(public_result, primary_error, teardown_error)
                 return public_result
             if cancellation_error is not None:
                 if cancellation_error is execution_error:
@@ -7923,6 +7957,7 @@ class RayQueryDriverActor:
                 raise
             raise primary_error from execution_error
 
+        terminal_error = self._query_terminal_errors.get(self._plan_query_ids.get(plan_id, ""))
         teardown_error = None
         try:
             await _run_in_executor_with_owned_side_effects(
@@ -7941,6 +7976,7 @@ class RayQueryDriverActor:
             public_result["outcome_cancelled"] = True
         if teardown_error is not None:
             add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
+        _capture_datasink_diagnostic(public_result, terminal_error, teardown_error)
         return public_result
 
     async def _run_copy_plan_for_session(
