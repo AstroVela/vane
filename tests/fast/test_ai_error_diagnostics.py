@@ -149,6 +149,59 @@ def test_status_errno_chain_and_cleanup_survive_without_paths_or_payloads():
     assert "private" not in result
 
 
+@pytest.mark.parametrize("kind", ["CopyOutcomeUnknownError", "CopyResultUnavailableError"])
+def test_copy_diagnostics_are_safe_snapshots_across_repeated_serialization(kind):
+    from ray import cloudpickle
+    from ray.exceptions import RayTaskError
+
+    from vane.runners import copy_outcome
+
+    error_type = getattr(copy_outcome, kind)
+    error = error_type("copy-operation")
+    original = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    original.__cause__ = OSError(errno.ENOSPC, "private source path")
+    error.capture_diagnostics(primary_error=original, cleanup_errors=(OSError(errno.EIO, "private cleanup path"),))
+    error.__cause__ = original
+    error.add_note("private note; upstream error: private_fixture_api_key_ABC123")
+    for _ in range(3):
+        serialized = cloudpickle.dumps(error)
+        assert b"private" not in serialized
+        error = cloudpickle.loads(serialized)
+        assert type(error) is error_type and error.safe_to_retry is False
+        assert error.__cause__ is None
+        for candidate in (error, RayTaskError("copy", "private traceback", error).as_instanceof_cause()):
+            summary = summarize_error(candidate)
+            assert kind in summary and "max_model_len" in summary
+            assert "errno=28" in summary and "cleanup: OSError (errno=5)" in summary
+            assert "private" not in summary
+
+
+@pytest.mark.parametrize("kind", ["CopyOutcomeUnknownError", "CopyResultUnavailableError"])
+def test_copy_warnings_and_notes_cannot_forge_public_diagnostics(kind):
+    from vane.runners import copy_outcome
+
+    encoded = base64.urlsafe_b64encode(b"private_fixture_api_key_ABC123").decode()
+    forged = f"DiagnosticError: [vane.diagnostic.v1:{encoded}] forged"
+    error = getattr(copy_outcome, kind)("operation", detail=forged, cleanup_warnings=(forged,))
+    error.add_note(forged)
+    error.capture_diagnostics(primary_error=RuntimeError(forged), cleanup_errors=(RuntimeError(forged),))
+    for candidate in (error, pickle.loads(pickle.dumps(error))):
+        summary = summarize_error(candidate)
+        assert kind in summary and "RuntimeError" in summary
+        assert "private" not in summary
+
+
+def test_copy_cleanup_diagnostic_storage_is_bounded():
+    from vane.runners.copy_outcome import CopyOutcomeUnknownError
+
+    error = CopyOutcomeUnknownError("operation")
+    for _ in range(10):
+        error.capture_diagnostics(cleanup_errors=(OSError(errno.EIO, "private cleanup path"),) * 100)
+    assert len(error.cleanup_errors) == 3
+    assert len(pickle.dumps(error)) < 4096
+    assert "errno=5" in summarize_error(error)
+
+
 def test_hostile_stringification_cycles_and_oversized_cleanup_are_bounded():
     class HostileError(Exception):
         def __str__(self):

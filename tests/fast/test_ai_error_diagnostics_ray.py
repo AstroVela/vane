@@ -215,3 +215,57 @@ def test_late_actor_initialization_failure_survives_query_transport(
                 assert "max_model_len" in summary and "TypeError" in summary
     finally:
         ray.kill(coordinator)
+
+
+@pytest.mark.parametrize("kind", ["unknown", "unavailable", "terminal_cleanup"])
+def test_copy_and_terminal_cleanup_diagnostics_survive_real_ray(diagnostic_query_runtime, kind):
+    import ray
+
+    from vane.ai import summarize_error
+
+    @ray.remote(num_cpus=0)
+    def fail():
+        import errno
+        from types import SimpleNamespace
+
+        from vane.ai import DiagnosticError
+        from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
+        from vane.runners.ray.driver import RayQueryDriverActor, _QueryCleanupDiagnostic
+
+        primary = DiagnosticError(
+            "actor initialization",
+            TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+        )
+        cleanup = OSError(errno.EIO, "private cleanup path")
+        if kind == "terminal_cleanup":
+
+            @ray.remote(num_cpus=0)
+            def failed_cleanup():
+                raise cleanup
+
+            try:
+                ray.get(failed_cleanup.remote(), timeout=15)
+            except ray.exceptions.RayTaskError as error:
+                cleanup = error
+
+            def teardown(*args):
+                raise _QueryCleanupDiagnostic("private cleanup output", (cleanup,))
+
+            runner = SimpleNamespace(_query_terminal_errors={"query": primary}, _teardown_plan_resources=teardown)
+            RayQueryDriverActor.__ray_metadata__.modified_class._finish_terminal_query(runner, "plan", "query")
+        else:
+            error_type = CopyOutcomeUnknownError if kind == "unknown" else CopyResultUnavailableError
+            error = error_type("operation")
+            error.capture_diagnostics(primary_error=primary, cleanup_errors=(cleanup,))
+            raise error from primary
+
+    with pytest.raises(ray.exceptions.RayTaskError) as caught:
+        ray.get(fail.remote(), timeout=30)
+    summary = summarize_error(caught.value)
+    assert "max_model_len" in summary and "cleanup: OSError (errno=5)" in summary
+    assert "private" not in summary
+    if kind != "terminal_cleanup":
+        assert caught.value.cause.operation_id == "operation"
+        assert caught.value.cause.safe_to_retry is False
+        if kind == "unavailable":
+            assert caught.value.cause.write_state == "committed"

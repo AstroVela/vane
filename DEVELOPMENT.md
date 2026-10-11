@@ -405,6 +405,10 @@ messages are never interpreted as diagnostic envelopes, even if they contain
 typed cause chain before Ray serializes it, and executor creation captures it
 before the native dispatcher converts the exception to text. The Ray driver
 captures native diagnostics at result-stream, COPY and DataSink call boundaries.
+COPY outcome exceptions retain sanitized cause/cleanup snapshots in their pickle
+state while preserving the committed/unknown outcome type and retry restrictions.
+Terminal query cleanup failures are captured from their exception objects into
+the transport summary; arbitrary warning strings and exception notes are not parsed.
 A Ray wrapper never authorizes decoding a plain `RuntimeError` body. Native
 decoding is restricted to native exceptions and those native query producers;
 descriptions and model identifiers cannot replace the encoded summary. Known

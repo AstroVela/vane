@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import pickle
 import threading
@@ -2166,8 +2167,11 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
 
 
 @pytest.mark.parametrize("late_init", [False, True])
-def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch, late_init):
-    from vane.ai import DiagnosticError
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-native-outcome-unknown"
@@ -2201,6 +2205,8 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2222,9 +2228,18 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         assert error.value.safe_to_retry is False
         if late_init:
             assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
-        else:
+        elif not cleanup_failure:
             assert error.value.cleanup_warnings == ()
         assert "readback was inconclusive" in str(error.value)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyOutcomeUnknownError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2242,8 +2257,11 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
 
 
 @pytest.mark.parametrize("late_init", [False, True])
-def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch, late_init):
-    from vane.ai import DiagnosticError
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-result-unavailable"
@@ -2270,6 +2288,8 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2289,6 +2309,16 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         assert "planned result marshalling failure" in str(error.value)
         if late_init:
             assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyResultUnavailableError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.write_state == "committed"
+        assert restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2471,6 +2501,17 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert restored.cleanup_warnings == error.cleanup_warnings
     assert restored.safe_to_retry is False
     assert str(restored) == str(error)
+
+
+def test_copy_recovery_unknown_error_retains_safe_cause_after_serialization():
+    from vane.ai import summarize_error
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as caught:
+        driver._raise_copy_outcome_unknown("copy-recovery", OSError(errno.EIO, "private recovery path"))
+    restored = pickle.loads(pickle.dumps(caught.value))
+    assert restored.operation_id == "copy-recovery" and restored.safe_to_retry is False
+    assert "OSError (errno=5)" in summarize_error(restored)
+    assert "private" not in summarize_error(restored)
 
 
 def test_copy_result_unavailable_error_preserves_terminal_state_across_serialization():
@@ -7762,6 +7803,37 @@ def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
     assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(error.value)))
     assert error.value.cleanup_errors == (cleanup_error,)
     assert error.value.__cause__ is error.value.primary_error
+
+
+@pytest.mark.parametrize("ray_wrapped", [False, True])
+def test_terminal_query_serializes_cleanup_diagnostics_after_ownership_is_released(ray_wrapped):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
+
+    cls, runner = _make_local_query_driver_actor()
+    query_id = "terminal-cleanup-diagnostic"
+    runner._query_terminal_errors[query_id] = DiagnosticError(
+        "actor initialization", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    cleanup_errors = (OSError(errno.EIO, "private cleanup path"), OSError(errno.ENOSPC, "private journal path"))
+    if ray_wrapped:
+        cleanup_errors = tuple(RayTaskError("cleanup", "private traceback", error) for error in cleanup_errors)
+
+    def teardown(plan_id):
+        runner._query_terminal_errors.pop(query_id)
+        raise driver._QueryCleanupDiagnostic("private cleanup message", cleanup_errors)
+
+    runner._teardown_plan_resources = teardown
+    with pytest.raises(DiagnosticError) as caught:
+        cls._finish_terminal_query(runner, "terminal-plan", query_id)
+    serialized = pickle.dumps(caught.value)
+    assert b"private" not in serialized
+    for error in (caught.value, pickle.loads(serialized)):
+        summary = summarize_error(error)
+        assert "max_model_len" in summary
+        assert "; cleanup: OSError (errno=5)" in summary and "OSError (errno=28)" in summary
+    assert query_id not in runner._query_terminal_errors
 
 
 def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():

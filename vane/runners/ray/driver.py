@@ -379,7 +379,9 @@ def _raise_copy_outcome_unknown(
     )
     if unknown_error is not None:
         raise unknown_error
-    raise CopyOutcomeUnknownError(operation_id) from operation_error
+    unknown_error = CopyOutcomeUnknownError(operation_id)
+    unknown_error.capture_diagnostics(primary_error=operation_error)
+    raise unknown_error from operation_error
 
 
 def _runtime_error_contains(error: BaseException, error_type: type[BaseException]) -> bool:
@@ -6712,7 +6714,21 @@ class RayQueryDriverActor:
         try:
             self._teardown_plan_resources(plan_id)
         except _QueryCleanupDiagnostic as cleanup_diagnostic:
-            _add_exception_note(primary_error, f"query cleanup diagnostic: {cleanup_diagnostic}")
+            from vane.ai._errors import DiagnosticError
+
+            # Ownership has been released, but callable cleanup still failed.
+            # Capture the actual exceptions now: notes are untrusted text and
+            # neither the public summarizer nor DiagnosticError's pickle reads them.
+            primary_error = DiagnosticError(
+                f"terminal query {query_id} failed",
+                QueryExecutionCleanupError.from_errors(
+                    "terminal query cleanup",
+                    primary_error,
+                    tuple(
+                        DiagnosticError("terminal query cleanup", error) for error in cleanup_diagnostic.diagnostics[:3]
+                    ),
+                ),
+            )
         except BaseException as teardown_error:
             aggregate_error = QueryExecutionCleanupError.from_errors(
                 f"terminal query {query_id} failed and deterministic teardown also failed",
@@ -8133,6 +8149,18 @@ class RayQueryDriverActor:
                     None,
                     cleanup_state=cleanup_state,
                     cleanup_warnings=cleanup_warnings,
+                )
+            special_error = committed_result_error if committed_result_error is not None else unknown_outcome_error
+            if special_error is not None:
+                special_error.capture_diagnostics(
+                    primary_error=primary_error,
+                    cleanup_errors=(
+                        teardown_error.diagnostics
+                        if isinstance(teardown_error, _QueryCleanupDiagnostic)
+                        else (teardown_error,)
+                        if teardown_error is not None
+                        else ()
+                    ),
                 )
             if committed_result_error is not None:
                 if committed_result_error is not primary_error:
