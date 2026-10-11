@@ -414,6 +414,8 @@ decoding is restricted to native exceptions and those native query producers;
 descriptions and model identifiers cannot replace the encoded summary. Known
 safe provider failures such as `vllm returned no outputs` retain their explanation
 through wrapping and transport using a closed vocabulary.
+Remote vLLM/SGLang executors retain typed actor diagnostics, including failed
+submission acknowledgements and cleanup, before returning errors to native SQL.
 Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and
 isolated Ray regressions for initialization, fetching results and writing Parquet.
 The dependent Context HTTP regressions exercise actual `vane.cls.batch`

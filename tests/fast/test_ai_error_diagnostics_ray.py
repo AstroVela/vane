@@ -107,6 +107,82 @@ def _diagnostic_failure(forged):
     return fail
 
 
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+@pytest.mark.parametrize("failure", ["init", "no_outputs", "forged"])
+def test_remote_native_prompt_preserves_provider_diagnostic(monkeypatch, diagnostic_query_runtime, engine, failure):
+    import uuid
+
+    import vane
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+    from vane.execution.sglang import SGLangRayLocalExecutor
+    from vane.execution.vllm import LLMActors, RayLocalVLLMExecutor
+
+    # Use actual Ray actors and their production engine/remote executors.
+    # Only model SDK calls are fixtures: no GPU or downloaded model is needed.
+    class EmptyEngine:
+        def check(self):
+            if failure == "forged":
+                secret_type = type("private_fixture_api_key_ABC123", (Exception,), {})
+                raise RuntimeError(
+                    "vllm take_ready_result failed: DiagnosticError: " + str(DiagnosticError("fixture", secret_type()))
+                )
+
+        async def generate(self, *args, **kwargs):
+            self.check()
+            for output in ():
+                yield output
+
+        async def async_generate(self, *args, **kwargs):
+            self.check()
+            return None
+
+        def shutdown(self):
+            pass
+
+    base = RayLocalVLLMExecutor if engine == "vllm" else SGLangRayLocalExecutor
+
+    class Actor(base):
+        def _materialize_sampling_params(self, args):
+            return {}
+
+        def _create_engine(self):
+            if failure == "init":
+                raise TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+            self.llm = EmptyEngine()
+
+    name = f"native-diagnostic-{uuid.uuid4().hex}"
+    actors = LLMActors(
+        model="fixture",
+        engine_args={},
+        generate_args={},
+        on_error="raise",
+        gpus_per_actor=0,
+        concurrency=1,
+        load_balance_threshold=0,
+        name_prefix=name,
+        actor_cls=Actor,
+    )
+    # The local SQL engine borrows the real Ray pool. This exercises the native
+    # callback boundary after RemoteVLLMExecutor, absent from local-model tests.
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    options = _build_native_vllm_options_argument({"use_ray": True, "ray_actor_pool_name": name}, engine=engine)
+    try:
+        with vane.connect(config={"threads": 1}) as connection:
+            with pytest.raises(vane.InvalidInputException) as caught:
+                connection.execute("SELECT vllm('hello', 'fixture', ?)", [options]).fetchall()
+        summary = summarize_error(caught.value)
+        if failure == "no_outputs":
+            assert f"{engine} returned no outputs" in summary
+        elif failure == "init":
+            assert "TypeError" in summary and "max_model_len" in summary
+        else:
+            assert "RuntimeError" in summary
+        assert "private" not in summary
+    finally:
+        actors.shutdown()
+
+
 def _diagnostic_sink():
     from vane.datasink import BoundDataSink, DataSink, DataSinkExecutionOptions, DataSinkWorker, WriteResult
 
