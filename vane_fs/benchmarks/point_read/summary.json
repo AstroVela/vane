@@ -1,0 +1,5807 @@
+{
+  "status": "PASS",
+  "plan": {
+    "frozen_epoch": 1791705111.9550586,
+    "variants": [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    "states": [
+      "fresh",
+      "aged",
+      "history"
+    ],
+    "native_medium": "tmpfs",
+    "fuse_medium": "ext4",
+    "native_orders": [
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ],
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ],
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ]
+    ],
+    "fuse_orders": [
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ],
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ],
+      [
+        "blob",
+        "blob_point",
+        "external",
+        "external_point"
+      ],
+      [
+        "external_point",
+        "external",
+        "blob_point",
+        "blob"
+      ]
+    ],
+    "fuse_states": [
+      "fresh",
+      "aged"
+    ],
+    "measurement_scope": "Read-only query optimization. Writes, barriers, GC, schema and checkpoint policy unchanged. Native history adds 16 retained versions for first 1 MiB. FUSE reads use warmed O_RDWR direct I/O. Plain binaries only. No owned builds/tests overlap.",
+    "adoption_gates": {
+      "native_old_snapshot_cpu_improvement_minimum": 0.1,
+      "point_read_native_cpu_regression_maximum": 0.05,
+      "fuse_throughput_median_and_aggregate_ratio_minimum": 0.95,
+      "fuse_p99_latency_ratio_maximum": 1.2,
+      "fuse_p99_absolute_increase_allowance_seconds": 0.001
+    },
+    "global_cache_eviction": false,
+    "source_revision": "4e83455308faea9d5f6fc45200df20a608ec6f25"
+  },
+  "native": {
+    "fresh/blob/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.05754669,
+          "bytes": 67108864,
+          "throughput_mib": 1112.140420239635,
+          "cpu_seconds": 0.057001
+        },
+        {
+          "rep": 1,
+          "seconds": 0.056261747,
+          "bytes": 67108864,
+          "throughput_mib": 1137.5402189341899,
+          "cpu_seconds": 0.055789
+        },
+        {
+          "rep": 2,
+          "seconds": 0.05556288,
+          "bytes": 67108864,
+          "throughput_mib": 1151.8481403411774,
+          "cpu_seconds": 0.055999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.056062195,
+          "bytes": 67108864,
+          "throughput_mib": 1141.5892652793918,
+          "cpu_seconds": 0.057
+        },
+        {
+          "rep": 4,
+          "seconds": 0.056258758,
+          "bytes": 67108864,
+          "throughput_mib": 1137.6006558836582,
+          "cpu_seconds": 0.055971
+        },
+        {
+          "rep": 5,
+          "seconds": 0.057690922,
+          "bytes": 67108864,
+          "throughput_mib": 1109.3599786808747,
+          "cpu_seconds": 0.057968
+        }
+      ],
+      "median_mib_per_second": 1137.5704374089241,
+      "aggregate_mib_per_second": 1131.4644008652026,
+      "seconds_range": [
+        0.05556288,
+        0.057690922
+      ],
+      "median_cpu_seconds": 0.0564995,
+      "sum_cpu_seconds": 0.33972800000000003
+    },
+    "fresh/blob/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.176288561,
+          "bytes": 33554432,
+          "throughput_mib": 181.52056956208293,
+          "cpu_seconds": 0.175935
+        },
+        {
+          "rep": 1,
+          "seconds": 0.180882047,
+          "bytes": 33554432,
+          "throughput_mib": 176.9108683295695,
+          "cpu_seconds": 0.179986
+        },
+        {
+          "rep": 2,
+          "seconds": 0.171478864,
+          "bytes": 33554432,
+          "throughput_mib": 186.61191970574285,
+          "cpu_seconds": 0.170999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.175464809,
+          "bytes": 33554432,
+          "throughput_mib": 182.37275145012126,
+          "cpu_seconds": 0.174999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.169130925,
+          "bytes": 33554432,
+          "throughput_mib": 189.20253643737834,
+          "cpu_seconds": 0.168967
+        },
+        {
+          "rep": 5,
+          "seconds": 0.167538114,
+          "bytes": 33554432,
+          "throughput_mib": 191.00131448298387,
+          "cpu_seconds": 0.166999
+        }
+      ],
+      "median_mib_per_second": 184.49233557793207,
+      "aggregate_mib_per_second": 184.47643838104554,
+      "seconds_range": [
+        0.167538114,
+        0.180882047
+      ],
+      "median_cpu_seconds": 0.172999,
+      "sum_cpu_seconds": 1.037885
+    },
+    "fresh/blob/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.16360431,
+          "bytes": 1048576,
+          "throughput_mib": 6.1123084104569125,
+          "cpu_seconds": 0.163973
+        },
+        {
+          "rep": 1,
+          "seconds": 0.166040024,
+          "bytes": 1048576,
+          "throughput_mib": 6.022644275214029,
+          "cpu_seconds": 0.165938
+        },
+        {
+          "rep": 2,
+          "seconds": 0.162945813,
+          "bytes": 1048576,
+          "throughput_mib": 6.1370094854784645,
+          "cpu_seconds": 0.163
+        },
+        {
+          "rep": 3,
+          "seconds": 0.15886273,
+          "bytes": 1048576,
+          "throughput_mib": 6.294742637244116,
+          "cpu_seconds": 0.158999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.158265281,
+          "bytes": 1048576,
+          "throughput_mib": 6.318505193820747,
+          "cpu_seconds": 0.158984
+        },
+        {
+          "rep": 5,
+          "seconds": 0.157832256,
+          "bytes": 1048576,
+          "throughput_mib": 6.335840501449843,
+          "cpu_seconds": 0.157866
+        }
+      ],
+      "median_mib_per_second": 6.215876061361291,
+      "aggregate_mib_per_second": 6.201227257187655,
+      "seconds_range": [
+        0.157832256,
+        0.166040024
+      ],
+      "median_cpu_seconds": 0.16099950000000002,
+      "sum_cpu_seconds": 0.9687600000000001
+    },
+    "fresh/blob/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.195926139,
+          "bytes": 33554432,
+          "throughput_mib": 163.32685451429225,
+          "cpu_seconds": 0.195898
+        },
+        {
+          "rep": 1,
+          "seconds": 0.198043358,
+          "bytes": 33554432,
+          "throughput_mib": 161.58077868988667,
+          "cpu_seconds": 0.197993
+        },
+        {
+          "rep": 2,
+          "seconds": 0.191521147,
+          "bytes": 33554432,
+          "throughput_mib": 167.08337695993436,
+          "cpu_seconds": 0.190926
+        },
+        {
+          "rep": 3,
+          "seconds": 0.189074602,
+          "bytes": 33554432,
+          "throughput_mib": 169.24536485339263,
+          "cpu_seconds": 0.189
+        },
+        {
+          "rep": 4,
+          "seconds": 0.18984295,
+          "bytes": 33554432,
+          "throughput_mib": 168.5603810939516,
+          "cpu_seconds": 0.189899
+        },
+        {
+          "rep": 5,
+          "seconds": 0.187917158,
+          "bytes": 33554432,
+          "throughput_mib": 170.28780309672413,
+          "cpu_seconds": 0.187941
+        }
+      ],
+      "median_mib_per_second": 167.82187902694298,
+      "aggregate_mib_per_second": 166.61960906572224,
+      "seconds_range": [
+        0.187917158,
+        0.198043358
+      ],
+      "median_cpu_seconds": 0.1904125,
+      "sum_cpu_seconds": 1.151657
+    },
+    "fresh/blob_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.058718413,
+          "bytes": 67108864,
+          "throughput_mib": 1089.947713675436,
+          "cpu_seconds": 0.058998
+        },
+        {
+          "rep": 1,
+          "seconds": 0.057153512,
+          "bytes": 67108864,
+          "throughput_mib": 1119.791203732152,
+          "cpu_seconds": 0.058001
+        },
+        {
+          "rep": 2,
+          "seconds": 0.054741385,
+          "bytes": 67108864,
+          "throughput_mib": 1169.1337367514543,
+          "cpu_seconds": 0.055
+        },
+        {
+          "rep": 3,
+          "seconds": 0.055700881,
+          "bytes": 67108864,
+          "throughput_mib": 1148.994393822963,
+          "cpu_seconds": 0.055982
+        },
+        {
+          "rep": 4,
+          "seconds": 0.055211278,
+          "bytes": 67108864,
+          "throughput_mib": 1159.1834552353596,
+          "cpu_seconds": 0.054999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.056050409,
+          "bytes": 67108864,
+          "throughput_mib": 1141.82931296719,
+          "cpu_seconds": 0.055986
+        }
+      ],
+      "median_mib_per_second": 1145.4118533950764,
+      "aggregate_mib_per_second": 1137.522035860631,
+      "seconds_range": [
+        0.054741385,
+        0.058718413
+      ],
+      "median_cpu_seconds": 0.055984,
+      "sum_cpu_seconds": 0.338966
+    },
+    "fresh/blob_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.173209592,
+          "bytes": 33554432,
+          "throughput_mib": 184.7472742733555,
+          "cpu_seconds": 0.173974
+        },
+        {
+          "rep": 1,
+          "seconds": 0.174592521,
+          "bytes": 33554432,
+          "throughput_mib": 183.28391054047498,
+          "cpu_seconds": 0.173982
+        },
+        {
+          "rep": 2,
+          "seconds": 0.1684383,
+          "bytes": 33554432,
+          "throughput_mib": 189.98054480483356,
+          "cpu_seconds": 0.168999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.167129009,
+          "bytes": 33554432,
+          "throughput_mib": 191.4688550567544,
+          "cpu_seconds": 0.166917
+        },
+        {
+          "rep": 4,
+          "seconds": 0.166804124,
+          "bytes": 33554432,
+          "throughput_mib": 191.84177964328987,
+          "cpu_seconds": 0.166977
+        },
+        {
+          "rep": 5,
+          "seconds": 0.179187581,
+          "bytes": 33554432,
+          "throughput_mib": 178.5838048675929,
+          "cpu_seconds": 0.178999
+        }
+      ],
+      "median_mib_per_second": 187.36390953909452,
+      "aggregate_mib_per_second": 186.52346097386675,
+      "seconds_range": [
+        0.166804124,
+        0.179187581
+      ],
+      "median_cpu_seconds": 0.1714865,
+      "sum_cpu_seconds": 1.0298479999999999
+    },
+    "fresh/blob_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.161654603,
+          "bytes": 1048576,
+          "throughput_mib": 6.186028615590983,
+          "cpu_seconds": 0.160999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.17936085,
+          "bytes": 1048576,
+          "throughput_mib": 5.575352703781232,
+          "cpu_seconds": 0.17999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.156650712,
+          "bytes": 1048576,
+          "throughput_mib": 6.383628821297665,
+          "cpu_seconds": 0.155999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.156393062,
+          "bytes": 1048576,
+          "throughput_mib": 6.3941455408041055,
+          "cpu_seconds": 0.156977
+        },
+        {
+          "rep": 4,
+          "seconds": 0.15610673,
+          "bytes": 1048576,
+          "throughput_mib": 6.405873724982901,
+          "cpu_seconds": 0.156
+        },
+        {
+          "rep": 5,
+          "seconds": 0.161607517,
+          "bytes": 1048576,
+          "throughput_mib": 6.1878309781840155,
+          "cpu_seconds": 0.161952
+        }
+      ],
+      "median_mib_per_second": 6.28572989974084,
+      "aggregate_mib_per_second": 6.1742784306540965,
+      "seconds_range": [
+        0.15610673,
+        0.17936085
+      ],
+      "median_cpu_seconds": 0.15898800000000002,
+      "sum_cpu_seconds": 0.971917
+    },
+    "fresh/blob_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.193279221,
+          "bytes": 33554432,
+          "throughput_mib": 165.56358119841553,
+          "cpu_seconds": 0.192984
+        },
+        {
+          "rep": 1,
+          "seconds": 0.196327789,
+          "bytes": 33554432,
+          "throughput_mib": 162.99271826465687,
+          "cpu_seconds": 0.195985
+        },
+        {
+          "rep": 2,
+          "seconds": 0.185476844,
+          "bytes": 33554432,
+          "throughput_mib": 172.5282752816303,
+          "cpu_seconds": 0.18496
+        },
+        {
+          "rep": 3,
+          "seconds": 0.188261062,
+          "bytes": 33554432,
+          "throughput_mib": 169.97673156650947,
+          "cpu_seconds": 0.187999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.186877622,
+          "bytes": 33554432,
+          "throughput_mib": 171.23505563443013,
+          "cpu_seconds": 0.186994
+        },
+        {
+          "rep": 5,
+          "seconds": 0.191182254,
+          "bytes": 33554432,
+          "throughput_mib": 167.37955186991363,
+          "cpu_seconds": 0.190954
+        }
+      ],
+      "median_mib_per_second": 168.67814171821155,
+      "aggregate_mib_per_second": 168.21376723289595,
+      "seconds_range": [
+        0.185476844,
+        0.196327789
+      ],
+      "median_cpu_seconds": 0.1894765,
+      "sum_cpu_seconds": 1.1398760000000001
+    },
+    "fresh/external/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.038734589,
+          "bytes": 67108864,
+          "throughput_mib": 1652.2700163412087,
+          "cpu_seconds": 0.038964
+        },
+        {
+          "rep": 1,
+          "seconds": 0.041572074,
+          "bytes": 67108864,
+          "throughput_mib": 1539.49499849346,
+          "cpu_seconds": 0.040981
+        },
+        {
+          "rep": 2,
+          "seconds": 0.036604858,
+          "bytes": 67108864,
+          "throughput_mib": 1748.4018104919298,
+          "cpu_seconds": 0.036
+        },
+        {
+          "rep": 3,
+          "seconds": 0.043249153,
+          "bytes": 67108864,
+          "throughput_mib": 1479.7977662129015,
+          "cpu_seconds": 0.042982
+        },
+        {
+          "rep": 4,
+          "seconds": 0.03748923,
+          "bytes": 67108864,
+          "throughput_mib": 1707.1569621461952,
+          "cpu_seconds": 0.037928
+        },
+        {
+          "rep": 5,
+          "seconds": 0.037680416,
+          "bytes": 67108864,
+          "throughput_mib": 1698.49504846231,
+          "cpu_seconds": 0.038001
+        }
+      ],
+      "median_mib_per_second": 1675.3825324017594,
+      "aggregate_mib_per_second": 1631.748939108229,
+      "seconds_range": [
+        0.036604858,
+        0.043249153
+      ],
+      "median_cpu_seconds": 0.0384825,
+      "sum_cpu_seconds": 0.234856
+    },
+    "fresh/external/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.158376444,
+          "bytes": 33554432,
+          "throughput_mib": 202.05024934137302,
+          "cpu_seconds": 0.158968
+        },
+        {
+          "rep": 1,
+          "seconds": 0.169401058,
+          "bytes": 33554432,
+          "throughput_mib": 188.9008272899925,
+          "cpu_seconds": 0.17
+        },
+        {
+          "rep": 2,
+          "seconds": 0.159719632,
+          "bytes": 33554432,
+          "throughput_mib": 200.35107518905377,
+          "cpu_seconds": 0.158964
+        },
+        {
+          "rep": 3,
+          "seconds": 0.157696227,
+          "bytes": 33554432,
+          "throughput_mib": 202.92178582053202,
+          "cpu_seconds": 0.157945
+        },
+        {
+          "rep": 4,
+          "seconds": 0.165891165,
+          "bytes": 33554432,
+          "throughput_mib": 192.89755424889566,
+          "cpu_seconds": 0.166
+        },
+        {
+          "rep": 5,
+          "seconds": 0.156167058,
+          "bytes": 33554432,
+          "throughput_mib": 204.90877147727275,
+          "cpu_seconds": 0.155953
+        }
+      ],
+      "median_mib_per_second": 201.2006622652134,
+      "aggregate_mib_per_second": 198.50057955552543,
+      "seconds_range": [
+        0.156167058,
+        0.169401058
+      ],
+      "median_cpu_seconds": 0.158966,
+      "sum_cpu_seconds": 0.96783
+    },
+    "fresh/external/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.147101332,
+          "bytes": 1048576,
+          "throughput_mib": 6.798034976325027,
+          "cpu_seconds": 0.146999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.155574124,
+          "bytes": 1048576,
+          "throughput_mib": 6.427804150772528,
+          "cpu_seconds": 0.155999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.146842542,
+          "bytes": 1048576,
+          "throughput_mib": 6.810015587989481,
+          "cpu_seconds": 0.146739
+        },
+        {
+          "rep": 3,
+          "seconds": 0.144962188,
+          "bytes": 1048576,
+          "throughput_mib": 6.89835062368126,
+          "cpu_seconds": 0.145
+        },
+        {
+          "rep": 4,
+          "seconds": 0.153458568,
+          "bytes": 1048576,
+          "throughput_mib": 6.516416861129579,
+          "cpu_seconds": 0.153
+        },
+        {
+          "rep": 5,
+          "seconds": 0.144694131,
+          "bytes": 1048576,
+          "throughput_mib": 6.911130348472807,
+          "cpu_seconds": 0.144948
+        }
+      ],
+      "median_mib_per_second": 6.804025282157254,
+      "aggregate_mib_per_second": 6.7216882783788545,
+      "seconds_range": [
+        0.144694131,
+        0.155574124
+      ],
+      "median_cpu_seconds": 0.146869,
+      "sum_cpu_seconds": 0.892685
+    },
+    "fresh/external/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.166293659,
+          "bytes": 33554432,
+          "throughput_mib": 192.43066868833523,
+          "cpu_seconds": 0.165945
+        },
+        {
+          "rep": 1,
+          "seconds": 0.174865348,
+          "bytes": 33554432,
+          "throughput_mib": 182.99794879886664,
+          "cpu_seconds": 0.174977
+        },
+        {
+          "rep": 2,
+          "seconds": 0.164538677,
+          "bytes": 33554432,
+          "throughput_mib": 194.48314878574112,
+          "cpu_seconds": 0.164947
+        },
+        {
+          "rep": 3,
+          "seconds": 0.163735336,
+          "bytes": 33554432,
+          "throughput_mib": 195.43734896662744,
+          "cpu_seconds": 0.163984
+        },
+        {
+          "rep": 4,
+          "seconds": 0.171839224,
+          "bytes": 33554432,
+          "throughput_mib": 186.2205802326016,
+          "cpu_seconds": 0.171999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.163019823,
+          "bytes": 33554432,
+          "throughput_mib": 196.2951462657397,
+          "cpu_seconds": 0.162978
+        }
+      ],
+      "median_mib_per_second": 193.4569087370382,
+      "aggregate_mib_per_second": 191.1794450129815,
+      "seconds_range": [
+        0.163019823,
+        0.174865348
+      ],
+      "median_cpu_seconds": 0.165446,
+      "sum_cpu_seconds": 1.0048300000000001
+    },
+    "fresh/external_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.037145554,
+          "bytes": 67108864,
+          "throughput_mib": 1722.95182352106,
+          "cpu_seconds": 0.037
+        },
+        {
+          "rep": 1,
+          "seconds": 0.036758952,
+          "bytes": 67108864,
+          "throughput_mib": 1741.0724875943145,
+          "cpu_seconds": 0.037
+        },
+        {
+          "rep": 2,
+          "seconds": 0.036140291,
+          "bytes": 67108864,
+          "throughput_mib": 1770.8767203894402,
+          "cpu_seconds": 0.037
+        },
+        {
+          "rep": 3,
+          "seconds": 0.038125362,
+          "bytes": 67108864,
+          "throughput_mib": 1678.6725854563688,
+          "cpu_seconds": 0.038983
+        },
+        {
+          "rep": 4,
+          "seconds": 0.035925393,
+          "bytes": 67108864,
+          "throughput_mib": 1781.469725327709,
+          "cpu_seconds": 0.036015
+        },
+        {
+          "rep": 5,
+          "seconds": 0.037066986,
+          "bytes": 67108864,
+          "throughput_mib": 1726.60383015765,
+          "cpu_seconds": 0.037
+        }
+      ],
+      "median_mib_per_second": 1733.8381588759821,
+      "aggregate_mib_per_second": 1736.2795863737103,
+      "seconds_range": [
+        0.035925393,
+        0.038125362
+      ],
+      "median_cpu_seconds": 0.037,
+      "sum_cpu_seconds": 0.22299799999999997
+    },
+    "fresh/external_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.152940176,
+          "bytes": 33554432,
+          "throughput_mib": 209.23213793084687,
+          "cpu_seconds": 0.152999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.157994319,
+          "bytes": 33554432,
+          "throughput_mib": 202.53892799778453,
+          "cpu_seconds": 0.157991
+        },
+        {
+          "rep": 2,
+          "seconds": 0.157982876,
+          "bytes": 33554432,
+          "throughput_mib": 202.55359827732215,
+          "cpu_seconds": 0.157998
+        },
+        {
+          "rep": 3,
+          "seconds": 0.158065214,
+          "bytes": 33554432,
+          "throughput_mib": 202.4480857628801,
+          "cpu_seconds": 0.157661
+        },
+        {
+          "rep": 4,
+          "seconds": 0.153053625,
+          "bytes": 33554432,
+          "throughput_mib": 209.0770473420672,
+          "cpu_seconds": 0.152913
+        },
+        {
+          "rep": 5,
+          "seconds": 0.161666293,
+          "bytes": 33554432,
+          "throughput_mib": 197.9386018333457,
+          "cpu_seconds": 0.160999
+        }
+      ],
+      "median_mib_per_second": 202.54626313755335,
+      "aggregate_mib_per_second": 203.88604616462402,
+      "seconds_range": [
+        0.152940176,
+        0.161666293
+      ],
+      "median_cpu_seconds": 0.157826,
+      "sum_cpu_seconds": 0.940561
+    },
+    "fresh/external_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.144105887,
+          "bytes": 1048576,
+          "throughput_mib": 6.939341763324354,
+          "cpu_seconds": 0.143955
+        },
+        {
+          "rep": 1,
+          "seconds": 0.147599526,
+          "bytes": 1048576,
+          "throughput_mib": 6.775089508078772,
+          "cpu_seconds": 0.148
+        },
+        {
+          "rep": 2,
+          "seconds": 0.147955485,
+          "bytes": 1048576,
+          "throughput_mib": 6.758789645412605,
+          "cpu_seconds": 0.147856
+        },
+        {
+          "rep": 3,
+          "seconds": 0.146510666,
+          "bytes": 1048576,
+          "throughput_mib": 6.825441637129681,
+          "cpu_seconds": 0.145939
+        },
+        {
+          "rep": 4,
+          "seconds": 0.144201551,
+          "bytes": 1048576,
+          "throughput_mib": 6.9347381707426985,
+          "cpu_seconds": 0.143952
+        },
+        {
+          "rep": 5,
+          "seconds": 0.14919253,
+          "bytes": 1048576,
+          "throughput_mib": 6.702748455301348,
+          "cpu_seconds": 0.149999
+        }
+      ],
+      "median_mib_per_second": 6.800265572604227,
+      "aggregate_mib_per_second": 6.821548833913357,
+      "seconds_range": [
+        0.144105887,
+        0.14919253
+      ],
+      "median_cpu_seconds": 0.14689750000000001,
+      "sum_cpu_seconds": 0.879701
+    },
+    "fresh/external_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.160795979,
+          "bytes": 33554432,
+          "throughput_mib": 199.00995161079246,
+          "cpu_seconds": 0.159961
+        },
+        {
+          "rep": 1,
+          "seconds": 0.167263612,
+          "bytes": 33554432,
+          "throughput_mib": 191.31477323352314,
+          "cpu_seconds": 0.166952
+        },
+        {
+          "rep": 2,
+          "seconds": 0.16481404,
+          "bytes": 33554432,
+          "throughput_mib": 194.15821613255764,
+          "cpu_seconds": 0.165001
+        },
+        {
+          "rep": 3,
+          "seconds": 0.165300104,
+          "bytes": 33554432,
+          "throughput_mib": 193.5872950206976,
+          "cpu_seconds": 0.164957
+        },
+        {
+          "rep": 4,
+          "seconds": 0.163875059,
+          "bytes": 33554432,
+          "throughput_mib": 195.27071535638623,
+          "cpu_seconds": 0.162958
+        },
+        {
+          "rep": 5,
+          "seconds": 0.1705669,
+          "bytes": 33554432,
+          "throughput_mib": 187.60967104403025,
+          "cpu_seconds": 0.17
+        }
+      ],
+      "median_mib_per_second": 193.87275557662764,
+      "aggregate_mib_per_second": 193.42833400738073,
+      "seconds_range": [
+        0.160795979,
+        0.1705669
+      ],
+      "median_cpu_seconds": 0.164979,
+      "sum_cpu_seconds": 0.989829
+    },
+    "aged/blob/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.055820507,
+          "bytes": 67108864,
+          "throughput_mib": 1146.5320442180864,
+          "cpu_seconds": 0.056
+        },
+        {
+          "rep": 1,
+          "seconds": 0.055935814,
+          "bytes": 67108864,
+          "throughput_mib": 1144.1685643477003,
+          "cpu_seconds": 0.055989
+        },
+        {
+          "rep": 2,
+          "seconds": 0.057296138,
+          "bytes": 67108864,
+          "throughput_mib": 1117.0037324330656,
+          "cpu_seconds": 0.057007
+        },
+        {
+          "rep": 3,
+          "seconds": 0.058595036,
+          "bytes": 67108864,
+          "throughput_mib": 1092.2426944152744,
+          "cpu_seconds": 0.058999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.055491806,
+          "bytes": 67108864,
+          "throughput_mib": 1153.323429408659,
+          "cpu_seconds": 0.055965
+        },
+        {
+          "rep": 5,
+          "seconds": 0.05633863,
+          "bytes": 67108864,
+          "throughput_mib": 1135.9878648096342,
+          "cpu_seconds": 0.055973
+        }
+      ],
+      "median_mib_per_second": 1140.0782145786673,
+      "aggregate_mib_per_second": 1131.1486401158725,
+      "seconds_range": [
+        0.055491806,
+        0.058595036
+      ],
+      "median_cpu_seconds": 0.0559945,
+      "sum_cpu_seconds": 0.339933
+    },
+    "aged/blob/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.182826915,
+          "bytes": 33554432,
+          "throughput_mib": 175.02893378690987,
+          "cpu_seconds": 0.182975
+        },
+        {
+          "rep": 1,
+          "seconds": 0.17925933,
+          "bytes": 33554432,
+          "throughput_mib": 178.5123262482349,
+          "cpu_seconds": 0.179983
+        },
+        {
+          "rep": 2,
+          "seconds": 0.177833753,
+          "bytes": 33554432,
+          "throughput_mib": 179.94334292658152,
+          "cpu_seconds": 0.177871
+        },
+        {
+          "rep": 3,
+          "seconds": 0.184094486,
+          "bytes": 33554432,
+          "throughput_mib": 173.82378307626226,
+          "cpu_seconds": 0.183999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.178856431,
+          "bytes": 33554432,
+          "throughput_mib": 178.91445010439685,
+          "cpu_seconds": 0.178985
+        },
+        {
+          "rep": 5,
+          "seconds": 0.178040772,
+          "bytes": 33554432,
+          "throughput_mib": 179.7341116898774,
+          "cpu_seconds": 0.177958
+        }
+      ],
+      "median_mib_per_second": 178.71338817631587,
+      "aggregate_mib_per_second": 177.62783242068878,
+      "seconds_range": [
+        0.177833753,
+        0.184094486
+      ],
+      "median_cpu_seconds": 0.179484,
+      "sum_cpu_seconds": 1.081771
+    },
+    "aged/blob/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.169968177,
+          "bytes": 1048576,
+          "throughput_mib": 5.883454289210857,
+          "cpu_seconds": 0.169998
+        },
+        {
+          "rep": 1,
+          "seconds": 0.165661195,
+          "bytes": 1048576,
+          "throughput_mib": 6.036416675613139,
+          "cpu_seconds": 0.165
+        },
+        {
+          "rep": 2,
+          "seconds": 0.166664207,
+          "bytes": 1048576,
+          "throughput_mib": 6.000088549306811,
+          "cpu_seconds": 0.166999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.170699583,
+          "bytes": 1048576,
+          "throughput_mib": 5.858245125297114,
+          "cpu_seconds": 0.170969
+        },
+        {
+          "rep": 4,
+          "seconds": 0.167515986,
+          "bytes": 1048576,
+          "throughput_mib": 5.9695795241894105,
+          "cpu_seconds": 0.166941
+        },
+        {
+          "rep": 5,
+          "seconds": 0.166990192,
+          "bytes": 1048576,
+          "throughput_mib": 5.988375652625155,
+          "cpu_seconds": 0.166961
+        }
+      ],
+      "median_mib_per_second": 5.978977588407282,
+      "aggregate_mib_per_second": 5.955338888857237,
+      "seconds_range": [
+        0.165661195,
+        0.170699583
+      ],
+      "median_cpu_seconds": 0.16698000000000002,
+      "sum_cpu_seconds": 1.006868
+    },
+    "aged/blob/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.202169457,
+          "bytes": 33554432,
+          "throughput_mib": 158.28305855320173,
+          "cpu_seconds": 0.202964
+        },
+        {
+          "rep": 1,
+          "seconds": 0.199429179,
+          "bytes": 33554432,
+          "throughput_mib": 160.45796387699113,
+          "cpu_seconds": 0.198999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.198195152,
+          "bytes": 33554432,
+          "throughput_mib": 161.45702696098238,
+          "cpu_seconds": 0.198
+        },
+        {
+          "rep": 3,
+          "seconds": 0.205879247,
+          "bytes": 33554432,
+          "throughput_mib": 155.43091625937413,
+          "cpu_seconds": 0.205986
+        },
+        {
+          "rep": 4,
+          "seconds": 0.199050377,
+          "bytes": 33554432,
+          "throughput_mib": 160.76332274417143,
+          "cpu_seconds": 0.199999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.199189041,
+          "bytes": 33554432,
+          "throughput_mib": 160.65140852804245,
+          "cpu_seconds": 0.198954
+        }
+      ],
+      "median_mib_per_second": 160.5546862025168,
+      "aggregate_mib_per_second": 159.48003488256964,
+      "seconds_range": [
+        0.198195152,
+        0.205879247
+      ],
+      "median_cpu_seconds": 0.199499,
+      "sum_cpu_seconds": 1.2049020000000001
+    },
+    "aged/blob_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.056299189,
+          "bytes": 67108864,
+          "throughput_mib": 1136.7836932784237,
+          "cpu_seconds": 0.057
+        },
+        {
+          "rep": 1,
+          "seconds": 0.058507461,
+          "bytes": 67108864,
+          "throughput_mib": 1093.8775825531038,
+          "cpu_seconds": 0.058001
+        },
+        {
+          "rep": 2,
+          "seconds": 0.056138914,
+          "bytes": 67108864,
+          "throughput_mib": 1140.0291783343014,
+          "cpu_seconds": 0.056
+        },
+        {
+          "rep": 3,
+          "seconds": 0.058135108,
+          "bytes": 67108864,
+          "throughput_mib": 1100.8838239364757,
+          "cpu_seconds": 0.058
+        },
+        {
+          "rep": 4,
+          "seconds": 0.05640949,
+          "bytes": 67108864,
+          "throughput_mib": 1134.5608691019897,
+          "cpu_seconds": 0.055979
+        },
+        {
+          "rep": 5,
+          "seconds": 0.057639333,
+          "bytes": 67108864,
+          "throughput_mib": 1110.352890447223,
+          "cpu_seconds": 0.058
+        }
+      ],
+      "median_mib_per_second": 1122.4568797746065,
+      "aggregate_mib_per_second": 1119.1110225018692,
+      "seconds_range": [
+        0.056138914,
+        0.058507461
+      ],
+      "median_cpu_seconds": 0.0575,
+      "sum_cpu_seconds": 0.34298
+    },
+    "aged/blob_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.179254116,
+          "bytes": 33554432,
+          "throughput_mib": 178.51751867164936,
+          "cpu_seconds": 0.178998
+        },
+        {
+          "rep": 1,
+          "seconds": 0.1811303,
+          "bytes": 33554432,
+          "throughput_mib": 176.66839838503,
+          "cpu_seconds": 0.180999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.183979608,
+          "bytes": 33554432,
+          "throughput_mib": 173.93231971665034,
+          "cpu_seconds": 0.183943
+        },
+        {
+          "rep": 3,
+          "seconds": 0.176396874,
+          "bytes": 33554432,
+          "throughput_mib": 181.40911045849938,
+          "cpu_seconds": 0.176999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.176521864,
+          "bytes": 33554432,
+          "throughput_mib": 181.28065994136568,
+          "cpu_seconds": 0.176999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.180485869,
+          "bytes": 33554432,
+          "throughput_mib": 177.29919897496242,
+          "cpu_seconds": 0.18076
+        }
+      ],
+      "median_mib_per_second": 177.9083588233059,
+      "aggregate_mib_per_second": 178.14584176740618,
+      "seconds_range": [
+        0.176396874,
+        0.183979608
+      ],
+      "median_cpu_seconds": 0.179879,
+      "sum_cpu_seconds": 1.078698
+    },
+    "aged/blob_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.170906013,
+          "bytes": 1048576,
+          "throughput_mib": 5.85116920374241,
+          "cpu_seconds": 0.171
+        },
+        {
+          "rep": 1,
+          "seconds": 0.169915596,
+          "bytes": 1048576,
+          "throughput_mib": 5.88527494556768,
+          "cpu_seconds": 0.168969
+        },
+        {
+          "rep": 2,
+          "seconds": 0.172933191,
+          "bytes": 1048576,
+          "throughput_mib": 5.782579932848171,
+          "cpu_seconds": 0.17299
+        },
+        {
+          "rep": 3,
+          "seconds": 0.16549177,
+          "bytes": 1048576,
+          "throughput_mib": 6.042596559333433,
+          "cpu_seconds": 0.164982
+        },
+        {
+          "rep": 4,
+          "seconds": 0.168597339,
+          "bytes": 1048576,
+          "throughput_mib": 5.931291715108267,
+          "cpu_seconds": 0.168999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.166640442,
+          "bytes": 1048576,
+          "throughput_mib": 6.000944236573736,
+          "cpu_seconds": 0.165943
+        }
+      ],
+      "median_mib_per_second": 5.908283330337973,
+      "aggregate_mib_per_second": 5.914334700269811,
+      "seconds_range": [
+        0.16549177,
+        0.172933191
+      ],
+      "median_cpu_seconds": 0.16898400000000002,
+      "sum_cpu_seconds": 1.012883
+    },
+    "aged/blob_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.202290486,
+          "bytes": 33554432,
+          "throughput_mib": 158.18835889296346,
+          "cpu_seconds": 0.201987
+        },
+        {
+          "rep": 1,
+          "seconds": 0.205377899,
+          "bytes": 33554432,
+          "throughput_mib": 155.81033867719137,
+          "cpu_seconds": 0.204972
+        },
+        {
+          "rep": 2,
+          "seconds": 0.20378783,
+          "bytes": 33554432,
+          "throughput_mib": 157.0260598976887,
+          "cpu_seconds": 0.203988
+        },
+        {
+          "rep": 3,
+          "seconds": 0.199012581,
+          "bytes": 33554432,
+          "throughput_mib": 160.79385453525674,
+          "cpu_seconds": 0.198944
+        },
+        {
+          "rep": 4,
+          "seconds": 0.1994121,
+          "bytes": 33554432,
+          "throughput_mib": 160.4717065814963,
+          "cpu_seconds": 0.198999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.201719719,
+          "bytes": 33554432,
+          "throughput_mib": 158.63595368185102,
+          "cpu_seconds": 0.200993
+        }
+      ],
+      "median_mib_per_second": 158.41215628740724,
+      "aggregate_mib_per_second": 158.4680608634389,
+      "seconds_range": [
+        0.199012581,
+        0.205377899
+      ],
+      "median_cpu_seconds": 0.20149,
+      "sum_cpu_seconds": 1.209883
+    },
+    "aged/external/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.037134951,
+          "bytes": 67108864,
+          "throughput_mib": 1723.4437713409127,
+          "cpu_seconds": 0.036997
+        },
+        {
+          "rep": 1,
+          "seconds": 0.039182537,
+          "bytes": 67108864,
+          "throughput_mib": 1633.3807073288795,
+          "cpu_seconds": 0.04
+        },
+        {
+          "rep": 2,
+          "seconds": 0.038204469,
+          "bytes": 67108864,
+          "throughput_mib": 1675.1966896857016,
+          "cpu_seconds": 0.038
+        },
+        {
+          "rep": 3,
+          "seconds": 0.039212033,
+          "bytes": 67108864,
+          "throughput_mib": 1632.1520488366416,
+          "cpu_seconds": 0.038999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.036067168,
+          "bytes": 67108864,
+          "throughput_mib": 1774.4670166507115,
+          "cpu_seconds": 0.036998
+        },
+        {
+          "rep": 5,
+          "seconds": 0.036824789,
+          "bytes": 67108864,
+          "throughput_mib": 1737.9597205567154,
+          "cpu_seconds": 0.036998
+        }
+      ],
+      "median_mib_per_second": 1699.3202305133073,
+      "aggregate_mib_per_second": 1694.422042503368,
+      "seconds_range": [
+        0.036067168,
+        0.039212033
+      ],
+      "median_cpu_seconds": 0.037499000000000005,
+      "sum_cpu_seconds": 0.227992
+    },
+    "aged/external/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.165566892,
+          "bytes": 33554432,
+          "throughput_mib": 193.27535604159314,
+          "cpu_seconds": 0.164941
+        },
+        {
+          "rep": 1,
+          "seconds": 0.16670611,
+          "bytes": 33554432,
+          "throughput_mib": 191.95457203098317,
+          "cpu_seconds": 0.165938
+        },
+        {
+          "rep": 2,
+          "seconds": 0.163003962,
+          "bytes": 33554432,
+          "throughput_mib": 196.31424664389445,
+          "cpu_seconds": 0.162999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.165327206,
+          "bytes": 33554432,
+          "throughput_mib": 193.55556035949704,
+          "cpu_seconds": 0.164999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.162343557,
+          "bytes": 33554432,
+          "throughput_mib": 197.11284261191838,
+          "cpu_seconds": 0.161942
+        },
+        {
+          "rep": 5,
+          "seconds": 0.160850144,
+          "bytes": 33554432,
+          "throughput_mib": 198.94293660066603,
+          "cpu_seconds": 0.161
+        }
+      ],
+      "median_mib_per_second": 194.93490350169574,
+      "aggregate_mib_per_second": 195.16204055700788,
+      "seconds_range": [
+        0.160850144,
+        0.16670611
+      ],
+      "median_cpu_seconds": 0.16397,
+      "sum_cpu_seconds": 0.981819
+    },
+    "aged/external/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.153625693,
+          "bytes": 1048576,
+          "throughput_mib": 6.5093278374991606,
+          "cpu_seconds": 0.153976
+        },
+        {
+          "rep": 1,
+          "seconds": 0.154656536,
+          "bytes": 1048576,
+          "throughput_mib": 6.465940760499122,
+          "cpu_seconds": 0.153999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.151164377,
+          "bytes": 1048576,
+          "throughput_mib": 6.615315194266968,
+          "cpu_seconds": 0.151
+        },
+        {
+          "rep": 3,
+          "seconds": 0.153982936,
+          "bytes": 1048576,
+          "throughput_mib": 6.494226087493228,
+          "cpu_seconds": 0.153969
+        },
+        {
+          "rep": 4,
+          "seconds": 0.163160167,
+          "bytes": 1048576,
+          "throughput_mib": 6.128946901604974,
+          "cpu_seconds": 0.163
+        },
+        {
+          "rep": 5,
+          "seconds": 0.15016439,
+          "bytes": 1048576,
+          "throughput_mib": 6.659368442811242,
+          "cpu_seconds": 0.149999
+        }
+      ],
+      "median_mib_per_second": 6.501776962496194,
+      "aggregate_mib_per_second": 6.474209292922695,
+      "seconds_range": [
+        0.15016439,
+        0.163160167
+      ],
+      "median_cpu_seconds": 0.1539725,
+      "sum_cpu_seconds": 0.925943
+    },
+    "aged/external/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.170321594,
+          "bytes": 33554432,
+          "throughput_mib": 187.87987622990426,
+          "cpu_seconds": 0.169959
+        },
+        {
+          "rep": 1,
+          "seconds": 0.171704574,
+          "bytes": 33554432,
+          "throughput_mib": 186.36661362323406,
+          "cpu_seconds": 0.171937
+        },
+        {
+          "rep": 2,
+          "seconds": 0.168085058,
+          "bytes": 33554432,
+          "throughput_mib": 190.37980163590746,
+          "cpu_seconds": 0.167989
+        },
+        {
+          "rep": 3,
+          "seconds": 0.171471901,
+          "bytes": 33554432,
+          "throughput_mib": 186.6194975000598,
+          "cpu_seconds": 0.170999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.192075484,
+          "bytes": 33554432,
+          "throughput_mib": 166.60116811159514,
+          "cpu_seconds": 0.193
+        },
+        {
+          "rep": 5,
+          "seconds": 0.167498764,
+          "bytes": 33554432,
+          "throughput_mib": 191.04618586916857,
+          "cpu_seconds": 0.166966
+        }
+      ],
+      "median_mib_per_second": 187.24968686498204,
+      "aggregate_mib_per_second": 184.41016181631522,
+      "seconds_range": [
+        0.167498764,
+        0.192075484
+      ],
+      "median_cpu_seconds": 0.170479,
+      "sum_cpu_seconds": 1.04085
+    },
+    "aged/external_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.03757661,
+          "bytes": 67108864,
+          "throughput_mib": 1703.187168826565,
+          "cpu_seconds": 0.038
+        },
+        {
+          "rep": 1,
+          "seconds": 0.037445937,
+          "bytes": 67108864,
+          "throughput_mib": 1709.1306861943394,
+          "cpu_seconds": 0.03798
+        },
+        {
+          "rep": 2,
+          "seconds": 0.037476575,
+          "bytes": 67108864,
+          "throughput_mib": 1707.7334308164502,
+          "cpu_seconds": 0.037
+        },
+        {
+          "rep": 3,
+          "seconds": 0.038522409,
+          "bytes": 67108864,
+          "throughput_mib": 1661.3706583095568,
+          "cpu_seconds": 0.039001
+        },
+        {
+          "rep": 4,
+          "seconds": 0.036917742,
+          "bytes": 67108864,
+          "throughput_mib": 1733.5838145247344,
+          "cpu_seconds": 0.035968
+        },
+        {
+          "rep": 5,
+          "seconds": 0.038499583,
+          "bytes": 67108864,
+          "throughput_mib": 1662.3556675925556,
+          "cpu_seconds": 0.038985
+        }
+      ],
+      "median_mib_per_second": 1705.4602998215078,
+      "aggregate_mib_per_second": 1695.8220280003534,
+      "seconds_range": [
+        0.036917742,
+        0.038522409
+      ],
+      "median_cpu_seconds": 0.037989999999999996,
+      "sum_cpu_seconds": 0.226934
+    },
+    "aged/external_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.165276544,
+          "bytes": 33554432,
+          "throughput_mib": 193.614890688905,
+          "cpu_seconds": 0.164737
+        },
+        {
+          "rep": 1,
+          "seconds": 0.166516455,
+          "bytes": 33554432,
+          "throughput_mib": 192.17319993990984,
+          "cpu_seconds": 0.165998
+        },
+        {
+          "rep": 2,
+          "seconds": 0.163205162,
+          "bytes": 33554432,
+          "throughput_mib": 196.0722296271487,
+          "cpu_seconds": 0.163992
+        },
+        {
+          "rep": 3,
+          "seconds": 0.160234518,
+          "bytes": 33554432,
+          "throughput_mib": 199.70728154841146,
+          "cpu_seconds": 0.159978
+        },
+        {
+          "rep": 4,
+          "seconds": 0.163301915,
+          "bytes": 33554432,
+          "throughput_mib": 195.95606089493808,
+          "cpu_seconds": 0.162999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.162047403,
+          "bytes": 33554432,
+          "throughput_mib": 197.4730813797738,
+          "cpu_seconds": 0.161966
+        }
+      ],
+      "median_mib_per_second": 196.01414526104338,
+      "aggregate_mib_per_second": 195.80208548332138,
+      "seconds_range": [
+        0.160234518,
+        0.166516455
+      ],
+      "median_cpu_seconds": 0.16349550000000002,
+      "sum_cpu_seconds": 0.97967
+    },
+    "aged/external_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.165526242,
+          "bytes": 1048576,
+          "throughput_mib": 6.041338146249947,
+          "cpu_seconds": 0.165999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.151747055,
+          "bytes": 1048576,
+          "throughput_mib": 6.589913721884092,
+          "cpu_seconds": 0.150999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.15139064,
+          "bytes": 1048576,
+          "throughput_mib": 6.605428182349979,
+          "cpu_seconds": 0.150986
+        },
+        {
+          "rep": 3,
+          "seconds": 0.148805814,
+          "bytes": 1048576,
+          "throughput_mib": 6.72016753323899,
+          "cpu_seconds": 0.14899
+        },
+        {
+          "rep": 4,
+          "seconds": 0.150790511,
+          "bytes": 1048576,
+          "throughput_mib": 6.631717031584302,
+          "cpu_seconds": 0.150992
+        },
+        {
+          "rep": 5,
+          "seconds": 0.151382972,
+          "bytes": 1048576,
+          "throughput_mib": 6.605762767030363,
+          "cpu_seconds": 0.151952
+        }
+      ],
+      "median_mib_per_second": 6.605595474690171,
+      "aggregate_mib_per_second": 6.524269171103367,
+      "seconds_range": [
+        0.148805814,
+        0.165526242
+      ],
+      "median_cpu_seconds": 0.1509955,
+      "sum_cpu_seconds": 0.919918
+    },
+    "aged/external_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.18202778,
+          "bytes": 33554432,
+          "throughput_mib": 175.79734258144555,
+          "cpu_seconds": 0.181982
+        },
+        {
+          "rep": 1,
+          "seconds": 0.171515639,
+          "bytes": 33554432,
+          "throughput_mib": 186.57190788298902,
+          "cpu_seconds": 0.170912
+        },
+        {
+          "rep": 2,
+          "seconds": 0.171391673,
+          "bytes": 33554432,
+          "throughput_mib": 186.70685360542575,
+          "cpu_seconds": 0.171999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.169214349,
+          "bytes": 33554432,
+          "throughput_mib": 189.1092581043467,
+          "cpu_seconds": 0.168985
+        },
+        {
+          "rep": 4,
+          "seconds": 0.168557827,
+          "bytes": 33554432,
+          "throughput_mib": 189.84582661949005,
+          "cpu_seconds": 0.168939
+        },
+        {
+          "rep": 5,
+          "seconds": 0.169865089,
+          "bytes": 33554432,
+          "throughput_mib": 188.3847951829584,
+          "cpu_seconds": 0.169983
+        }
+      ],
+      "median_mib_per_second": 187.5458243941921,
+      "aggregate_mib_per_second": 185.9433856604782,
+      "seconds_range": [
+        0.168557827,
+        0.18202778
+      ],
+      "median_cpu_seconds": 0.1704475,
+      "sum_cpu_seconds": 1.0328
+    },
+    "history/blob/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.05891843,
+          "bytes": 67108864,
+          "throughput_mib": 1086.2475459716086,
+          "cpu_seconds": 0.059
+        },
+        {
+          "rep": 1,
+          "seconds": 0.05710986,
+          "bytes": 67108864,
+          "throughput_mib": 1120.6471176781033,
+          "cpu_seconds": 0.057
+        },
+        {
+          "rep": 2,
+          "seconds": 0.057073947,
+          "bytes": 67108864,
+          "throughput_mib": 1121.3522695390245,
+          "cpu_seconds": 0.056989
+        },
+        {
+          "rep": 3,
+          "seconds": 0.057509182,
+          "bytes": 67108864,
+          "throughput_mib": 1112.8657681133423,
+          "cpu_seconds": 0.057
+        },
+        {
+          "rep": 4,
+          "seconds": 0.060314073,
+          "bytes": 67108864,
+          "throughput_mib": 1061.1122216866368,
+          "cpu_seconds": 0.06
+        },
+        {
+          "rep": 5,
+          "seconds": 0.056455517,
+          "bytes": 67108864,
+          "throughput_mib": 1133.6358853998274,
+          "cpu_seconds": 0.056999
+        }
+      ],
+      "median_mib_per_second": 1116.7564428957228,
+      "aggregate_mib_per_second": 1105.414487410853,
+      "seconds_range": [
+        0.056455517,
+        0.060314073
+      ],
+      "median_cpu_seconds": 0.057,
+      "sum_cpu_seconds": 0.346988
+    },
+    "history/blob/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.185053246,
+          "bytes": 33554432,
+          "throughput_mib": 172.92320287102663,
+          "cpu_seconds": 0.184999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.182085209,
+          "bytes": 33554432,
+          "throughput_mib": 175.7418967512073,
+          "cpu_seconds": 0.181999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.197454202,
+          "bytes": 33554432,
+          "throughput_mib": 162.06289699522324,
+          "cpu_seconds": 0.198
+        },
+        {
+          "rep": 3,
+          "seconds": 0.181118439,
+          "bytes": 33554432,
+          "throughput_mib": 176.67996796284226,
+          "cpu_seconds": 0.180975
+        },
+        {
+          "rep": 4,
+          "seconds": 0.190689229,
+          "bytes": 33554432,
+          "throughput_mib": 167.81230994436504,
+          "cpu_seconds": 0.190999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.182293861,
+          "bytes": 33554432,
+          "throughput_mib": 175.5407440736581,
+          "cpu_seconds": 0.182
+        }
+      ],
+      "median_mib_per_second": 174.23197347234236,
+      "aggregate_mib_per_second": 171.62867421928303,
+      "seconds_range": [
+        0.181118439,
+        0.197454202
+      ],
+      "median_cpu_seconds": 0.18349949999999998,
+      "sum_cpu_seconds": 1.118972
+    },
+    "history/blob/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.176482026,
+          "bytes": 1048576,
+          "throughput_mib": 5.666299411136634,
+          "cpu_seconds": 0.176998
+        },
+        {
+          "rep": 1,
+          "seconds": 0.17477692,
+          "bytes": 1048576,
+          "throughput_mib": 5.72157925657461,
+          "cpu_seconds": 0.175
+        },
+        {
+          "rep": 2,
+          "seconds": 0.186713231,
+          "bytes": 1048576,
+          "throughput_mib": 5.355806841562289,
+          "cpu_seconds": 0.186999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.17295751,
+          "bytes": 1048576,
+          "throughput_mib": 5.781766862855507,
+          "cpu_seconds": 0.172999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.182958802,
+          "bytes": 1048576,
+          "throughput_mib": 5.465711346317189,
+          "cpu_seconds": 0.182939
+        },
+        {
+          "rep": 5,
+          "seconds": 0.174811579,
+          "bytes": 1048576,
+          "throughput_mib": 5.720444868242967,
+          "cpu_seconds": 0.174985
+        }
+      ],
+      "median_mib_per_second": 5.6933721396898,
+      "aggregate_mib_per_second": 5.614297387693251,
+      "seconds_range": [
+        0.17295751,
+        0.186713231
+      ],
+      "median_cpu_seconds": 0.175999,
+      "sum_cpu_seconds": 1.06992
+    },
+    "history/blob/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.221866453,
+          "bytes": 33554432,
+          "throughput_mib": 144.23090813102783,
+          "cpu_seconds": 0.222
+        },
+        {
+          "rep": 1,
+          "seconds": 0.218402302,
+          "bytes": 33554432,
+          "throughput_mib": 146.51860217114378,
+          "cpu_seconds": 0.217949
+        },
+        {
+          "rep": 2,
+          "seconds": 0.2331505,
+          "bytes": 33554432,
+          "throughput_mib": 137.25040263692335,
+          "cpu_seconds": 0.232949
+        },
+        {
+          "rep": 3,
+          "seconds": 0.216301431,
+          "bytes": 33554432,
+          "throughput_mib": 147.94169346017873,
+          "cpu_seconds": 0.215962
+        },
+        {
+          "rep": 4,
+          "seconds": 0.230550471,
+          "bytes": 33554432,
+          "throughput_mib": 138.79824170907895,
+          "cpu_seconds": 0.231
+        },
+        {
+          "rep": 5,
+          "seconds": 0.21937561,
+          "bytes": 33554432,
+          "throughput_mib": 145.86854026297635,
+          "cpu_seconds": 0.218938
+        }
+      ],
+      "median_mib_per_second": 145.0497241970021,
+      "aggregate_mib_per_second": 143.3213625633301,
+      "seconds_range": [
+        0.216301431,
+        0.2331505
+      ],
+      "median_cpu_seconds": 0.220469,
+      "sum_cpu_seconds": 1.338798
+    },
+    "history/blob/old_snapshot": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.189468825,
+          "bytes": 33554432,
+          "throughput_mib": 168.89322029626774,
+          "cpu_seconds": 0.188643
+        },
+        {
+          "rep": 1,
+          "seconds": 0.192428599,
+          "bytes": 33554432,
+          "throughput_mib": 166.29544759092695,
+          "cpu_seconds": 0.192945
+        },
+        {
+          "rep": 2,
+          "seconds": 0.206268929,
+          "bytes": 33554432,
+          "throughput_mib": 155.13727712233384,
+          "cpu_seconds": 0.205975
+        },
+        {
+          "rep": 3,
+          "seconds": 0.187715118,
+          "bytes": 33554432,
+          "throughput_mib": 170.4710858717304,
+          "cpu_seconds": 0.187982
+        },
+        {
+          "rep": 4,
+          "seconds": 0.201687559,
+          "bytes": 33554432,
+          "throughput_mib": 158.66124890727644,
+          "cpu_seconds": 0.200999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.19006185,
+          "bytes": 33554432,
+          "throughput_mib": 168.36624498814464,
+          "cpu_seconds": 0.189975
+        }
+      ],
+      "median_mib_per_second": 167.3308462895358,
+      "aggregate_mib_per_second": 164.4355277756957,
+      "seconds_range": [
+        0.187715118,
+        0.206268929
+      ],
+      "median_cpu_seconds": 0.19146000000000002,
+      "sum_cpu_seconds": 1.166519
+    },
+    "history/blob_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.057976747,
+          "bytes": 67108864,
+          "throughput_mib": 1103.8908409262767,
+          "cpu_seconds": 0.058001
+        },
+        {
+          "rep": 1,
+          "seconds": 0.055457889,
+          "bytes": 67108864,
+          "throughput_mib": 1154.028780287688,
+          "cpu_seconds": 0.055999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.055902214,
+          "bytes": 67108864,
+          "throughput_mib": 1144.856266336786,
+          "cpu_seconds": 0.055993
+        },
+        {
+          "rep": 3,
+          "seconds": 0.056504637,
+          "bytes": 67108864,
+          "throughput_mib": 1132.6504053109836,
+          "cpu_seconds": 0.056001
+        },
+        {
+          "rep": 4,
+          "seconds": 0.057474412,
+          "bytes": 67108864,
+          "throughput_mib": 1113.5390128045156,
+          "cpu_seconds": 0.056992
+        },
+        {
+          "rep": 5,
+          "seconds": 0.058891446,
+          "bytes": 67108864,
+          "throughput_mib": 1086.7452634802005,
+          "cpu_seconds": 0.059
+        }
+      ],
+      "median_mib_per_second": 1123.0947090577497,
+      "aggregate_mib_per_second": 1122.1267036217473,
+      "seconds_range": [
+        0.055457889,
+        0.058891446
+      ],
+      "median_cpu_seconds": 0.056496500000000005,
+      "sum_cpu_seconds": 0.341986
+    },
+    "history/blob_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.191435845,
+          "bytes": 33554432,
+          "throughput_mib": 167.1578277307471,
+          "cpu_seconds": 0.190965
+        },
+        {
+          "rep": 1,
+          "seconds": 0.173291382,
+          "bytes": 33554432,
+          "throughput_mib": 184.66007732571492,
+          "cpu_seconds": 0.172967
+        },
+        {
+          "rep": 2,
+          "seconds": 0.174158177,
+          "bytes": 33554432,
+          "throughput_mib": 183.74101377967455,
+          "cpu_seconds": 0.173986
+        },
+        {
+          "rep": 3,
+          "seconds": 0.171724009,
+          "bytes": 33554432,
+          "throughput_mib": 186.3455214349206,
+          "cpu_seconds": 0.171998
+        },
+        {
+          "rep": 4,
+          "seconds": 0.174673595,
+          "bytes": 33554432,
+          "throughput_mib": 183.19884009944377,
+          "cpu_seconds": 0.174981
+        },
+        {
+          "rep": 5,
+          "seconds": 0.181043934,
+          "bytes": 33554432,
+          "throughput_mib": 176.75267706014387,
+          "cpu_seconds": 0.180998
+        }
+      ],
+      "median_mib_per_second": 183.46992693955917,
+      "aggregate_mib_per_second": 180.05734680199052,
+      "seconds_range": [
+        0.171724009,
+        0.191435845
+      ],
+      "median_cpu_seconds": 0.1744835,
+      "sum_cpu_seconds": 1.065895
+    },
+    "history/blob_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.182204125,
+          "bytes": 1048576,
+          "throughput_mib": 5.488349948169395,
+          "cpu_seconds": 0.181979
+        },
+        {
+          "rep": 1,
+          "seconds": 0.167687116,
+          "bytes": 1048576,
+          "throughput_mib": 5.963487379674417,
+          "cpu_seconds": 0.167977
+        },
+        {
+          "rep": 2,
+          "seconds": 0.169058782,
+          "bytes": 1048576,
+          "throughput_mib": 5.915102357711296,
+          "cpu_seconds": 0.168999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.163415472,
+          "bytes": 1048576,
+          "throughput_mib": 6.119371610051709,
+          "cpu_seconds": 0.163953
+        },
+        {
+          "rep": 4,
+          "seconds": 0.168617529,
+          "bytes": 1048576,
+          "throughput_mib": 5.930581511486864,
+          "cpu_seconds": 0.168999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.174691647,
+          "bytes": 1048576,
+          "throughput_mib": 5.7243721561569565,
+          "cpu_seconds": 0.173999
+        }
+      ],
+      "median_mib_per_second": 5.92284193459908,
+      "aggregate_mib_per_second": 5.849808101578829,
+      "seconds_range": [
+        0.163415472,
+        0.182204125
+      ],
+      "median_cpu_seconds": 0.168999,
+      "sum_cpu_seconds": 1.025906
+    },
+    "history/blob_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.228357003,
+          "bytes": 33554432,
+          "throughput_mib": 140.1314589857356,
+          "cpu_seconds": 0.227981
+        },
+        {
+          "rep": 1,
+          "seconds": 0.212736737,
+          "bytes": 33554432,
+          "throughput_mib": 150.42065818655476,
+          "cpu_seconds": 0.213001
+        },
+        {
+          "rep": 2,
+          "seconds": 0.212778898,
+          "bytes": 33554432,
+          "throughput_mib": 150.39085313807763,
+          "cpu_seconds": 0.212999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.21186196,
+          "bytes": 33554432,
+          "throughput_mib": 151.04174435089718,
+          "cpu_seconds": 0.211964
+        },
+        {
+          "rep": 4,
+          "seconds": 0.213940894,
+          "bytes": 33554432,
+          "throughput_mib": 149.5740220661133,
+          "cpu_seconds": 0.213999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.222657912,
+          "bytes": 33554432,
+          "throughput_mib": 143.71822547226617,
+          "cpu_seconds": 0.222999
+        }
+      ],
+      "median_mib_per_second": 149.98243760209544,
+      "aggregate_mib_per_second": 147.42768588311506,
+      "seconds_range": [
+        0.21186196,
+        0.228357003
+      ],
+      "median_cpu_seconds": 0.2135,
+      "sum_cpu_seconds": 1.302943
+    },
+    "history/blob_point/old_snapshot": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.191708998,
+          "bytes": 33554432,
+          "throughput_mib": 166.9196560090518,
+          "cpu_seconds": 0.191959
+        },
+        {
+          "rep": 1,
+          "seconds": 0.166953455,
+          "bytes": 33554432,
+          "throughput_mib": 191.6701873585066,
+          "cpu_seconds": 0.166908
+        },
+        {
+          "rep": 2,
+          "seconds": 0.174281142,
+          "bytes": 33554432,
+          "throughput_mib": 183.61137431610356,
+          "cpu_seconds": 0.173971
+        },
+        {
+          "rep": 3,
+          "seconds": 0.166502897,
+          "bytes": 33554432,
+          "throughput_mib": 192.18884822166186,
+          "cpu_seconds": 0.165965
+        },
+        {
+          "rep": 4,
+          "seconds": 0.172664608,
+          "bytes": 33554432,
+          "throughput_mib": 185.3303949816977,
+          "cpu_seconds": 0.173
+        },
+        {
+          "rep": 5,
+          "seconds": 0.17741645,
+          "bytes": 33554432,
+          "throughput_mib": 180.36658945661463,
+          "cpu_seconds": 0.177984
+        }
+      ],
+      "median_mib_per_second": 184.47088464890064,
+      "aggregate_mib_per_second": 182.93945690134575,
+      "seconds_range": [
+        0.166502897,
+        0.191708998
+      ],
+      "median_cpu_seconds": 0.1734855,
+      "sum_cpu_seconds": 1.049787
+    },
+    "history/external/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.037605022,
+          "bytes": 67108864,
+          "throughput_mib": 1701.9003472461736,
+          "cpu_seconds": 0.038
+        },
+        {
+          "rep": 1,
+          "seconds": 0.037342047,
+          "bytes": 67108864,
+          "throughput_mib": 1713.8856903050869,
+          "cpu_seconds": 0.037973
+        },
+        {
+          "rep": 2,
+          "seconds": 0.038142925,
+          "bytes": 67108864,
+          "throughput_mib": 1677.899636695403,
+          "cpu_seconds": 0.038001
+        },
+        {
+          "rep": 3,
+          "seconds": 0.03876914,
+          "bytes": 67108864,
+          "throughput_mib": 1650.7975157560884,
+          "cpu_seconds": 0.038001
+        },
+        {
+          "rep": 4,
+          "seconds": 0.036644901,
+          "bytes": 67108864,
+          "throughput_mib": 1746.491278554689,
+          "cpu_seconds": 0.037
+        },
+        {
+          "rep": 5,
+          "seconds": 0.037773589,
+          "bytes": 67108864,
+          "throughput_mib": 1694.3055106571946,
+          "cpu_seconds": 0.038
+        }
+      ],
+      "median_mib_per_second": 1698.1029289516841,
+      "aggregate_mib_per_second": 1697.0303700908578,
+      "seconds_range": [
+        0.036644901,
+        0.03876914
+      ],
+      "median_cpu_seconds": 0.038,
+      "sum_cpu_seconds": 0.22697499999999998
+    },
+    "history/external/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.216889021,
+          "bytes": 33554432,
+          "throughput_mib": 147.5408937366175,
+          "cpu_seconds": 0.216957
+        },
+        {
+          "rep": 1,
+          "seconds": 0.19207658,
+          "bytes": 33554432,
+          "throughput_mib": 166.60021747575888,
+          "cpu_seconds": 0.19197
+        },
+        {
+          "rep": 2,
+          "seconds": 0.196810116,
+          "bytes": 33554432,
+          "throughput_mib": 162.59326832569926,
+          "cpu_seconds": 0.196999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.197173226,
+          "bytes": 33554432,
+          "throughput_mib": 162.29384003688207,
+          "cpu_seconds": 0.196885
+        },
+        {
+          "rep": 4,
+          "seconds": 0.187831998,
+          "bytes": 33554432,
+          "throughput_mib": 170.3650088415713,
+          "cpu_seconds": 0.187999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.194114736,
+          "bytes": 33554432,
+          "throughput_mib": 164.85095701338201,
+          "cpu_seconds": 0.193999
+        }
+      ],
+      "median_mib_per_second": 163.72211266954065,
+      "aggregate_mib_per_second": 162.03958181881356,
+      "seconds_range": [
+        0.187831998,
+        0.216889021
+      ],
+      "median_cpu_seconds": 0.195442,
+      "sum_cpu_seconds": 1.184809
+    },
+    "history/external/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.182600305,
+          "bytes": 1048576,
+          "throughput_mib": 5.476442112185958,
+          "cpu_seconds": 0.182
+        },
+        {
+          "rep": 1,
+          "seconds": 0.185523742,
+          "bytes": 1048576,
+          "throughput_mib": 5.390145698980134,
+          "cpu_seconds": 0.184994
+        },
+        {
+          "rep": 2,
+          "seconds": 0.18920171,
+          "bytes": 1048576,
+          "throughput_mib": 5.2853644927416354,
+          "cpu_seconds": 0.188976
+        },
+        {
+          "rep": 3,
+          "seconds": 0.186236223,
+          "bytes": 1048576,
+          "throughput_mib": 5.369524703043403,
+          "cpu_seconds": 0.185966
+        },
+        {
+          "rep": 4,
+          "seconds": 0.209986358,
+          "bytes": 1048576,
+          "throughput_mib": 4.762214124405167,
+          "cpu_seconds": 0.209966
+        },
+        {
+          "rep": 5,
+          "seconds": 0.186882404,
+          "bytes": 1048576,
+          "throughput_mib": 5.350958563225674,
+          "cpu_seconds": 0.186903
+        }
+      ],
+      "median_mib_per_second": 5.360241633134539,
+      "aggregate_mib_per_second": 5.2611699939600545,
+      "seconds_range": [
+        0.182600305,
+        0.209986358
+      ],
+      "median_cpu_seconds": 0.1864345,
+      "sum_cpu_seconds": 1.138805
+    },
+    "history/external/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.227792816,
+          "bytes": 33554432,
+          "throughput_mib": 140.47853027990135,
+          "cpu_seconds": 0.227
+        },
+        {
+          "rep": 1,
+          "seconds": 0.227049936,
+          "bytes": 33554432,
+          "throughput_mib": 140.938159084088,
+          "cpu_seconds": 0.227
+        },
+        {
+          "rep": 2,
+          "seconds": 0.233765002,
+          "bytes": 33554432,
+          "throughput_mib": 136.8896101906649,
+          "cpu_seconds": 0.234
+        },
+        {
+          "rep": 3,
+          "seconds": 0.233107643,
+          "bytes": 33554432,
+          "throughput_mib": 137.27563621755635,
+          "cpu_seconds": 0.232975
+        },
+        {
+          "rep": 4,
+          "seconds": 0.223510404,
+          "bytes": 33554432,
+          "throughput_mib": 143.1700691659973,
+          "cpu_seconds": 0.223979
+        },
+        {
+          "rep": 5,
+          "seconds": 0.229137993,
+          "bytes": 33554432,
+          "throughput_mib": 139.6538373276229,
+          "cpu_seconds": 0.228999
+        }
+      ],
+      "median_mib_per_second": 140.06618380376213,
+      "aggregate_mib_per_second": 139.70100262987575,
+      "seconds_range": [
+        0.223510404,
+        0.233765002
+      ],
+      "median_cpu_seconds": 0.22799950000000002,
+      "sum_cpu_seconds": 1.373953
+    },
+    "history/external/old_snapshot": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.189212066,
+          "bytes": 33554432,
+          "throughput_mib": 169.1224068131046,
+          "cpu_seconds": 0.189999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.193978029,
+          "bytes": 33554432,
+          "throughput_mib": 164.96713656163607,
+          "cpu_seconds": 0.193998
+        },
+        {
+          "rep": 2,
+          "seconds": 0.193768226,
+          "bytes": 33554432,
+          "throughput_mib": 165.14575511466984,
+          "cpu_seconds": 0.193983
+        },
+        {
+          "rep": 3,
+          "seconds": 0.192512595,
+          "bytes": 33554432,
+          "throughput_mib": 166.2228905075016,
+          "cpu_seconds": 0.191999
+        },
+        {
+          "rep": 4,
+          "seconds": 0.185518311,
+          "bytes": 33554432,
+          "throughput_mib": 172.48971181071178,
+          "cpu_seconds": 0.184999
+        },
+        {
+          "rep": 5,
+          "seconds": 0.191405239,
+          "bytes": 33554432,
+          "throughput_mib": 167.18455653139148,
+          "cpu_seconds": 0.190953
+        }
+      ],
+      "median_mib_per_second": 166.70372351944656,
+      "aggregate_mib_per_second": 167.48161797215096,
+      "seconds_range": [
+        0.185518311,
+        0.193978029
+      ],
+      "median_cpu_seconds": 0.191476,
+      "sum_cpu_seconds": 1.145931
+    },
+    "history/external_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.038086271,
+          "bytes": 67108864,
+          "throughput_mib": 1680.3955420051493,
+          "cpu_seconds": 0.037986
+        },
+        {
+          "rep": 1,
+          "seconds": 0.037892527,
+          "bytes": 67108864,
+          "throughput_mib": 1688.9873826572716,
+          "cpu_seconds": 0.037953
+        },
+        {
+          "rep": 2,
+          "seconds": 0.037752363,
+          "bytes": 67108864,
+          "throughput_mib": 1695.2581219882848,
+          "cpu_seconds": 0.036999
+        },
+        {
+          "rep": 3,
+          "seconds": 0.03862595,
+          "bytes": 67108864,
+          "throughput_mib": 1656.9171761471239,
+          "cpu_seconds": 0.03898
+        },
+        {
+          "rep": 4,
+          "seconds": 0.037649353,
+          "bytes": 67108864,
+          "throughput_mib": 1699.896409906433,
+          "cpu_seconds": 0.038
+        },
+        {
+          "rep": 5,
+          "seconds": 0.0373268,
+          "bytes": 67108864,
+          "throughput_mib": 1714.5857667949033,
+          "cpu_seconds": 0.037
+        }
+      ],
+      "median_mib_per_second": 1692.122752322778,
+      "aggregate_mib_per_second": 1689.1500752833074,
+      "seconds_range": [
+        0.0373268,
+        0.03862595
+      ],
+      "median_cpu_seconds": 0.0379695,
+      "sum_cpu_seconds": 0.226918
+    },
+    "history/external_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.194136399,
+          "bytes": 33554432,
+          "throughput_mib": 164.83256187316013,
+          "cpu_seconds": 0.193999
+        },
+        {
+          "rep": 1,
+          "seconds": 0.19580248,
+          "bytes": 33554432,
+          "throughput_mib": 163.43000354234533,
+          "cpu_seconds": 0.195909
+        },
+        {
+          "rep": 2,
+          "seconds": 0.185623016,
+          "bytes": 33554432,
+          "throughput_mib": 172.392414957852,
+          "cpu_seconds": 0.185
+        },
+        {
+          "rep": 3,
+          "seconds": 0.208436817,
+          "bytes": 33554432,
+          "throughput_mib": 153.52374144151318,
+          "cpu_seconds": 0.208937
+        },
+        {
+          "rep": 4,
+          "seconds": 0.196727742,
+          "bytes": 33554432,
+          "throughput_mib": 162.66134951114316,
+          "cpu_seconds": 0.196993
+        },
+        {
+          "rep": 5,
+          "seconds": 0.18662207,
+          "bytes": 33554432,
+          "throughput_mib": 171.46953733821513,
+          "cpu_seconds": 0.18697
+        }
+      ],
+      "median_mib_per_second": 164.13128270775275,
+      "aggregate_mib_per_second": 164.47530112266628,
+      "seconds_range": [
+        0.185623016,
+        0.208436817
+      ],
+      "median_cpu_seconds": 0.19495400000000002,
+      "sum_cpu_seconds": 1.167808
+    },
+    "history/external_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.186565908,
+          "bytes": 1048576,
+          "throughput_mib": 5.360036089766196,
+          "cpu_seconds": 0.185988
+        },
+        {
+          "rep": 1,
+          "seconds": 0.186717885,
+          "bytes": 1048576,
+          "throughput_mib": 5.355673346449913,
+          "cpu_seconds": 0.186999
+        },
+        {
+          "rep": 2,
+          "seconds": 0.177939972,
+          "bytes": 1048576,
+          "throughput_mib": 5.619872751244448,
+          "cpu_seconds": 0.177957
+        },
+        {
+          "rep": 3,
+          "seconds": 0.201607738,
+          "bytes": 1048576,
+          "throughput_mib": 4.960127076074828,
+          "cpu_seconds": 0.200965
+        },
+        {
+          "rep": 4,
+          "seconds": 0.188052389,
+          "bytes": 1048576,
+          "throughput_mib": 5.317667089036556,
+          "cpu_seconds": 0.187998
+        },
+        {
+          "rep": 5,
+          "seconds": 0.178622944,
+          "bytes": 1048576,
+          "throughput_mib": 5.5983849420822445,
+          "cpu_seconds": 0.178999
+        }
+      ],
+      "median_mib_per_second": 5.3578547181080545,
+      "aggregate_mib_per_second": 5.359502780204551,
+      "seconds_range": [
+        0.177939972,
+        0.201607738
+      ],
+      "median_cpu_seconds": 0.18649349999999998,
+      "sum_cpu_seconds": 1.118906
+    },
+    "history/external_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.236689183,
+          "bytes": 33554432,
+          "throughput_mib": 135.19840490555922,
+          "cpu_seconds": 0.235975
+        },
+        {
+          "rep": 1,
+          "seconds": 0.23611531,
+          "bytes": 33554432,
+          "throughput_mib": 135.52700161628655,
+          "cpu_seconds": 0.235567
+        },
+        {
+          "rep": 2,
+          "seconds": 0.225883096,
+          "bytes": 33554432,
+          "throughput_mib": 141.66620064389411,
+          "cpu_seconds": 0.225972
+        },
+        {
+          "rep": 3,
+          "seconds": 0.251403809,
+          "bytes": 33554432,
+          "throughput_mib": 127.28526320776629,
+          "cpu_seconds": 0.251969
+        },
+        {
+          "rep": 4,
+          "seconds": 0.234887701,
+          "bytes": 33554432,
+          "throughput_mib": 136.23531527519185,
+          "cpu_seconds": 0.235
+        },
+        {
+          "rep": 5,
+          "seconds": 0.226392989,
+          "bytes": 33554432,
+          "throughput_mib": 141.3471333248752,
+          "cpu_seconds": 0.225985
+        }
+      ],
+      "median_mib_per_second": 135.8811584457392,
+      "aggregate_mib_per_second": 136.03783271077413,
+      "seconds_range": [
+        0.225883096,
+        0.251403809
+      ],
+      "median_cpu_seconds": 0.23528349999999998,
+      "sum_cpu_seconds": 1.410468
+    },
+    "history/external_point/old_snapshot": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.181389112,
+          "bytes": 33554432,
+          "throughput_mib": 176.41632205575823,
+          "cpu_seconds": 0.182001
+        },
+        {
+          "rep": 1,
+          "seconds": 0.181001614,
+          "bytes": 33554432,
+          "throughput_mib": 176.79400361590146,
+          "cpu_seconds": 0.180967
+        },
+        {
+          "rep": 2,
+          "seconds": 0.172349341,
+          "bytes": 33554432,
+          "throughput_mib": 185.66940734632692,
+          "cpu_seconds": 0.172946
+        },
+        {
+          "rep": 3,
+          "seconds": 0.182996617,
+          "bytes": 33554432,
+          "throughput_mib": 174.8666206217353,
+          "cpu_seconds": 0.182982
+        },
+        {
+          "rep": 4,
+          "seconds": 0.177500013,
+          "bytes": 33554432,
+          "throughput_mib": 180.2816769371166,
+          "cpu_seconds": 0.177992
+        },
+        {
+          "rep": 5,
+          "seconds": 0.172833636,
+          "bytes": 33554432,
+          "throughput_mib": 185.14914538973187,
+          "cpu_seconds": 0.172969
+        }
+      ],
+      "median_mib_per_second": 178.53784027650903,
+      "aggregate_mib_per_second": 179.7634426009284,
+      "seconds_range": [
+        0.172349341,
+        0.182996617
+      ],
+      "median_cpu_seconds": 0.17947950000000001,
+      "sum_cpu_seconds": 1.069857
+    }
+  },
+  "fuse": {
+    "fresh/blob/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.18138069997075945,
+          "bytes": 67108864,
+          "throughput_mib": 352.84900769661544,
+          "p50": 0.0012546019861474633,
+          "p95": 0.0012967570219188929,
+          "p99": 0.0013795449631288648,
+          "maximum": 0.00147510995157063,
+          "latencies_file": "fresh-0-blob-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.17726830707397312,
+          "bytes": 67108864,
+          "throughput_mib": 361.03464322752933,
+          "p50": 0.0012081610038876534,
+          "p95": 0.001331570092588663,
+          "p99": 0.0014563759323209524,
+          "maximum": 0.001600744086317718,
+          "latencies_file": "fresh-1-blob-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.18463403405621648,
+          "bytes": 67108864,
+          "throughput_mib": 346.6316506983409,
+          "p50": 0.0012395329540595412,
+          "p95": 0.001668964046984911,
+          "p99": 0.0017121860291808844,
+          "maximum": 0.0017125660087913275,
+          "latencies_file": "fresh-2-blob-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.1727112450171262,
+          "bytes": 67108864,
+          "throughput_mib": 370.56070086029257,
+          "p50": 0.0011775540187954903,
+          "p95": 0.0012680100044235587,
+          "p99": 0.0012889259960502386,
+          "maximum": 0.001638500951230526,
+          "latencies_file": "fresh-3-blob-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.15495429001748562,
+          "bytes": 67108864,
+          "throughput_mib": 413.02502817300507,
+          "p50": 0.0010335060069337487,
+          "p95": 0.0013710870407521725,
+          "p99": 0.0014766519889235497,
+          "maximum": 0.0014769249828532338,
+          "latencies_file": "fresh-4-blob-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.15769674198236316,
+          "bytes": 67108864,
+          "throughput_mib": 405.8422462980102,
+          "p50": 0.0010769310174509883,
+          "p95": 0.0011965039884671569,
+          "p99": 0.0012373259523883462,
+          "maximum": 0.0012648779666051269,
+          "latencies_file": "fresh-5-blob-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 365.79767204391095,
+      "aggregate_mib_per_second": 373.3065160910772,
+      "seconds_range": [
+        0.15495429001748562,
+        0.18463403405621648
+      ],
+      "pooled_p99_seconds": 0.0016688380856066942
+    },
+    "fresh/blob/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.5644516049651429,
+          "bytes": 33554432,
+          "throughput_mib": 56.69219419081309,
+          "p50": 6.225996185094118e-05,
+          "p95": 8.804898243397474e-05,
+          "p99": 9.907304774969816e-05,
+          "maximum": 0.00022257305681705475,
+          "latencies_file": "fresh-0-blob-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.5417403109604493,
+          "bytes": 33554432,
+          "throughput_mib": 59.06889214735991,
+          "p50": 5.9477053582668304e-05,
+          "p95": 8.74480465427041e-05,
+          "p99": 9.941495954990387e-05,
+          "maximum": 0.00021664693485945463,
+          "latencies_file": "fresh-1-blob-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5270929789403453,
+          "bytes": 33554432,
+          "throughput_mib": 60.71035145323318,
+          "p50": 5.675607826560736e-05,
+          "p95": 8.15539387986064e-05,
+          "p99": 9.894801769405603e-05,
+          "maximum": 0.00024130090605467558,
+          "latencies_file": "fresh-2-blob-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5122845189180225,
+          "bytes": 33554432,
+          "throughput_mib": 62.46528797627153,
+          "p50": 5.400506779551506e-05,
+          "p95": 8.326489478349686e-05,
+          "p99": 9.595300070941448e-05,
+          "maximum": 0.00023979402612894773,
+          "latencies_file": "fresh-3-blob-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4852942969882861,
+          "bytes": 33554432,
+          "throughput_mib": 65.9393695713931,
+          "p50": 5.062599666416645e-05,
+          "p95": 8.031399920582771e-05,
+          "p99": 9.496905840933323e-05,
+          "maximum": 0.0002843959955498576,
+          "latencies_file": "fresh-4-blob-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.47064136201515794,
+          "bytes": 33554432,
+          "throughput_mib": 67.99232405537994,
+          "p50": 5.117000546306372e-05,
+          "p95": 7.211195770651102e-05,
+          "p99": 8.476607035845518e-05,
+          "maximum": 0.0002109830966219306,
+          "latencies_file": "fresh-5-blob-point.json"
+        }
+      ],
+      "median_mib_per_second": 61.58781971475236,
+      "aggregate_mib_per_second": 61.905428330460396,
+      "seconds_range": [
+        0.47064136201515794,
+        0.5644516049651429
+      ],
+      "pooled_p99_seconds": 9.681191295385361e-05
+    },
+    "fresh/blob/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4172815289348364,
+          "bytes": 1048576,
+          "throughput_mib": 2.3964636118752387,
+          "p50": 4.784099292010069e-05,
+          "p95": 5.784910172224045e-05,
+          "p99": 6.864708848297596e-05,
+          "maximum": 0.0001558610238134861,
+          "latencies_file": "fresh-0-blob-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4366739100078121,
+          "bytes": 1048576,
+          "throughput_mib": 2.290038349170231,
+          "p50": 5.3483061492443085e-05,
+          "p95": 6.025191396474838e-05,
+          "p99": 6.698002107441425e-05,
+          "maximum": 0.0002197349676862359,
+          "latencies_file": "fresh-1-blob-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.43448745901696384,
+          "bytes": 1048576,
+          "throughput_mib": 2.301562402428183,
+          "p50": 4.9544963985681534e-05,
+          "p95": 7.334304973483086e-05,
+          "p99": 8.271902333945036e-05,
+          "maximum": 0.0002169259823858738,
+          "latencies_file": "fresh-2-blob-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4200041809817776,
+          "bytes": 1048576,
+          "throughput_mib": 2.3809286794775653,
+          "p50": 4.832400009036064e-05,
+          "p95": 5.7984027080237865e-05,
+          "p99": 7.313606329262257e-05,
+          "maximum": 0.00020502402912825346,
+          "latencies_file": "fresh-3-blob-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4609939819201827,
+          "bytes": 1048576,
+          "throughput_mib": 2.1692257149099654,
+          "p50": 4.833401180803776e-05,
+          "p95": 7.838604506105185e-05,
+          "p99": 9.36680007725954e-05,
+          "maximum": 0.00020015996415168047,
+          "latencies_file": "fresh-4-blob-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.3927885200828314,
+          "bytes": 1048576,
+          "throughput_mib": 2.5458992533415175,
+          "p50": 4.5927008613944054e-05,
+          "p95": 5.7762954384088516e-05,
+          "p99": 6.848399061709642e-05,
+          "maximum": 0.0002236498985439539,
+          "latencies_file": "fresh-5-blob-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.3412455409528743,
+      "aggregate_mib_per_second": 2.3417105339126087,
+      "seconds_range": [
+        0.3927885200828314,
+        0.4609939819201827
+      ],
+      "pooled_p99_seconds": 8.090096525847912e-05
+    },
+    "fresh/blob/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.5109589770436287,
+          "bytes": 33554432,
+          "throughput_mib": 62.627336905106674,
+          "p50": 5.742104258388281e-05,
+          "p95": 7.138808723539114e-05,
+          "p99": 8.263194467872381e-05,
+          "maximum": 0.00022380601149052382,
+          "latencies_file": "fresh-0-blob-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4938099690480158,
+          "bytes": 33554432,
+          "throughput_mib": 64.80225594005468,
+          "p50": 5.808309651911259e-05,
+          "p95": 6.512901745736599e-05,
+          "p99": 7.214501965790987e-05,
+          "maximum": 0.00026697595603764057,
+          "latencies_file": "fresh-1-blob-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5192998909624293,
+          "bytes": 33554432,
+          "throughput_mib": 61.62142637983946,
+          "p50": 5.5785058066248894e-05,
+          "p95": 8.497200906276703e-05,
+          "p99": 0.00011230295058339834,
+          "maximum": 0.00023346603848040104,
+          "latencies_file": "fresh-2-blob-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5158478500088677,
+          "bytes": 33554432,
+          "throughput_mib": 62.03379542911714,
+          "p50": 5.6165968999266624e-05,
+          "p95": 7.73079227656126e-05,
+          "p99": 9.363400749862194e-05,
+          "maximum": 0.00029805698432028294,
+          "latencies_file": "fresh-3-blob-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.49795558804180473,
+          "bytes": 33554432,
+          "throughput_mib": 64.26275910636735,
+          "p50": 5.436502397060394e-05,
+          "p95": 7.411395199596882e-05,
+          "p99": 8.801498916000128e-05,
+          "maximum": 0.00021601899061352015,
+          "latencies_file": "fresh-4-blob-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.46734426298644394,
+          "bytes": 33554432,
+          "throughput_mib": 68.47200775615,
+          "p50": 5.2974908612668514e-05,
+          "p95": 6.326800212264061e-05,
+          "p99": 8.117104880511761e-05,
+          "maximum": 0.00034876796416938305,
+          "latencies_file": "fresh-5-blob-cross.json"
+        }
+      ],
+      "median_mib_per_second": 63.445048005737014,
+      "aggregate_mib_per_second": 63.888907027628626,
+      "seconds_range": [
+        0.46734426298644394,
+        0.5192998909624293
+      ],
+      "pooled_p99_seconds": 9.191699791699648e-05
+    },
+    "fresh/blob_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.1517449429957196,
+          "bytes": 67108864,
+          "throughput_mib": 421.7603482298932,
+          "p50": 0.0010265479795634747,
+          "p95": 0.0011874859919771552,
+          "p99": 0.0013025799999013543,
+          "maximum": 0.0013034350704401731,
+          "latencies_file": "fresh-0-blob_point-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.17327132599893957,
+          "bytes": 67108864,
+          "throughput_mib": 369.36290312911717,
+          "p50": 0.0011739220935851336,
+          "p95": 0.00131342897657305,
+          "p99": 0.0013785980409011245,
+          "maximum": 0.0014422009699046612,
+          "latencies_file": "fresh-1-blob_point-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.15555545303504914,
+          "bytes": 67108864,
+          "throughput_mib": 411.42884258502835,
+          "p50": 0.0010772750247269869,
+          "p95": 0.0011171350488439202,
+          "p99": 0.0011284820502623916,
+          "maximum": 0.0011300359619781375,
+          "latencies_file": "fresh-2-blob_point-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.1365298411110416,
+          "bytes": 67108864,
+          "throughput_mib": 468.76198990041974,
+          "p50": 0.0009611269924789667,
+          "p95": 0.0011751899728551507,
+          "p99": 0.0011850990122184157,
+          "maximum": 0.001185334986075759,
+          "latencies_file": "fresh-3-blob_point-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.18738202401436865,
+          "bytes": 67108864,
+          "throughput_mib": 341.54823727964646,
+          "p50": 0.0012881580041721463,
+          "p95": 0.001528021995909512,
+          "p99": 0.0015952649991959333,
+          "maximum": 0.0016554390313103795,
+          "latencies_file": "fresh-4-blob_point-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.18362681299913675,
+          "bytes": 67108864,
+          "throughput_mib": 348.5329781348483,
+          "p50": 0.0012640729546546936,
+          "p95": 0.0013610910391435027,
+          "p99": 0.0013855639845132828,
+          "maximum": 0.001425712020136416,
+          "latencies_file": "fresh-5-blob_point-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 390.39587285707273,
+      "aggregate_mib_per_second": 388.62054274507506,
+      "seconds_range": [
+        0.1365298411110416,
+        0.18738202401436865
+      ],
+      "pooled_p99_seconds": 0.0014677030267193913
+    },
+    "fresh/blob_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4918109269347042,
+          "bytes": 33554432,
+          "throughput_mib": 65.06565480243694,
+          "p50": 5.3727999329566956e-05,
+          "p95": 7.98999099060893e-05,
+          "p99": 8.867797441780567e-05,
+          "maximum": 0.0002214460400864482,
+          "latencies_file": "fresh-0-blob_point-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.5070260809734464,
+          "bytes": 33554432,
+          "throughput_mib": 63.113124158352484,
+          "p50": 5.563895683735609e-05,
+          "p95": 7.655797526240349e-05,
+          "p99": 8.857902139425278e-05,
+          "maximum": 0.0002578439889475703,
+          "latencies_file": "fresh-1-blob_point-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5411446780199185,
+          "bytes": 33554432,
+          "throughput_mib": 59.13390873045256,
+          "p50": 5.56230079382658e-05,
+          "p95": 9.951402898877859e-05,
+          "p99": 0.0001111150486394763,
+          "maximum": 0.00021440803539007902,
+          "latencies_file": "fresh-2-blob_point-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5000757289817557,
+          "bytes": 33554432,
+          "throughput_mib": 63.99030815824189,
+          "p50": 5.6037912145256996e-05,
+          "p95": 7.148203440010548e-05,
+          "p99": 0.00010426400694996119,
+          "maximum": 0.0001831370173022151,
+          "latencies_file": "fresh-3-blob_point-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5146478420356289,
+          "bytes": 33554432,
+          "throughput_mib": 62.17844006384593,
+          "p50": 5.5589014664292336e-05,
+          "p95": 8.503603748977184e-05,
+          "p99": 0.00010304700117558241,
+          "maximum": 0.0002986169420182705,
+          "latencies_file": "fresh-4-blob_point-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.520837250049226,
+          "bytes": 33554432,
+          "throughput_mib": 61.43953796886758,
+          "p50": 5.520600825548172e-05,
+          "p95": 8.427607826888561e-05,
+          "p99": 0.0001004610676318407,
+          "maximum": 0.00022123893722891808,
+          "latencies_file": "fresh-5-blob_point-point.json"
+        }
+      ],
+      "median_mib_per_second": 62.64578211109921,
+      "aggregate_mib_per_second": 62.428010526057136,
+      "seconds_range": [
+        0.4918109269347042,
+        0.5411446780199185
+      ],
+      "pooled_p99_seconds": 0.00010305095929652452
+    },
+    "fresh/blob_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4555508600315079,
+          "bytes": 1048576,
+          "throughput_mib": 2.1951445771188656,
+          "p50": 5.0570000894367695e-05,
+          "p95": 7.016793824732304e-05,
+          "p99": 8.514197543263435e-05,
+          "maximum": 0.0002692750422284007,
+          "latencies_file": "fresh-0-blob_point-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.40748779207933694,
+          "bytes": 1048576,
+          "throughput_mib": 2.45406124904302,
+          "p50": 4.655309021472931e-05,
+          "p95": 5.852803587913513e-05,
+          "p99": 6.726500578224659e-05,
+          "maximum": 0.00021422002464532852,
+          "latencies_file": "fresh-1-blob_point-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.43831939110532403,
+          "bytes": 1048576,
+          "throughput_mib": 2.2814413879300846,
+          "p50": 5.248398520052433e-05,
+          "p95": 6.613600999116898e-05,
+          "p99": 7.489591371268034e-05,
+          "maximum": 0.0011083499994128942,
+          "latencies_file": "fresh-2-blob_point-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.39968733093701303,
+          "bytes": 1048576,
+          "throughput_mib": 2.50195571036899,
+          "p50": 4.7871959395706654e-05,
+          "p95": 5.940499249845743e-05,
+          "p99": 6.641994696110487e-05,
+          "maximum": 0.00020335603039711714,
+          "latencies_file": "fresh-3-blob_point-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4107787139946595,
+          "bytes": 1048576,
+          "throughput_mib": 2.4344007270371875,
+          "p50": 4.862900823354721e-05,
+          "p95": 5.764001980423927e-05,
+          "p99": 7.18049705028534e-05,
+          "maximum": 0.00022355990950018167,
+          "latencies_file": "fresh-4-blob_point-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4287193270865828,
+          "bytes": 1048576,
+          "throughput_mib": 2.332528385868742,
+          "p50": 4.970200825482607e-05,
+          "p95": 6.127497181296349e-05,
+          "p99": 8.330401033163071e-05,
+          "maximum": 0.0002824249677360058,
+          "latencies_file": "fresh-5-blob_point-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.3834645564529646,
+      "aggregate_mib_per_second": 2.3616994553294655,
+      "seconds_range": [
+        0.39968733093701303,
+        0.4555508600315079
+      ],
+      "pooled_p99_seconds": 7.687101606279612e-05
+    },
+    "fresh/blob_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.501383570022881,
+          "bytes": 33554432,
+          "throughput_mib": 63.82339173686855,
+          "p50": 5.5968062952160835e-05,
+          "p95": 8.15950334072113e-05,
+          "p99": 9.387207683175802e-05,
+          "maximum": 0.0002584070898592472,
+          "latencies_file": "fresh-0-blob_point-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.43447656405624,
+          "bytes": 33554432,
+          "throughput_mib": 73.65184372949933,
+          "p50": 4.865799564868212e-05,
+          "p95": 6.009696517139673e-05,
+          "p99": 6.901391316205263e-05,
+          "maximum": 0.0002851699246093631,
+          "latencies_file": "fresh-1-blob_point-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.4008566529955715,
+          "bytes": 33554432,
+          "throughput_mib": 79.82903554391929,
+          "p50": 4.413002170622349e-05,
+          "p95": 5.863001570105553e-05,
+          "p99": 6.90630404278636e-05,
+          "maximum": 0.00014442892279475927,
+          "latencies_file": "fresh-2-blob_point-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4169604820199311,
+          "bytes": 33554432,
+          "throughput_mib": 76.74588211568302,
+          "p50": 4.8325047828257084e-05,
+          "p95": 5.528493784368038e-05,
+          "p99": 6.190896965563297e-05,
+          "maximum": 0.00018270895816385746,
+          "latencies_file": "fresh-3-blob_point-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5335018249461427,
+          "bytes": 33554432,
+          "throughput_mib": 59.98105068006171,
+          "p50": 5.817797500640154e-05,
+          "p95": 8.011702448129654e-05,
+          "p99": 9.804102592170238e-05,
+          "maximum": 0.00029403495136648417,
+          "latencies_file": "fresh-4-blob_point-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4372414039680734,
+          "bytes": 33554432,
+          "throughput_mib": 73.18611574656956,
+          "p50": 4.8675923608243465e-05,
+          "p95": 6.560608744621277e-05,
+          "p99": 7.993297185748816e-05,
+          "maximum": 0.0002130080247297883,
+          "latencies_file": "fresh-5-blob_point-cross.json"
+        }
+      ],
+      "median_mib_per_second": 73.41897973803444,
+      "aggregate_mib_per_second": 70.4737026242184,
+      "seconds_range": [
+        0.4008566529955715,
+        0.5335018249461427
+      ],
+      "pooled_p99_seconds": 8.634396363049746e-05
+    },
+    "fresh/external/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.13429917697794735,
+          "bytes": 67108864,
+          "throughput_mib": 476.547968797375,
+          "p50": 0.0008181839948520064,
+          "p95": 0.0011846439447253942,
+          "p99": 0.001217214041389525,
+          "maximum": 0.0013020329643040895,
+          "latencies_file": "fresh-0-external-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.1324788921047002,
+          "bytes": 67108864,
+          "throughput_mib": 483.095827442607,
+          "p50": 0.0008770950371399522,
+          "p95": 0.00094477494712919,
+          "p99": 0.0009673340246081352,
+          "maximum": 0.0009933001128956676,
+          "latencies_file": "fresh-1-external-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.13439580996055156,
+          "bytes": 67108864,
+          "throughput_mib": 476.2053223146284,
+          "p50": 0.0008418610086664557,
+          "p95": 0.0009740979876369238,
+          "p99": 0.0010054738959297538,
+          "maximum": 0.0010950090363621712,
+          "latencies_file": "fresh-2-external-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.13588424504268914,
+          "bytes": 67108864,
+          "throughput_mib": 470.9891126811197,
+          "p50": 0.0009141539921984076,
+          "p95": 0.0009601140627637506,
+          "p99": 0.0009953449480235577,
+          "maximum": 0.0010076139587908983,
+          "latencies_file": "fresh-3-external-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.1345308490563184,
+          "bytes": 67108864,
+          "throughput_mib": 475.72731792696703,
+          "p50": 0.0008918129606172442,
+          "p95": 0.0009457010310143232,
+          "p99": 0.0010945749236270785,
+          "maximum": 0.0011289749527350068,
+          "latencies_file": "fresh-4-external-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.12262722000014037,
+          "bytes": 67108864,
+          "throughput_mib": 521.9069632331773,
+          "p50": 0.0007614740170538425,
+          "p95": 0.0009216309990733862,
+          "p99": 0.0009652689332142472,
+          "maximum": 0.0009899379219859838,
+          "latencies_file": "fresh-5-external-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 476.3766455560017,
+      "aggregate_mib_per_second": 483.49555614157043,
+      "seconds_range": [
+        0.12262722000014037,
+        0.13588424504268914
+      ],
+      "pooled_p99_seconds": 0.0011793749872595072
+    },
+    "fresh/external/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.49243035609833896,
+          "bytes": 33554432,
+          "throughput_mib": 64.98380858065858,
+          "p50": 5.246000364422798e-05,
+          "p95": 8.048699237406254e-05,
+          "p99": 9.191001299768686e-05,
+          "maximum": 0.00023353192955255508,
+          "latencies_file": "fresh-0-external-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4910804710816592,
+          "bytes": 33554432,
+          "throughput_mib": 65.16243647302132,
+          "p50": 5.013903137296438e-05,
+          "p95": 8.411891758441925e-05,
+          "p99": 9.838398545980453e-05,
+          "maximum": 0.00022770604118704796,
+          "latencies_file": "fresh-1-external-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5080705609871075,
+          "bytes": 33554432,
+          "throughput_mib": 62.983377619495684,
+          "p50": 5.424197297543287e-05,
+          "p95": 8.17510299384594e-05,
+          "p99": 9.235693141818047e-05,
+          "maximum": 0.0006289000157266855,
+          "latencies_file": "fresh-2-external-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5087940079392865,
+          "bytes": 33554432,
+          "throughput_mib": 62.89382245204921,
+          "p50": 5.4712058044970036e-05,
+          "p95": 8.085800800472498e-05,
+          "p99": 9.040301665663719e-05,
+          "maximum": 0.00022399402223527431,
+          "latencies_file": "fresh-3-external-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5078341879416257,
+          "bytes": 33554432,
+          "throughput_mib": 63.01269343386216,
+          "p50": 5.3634983487427235e-05,
+          "p95": 8.197699207812548e-05,
+          "p99": 9.301409590989351e-05,
+          "maximum": 0.00021955498959869146,
+          "latencies_file": "fresh-4-external-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.5454715930391103,
+          "bytes": 33554432,
+          "throughput_mib": 58.664833161542106,
+          "p50": 5.758705083280802e-05,
+          "p95": 9.777105879038572e-05,
+          "p99": 0.0001123619731515646,
+          "maximum": 0.0002917980309575796,
+          "latencies_file": "fresh-5-external-point.json"
+        }
+      ],
+      "median_mib_per_second": 62.99803552667892,
+      "aggregate_mib_per_second": 62.87493319232056,
+      "seconds_range": [
+        0.4910804710816592,
+        0.5454715930391103
+      ],
+      "pooled_p99_seconds": 0.00010079098865389824
+    },
+    "fresh/external/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.39028955693356693,
+          "bytes": 1048576,
+          "throughput_mib": 2.562200249109445,
+          "p50": 4.5360997319221497e-05,
+          "p95": 5.361391231417656e-05,
+          "p99": 6.163597572594881e-05,
+          "maximum": 0.00020994211081415415,
+          "latencies_file": "fresh-0-external-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.39294941490516067,
+          "bytes": 1048576,
+          "throughput_mib": 2.5448568239791185,
+          "p50": 4.4350046664476395e-05,
+          "p95": 5.926599260419607e-05,
+          "p99": 6.57000346109271e-05,
+          "maximum": 0.00030362000688910484,
+          "latencies_file": "fresh-1-external-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.382793496013619,
+          "bytes": 1048576,
+          "throughput_mib": 2.6123745842443,
+          "p50": 4.331499803811312e-05,
+          "p95": 6.060407031327486e-05,
+          "p99": 8.294498547911644e-05,
+          "maximum": 0.00028372195083647966,
+          "latencies_file": "fresh-2-external-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.3976809559389949,
+          "bytes": 1048576,
+          "throughput_mib": 2.5145785461082077,
+          "p50": 4.5527005568146706e-05,
+          "p95": 5.50650293007493e-05,
+          "p99": 6.244995165616274e-05,
+          "maximum": 0.00021161104086786509,
+          "latencies_file": "fresh-3-external-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.38358847599010915,
+          "bytes": 1048576,
+          "throughput_mib": 2.6069604865444003,
+          "p50": 4.51760133728385e-05,
+          "p95": 5.1943003199994564e-05,
+          "p99": 5.846400745213032e-05,
+          "maximum": 0.0001970489975064993,
+          "latencies_file": "fresh-4-external-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4227018849924207,
+          "bytes": 1048576,
+          "throughput_mib": 2.3657334767218523,
+          "p50": 4.914205055683851e-05,
+          "p95": 5.8074016124010086e-05,
+          "p99": 6.816990207880735e-05,
+          "maximum": 0.00019461405463516712,
+          "latencies_file": "fresh-5-external-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.553528536544282,
+      "aggregate_mib_per_second": 2.531641526712784,
+      "seconds_range": [
+        0.382793496013619,
+        0.4227018849924207
+      ],
+      "pooled_p99_seconds": 6.771599873900414e-05
+    },
+    "fresh/external/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.42807104100938886,
+          "bytes": 33554432,
+          "throughput_mib": 74.75394720592217,
+          "p50": 4.773004911839962e-05,
+          "p95": 6.298406515270472e-05,
+          "p99": 7.441896013915539e-05,
+          "maximum": 0.0001940529327839613,
+          "latencies_file": "fresh-0-external-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4663533790735528,
+          "bytes": 33554432,
+          "throughput_mib": 68.6174935915989,
+          "p50": 5.1746959798038006e-05,
+          "p95": 6.550503894686699e-05,
+          "p99": 7.565401028841734e-05,
+          "maximum": 0.00021432898938655853,
+          "latencies_file": "fresh-1-external-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.42860642401501536,
+          "bytes": 33554432,
+          "throughput_mib": 74.6605701805322,
+          "p50": 4.7990004532039165e-05,
+          "p95": 5.817099008709192e-05,
+          "p99": 7.615797221660614e-05,
+          "maximum": 0.00022960000205785036,
+          "latencies_file": "fresh-2-external-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4763368160929531,
+          "bytes": 33554432,
+          "throughput_mib": 67.17935485749956,
+          "p50": 5.289108958095312e-05,
+          "p95": 6.67589483782649e-05,
+          "p99": 7.86749878898263e-05,
+          "maximum": 0.00033603596966713667,
+          "latencies_file": "fresh-3-external-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4416493179742247,
+          "bytes": 33554432,
+          "throughput_mib": 72.45567625187087,
+          "p50": 4.849501419812441e-05,
+          "p95": 6.557197775691748e-05,
+          "p99": 7.347902283072472e-05,
+          "maximum": 0.00020334101282060146,
+          "latencies_file": "fresh-4-external-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.43739309604279697,
+          "bytes": 33554432,
+          "throughput_mib": 73.16073410740105,
+          "p50": 4.8659974709153175e-05,
+          "p95": 6.363203283399343e-05,
+          "p99": 7.168005686253309e-05,
+          "maximum": 0.00017644604668021202,
+          "latencies_file": "fresh-5-external-cross.json"
+        }
+      ],
+      "median_mib_per_second": 72.80820517963596,
+      "aggregate_mib_per_second": 71.68431818894605,
+      "seconds_range": [
+        0.42807104100938886,
+        0.4763368160929531
+      ],
+      "pooled_p99_seconds": 7.517996709793806e-05
+    },
+    "fresh/external_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.13194519106764346,
+          "bytes": 67108864,
+          "throughput_mib": 485.0498868669609,
+          "p50": 0.0008758550975471735,
+          "p95": 0.000942099024541676,
+          "p99": 0.0010740070138126612,
+          "maximum": 0.0012175230076536536,
+          "latencies_file": "fresh-0-external_point-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.11893135390710086,
+          "bytes": 67108864,
+          "throughput_mib": 538.1255480366549,
+          "p50": 0.0007220980478450656,
+          "p95": 0.0010305449832230806,
+          "p99": 0.001060839043930173,
+          "maximum": 0.0010712549556046724,
+          "latencies_file": "fresh-1-external_point-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.10419517289847136,
+          "bytes": 67108864,
+          "throughput_mib": 614.2319094029638,
+          "p50": 0.0006667029811069369,
+          "p95": 0.0006887480849400163,
+          "p99": 0.0007026499370113015,
+          "maximum": 0.000708772917278111,
+          "latencies_file": "fresh-2-external_point-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.13617083604913205,
+          "bytes": 67108864,
+          "throughput_mib": 469.99784870901465,
+          "p50": 0.0008997779805213213,
+          "p95": 0.0009385229786857963,
+          "p99": 0.0009482830064371228,
+          "maximum": 0.0010192040354013443,
+          "latencies_file": "fresh-3-external_point-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.11598578293342143,
+          "bytes": 67108864,
+          "throughput_mib": 551.7917660368556,
+          "p50": 0.0007287960033863783,
+          "p95": 0.0008251150138676167,
+          "p99": 0.0009314760100096464,
+          "maximum": 0.0009548310190439224,
+          "latencies_file": "fresh-4-external_point-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.1221471440512687,
+          "bytes": 67108864,
+          "throughput_mib": 523.9582185657763,
+          "p50": 0.0007901940261945128,
+          "p95": 0.0008886059513315558,
+          "p99": 0.0009584820363670588,
+          "maximum": 0.0010004040086641908,
+          "latencies_file": "fresh-5-external_point-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 531.0418833012156,
+      "aggregate_mib_per_second": 526.4778019717152,
+      "seconds_range": [
+        0.10419517289847136,
+        0.13617083604913205
+      ],
+      "pooled_p99_seconds": 0.0010430010734125972
+    },
+    "fresh/external_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.5041012320434675,
+          "bytes": 33554432,
+          "throughput_mib": 63.4793132131062,
+          "p50": 5.399493966251612e-05,
+          "p95": 8.024298585951328e-05,
+          "p99": 9.252398740500212e-05,
+          "maximum": 0.00021104607731103897,
+          "latencies_file": "fresh-0-external_point-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4441478770459071,
+          "bytes": 33554432,
+          "throughput_mib": 72.04807599855415,
+          "p50": 4.7683948650956154e-05,
+          "p95": 7.274001836776733e-05,
+          "p99": 0.00010863004717975855,
+          "maximum": 0.0002922510029748082,
+          "latencies_file": "fresh-1-external_point-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5102366569917649,
+          "bytes": 33554432,
+          "throughput_mib": 62.715995727677544,
+          "p50": 5.477690137922764e-05,
+          "p95": 9.141000919044018e-05,
+          "p99": 0.0001029859995469451,
+          "maximum": 0.00019779207650572062,
+          "latencies_file": "fresh-2-external_point-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5250041430117562,
+          "bytes": 33554432,
+          "throughput_mib": 60.95189995345129,
+          "p50": 5.532801151275635e-05,
+          "p95": 8.609297219663858e-05,
+          "p99": 9.953102562576532e-05,
+          "maximum": 0.00022883096244186163,
+          "latencies_file": "fresh-3-external_point-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4746365729952231,
+          "bytes": 33554432,
+          "throughput_mib": 67.4200047376502,
+          "p50": 4.919408820569515e-05,
+          "p95": 7.614796049892902e-05,
+          "p99": 8.631404489278793e-05,
+          "maximum": 0.00021580595057457685,
+          "latencies_file": "fresh-4-external_point-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.5147512949770316,
+          "bytes": 33554432,
+          "throughput_mib": 62.165943655232276,
+          "p50": 5.356105975806713e-05,
+          "p95": 8.750404231250286e-05,
+          "p99": 0.00013638997916132212,
+          "maximum": 0.00021927489433437586,
+          "latencies_file": "fresh-5-external_point-point.json"
+        }
+      ],
+      "median_mib_per_second": 63.09765447039187,
+      "aggregate_mib_per_second": 64.583886186382,
+      "seconds_range": [
+        0.4441478770459071,
+        0.5250041430117562
+      ],
+      "pooled_p99_seconds": 0.00011378608178347349
+    },
+    "fresh/external_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.3990678860573098,
+          "bytes": 1048576,
+          "throughput_mib": 2.5058393194194304,
+          "p50": 4.682003054767847e-05,
+          "p95": 5.676702130585909e-05,
+          "p99": 6.297300569713116e-05,
+          "maximum": 0.0005841669626533985,
+          "latencies_file": "fresh-0-external_point-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.376476933946833,
+          "bytes": 1048576,
+          "throughput_mib": 2.6562052275458194,
+          "p50": 4.394201096147299e-05,
+          "p95": 5.0663016736507416e-05,
+          "p99": 5.9041078202426434e-05,
+          "maximum": 0.00015128799714148045,
+          "latencies_file": "fresh-1-external_point-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.38229254505131394,
+          "bytes": 1048576,
+          "throughput_mib": 2.615797804442598,
+          "p50": 4.323804751038551e-05,
+          "p95": 6.211490835994482e-05,
+          "p99": 6.992707494646311e-05,
+          "maximum": 0.00024921807926148176,
+          "latencies_file": "fresh-2-external_point-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4104923401027918,
+          "bytes": 1048576,
+          "throughput_mib": 2.4360990505927322,
+          "p50": 4.68340003862977e-05,
+          "p95": 6.061699241399765e-05,
+          "p99": 7.34629575163126e-05,
+          "maximum": 0.0006534579442813993,
+          "latencies_file": "fresh-3-external_point-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.40665606991387904,
+          "bytes": 1048576,
+          "throughput_mib": 2.4590804711504206,
+          "p50": 4.4816057197749615e-05,
+          "p95": 6.94809714332223e-05,
+          "p99": 8.452904876321554e-05,
+          "maximum": 0.00020698097068816423,
+          "latencies_file": "fresh-4-external_point-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.3779248360078782,
+          "bytes": 1048576,
+          "throughput_mib": 2.6460287991741143,
+          "p50": 4.20550350099802e-05,
+          "p95": 5.916110239923e-05,
+          "p99": 6.549607496708632e-05,
+          "maximum": 0.0002486900193616748,
+          "latencies_file": "fresh-5-external_point-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.560818561931014,
+      "aggregate_mib_per_second": 2.550033125672356,
+      "seconds_range": [
+        0.376476933946833,
+        0.4104923401027918
+      ],
+      "pooled_p99_seconds": 7.323198951780796e-05
+    },
+    "fresh/external_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.439659042051062,
+          "bytes": 33554432,
+          "throughput_mib": 72.78367311796016,
+          "p50": 5.22698974236846e-05,
+          "p95": 6.122700870037079e-05,
+          "p99": 6.690307054668665e-05,
+          "maximum": 0.00020189303904771805,
+          "latencies_file": "fresh-0-external_point-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4043030039174482,
+          "bytes": 33554432,
+          "throughput_mib": 79.14855860564879,
+          "p50": 4.59959264844656e-05,
+          "p95": 5.368993151932955e-05,
+          "p99": 6.782507989555597e-05,
+          "maximum": 0.00018595799338072538,
+          "latencies_file": "fresh-1-external_point-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.4202878309879452,
+          "bytes": 33554432,
+          "throughput_mib": 76.13829771083196,
+          "p50": 4.70189843326807e-05,
+          "p95": 6.231397856026888e-05,
+          "p99": 7.998407818377018e-05,
+          "maximum": 0.00023206300102174282,
+          "latencies_file": "fresh-2-external_point-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4903900650097057,
+          "bytes": 33554432,
+          "throughput_mib": 65.25417679366457,
+          "p50": 5.3984927944839e-05,
+          "p95": 6.991799455136061e-05,
+          "p99": 8.33671074360609e-05,
+          "maximum": 0.000215230043977499,
+          "latencies_file": "fresh-3-external_point-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4248572679935023,
+          "bytes": 33554432,
+          "throughput_mib": 75.31941291984536,
+          "p50": 4.781805910170078e-05,
+          "p95": 5.685293581336737e-05,
+          "p99": 7.125397678464651e-05,
+          "maximum": 0.0003022660966962576,
+          "latencies_file": "fresh-4-external_point-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.47247293102554977,
+          "bytes": 33554432,
+          "throughput_mib": 67.72874782591417,
+          "p50": 5.199399311095476e-05,
+          "p95": 6.724195554852486e-05,
+          "p99": 7.669499609619379e-05,
+          "maximum": 0.0002686700318008661,
+          "latencies_file": "fresh-5-external_point-cross.json"
+        }
+      ],
+      "median_mib_per_second": 74.05154301890276,
+      "aggregate_mib_per_second": 72.39900518965554,
+      "seconds_range": [
+        0.4043030039174482,
+        0.4903900650097057
+      ],
+      "pooled_p99_seconds": 7.581699173897505e-05
+    },
+    "aged/blob/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.18124010402243584,
+          "bytes": 67108864,
+          "throughput_mib": 353.12272824604753,
+          "p50": 0.0012381590204313397,
+          "p95": 0.0013405249919742346,
+          "p99": 0.0016844760393723845,
+          "maximum": 0.001711048069410026,
+          "latencies_file": "aged-0-blob-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.15480971394572407,
+          "bytes": 67108864,
+          "throughput_mib": 413.41075032564333,
+          "p50": 0.00102903600782156,
+          "p95": 0.0013325379695743322,
+          "p99": 0.0015200269408524036,
+          "maximum": 0.0015206580283120275,
+          "latencies_file": "aged-1-blob-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.1671730059897527,
+          "bytes": 67108864,
+          "throughput_mib": 382.83692765519237,
+          "p50": 0.00112720497418195,
+          "p95": 0.0012488790089264512,
+          "p99": 0.0013001820771023631,
+          "maximum": 0.0014180369907990098,
+          "latencies_file": "aged-2-blob-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.17361916310619563,
+          "bytes": 67108864,
+          "throughput_mib": 368.6229034571135,
+          "p50": 0.0011797579936683178,
+          "p95": 0.0013566890265792608,
+          "p99": 0.0014229640364646912,
+          "maximum": 0.001441547996364534,
+          "latencies_file": "aged-3-blob-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.1277072550728917,
+          "bytes": 67108864,
+          "throughput_mib": 501.14615621070703,
+          "p50": 0.0008370049763470888,
+          "p95": 0.0009952670661732554,
+          "p99": 0.0010599859524518251,
+          "maximum": 0.0010879680048674345,
+          "latencies_file": "aged-4-blob-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.17507066403049976,
+          "bytes": 67108864,
+          "throughput_mib": 365.56667191740536,
+          "p50": 0.0011750049889087677,
+          "p95": 0.0014451369643211365,
+          "p99": 0.0016249980544671416,
+          "maximum": 0.0017487669829279184,
+          "latencies_file": "aged-5-blob-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 375.72991555615295,
+      "aggregate_mib_per_second": 391.9887678704867,
+      "seconds_range": [
+        0.1277072550728917,
+        0.18124010402243584
+      ],
+      "pooled_p99_seconds": 0.001599868992343545
+    },
+    "aged/blob/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.5048398310318589,
+          "bytes": 33554432,
+          "throughput_mib": 63.386440674845595,
+          "p50": 5.348806735128164e-05,
+          "p95": 8.53630481287837e-05,
+          "p99": 9.936804417520761e-05,
+          "maximum": 0.00024350895546376705,
+          "latencies_file": "aged-0-blob-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.5041589420288801,
+          "bytes": 33554432,
+          "throughput_mib": 63.4720468732,
+          "p50": 5.395489279180765e-05,
+          "p95": 8.317898027598858e-05,
+          "p99": 0.00010237598326057196,
+          "maximum": 0.0001911489525809884,
+          "latencies_file": "aged-1-blob-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5327052270295098,
+          "bytes": 33554432,
+          "throughput_mib": 60.07074527584337,
+          "p50": 5.779706407338381e-05,
+          "p95": 8.919800166040659e-05,
+          "p99": 9.971205145120621e-05,
+          "maximum": 0.00024277507327497005,
+          "latencies_file": "aged-2-blob-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5553977680392563,
+          "bytes": 33554432,
+          "throughput_mib": 57.61636405736905,
+          "p50": 5.56649174541235e-05,
+          "p95": 9.783997666090727e-05,
+          "p99": 0.00011802604421973228,
+          "maximum": 0.0031140330247581005,
+          "latencies_file": "aged-3-blob-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5198662949260324,
+          "bytes": 33554432,
+          "throughput_mib": 61.554288693697714,
+          "p50": 5.704606883227825e-05,
+          "p95": 8.10469500720501e-05,
+          "p99": 9.719701483845711e-05,
+          "maximum": 0.0003004149766638875,
+          "latencies_file": "aged-4-blob-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.516349232988432,
+          "bytes": 33554432,
+          "throughput_mib": 61.97355966773927,
+          "p50": 5.373801104724407e-05,
+          "p95": 8.73140525072813e-05,
+          "p99": 0.00010968092828989029,
+          "maximum": 0.0002939020050689578,
+          "latencies_file": "aged-5-blob-point.json"
+        }
+      ],
+      "median_mib_per_second": 61.76392418071849,
+      "aggregate_mib_per_second": 61.27690937729585,
+      "seconds_range": [
+        0.5041589420288801,
+        0.5553977680392563
+      ],
+      "pooled_p99_seconds": 0.00010606902651488781
+    },
+    "aged/blob/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4127174490131438,
+          "bytes": 1048576,
+          "throughput_mib": 2.4229651602836717,
+          "p50": 4.664110019803047e-05,
+          "p95": 6.516301073133945e-05,
+          "p99": 7.312605157494545e-05,
+          "maximum": 0.0002809780417010188,
+          "latencies_file": "aged-0-blob-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.40225932805333287,
+          "bytes": 1048576,
+          "throughput_mib": 2.4859585104945454,
+          "p50": 4.58291033282876e-05,
+          "p95": 5.58680621907115e-05,
+          "p99": 7.099099457263947e-05,
+          "maximum": 0.00021910795476287603,
+          "latencies_file": "aged-1-blob-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.4494826860027388,
+          "bytes": 1048576,
+          "throughput_mib": 2.224779799402344,
+          "p50": 5.2017043344676495e-05,
+          "p95": 6.325705908238888e-05,
+          "p99": 8.274195715785027e-05,
+          "maximum": 0.00021797302179038525,
+          "latencies_file": "aged-2-blob-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4394955789903179,
+          "bytes": 1048576,
+          "throughput_mib": 2.2753357435298116,
+          "p50": 5.0078961066901684e-05,
+          "p95": 6.471003871411085e-05,
+          "p99": 7.435900624841452e-05,
+          "maximum": 0.000226362026296556,
+          "latencies_file": "aged-3-blob-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.39928709098603576,
+          "bytes": 1048576,
+          "throughput_mib": 2.50446363675447,
+          "p50": 4.514597821980715e-05,
+          "p95": 6.84099504724145e-05,
+          "p99": 7.907208055257797e-05,
+          "maximum": 0.0002200249582529068,
+          "latencies_file": "aged-4-blob-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.41129433701280504,
+          "bytes": 1048576,
+          "throughput_mib": 2.4313488176445923,
+          "p50": 4.6644010581076145e-05,
+          "p95": 7.176899816840887e-05,
+          "p99": 8.518598042428493e-05,
+          "maximum": 0.00018997106235474348,
+          "latencies_file": "aged-5-blob-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.427156988964132,
+      "aggregate_mib_per_second": 2.386125662301773,
+      "seconds_range": [
+        0.39928709098603576,
+        0.4494826860027388
+      ],
+      "pooled_p99_seconds": 7.949606515467167e-05
+    },
+    "aged/blob/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.46663268900010735,
+          "bytes": 33554432,
+          "throughput_mib": 68.57642157168428,
+          "p50": 5.056709051132202e-05,
+          "p95": 7.421593181788921e-05,
+          "p99": 8.203205652534962e-05,
+          "maximum": 0.00018632004503160715,
+          "latencies_file": "aged-0-blob-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4774049600819126,
+          "bytes": 33554432,
+          "throughput_mib": 67.02904803190457,
+          "p50": 5.422800313681364e-05,
+          "p95": 6.477208808064461e-05,
+          "p99": 7.724494207650423e-05,
+          "maximum": 0.00021759991068392992,
+          "latencies_file": "aged-1-blob-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5075248709181324,
+          "bytes": 33554432,
+          "throughput_mib": 63.05109726368828,
+          "p50": 5.7412078604102135e-05,
+          "p95": 7.136096246540546e-05,
+          "p99": 7.841503247618675e-05,
+          "maximum": 0.00021966395433992147,
+          "latencies_file": "aged-2-blob-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5051251710392535,
+          "bytes": 33554432,
+          "throughput_mib": 63.35063432725523,
+          "p50": 5.6421966291964054e-05,
+          "p95": 6.983103230595589e-05,
+          "p99": 8.378701750189066e-05,
+          "maximum": 0.0002178669674322009,
+          "latencies_file": "aged-3-blob-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4504076460143551,
+          "bytes": 33554432,
+          "throughput_mib": 71.04675127779717,
+          "p50": 5.1717041060328484e-05,
+          "p95": 5.861092358827591e-05,
+          "p99": 6.464298348873854e-05,
+          "maximum": 0.00014841300435364246,
+          "latencies_file": "aged-4-blob-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4584640930406749,
+          "bytes": 33554432,
+          "throughput_mib": 69.79826879737986,
+          "p50": 5.1186070777475834e-05,
+          "p95": 6.423797458410263e-05,
+          "p99": 8.759694173932076e-05,
+          "maximum": 0.0027411129558458924,
+          "latencies_file": "aged-5-blob-cross.json"
+        }
+      ],
+      "median_mib_per_second": 67.80273480179443,
+      "aggregate_mib_per_second": 67.00262363557839,
+      "seconds_range": [
+        0.4504076460143551,
+        0.5075248709181324
+      ],
+      "pooled_p99_seconds": 8.078699465841055e-05
+    },
+    "aged/blob_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.1689270440256223,
+          "bytes": 67108864,
+          "throughput_mib": 378.86177650922895,
+          "p50": 0.0011496380902826786,
+          "p95": 0.0013039309997111559,
+          "p99": 0.0015435050008818507,
+          "maximum": 0.0015911079244688153,
+          "latencies_file": "aged-0-blob_point-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.18516284495126456,
+          "bytes": 67108864,
+          "throughput_mib": 345.64169726839634,
+          "p50": 0.0012288229772821069,
+          "p95": 0.0016854790737852454,
+          "p99": 0.001758752972818911,
+          "maximum": 0.0018359109526500106,
+          "latencies_file": "aged-1-blob_point-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.17426832194905728,
+          "bytes": 67108864,
+          "throughput_mib": 367.2497633775845,
+          "p50": 0.0012120039900764823,
+          "p95": 0.0013007209636271,
+          "p99": 0.001544464030303061,
+          "maximum": 0.0016158520011231303,
+          "latencies_file": "aged-2-blob_point-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.17499010008759797,
+          "bytes": 67108864,
+          "throughput_mib": 365.7349756812663,
+          "p50": 0.0012164420913904905,
+          "p95": 0.0012758709490299225,
+          "p99": 0.0013617140939459205,
+          "maximum": 0.0013634819770231843,
+          "latencies_file": "aged-3-blob_point-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.19394334801472723,
+          "bytes": 67108864,
+          "throughput_mib": 329.9932720308619,
+          "p50": 0.0012981020845472813,
+          "p95": 0.001719399937428534,
+          "p99": 0.001785735017620027,
+          "maximum": 0.0018160840263590217,
+          "latencies_file": "aged-4-blob_point-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.17569063906557858,
+          "bytes": 67108864,
+          "throughput_mib": 364.2766645985689,
+          "p50": 0.0012004070449620485,
+          "p95": 0.0013110149884596467,
+          "p99": 0.0015967050567269325,
+          "maximum": 0.0017974930815398693,
+          "latencies_file": "aged-5-blob_point-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 365.0058201399176,
+      "aggregate_mib_per_second": 357.881020667513,
+      "seconds_range": [
+        0.1689270440256223,
+        0.19394334801472723
+      ],
+      "pooled_p99_seconds": 0.0017574750818312168
+    },
+    "aged/blob_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4905880920123309,
+          "bytes": 33554432,
+          "throughput_mib": 65.22783679632339,
+          "p50": 5.271006375551224e-05,
+          "p95": 7.909606210887432e-05,
+          "p99": 8.77609709277749e-05,
+          "maximum": 0.0002176400739699602,
+          "latencies_file": "aged-0-blob_point-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.5234992270125076,
+          "bytes": 33554432,
+          "throughput_mib": 61.127119867238015,
+          "p50": 5.572591908276081e-05,
+          "p95": 8.569296915084124e-05,
+          "p99": 9.837106335908175e-05,
+          "maximum": 0.0002499660477042198,
+          "latencies_file": "aged-1-blob_point-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5079482669243589,
+          "bytes": 33554432,
+          "throughput_mib": 62.99854155180193,
+          "p50": 5.339900963008404e-05,
+          "p95": 8.539005648344755e-05,
+          "p99": 9.702204260975122e-05,
+          "maximum": 0.0003619579365476966,
+          "latencies_file": "aged-2-blob_point-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4880615200381726,
+          "bytes": 33554432,
+          "throughput_mib": 65.56550493367556,
+          "p50": 5.1186070777475834e-05,
+          "p95": 7.816602010279894e-05,
+          "p99": 8.842896204441786e-05,
+          "maximum": 0.00020418199710547924,
+          "latencies_file": "aged-3-blob_point-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5511163740884513,
+          "bytes": 33554432,
+          "throughput_mib": 58.06396163229251,
+          "p50": 5.659007001668215e-05,
+          "p95": 9.247404523193836e-05,
+          "p99": 0.0001222669379785657,
+          "maximum": 0.00021605589427053928,
+          "latencies_file": "aged-4-blob_point-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.49843317398335785,
+          "bytes": 33554432,
+          "throughput_mib": 64.2011841713177,
+          "p50": 5.344802048057318e-05,
+          "p95": 7.899908814579248e-05,
+          "p99": 8.667097426950932e-05,
+          "maximum": 0.00031394301913678646,
+          "latencies_file": "aged-5-blob_point-point.json"
+        }
+      ],
+      "median_mib_per_second": 63.599862861559814,
+      "aggregate_mib_per_second": 62.7523442111451,
+      "seconds_range": [
+        0.4880615200381726,
+        0.5511163740884513
+      ],
+      "pooled_p99_seconds": 0.0001004519872367382
+    },
+    "aged/blob_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4244634440401569,
+          "bytes": 1048576,
+          "throughput_mib": 2.3559154835142735,
+          "p50": 4.824204370379448e-05,
+          "p95": 6.089499220252037e-05,
+          "p99": 7.818103767931461e-05,
+          "maximum": 0.00016525399405509233,
+          "latencies_file": "aged-0-blob_point-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.4066658620722592,
+          "bytes": 1048576,
+          "throughput_mib": 2.459021258642834,
+          "p50": 4.7820969484746456e-05,
+          "p95": 5.5375974625349045e-05,
+          "p99": 6.180303171277046e-05,
+          "maximum": 0.00022863398771733046,
+          "latencies_file": "aged-1-blob_point-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.38890168897341937,
+          "bytes": 1048576,
+          "throughput_mib": 2.571343936920644,
+          "p50": 4.223710857331753e-05,
+          "p95": 6.929005030542612e-05,
+          "p99": 8.07150499895215e-05,
+          "maximum": 0.000153058092109859,
+          "latencies_file": "aged-2-blob_point-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.44841173896566033,
+          "bytes": 1048576,
+          "throughput_mib": 2.2300932671982983,
+          "p50": 4.9802009016275406e-05,
+          "p95": 6.677897181361914e-05,
+          "p99": 8.324196096509695e-05,
+          "maximum": 0.0008112569339573383,
+          "latencies_file": "aged-3-blob_point-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.44029760698322207,
+          "bytes": 1048576,
+          "throughput_mib": 2.271191085619745,
+          "p50": 4.96390275657177e-05,
+          "p95": 7.687101606279612e-05,
+          "p99": 9.378197137266397e-05,
+          "maximum": 0.00028592697344720364,
+          "latencies_file": "aged-4-blob_point-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4104210240766406,
+          "bytes": 1048576,
+          "throughput_mib": 2.4365223546960975,
+          "p50": 4.7727953642606735e-05,
+          "p95": 5.651300307363272e-05,
+          "p99": 6.420793943107128e-05,
+          "maximum": 0.00021704600658267736,
+          "latencies_file": "aged-5-blob_point-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.3962189191051855,
+      "aggregate_mib_per_second": 2.3817450057371663,
+      "seconds_range": [
+        0.38890168897341937,
+        0.44841173896566033
+      ],
+      "pooled_p99_seconds": 8.324207738041878e-05
+    },
+    "aged/blob_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.4484015080379322,
+          "bytes": 33554432,
+          "throughput_mib": 71.36461279985923,
+          "p50": 5.178793799132109e-05,
+          "p95": 5.884293932467699e-05,
+          "p99": 6.487604696303606e-05,
+          "maximum": 0.00022763304878026247,
+          "latencies_file": "aged-0-blob_point-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.48688817699439824,
+          "bytes": 33554432,
+          "throughput_mib": 65.72351006249258,
+          "p50": 5.522603169083595e-05,
+          "p95": 6.504100747406483e-05,
+          "p99": 7.303396705538034e-05,
+          "maximum": 0.00023088394664227962,
+          "latencies_file": "aged-1-blob_point-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.41271400707773864,
+          "bytes": 33554432,
+          "throughput_mib": 77.53553175134299,
+          "p50": 4.699092824012041e-05,
+          "p95": 5.677598528563976e-05,
+          "p99": 6.691890303045511e-05,
+          "maximum": 0.00013379903975874186,
+          "latencies_file": "aged-2-blob_point-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4951618480263278,
+          "bytes": 33554432,
+          "throughput_mib": 64.62533437814166,
+          "p50": 5.5543030612170696e-05,
+          "p95": 6.964302156120539e-05,
+          "p99": 8.90230294317007e-05,
+          "maximum": 0.00022551510483026505,
+          "latencies_file": "aged-3-blob_point-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.49692318902816623,
+          "bytes": 33554432,
+          "throughput_mib": 64.39627030202087,
+          "p50": 5.4067932069301605e-05,
+          "p95": 8.20419518277049e-05,
+          "p99": 9.81279881671071e-05,
+          "maximum": 0.0002738790353760123,
+          "latencies_file": "aged-4-blob_point-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4761129580438137,
+          "bytes": 33554432,
+          "throughput_mib": 67.2109411419448,
+          "p50": 5.4721953347325325e-05,
+          "p95": 6.269000004976988e-05,
+          "p99": 6.97809737175703e-05,
+          "maximum": 0.0002861830871552229,
+          "latencies_file": "aged-5-blob_point-cross.json"
+        }
+      ],
+      "median_mib_per_second": 66.46722560221869,
+      "aggregate_mib_per_second": 68.17693522168304,
+      "seconds_range": [
+        0.41271400707773864,
+        0.49692318902816623
+      ],
+      "pooled_p99_seconds": 8.373591117560863e-05
+    },
+    "aged/external/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.1310458250809461,
+          "bytes": 67108864,
+          "throughput_mib": 488.3787786483671,
+          "p50": 0.0008714849827811122,
+          "p95": 0.0009194459998980165,
+          "p99": 0.001067152014002204,
+          "maximum": 0.0010924709495157003,
+          "latencies_file": "aged-0-external-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.11296294501516968,
+          "bytes": 67108864,
+          "throughput_mib": 566.557467065023,
+          "p50": 0.0007139530498534441,
+          "p95": 0.0008085250156000257,
+          "p99": 0.0009215450845658779,
+          "maximum": 0.0009501309832558036,
+          "latencies_file": "aged-1-external-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.13360429496970028,
+          "bytes": 67108864,
+          "throughput_mib": 479.02651643432847,
+          "p50": 0.000888362992554903,
+          "p95": 0.0009175719460472465,
+          "p99": 0.000943556078709662,
+          "maximum": 0.0009762269910424948,
+          "latencies_file": "aged-2-external-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.1190100759267807,
+          "bytes": 67108864,
+          "throughput_mib": 537.7695922097815,
+          "p50": 0.0007737110136076808,
+          "p95": 0.0009658330818638206,
+          "p99": 0.001109856995753944,
+          "maximum": 0.0012168700341135263,
+          "latencies_file": "aged-3-external-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.12882392504252493,
+          "bytes": 67108864,
+          "throughput_mib": 496.80212723586493,
+          "p50": 0.0008149679051712155,
+          "p95": 0.0009368489263579249,
+          "p99": 0.0010619990061968565,
+          "maximum": 0.0011058790842071176,
+          "latencies_file": "aged-4-external-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.1140334369847551,
+          "bytes": 67108864,
+          "throughput_mib": 561.2388935409886,
+          "p50": 0.0006987079977989197,
+          "p95": 0.0010187909938395023,
+          "p99": 0.0010667819296941161,
+          "maximum": 0.0010740229627117515,
+          "latencies_file": "aged-5-external-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 517.2858597228233,
+      "aggregate_mib_per_second": 519.2834678288716,
+      "seconds_range": [
+        0.11296294501516968,
+        0.13360429496970028
+      ],
+      "pooled_p99_seconds": 0.0010619990061968565
+    },
+    "aged/external/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.5072961940895766,
+          "bytes": 33554432,
+          "throughput_mib": 63.07951917011534,
+          "p50": 5.41789922863245e-05,
+          "p95": 8.019001688808203e-05,
+          "p99": 9.083002805709839e-05,
+          "maximum": 0.00036977999843657017,
+          "latencies_file": "aged-0-external-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.48406063800211996,
+          "bytes": 33554432,
+          "throughput_mib": 66.10742020271405,
+          "p50": 5.370797589421272e-05,
+          "p95": 7.387995719909668e-05,
+          "p99": 8.620298467576504e-05,
+          "maximum": 0.00029407197143882513,
+          "latencies_file": "aged-1-external-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.44402094290126115,
+          "bytes": 33554432,
+          "throughput_mib": 72.06867268672049,
+          "p50": 4.978198558092117e-05,
+          "p95": 6.152002606540918e-05,
+          "p99": 8.599401917308569e-05,
+          "maximum": 0.00019925297237932682,
+          "latencies_file": "aged-2-external-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.43791102804243565,
+          "bytes": 33554432,
+          "throughput_mib": 73.07420446351273,
+          "p50": 4.8937974497675896e-05,
+          "p95": 6.13359734416008e-05,
+          "p99": 7.250800263136625e-05,
+          "maximum": 0.0001786580542102456,
+          "latencies_file": "aged-3-external-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5112789620179683,
+          "bytes": 33554432,
+          "throughput_mib": 62.58814145940821,
+          "p50": 5.487899761646986e-05,
+          "p95": 8.187396451830864e-05,
+          "p99": 9.755394421517849e-05,
+          "maximum": 0.0003041069721803069,
+          "latencies_file": "aged-4-external-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4630281439749524,
+          "bytes": 33554432,
+          "throughput_mib": 69.11026989696559,
+          "p50": 4.8756017349660397e-05,
+          "p95": 7.787090726196766e-05,
+          "p99": 0.00010095397010445595,
+          "maximum": 0.0002238560700789094,
+          "latencies_file": "aged-5-external-point.json"
+        }
+      ],
+      "median_mib_per_second": 67.60884504983983,
+      "aggregate_mib_per_second": 67.42529703433807,
+      "seconds_range": [
+        0.43791102804243565,
+        0.5112789620179683
+      ],
+      "pooled_p99_seconds": 9.083002805709839e-05
+    },
+    "aged/external/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.3946377680404112,
+          "bytes": 1048576,
+          "throughput_mib": 2.5339693282919624,
+          "p50": 4.4479966163635254e-05,
+          "p95": 5.9244921430945396e-05,
+          "p99": 6.655300967395306e-05,
+          "maximum": 0.00016119400970637798,
+          "latencies_file": "aged-0-external-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.3784298279788345,
+          "bytes": 1048576,
+          "throughput_mib": 2.6424978320047483,
+          "p50": 4.4446089304983616e-05,
+          "p95": 5.258398596197367e-05,
+          "p99": 7.002498023211956e-05,
+          "maximum": 0.00027823098935186863,
+          "latencies_file": "aged-1-external-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.40346119191963226,
+          "bytes": 1048576,
+          "throughput_mib": 2.478553129836576,
+          "p50": 4.558998625725508e-05,
+          "p95": 6.045110058039427e-05,
+          "p99": 7.001205813139677e-05,
+          "maximum": 0.0002453679917380214,
+          "latencies_file": "aged-2-external-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4089555050013587,
+          "bytes": 1048576,
+          "throughput_mib": 2.4452537935555547,
+          "p50": 4.657695535570383e-05,
+          "p95": 5.9538986533880234e-05,
+          "p99": 6.799702532589436e-05,
+          "maximum": 0.00032163807190954685,
+          "latencies_file": "aged-3-external-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.36967626796104014,
+          "bytes": 1048576,
+          "throughput_mib": 2.7050695072083695,
+          "p50": 4.261103458702564e-05,
+          "p95": 5.0893984735012054e-05,
+          "p99": 5.8116973377764225e-05,
+          "maximum": 0.00019295699894428253,
+          "latencies_file": "aged-4-external-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.3629630650393665,
+          "bytes": 1048576,
+          "throughput_mib": 2.755101265996697,
+          "p50": 3.9363978430628777e-05,
+          "p95": 6.245099939405918e-05,
+          "p99": 8.109898772090673e-05,
+          "maximum": 0.00015301199164241552,
+          "latencies_file": "aged-5-external-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.5882335801483554,
+      "aggregate_mib_per_second": 2.5883002670167485,
+      "seconds_range": [
+        0.3629630650393665,
+        0.4089555050013587
+      ],
+      "pooled_p99_seconds": 6.939296144992113e-05
+    },
+    "aged/external/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.42609891097527,
+          "bytes": 33554432,
+          "throughput_mib": 75.09993378475737,
+          "p50": 4.788802471011877e-05,
+          "p95": 5.801999941468239e-05,
+          "p99": 7.496390026062727e-05,
+          "maximum": 0.0002855469938367605,
+          "latencies_file": "aged-0-external-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.40204903401900083,
+          "bytes": 33554432,
+          "throughput_mib": 79.59228176752113,
+          "p50": 4.449498374015093e-05,
+          "p95": 6.15559983998537e-05,
+          "p99": 7.431302219629288e-05,
+          "maximum": 0.00020531797781586647,
+          "latencies_file": "aged-1-external-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.4889692390570417,
+          "bytes": 33554432,
+          "throughput_mib": 65.44378959648006,
+          "p50": 5.394802428781986e-05,
+          "p95": 7.537100464105606e-05,
+          "p99": 9.605195373296738e-05,
+          "maximum": 0.00019601406529545784,
+          "latencies_file": "aged-2-external-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4356189059326425,
+          "bytes": 33554432,
+          "throughput_mib": 73.45870338544947,
+          "p50": 4.9054971896111965e-05,
+          "p95": 5.8527919463813305e-05,
+          "p99": 6.79829390719533e-05,
+          "maximum": 0.00015346799045801163,
+          "latencies_file": "aged-3-external-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4423686290392652,
+          "bytes": 33554432,
+          "throughput_mib": 72.33786009983913,
+          "p50": 4.992191679775715e-05,
+          "p95": 5.95280434936285e-05,
+          "p99": 7.200893014669418e-05,
+          "maximum": 0.0002906159497797489,
+          "latencies_file": "aged-4-external-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.42207253898959607,
+          "bytes": 33554432,
+          "throughput_mib": 75.81635156033875,
+          "p50": 4.685996100306511e-05,
+          "p95": 6.0057034716010094e-05,
+          "p99": 7.603701669722795e-05,
+          "maximum": 0.00019764399621635675,
+          "latencies_file": "aged-5-external-cross.json"
+        }
+      ],
+      "median_mib_per_second": 74.27931858510343,
+      "aggregate_mib_per_second": 73.36148111946484,
+      "seconds_range": [
+        0.40204903401900083,
+        0.4889692390570417
+      ],
+      "pooled_p99_seconds": 7.848197128623724e-05
+    },
+    "aged/external_point/sequential": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.13619507697876543,
+          "bytes": 67108864,
+          "throughput_mib": 469.91419528312633,
+          "p50": 0.0008817709749564528,
+          "p95": 0.0011493379715830088,
+          "p99": 0.001180815976113081,
+          "maximum": 0.0012158689787611365,
+          "latencies_file": "aged-0-external_point-sequential.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.14025263697840273,
+          "bytes": 67108864,
+          "throughput_mib": 456.31940602910197,
+          "p50": 0.0008308879332616925,
+          "p95": 0.001185821951366961,
+          "p99": 0.0012199280317872763,
+          "maximum": 0.0012530710082501173,
+          "latencies_file": "aged-1-external_point-sequential.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.1320893180090934,
+          "bytes": 67108864,
+          "throughput_mib": 484.5206331945333,
+          "p50": 0.0008561700815334916,
+          "p95": 0.0009044730104506016,
+          "p99": 0.0011216369457542896,
+          "maximum": 0.0011457520304247737,
+          "latencies_file": "aged-2-external_point-sequential.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.13628221303224564,
+          "bytes": 67108864,
+          "throughput_mib": 469.6137417790318,
+          "p50": 0.0008953319629654288,
+          "p95": 0.0009500239975750446,
+          "p99": 0.000959463999606669,
+          "maximum": 0.0010900230845436454,
+          "latencies_file": "aged-3-external_point-sequential.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.13702506304252893,
+          "bytes": 67108864,
+          "throughput_mib": 467.0678383861506,
+          "p50": 0.0009025699691846967,
+          "p95": 0.0009764699498191476,
+          "p99": 0.001131976954638958,
+          "maximum": 0.001220731995999813,
+          "latencies_file": "aged-4-external_point-sequential.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.10866095498204231,
+          "bytes": 67108864,
+          "throughput_mib": 588.9880133169901,
+          "p50": 0.0007105349795892835,
+          "p95": 0.0007873920258134604,
+          "p99": 0.000901241903193295,
+          "maximum": 0.0009618069743737578,
+          "latencies_file": "aged-5-external_point-sequential.json"
+        }
+      ],
+      "median_mib_per_second": 469.76396853107906,
+      "aggregate_mib_per_second": 485.76526680099954,
+      "seconds_range": [
+        0.10866095498204231,
+        0.14025263697840273
+      ],
+      "pooled_p99_seconds": 0.0011958950199186802
+    },
+    "aged/external_point/point": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.496407374041155,
+          "bytes": 33554432,
+          "throughput_mib": 64.46318421802296,
+          "p50": 5.109002813696861e-05,
+          "p95": 8.962606079876423e-05,
+          "p99": 0.00012000300921499729,
+          "maximum": 0.0002039290266111493,
+          "latencies_file": "aged-0-external_point-point.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.5146063939901069,
+          "bytes": 33554432,
+          "throughput_mib": 62.18344811435667,
+          "p50": 5.39940083399415e-05,
+          "p95": 8.803501259535551e-05,
+          "p99": 0.00012126506771892309,
+          "maximum": 0.0002247140510007739,
+          "latencies_file": "aged-1-external_point-point.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.5039163610199466,
+          "bytes": 33554432,
+          "throughput_mib": 63.502601771513696,
+          "p50": 5.396793130785227e-05,
+          "p95": 8.041702676564455e-05,
+          "p99": 9.311398025602102e-05,
+          "maximum": 0.00021501106675714254,
+          "latencies_file": "aged-2-external_point-point.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.5183603600598872,
+          "bytes": 33554432,
+          "throughput_mib": 61.733115542058385,
+          "p50": 5.4965028539299965e-05,
+          "p95": 8.348503615707159e-05,
+          "p99": 9.445811156183481e-05,
+          "maximum": 0.00023005995899438858,
+          "latencies_file": "aged-3-external_point-point.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.5114157389616594,
+          "bytes": 33554432,
+          "throughput_mib": 62.571402407306486,
+          "p50": 5.3786905482411385e-05,
+          "p95": 8.280202746391296e-05,
+          "p99": 9.463203605264425e-05,
+          "maximum": 0.00023023097310215235,
+          "latencies_file": "aged-4-external_point-point.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4706458000000566,
+          "bytes": 33554432,
+          "throughput_mib": 67.99168291737895,
+          "p50": 5.050294566899538e-05,
+          "p95": 7.553398609161377e-05,
+          "p99": 0.00010465492960065603,
+          "maximum": 0.00024181499611586332,
+          "latencies_file": "aged-5-external_point-point.json"
+        }
+      ],
+      "median_mib_per_second": 63.037002089410095,
+      "aggregate_mib_per_second": 63.6741575154368,
+      "seconds_range": [
+        0.4706458000000566,
+        0.5183603600598872
+      ],
+      "pooled_p99_seconds": 0.00010893691796809435
+    },
+    "aged/external_point/partial": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.37659919599536806,
+          "bytes": 1048576,
+          "throughput_mib": 2.6553428967285937,
+          "p50": 4.351208917796612e-05,
+          "p95": 5.22789778187871e-05,
+          "p99": 7.285107858479023e-05,
+          "maximum": 0.00027752190362662077,
+          "latencies_file": "aged-0-external_point-partial.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.37226797093171626,
+          "bytes": 1048576,
+          "throughput_mib": 2.6862370068990606,
+          "p50": 4.127202555537224e-05,
+          "p95": 6.136007141321898e-05,
+          "p99": 8.362403605133295e-05,
+          "maximum": 0.00027121196035295725,
+          "latencies_file": "aged-1-external_point-partial.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.3562907080631703,
+          "bytes": 1048576,
+          "throughput_mib": 2.8066968275319155,
+          "p50": 4.115491174161434e-05,
+          "p95": 4.897092003375292e-05,
+          "p99": 6.055505946278572e-05,
+          "maximum": 0.00017298804596066475,
+          "latencies_file": "aged-2-external_point-partial.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.42077553598210216,
+          "bytes": 1048576,
+          "throughput_mib": 2.376564021636789,
+          "p50": 4.633399657905102e-05,
+          "p95": 6.902101449668407e-05,
+          "p99": 8.887297008186579e-05,
+          "maximum": 0.0002532580401748419,
+          "latencies_file": "aged-3-external_point-partial.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.4090659939683974,
+          "bytes": 1048576,
+          "throughput_mib": 2.4445933290589186,
+          "p50": 4.6313973143696785e-05,
+          "p95": 6.326299626380205e-05,
+          "p99": 7.816799916327e-05,
+          "maximum": 0.0001877850154414773,
+          "latencies_file": "aged-4-external_point-partial.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.42192441306542605,
+          "bytes": 1048576,
+          "throughput_mib": 2.3700927678838393,
+          "p50": 4.664994776248932e-05,
+          "p95": 6.878003478050232e-05,
+          "p99": 8.108397014439106e-05,
+          "maximum": 0.00029594695661216974,
+          "latencies_file": "aged-5-external_point-partial.json"
+        }
+      ],
+      "median_mib_per_second": 2.5499681128937564,
+      "aggregate_mib_per_second": 2.5456911055681255,
+      "seconds_range": [
+        0.3562907080631703,
+        0.42192441306542605
+      ],
+      "pooled_p99_seconds": 7.918104529380798e-05
+    },
+    "aged/external_point/cross": {
+      "samples": [
+        {
+          "rep": 0,
+          "seconds": 0.43552289705257863,
+          "bytes": 33554432,
+          "throughput_mib": 73.47489699522455,
+          "p50": 4.877499304711819e-05,
+          "p95": 6.512505933642387e-05,
+          "p99": 7.749500218778849e-05,
+          "maximum": 0.00019728299230337143,
+          "latencies_file": "aged-0-external_point-cross.json"
+        },
+        {
+          "rep": 1,
+          "seconds": 0.3707843900192529,
+          "bytes": 33554432,
+          "throughput_mib": 86.3035253408009,
+          "p50": 4.073709715157747e-05,
+          "p95": 5.596701521426439e-05,
+          "p99": 7.044803351163864e-05,
+          "maximum": 0.00016294396482408047,
+          "latencies_file": "aged-1-external_point-cross.json"
+        },
+        {
+          "rep": 2,
+          "seconds": 0.4627699649427086,
+          "bytes": 33554432,
+          "throughput_mib": 69.14882646707989,
+          "p50": 5.1020062528550625e-05,
+          "p95": 6.747199222445488e-05,
+          "p99": 8.68999632075429e-05,
+          "maximum": 0.00024622806813567877,
+          "latencies_file": "aged-2-external_point-cross.json"
+        },
+        {
+          "rep": 3,
+          "seconds": 0.4378638450289145,
+          "bytes": 33554432,
+          "throughput_mib": 73.08207874045154,
+          "p50": 4.965602420270443e-05,
+          "p95": 5.7236989960074425e-05,
+          "p99": 6.838003173470497e-05,
+          "maximum": 0.0002848359290510416,
+          "latencies_file": "aged-3-external_point-cross.json"
+        },
+        {
+          "rep": 4,
+          "seconds": 0.46262336801737547,
+          "bytes": 33554432,
+          "throughput_mib": 69.17073847164185,
+          "p50": 5.0579081289470196e-05,
+          "p95": 7.013010326772928e-05,
+          "p99": 8.910498581826687e-05,
+          "maximum": 0.00021534599363803864,
+          "latencies_file": "aged-4-external_point-cross.json"
+        },
+        {
+          "rep": 5,
+          "seconds": 0.4775077379308641,
+          "bytes": 33554432,
+          "throughput_mib": 67.01462082826627,
+          "p50": 5.058199167251587e-05,
+          "p95": 7.984694093465805e-05,
+          "p99": 9.254098404198885e-05,
+          "maximum": 0.00023536407388746738,
+          "latencies_file": "aged-5-external_point-cross.json"
+        }
+      ],
+      "median_mib_per_second": 71.1264086060467,
+      "aggregate_mib_per_second": 72.53296671809841,
+      "seconds_range": [
+        0.3707843900192529,
+        0.4775077379308641
+      ],
+      "pooled_p99_seconds": 8.469598833471537e-05
+    }
+  },
+  "gates": {
+    "blob": {
+      "pass_all": false,
+      "checks": [
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "sequential",
+          "cpu_median_ratio": 0.9908760254515526,
+          "cpu_sum_ratio": 0.9977570291527338,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "point",
+          "cpu_median_ratio": 0.9912571748969645,
+          "cpu_sum_ratio": 0.9922563675166323,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "partial",
+          "cpu_median_ratio": 0.9875061723794173,
+          "cpu_sum_ratio": 1.0032588050703992,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "cross",
+          "cpu_median_ratio": 0.9950843563316483,
+          "cpu_sum_ratio": 0.9897703917051693,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "sequential",
+          "cpu_median_ratio": 1.0268865692166196,
+          "cpu_sum_ratio": 1.0089635310487655,
+          "pass": true,
+          "paired_throughput_wins": 2
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "point",
+          "cpu_median_ratio": 1.0022007532704866,
+          "cpu_sum_ratio": 0.9971592878714626,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "partial",
+          "cpu_median_ratio": 1.01200143729788,
+          "cpu_sum_ratio": 1.00597397076876,
+          "pass": true,
+          "paired_throughput_wins": 2
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "cross",
+          "cpu_median_ratio": 1.0099799998997487,
+          "cpu_sum_ratio": 1.0041339461632564,
+          "pass": true,
+          "paired_throughput_wins": 1
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "sequential",
+          "cpu_median_ratio": 0.9911666666666668,
+          "cpu_sum_ratio": 0.9855845158910395,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "point",
+          "cpu_median_ratio": 0.9508663511344719,
+          "cpu_sum_ratio": 0.9525662840535777,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "partial",
+          "cpu_median_ratio": 0.9602270467445839,
+          "cpu_sum_ratio": 0.958862344848213,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "cross",
+          "cpu_median_ratio": 0.9683901138028476,
+          "cpu_sum_ratio": 0.973218513920696,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "old_snapshot",
+          "cpu_median_ratio": 0.9061187715449701,
+          "cpu_sum_ratio": 0.8999313341660101,
+          "pass": false,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "sequential",
+          "throughput_median_ratio": 1.0672453727649993,
+          "throughput_aggregate_ratio": 1.0410226609874167,
+          "p99_ratio": 0.879475989539044,
+          "p99_increase_seconds": -0.00020113505888730288,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "point",
+          "throughput_median_ratio": 1.017178110886972,
+          "throughput_aggregate_ratio": 1.0084416215134984,
+          "p99_ratio": 1.0644450269838674,
+          "p99_increase_seconds": 6.2390463426709175e-06,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "partial",
+          "throughput_median_ratio": 1.018032715817969,
+          "throughput_aggregate_ratio": 1.0085360342909073,
+          "p99_ratio": 0.9501866364287832,
+          "p99_increase_seconds": -4.0299491956830025e-06,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "cross",
+          "throughput_median_ratio": 1.1572058347468748,
+          "throughput_aggregate_ratio": 1.1030663365980293,
+          "p99_ratio": 0.9393688391397245,
+          "p99_increase_seconds": -5.5730342864990234e-06,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "sequential",
+          "throughput_median_ratio": 0.9714579676192097,
+          "throughput_aggregate_ratio": 0.9129879476183284,
+          "p99_ratio": 1.0985118720607272,
+          "p99_increase_seconds": 0.00015760608948767185,
+          "pass": false,
+          "paired_throughput_wins": 1
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "point",
+          "throughput_median_ratio": 1.0297250977037897,
+          "throughput_aggregate_ratio": 1.024078153562946,
+          "p99_ratio": 0.9470435483127471,
+          "p99_increase_seconds": -5.617039278149605e-06,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "partial",
+          "throughput_median_ratio": 0.9872533709193032,
+          "throughput_aggregate_ratio": 0.9981641132175827,
+          "p99_ratio": 1.047121982936623,
+          "p99_increase_seconds": 3.7460122257471085e-06,
+          "pass": true,
+          "paired_throughput_wins": 2
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "cross",
+          "throughput_median_ratio": 0.980303018698585,
+          "throughput_aggregate_ratio": 1.0175263522887048,
+          "p99_ratio": 1.0365023668681688,
+          "p99_increase_seconds": 2.9489165171980858e-06,
+          "pass": true,
+          "paired_throughput_wins": 3
+        }
+      ]
+    },
+    "external": {
+      "pass_all": false,
+      "checks": [
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "sequential",
+          "cpu_median_ratio": 0.9614759955824075,
+          "cpu_sum_ratio": 0.9495094866641686,
+          "pass": true,
+          "paired_throughput_wins": 6
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "point",
+          "cpu_median_ratio": 0.9928286551841274,
+          "cpu_sum_ratio": 0.9718245972949795,
+          "pass": true,
+          "paired_throughput_wins": 4
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "partial",
+          "cpu_median_ratio": 1.0001940504803601,
+          "cpu_sum_ratio": 0.985455115746316,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "fresh",
+          "workload": "cross",
+          "cpu_median_ratio": 0.9971773267410513,
+          "cpu_sum_ratio": 0.9850711065553376,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "sequential",
+          "cpu_median_ratio": 1.0130936824981998,
+          "cpu_sum_ratio": 0.9953594862977648,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "point",
+          "cpu_median_ratio": 0.9971061779593828,
+          "cpu_sum_ratio": 0.9978112055276992,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "partial",
+          "cpu_median_ratio": 0.9806653785578593,
+          "cpu_sum_ratio": 0.9934931199868675,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "aged",
+          "workload": "cross",
+          "cpu_median_ratio": 0.9998152265088369,
+          "cpu_sum_ratio": 0.9922659364942114,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "sequential",
+          "cpu_median_ratio": 0.9991973684210528,
+          "cpu_sum_ratio": 0.9997488710210377,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "point",
+          "cpu_median_ratio": 0.9975030955475283,
+          "cpu_sum_ratio": 0.9856508517406602,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "partial",
+          "cpu_median_ratio": 1.0003164650319547,
+          "cpu_sum_ratio": 0.9825264202387589,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "cross",
+          "cpu_median_ratio": 1.0319474384812246,
+          "cpu_sum_ratio": 1.0265766005096244,
+          "pass": true,
+          "paired_throughput_wins": 2
+        },
+        {
+          "kind": "native",
+          "state": "history",
+          "workload": "old_snapshot",
+          "cpu_median_ratio": 0.9373472393407007,
+          "cpu_sum_ratio": 0.9336138039724905,
+          "pass": false,
+          "paired_throughput_wins": 6
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "sequential",
+          "throughput_median_ratio": 1.1147521362669062,
+          "throughput_aggregate_ratio": 1.0888989470206407,
+          "p99_ratio": 0.884367639368205,
+          "p99_increase_seconds": -0.00013637391384691,
+          "pass": true,
+          "paired_throughput_wins": 5
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "point",
+          "throughput_median_ratio": 1.0015813023831635,
+          "throughput_aggregate_ratio": 1.0271801957838131,
+          "p99_ratio": 1.1289311009161596,
+          "p99_increase_seconds": 1.2995093129575253e-05,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "partial",
+          "throughput_median_ratio": 1.0028548830696045,
+          "throughput_aggregate_ratio": 1.0072646931903715,
+          "p99_ratio": 1.0814577187300147,
+          "p99_increase_seconds": 5.515990778803825e-06,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "fresh",
+          "workload": "cross",
+          "throughput_median_ratio": 1.0170768917623938,
+          "throughput_aggregate_ratio": 1.0099699211594049,
+          "p99_ratio": 1.0084733296066375,
+          "p99_increase_seconds": 6.370246410369873e-07,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "sequential",
+          "throughput_median_ratio": 0.9081322439062846,
+          "throughput_aggregate_ratio": 0.9354529787593433,
+          "p99_ratio": 1.1260792269489226,
+          "p99_increase_seconds": 0.0001338960137218237,
+          "pass": false,
+          "paired_throughput_wins": 2
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "point",
+          "throughput_median_ratio": 0.9323780348997315,
+          "throughput_aggregate_ratio": 0.9443659919363661,
+          "p99_ratio": 1.1993491612665081,
+          "p99_increase_seconds": 1.810688991099596e-05,
+          "pass": false,
+          "paired_throughput_wins": 1
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "partial",
+          "throughput_median_ratio": 0.9852156051339054,
+          "throughput_aggregate_ratio": 0.9835377826940713,
+          "p99_ratio": 1.1410529776993394,
+          "p99_increase_seconds": 9.788083843886852e-06,
+          "pass": true,
+          "paired_throughput_wins": 3
+        },
+        {
+          "kind": "fuse",
+          "state": "aged",
+          "workload": "cross",
+          "throughput_median_ratio": 0.9575533265636468,
+          "throughput_aggregate_ratio": 0.9887064112021232,
+          "p99_ratio": 1.0791776371902604,
+          "p99_increase_seconds": 6.2140170484781265e-06,
+          "pass": true,
+          "paired_throughput_wins": 2
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,209 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -656,5 +656,5 @@
+ 	}
+-	bool vacant = false;
+-	int64_t last_payload = 0;
+-	if (data.size() >= 2 * BLOCK_SIZE) {
++	auto first = offset / BLOCK_SIZE;
++	auto last = (offset + int64_t(data.size()) - 1) / BLOCK_SIZE;
++	auto vacant_range = [&](int64_t begin, int64_t end) {
+ 		// Check the entire replacement interval, including tombstones and
+@@ -663,13 +663,46 @@
+ 		                       "AND low<? AND high>? LIMIT 1");
+-		auto first = offset / BLOCK_SIZE;
+-		auto last = (offset + int64_t(data.size()) - 1) / BLOCK_SIZE;
+ 		occupied.Bind(1, node.key.inode);
+-		occupied.Bind(2, first);
+-		occupied.Bind(3, last);
++		occupied.Bind(2, begin);
++		occupied.Bind(3, end);
+ 		occupied.Bind(4, view.high);
+ 		occupied.Bind(5, view.point);
+-		vacant = !occupied.Step();
+-		if (vacant) {
++		return !occupied.Step();
++	};
++	bool vacant = false;
++	if (data.size() >= 2 * BLOCK_SIZE) {
++		vacant = vacant_range(first, last);
++		if (!vacant) {
++			// Include a partial edge when its entire replacement interval is vacant.
++			// An existing opposite edge must not force the new edge into an inline
++			// remainder; complete 64-block groups can remain external.
++			auto full_first = first + (offset % BLOCK_SIZE != 0);
++			auto full_last = (offset + int64_t(data.size())) / BLOCK_SIZE - 1;
++			if (first != full_first && last - full_first >= 1 && vacant_range(full_first, last)) {
++				first = full_first;
++				vacant = true;
++			} else if (last != full_last && full_last - first >= 1 && vacant_range(first, full_last)) {
++				last = full_last;
++				vacant = true;
++			} else if (first != full_first && last != full_last && full_last - full_first >= 1 &&
++			           vacant_range(full_first, full_last)) {
++				first = full_first;
++				last = full_last;
++				vacant = true;
++			}
++		}
++	}
++	int64_t last_payload = 0;
++	constexpr size_t BATCH_BLOCKS = 64;
++	std::vector<std::pair<int64_t, std::string>> new_blocks;
++	if (vacant) {
++		new_blocks.reserve(BATCH_BLOCKS);
++	}
++	size_t consumed = 0;
++	while (consumed < data.size()) {
++		int64_t position = offset + int64_t(consumed);
++		auto block = position / BLOCK_SIZE;
++		bool insert_new = vacant && block >= first && block <= last;
++		if (insert_new && block == first) {
++			// Allocate after any leading partial block used an automatic rowid.
+ 			// The enclosing IMMEDIATE transaction serializes payload allocation.
+-			// Explicit IDs keep batches mapped without relying on RETURNING order.
+ 			Statement maximum(db, "SELECT coalesce(max(id),0) FROM block_payloads");
+@@ -679,12 +712,4 @@
+ 			vacant = last - first + 1 <= std::numeric_limits<int64_t>::max() - last_payload;
+-		}
+-	}
+-	constexpr size_t BATCH_BLOCKS = 64;
+-	std::vector<std::pair<int64_t, std::string>> new_blocks;
+-	if (vacant) {
+-		new_blocks.reserve(BATCH_BLOCKS);
+-	}
+-	size_t consumed = 0;
+-	while (consumed < data.size()) {
+-		int64_t position = offset + int64_t(consumed);
++			insert_new = vacant;
++		}
+ 		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, data.size() - consumed);
+@@ -694,8 +719,8 @@
+ 		} else {
+-			bytes = vacant ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, position / BLOCK_SIZE, view);
++			bytes = insert_new ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, block, view);
+ 			bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
+ 		}
+-		if (vacant) {
++		if (insert_new) {
+ 			if (!std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == 0; })) {
+-				new_blocks.emplace_back(position / BLOCK_SIZE, std::move(bytes));
++				new_blocks.emplace_back(block, std::move(bytes));
+ 				if (new_blocks.size() == BATCH_BLOCKS) {
+@@ -705,3 +730,5 @@
+ 		} else {
+-			StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
++			// Publish explicit IDs before a trailing edge allocates an automatic one.
++			InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
++			StoreBlock(db, node.key.inode, block, bytes, view);
+ 		}
+--- a/tests/test_core.cpp
++++ b/tests/test_core.cpp
+@@ -145,4 +145,5 @@
+ 	SQL(path, "INSERT INTO block_payloads(id,data) VALUES(9223372036854775807,zeroblob(4096))");
+-	main->WriteFile("/rowids", data);
+-	Require(main->Read("/rowids") == data, "Payload rowid limit broke a large write");
++	main->WriteFile("/rowids", "p");
++	main->Write("/rowids", data, 1);
++	Require(main->Read("/rowids") == "p" + data, "Payload rowid limit broke a partial-edge write");
+ 	workspace.Sync();
+@@ -151,3 +152,3 @@
+ 	Require(reopened.Checkout()->Read("/large") == expected, "Reopen lost a large write");
+-	Require(reopened.Checkout()->Read("/rowids") == data, "Reopen lost automatically allocated payloads");
++	Require(reopened.Checkout()->Read("/rowids") == "p" + data, "Reopen lost automatically allocated payloads");
+ }
+--- a/tests/test_workspace.py
++++ b/tests/test_workspace.py
+@@ -123,2 +123,3 @@
+-@pytest.mark.parametrize("table", ["block_payloads", "block_versions"])
+-def test_large_write_failure_rolls_back_all_batches(workspace, database_path, table):
++@pytest.mark.parametrize("offset", [1, 8191])
++@pytest.mark.parametrize("table", ["block_payloads", "block_versions", "inode_versions"])
++def test_large_write_failure_rolls_back_all_batches(workspace, database_path, table, offset):
+@@ -153 +154 @@
+-        "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
++        f"SELECT CASE WHEN (SELECT writes FROM fault_counter)={1 if table == 'inode_versions' else 100} "
+@@ -159 +160 @@
+-            main.write("/file", data, offset=8191)
++            main.write("/file", data, offset=offset)
+@@ -165,2 +166,29 @@
+-    main.write("/file", data, offset=8191)
+-    assert main.read("/file") == b"before" + b"\0" * (8191 - 6) + data
++    main.write("/file", data, offset=offset)
++    assert main.read("/file") == (b"before" + b"\0" * offset)[:offset] + data
++
++
++@pytest.mark.parametrize("offset", [1, 4095])
++@pytest.mark.parametrize("edges", ["head", "tail", "both"])
++def test_large_write_preserves_partial_edges_and_views(workspace, database_path, offset, edges):
++    block = 4096
++    data = b"".join(bytes([i if i % 5 else 0]) * block for i in range(193)) + b"tail"
++    tail = (offset + len(data)) // block * block
++    main = workspace.checkout()
++    main.write_file("/file", b"p" * block if edges != "tail" else b"")
++    if edges != "head":
++        main.write("/file", b"s" * block, tail)
++    original = main.read("/file")
++    saved = workspace.snapshot()
++    child = workspace.checkout(workspace.fork("main", "child").id)
++    expected = bytearray(original)
++    expected[offset : offset + len(data)] = data
++    child.write("/file", data, offset)
++    with workspace.open_snapshot(saved) as frozen:
++        assert child.read("/file") == bytes(expected)
++        assert main.read("/file") == original
++        assert frozen.read("/file") == original
++        workspace.collect_garbage()
++        assert child.read("/file") == bytes(expected)
++        assert frozen.read("/file") == original
++    with Workspace(database_path) as reopened:
++        assert reopened.checkout(child.id).read("/file") == bytes(expected)
+--- a/tests/test_staging.cpp
++++ b/tests/test_staging.cpp
+@@ -200,3 +200,3 @@
+ }
+-static void Recovery(const std::string &path, int point, bool lose_unsynced, bool restart, bool spill = false) {
++static void Recovery(const std::string &path, int point, bool lose_unsynced, bool restart, bool spill = false, bool partial = false) {
+ 	{
+@@ -204,2 +204,4 @@
+ 		workspace.Checkout()->WriteFile("/stable", std::string(MIB, 's'));
++		if (partial)
++			workspace.Checkout()->WriteFile("/pending", std::string(4096, 'x'));
+ 	}
+@@ -220,4 +222,7 @@
+ 			if (spill)
+-				SQL(path, "CREATE TABLE spill_padding(data BLOB); CREATE TRIGGER spill BEFORE INSERT ON inode_versions "
+-				          "BEGIN INSERT INTO spill_padding VALUES(zeroblob(2097152)); END");
++                SQL(path, partial ? "CREATE TABLE spill_padding(data BLOB); CREATE TRIGGER spill BEFORE INSERT ON "
++                                    "block_payloads WHEN length(new.data)=4096 BEGIN INSERT INTO spill_padding "
++                                    "VALUES(zeroblob(2097152)); END"
++                                  : "CREATE TABLE spill_padding(data BLOB); CREATE TRIGGER spill BEFORE INSERT ON "
++                                    "inode_versions BEGIN INSERT INTO spill_padding VALUES(zeroblob(2097152)); END");
+ 			if (restart)
+@@ -226,2 +231,5 @@
+ 			boundary = point;
++            if (partial)
++                session->Write("/pending", std::string(MIB, 'p'), 1);
++            else
+ 			session->WriteFile("/pending", std::string(MIB, 'p'));
+@@ -259,5 +267,8 @@
+ 		Require(session->Read("/renamed") == std::string(MIB, 's'), "Published namespace lost");
+-		Require(session->Read("/pending") == std::string(MIB, 'p'), "Published bytes lost");
++		Require(session->Read("/pending") == (partial ? "x" : "") + std::string(MIB, 'p'), "Published bytes lost");
+ 	} else {
+ 		Require(session->Read("/stable") == std::string(MIB, 's'), "Recovery lost earlier durable bytes");
++        if (partial)
++            Require(session->Read("/pending") == std::string(4096, 'x'), "Recovery lost original partial block");
++        else
+ 		Expect(ErrorCode::NotFound, [&] { session->Stat("/pending"); });
+@@ -343,4 +354,9 @@
+ 		Recovery((root / "spill-recovery.sqlite").string(), 4, true, true, true);
++        for (bool lose : {false, true})
++            for (bool restart : {false, true})
++                for (int point = 1; point <= 8; ++point)
++                    Recovery((root / ("partial-recovery-" + std::to_string(lose) + "-" + std::to_string(restart) + "-" + std::to_string(point) + ".sqlite")).string(), point, lose, restart, false, true);
++        Recovery((root / "partial-spill-recovery.sqlite").string(), 4, true, true, true, true);
+ 		fs::remove_all(root);
+-		std::cout << "PASS: batching, visibility, retry, gate/spill and 33 crash/loss cases\n";
++		std::cout << "PASS: batching, visibility, retry, gate/spill and 66 crash/loss cases\n";
+ 		return 0;
