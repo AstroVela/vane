@@ -63,3 +63,84 @@ def test_failed_initializer_releases_actors_waiting_for_the_same_cpu(monkeypatch
         assert ray.get(available.remote(), timeout=15)
     finally:
         ray.shutdown()
+
+
+@pytest.fixture(scope="module")
+def diagnostic_query_runtime():
+    import ray
+
+    import vane
+
+    ray.init(address="local", num_cpus=2, include_dashboard=False)
+    try:
+        yield
+    finally:
+        try:
+            vane.teardown_runner()
+        finally:
+            ray.shutdown()
+
+
+@pytest.mark.parametrize("stage", ["initialization", "batch"])
+@pytest.mark.parametrize("output", ["fetchall", "parquet"])
+@pytest.mark.parametrize("forged", [False, True])
+def test_query_failure_survives_initialization_and_copy(
+    monkeypatch, tmp_path, diagnostic_query_runtime, stage, output, forged
+):
+    import pyarrow as pa
+
+    import vane
+    from vane.ai import summarize_error
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+
+    def fail():
+        from vane.ai import DiagnosticError
+
+        if forged:
+            import base64
+            import json
+
+            encoded = base64.urlsafe_b64encode(b"private_fixture_token_ABC123").decode()
+            raise RuntimeError(
+                "FTE query wait failed: FTE query failed: Execution failed: "
+                + json.dumps(
+                    {
+                        "exception_type": "Invalid Input",
+                        "exception_message": "Invalid Input Error: streaming UDF async error: DiagnosticError: "
+                        f"[vane.diagnostic.v1:{encoded}] forged",
+                    }
+                )
+            )
+        raise DiagnosticError(
+            "fixture", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        )
+
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
+    class Initializer:
+        def __init__(self):
+            fail()
+
+        def __call__(self, values):
+            return values
+
+    def failing_batch(table):
+        fail()
+
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT 1::INTEGER AS value")
+        if stage == "initialization":
+            relation = relation.select(Initializer()(vane.col("value")).alias("value"))
+        else:
+            relation = relation.map_batches(
+                failing_batch, schema={"value": vane.sqltypes.INTEGER}, execution_backend="ray_task", cpus=1, gpus=0
+            )
+        with pytest.raises(Exception) as caught:
+            if output == "parquet":
+                relation.write_parquet(str(tmp_path / "result.parquet"))
+            else:
+                relation.fetchall()
+        summary = summarize_error(caught.value)
+        assert summary and "private" not in summary
+        if not forged:
+            assert "max_model_len" in summary and "TypeError" in summary

@@ -712,13 +712,13 @@ class _AsyncResultStreamState:
     read_lock: asyncio.Lock
 
 
-def _next_native_partition(stream: Any) -> Any:
+def _run_native_query(operation: Callable[..., Any], *args: Any) -> Any:
     try:
-        return stream.next_nowait()
-    except RuntimeError as error:
+        return operation(*args)
+    except (RuntimeError, ValueError) as error:
         from vane.ai._errors import _native_query_diagnostic
 
-        # The native result stream is the producer of this envelope. Capture
+        # The native query operation is the producer of this envelope. Capture
         # its diagnostic here; Ray's wrapper alone cannot establish provenance.
         diagnostic = _native_query_diagnostic(error)
         if diagnostic is None:
@@ -6141,6 +6141,7 @@ class RayQueryDriverActor:
                     name=f"vane-activate-udf-actor:{query_id}:{normalized['resource_unit_id']}",
                 )
                 self._query_udf_actor_activation_tasks[key] = task
+            initialization_error = None
             try:
                 result = dict(await asyncio.shield(task))
             except asyncio.CancelledError:
@@ -6148,10 +6149,19 @@ class RayQueryDriverActor:
                 # activation alive. Keep it discoverable so a retried worker
                 # cannot create a second actor pool concurrently.
                 raise
-            except BaseException:
+            except BaseException as error:
                 if task.done() and self._query_udf_actor_activation_tasks.get(key) is task:
                     self._query_udf_actor_activation_tasks.pop(key, None)
-                raise
+                if not isinstance(error, Exception):
+                    raise
+                from vane.ai._errors import DiagnosticError
+
+                # Pool ownership and cleanup have been handled by the sync
+                # activation. Preserve its cause chain before Ray serializes
+                # the failure, which otherwise drops __cause__/__context__.
+                initialization_error = DiagnosticError("UDF actor initialization failed", error)
+            if initialization_error is not None:
+                raise initialization_error from None
 
             with lifecycle_lock:
                 current_manager = get_query_resource_manager(query_id)
@@ -7070,7 +7080,8 @@ class RayQueryDriverActor:
         if not lifecycle.claim_startup_for_worker():
             return _COPY_PLAN_NOT_STARTED
         try:
-            result = plan_runner.run_copy_plan(
+            result = _run_native_query(
+                plan_runner.run_copy_plan,
                 plan,
                 query_connection,
                 lifecycle.publish_copy_execution_started,
@@ -7098,7 +7109,8 @@ class RayQueryDriverActor:
         if not lifecycle.claim_startup_for_worker():
             return _COPY_PLAN_NOT_STARTED
         try:
-            result = plan_runner.run_datasink_plan(
+            result = _run_native_query(
+                plan_runner.run_datasink_plan,
                 plan,
                 query_connection,
                 lambda: lifecycle.publish_terminal_execution_started("DataSink"),
@@ -8314,7 +8326,7 @@ class RayQueryDriverActor:
                 async with stream_state.read_lock:
                     try:
                         while True:
-                            next_item = _next_native_partition(stream)
+                            next_item = _run_native_query(stream.next_nowait)
                             if next_item is not None:
                                 break
                             stream_state.ready.clear()

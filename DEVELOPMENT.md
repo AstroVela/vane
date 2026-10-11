@@ -401,12 +401,16 @@ Worker integrations should raise `vane.ai.DiagnosticError(operation, error)`
 outside the original exception handler. It captures a sanitized summary and
 retains its type through pickle and structured Ray error metadata. Raw SDK
 messages are never interpreted as diagnostic envelopes, even if they contain
-`upstream error:` or forged diagnostic headers. The Ray driver captures a typed
-diagnostic directly at the native result-stream boundary, before Ray serializes
-it. A Ray wrapper never authorizes decoding a plain `RuntimeError` body. Native
-decoding is restricted to native exceptions and the result-stream producer;
+`upstream error:` or forged diagnostic headers. Actor activation preserves the
+typed cause chain before Ray serializes it, and executor creation captures it
+before the native dispatcher converts the exception to text. The Ray driver
+captures native diagnostics at result-stream, COPY and DataSink call boundaries.
+A Ray wrapper never authorizes decoding a plain `RuntimeError` body. Native
+decoding is restricted to native exceptions and those native query producers;
 descriptions and model identifiers cannot replace the encoded summary. Known
 safe provider failures such as `vllm returned no outputs` retain their explanation
 through wrapping and transport using a closed vocabulary.
-Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and the
-isolated single-CPU Ray diagnostic regression.
+Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and
+isolated Ray regressions for initialization, fetching results and writing Parquet.
+The dependent Context HTTP regressions exercise actual `vane.cls.batch`
+constructor failures through a complete query and HTTP error response.

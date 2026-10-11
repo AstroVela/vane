@@ -256,24 +256,36 @@ def _is_exception(error: BaseException, module_name: str, *names: str) -> bool:
     return any(isinstance(cls := namespace.get(name), type) and isinstance(error, cls) for name in names)
 
 
+def _native_invalid_input_message(message: str) -> str | None:
+    try:
+        payload = json.loads(message)
+    except (ValueError, RecursionError):
+        return None
+    if type(payload) is not dict or payload.get("exception_type") != "Invalid Input":
+        return None
+    nested_message = payload.get("exception_message")
+    return nested_message if type(nested_message) is str else None
+
+
 def _native_summary(message: str) -> str | None:
     """Decode only complete native UDF envelopes, never search arbitrary text."""
     prefix = "FTE query wait failed: FTE query failed: Execution failed: "
     if message.startswith(prefix):
-        try:
-            payload = json.loads(message[len(prefix) :])
-        except (ValueError, RecursionError):
+        nested = _native_invalid_input_message(message[len(prefix) :])
+        if nested is None:
             return None
-        if type(payload) is not dict or payload.get("exception_type") != "Invalid Input":
-            return None
-        nested_message = payload.get("exception_message")
-        if type(nested_message) is not str:
-            return None
-        message = nested_message
+        message = nested
     message = message.removeprefix("Attempting to execute an unsuccessful or closed pending query result\nError: ")
     message = message.removeprefix("Invalid Input Error: ")
-    if message.startswith("streaming UDF async error: "):
-        message = message.removeprefix("streaming UDF async error: ")
+    if message.startswith(("udf async error: ", "streaming UDF async error: ")):
+        message = message.split(": ", 1)[1]
+        # Initialization can reach either the slot error or the streaming
+        # collector first. Both carry the native InvalidInputException JSON.
+        if message.startswith("{"):
+            nested = _native_invalid_input_message(message)
+            if nested is None or not nested.startswith("Failed to build udf executor: "):
+                return None
+            message = nested.removeprefix("Failed to build udf executor: ")
     elif message.startswith("Python exception occurred while executing the UDF: "):
         message = message.removeprefix("Python exception occurred while executing the UDF: ")
     else:
@@ -287,7 +299,7 @@ def _native_summary(message: str) -> str | None:
 
 
 def _native_query_diagnostic(error: BaseException) -> DiagnosticError | None:
-    """Capture a native stream failure at the producer, before Ray flattens it.
+    """Capture a native query failure at the producer, before Ray flattens it.
 
     Call only at a native query operation boundary. A generic RuntimeError or
     RayTaskError is not proof that its message came from the native runtime.

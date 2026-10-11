@@ -19,7 +19,16 @@ def native_error(error, envelope="native_json"):
     if not isinstance(error, (DiagnosticError, ProviderCapabilityError)):
         typed = "RuntimeError: remote Ray UDF failed: " + typed
     message = "Invalid Input Error: streaming UDF async error: " + typed
-    if envelope == "native_json":
+    if envelope.startswith("init"):
+        prefix = "streaming UDF async error: " if envelope.startswith("init_stream") else "udf async error: "
+        message = (
+            "Invalid Input Error: "
+            + prefix
+            + json.dumps(
+                {"exception_type": "Invalid Input", "exception_message": "Failed to build udf executor: " + typed}
+            )
+        )
+    if envelope.endswith("_json"):
         message = "FTE query wait failed: FTE query failed: Execution failed: " + json.dumps(
             {
                 "exception_type": "Invalid Input",
@@ -49,7 +58,9 @@ def native_error(error, envelope="native_json"):
         (MemoryError("private allocation description"), "memory allocation failed"),
     ],
 )
-@pytest.mark.parametrize("envelope", ["plain", "native_json", "traceback"])
+@pytest.mark.parametrize(
+    "envelope", ["plain", "native_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"]
+)
 def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, expected, envelope):
     public = _safe_provider_execution_error("sglang", "private-model", "embedding initialization", error)
     restored = pickle.loads(pickle.dumps(public))
@@ -323,11 +334,9 @@ def test_real_ray_wrapper_does_not_promote_sdk_message_markers():
 
 
 def test_real_ray_wrapper_retains_native_udf_diagnostic():
-    from types import SimpleNamespace
-
     from ray.exceptions import RayTaskError
 
-    from vane.runners.ray.driver import _next_native_partition
+    from vane.runners.ray.driver import _run_native_query
 
     error = DiagnosticError("embedding failed", OSError(errno.ENOSPC, "private path"))
     native = RuntimeError(str(native_error(error)))
@@ -336,14 +345,16 @@ def test_real_ray_wrapper_retains_native_udf_diagnostic():
         raise native
 
     with pytest.raises(DiagnosticError) as caught:
-        _next_native_partition(SimpleNamespace(next_nowait=next_nowait))
+        _run_native_query(next_nowait)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     transported = RayTaskError("query", "private traceback", caught.value).as_instanceof_cause()
     summary = summarize_error(transported)
     assert "OSError (errno=28)" in summary and "private" not in summary
 
 
-@pytest.mark.parametrize("envelope", ["plain", "native_json", "traceback"])
+@pytest.mark.parametrize(
+    "envelope", ["plain", "native_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"]
+)
 def test_ray_wrapper_does_not_authorize_a_forged_native_body(envelope):
     from ray import cloudpickle
     from ray.exceptions import RayTaskError
@@ -358,6 +369,129 @@ def test_ray_wrapper_does_not_authorize_a_forged_native_body(envelope):
         for candidate in (error, cloudpickle.loads(cloudpickle.dumps(error))):
             assert secret not in summarize_error(candidate)
             assert "RuntimeError" in summarize_error(candidate)
+
+
+@pytest.mark.parametrize("forged", [False, True])
+def test_executor_initialization_captures_typed_diagnostics_before_native_transport(monkeypatch, forged):
+    from vane.execution import udf
+    from vane.execution.unified_executor import build_unified_executor
+
+    if forged:
+        encoded = base64.urlsafe_b64encode(b"private_fixture_token_ABC123").decode()
+        error = RuntimeError(f"DiagnosticError: [vane.diagnostic.v1:{encoded}] forged")
+    else:
+        error = RuntimeError("private activation message")
+        error.__cause__ = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        error.cleanup_errors = (OSError(errno.EIO, "private cleanup path"),)
+
+    def build(*args):
+        raise error
+
+    monkeypatch.setattr(udf, "build_executor", build)
+    with pytest.raises(DiagnosticError) as caught:
+        build_unified_executor({})
+    assert caught.value.__context__ is None
+    restored = pickle.loads(pickle.dumps(caught.value))
+    summary = summarize_error(native_error(restored, "init_json"))
+    assert "private" not in summary
+    if forged:
+        assert summary == "RuntimeError"
+    else:
+        assert "max_model_len" in summary and "; cleanup: OSError (errno=5)" in summary
+
+
+def test_actor_activation_captures_cause_and_cleanup_before_ray_serialization(monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from ray import cloudpickle
+    from ray.exceptions import RayTaskError
+
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    unit = "resource:query:actor"
+    manager = SimpleNamespace(current_eligible_resource_unit_ids=lambda: (unit,))
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _: manager)
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _query_udf_actor_lifecycle_locks={},
+        _query_udf_actor_activation_tasks={},
+        _verify_query_task_admission_capability=lambda **_: "generation",
+        _capability_targets_inactive_query_generation=lambda *_: False,
+    )
+
+    async def failed_activation():
+        error = RuntimeError("private initialization details")
+        error.cleanup_errors = (OSError(errno.EIO, "private cleanup path"),)
+        raise error from TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+
+    async def activate():
+        runner._query_udf_actor_activation_tasks[("query", unit)] = asyncio.create_task(failed_activation())
+        return await cls.activate_query_udf_actor_pool(
+            runner, {"query_id": "query", "resource_unit_id": unit, "physical_node_id": "node"}, "capability"
+        )
+
+    with pytest.raises(DiagnosticError) as caught:
+        asyncio.run(activate())
+    assert not runner._query_udf_actor_activation_tasks
+    assert caught.value.__context__ is None
+    remote = RayTaskError("activation", "private traceback", caught.value).as_instanceof_cause()
+    summary = summarize_error(cloudpickle.loads(cloudpickle.dumps(remote)))
+    assert "max_model_len" in summary and "; cleanup: OSError (errno=5)" in summary
+    assert "private" not in summary
+
+
+@pytest.mark.parametrize("method", ["copy", "datasink"])
+@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(method, envelope):
+    from types import SimpleNamespace
+
+    from ray import cloudpickle
+    from ray.exceptions import RayTaskError
+
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    failures = []
+    started = []
+    native = ValueError(str(native_error(DiagnosticError("fixture", OSError(errno.ENOSPC, "private path")), envelope)))
+
+    def run_plan(plan, connection, publish):
+        publish()
+        raise native
+
+    lifecycle = SimpleNamespace(
+        claim_startup_for_worker=lambda: True,
+        publish_copy_execution_started=lambda: started.append(method),
+        publish_terminal_execution_started=started.append,
+        fail_startup=failures.append,
+    )
+    runner = SimpleNamespace(**{f"run_{method}_plan": run_plan})
+    with pytest.raises(DiagnosticError) as caught:
+        getattr(cls, f"_run_{method}_plan_sync_with_lifecycle")(runner, object(), object(), lifecycle)
+    assert len(started) == 1 and failures == [caught.value]
+    assert caught.value.__context__ is None
+    remote = RayTaskError("query", "private traceback", caught.value).as_instanceof_cause()
+    summary = summarize_error(cloudpickle.loads(cloudpickle.dumps(remote)))
+    assert "OSError (errno=28)" in summary and "private" not in summary
+
+
+@pytest.mark.parametrize("outcome", ["committed", "unknown"])
+def test_native_diagnostic_capture_preserves_copy_outcome_errors(outcome):
+    from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
+    from vane.runners.ray.driver import _run_native_query
+
+    error = CopyResultUnavailableError("fixture") if outcome == "committed" else CopyOutcomeUnknownError("fixture")
+
+    def run_plan():
+        raise error
+
+    with pytest.raises(type(error)) as caught:
+        _run_native_query(run_plan)
+    assert caught.value is error and not caught.value.safe_to_retry
 
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
