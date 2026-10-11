@@ -433,6 +433,7 @@ def test_native_local_query_does_not_enter_fragment_compiler(connection, monkeyp
         "select nextval('must_not_exist')",
         "select row_number() over () from range(10)",
         "select median(range) from range(10)",
+        "select a.range from range(2) a asof join range(3) b on a.range>=b.range",
         "select 1::UUID",
         "select $1",
     ],

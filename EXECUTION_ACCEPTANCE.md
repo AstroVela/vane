@@ -87,7 +87,7 @@ The same connection and worker pool are reused across each sequence:
 - Two FTE worker losses before a downstream attempt commits. Retries must use
   the same input identity and a new fence, deliver exact results without
   duplicates, and leave the pool usable for pipelined queries.
-- Unsupported window, median, inequality-join and UUID queries are rejected
+- Unsupported window, median, ASOF-join and UUID queries are rejected
   without falling back to local execution; all admission/storage ownership is
   released and a supported query still succeeds.
 - A real long-running filter alternates a 60-second execution deadline and a
