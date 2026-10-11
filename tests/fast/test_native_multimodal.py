@@ -22,7 +22,9 @@ from vane.ai.provider import load_provider
 
 def install_sdk(setitem, *, mock_transformers=True):
     """Doubles for the documented Python APIs, installed inside each worker."""
-    state = SimpleNamespace(loads=[], engines=[], calls=[], processing=[], finish="stop", fail=False, requests_closed=0)
+    state = SimpleNamespace(
+        loads=[], engines=[], calls=[], processing=[], finish="stop", fail=False, requests_closed=0, on_embedding=None
+    )
     state.config = SimpleNamespace()
 
     class Processor:
@@ -82,9 +84,13 @@ def install_sdk(setitem, *, mock_transformers=True):
         async def encode(self, prompt, pooling_params, request_id, **kwargs):
             assert self.loop is asyncio.get_running_loop()
             state.calls.append(("encode", prompt, vars(pooling_params), kwargs))
-            if state.fail:
-                raise ValueError("engine failure")
-            yield SimpleNamespace(finished=True, outputs=SimpleNamespace(data=np.array([3.0, 4.0])))
+            try:
+                if state.fail:
+                    raise ValueError("engine failure")
+                vector = [3.0, 4.0] if state.on_embedding is None else await state.on_embedding(prompt)
+                yield SimpleNamespace(finished=True, outputs=SimpleNamespace(data=np.array(vector)))
+            finally:
+                state.requests_closed += 1
 
         async def async_generate(self, **kwargs):
             assert self.loop is asyncio.get_running_loop()
@@ -102,7 +108,8 @@ def install_sdk(setitem, *, mock_transformers=True):
             try:
                 if state.fail:
                     raise ValueError("engine failure")
-                yield {"embedding": [3.0, 4.0]}
+                vector = [3.0, 4.0] if state.on_embedding is None else await state.on_embedding(request)
+                yield {"embedding": vector}
             finally:
                 state.requests_closed += 1
 
@@ -151,6 +158,171 @@ def sdk(monkeypatch):
 
 def clip():
     return VideoClip((np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8, 3), dtype=np.uint8)), (0.125, 1.375), (4, 18))
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["text", "image", "video"])
+def test_native_embedding_overlaps_requests_and_restores_order(family, kind, sdk):
+    async def run():
+        descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
+            model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": 2}
+        )
+        runtime = descriptor.instantiate()
+        active, peak, count = 0, 0, 0
+        gates = [asyncio.Event(), asyncio.Event()]
+        finished = []
+
+        async def request(value):
+            nonlocal active, peak, count
+            index, count = count, count + 1
+            active += 1
+            peak = max(peak, active)
+            try:
+                if index % 2 == 0:
+                    await gates[index // 2].wait()
+                else:
+                    gates[index // 2].set()
+                finished.append(index)
+                return [index, 1]
+            finally:
+                active -= 1
+
+        sdk.on_embedding = request
+        value = {"text": "query", "image": np.zeros((8, 8, 3), dtype=np.uint8), "video": clip()}[kind]
+        try:
+            result = await getattr(runtime, f"embed_{kind}")([value] * 4)
+            assert result == [[0, 1], [1, 1], [2, 1], [3, 1]]
+            assert peak == 2 and active == 0
+            assert finished[0] == 1
+            assert len(sdk.engines) == 1 and sdk.requests_closed == 4
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), 5))
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+def test_native_embedding_retries_only_the_failed_request(family, sdk):
+    import pyarrow as pa
+
+    from vane.ai.functions import RetryAfterError, _EmbedTextBatch
+    from vane.execution._async_runtime import AsyncRuntime
+
+    calls = 0
+
+    async def request(value):
+        nonlocal calls
+        index, calls = calls, calls + 1
+        await asyncio.sleep(0)
+        if index == 2:
+            raise RetryAfterError(0, status=503)
+        return [min(index, 2), 1]
+
+    sdk.on_embedding = request
+    descriptor = load_provider(family).get_text_embedder(
+        model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": 2}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "embedding", 2, max_retries=1)
+    runtime = AsyncRuntime()
+    wrapper.bind_async_runtime(runtime.run)
+    try:
+        result = wrapper(pa.table({"text": ["first", None, "second", "retry"]}))
+        assert result["embedding"].to_pylist() == [[0, 1], None, [1, 1], [2, 1]]
+        assert calls == sdk.requests_closed == 4
+        assert len(sdk.engines) == 1
+    finally:
+        wrapper.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("failure", ["request", "vector"])
+def test_native_embedding_ignore_preserves_successful_rows(family, failure, sdk):
+    import pyarrow as pa
+
+    from vane.ai.functions import _EmbedTextBatch
+    from vane.execution._async_runtime import AsyncRuntime
+
+    calls = 0
+
+    async def request(value):
+        nonlocal calls
+        index, calls = calls, calls + 1
+        await asyncio.sleep(0)
+        if index == 1:
+            if failure == "request":
+                raise ValueError("invalid input")
+            return [float("nan"), 1]
+        return [index, 1]
+
+    sdk.on_embedding = request
+    descriptor = load_provider(family).get_text_embedder(
+        model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": 2}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "embedding", 2, max_retries=2, on_error="ignore")
+    runtime = AsyncRuntime()
+    wrapper.bind_async_runtime(runtime.run)
+    try:
+        result = wrapper(pa.table({"text": ["first", "bad", "last"]}))
+        assert result["embedding"].to_pylist() == [[0, 1], None, [2, 1]]
+        assert calls == sdk.requests_closed == 3
+    finally:
+        wrapper.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+def test_native_embedding_cancellation_drains_sdk_streams(family, sdk):
+    async def run():
+        descriptor = load_provider(family).get_video_embedder(
+            model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": 2}
+        )
+        runtime = descriptor.instantiate()
+        started, cleaning = [], []
+        release = asyncio.Event()
+
+        async def request(value):
+            started.append(value)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.append(value)
+                await release.wait()
+
+        sdk.on_embedding = request
+        task = asyncio.create_task(runtime.embed_video([clip()] * 6))
+        try:
+            while len(started) < 2:
+                await asyncio.sleep(0)
+            task.cancel()
+            while len(cleaning) < 2:
+                await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and sdk.requests_closed == 0
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert len(started) == sdk.requests_closed == 2
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await runtime.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), 5))
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["text", "image", "video"])
+@pytest.mark.parametrize("limit", [0, True, 1.5, 1025])
+def test_native_embedding_rejects_invalid_concurrency_before_loading(family, kind, limit, sdk):
+    with pytest.raises(ValueError):
+        getattr(load_provider(family), f"get_{kind}_embedder")(
+            model="configured-encoder", dimensions=2, options={"max_concurrency_per_actor": limit}
+        )
+    assert sdk.loads == sdk.engines == []
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -1220,7 +1392,9 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
     descriptor = load_provider(family).get_prompter(
         "configured-model", options={"media_mime_types": ["video/mp4"], "gpus_per_actor": 0}
     )
-    embedding = load_provider(family).get_video_embedder("configured-encoder", 2, options={"gpus_per_actor": 0})
+    embedding = load_provider(family).get_video_embedder(
+        "configured-encoder", 2, options={"gpus_per_actor": 0, "max_concurrency_per_actor": 2}
+    )
 
     @ray.remote
     def execute(prompt_desc, embed_desc, install):
@@ -1234,10 +1408,27 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
 
         async def run():
             prompt_runtime, embed_runtime = prompt_desc.instantiate(), embed_desc.instantiate()
+            active, peak = 0, 0
+            ready = asyncio.Event()
+
+            async def request(value):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    ready.set()
+                try:
+                    await asyncio.wait_for(ready.wait(), 5)
+                    return [3.0, 4.0]
+                finally:
+                    active -= 1
+
+            state.on_embedding = request
             try:
                 answer = await prompt_runtime.prompt(("question", PromptMedia(b"video", "video/mp4")))
                 text_answer = await prompt_runtime.prompt(("question",))
-                result = await embed_runtime.embed_video([clip()])
+                result = await embed_runtime.embed_video([clip()] * 4)
+                assert peak == 2 and active == 0 and state.requests_closed == 4
                 return answer, text_answer, result
             finally:
                 await prompt_runtime.aclose()
@@ -1257,7 +1448,7 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
     assert ray.get(execute.remote(descriptor, embedding, install_sdk), timeout=30) == (
         '{"answer":"ok"}',
         '{"answer":"ok"}',
-        [[3.0, 4.0]],
+        [[3.0, 4.0]] * 4,
     )
 
 
@@ -1280,7 +1471,22 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
 
     class WorkerEmbedding(NativeTextEmbedderDescriptor):
         def instantiate(self):
-            install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
+            state = install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
+            active = 0
+            ready = asyncio.Event()
+
+            async def request(value):
+                nonlocal active
+                active += 1
+                if active == 2:
+                    ready.set()
+                try:
+                    await asyncio.wait_for(ready.wait(), 5)
+                    return [3.0, 4.0]
+                finally:
+                    active -= 1
+
+            state.on_embedding = request
             return super().instantiate()
 
     base = type(load_provider(family))
@@ -1309,7 +1515,7 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
             params=[str(media)],
         )
         if entry == "python":
-            relation = conn.sql("select * from (values (NULL::VARCHAR), ('question')) t(q)")
+            relation = conn.sql("select * from (values (NULL::VARCHAR), ('first'), ('second')) t(q)")
             vectors = embed(
                 relation,
                 vane.col("q"),
@@ -1319,9 +1525,11 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
                 gpus_per_actor=0,
                 normalize=True,
                 max_retries=0,
+                batch_size=4,
+                max_concurrency_per_actor=2,
             ).fetchall()
             assert vectors[0][1] is None
-            np.testing.assert_allclose(vectors[1][1], [0.6, 0.8])
+            np.testing.assert_allclose([row[1] for row in vectors[1:]], [[0.6, 0.8]] * 2)
             result = prompt(
                 conn.sql("select * from prompts order by id"),
                 [vane.col("q"), vane.col("media")],
@@ -1335,6 +1543,15 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
         else:
             import json
 
+            vectors = conn.sql(
+                """select ai_embed(q, provider => ?, model => 'configured-encoder', dimensions => 2,
+                options => {gpus_per_actor: 0, normalize: true, max_retries: 0,
+                            batch_size: 4, max_concurrency_per_actor: 2})
+                from (values (NULL::VARCHAR), ('first'), ('second')) t(q)""",
+                params=[family],
+            ).fetchall()
+            assert vectors[0][0] is None
+            np.testing.assert_allclose([row[0] for row in vectors[1:]], [[0.6, 0.8]] * 2)
             result = conn.sql(
                 """select id, ai_prompt(q, media,
                 provider => ?, model => 'configured-vlm', return_format => ?,

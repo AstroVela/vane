@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_requests import ManagedEmbedder
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.options import (
@@ -41,6 +42,7 @@ from vane.ai.protocols import (
 )
 from vane.ai.provider import Provider, _translate_missing_provider_dependency
 from vane.ai.typing import UDFOptions
+from vane.execution._async_dispatch import map_async_ordered
 
 IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 VIDEO_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime"})
@@ -139,6 +141,7 @@ class _NativeEmbeddingDescriptor:
         if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 4000:
             raise ValueError("embedding instruction must contain 1 to 4000 characters")
         _engine_options(self.family, self.options, embedding=True)
+        _positive(self.options, "max_concurrency_per_actor", 8, 1024)
         pooling = self.options.get("pooling_args", {})
         if {"dimensions", "task"} & pooling.keys():
             raise ValueError("pooling_args cannot override dimensions or task")
@@ -515,7 +518,7 @@ class _NativeRuntime:
         return final
 
 
-class NativeEmbedder(_NativeRuntime):
+class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
     async def _embed(self, kind: str, value: Any) -> Any:
         if kind == "video":
             self.descriptor.get_input_spec().validate_count(len(value.frames))
@@ -624,14 +627,40 @@ class NativeEmbedder(_NativeRuntime):
             raise ValueError("Native SGLang returned no embedding")
         return result["embedding"]
 
+    async def _embed_many(self, kind: str, values: list[Any]) -> list[Any]:
+        # Native engines accept individual requests. Overlap those requests on
+        # the actor-owned engine while keeping retries/validation per input;
+        # the enclosing Arrow batch must never replay successful siblings.
+        from vane.ai.functions import _log_substituted_failure, _retry_call_async
+
+        async def invoke(value: Any) -> Any:
+            try:
+                result = await _retry_call_async(
+                    self._embed,
+                    kind,
+                    value,
+                    max_retries=getattr(self, "_request_max_retries", 0),
+                    on_error="raise",
+                )
+                return getattr(self, "_validate_vector", lambda result: result)(result)
+            except EmbeddingConfigurationError:
+                raise
+            except Exception as exc:
+                if getattr(self, "_request_on_error", "raise") == "raise":
+                    raise
+                _log_substituted_failure(exc, on_error="ignore")
+                return None
+
+        return await map_async_ordered(values, invoke, max_concurrency=self.options["max_concurrency_per_actor"])
+
     async def embed_text(self, values: list[str]) -> list[Any]:
-        return [await self._embed("text", value) for value in values]
+        return await self._embed_many("text", values)
 
     async def embed_image(self, values: list[Any]) -> list[Any]:
-        return [await self._embed("image", value) for value in values]
+        return await self._embed_many("image", values)
 
     async def embed_video(self, values: list[VideoClip]) -> list[Any]:
-        return [await self._embed("video", value) for value in values]
+        return await self._embed_many("video", values)
 
 
 class NativePrompter(_NativeRuntime):

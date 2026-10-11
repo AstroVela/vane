@@ -13,6 +13,16 @@ Vane's actor owns the native model engine and releases it when execution ends.
 The engine's tensor/pipeline parallelism must fit gpus_per_actor. Use zero only
 for an explicitly configured engine/device that can execute on CPU.
 
+Native embedding overlaps requests on each actor's engine, controlled by
+max_concurrency_per_actor (default 8, range 1..1024). batch_size controls the
+number of input rows delivered to the actor; set it above one to overlap video
+clips (video embedding otherwise defaults to batch_size=1). actor_number controls
+the number of model instances, independently of request concurrency. Results
+retain input order. Retries belong to individual requests and never replay
+successful siblings; failure/cancellation drains running requests before returning.
+Prompt uses the same bounded request dispatcher. Model tensor batching for
+Transformers/Cosmos remains separate from asynchronous request concurrency.
+
 Embedding options accept engine_args, pooling_args (vLLM), processor_kwargs,
 chat_template and chat_template_kwargs. Native vLLM embedding flattens text
 settings and the current modality's images_kwargs/videos_kwargs before SDK
@@ -68,8 +78,15 @@ def main():
     parser.add_argument("--dimensions", type=int)
     parser.add_argument("--engine-args", type=json.loads, default={})
     parser.add_argument("--gpus-per-actor", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-concurrency-per-actor", type=int, default=8)
     args = parser.parse_args()
-    options = {"engine_args": args.engine_args, "gpus_per_actor": args.gpus_per_actor}
+    options = {
+        "engine_args": args.engine_args,
+        "gpus_per_actor": args.gpus_per_actor,
+        "batch_size": args.batch_size,
+        "max_concurrency_per_actor": args.max_concurrency_per_actor,
+    }
     with vane.connect() as connection:
         inputs = connection.sql("SELECT 'Find the person opening the door' AS query")
         if args.embedding:
