@@ -158,9 +158,13 @@ def main():
                 audit["cleanup_paths"].append(entry["path"])
             for path in data.parent.glob("*.log"):
                 add_local(path)
+                legacy = here / label / path.name
+                if legacy.exists():
+                    legacy.unlink()
                 if path.stat().st_size:
-                    target = here / label / path.name
+                    target = here / label / (medium + "-" + path.name)
                     shutil.copy2(path, target)
+                    assert digest(target) == digest(path)
             add_local(data.parent / "host.jsonl")
             write(label + "/" + medium + "-window.json", window)
             audit["windows"].append(
@@ -174,6 +178,8 @@ def main():
                 )
             )
     assert audit["mounts"] == 64
+    windows = sorted(audit["windows"], key=lambda w: w["started_epoch"])
+    assert all(a["ended_epoch"] <= b["started_epoch"] for a, b in zip(windows, windows[1:]))
     commands = read(requests / "build.json")["commands"]
     assert all(c["returncode"] == 0 for c in commands)
     assert all(
