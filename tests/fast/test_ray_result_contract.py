@@ -366,6 +366,7 @@ def _make_local_query_driver_actor():
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._udf_actor_timeout_cleanup_pending = set()
     runner._active_udf_actor_by_unit = {}
     runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}

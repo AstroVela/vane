@@ -183,6 +183,11 @@ class UDFActorPoolBase:
 
         self.actors: list[Any] = []
         self._init_refs: list[Any] = []
+        self._confirmed_ready: set[int] = set()
+        self._vane_retired = False
+        self._vane_location_nonce = ""
+        self._vane_readiness_futures: list[Any] = []
+        self._vane_init_errors: dict[int, BaseException] = {}
         try:
             for actor_index in range(concurrency):
                 self.actors.append(Actor.options(**actor_options[actor_index]).remote())
@@ -200,11 +205,6 @@ class UDFActorPoolBase:
                     creation_error=creation_error,
                 ) from creation_error
             raise
-        self._confirmed_ready: set[int] = set()
-        self._vane_retired = False
-        self._vane_location_nonce = ""
-        self._vane_readiness_futures: list[Any] = []
-        self._vane_init_errors: dict[int, BaseException] = {}
 
     @staticmethod
     def _actor_class(max_restarts: int, max_task_retries: int) -> Any:

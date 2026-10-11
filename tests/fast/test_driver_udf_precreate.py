@@ -1327,6 +1327,7 @@ def test_stale_execution_phase_callback_does_not_retire_current_actor_pool(
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
     )
 
     runner_cls._retire_udf_actor_pools_outside_phase(
@@ -1360,6 +1361,7 @@ def test_plan_actor_cleanup_reports_close_failure_without_retaining_terminated_p
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
     )
 
     diagnostics = runner_cls._cleanup_udf_actor_pools(runner, "q1")
@@ -1400,6 +1402,7 @@ def test_phase_actor_retirement_records_close_failure_after_releasing_terminated
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
         _udf_actor_cleanup_diagnostics_by_plan={},
     )
 
@@ -1446,6 +1449,7 @@ def test_phase_actor_retirement_preserves_close_failure_when_completion_fails(mo
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
         _udf_actor_cleanup_diagnostics_by_plan={},
     )
 
@@ -1498,6 +1502,7 @@ def test_phase_actor_retirement_serializes_plan_cleanup(monkeypatch):
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
     )
 
     def retire_phase():
@@ -1571,6 +1576,7 @@ def test_plan_cleanup_serializes_late_phase_actor_retirement(monkeypatch):
         _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
         _active_udf_actors=[pool],
         _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_timeout_cleanup_pending=set(),
     )
 
     def cleanup_plan():
@@ -1678,6 +1684,7 @@ def test_actor_activation_rechecks_phase_after_slow_pool_creation(monkeypatch):
         _active_udf_actor_by_unit={"q1": {}},
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
+        _udf_actor_timeout_cleanup_pending=set(),
         _driver_handle=object(),
     )
 
@@ -1760,6 +1767,7 @@ def test_actor_activation_cleans_up_when_atomic_slot_publication_is_fenced(monke
         _active_udf_actor_by_unit={"q1": {}},
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
+        _udf_actor_timeout_cleanup_pending=set(),
         _driver_handle=object(),
     )
 
@@ -1917,6 +1925,7 @@ def test_activation_returns_pending_handles_and_retirement_ignores_late_readines
     assert pool._confirmed_ready == set()
     assert pool.actors == []
     assert runner._active_udf_actors == []
+    assert runner._udf_actor_timeout_cleanup_pending == set()
     assert runner._active_udf_actors_by_plan == {}
     assert runner._query_terminal_errors == {}
 
@@ -1976,6 +1985,7 @@ def test_actor_activation_retains_unpublished_pool_when_shutdown_fails(monkeypat
         _active_udf_actor_by_unit={"q1": {}},
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
+        _udf_actor_timeout_cleanup_pending=set(),
         _driver_handle=object(),
     )
 
@@ -2062,6 +2072,7 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
         _active_udf_actor_by_unit={"q1": {}},
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
+        _udf_actor_timeout_cleanup_pending=set(),
         _driver_handle=object(),
         _watch_query_udf_actor_pool_readiness=lambda *_args: (_ for _ in ()).throw(
             RuntimeError("planned readiness watcher failure")
@@ -2156,6 +2167,7 @@ def test_actor_readiness_close_failure_releases_terminated_pool(monkeypatch):
         _active_udf_actor_by_unit={"q1": {}},
         _active_udf_actors=[],
         _active_udf_actors_by_plan={},
+        _udf_actor_timeout_cleanup_pending=set(),
         _driver_handle=object(),
         _watch_query_udf_actor_pool_readiness=lambda *_args: (_ for _ in ()).throw(
             RuntimeError("planned readiness watcher failure")
@@ -2300,15 +2312,20 @@ def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
     assert killed == [("actor-0", True)]
 
 
-def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(monkeypatch):
+@pytest.mark.parametrize("kill", [False, True])
+@pytest.mark.parametrize("failure_stage", ["creation", "init"])
+def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(monkeypatch, kill, failure_stage):
     import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     fail_kill = True
+    actors = []
+    killed = []
 
-    def _kill(_actor, *, no_restart):
+    def _kill(actor, *, no_restart):
         assert no_restart is True
         if fail_kill:
             raise RuntimeError("planned actor cleanup failure")
+        killed.append(actor)
 
     fake_ray = types.SimpleNamespace(
         put=lambda payload: ("payload-ref", payload),
@@ -2326,9 +2343,22 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
                 def remote():
                     actor_index = cls.calls
                     cls.calls += 1
-                    if actor_index == 1:
+                    if actor_index == 1 and failure_stage == "creation":
                         raise RuntimeError("planned actor creation failure")
-                    return f"actor-{actor_index}"
+
+                    def init(_payload):
+                        if actor_index == 1:
+                            raise RuntimeError("planned actor init submission failure")
+                        return f"init-{actor_index}"
+
+                    actor = SimpleNamespace(
+                        init_payload=SimpleNamespace(remote=init),
+                        close_executor=SimpleNamespace(
+                            remote=lambda: pytest.fail("partially initialized actors cannot run close RPCs")
+                        ),
+                    )
+                    actors.append(actor)
+                    return actor
 
             return _BoundActor
 
@@ -2358,11 +2388,17 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
 
     owned_pools = exc_info.value.owned_actor_pools
     assert len(owned_pools) == 1
-    assert owned_pools[0].actors == ["actor-0"]
+    assert owned_pools[0].actors == actors
+    assert len(actors) == (1 if failure_stage == "creation" else 2)
+    assert "planned actor cleanup failure" in str(exc_info.value)
+    assert owned_pools[0]._confirmed_ready == set()
 
     fail_kill = False
-    owned_pools[0].shutdown(kill=True)
+    owned_pools[0].shutdown(kill=kill)
     assert owned_pools[0].actors == []
+    assert owned_pools[0]._init_refs == []
+    assert owned_pools[0]._payload_ref is None
+    assert killed == actors
 
 
 def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snapshot(monkeypatch):
@@ -3049,6 +3085,7 @@ def _pending_pool_driver(monkeypatch):
     runner._active_udf_actor_by_unit = {}
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._udf_actor_timeout_cleanup_pending = set()
     runner._driver_handle = object()
     return runner, manager, pool, init
 
@@ -3110,6 +3147,72 @@ def test_deadline_kill_failure_preserves_ownership_and_is_retried(monkeypatch):
     runner._expire_pending_udf_actor_pools(now=pool._vane_init_deadline + 1)
     assert attempts == [True, True]
     assert runner._active_udf_actors == []
+    assert runner._udf_actor_timeout_cleanup_pending == set()
+
+
+@pytest.mark.parametrize("sibling_state", ["pending", "ready", "unpublished"])
+@pytest.mark.parametrize("expiry_trigger", ["maintenance", "callback"])
+def test_deadline_cleanup_retries_siblings_after_expired_pool_is_gone(monkeypatch, sibling_state, expiry_trigger):
+    import vane.runners.ray.driver as driver
+
+    runner, manager, pool, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    deadline = pool._vane_init_deadline
+    attempts = []
+    sibling = SimpleNamespace(
+        actors=["sibling-actor"],
+        _confirmed_ready={0} if sibling_state == "ready" else set(),
+        _vane_init_deadline=deadline + 100,
+        _vane_init_timed_out=False,
+        _vane_retired=False,
+    )
+
+    def shutdown(*, kill):
+        assert kill
+        attempts.append(kill)
+        if len(attempts) < 3:
+            raise RuntimeError("sibling kill unavailable")
+        sibling.actors.clear()
+
+    sibling.shutdown = shutdown
+    runner._active_udf_actors.append(sibling)
+    runner._active_udf_actors_by_plan["q1"].append(sibling)
+    if sibling_state != "unpublished":
+        runner._active_udf_actor_by_unit["q1"]["resource:q1:sibling"] = sibling
+    if expiry_trigger == "callback":
+        monkeypatch.setattr(driver.time, "monotonic", lambda: deadline + 0.01)
+        init.set_result("late-node")
+        # Normal teardown may race the maintenance pass after a late callback.
+        with pytest.raises(RuntimeError, match="sibling kill unavailable"):
+            runner._cleanup_udf_actor_pools("q1")
+    else:
+        with pytest.raises(RuntimeError, match="sibling kill unavailable"):
+            runner._expire_pending_udf_actor_pools(now=deadline)
+
+    assert pool.actors == []
+    assert runner._active_udf_actors == [sibling]
+    assert runner._active_udf_actors_by_plan == {"q1": [sibling]}
+    assert "resource:q1:actor" not in runner._active_udf_actor_by_unit.get("q1", {})
+    assert sibling._vane_retired and not sibling._vane_init_timed_out
+    assert runner._udf_actor_timeout_cleanup_pending == {"q1"}
+    if expiry_trigger == "maintenance":
+        init.set_result("late-node")
+    assert not pool._confirmed_ready
+
+    # Retry before the sibling's own deadline; keep retrying persistent failures.
+    with pytest.raises(RuntimeError, match="sibling kill unavailable"):
+        runner._expire_pending_udf_actor_pools(now=deadline + 1)
+    assert runner._active_udf_actors_by_plan == {"q1": [sibling]}
+    assert runner._udf_actor_timeout_cleanup_pending == {"q1"}
+    runner._expire_pending_udf_actor_pools(now=deadline + 2)
+    assert attempts == [True, True, True]
+    assert runner._active_udf_actors == []
+    assert runner._active_udf_actors_by_plan == {}
+    assert runner._active_udf_actor_by_unit == {}
+    assert runner._udf_actor_timeout_cleanup_pending == set()
+    runner._expire_pending_udf_actor_pools(now=deadline + 3)
+    assert attempts == [True, True, True]
+    assert len(manager.failures) == 1
 
 
 def test_retired_pool_deadline_does_not_fail_query(monkeypatch):

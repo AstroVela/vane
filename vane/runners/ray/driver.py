@@ -1788,6 +1788,7 @@ class RayQueryDriverActor:
         self._active_udf_actors: list[UDFActorPoolBase] = []
         self._active_udf_actors_by_plan: dict[str, list[UDFActorPoolBase]] = {}
         self._active_udf_actor_by_unit: dict[str, dict[str, UDFActorPoolBase]] = {}
+        self._udf_actor_timeout_cleanup_pending: set[str] = set()
         self._udf_actor_cleanup_diagnostics_by_plan: dict[str, list[BaseException]] = {}
         self._query_udf_actor_lifecycle_locks: dict[str, threading.RLock] = {}
         self._query_udf_actor_nodes: dict[str, dict[str, dict[str, Any]]] = {}
@@ -5774,21 +5775,33 @@ class RayQueryDriverActor:
                 for unit_id, pool in pools.items()
                 if pool._vane_init_deadline <= now
             ]
-        errors: list[BaseException] = []
         for query_id, unit_id, pool in pending:
             with _query_udf_actor_lifecycle_lock(self, query_id):
                 with self._session_lock:
                     if self._active_udf_actor_by_unit.get(query_id, {}).get(unit_id) is not pool:
+                        continue
+                    if query_id in self._udf_actor_timeout_cleanup_pending:
                         continue
                     if not pool._vane_init_timed_out:
                         if pool._vane_retired or pool._confirmed_ready:
                             continue
                         pool._vane_init_timed_out = True
                         pool._vane_retired = True
+                    self._udf_actor_timeout_cleanup_pending.add(query_id)
                     message = _udf_actor_init_timeout_message(query_id, unit_id, pool)
                 with self._query_resource_lock:
                     self._query_terminal_errors.setdefault(query_id, message)
                     get_query_resource_manager(query_id).fail(message)
+        # Keep retry ownership on the query: the expired pool can terminate
+        # before a ready, pending, or unpublished sibling fails to terminate.
+        with self._session_lock:
+            cleanup_queries = tuple(self._udf_actor_timeout_cleanup_pending)
+        errors: list[BaseException] = []
+        for query_id in cleanup_queries:
+            with _query_udf_actor_lifecycle_lock(self, query_id):
+                with self._session_lock:
+                    if query_id not in self._udf_actor_timeout_cleanup_pending:
+                        continue
                 try:
                     self._cleanup_udf_actor_pools(query_id, force=True)
                 except BaseException as exc:
@@ -6059,6 +6072,7 @@ class RayQueryDriverActor:
                 if not pool._confirmed_ready and time.monotonic() >= pool._vane_init_deadline:
                     pool._vane_init_timed_out = True
                     pool._vane_retired = True
+                    self._udf_actor_timeout_cleanup_pending.add(query_id)
                     message = _udf_actor_init_timeout_message(query_id, resource_unit_id, pool)
                 else:
                     pool.actor_node_ids[actor_index] = node_id
@@ -6288,8 +6302,10 @@ class RayQueryDriverActor:
         with lifecycle_lock:
             with self._session_lock:
                 pools = list(self._active_udf_actors_by_plan.get(plan_key, ()))
-            if not pools:
-                return []
+                force = force or plan_key in self._udf_actor_timeout_cleanup_pending
+                if not pools:
+                    self._udf_actor_timeout_cleanup_pending.discard(plan_key)
+                    return []
             errors: list[BaseException] = []
             diagnostics: list[BaseException] = []
             failed_pool_count = 0
@@ -6338,6 +6354,8 @@ class RayQueryDriverActor:
                         f"failed to shut down {failed_pool_count} query-owned UDF actor pool(s): " + "; ".join(details)
                     )
                 ) from errors[0]
+            with self._session_lock:
+                self._udf_actor_timeout_cleanup_pending.discard(plan_key)
             return diagnostics
 
     def _cleanup_vllm_actor_pools(self, plan_id: str) -> None:
