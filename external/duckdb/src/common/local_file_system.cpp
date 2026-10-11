@@ -193,6 +193,13 @@ static FileMetadata StatsInternal(int fd, const string &path) {
 	// Retain the full native fraction for consumers that need more precision
 	// than timestamp_t's microseconds, such as distributed source snapshots.
 	file_metadata.extended_file_info.emplace("mtime_nsec", Value::BIGINT(PosixModificationTimeNanos(s)));
+	file_metadata.extended_file_info.emplace("file_identity", Value::UBIGINT(s.st_ino));
+	file_metadata.extended_file_info.emplace("ctime", Value::BIGINT(s.st_ctime));
+#ifdef __APPLE__
+	file_metadata.extended_file_info.emplace("ctime_nsec", Value::BIGINT(s.st_ctimespec.tv_nsec));
+#else
+	file_metadata.extended_file_info.emplace("ctime_nsec", Value::BIGINT(s.st_ctim.tv_nsec));
+#endif
 
 	switch (s.st_mode & S_IFMT) {
 	case S_IFBLK:
@@ -963,6 +970,16 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 	file_metadata.extended_file_info.emplace(
 	    "mtime_nsec",
 	    Value::BIGINT(static_cast<int64_t>((FiletimeToTicks(file_info.ftLastWriteTime) % 10000000) * 100)));
+	FILE_BASIC_INFO basic_info;
+	if (!GetFileInformationByHandleEx(hFile, FileBasicInfo, &basic_info, sizeof(basic_info))) {
+		throw IOException("Failed to get file change time for \"%s\": %s", path,
+		                  LocalFileSystem::GetLastErrorAsString());
+	}
+	file_metadata.extended_file_info.emplace(
+	    "file_identity", Value::UBIGINT((uint64_t(file_info.nFileIndexHigh) << 32) | file_info.nFileIndexLow));
+	file_metadata.extended_file_info.emplace("ctime", Value::BIGINT(basic_info.ChangeTime.QuadPart / 10000000));
+	file_metadata.extended_file_info.emplace("ctime_nsec",
+	                                         Value::BIGINT((basic_info.ChangeTime.QuadPart % 10000000) * 100));
 
 	// Get file type from attributes
 	if (strncmp(path.c_str(), PIPE_PREFIX, strlen(PIPE_PREFIX)) == 0) {

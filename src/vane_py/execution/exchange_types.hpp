@@ -37,6 +37,7 @@ inline void CheckExchangeType(const LogicalType &type, idx_t depth = 0) {
 	case LogicalTypeId::INTERVAL:
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::BLOB:
+	case LogicalTypeId::AGGREGATE_STATE:
 	case LogicalTypeId::SQLNULL:
 		return;
 	case LogicalTypeId::LIST:

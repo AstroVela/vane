@@ -210,6 +210,10 @@ DirectRead DirectChannel::Poll(const string &id, shared_ptr<DirectBatch> &batch,
 	return DirectRead::BLOCKED;
 }
 
+idx_t DirectChannel::FrameSize(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count) const {
+	return Measure(input, rows, offset, count, limits.frame_bytes);
+}
+
 idx_t DirectChannel::FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_t offset) const {
 	if (input.GetTypes() != types || offset >= rows.size()) {
 		throw InvalidInputException("direct frame schema or row selection mismatch");

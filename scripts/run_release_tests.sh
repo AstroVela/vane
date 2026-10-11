@@ -48,6 +48,7 @@ release_tests=(
   "$project_root/tests/fast/test_milvus_datasink.py"
   "$project_root/tests/fast/test_native_fragment_compiler.py"
   "$project_root/tests/fast/test_analytical_fragment_compiler.py"
+  "$project_root/tests/fast/test_execution_performance.py"
   "$project_root/tests/fast/test_analytical_exchange.py"
   "$project_root/tests/fast/test_worker_resources.py"
   "$project_root/tests/fast/test_ray_analytical_execution.py"

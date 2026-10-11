@@ -98,7 +98,11 @@ class _Query:
 
         spec, resources, index, routes = self.spec, self.resources, self.index, self.routes
         relevant = [r for r in routes if index in (r["source_worker"], r["target_worker"])]
-        links = sum((r["source_worker"] == index) + (r["target_worker"] == index) for r in relevant)
+        links = sum(
+            (r["source_worker"] == index) + (r["target_worker"] == index)
+            for r in relevant
+            if r["source_worker"] != r["target_worker"]
+        )
         with self.lifecycle:
             if self.stop.is_set():
                 raise RuntimeError("query preparation was canceled")
@@ -113,24 +117,32 @@ class _Query:
             if self.stop.is_set():
                 raise RuntimeError("query preparation was canceled")
             self.service = native.TaskService(self.connection)
-            self.flight = native.DirectFlight(
-                "0.0.0.0",
-                _host(),
-                links,
-                links * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
-                resources.exchange.frame_bytes,
-            )
+            if links:
+                self.flight = native.DirectFlight(
+                    "0.0.0.0",
+                    _host(),
+                    links,
+                    links * native.DirectFlight.staging_per_link(resources.exchange.frame_bytes),
+                    resources.exchange.frame_bytes,
+                )
             incoming: dict[str, dict[str, list[Any]]] = {}
             outgoing: dict[str, dict[str, list[Any]]] = {}
             for route in relevant:
+                local = route["source_worker"] == route["target_worker"]
                 if route["source_worker"] == index:
                     channel = _channel(route["schema"], resources, route["source"], route["target"])
                     self.channels[f"out/{route['id']}"] = channel
-                    self.flight.publish(route["ticket"], channel, route["target"])
+                    if not local:
+                        self.flight.publish(route["ticket"], channel, route["target"])
                     outgoing.setdefault(route["source"], {}).setdefault(route["edge"], []).append(channel)
                 if route["target_worker"] == index:
-                    channel = _channel(route["schema"], resources, route["source"], route["target"])
-                    self.channels[f"in/{route['id']}"] = channel
+                    if local:
+                        channel = self.channels[f"out/{route['id']}"]
+                    else:
+                        channel = _channel(route["schema"], resources, route["source"], route["target"])
+                        self.channels[f"in/{route['id']}"] = channel
+                    # A local edge has one allocation/credit ledger. The input
+                    # borrows the producer's channel, without a relay or staging.
                     incoming.setdefault(route["target"], {}).setdefault(route["port"], []).append(
                         (channel, route["target"])
                     )
@@ -173,7 +185,7 @@ class _Query:
             if self.stop.is_set() or self.started:
                 raise RuntimeError("query no longer accepts input bindings")
             for route in self.routes:
-                if route["target_worker"] == self.index:
+                if route["target_worker"] == self.index and route["source_worker"] != self.index:
                     self.flight.subscribe(
                         locations[route["source_worker"]],
                         route["ticket"],
@@ -199,16 +211,17 @@ class _Query:
     def _run(self) -> None:
         try:
             while not self.stop.is_set():
-                self.service.pump(max(1, len(self.order)))
+                progressed = self.service.pump(max(1, len(self.order)))
                 status = self.service.status()
                 error = next((task["error"] for task in status if task["state"] in {"FAILED", "CANCELED"}), "")
-                error = error or self.flight.error
+                error = error or (self.flight.error if self.flight is not None else "")
                 if error:
                     self.cancel(error)
                     return
                 if time.monotonic() - self.started_at >= self.spec.options.execution_timeout:
                     self.service.expire()
-                self.stop.wait(0.002)
+                if not progressed:
+                    self.stop.wait(0.002)
         except BaseException as error:
             self.cancel(str(error))
 
@@ -216,7 +229,11 @@ class _Query:
         tasks = self.service.diagnostics()
         production = self.service.production_status()
         channels = {name: channel.snapshot() for name, channel in self.channels.items()}
-        error = self.error or self.flight.error or next((c["error"] for c in channels.values() if c["error"]), "")
+        error = (
+            self.error
+            or (self.flight.error if self.flight is not None else "")
+            or next((c["error"] for c in channels.values() if c["error"]), "")
+        )
         return {
             "tasks": tasks,
             "error": error,
@@ -316,7 +333,7 @@ class PipelinedWorker:
             self.queries[spec.query_id] = query
         try:
             query.prepare(tasks, reservation["operator"])
-            return str(query.flight.location)
+            return str(query.flight.location) if query.flight is not None else ""
         except BaseException as primary:
             try:
                 self.release(epoch, spec.query_id, sequence)
@@ -345,6 +362,8 @@ class PipelinedWorker:
     def ready(self, epoch: str, query: str) -> bool:
         self._check(epoch)
         owner = self.queries[query]
+        if owner.flight is None:
+            return True
         if owner.flight.error:
             raise RuntimeError(owner.flight.error)
         return bool(owner.flight.ready)

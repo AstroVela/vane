@@ -127,6 +127,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayo
 	case LogicalTypeId::VARCHAR:
 		return arrow::utf8();
 	case LogicalTypeId::BLOB:
+	case LogicalTypeId::AGGREGATE_STATE:
 		return arrow::binary();
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
@@ -405,7 +406,8 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 		break;
 	}
 	case LogicalTypeId::VARCHAR:
-	case LogicalTypeId::BLOB: {
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::AGGREGATE_STATE: {
 		auto &values = static_cast<const arrow::BinaryArray &>(source);
 		auto data = FlatVector::GetData<string_t>(target);
 		for (idx_t row = 0; row < count; row++) {

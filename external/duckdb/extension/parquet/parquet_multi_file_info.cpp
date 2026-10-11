@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "parquet_multi_file_info.hpp"
+#include "parquet_split.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -192,6 +193,45 @@ static void ParseRowGroupIdsFromOpenFile(const OpenFileInfo &file, vector<idx_t>
 		std::sort(out.begin(), out.end());
 		out.erase(std::unique(out.begin(), out.end()), out.end());
 	}
+}
+
+vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindData &bind, idx_t partitions) {
+	vector<OpenFileInfo> result;
+	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
+	for (auto &file : bind.file_list->GetAllFiles()) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		ParquetReader reader(context, file, options);
+		vector<idx_t> groups;
+		ParseRowGroupIdsFromOpenFile(file, groups);
+		if (groups.empty()) {
+			for (idx_t i = 0; i < reader.NumRowGroups(); i++) {
+				groups.push_back(i);
+			}
+		}
+		if (groups.size() <= 1 || partitions <= 1) {
+			result.push_back(file);
+			continue;
+		}
+		auto count = MinValue<idx_t>(groups.size(), partitions);
+		for (idx_t part = 0; part < count; part++) {
+			OpenFileInfo split(file.path);
+			split.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			if (file.extended_info) {
+				split.extended_info->options = file.extended_info->options;
+			}
+			auto &split_options = split.extended_info->options;
+			split_options.erase("row_group_id");
+			vector<Value> selected;
+			for (idx_t i = part * groups.size() / count; i < (part + 1) * groups.size() / count; i++) {
+				selected.push_back(Value::UBIGINT(groups[i]));
+			}
+			split_options["row_group_ids"] = Value::LIST(LogicalType::UBIGINT, std::move(selected));
+			result.push_back(std::move(split));
+		}
+	}
+	return result;
 }
 
 static void BindSchema(ClientContext &context, vector<LogicalType> &return_types, vector<string> &names,

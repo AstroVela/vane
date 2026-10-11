@@ -289,18 +289,17 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 | 算子 | 分布与执行规则 |
 | --- | --- |
-| COUNT、非 DECIMAL/HUGEINT 输入的 SUM、单参数 MIN/MAX | 每个 source 分区先执行 native partial aggregate；GROUP BY 键使用 HASH，无分组使用 GATHER；final aggregate 合并，投影恢复原始返回类型 |
-| FLOAT/DOUBLE AVG | partial SUM 与 COUNT，final 合并后计算商；FILTER 在两项中一致传播；NULL 与空组保持 native 语义 |
-| DISTINCT、带排序的聚合、DECIMAL/HUGEINT SUM、整数/decimal/时间 AVG、双参数 MIN/MAX(x,n)、Binder 内部聚合改写 | 原始行先按 group key 分区，再执行完整 native aggregate；全局聚合汇入一个分区，保留原生去重、精度/舍入和前 n 个极值语义；单参数 MIN/MAX 的 LIST 输入仍按普通标量合并 |
+| COUNT、SUM、AVG、具有可导出固定状态的单参数 MIN/MAX | source 分区执行 native partial，交换带类型的 AGGREGATE_STATE；final 调用原函数 combine/finalize，GROUP BY 使用 HASH，无分组使用 GATHER；FILTER 只在 partial 应用 |
+| DISTINCT、带排序的聚合、双参数 MIN/MAX(x,n)、具有动态状态的 MIN/MAX、Binder 内部聚合改写 | 原始行按 group key 分区后执行完整 native aggregate，保留去重、排序和动态状态的所有权 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
 | BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
 | TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
 
-整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。包含这类 AVG 的聚合节点按完整 group 执行；跨节点的类型与最终精度仍由 native 决定。
+整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。partial 导出原生 sum/count 状态，final 合并后只做一次原生终结，保留 DECIMAL scale 和时间类型的舍入。
 
-DECIMAL SUM 的原生累加器可以保存 39 位的 signed 128-bit 中间值，而其返回类型声明为 `DECIMAL(38,s)`。例如三个 `4×10³⁷` 和三个 `−3×10³⁷` 的总和合法，但前一个分区的部分和 `1.2×10³⁸` 不能作为 38 位 Arrow decimal 传输。包含 DECIMAL SUM 的整个聚合节点因此采用完整分组策略，保留 FILTER、NULL、scale 及同节点其他聚合的语义；代价是交换原始行，无法提前缩减为部分和。公开 DECIMAL 的 Arrow schema 继续使用声明的精度与 scale。
+DECIMAL SUM 的部分状态可以超过声明的 `DECIMAL(38,s)`，因此交换私有状态字节，不把分区小计提前终结为 SQL DECIMAL。具有 128 位输入的 SUM/AVG 使用下述宽状态，避免分区内先溢出。AGGREGATE_STATE 在内部 Arrow 中编码为 binary；函数、输入/返回类型、引擎代码和平台身份共同限定 codec，加载时检查实际状态长度。公开 DECIMAL 的 Arrow schema 继续使用声明精度与 scale。
 
 仅取消 partial 仍不足以避免溢出：异步输入可能让三个 `6×10³⁷` 先于三个 `−4×10³⁷` 到达。因此，对使用 128 位存储的 HUGEINT/DECIMAL 输入，fragment 的 SUM 与 AVG 共用 signed 192-bit 私有累加状态，以三个 unsigned 64-bit limb 实现精确加法与 combine，并维护非 NULL 行数。状态覆盖最多 64-bit 行数的 signed 128-bit 输入。SUM 在组完成后检查返回值的 128 位范围，保留 HUGEINT 或 DECIMAL 的 SQL 类型与 scale；AVG 允许总和超出 128 位，在完整组上除以行数及 DECIMAL scale。总和落在原生范围内时，AVG 继续使用原生 HUGEINT 到 long double 的转换，避免改变既有舍入；超出时从宽整数直接转换，保留正负抵消后的有效数位。
 
@@ -310,11 +309,21 @@ DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `o
 
 物理计划反序列化时，聚合参数已指向计算好的输入列。重新绑定函数数据使用这些表达式的副本，保留原参数，避免 collation 绑定器重复包装输入列。该规则由物理反序列化作用域标记控制；逻辑表达式反序列化继续保留绑定器的参数改写。
 
-聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。没有引入兼容旧分布式聚合拆分器的接口。
+聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。状态合并复用引擎的 combine/finalize 包装器，FragmentGraph 独立构图。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。
+
+### 大文件与交换吞吐
+
+Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row groups 划为最多 `partition_count` 个连续范围，通过原生 `row_group_ids` 扫描。单个大文件因此能分配给多个 worker；重复扫描引用、Hive 路径以及原文件内的 `file_row_number` 都保留。优化前收集的数据源依赖仍按完整文件验证，不随行组或过滤裁剪丢失。
+
+同 worker 的 pipelined 边共用一个 DirectChannel，只有一份 credit 和窗口预留，不创建 Flight relay 或预留该边的网络 staging。跨 worker 和根结果链路继续使用 Flight。执行循环在 pump 有进展时立即继续，只有无进展时才短暂等待。
+
+DirectCollector 为本地扫描的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。依赖上游 exchange 的任务立即转发可用结果，避免等待下一批输入时扣住已有结果。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。
+
+FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
 
-engine identity 同时包含 DuckDB SourceID 与 Vane 编译器/加载器源码摘要。schema、fragment 和 HASH 表达式分别带版本及身份，加载器在解释 native 算子之前检查身份与完整载荷边界。Python 图里的端口、source 和 source dependency 是原生描述的视图；validate_native_graph 对照 native 解码结果校验，拒绝两者不一致。
+engine identity 同时包含 DuckDB SourceID、平台 ABI 标识与 Vane 编译器/加载器源码摘要。schema、fragment 和 HASH 表达式分别带版本及身份，加载器在解释 native 算子之前检查身份与完整载荷边界。Python 图里的端口、source 和 source dependency 是原生描述的视图；validate_native_graph 对照 native 解码结果校验，拒绝两者不一致。
 
 range 的扫描 split 由 table function 的 native 回调规划；Parquet 从绑定后的 MultiFileList 枚举文件，使用独立的文件 split codec，不依赖旧 FTE 的 split 管理器。载荷带稳定 split_id、能力和 codec 身份。worker bind 独立持有可移植状态，加载时必须显式提供所分配的 split；空列表代表空任务，未知或重复 split_id 被拒绝。无扫描的常量查询只执行一次，不因请求多个分区而复制结果。Parquet 的 requires_snapshot 标记为真：固定文件列表只封闭了枚举，提交层还必须检查访问条件与回放保证。
 

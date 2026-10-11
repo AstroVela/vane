@@ -200,10 +200,9 @@ unique_ptr<FunctionData> MergeAggregateDeserialize(Deserializer &deserializer, A
 		throw SerializationException("Invalid merge aggregate payload for %s", function.name);
 	}
 	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-	idx_t state_size = 0;
-	deserializer.ReadPropertyWithDefault<idx_t>(101, "state_size", state_size);
-	if (state_size == 0) {
-		state_size = bound_aggregate.function.state_size(bound_aggregate.function);
+	auto state_size = deserializer.ReadProperty<idx_t>(101, "state_size");
+	if (state_size != bound_aggregate.function.state_size(bound_aggregate.function)) {
+		throw SerializationException("Merge aggregate native state size mismatch for %s", function.name);
 	}
 	if (function.arguments.empty()) {
 		throw SerializationException("Merge aggregate missing arguments for %s", function.name);
@@ -217,8 +216,22 @@ unique_ptr<FunctionData> MergeAggregateDeserialize(Deserializer &deserializer, A
 	if (child_expr->bind_info) {
 		child_bind = child_expr->bind_info->Copy();
 	}
-	return make_uniq<MergeAggregateBindData>(child_expr->function, state_size, std::move(child_bind),
+	auto child_function = child_expr->function;
+	return make_uniq<MergeAggregateBindData>(std::move(child_function), state_size, std::move(child_bind),
 	                                         std::move(child_expr));
+}
+
+unique_ptr<BoundAggregateExpression> BindMergeAggregate(const BoundAggregateExpression &aggregate,
+                                                        const LogicalType &state_type, idx_t column) {
+	auto state_size = aggregate.function.state_size(aggregate.function);
+	auto function = MakeMergeAggregateFunction(aggregate.function, state_type, state_size);
+	vector<unique_ptr<Expression>> children;
+	children.push_back(make_uniq<BoundReferenceExpression>(state_type, column));
+	auto child = unique_ptr_cast<Expression, BoundAggregateExpression>(aggregate.Copy());
+	auto bind = make_uniq<MergeAggregateBindData>(
+	    aggregate.function, state_size, aggregate.bind_info ? aggregate.bind_info->Copy() : nullptr, std::move(child));
+	return make_uniq<BoundAggregateExpression>(std::move(function), std::move(children), nullptr, std::move(bind),
+	                                           AggregateType::NON_DISTINCT);
 }
 
 std::vector<BoundExpr> MakeGroupByReferences(const std::vector<BoundExpr> &group_by) {

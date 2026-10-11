@@ -58,6 +58,21 @@ QUERIES = [
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_parquet_row_groups_and_decimal_partial_states(tmp_path, mode):
+    path = tmp_path / "data.parquet"
+    sql = f"select sum(v), avg(v), count(*) from read_parquet('{path}') where k % 3<>0"
+    with vane.connect(backend="local", config={"threads": 1}) as local:
+        local.execute(
+            f"copy (select range k, range::decimal(15,2) v from range(16384)) to '{path}' (row_group_size 2048)"
+        )
+        expected = local.execute(sql).to_arrow_table()
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
+        with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+            assert result.collect().equals(expected)
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_analytical_sql_and_repeated_execution(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,

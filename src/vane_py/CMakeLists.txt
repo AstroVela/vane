@@ -89,9 +89,14 @@ target_include_directories(
 set(_fragment_identity "")
 foreach(
   _fragment_file
-  execution/fragment_plan.hpp execution/fragment_plan.cpp
-  execution/fragment_plan_bindings.cpp execution/exchange_types.hpp
-  execution/arrow_frame.hpp execution/arrow_frame.cpp)
+  execution/fragment_plan.hpp
+  execution/fragment_plan.cpp
+  execution/fragment_plan_bindings.cpp
+  execution/exchange_types.hpp
+  execution/arrow_frame.hpp
+  execution/arrow_frame.cpp
+  execution/file_snapshot.hpp
+  execution/file_snapshot.cpp)
   set_property(
     DIRECTORY
     APPEND
@@ -106,4 +111,5 @@ set_property(
   PROPERTY COMPILE_DEFINITIONS
            "VANE_FRAGMENT_BUILD_ID=\"${_fragment_identity}\"")
 target_include_directories(
-  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include")
+  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include"
+                     "${DUCKDB_SOURCE_PATH}/extension/parquet/include")

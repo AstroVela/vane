@@ -70,13 +70,23 @@ string Fingerprint(ClientContext &context, FileHandle &file, FileHandle *target,
 }
 } // namespace
 
-string FileFingerprint(ClientContext &context, const OpenFileInfo &source) {
+string FileIdentity(ClientContext &context, const OpenFileInfo &source) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (!fs.IsPathAbsolute(source.path)) {
-		throw NotImplementedException("FTE snapshots require absolute local paths");
+		throw NotImplementedException("submission file sources require absolute local paths");
 	}
-	auto file = fs.OpenFile(source, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
-	return Fingerprint(context, *file, nullptr, 1ULL << 40);
+	auto file = fs.OpenFile(source, FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ));
+	CheckFile(*file);
+	auto stats = file->Stats();
+	string result = std::to_string(stats.file_size) + ":" + std::to_string(stats.last_modification_time.value);
+	for (auto &key : {"mtime_nsec", "file_identity", "ctime", "ctime_nsec"}) {
+		auto found = stats.extended_file_info.find(key);
+		if (found == stats.extended_file_info.end()) {
+			throw NotImplementedException("submission file sources require precise local file identities");
+		}
+		result += ":" + found->second.ToString();
+	}
+	return result;
 }
 
 string FrozenFilePath(ClientContext &context, const string &source, const string &directory) {
@@ -119,14 +129,16 @@ FrozenFile FreezeFile(ClientContext &context, const string &source, const string
 	                                 FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE | FileFlags::FILE_FLAGS_PRIVATE);
 	auto size = input->GetFileSize();
 	auto sha = Fingerprint(context, *input, output.get(), remaining);
-	output->Sync();
-	output->Close();
-	// A second pass also catches ordinary concurrent rewrites of an equal-size
-	// file. Subsequent attempts read only the frozen copy, never the original.
-	if (sha != Fingerprint(context, *input, nullptr, remaining) || input->GetFileSize() != size) {
+	if (input->GetFileSize() != size) {
 		throw IOException("file changed while freezing query input");
 	}
-	return {UTF8Path(destination), idx_t(size), sha};
+	output->Sync();
+	output->Close();
+	// Fingerprint checked size, inode, mtime and ctime around the copy. The
+	// query-owned frozen inode now has one verified content identity. Attempts
+	// validate that same inode/version instead of rehashing its entire contents.
+	auto path = UTF8Path(destination);
+	return {path, idx_t(size), sha, FileIdentity(context, OpenFileInfo(path))};
 }
 
 struct StoreGuard::Impl {

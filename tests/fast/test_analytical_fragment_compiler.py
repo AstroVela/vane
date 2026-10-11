@@ -405,4 +405,7 @@ def test_partial_aggregation_reduces_rows_before_exchange():
             }
             partial_rows.extend(native._execute_fragment_for_test(connection, source.native_plan, {}, assignments))
         assert len(partial_rows) == 9
-        assert sum(row[1] for row in partial_rows) == sum(range(90))
+        assert all(isinstance(row[1], bytes) for row in partial_rows)
+        assert Counter(execute_graph(connection, graph)) == Counter(
+            connection.execute("select range % 3 k, sum(range) from range(90) group by k").fetchall()
+        )
