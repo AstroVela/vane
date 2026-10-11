@@ -30,7 +30,11 @@ def main():
     parser.add_argument(
         "--writeback", action="store_true", help="Trace the isolated writeback comparison, including each hint"
     )
+    parser.add_argument(
+        "--background-writeback", action="store_true", help="Label queued background hints and their shutdown waits"
+    )
     args = parser.parse_args()
+    assert not args.background_writeback or args.writeback
     out, parent = args.output.resolve(), args.parent.resolve()
     out.mkdir()
     here = Path(__file__).resolve().parent
@@ -127,11 +131,20 @@ void Record(const char *name, long long begin) { timeline::Record(name, begin, 0
                     stage, signature, signature + '\n        payload_trace::Span trace("' + label + '");'
                 )
             if args.writeback and name == "updated":
+                label = "enqueue_payload_writeback" if args.background_writeback else "payload_writeback_hint"
                 stage = replace_once(
                     stage,
                     "void Writeback(int64_t offset, int64_t bytes) {",
-                    'void Writeback(int64_t offset, int64_t bytes) {\n        payload_trace::Span trace("payload_writeback_hint");',
+                    'void Writeback(int64_t offset, int64_t bytes) {\n        payload_trace::Span trace("'
+                    + label
+                    + '");',
                 )
+                if args.background_writeback:
+                    stage = replace_once(
+                        stage,
+                        "void StopWriteback() {",
+                        'void StopWriteback() {\n        payload_trace::Span trace("writeback_shutdown");',
+                    )
             stage = replace_once(
                 stage,
                 "void Save(bool pending) {",
