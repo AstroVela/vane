@@ -33,8 +33,10 @@ def main():
     parser.add_argument(
         "--background-writeback", action="store_true", help="Label queued background hints and their shutdown waits"
     )
+    parser.add_argument("--writeback-budget", action="store_true", help="Record the budgeted FULL-publication pause")
     args = parser.parse_args()
     assert not args.background_writeback or args.writeback
+    assert not args.writeback_budget or args.background_writeback
     out, parent = args.output.resolve(), args.parent.resolve()
     out.mkdir()
     here = Path(__file__).resolve().parent
@@ -144,6 +146,20 @@ void Record(const char *name, long long begin) { timeline::Record(name, begin, 0
                         stage,
                         "void StopWriteback() {",
                         'void StopWriteback() {\n        payload_trace::Span trace("writeback_shutdown");',
+                    )
+                if args.writeback_budget:
+                    stage = replace_once(
+                        stage,
+                        "++stage.writeback_pauses;",
+                        "++stage.writeback_pauses;\n                trace_begin = payload_trace::Now();",
+                    )
+                    stage = replace_once(
+                        stage,
+                        "--stage->writeback_pauses;",
+                        'payload_trace::Record("full_writeback_pause", trace_begin);\n                --stage->writeback_pauses;',
+                    )
+                    stage = replace_once(
+                        stage, "Staging *stage;", "Staging *stage;\n        long long trace_begin = 0;"
                     )
             stage = replace_once(
                 stage,

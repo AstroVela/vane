@@ -1,0 +1,3 @@
+/usr/bin/ld:/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/validate.py: file format not recognized; treating as linker script
+/usr/bin/ld:/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/validate.py:4: syntax error
+collect2: error: ld returned 1 exit status
