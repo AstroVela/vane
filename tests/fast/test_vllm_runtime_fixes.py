@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import pickle
 import sys
 import threading
 import time
@@ -16,6 +17,9 @@ from decimal import Decimal
 
 import pyarrow as pa
 import pytest
+
+from vane.ai import DiagnosticError, summarize_error
+from vane.ai.provider import _SafeProviderError
 
 
 def _packed_native_vllm_options(options):
@@ -434,6 +438,7 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
 
 
 def test_ray_actor_wait_raises_stored_executor_error():
+    from vane.ai.provider import _safe_provider_execution_error
     from vane.execution.vllm import RayLocalVLLMExecutor
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
@@ -442,7 +447,11 @@ def test_ray_actor_wait_raises_stored_executor_error():
     executor._per_executor_deques = {"executor": deque()}
     executor._per_executor_running_task_count = {"executor": 0}
     executor._per_executor_finished = set()
-    executor._per_executor_errors = {"executor": "sentinel request failure"}
+    executor._per_executor_errors = {
+        "executor": str(
+            _safe_provider_execution_error("vllm", "fixture", "generation", RuntimeError("private request"))
+        )
+    }
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
     executor._per_executor_wait_tokens_observed = {}
@@ -450,7 +459,7 @@ def test_ray_actor_wait_raises_stored_executor_error():
     executor._async_waiters = {}
     executor._notify_state_change = lambda **_kwargs: None
 
-    with pytest.raises(RuntimeError, match="vllm task failed: sentinel request failure"):
+    with pytest.raises(RuntimeError, match="vllm task failed; upstream error: RuntimeError"):
         asyncio.run(executor.wait_for_result("executor", "error-wait"))
 
     assert executor._per_executor_waiters == {}
@@ -1373,15 +1382,117 @@ def test_remote_executor_consumes_all_submit_acks_before_aborting(monkeypatch):
     executor.submit(None, ["first"], pa.table({"id": [1]}))
     executor.submit(None, ["second"], pa.table({"id": [2]}))
 
-    with pytest.raises(RuntimeError, match="first-submit-ack failed"):
+    with pytest.raises(DiagnosticError):
         executor.take_ready_result()
 
     assert events == ["first-submit-ack", "second-submit-ack", "abort"]
     assert actor.aborted == [executor._executor_id]
+    assert "first-submit-ack failed" in executor._error_message
     assert "second-submit-ack failed" in executor._error_message
     assert executor._submit_refs == {}
     assert executor._reservations == {}
     assert router.inflight == [0]
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+@pytest.mark.parametrize("during_submit", [False, True])
+def test_remote_executor_preserves_actor_diagnostics_and_cleanup(monkeypatch, engine, during_submit):
+    import vane.execution.vllm as vllm
+
+    class FailureRef(_Ref):
+        def resolve(self):
+            raise DiagnosticError("actor generation", _SafeProviderError(f"{engine} returned no outputs"))
+
+    class Actor(_FakeVLLMActor):
+        def __init__(self):
+            super().__init__()
+            if during_submit:
+                self.submit_async = _RemoteMethod(lambda *args: FailureRef(), raw_ref=True)
+            else:
+                self.wait_for_result = _RemoteMethod(lambda *args: FailureRef(), raw_ref=True)
+
+        def _abort(self, executor_id, wait_token):
+            super()._abort(executor_id, wait_token)
+            if len(self.aborted) == 1:
+                raise OSError(5, "private cleanup location")
+
+    actor = Actor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+    operations = [
+        executor.finished_submitting if during_submit else executor.take_ready_result,
+        executor.take_ready_result,
+        executor.wait_for_result,
+        executor.all_tasks_finished,
+        lambda: executor.submit(None, ["another"], pa.table({"id": [2]})),
+    ]
+    for operation in operations:
+        with pytest.raises(DiagnosticError) as caught:
+            operation()
+        for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+            summary = summarize_error(error)
+            assert f"{engine} returned no outputs" in summary
+            assert "errno=5" in summary
+            assert "private" not in summary
+    assert actor.aborted == [executor._executor_id]
+    assert executor._submit_refs == {} and executor._reservations == {}
+    assert router.inflight == [0]
+    executor.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["deadline", "no_pending_refs", "missing_results"])
+def test_remote_executor_framework_failures_keep_their_explanation(monkeypatch, failure):
+    import vane.execution.vllm as vllm
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    executor.submit(None, ["prompt"], pa.table({"id": [1]}))
+    executor.finished_submitting()
+    assert executor.take_ready_result() is None
+    if failure == "deadline":
+        monkeypatch.setattr(vllm, "configured_ray_get_timeout_s", lambda: 0)
+        expected = "vllm remote wait exceeded query deadline"
+    elif failure == "no_pending_refs":
+        # Inject a lost wait reference after normal submission. The lifecycle
+        # guard must explain this invariant failure rather than hide its cause.
+        executor._wait_refs_by_actor = [None]
+        monkeypatch.setattr(executor, "_ensure_remote_wait_refs", lambda: None)
+        expected = "vllm remote wait has no pending actor wait refs before completion"
+    else:
+        actor.wait_refs[0].set_result(False)
+        expected = "vllm actor finished without returning all submitted results: actor_idx=0 submitted=1 received=0"
+    try:
+        for operation in (executor.wait_for_result, executor.take_ready_result, executor.all_tasks_finished):
+            with pytest.raises(DiagnosticError) as caught:
+                operation()
+            for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+                assert expected in summarize_error(error)
+        assert actor.aborted == [executor._executor_id]
+        assert router.inflight == [0]
+    finally:
+        executor.shutdown()
 
 
 def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeypatch):
@@ -1425,7 +1536,7 @@ def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeyp
     assert router.inflight == [0]
     assert router._reservations == {}
     assert executor._released_outstanding_inflight is True
-    with pytest.raises(RuntimeError, match="no longer accepts submissions"):
+    with pytest.raises(DiagnosticError):
         executor.submit(None, ["another"], pa.table({"id": [2]}))
 
 
@@ -1537,8 +1648,11 @@ def test_remote_executor_reports_router_completion_when_actor_finish_ack_fails_o
     monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
     executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
 
-    with pytest.raises(RuntimeError, match="finish acknowledgement failed"):
+    with pytest.raises(DiagnosticError) as caught:
         executor.finished_submitting()
+
+    assert "RuntimeError" in summarize_error(caught.value)
+    assert "finish acknowledgement failed" not in str(caught.value)
 
     assert executor._router_completion_reported is True
     assert executor._executor_id not in router._active_executors
@@ -1587,6 +1701,7 @@ def test_remote_wait_marks_finished_after_releasing_result_condition():
 
     executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
     executor._error_message = None
+    executor._error = None
     executor._result_buffer = deque()
     executor._finished = False
     executor._finished_submitting_flag = True

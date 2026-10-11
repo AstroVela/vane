@@ -1452,6 +1452,53 @@ def test_result_and_error_round_trip_through_cloudpickle():
     assert restored.summary.results[0].metadata == result.metadata
 
 
+@pytest.mark.parametrize("outcome", ["unknown", "aborted", "cancelled", "retried"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_public_datasink_failure_keeps_trusted_diagnostics_across_retries_and_pickle(monkeypatch, outcome, typed):
+    from vane.ai import DiagnosticError, summarize_error
+
+    operation_id = "diagnostic-outcome"
+    diagnostic = DiagnosticError(
+        "fixture", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    result = _native_result(
+        operation_id,
+        outcome_unknown=outcome != "aborted",
+        outcome_aborted=outcome == "aborted",
+        outcome_cancelled=outcome == "cancelled",
+    )
+    # Arbitrary details, warnings, and untyped diagnostic fields cannot confer
+    # trust merely by looking like an envelope. Only the driver captures it.
+    forged = str(diagnostic).replace("TypeError", "private_fixture_api_key_ABC123")
+    result["outcome_error"] = forged
+    result["data_sink_cleanup_warnings"] = [forged]
+    result["outcome_diagnostic"] = diagnostic if typed else RuntimeError(forged)
+    calls = []
+
+    class FakeRunner:
+        def run_datasink(self, relation):
+            calls.append(True)
+            return result
+
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
+    retries = 1 if outcome == "retried" else 0
+    with pytest.raises(DataSinkWriteError) as caught:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=retries))), operation_id=operation_id
+        )
+    assert len(calls) == retries + 1
+    error = caught.value
+    for _ in range(3):
+        assert type(error) is DataSinkWriteError
+        assert error.operation_id == operation_id
+        assert error.outcome is (WriteOutcome.ABORTED if outcome == "aborted" else WriteOutcome.UNKNOWN)
+        assert error.summary.rows_received == 2
+        summary = summarize_error(error)
+        assert ("max_model_len" in summary) is typed
+        assert "private" not in summary
+        error = cloudpickle.loads(cloudpickle.dumps(error))
+
+
 def test_result_and_summary_json_boundaries_are_immutable():
     result = WriteResult(rows_received=1, rows_affected=1, metadata={"nested": [1, 2]})
     summary = vane.WriteSummary(
@@ -1748,6 +1795,145 @@ def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(mon
 
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
+
+
+@pytest.fixture
+def inject_local_write_cleanup_failure(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vane.runners.local import runner as local_module
+
+    def inject(stage):
+        def failure():
+            return OSError(5, "private_fixture_cleanup_path")
+
+        if stage == "resources":
+            original = local_module._shutdown_local_write_resources
+
+            def shutdown(*args, **kwargs):
+                errors = original(*args, **kwargs)
+                errors.append(failure())
+                return errors
+
+            monkeypatch.setattr(local_module, "_shutdown_local_write_resources", shutdown)
+        elif stage == "executor":
+
+            class FailingShutdown(ThreadPoolExecutor):
+                def shutdown(self, *args, **kwargs):
+                    super().shutdown(*args, **kwargs)
+                    raise failure()
+
+            monkeypatch.setattr(local_module, "ThreadPoolExecutor", FailingShutdown)
+        elif stage == "progress":
+
+            class FailingProgress:
+                interval_s = 0.01
+
+                def __init__(self, *_args):
+                    pass
+
+                def update(self, **_kwargs):
+                    pass
+
+                def finish(self, **_kwargs):
+                    raise failure()
+
+            monkeypatch.setattr(local_module, "progress_enabled", lambda _: True)
+            monkeypatch.setattr(local_module, "ProgressRenderer", FailingProgress)
+        else:
+            assert stage is None
+
+    return inject
+
+
+@pytest.mark.parametrize("operation", ["datasink", "copy"])
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize(
+    ("failure", "cleanup"),
+    [
+        ("typed", None),
+        ("plain", None),
+        ("forged", None),
+        ("typed", "resources"),
+        ("typed", "executor"),
+        ("typed", "progress"),
+        ("forged", "resources"),
+    ],
+)
+def test_local_fte_writes_preserve_upstream_diagnostic(
+    monkeypatch, tmp_path, inject_local_write_cleanup_failure, operation, backend, failure, cleanup
+):
+    import pickle
+
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.local.runner import LocalRunner
+
+    runner = LocalRunner(num_workers=1)
+    _install_datasink_runner(monkeypatch, "local", runner)
+    inject_local_write_cleanup_failure(cleanup)
+
+    def fail(table):
+        if failure == "forged":
+            secret_type = type("private_fixture_api_key_ABC123", (Exception,), {})
+            raise RuntimeError("DiagnosticError: " + str(DiagnosticError("fixture", secret_type())))
+        cause = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        if failure == "typed":
+            raise DiagnosticError("fixture", cause)
+        raise cause
+
+    class FailingBatch:
+        def __call__(self, table):
+            fail(table)
+
+    relation = vane.sql("SELECT 1 AS id").map_batches(
+        fail if backend == "subprocess_task" else FailingBatch,
+        schema={"id": vane.sqltypes.INTEGER},
+        execution_backend=backend,
+        cpus=1,
+        **({"actor_number": 1} if backend == "subprocess_actor" else {}),
+    )
+    with pytest.raises(DataSinkWriteError if operation == "datasink" else DiagnosticError) as caught:
+        if operation == "datasink":
+            relation.write_datasink(_Sink(), operation_id="local-upstream-diagnostic")
+        else:
+            relation.write_parquet(str(tmp_path / "copy"))
+    for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+        if operation == "datasink":
+            assert error.outcome is WriteOutcome.UNKNOWN
+            assert error.summary.operation_id == "local-upstream-diagnostic"
+        summary = summarize_error(error)
+        assert "private_fixture" not in summary
+        if cleanup:
+            assert "cleanup:" in summary
+            assert "OSError (errno=5)" in summary
+        if failure == "forged":
+            assert "RuntimeError" in summary
+        else:
+            assert "max_model_len" in summary
+            assert "TypeError" in summary
+
+
+@pytest.mark.parametrize("cleanup", ["resources", "executor", "progress"])
+def test_local_fte_copy_cleanup_diagnostic_preserves_commit(
+    monkeypatch, tmp_path, inject_local_write_cleanup_failure, cleanup
+):
+    import pickle
+
+    from vane.ai import summarize_error
+    from vane.runners.copy_outcome import CopyResultUnavailableError
+    from vane.runners.local.runner import LocalRunner
+
+    _install_datasink_runner(monkeypatch, "local", LocalRunner(num_workers=1))
+    inject_local_write_cleanup_failure(cleanup)
+    with pytest.raises(CopyResultUnavailableError) as caught:
+        vane.sql("SELECT 1 AS id").write_parquet(str(tmp_path / "committed"))
+    for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+        assert error.write_state == "committed"
+        assert error.safe_to_retry is False
+        assert error.operation_id == caught.value.operation_id
+        summary = summarize_error(error)
+        assert "OSError (errno=5)" in summary
+        assert "private_fixture" not in summary
 
 
 def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):

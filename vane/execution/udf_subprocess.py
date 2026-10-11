@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
+from vane.execution._subprocess_error import capture_cleanup, decode_error, native_result_error
 from vane.execution._udf_runtime import _bounded_close_error
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
@@ -519,8 +520,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 timeout_s=_subprocess_control_timeout_s(),
             )
             if msg_type == _MSG_ERROR:
-                self._mark_broken(payload_data.decode("utf-8", errors="replace"))
-                raise RuntimeError(self._broken_error)
+                message, diagnostic = decode_error(payload_data)
+                self._mark_reported_error(message, diagnostic=diagnostic, graceful_close=False)
+                raise diagnostic
             self._raise_if_startup_cancelled()
 
             # The worker has loaded the payload. The parent no longer needs this shm.
@@ -801,13 +803,16 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._broken_error = error
         self.close(kill=not graceful_close)
 
-    def _mark_reported_error(self, error: str) -> None:
+    def _mark_reported_error(
+        self, error: str, *, diagnostic: BaseException | None = None, graceful_close: bool = True
+    ) -> None:
         try:
-            self._mark_broken(error, graceful_close=True)
+            self._mark_broken(error, graceful_close=graceful_close)
         except BaseException as cleanup_error:
-            raise RuntimeError(
-                f"{error}; graceful broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
-            ) from cleanup_error
+            message = f"{error}; graceful broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
+            if diagnostic is not None:
+                raise capture_cleanup(message, diagnostic, cleanup_error) from None
+            raise RuntimeError(message) from cleanup_error
 
     def _mark_broken_after_cleanup_failure(self, error: BaseException) -> str:
         try:
@@ -997,9 +1002,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 )
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
-                error = payload.decode("utf-8", errors="replace")
-                self._mark_reported_error(error)
-                raise RuntimeError(error)
+                message, diagnostic = decode_error(payload)
+                self._mark_reported_error(message, diagnostic=diagnostic)
+                raise diagnostic
             if msg_type == _MSG_TASK_CANCELLED:
                 error = payload.decode("utf-8", errors="replace") or "UDF subprocess task cancelled"
                 scope = self._current_execution_scope()
@@ -1220,9 +1225,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._mark_broken(f"UDF subprocess finished_submitting failed: {exc}", actor_lost=True)
             raise RuntimeError(self._broken_error) from exc
         if msg_type == _MSG_ERROR:
-            error = payload.decode("utf-8", errors="replace")
-            self._mark_reported_error(error)
-            raise RuntimeError(error)
+            message, diagnostic = decode_error(payload)
+            self._mark_reported_error(message, diagnostic=diagnostic)
+            raise diagnostic
         self._finished_submitting = True
 
     def all_tasks_finished(self) -> bool:
@@ -1324,9 +1329,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     sock.settimeout(remaining)
                 msg_type, payload = _recv_message(sock)
                 if msg_type == _MSG_ERROR:
-                    graceful_error = RuntimeError(
-                        "UDF subprocess graceful shutdown failed: " + payload.decode("utf-8", errors="replace")
-                    )
+                    _, graceful_error = decode_error(payload, prefix="UDF subprocess graceful shutdown failed: ")
                 elif msg_type != _MSG_ACK:
                     graceful_error = RuntimeError(
                         f"UDF subprocess graceful shutdown returned unexpected message type {msg_type:#x}"
@@ -3175,7 +3178,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         except BaseException as exc:
             _release_local_ref_bundle_result(result)
             result = None
-            item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
+            diagnostic = native_result_error(exc)
+            item = (SUBMIT_RESULT_MARKER, int(submit_id), diagnostic) if submit_id is not None else diagnostic
         finally:
             with self._task_futures_lock:
                 debug_meta = self._task_future_meta.get(future)

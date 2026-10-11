@@ -1204,6 +1204,7 @@ def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
 def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
     from concurrent.futures import Future
 
+    from vane.ai import DiagnosticError, summarize_error
     from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -1243,12 +1244,16 @@ def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
         pool,
         manager,
     )
-    pending_future.set_exception(RuntimeError("warmup failed"))
+    pending_future.set_exception(
+        DiagnosticError(
+            "warmup failed", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        )
+    )
 
     assert isinstance(pool._vane_init_errors[1], RuntimeError)
-    assert failures == [runner._query_terminal_errors["q1"]]
+    assert failures == [str(runner._query_terminal_errors["q1"])]
     assert "resource:q1:actor/actor-1" in failures[0]
-    assert "warmup failed" in failures[0]
+    assert "max_model_len" in summarize_error(runner._query_terminal_errors["q1"])
 
 
 def test_retired_pool_ignores_late_actor_init_failure():
@@ -3111,8 +3116,21 @@ def test_pending_actor_deadline_fails_query_and_kills_pool(monkeypatch):
     assert runner._active_udf_actors == []
     init.set_result("late-node")
     assert not pool._confirmed_ready
-    with pytest.raises(RuntimeError, match="initialization timed out"):
+    with pytest.raises(TimeoutError, match="initialization timed out") as caught:
         _activate_pending_pool(runner)
+    assert caught.value is runner._query_terminal_errors["q1"]
+
+
+def test_pending_actor_failure_preserves_diagnostic_on_later_activation(monkeypatch):
+    from vane.ai import DiagnosticError, summarize_error
+
+    runner, _, _, init = _pending_pool_driver(monkeypatch)
+    _activate_pending_pool(runner)
+    init.set_exception(TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"))
+    with pytest.raises(DiagnosticError) as caught:
+        _activate_pending_pool(runner)
+    assert caught.value is runner._query_terminal_errors["q1"]
+    assert "max_model_len" in summarize_error(caught.value)
 
 
 def test_first_ready_actor_disarms_initialization_deadline(monkeypatch):
@@ -3467,3 +3485,56 @@ def test_timeout_scan_rechecks_pool_state_after_snapshot(monkeypatch, new_state)
     assert not manager.failures
     assert pool.actors == ["actor-0"]
     assert runner._udf_actor_timeout_cleanup_pending == set()
+
+
+@pytest.mark.parametrize("second_ready", [False, True])
+@pytest.mark.parametrize("kill_fails", [False, True])
+def test_first_initializer_failure_is_terminal_even_with_pending_or_ready_actors(monkeypatch, second_ready, kill_fails):
+    from concurrent.futures import Future
+
+    import vane.execution.udf_ray as udf_ray
+
+    class Ref:
+        def __init__(self, error=None):
+            self.value = Future()
+            if error is not None:
+                self.value.set_exception(error)
+            else:
+                self.value.set_result("node-ready")
+
+        def future(self):
+            return self.value
+
+    failure = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    refs = [Ref(failure), Ref()]
+    waits, killed = [], []
+
+    def wait(pending, *, num_returns, timeout):
+        waits.append(timeout)
+        if len(waits) == 1:
+            return [refs[0]], [refs[1]]
+        assert len(waits) == 2 and timeout == 0, "must not wait for an actor blocked behind a failed initializer"
+        return ([refs[1]], []) if second_ready else ([], [refs[1]])
+
+    def kill(actor, no_restart=True):
+        killed.append(actor)
+        if kill_fails:
+            raise OSError(5, "cleanup failed")
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(wait=wait, kill=kill))
+    for name in ("VANE_RAY_ACTOR_INIT_TIMEOUT_S", "VANE_RAY_OBJECT_GET_TIMEOUT_S", "VANE_QUERY_DEADLINE_EPOCH_S"):
+        monkeypatch.delenv(name, raising=False)
+    pool = SimpleNamespace(
+        actors=["first", "pending"], actor_node_ids=["", ""], _init_refs=refs, _confirmed_ready=set(), _owns_actors=True
+    )
+    with pytest.raises(RuntimeError) as caught:
+        udf_ray.wait_for_first_actor_pool_ready(pool)
+    assert "max_model_len" in str(caught.value)
+    assert killed == ["first", "pending"]
+    if kill_fails:
+        assert caught.value.creation_error.__cause__ is failure
+        assert caught.value.cleanup_errors
+        assert pool.actors == ["first", "pending"]
+    else:
+        assert caught.value.__cause__ is failure
+        assert pool.actors == []

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from vane import pickle as vane_pickle
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution._subprocess_error import error_payload
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
     _open_existing_shm,
@@ -635,7 +636,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     _send_message(
                         sock,
                         _MSG_ERROR,
-                        _format_exception(cleanup_error).encode("utf-8", errors="replace"),
+                        error_payload(cleanup_error, _format_exception(cleanup_error)),
                     )
                     # The parent may decide to force termination after this
                     # bounded attempt. Retain the executor until then so its
@@ -648,7 +649,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         executor.finished_submitting()
                     _send_message(sock, _MSG_ACK)
                 except Exception as exc:
-                    _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                    _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
                 continue
             if msg_type not in (_MSG_SUBMIT, _MSG_SUBMIT_REF_BUNDLE):
                 raise ValueError(f"unknown UDF subprocess message type: {msg_type:#x}")
@@ -727,10 +728,10 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             except _TaskCancelledError as exc:
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
-                _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
     except Exception as exc:
         try:
-            _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+            _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
         except Exception:
             pass
     finally:
