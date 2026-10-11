@@ -397,5 +397,12 @@ Ray/native transport, capturing cause/cleanup chains before detaching upstream
 exceptions. Flattened diagnostics keep each exception's own status, including
 HTTP status stored on an SDK response. A resolved actor initializer failure now fails its pool and
 releases owned actors immediately, even if other actors are pending for resources.
+Worker integrations should raise `vane.ai.DiagnosticError(operation, error)`
+outside the original exception handler. It captures a sanitized summary and
+retains its type through pickle and structured Ray error metadata. Raw SDK
+messages are never interpreted as diagnostic envelopes, even if they contain
+`upstream error:` or forged diagnostic headers. Native decoding is restricted to
+typed query/transport errors and their complete UDF envelopes; descriptions and
+model identifiers cannot replace the encoded summary.
 Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and the
 isolated single-CPU Ray diagnostic regression.

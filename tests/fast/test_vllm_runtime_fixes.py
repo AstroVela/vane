@@ -434,6 +434,7 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
 
 
 def test_ray_actor_wait_raises_stored_executor_error():
+    from vane.ai.provider import _safe_provider_execution_error
     from vane.execution.vllm import RayLocalVLLMExecutor
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
@@ -442,7 +443,11 @@ def test_ray_actor_wait_raises_stored_executor_error():
     executor._per_executor_deques = {"executor": deque()}
     executor._per_executor_running_task_count = {"executor": 0}
     executor._per_executor_finished = set()
-    executor._per_executor_errors = {"executor": "sentinel request failure"}
+    executor._per_executor_errors = {
+        "executor": str(
+            _safe_provider_execution_error("vllm", "fixture", "generation", RuntimeError("private request"))
+        )
+    }
     executor._per_executor_aborted = set()
     executor._per_executor_waiters = {}
     executor._per_executor_wait_tokens_observed = {}
@@ -450,7 +455,7 @@ def test_ray_actor_wait_raises_stored_executor_error():
     executor._async_waiters = {}
     executor._notify_state_change = lambda **_kwargs: None
 
-    with pytest.raises(RuntimeError, match="vllm task failed: sentinel request failure"):
+    with pytest.raises(RuntimeError, match="vllm task failed; upstream error: RuntimeError"):
         asyncio.run(executor.wait_for_result("executor", "error-wait"))
 
     assert executor._per_executor_waiters == {}

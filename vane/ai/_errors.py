@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
+import sys
 from typing import Any
 
 _ENGINE_OPTIONS = frozenset(
@@ -44,10 +48,54 @@ _MEMORY = re.compile(
 _SAFE_MEMORY = re.compile(
     rf"insufficient GPU KV-cache memory; mem_fraction_static=({_FRACTION}), required above ({_FRACTION})(?![0-9.])"
 )
-_PROVIDER_SUMMARY = re.compile(r"upstream error: ([^\n]{1,4096})")
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
+_DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
+
+
+class DiagnosticError(RuntimeError):
+    """An explicitly sanitized exception, safe to carry across query workers.
+
+    ``operation`` is an application-owned description, never upstream text.
+    Only the bounded summary of ``error`` is retained, not the original object.
+    """
+
+    def __init__(self, operation: str, error: BaseException):
+        self.summary = summarize_error(error)
+        super().__init__(_diagnostic_message(self.summary, f"{operation}; upstream error: {self.summary}"))
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return _restore_diagnostic_error, (self.args[0], self.summary)
+
+
+def _restore_diagnostic_error(message: str, summary: str) -> DiagnosticError:
+    error = DiagnosticError.__new__(DiagnosticError)
+    RuntimeError.__init__(error, message)
+    error.summary = summary
+    return error
+
+
+def _diagnostic_message(summary: str, message: str) -> str:
+    # Put the structured summary before any application-owned description.
+    # Model identifiers may themselves contain newlines or diagnostic markers.
+    encoded = base64.urlsafe_b64encode(summary.encode()).decode("ascii")
+    return f"{_DIAGNOSTIC_HEADER}{encoded}] {message}"
+
+
+def _encoded_summary(message: str) -> str | None:
+    if not message.startswith(_DIAGNOSTIC_HEADER):
+        return None
+    encoded, separator, _ = message[len(_DIAGNOSTIC_HEADER) :].partition("] ")
+    if not separator or not 0 < len(encoded) <= 8192:
+        return None
+    try:
+        summary = base64.b64decode(encoded, altchars=b"-_", validate=True).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeError):
+        return None
+    if len(summary) > 4096:
+        return None
+    return _transported_summary(summary)
 
 
 def _arguments(error: BaseException) -> tuple[Any, ...]:
@@ -182,17 +230,67 @@ def _transported_summary(message: str) -> str:
     return "".join(parts) or "ProviderError"
 
 
-def _summary(error: BaseException) -> str:
+def _is_exception(error: BaseException, module_name: str, *names: str) -> bool:
+    # Inspect already loaded transport modules, without importing Ray/native
+    # code or treating a user-supplied class name as proof of provenance.
+    namespace = _attributes(sys.modules.get(module_name))
+    return any(isinstance(cls := namespace.get(name), type) and isinstance(error, cls) for name in names)
+
+
+def _native_summary(message: str) -> str | None:
+    """Decode only complete native UDF envelopes, never search arbitrary text."""
+    prefix = "FTE query wait failed: FTE query failed: Execution failed: "
+    if message.startswith(prefix):
+        try:
+            payload = json.loads(message[len(prefix) :])
+        except (ValueError, RecursionError):
+            return None
+        if type(payload) is not dict or payload.get("exception_type") != "Invalid Input":
+            return None
+        nested_message = payload.get("exception_message")
+        if type(nested_message) is not str:
+            return None
+        message = nested_message
+    message = message.removeprefix("Attempting to execute an unsuccessful or closed pending query result\nError: ")
+    message = message.removeprefix("Invalid Input Error: ")
+    if message.startswith("streaming UDF async error: "):
+        message = message.removeprefix("streaming UDF async error: ")
+    elif message.startswith("Python exception occurred while executing the UDF: "):
+        message = message.removeprefix("Python exception occurred while executing the UDF: ")
+    else:
+        return None
+    # These headers are produced from actual exception types by the transport.
+    # A ClientError/RuntimeError body that contains such a header is not one.
+    for name in ("DiagnosticError", "ProviderCapabilityError"):
+        if message.startswith(name + ": "):
+            return _encoded_summary(message[len(name) + 2 :])
+    return None
+
+
+def _summary(error: BaseException, *, ray_transport: bool = False) -> str:
+    attributes = _attributes(error)
+    if isinstance(error, DiagnosticError) and type(summary := attributes.get("summary")) is str:
+        return _transported_summary(summary)
+    from vane.ai.provider import ProviderCapabilityError, _SafeProviderError
+
+    if isinstance(error, ProviderCapabilityError) and type(summary := attributes.get("original_error_summary")) is str:
+        return _transported_summary(summary)
+    if isinstance(error, _SafeProviderError):
+        # Internal typed wrappers contain already sanitized text. Raw SDK
+        # errors never enter this branch, regardless of their message contents.
+        message = _message(error)
+        position = message.find(_DIAGNOSTIC_HEADER)
+        encoded = _encoded_summary(message[position:]) if position >= 0 else None
+        return encoded if encoded is not None else _transported_summary(message)
     name = _type_name(error)
     message = _message(error)
+    if _is_exception(error, "vane._native", "Error") or (ray_transport and type(error) is RuntimeError):
+        transported = _native_summary(message)
+        if transported is not None:
+            return transported
     detail = technical_detail(name, message)
     if detail:
         return f"{name}: {detail}"
-    # Native query transport may flatten Python errors. Only reconstruct the
-    # provider's safe grammar; surrounding SQL, prompts and paths are discarded.
-    match = _PROVIDER_SUMMARY.search(message)
-    if match:
-        return _transported_summary(match[1])
     details = _numeric_details(error)
     return f"{name} ({', '.join(details)})" if details else name
 
@@ -212,11 +310,13 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
     current = error
     summaries: list[str] = []
     cleanup: list[str] = []
+    ray_transport = False
     for _ in range(16):
         if id(current) in seen:
             break
         seen.add(id(current))
-        summary = _summary(current)
+        ray_transport = ray_transport or _is_exception(current, "ray.exceptions", "RayTaskError", "ActorDiedError")
+        summary = _summary(current, ray_transport=ray_transport)
         if summary not in summaries:
             summaries.append(summary)
         attrs = _attributes(current)

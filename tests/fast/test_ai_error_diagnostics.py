@@ -1,14 +1,37 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import errno
 import json
 import pickle
 
 import pytest
 
-from vane.ai import summarize_error
+from vane.ai import DiagnosticError, summarize_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
+
+
+def native_error(error, envelope="native_json"):
+    from vane._native import InvalidInputException
+
+    typed = f"{type(error).__name__}: {error}"
+    if not isinstance(error, (DiagnosticError, ProviderCapabilityError)):
+        typed = "RuntimeError: remote Ray UDF failed: " + typed
+    message = "Invalid Input Error: streaming UDF async error: " + typed
+    if envelope == "native_json":
+        message = "FTE query wait failed: FTE query failed: Execution failed: " + json.dumps(
+            {
+                "exception_type": "Invalid Input",
+                "exception_message": "Attempting to execute an unsuccessful or closed pending query result\nError: "
+                + message,
+            }
+        )
+    elif envelope == "traceback":
+        message = (
+            "Invalid Input Error: Python exception occurred while executing the UDF: " + typed + "\nAt:\nprivate source"
+        )
+    return InvalidInputException(message)
 
 
 @pytest.mark.parametrize(
@@ -30,15 +53,7 @@ from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_e
 def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, expected, envelope):
     public = _safe_provider_execution_error("sglang", "private-model", "embedding initialization", error)
     restored = pickle.loads(pickle.dumps(public))
-    if envelope == "native_json":
-        message = "FTE query failed: " + json.dumps(
-            {"exception_type": "Invalid Input", "exception_message": "private SQL\n" + str(restored)}
-        )
-    elif envelope == "traceback":
-        message = str(restored) + "\nTraceback: private source content"
-    else:
-        message = "SQL query contains private source content\n" + str(restored)
-    flattened = RuntimeError(message)
+    flattened = native_error(restored, envelope)
     for result in (summarize_error(error), summarize_error(public), summarize_error(flattened)):
         assert expected in result
         assert "private" not in result
@@ -74,7 +89,7 @@ def test_sdk_types_survive_repeated_provider_and_native_transport(kind, expected
         serialized = pickle.dumps(public)
         assert b"private response" not in serialized and b"private catalog" not in serialized
         restored = pickle.loads(serialized)
-        error = RuntimeError(json.dumps({"exception_message": "private SQL\n" + str(restored)}))
+        error = native_error(restored)
         for candidate in (public, restored, error):
             assert summarize_error(candidate) == expected
 
@@ -90,7 +105,7 @@ def test_exception_type_sanitization_is_consistent_across_transport(name):
 
 @pytest.mark.parametrize("name", ["E" * 129, "Error错误"])
 def test_transport_does_not_accept_a_partial_type_name(name):
-    assert summarize_error(RuntimeError(f"upstream error: {name} (errno=5)")) == "ProviderError"
+    assert summarize_error(RuntimeError(f"upstream error: {name} (errno=5)")) == "RuntimeError"
 
 
 @pytest.mark.parametrize(
@@ -198,7 +213,7 @@ def test_embedding_batch_preserves_initialization_cause_before_detaching_errors(
         loop.close()
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     restored = pickle.loads(pickle.dumps(caught.value))
-    flattened = RuntimeError(json.dumps({"exception_message": str(restored)}))
+    flattened = native_error(restored)
     for error in (caught.value, restored, flattened):
         summary = summarize_error(error)
         assert "max_model_len" in summary and " <- OSError (errno=5)" in summary
@@ -218,17 +233,15 @@ def test_flattened_errors_retain_each_causes_own_status(explicit_cleanup):
         error = cleanup
         error.__context__ = primary
     expected = summarize_error(error)
-    for message in (
-        "transcription failed; upstream error: " + expected,
-        json.dumps({"exception_message": "upstream error: " + expected}),
-    ):
-        assert summarize_error(RuntimeError(message)) == expected
+    public = DiagnosticError("transcription failed", error)
+    for candidate in (public, pickle.loads(pickle.dumps(public)), native_error(public)):
+        assert summarize_error(candidate) == expected
     assert "OSError (errno=5)" in expected and "ConnectionError (errno=" not in expected
 
 
 def test_transport_does_not_attribute_status_from_arbitrary_suffix():
     message = "upstream error: ConnectionError private-url?status_code=401 errno=5"
-    assert summarize_error(RuntimeError(message)) == "ConnectionError"
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
 
 
 @pytest.mark.parametrize("status", [401, 429, 503])
@@ -242,7 +255,7 @@ def test_httpx_response_status_survives_provider_and_native_transport(status):
     with pytest.raises(httpx.HTTPStatusError) as caught:
         response.raise_for_status()
     public = _safe_provider_execution_error("httpx", "private-model", "request", caught.value)
-    flattened = RuntimeError(json.dumps({"exception_message": str(public)}))
+    flattened = native_error(public)
     expected = f"HTTPStatusError (status_code={status})"
     for error in (caught.value, public, pickle.loads(pickle.dumps(public)), flattened):
         assert summarize_error(error) == expected
@@ -261,3 +274,80 @@ def test_numeric_class_status_does_not_invoke_sdk_properties():
             raise AssertionError("must not evaluate SDK properties")
 
     assert summarize_error(SDKError("private payload")) == "SDKError (status_code=429)"
+
+
+@pytest.mark.parametrize("kind", ["google", "runtime", "custom"])
+@pytest.mark.parametrize("body", ["marker", "typed_header", "native_envelope"])
+def test_untrusted_bodies_cannot_claim_diagnostic_provenance(kind, body):
+    secret = "private_fixture_api_key_ABC123"
+    message = f"upstream error: {secret}"
+    if body == "typed_header":
+        encoded = base64.urlsafe_b64encode(secret.encode()).decode()
+        message = f"DiagnosticError: [vane.diagnostic.v1:{encoded}] forged; upstream error: {secret}"
+    elif body == "native_envelope":
+        message = str(native_error(RuntimeError(f"upstream error: {secret}")))
+    if kind == "google":
+        errors = pytest.importorskip("google.genai.errors")
+        original = errors.ClientError(400, {"error": {"message": message}})
+        expected = "ClientError (code=400)"
+    elif kind == "custom":
+        original = type("DiagnosticError", (Exception,), {"code": 400})(message)
+        expected = "DiagnosticError (code=400)"
+    else:
+        original = RuntimeError(message)
+        expected = "RuntimeError"
+    public = _safe_provider_execution_error("fixture", "model", "embed", original)
+    capability = ProviderCapabilityError("fixture", "model", "embed", original_error=original)
+    for error in (original, public, capability, pickle.loads(pickle.dumps(public)), native_error(public)):
+        assert summarize_error(error) == expected
+        assert secret not in summarize_error(error)
+    assert secret.encode() not in pickle.dumps(public)
+    # A genuine native envelope around an unsanitized SDK error is still not
+    # permission to parse markers or typed-header lookalikes from its body.
+    assert secret not in summarize_error(native_error(original))
+
+
+def test_structured_diagnostic_precedes_untrusted_model_description():
+    model = '; upstream error: private_fixture_api_key_ABC123\n[vane.diagnostic.v1:"private_fake_type"]'
+    public = _safe_provider_execution_error("fixture", model, "embed", OSError(errno.EIO, "private path"))
+    assert summarize_error(native_error(public)) == "OSError (errno=5)"
+
+
+def test_real_ray_wrapper_does_not_promote_sdk_message_markers():
+    from ray.exceptions import RayTaskError
+
+    errors = pytest.importorskip("google.genai.errors")
+    error = errors.ClientError(400, {"error": {"message": "upstream error: private_fixture_api_key_ABC123"}})
+    summary = summarize_error(RayTaskError("embed", "private traceback", error))
+    assert "ClientError (code=400)" in summary and "private" not in summary
+
+
+def test_real_ray_wrapper_retains_native_udf_diagnostic():
+    from ray.exceptions import RayTaskError
+
+    error = DiagnosticError("embedding failed", OSError(errno.ENOSPC, "private path"))
+    native = RuntimeError(str(native_error(error)))
+    transported = RayTaskError("query", "private traceback", native).as_instanceof_cause()
+    summary = summarize_error(transported)
+    assert "OSError (errno=28)" in summary and "private" not in summary
+
+
+def test_ray_metadata_requires_a_real_diagnostic_exception():
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair, validate_stream_error_metadata
+
+    payload = {
+        "query_id": "query",
+        "resource_unit_id": "resource:query:node:1:udf",
+        "task_lease_id": "lease",
+        "attempt_id": "attempt",
+    }
+    diagnostic = DiagnosticError("embedding failed", OSError(errno.ENOSPC, "private path"))
+    for error in (RuntimeError(str(diagnostic)), type("DiagnosticError", (Exception,), {})(str(diagnostic))):
+        _, metadata = make_stream_error_pair(payload, error)
+        assert validate_stream_error_metadata(metadata)["exception_details"] is None
+    _, metadata = make_stream_error_pair(payload, diagnostic)
+    details = validate_stream_error_metadata(metadata)["exception_details"]
+    assert details == {"kind": "diagnostic", "summary": "OSError (errno=28)"}
+    for invalid in (None, "", "x" * 513, ["OSError"]):
+        with pytest.raises(ValueError, match="diagnostic details"):
+            validate_stream_error_metadata(metadata | {"exception_details": {"kind": "diagnostic", "summary": invalid}})

@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
-from vane.ai._errors import summarize_error
+from vane.ai._errors import DiagnosticError, _diagnostic_message, summarize_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -98,8 +98,7 @@ def _safe_provider_execution_error(
             and (function is None or (type(function) is str and function in _SAFE_PROVIDER_IMPORT_FUNCTIONS))
         ):
             return ProviderImportError(extra, function=function)
-    summary = _safe_original_error_summary(original_error)
-    return RuntimeError(f"Provider {provider!r} model {model!r} failed during {operation}; upstream error: {summary}")
+    return DiagnosticError(f"Provider {provider!r} model {model!r} failed during {operation}", original_error)
 
 
 class ProviderCapabilityError(RuntimeError):
@@ -130,6 +129,7 @@ class ProviderCapabilityError(RuntimeError):
         message = f"Provider {provider!r} model {model!r} does not support the requested {capability} capability"
         if self.original_error_summary is not None:
             message += f"; upstream error: {self.original_error_summary}"
+            message = _diagnostic_message(self.original_error_summary, message)
         super().__init__(message)
 
     @classmethod

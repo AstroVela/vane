@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vane.ai._audio_embedding import AudioClip, AudioInputSpec
-    from vane.ai._errors import summarize_error
+    from vane.ai._errors import DiagnosticError, summarize_error
     from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
@@ -44,6 +44,7 @@ __all__ = [
     "EmbedAudioOptions",
     "embed_audio",
     "Descriptor",
+    "DiagnosticError",
     "EmbedImageOptions",
     "EmbedOptions",
     "EmbedVideoOptions",
@@ -68,6 +69,7 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "DiagnosticError": ("vane.ai._errors", "DiagnosticError"),
     "summarize_error": ("vane.ai._errors", "summarize_error"),
     "AudioClip": ("vane.ai._audio_embedding", "AudioClip"),
     "AudioInputSpec": ("vane.ai._audio_embedding", "AudioInputSpec"),
