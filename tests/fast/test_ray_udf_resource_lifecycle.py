@@ -23,12 +23,13 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
         import sys
         import time
         from concurrent.futures import ThreadPoolExecutor
+        from contextlib import ExitStack
         from pathlib import Path
 
         import ray
         import vane
         from ray_test_profile import ray_test_object_store_options
-        from vane.runners.ray.driver import RayQueryDriverClient
+        from vane.runners.ray.driver import RayQueryDriverClient, shutdown_background_event_loop
 
         root = Path(sys.argv[1])
         scenario = sys.argv[2]
@@ -63,6 +64,17 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
                 return result.fetchall()
 
         peer = RayQueryDriverClient()
+
+        def close_query_runner():
+            # Connections close sessions, but the process-wide runner still
+            # owns a client heartbeat. Join it before shutting down Ray so it
+            # cannot auto-initialize a second cluster during cleanup.
+            vane.teardown_runner()
+            snapshot = ray.get(peer.runner.runtime_lifecycle_snapshot.remote(peer._owner_id))
+            assert snapshot["client_count"] == 1, snapshot
+            assert snapshot["session_count"] == 0, snapshot
+            assert snapshot["plan_count"] == 0, snapshot
+
         crashed_client = None
         blocker = None
         try:
@@ -123,15 +135,21 @@ def test_ray_udf_resource_lifecycle(scenario, tmp_path):
                 assert snapshot["session_count"] == 0, snapshot
                 assert snapshot["plan_count"] == 0, snapshot
                 assert query() == [(42,)]
-            print("lifecycle scenario passed:", scenario, flush=True)
         finally:
             (root / "release").touch()
-            if crashed_client is not None:
-                ray.kill(crashed_client, no_restart=True)
-            if blocker is not None:
-                ray.kill(blocker, no_restart=True)
-            peer.close()
-            ray.shutdown()
+            with ExitStack() as cleanup:
+                # LIFO: close the query runner and observer, then join result
+                # watchers before destroying the Ray core worker. Run every
+                # cleanup even when an earlier one fails; propagate the error.
+                cleanup.callback(ray.shutdown)
+                cleanup.callback(shutdown_background_event_loop)
+                cleanup.callback(peer.close)
+                cleanup.callback(close_query_runner)
+                if crashed_client is not None:
+                    ray.kill(crashed_client, no_restart=True)
+                if blocker is not None:
+                    ray.kill(blocker, no_restart=True)
+        print("lifecycle scenario passed:", scenario, flush=True)
         """
     )
     result = subprocess.run(
