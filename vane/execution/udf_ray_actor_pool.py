@@ -103,10 +103,12 @@ class _OwnedUDFActorPoolsError(RuntimeError):
         *,
         owned_actor_pools: list[Any],
         creation_error: BaseException,
+        cleanup_errors: tuple[BaseException, ...] = (),
     ) -> None:
         super().__init__(_bounded_actor_cleanup_text(message))
         self.owned_actor_pools = list(owned_actor_pools)
         self.creation_error = creation_error
+        self.cleanup_errors = cleanup_errors
 
 
 def _actor_pool_terminated(pool: Any) -> bool:
@@ -507,14 +509,19 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
                 actors_obj.actor_node_ids[actor_index] = node_id
                 actors_obj._confirmed_ready.add(actor_index)
                 ready_nodes[actor_index] = node_id
+            if first_failure is not None:
+                # A failed initializer can still hold the resources needed by
+                # the remaining actors. Waiting for them can never finish on
+                # a full cluster. A resolved failure is terminal for this pool,
+                # including when another actor became ready at the same time.
+                count = f"all {failure_count}" if failure_count == len(refs) else str(failure_count)
+                raise RuntimeError(
+                    _bounded_actor_cleanup_text(
+                        f"{count} UDF actors failed during initialization: " + "; ".join(failure_details)
+                    )
+                ) from first_failure
             if ready_nodes:
                 return ready_nodes
-        if first_failure is not None:
-            raise RuntimeError(
-                _bounded_actor_cleanup_text(
-                    f"all {failure_count} UDF actors failed during initialization: " + "; ".join(failure_details)
-                )
-            ) from first_failure
         raise RuntimeError("all UDF actors finished initialization without becoming ready")
     except BaseException as readiness_error:
         try:
@@ -528,6 +535,7 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
                 ),
                 owned_actor_pools=[actors_obj],
                 creation_error=readiness_error,
+                cleanup_errors=(cleanup_error,),
             ) from readiness_error
         raise
 

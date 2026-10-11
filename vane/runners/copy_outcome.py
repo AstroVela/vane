@@ -7,7 +7,36 @@ from collections.abc import Mapping
 from typing import Any
 
 
-class CopyResultUnavailableError(RuntimeError):
+class _CopyError(RuntimeError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.primary_error: BaseException | None = None
+        self.cleanup_errors: tuple[BaseException, ...] = ()
+
+    def capture_diagnostics(
+        self,
+        *,
+        primary_error: BaseException | None = None,
+        cleanup_errors: tuple[BaseException, ...] = (),
+    ) -> None:
+        """Retain sanitized snapshots without changing the COPY outcome type."""
+        from vane.ai._errors import DiagnosticError
+
+        if primary_error is not None and primary_error is not self:
+            self.primary_error = DiagnosticError("COPY execution", primary_error)
+        remaining = 3 - len(self.cleanup_errors)
+        self.cleanup_errors += tuple(
+            DiagnosticError("COPY cleanup", error) for error in cleanup_errors[:remaining] if error is not self
+        )
+
+    def _diagnostic_state(self) -> dict[str, Any]:
+        # Warnings and __notes__ are arbitrary text, not a trusted diagnostic
+        # transport. Only these explicitly captured cause/cleanup snapshots are
+        # consumed by summarize_error after Ray/pickle drops __cause__.
+        return {"primary_error": self.primary_error, "cleanup_errors": self.cleanup_errors}
+
+
+class CopyResultUnavailableError(_CopyError):
     """A COPY committed, but the runner could not return its result."""
 
     def __init__(
@@ -46,15 +75,16 @@ class CopyResultUnavailableError(RuntimeError):
     ) -> tuple[
         type[CopyResultUnavailableError],
         tuple[str, str, tuple[str, ...]],
+        dict[str, Any],
     ]:
-        return CopyResultUnavailableError, (
-            self.operation_id,
-            self.detail,
-            self.cleanup_warnings,
+        return (
+            CopyResultUnavailableError,
+            (self.operation_id, self.detail, self.cleanup_warnings),
+            self._diagnostic_state(),
         )
 
 
-class CopyOutcomeUnknownError(RuntimeError):
+class CopyOutcomeUnknownError(_CopyError):
     """The runner cannot prove whether a COPY operation committed."""
 
     def __init__(
@@ -128,13 +158,18 @@ class CopyOutcomeUnknownError(RuntimeError):
     ) -> tuple[
         type[CopyOutcomeUnknownError],
         tuple[str, str, str, str, str, str, tuple[str, ...]],
+        dict[str, Any],
     ]:
-        return CopyOutcomeUnknownError, (
-            self.operation_id,
-            self.base_path,
-            self.run_id,
-            self.manifest_path,
-            self.committed_marker_path,
-            self.detail,
-            self.cleanup_warnings,
+        return (
+            CopyOutcomeUnknownError,
+            (
+                self.operation_id,
+                self.base_path,
+                self.run_id,
+                self.manifest_path,
+                self.committed_marker_path,
+                self.detail,
+                self.cleanup_warnings,
+            ),
+            self._diagnostic_state(),
         )
