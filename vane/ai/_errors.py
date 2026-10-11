@@ -54,6 +54,8 @@ _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
 _DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
 _SAFE_PROVIDER_DETAILS = {
+    "distributed Ray UDF payload requires query_id": "RuntimeError",
+    "distributed Ray UDF payload requires pre-registered resource_unit_id": "RuntimeError",
     **{
         f"{provider} {detail}": "RuntimeError"
         for provider in ("vllm", "sglang")
@@ -269,14 +271,15 @@ def _native_invalid_input_message(message: str) -> str | None:
 
 
 def _native_summary(message: str) -> str | None:
-    """Decode only complete native UDF envelopes, never search arbitrary text."""
+    """Decode complete native UDF/LLM envelopes, never search arbitrary text."""
     message = message.removeprefix("DuckDBError::ExternalError: ")
-    prefix = "FTE query wait failed: FTE query failed: Execution failed: "
-    if message.startswith(prefix):
-        nested = _native_invalid_input_message(message[len(prefix) :])
-        if nested is None:
-            return None
-        message = nested
+    for prefix in ("FTE query wait failed: FTE query failed: Execution failed: ", "Execution failed: "):
+        if message.startswith(prefix):
+            nested = _native_invalid_input_message(message[len(prefix) :].partition("\n--- DIAGNOSTIC DUMP ---\n")[0])
+            if nested is None:
+                return None
+            message = nested
+            break
     message = message.removeprefix("Attempting to execute an unsuccessful or closed pending query result\nError: ")
     message = message.removeprefix("Invalid Input Error: ")
     if message.startswith(("udf async error: ", "streaming UDF async error: ")):
@@ -290,6 +293,19 @@ def _native_summary(message: str) -> str | None:
             message = nested.removeprefix("Failed to build udf executor: ")
     elif message.startswith("Python exception occurred while executing the UDF: "):
         message = message.removeprefix("Python exception occurred while executing the UDF: ")
+    elif message.startswith(
+        (
+            # Both engines use VLLMPythonExecutor's native bridge.
+            "vllm submit failed: ",
+            "vllm take_ready_result failed: ",
+            "vllm finished_submitting failed: ",
+            "vllm all_tasks_finished failed: ",
+            "vllm register_wakeup_callback failed: ",
+            "vllm wait_for_result failed: ",
+            "vllm shutdown failed: ",
+        )
+    ):
+        message = message.split(": ", 1)[1]
     else:
         return None
     # These headers are produced from actual exception types by the transport.
@@ -311,6 +327,16 @@ def _native_query_diagnostic(error: BaseException) -> DiagnosticError | None:
         return None
     message = _diagnostic_message(summary, f"Native query failed; upstream error: {summary}")
     return _restore_diagnostic_error(message, summary)
+
+
+def _capture_native_datasink_diagnostic(result: dict[str, Any], *, diagnostic: DiagnosticError | None = None) -> None:
+    """Capture a returned failure at a native DataSink producer boundary."""
+    if result.get("outcome_unknown") is not True and result.get("outcome_aborted") is not True:
+        return
+    if diagnostic is None and type(detail := result.get("outcome_error")) is str:
+        diagnostic = _native_query_diagnostic(RuntimeError(detail))
+    if diagnostic is not None:
+        result["outcome_diagnostic"] = diagnostic
 
 
 def _summary(error: BaseException) -> str:

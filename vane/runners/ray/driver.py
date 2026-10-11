@@ -7166,14 +7166,12 @@ class RayQueryDriverActor:
             )
             lifecycle.fail_startup(startup_contract_error)
             raise startup_contract_error
-        if isinstance(result, dict) and isinstance(detail := result.get("outcome_error"), str) and detail:
-            from vane.ai._errors import _native_query_diagnostic
+        if isinstance(result, dict):
+            from vane.ai._errors import _capture_native_datasink_diagnostic
 
             # Unlike COPY, native DataSink can return a failed outcome rather
             # than raise. Only this native producer boundary may decode it.
-            diagnostic = _native_query_diagnostic(RuntimeError(detail))
-            if diagnostic is not None:
-                _capture_datasink_diagnostic(result, diagnostic)
+            _capture_native_datasink_diagnostic(result)
         return result
 
     def _ensure_copy_operation_state(self) -> None:

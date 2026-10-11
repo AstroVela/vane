@@ -164,7 +164,11 @@ def test_local_runner_records_cleanup_failures_on_copy_outcome(committed):
     assert error.safe_to_retry is False
 
 
-def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch):
+@pytest.mark.parametrize("failure", [None, "typed", "forged"])
+def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch, failure):
+    import json
+
+    from vane.ai import DiagnosticError, summarize_error
     from vane.runners.fte import FteTaskAttemptId, FteTaskId
     from vane.runners.local import runner as runner_module
 
@@ -182,6 +186,19 @@ def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(mon
     class FakePlanRunner:
         def execute_native(self, *args):
             native_calls.append(args)
+            if failure is not None:
+                message = "DiagnosticError: " + str(DiagnosticError("fixture", OSError(28, "private path")))
+                if failure == "forged":
+                    message = "RuntimeError: " + message
+                raise ValueError(
+                    "Execution failed: "
+                    + json.dumps(
+                        {
+                            "exception_type": "Invalid Input",
+                            "exception_message": "streaming UDF async error: " + message,
+                        }
+                    )
+                )
             return "ok"
 
     monkeypatch.setattr(
@@ -195,14 +212,16 @@ def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(mon
     monkeypatch.setattr(executor, "_get_conn", lambda: FakeConnection())
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
-    result = executor(
-        {
-            "task_id": attempt_id.to_dict(),
-            "fragment_plan": object(),
-        }
-    )
-
-    assert result == "ok"
+    request = {"task_id": attempt_id.to_dict(), "fragment_plan": object()}
+    if failure is None:
+        assert executor(request) == "ok"
+    else:
+        with pytest.raises(ValueError, match="Execution failed"):
+            executor(request)
+    if failure == "typed":
+        assert summarize_error(executor.diagnostic) == "OSError (errno=28)"
+    else:
+        assert executor.diagnostic is None
     assert len(native_calls) == 1
     assert native_calls[0][10] == {"task_id": str(attempt_id)}
 

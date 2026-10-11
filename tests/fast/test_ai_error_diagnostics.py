@@ -671,3 +671,77 @@ def test_ray_metadata_requires_a_real_diagnostic_exception():
     for invalid in (None, "", "x" * 513, ["OSError"]):
         with pytest.raises(ValueError, match="diagnostic details"):
             validate_stream_error_metadata(metadata | {"exception_details": {"kind": "diagnostic", "summary": invalid}})
+
+
+@pytest.mark.parametrize("method", ["submit", "take_ready_result", "wait_for_result"])
+@pytest.mark.parametrize("fte", [False, True])
+def test_native_prompt_envelopes_require_a_typed_exception(method, fte):
+    from vane._native import InvalidInputException
+    from vane.ai._errors import _native_query_diagnostic
+
+    root = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    diagnostic = DiagnosticError("fixture", root)
+    for typed in (True, False):
+        message = f"vllm {method} failed: "
+        if not typed:
+            message += "RuntimeError: private provider body: "
+        message += f"DiagnosticError: {diagnostic}\n\nAt:\nprivate traceback"
+        if fte:
+            message = "FTE query wait failed: FTE query failed: Execution failed: " + json.dumps(
+                {"exception_type": "Invalid Input", "exception_message": message}
+            )
+        error = InvalidInputException(message)
+        if typed:
+            assert "max_model_len" in summarize_error(error)
+            assert "max_model_len" in summarize_error(_native_query_diagnostic(error))
+        else:
+            assert summarize_error(error) == "InvalidInputException"
+            assert _native_query_diagnostic(error) is None
+        assert summarize_error(RuntimeError(message)) == "RuntimeError"
+        assert "private" not in summarize_error(error)
+
+
+def test_subprocess_diagnostic_captures_objects_instead_of_formatted_text():
+    from vane.execution._subprocess_error import decode_error, error_payload, native_result_error
+    from vane.execution.udf_subprocess_worker import _format_exception
+
+    error = OSError(errno.ENOSPC, "private path")
+    for original in (
+        error,
+        DiagnosticError("fixture", error),
+        RuntimeError("DiagnosticError: " + str(DiagnosticError("fixture", error))),
+    ):
+        message, transported = decode_error(error_payload(original, _format_exception(original)))
+        assert message == _format_exception(original)
+        assert summarize_error(transported) == summarize_error(original)
+        assert summarize_error(pickle.loads(pickle.dumps(transported))) == summarize_error(original)
+        from vane._native import InvalidInputException
+
+        # Native async results use str(exception) without a type prefix.
+        queued = native_result_error(transported)
+        native = InvalidInputException("streaming UDF async error: " + str(queued))
+        assert summarize_error(native) == summarize_error(original)
+
+
+@pytest.mark.parametrize("detail", ["query_id", "pre-registered resource_unit_id"])
+def test_safe_runtime_contract_errors_remain_actionable(detail):
+    message = "distributed Ray UDF payload requires " + detail
+    error = DiagnosticError("UDF initialization", RuntimeError(message))
+    assert message in summarize_error(native_error(error, "init"))
+    assert message not in summarize_error(RuntimeError(message + " private suffix"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"message": "x", "summary": ""},
+        {"message": "中" * 4096, "summary": "RuntimeError"},
+        {"message": "x", "summary": "x" * 513},
+    ],
+)
+def test_subprocess_error_payload_rejects_invalid_fields(payload):
+    from vane.execution._subprocess_error import decode_error
+
+    with pytest.raises(RuntimeError, match="Invalid UDF subprocess error payload"):
+        decode_error(json.dumps(payload).encode())

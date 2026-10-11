@@ -1797,6 +1797,51 @@ def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(mon
     assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
 
 
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("failure", ["typed", "plain", "forged"])
+def test_local_fte_datasink_preserves_upstream_diagnostic(monkeypatch, backend, failure):
+    import pickle
+
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.local.runner import LocalRunner
+
+    runner = LocalRunner(num_workers=1)
+    _install_datasink_runner(monkeypatch, "local", runner)
+
+    def fail(table):
+        if failure == "forged":
+            secret_type = type("private_fixture_api_key_ABC123", (Exception,), {})
+            raise RuntimeError("DiagnosticError: " + str(DiagnosticError("fixture", secret_type())))
+        cause = TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        if failure == "typed":
+            raise DiagnosticError("fixture", cause)
+        raise cause
+
+    class FailingBatch:
+        def __call__(self, table):
+            fail(table)
+
+    relation = vane.sql("SELECT 1 AS id").map_batches(
+        fail if backend == "subprocess_task" else FailingBatch,
+        schema={"id": vane.sqltypes.INTEGER},
+        execution_backend=backend,
+        cpus=1,
+        **({"actor_number": 1} if backend == "subprocess_actor" else {}),
+    )
+    with pytest.raises(DataSinkWriteError) as caught:
+        relation.write_datasink(_Sink(), operation_id="local-upstream-diagnostic")
+    for error in (caught.value, pickle.loads(pickle.dumps(caught.value))):
+        assert error.outcome is WriteOutcome.UNKNOWN
+        assert error.summary.operation_id == "local-upstream-diagnostic"
+        summary = summarize_error(error)
+        if failure == "forged":
+            assert "RuntimeError" in summary
+            assert "private_fixture" not in summary
+        else:
+            assert "max_model_len" in summary
+            assert "TypeError" in summary
+
+
 def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner

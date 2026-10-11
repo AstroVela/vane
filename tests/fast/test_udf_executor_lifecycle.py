@@ -8427,10 +8427,33 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
     return executor
 
 
+def test_single_subprocess_startup_failure_keeps_typed_diagnostic():
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import DiagnosticError, summarize_error
+
+    class FailingInit:
+        def __init__(self):
+            raise TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+
+        def __call__(self, table):
+            return table
+
+    workers = []
+    with pytest.raises(DiagnosticError) as caught:
+        subprocess_exec._SingleSubprocessExecutor(
+            _subprocess_map_payload(FailingInit, execution_backend="subprocess_actor", actor_number=1),
+            startup_observer=workers.append,
+        )
+    assert "max_model_len" in summarize_error(caught.value)
+    assert len(workers) == 1
+    assert workers[0]._closed and workers[0]._cleanup_finished
+
+
 def test_single_subprocess_reported_submit_error_closes_worker_gracefully():
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution._subprocess_error import error_payload
 
-    error = b"planned write failure"
+    error = error_payload(RuntimeError("planned write failure"), "planned write failure")
     responses = (
         subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
         + error
@@ -8454,9 +8477,13 @@ def test_single_subprocess_reported_submit_error_closes_worker_gracefully():
 
 def test_single_subprocess_reported_submit_error_preserves_close_failure():
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import summarize_error
+    from vane.execution._subprocess_error import error_payload
 
-    submit_error = b"planned write failure"
-    close_error = b"planned close failure"
+    submit_error = error_payload(
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"), "planned write failure"
+    )
+    close_error = error_payload(OSError(5, "private path"), "planned close failure")
     responses = (
         subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(submit_error))
         + submit_error
@@ -8470,8 +8497,13 @@ def test_single_subprocess_reported_submit_error_preserves_close_failure():
     with pytest.raises(
         RuntimeError,
         match="planned write failure.*graceful broken-worker cleanup failed.*planned close failure",
-    ):
+    ) as caught:
         executor._recv_submit_result()
+
+    diagnostic = summarize_error(caught.value)
+    assert "max_model_len" in diagnostic
+    assert "cleanup:" in diagnostic and "OSError (errno=5)" in diagnostic
+    assert "private path" not in diagnostic
 
     messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
     assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
@@ -8483,8 +8515,9 @@ def test_single_subprocess_reported_submit_error_preserves_close_failure():
 
 def test_single_subprocess_reported_finish_error_closes_worker_gracefully():
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution._subprocess_error import error_payload
 
-    error = b"planned finish failure"
+    error = error_payload(RuntimeError("planned finish failure"), "planned finish failure")
     responses = (
         subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
         + error
@@ -8661,15 +8694,19 @@ def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():
 
 def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import summarize_error
+    from vane.execution._subprocess_error import error_payload
 
-    payload = b"cleanup failed"
+    payload = error_payload(OSError(5, "private path"), "cleanup failed")
     response = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(payload)) + payload
     sock = _GracefulShutdownSocket(response)
     proc = _FakeShutdownProcess(exits_on_wait=True)
     executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
 
-    with pytest.raises(RuntimeError, match="graceful shutdown failed.*cleanup failed"):
+    with pytest.raises(RuntimeError, match="graceful shutdown failed.*cleanup failed") as caught:
         executor.close(kill=False)
+
+    assert "OSError (errno=5)" in summarize_error(caught.value)
 
     assert proc.kill_calls == 0
     assert len(proc.wait_timeouts) == 1

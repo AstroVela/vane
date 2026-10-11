@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+    from vane.ai._errors import DiagnosticError
+
 
 _ARROW_DATASET_PRELOAD_LOCK = threading.Lock()
 _ARROW_DATASET_PRELOADED: bool = False
@@ -428,6 +430,12 @@ class _InProcessFragmentExecutor:
         self._in_flight = 0
         self._closing = False
         self._closed = False
+        self._diagnostic: DiagnosticError | None = None
+
+    @property
+    def diagnostic(self) -> DiagnosticError | None:
+        with self._resources_lock:
+            return self._diagnostic
 
     @property
     def close_timeout_s(self) -> float:
@@ -595,19 +603,32 @@ class _InProcessFragmentExecutor:
                 except Exception:
                     pass
                 raise RuntimeError("local fragment executor is closing")
-            return self._get_plan_runner().execute_native(
-                cursor,
-                execution_plan,
-                scan_split_batch_map or None,
-                exchange_source_task_map or None,
-                _copy_output_info_from_context(context),
-                request_payload.get("exchange_sink_instance"),
-                request_payload.get("fte_scan_source_queues"),
-                request_payload.get("fte_exchange_source_queues"),
-                request_payload.get("dynamic_filter_domains"),
-                request_payload.get("native_progress_callback"),
-                {"task_id": str(task_attempt_id)},
-            )
+            plan_runner = self._get_plan_runner()
+            try:
+                return plan_runner.execute_native(
+                    cursor,
+                    execution_plan,
+                    scan_split_batch_map or None,
+                    exchange_source_task_map or None,
+                    _copy_output_info_from_context(context),
+                    request_payload.get("exchange_sink_instance"),
+                    request_payload.get("fte_scan_source_queues"),
+                    request_payload.get("fte_exchange_source_queues"),
+                    request_payload.get("dynamic_filter_domains"),
+                    request_payload.get("native_progress_callback"),
+                    {"task_id": str(task_attempt_id)},
+                )
+            except (RuntimeError, ValueError) as error:
+                from vane.ai._errors import _native_query_diagnostic
+
+                # Native FTE later stringifies/truncates fragment failures. Keep
+                # the first typed diagnostic on this query's executor beforehand.
+                diagnostic = _native_query_diagnostic(error)
+                if diagnostic is not None:
+                    with self._resources_lock:
+                        if self._diagnostic is None:
+                            self._diagnostic = diagnostic
+                raise
         finally:
             try:
                 # Operator state can retain cursor-owned resources. Destroy
@@ -936,9 +957,12 @@ class LocalRunner(Runner):
                 renderer = ProgressRenderer(lambda: self._progress_snapshot(backend, query_id, started_at))
 
             def execute_datasink() -> dict[str, Any]:
+                from vane.ai._errors import _capture_native_datasink_diagnostic
+
                 native_result = plan_runner.run_datasink_plan(physical_plan, conn)
                 if not isinstance(native_result, dict):
                     raise TypeError("DistributedPhysicalPlanRunner.run_datasink_plan() must return a dict")
+                _capture_native_datasink_diagnostic(native_result, diagnostic=fragment_executor.diagnostic)
                 return native_result
 
             write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-datasink")
