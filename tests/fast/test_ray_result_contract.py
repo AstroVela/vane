@@ -1366,6 +1366,8 @@ def test_close_plan_cancels_queued_copy_before_connection_teardown(monkeypatch):
 
 
 def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
+    from vane.ai import DiagnosticError
+
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
     logical_plan = _FakeLogicalPlan(physical_plan)
@@ -1374,7 +1376,10 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             on_execution_started()
-            runner._query_terminal_errors["copy-query-terminal"] = "Ray actor UDF pool initialization failed"
+            runner._query_terminal_errors["copy-query-terminal"] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
             return _committed_copy_result(ok=True)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1402,6 +1407,7 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     assert outcome.write_state == "committed"
     assert outcome.cleanup_state == "complete"
     assert any("Ray actor UDF pool initialization failed" in warning for warning in outcome.cleanup_warnings)
+    assert any("max_model_len" in warning for warning in outcome.cleanup_warnings)
 
 
 def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatch):
@@ -1759,6 +1765,42 @@ def test_query_driver_marks_unknown_result_when_cancelled_during_teardown(monkey
     assert plan_id not in runner._plan_lifecycles
 
 
+def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outcome(monkeypatch):
+    from vane.ai import DiagnosticError
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-late-initialization"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            runner._query_terminal_errors[plan_id] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+    def teardown(_self, actual_plan_id, expected_lifecycle):
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
+
+    try:
+        result = asyncio.run(_run_actor_datasink_plan(runner, logical_plan))
+    finally:
+        cls._shutdown_driver_executors(runner)
+    assert result["outcome_unknown"] is True
+    assert result["outcome_aborted"] is False
+    assert result["outcome_cancelled"] is False
+    assert "max_model_len" in result["outcome_error"]
+
+
 def test_query_driver_marks_failed_execution_when_cancelled_during_cleanup(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "datasink-failed-then-cancelled-during-cleanup"
@@ -2064,7 +2106,10 @@ def test_query_driver_owner_discard_releases_pending_copy_cleanup_terminal():
     assert cls._copy_operation_terminal_record(runner, operation_id) is None
 
 
-def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, late_init):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2075,6 +2120,11 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise ValueError("planned failure before commit")
 
     def _teardown(_self, actual_plan_id):
@@ -2093,7 +2143,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
         lambda: _run_actor_copy_plan(runner, logical_plan),
         lambda: _run_actor_copy_plan(runner, logical_plan),
     ):
-        with pytest.raises(ValueError, match="planned failure before commit"):
+        with pytest.raises(DiagnosticError if late_init else ValueError):
             asyncio.run(operation())
 
     recovered = asyncio.run(
@@ -2106,12 +2156,19 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     )
 
     assert recovered.outcome is None
-    assert isinstance(recovered.error, ValueError)
-    assert str(recovered.error) == "planned failure before commit"
+    if late_init:
+        assert isinstance(recovered.error, DiagnosticError)
+        assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(recovered.error)))
+    else:
+        assert isinstance(recovered.error, ValueError)
+        assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
 
 
-def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch, late_init):
+    from vane.ai import DiagnosticError
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-native-outcome-unknown"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2132,6 +2189,11 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             return unknown_result
 
     def _teardown(_self, actual_plan_id):
@@ -2158,7 +2220,10 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         assert error.value.manifest_path.endswith("/manifest.txt")
         assert error.value.committed_marker_path.endswith("/committed")
         assert error.value.safe_to_retry is False
-        assert error.value.cleanup_warnings == ()
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        else:
+            assert error.value.cleanup_warnings == ()
         assert "readback was inconclusive" in str(error.value)
 
     recovered = asyncio.run(
@@ -2176,7 +2241,10 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert plan_calls == 1
 
 
-def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch, late_init):
+    from vane.ai import DiagnosticError
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-result-unavailable"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2187,6 +2255,11 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise driver.CopyResultUnavailableError(
                 plan_id,
                 "planned result marshalling failure",
@@ -2214,6 +2287,8 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         assert error.value.write_state == "committed"
         assert error.value.safe_to_retry is False
         assert "planned result marshalling failure" in str(error.value)
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -4130,7 +4205,8 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
         query_id=query_id,
         query_connection=query_connection,
     )
-    runner._query_terminal_errors[query_id] = "planned terminal marker"
+    terminal_error = RuntimeError("planned terminal marker")
+    runner._query_terminal_errors[query_id] = terminal_error
     fragment_drops = []
     monkeypatch.setattr(
         cls,
@@ -4147,7 +4223,7 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
     assert runner._plan_query_ids[plan_id] == query_id
     assert runner._plan_connections[plan_id] is query_connection
     assert plan_id in runner._sessions[_TEST_SESSION_ID].plan_ids
-    assert runner._query_terminal_errors[query_id] == "planned terminal marker"
+    assert runner._query_terminal_errors[query_id] is terminal_error
 
     cls._teardown_plan_resources(runner, plan_id)
 
@@ -7614,7 +7690,10 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
         )
 
 
-def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery():
+@pytest.mark.parametrize("during_poll", [False, True])
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(during_poll):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
     query_id = "query-placement-lost"
@@ -7622,7 +7701,19 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
+    terminal_error = DiagnosticError(
+        "Ray actor UDF pool initialization failed",
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+    )
+    if during_poll:
+
+        def failed_poll():
+            runner._query_terminal_errors[query_id] = terminal_error
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+        runner.curr_streams[plan_id].next_nowait = failed_poll
+    else:
+        runner._query_terminal_errors[query_id] = terminal_error
     teardown_calls = []
 
     def _teardown(actual_plan_id):
@@ -7632,7 +7723,7 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     runner._teardown_plan_resources = _teardown
 
-    with pytest.raises(RuntimeError, match="Ray actor UDF pool initialization failed"):
+    with pytest.raises(DiagnosticError, match="Ray actor UDF pool initialization failed") as caught:
         asyncio.run(
             cls.get_next_partition(
                 runner,
@@ -7644,24 +7735,31 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
+    assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(caught.value)))
     from vane.runners.ray.query_resource_runtime import release_query_resource_manager
 
     release_query_resource_manager(query_id, reason="test_complete")
 
 
 def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "terminal-cleanup-plan"
     query_id = "terminal-cleanup-query"
-    runner._query_terminal_errors[query_id] = "fixed actor placement was lost"
+    terminal_error = DiagnosticError(
+        "Ray actor UDF pool initialization failed",
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+    )
+    runner._query_terminal_errors[query_id] = terminal_error
     cleanup_error = RuntimeError("planned terminal teardown failure")
     runner._teardown_plan_resources = lambda *_args, **_kwargs: (_ for _ in ()).throw(cleanup_error)
 
     with pytest.raises(driver.QueryExecutionCleanupError) as error:
         cls._finish_terminal_query(runner, plan_id, query_id)
 
-    assert isinstance(error.value.primary_error, RuntimeError)
-    assert str(error.value.primary_error) == "fixed actor placement was lost"
+    assert error.value.primary_error is terminal_error
+    assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(error.value)))
     assert error.value.cleanup_errors == (cleanup_error,)
     assert error.value.__cause__ is error.value.primary_error
 

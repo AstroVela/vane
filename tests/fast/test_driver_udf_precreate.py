@@ -1203,6 +1203,7 @@ def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
 def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
     from concurrent.futures import Future
 
+    from vane.ai import DiagnosticError, summarize_error
     from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -1242,12 +1243,16 @@ def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
         pool,
         manager,
     )
-    pending_future.set_exception(RuntimeError("warmup failed"))
+    pending_future.set_exception(
+        DiagnosticError(
+            "warmup failed", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+        )
+    )
 
     assert isinstance(pool._vane_init_errors[1], RuntimeError)
-    assert failures == [runner._query_terminal_errors["q1"]]
+    assert failures == [str(runner._query_terminal_errors["q1"])]
     assert "resource:q1:actor/actor-1" in failures[0]
-    assert "warmup failed" in failures[0]
+    assert "max_model_len" in summarize_error(runner._query_terminal_errors["q1"])
 
 
 def test_retired_pool_ignores_late_actor_init_failure():

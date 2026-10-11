@@ -1785,7 +1785,7 @@ class RayQueryDriverActor:
         self.curr_streams: dict[str, Any] = {}  # C++ ResultPartitionStream objects
         self._async_result_streams: dict[str, _AsyncResultStreamState] = {}
         self._plan_query_ids: dict[str, str] = {}
-        self._query_terminal_errors: dict[str, str] = {}
+        self._query_terminal_errors: dict[str, BaseException] = {}
         self._leased_result_partition_refs: dict[str, dict[str, Any]] = {}
         self._result_partition_ref_counters: dict[str, int] = {}
         self.plan_runner: Any | None = None
@@ -3310,9 +3310,11 @@ class RayQueryDriverActor:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            from vane.ai._errors import DiagnosticError
+
             self._query_fte_admission_dirty_queries.discard(query_key)
-            message = f"FTE resource admission wake failed for {query_key}: {type(exc).__name__}: {exc}"
-            self._query_terminal_errors.setdefault(query_key, message)
+            diagnostic = DiagnosticError(f"FTE resource admission wake failed for {query_key}", exc)
+            self._query_terminal_errors.setdefault(query_key, diagnostic)
             try:
                 from vane.runners.ray.query_resource_runtime import (
                     get_query_resource_manager,
@@ -3322,7 +3324,7 @@ class RayQueryDriverActor:
                 # is not proof that already submitted Ray work has stopped.
                 # Fence new work while retaining every live lease until the
                 # normal teardown path quiesces its physical owner.
-                get_query_resource_manager(query_key).fail(message)
+                get_query_resource_manager(query_key).fail(str(diagnostic))
             except KeyError:
                 pass
             self._fail_query_admission_requests(query_key)
@@ -5966,6 +5968,8 @@ class RayQueryDriverActor:
                 if not node_id:
                     raise RuntimeError("actor initialization returned an empty Ray node_id")
             except BaseException as exc:
+                from vane.ai._errors import DiagnosticError
+
                 with self._session_lock:
                     if (
                         bool(getattr(pool, "_vane_retired", False))
@@ -5973,17 +5977,16 @@ class RayQueryDriverActor:
                     ):
                         return
                     pool._vane_init_errors[actor_index] = exc
-                message = (
-                    f"Ray actor UDF pool initialization failed for "
-                    f"{resource_unit_id}/actor-{actor_index}: {_safe_exception_summary(exc)}"
+                diagnostic = DiagnosticError(
+                    f"Ray actor UDF pool initialization failed for {resource_unit_id}/actor-{actor_index}", exc
                 )
                 with self._query_resource_lock:
-                    self._query_terminal_errors.setdefault(query_id, message)
+                    self._query_terminal_errors.setdefault(query_id, diagnostic)
                 # A failed pending actor makes the fixed pool unusable, but
                 # other actors/tasks may still be live.  Preserve their QRM
                 # charges until ordered plan teardown kills the pool and
                 # observes task termination.
-                manager.fail(message)
+                manager.fail(str(diagnostic))
                 return
 
             with self._session_lock:
@@ -6703,10 +6706,9 @@ class RayQueryDriverActor:
                 raise
 
     def _finish_terminal_query(self, plan_id: str, query_id: str) -> None:
-        reason = str(getattr(self, "_query_terminal_errors", {}).get(str(query_id), ""))
-        if not reason:
+        primary_error = getattr(self, "_query_terminal_errors", {}).get(str(query_id))
+        if primary_error is None:
             return
-        primary_error = RuntimeError(reason)
         try:
             self._teardown_plan_resources(plan_id)
         except _QueryCleanupDiagnostic as cleanup_diagnostic:
@@ -7830,6 +7832,9 @@ class RayQueryDriverActor:
                 lifecycle.finish_setup(succeeded=False)
                 setup_finished = True
             execution_started = execution_started or lifecycle.fragments_started()
+            terminal_error = self._query_terminal_errors.get(self._plan_query_ids.get(plan_id, ""))
+            if terminal_error is not None and not isinstance(primary_error, asyncio.CancelledError):
+                primary_error = terminal_error
             teardown_error: BaseException | None = None
             try:
                 await _run_in_executor_with_owned_side_effects(
@@ -8023,6 +8028,9 @@ class RayQueryDriverActor:
                 lifecycle.finish_setup(succeeded=False)
                 setup_finished = True
             query_id = self._plan_query_ids.get(plan_id, "")
+            # Teardown removes the terminal record. Retain the typed failure
+            # now, but classify native COPY commit markers before using it.
+            terminal_error = self._query_terminal_errors.get(query_id)
             teardown_error: BaseException | None = None
             try:
                 await _run_in_executor_with_owned_side_effects(
@@ -8091,6 +8099,8 @@ class RayQueryDriverActor:
                                 )
                         elif observed_result.get("copy_output_committed") is True:
                             committed_result = observed_result
+            if terminal_error is not None and not isinstance(primary_error, asyncio.CancelledError):
+                primary_error = terminal_error
             if committed_result is not None:
                 cleanup_warnings = self._copy_native_cleanup_warnings(committed_result) + (
                     self._copy_cleanup_warning(
@@ -8339,16 +8349,21 @@ class RayQueryDriverActor:
                             next_item = None
                         else:
                             raise
-            except (StopIteration, StopAsyncIteration):
-                await _run_in_executor_with_owned_side_effects(
-                    self._get_driver_lifecycle_executor(),
-                    self._cleanup_finished_plan,
-                    plan_id,
-                )
-                return None
-            except RuntimeError as e:
+            except Exception as e:
+                # A readiness callback may fail the query while a native poll
+                # is in flight. Its scheduler error only contains a string;
+                # use the producer's typed diagnostic before teardown clears it.
+                if query_id in getattr(self, "_query_terminal_errors", {}):
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
+                        self._finish_terminal_query,
+                        str(plan_id),
+                        query_id,
+                    )
                 # pybind11 wraps StopIteration in RuntimeError
-                if "StopIteration" in str(e):
+                if isinstance(e, (StopIteration, StopAsyncIteration)) or (
+                    isinstance(e, RuntimeError) and "StopIteration" in str(e)
+                ):
                     await _run_in_executor_with_owned_side_effects(
                         self._get_driver_lifecycle_executor(),
                         self._cleanup_finished_plan,

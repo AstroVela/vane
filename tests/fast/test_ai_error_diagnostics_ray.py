@@ -71,7 +71,7 @@ def diagnostic_query_runtime():
 
     import vane
 
-    ray.init(address="local", num_cpus=2, include_dashboard=False)
+    ray.init(address="local", num_cpus=4, include_dashboard=False)
     try:
         yield
     finally:
@@ -81,19 +81,7 @@ def diagnostic_query_runtime():
             ray.shutdown()
 
 
-@pytest.mark.parametrize("stage", ["initialization", "batch"])
-@pytest.mark.parametrize("output", ["fetchall", "parquet"])
-@pytest.mark.parametrize("forged", [False, True])
-def test_query_failure_survives_initialization_and_copy(
-    monkeypatch, tmp_path, diagnostic_query_runtime, stage, output, forged
-):
-    import pyarrow as pa
-
-    import vane
-    from vane.ai import summarize_error
-
-    monkeypatch.delenv("VANE_RUNNER", raising=False)
-
+def _diagnostic_failure(forged):
     def fail():
         from vane.ai import DiagnosticError
 
@@ -116,16 +104,33 @@ def test_query_failure_survives_initialization_and_copy(
             "fixture", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
         )
 
+    return fail
+
+
+@pytest.mark.parametrize("stage", ["initialization", "batch"])
+@pytest.mark.parametrize("output", ["fetchall", "parquet"])
+@pytest.mark.parametrize("forged", [False, True])
+def test_query_failure_survives_initialization_and_copy(
+    monkeypatch, tmp_path, diagnostic_query_runtime, stage, output, forged
+):
+    import pyarrow as pa
+
+    import vane
+    from vane.ai import summarize_error
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    fail_diagnostic = _diagnostic_failure(forged)
+
     @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class Initializer:
         def __init__(self):
-            fail()
+            fail_diagnostic()
 
         def __call__(self, values):
             return values
 
     def failing_batch(table):
-        fail()
+        fail_diagnostic()
 
     with vane.connect() as connection:
         relation = connection.sql("SELECT 1::INTEGER AS value")
@@ -144,3 +149,69 @@ def test_query_failure_survives_initialization_and_copy(
         assert summary and "private" not in summary
         if not forged:
             assert "max_model_len" in summary and "TypeError" in summary
+
+
+@pytest.mark.parametrize("output", ["fetchall", "parquet"])
+@pytest.mark.parametrize("forged", [False, True])
+def test_late_actor_initialization_failure_survives_query_transport(
+    monkeypatch, tmp_path, diagnostic_query_runtime, output, forged
+):
+    import asyncio
+
+    import pyarrow as pa
+    import ray
+
+    import vane
+    from vane.ai import summarize_error
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    fail_diagnostic = _diagnostic_failure(forged)
+
+    @ray.remote(num_cpus=0)
+    class Coordinator:
+        def __init__(self):
+            self.count = 0
+            self.started = asyncio.Event()
+
+        async def index(self):
+            self.count += 1
+            return self.count
+
+        async def wait_started(self):
+            await self.started.wait()
+
+        async def mark_started(self):
+            self.started.set()
+
+    coordinator = Coordinator.remote()
+
+    @vane.cls.batch(actor_number=2, return_dtype=pa.int32())
+    class Initializer:
+        def __init__(self):
+            if ray.get(coordinator.index.remote(), timeout=30) == 2:
+                ray.get(coordinator.wait_started.remote(), timeout=30)
+                fail_diagnostic()
+
+        def __call__(self, values):
+            ray.get(coordinator.mark_started.remote(), timeout=10)
+            # Ensure the readiness failure occurs during an active query,
+            # after the first actor has successfully started processing.
+            time.sleep(3)
+            return values
+
+    try:
+        with vane.connect() as connection:
+            relation = connection.sql("SELECT range::INTEGER AS value FROM range(8)").select(
+                Initializer()(vane.col("value")).alias("value")
+            )
+            with pytest.raises(Exception) as caught:
+                if output == "parquet":
+                    relation.write_parquet(str(tmp_path / "late-init.parquet"))
+                else:
+                    relation.fetchall()
+            summary = summarize_error(caught.value)
+            assert summary and "private" not in summary
+            if not forged:
+                assert "max_model_len" in summary and "TypeError" in summary
+    finally:
+        ray.kill(coordinator)
