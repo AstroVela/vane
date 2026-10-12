@@ -44,7 +44,6 @@ try:
         ENTRY_POINT_GROUP,
         _current_musl_version,
         _entry_points,
-        _extension_distribution_version_from_digest,
         _extension_interpreter_tag,
         _extension_material_members,
         _is_macos_binary,
@@ -58,6 +57,7 @@ try:
         _validate_artifact_platform_tag,
         _validate_dependency_platform_tag,
         _validate_exact_requirements,
+        _validate_extension_distribution_version,
         _validate_extension_wheel_archive_size,
         _validate_linux_elf_platform,
         _validate_macos_wheel_binary_platform,
@@ -644,7 +644,11 @@ def _assert_extension_wheel_snapshot_layout(
         raise RuntimeError("extension wheel descriptor must contain a non-empty trust identity")
     descriptor_digest = hashlib.sha256(canonical_descriptor).hexdigest()
     expected_package_root = f"vane_extensions/{extension_name}_{descriptor_digest}/"
-    distribution_version = _extension_distribution_version_from_digest(vane_version, descriptor_digest)
+    distribution_version = str(parse_wheel_filename(snapshot.source_path.name)[1])
+    try:
+        _validate_extension_distribution_version(distribution_version, vane_version, descriptor_digest)
+    except ValueError as exception:
+        raise RuntimeError(str(exception)) from exception
     distribution_root = f"vane_extension_{extension_name}-{distribution_version}"
     expected_metadata = f"{distribution_root}.dist-info/METADATA"
     expected_platform_build_details = f"{distribution_root}.dist-info/{_PLATFORM_BUILD_DETAILS_FILENAME}"
