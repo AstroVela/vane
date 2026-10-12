@@ -51,13 +51,22 @@ def transport(monkeypatch):
 def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(monkeypatch, tracking, limited_tasks):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     observed = []
+    output_observed = []
     complete = udf_subprocess.UDFExecutor._complete_task_submit
+    publish = udf_subprocess.UDFExecutor._publish_stream_result
 
     def observe(executor, *args, **kwargs):
         observed.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
         return complete(executor, *args, **kwargs)
 
+    def observe_output(executor, *args, **kwargs):
+        # The producer owns this block until publication. Downstream can
+        # consume and release it before the terminal completion callback.
+        output_observed.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
+        return publish(executor, *args, **kwargs)
+
     monkeypatch.setattr(udf_subprocess.UDFExecutor, "_complete_task_submit", observe)
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "_publish_stream_result", observe_output)
 
     class Identity:
         def __call__(self, table):
@@ -106,12 +115,20 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
                         resource.shutdown()
                 gc.collect()
                 _wait(lambda: not runtime.resource_snapshot()["udf_units"])
+                if tracking != "graph_only":
+                    data = runtime.resource_snapshot()["data"]
+                    assert data["leases"] == data["retained_bytes"] == 0
             assert len(query_ids) == 2 and worker_pids[0] == worker_pids[1]
-        assert {identity["query_id"] for identity, _ in observed} == query_ids
-        assert {identity["backend"] for identity, _ in observed} == {"subprocess_task", "subprocess_actor"}
+        expected = {
+            (query_id, backend) for query_id in query_ids for backend in ("subprocess_task", "subprocess_actor")
+        }
+        for snapshots in (observed, output_observed):
+            assert {(identity["query_id"], identity["backend"]) for identity, _ in snapshots} == expected
         for identity, units in observed:
             own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
             assert own["completing_tasks"] >= 1
+        for identity, units in output_observed:
+            own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
             if tracking == "graph_only":
                 assert own["data"] is None
             else:
