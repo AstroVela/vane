@@ -14,6 +14,7 @@ import pytest
 
 import vane
 from vane import pickle as vane_pickle
+from vane.ai import DiagnosticError, summarize_error
 from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
@@ -252,8 +253,9 @@ def test_data_accounting_completion_failure_still_returns_task_worker_capacity(m
             _submit(failed, pa.table({"x": [1]}))
             _wait_until(lambda: bool(failed._queue), "completion callback did not publish its result")
         error = failed.take_ready_result()
-        assert isinstance(error, RuntimeError)
-        assert str(error) == "planned accounting callback failure"
+        assert isinstance(error, DiagnosticError)
+        assert summarize_error(error) == "RuntimeError"
+        assert "planned accounting callback failure" in str(error)
         failed.stats()  # Cleanup is a task result, not a persistent wakeup error.
         assert not failed._task_futures
         assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0

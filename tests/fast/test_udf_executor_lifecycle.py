@@ -6098,6 +6098,104 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     assert "planned completion debug failure" in str(executor._wakeup_error)
 
 
+@pytest.mark.parametrize("submit_id", [None, 7], ids=["plain", "with-id"])
+@pytest.mark.parametrize("primary_failure", [False, True], ids=["success", "execution-error"])
+@pytest.mark.parametrize("input_failure", [False, True], ids=["input-clean", "input-error"])
+@pytest.mark.parametrize("execution_failure", [False, True], ids=["capacity-clean", "capacity-error"])
+def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
+    submit_id, primary_failure, input_failure, execution_failure
+):
+    import errno
+
+    import vane
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+    from vane.execution.udf import build_executor
+    from vane.execution.udf_admission import AdmissionLease
+
+    events = []
+
+    class InputCleanup:
+        def finish(self):
+            events.append("input-finished")
+            if input_failure:
+                raise OSError(errno.EBUSY, "private input cleanup")
+
+    def complete_execution():
+        events.append("execution-finished")
+        if execution_failure:
+            raise OSError(errno.ENOSPC, "private execution cleanup")
+
+    admission = AdmissionLease(
+        "diagnostic-test",
+        0,
+        {},
+        _execution_finished_callback=complete_execution,
+        _release_callback=lambda: events.append("slot-released"),
+    )
+    executor = build_executor(_subprocess_map_payload(lambda table: table, execution_backend="subprocess_task"))
+    result = None
+    try:
+        future = Future()
+        scope = executor._new_execution_scope()
+        executor._pending_batches = 1
+        executor._track_task_future(future, submit_id, 1, time.perf_counter(), admission, scope, InputCleanup())
+        if primary_failure:
+            future.set_exception(OSError(errno.EIO, "private execution error"))
+        else:
+            result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+            future.set_result(result)
+
+        # Completion returns execution capacity; consuming the terminal result
+        # still owns the buffered-result slot, including when cleanup fails.
+        assert events == ["input-finished", "execution-finished"]
+        assert executor._pending_batches == 0
+        assert not executor._task_futures
+        assert not executor._task_future_meta
+        assert not executor._execution_scopes
+        assert scope.finished
+        assert executor._wakeup_error is None
+        assert list(executor._result_admissions) == [admission]
+        item = executor.take_ready_result()
+        assert events == ["input-finished", "execution-finished", "slot-released"]
+        if submit_id is not None:
+            assert item[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, submit_id)
+            item = item[2]
+        errors = [
+            number
+            for present, number in (
+                (primary_failure, errno.EIO),
+                (input_failure, errno.EBUSY),
+                (execution_failure, errno.ENOSPC),
+            )
+            if present
+        ]
+        if errors:
+            assert isinstance(item, DiagnosticError)
+            native = vane.InvalidInputException("streaming UDF async error: " + str(item))
+            summary = summarize_error(native)
+            primary, _, cleanup = summary.partition("; cleanup: ")
+            assert f"OSError (errno={errors[0]})" in primary
+            for number in errors[1:]:
+                assert f"OSError (errno={number})" in cleanup
+            assert summary.count("cleanup:") == int(len(errors) > 1)
+            assert "private" not in summary
+            if result is not None:
+                assert all(ref._closed for ref in result[1])
+        else:
+            assert item is result
+            assert not any(ref._closed for ref in result[1])
+            assert result[1][0].to_table().to_pydict() == {"x": [1, 2]}
+        assert executor.take_ready_result() is None
+        assert not executor._result_admissions
+        executor.stats()
+    finally:
+        local._release_local_ref_bundle_result(result)
+        executor.close(kill=True)
+        local._shutdown_global_task_runtime()
+
+
 def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure():
     import vane.execution.udf_subprocess as subprocess_exec
 

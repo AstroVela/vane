@@ -4062,7 +4062,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     ) -> None:
         item: Any | None = None
         result: Any | None = None
-        failed = False
+        error: BaseException | None = None
         debug_meta: (
             tuple[
                 int | None,
@@ -4083,11 +4083,14 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._record_output_budget_result(result)
             item = self._submit_result_item(submit_id, result)
         except BaseException as exc:
-            failed = True
+            error = exc
+            if cleanup_error is not None and cleanup_error is not exc:
+                message = (
+                    f"{_bounded_close_error(error)}; UDF input cleanup failed: {_bounded_close_error(cleanup_error)}"
+                )
+                error = capture_cleanup(message, error, cleanup_error)
             _release_local_ref_bundle_result(result)
             result = None
-            diagnostic = native_result_error(exc)
-            item = (SUBMIT_RESULT_MARKER, int(submit_id), diagnostic) if submit_id is not None else diagnostic
         finally:
             with self._task_futures_lock:
                 debug_meta = self._task_future_meta.get(future)
@@ -4102,10 +4105,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         # Reservation cleanup is part of this task's result,
                         # just like task_scope.finish(). Poisoning wakeups can
                         # skip result consumption and strand its pool slot.
-                        if not failed:
+                        if error is None:
                             _release_local_ref_bundle_result(result)
                             result = None
-                            item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
+                            error = exc
+                        else:
+                            message = f"{_bounded_close_error(error)}; UDF execution cleanup failed: {_bounded_close_error(exc)}"
+                            error = capture_cleanup(message, error, exc)
                 try:
                     if _should_debug_submit(debug_seq):
                         _subprocess_debug_log(
@@ -4115,6 +4121,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         )
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
+            if error is not None:
+                # Capture every completion failure after both cleanup stages,
+                # before native result consumption discards exception types.
+                item = self._submit_result_item(submit_id, native_result_error(error))
             if item is not None:
                 with self._queue_lock:
                     if self._closed:

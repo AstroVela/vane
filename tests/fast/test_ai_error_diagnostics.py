@@ -926,3 +926,75 @@ def test_subprocess_error_payload_rejects_invalid_fields(payload):
 
     with pytest.raises(RuntimeError, match="Invalid UDF subprocess error payload"):
         decode_error(json.dumps(payload).encode())
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("primary_failure", [False, True], ids=["success", "execution-error"])
+@pytest.mark.parametrize("cleanup_kind", ["errno", "forged"])
+def test_native_subprocess_completion_cleanup_preserves_diagnostics(
+    monkeypatch, backend, primary_failure, cleanup_kind
+):
+    import inspect
+
+    import vane
+    from vane.execution import udf_subprocess as local
+    from vane.execution.udf_admission import AdmissionLease
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    original = AdmissionLease.complete_execution
+    injected = []
+    if cleanup_kind == "errno":
+        cleanup_error = OSError(errno.ENOSPC, "private cleanup path")
+    else:
+        private_type = type("PrivateForgedDiagnostic", (Exception,), {})
+        cleanup_error = RuntimeError("DiagnosticError: " + str(DiagnosticError("fixture", private_type())))
+
+    def complete_then_fail(lease):
+        # Target completion rather than later release() / query shutdown, so
+        # the real native async queue must transport this injected failure.
+        frame = inspect.currentframe()
+        try:
+            completing = frame.f_back.f_code.co_name == "_complete_task_submit"
+        finally:
+            del frame
+        original(lease)
+        if completing and not injected:
+            injected.append(True)
+            raise cleanup_error
+
+    def run(table):
+        if primary_failure:
+            raise OSError(errno.EIO, "private execution path")
+        return table
+
+    class Model:
+        def __call__(self, table):
+            return run(table)
+
+    local._shutdown_global_task_runtime()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(AdmissionLease, "complete_execution", complete_then_fail)
+            with vane.connect() as conn:
+                relation = conn.sql("SELECT 1::BIGINT AS i").map_batches(
+                    Model if backend == "subprocess_actor" else run,
+                    schema={"i": vane.sqltypes.BIGINT},
+                    execution_backend=backend,
+                    actor_number=1 if backend == "subprocess_actor" else None,
+                )
+                with pytest.raises(vane.InvalidInputException) as caught:
+                    relation.fetchall()
+        assert injected == [True]
+        summary = summarize_error(caught.value)
+        primary, _, cleanup = summary.partition("; cleanup: ")
+        expected = f"OSError (errno={errno.ENOSPC})" if cleanup_kind == "errno" else "RuntimeError"
+        if primary_failure:
+            assert f"OSError (errno={errno.EIO})" in primary
+            assert expected in cleanup
+            assert summary.count("cleanup:") == 1
+        else:
+            assert summary == expected
+        assert "private" not in summary.lower()
+        assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+    finally:
+        local._shutdown_global_task_runtime()
