@@ -17,6 +17,7 @@ from vane.runners.fte import (
     FteTaskExecutionClass,
     FteWorkerReservationUnavailable,
     PartitionInfo,
+    ScanBatchSplitAssigner,
 )
 from vane.runners.fte.dynamic_inputs import (
     split_exchange_source_task_by_partition as _split_exchange_source_task_by_partition,
@@ -723,6 +724,13 @@ class FteWorkerSubmissionMixin:
                 preserve_order=aggregate["preserve_order"],
             )
 
+        # Merge singleton transport events for each scan fragment before LPT.
+        # Flush at this bounded scheduler batch boundary, not source exhaustion,
+        # so a slow producer cannot delay the first runnable scan tasks.
+        last_item_by_fragment = {
+            (entry[0]["query_id"], entry[0]["fragment_id"]): index for index, entry in enumerate(prepared)
+        }
+
         for prepared_index, (
             item,
             splits,
@@ -795,7 +803,8 @@ class FteWorkerSubmissionMixin:
                 by_source.setdefault(split.source_node_id, []).append(split)
 
             scheduled_attempts = []
-            if not by_source and not fragment_execution.partitions:
+            is_scan_batch = isinstance(fragment_state.assigner, ScanBatchSplitAssigner)
+            if not by_source and not fragment_execution.partitions and not is_scan_batch:
                 _fte_submission_debug_log(
                     "pending_item_empty_source_add_partition",
                     prepared_index=prepared_index,
@@ -843,6 +852,7 @@ class FteWorkerSubmissionMixin:
                 if dispatch.query_closed:
                     return handles
 
+            assignment_results = []
             for source_node_id, source_splits in by_source.items():
                 _fte_submission_debug_log(
                     "pending_item_assign_start",
@@ -867,6 +877,14 @@ class FteWorkerSubmissionMixin:
                     no_more_partitions=result.no_more_partitions,
                     elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
                 )
+                assignment_results.append(result)
+            if (
+                isinstance(fragment_state.assigner, ScanBatchSplitAssigner)
+                and prepared_index == last_item_by_fragment[(item["query_id"], item["fragment_id"])]
+            ):
+                assignment_results.append(fragment_state.assigner.flush())
+
+            for result in assignment_results:
                 for partition_info in result.partitions_added:
                     partition = fragment_execution.add_partition(
                         partition_info.partition_id,
