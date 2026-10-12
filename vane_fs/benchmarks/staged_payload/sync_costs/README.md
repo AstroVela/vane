@@ -87,7 +87,7 @@ waiting, but do not identify a particular kernel or device mechanism.
 
 Smaller batches have no second-scale sync in these 36 runs, with a maximum
 around 69 ms. This sample size does not establish an upper latency bound.
-Their usual median throughput is 14–16% lower than growing-128 because of
+Growing-16 median throughput is 14–16% lower than growing-128 because of
 more serial barriers. Sealing adds only about 2% over the growing 16 MiB
 variant; this evidence does not justify a new segmented storage format.
 
