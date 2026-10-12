@@ -10783,7 +10783,8 @@ def test_streaming_wait_does_not_publish_loser_after_selected_attempt_was_publis
         manager.shutdown()
 
 
-def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(monkeypatch):
+@pytest.mark.parametrize("preserve_task_order", [True, False])
+def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(monkeypatch, preserve_task_order):
     class _UnselectedHandle:
         worker_id = "worker-empty-selection"
 
@@ -10869,7 +10870,7 @@ def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(mo
         manager.worker_snapshots()
         manager.register_query_owner(query_id, query_id)
 
-        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0, preserve_task_order=preserve_task_order) == 0
         assert worker.handle is not None
         assert worker.handle.get_result_sync_calls == 1
         assert worker.handle.ack_calls == 0
@@ -10896,8 +10897,10 @@ def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(mo
         (-1, -1, 1, "failed to finalize streamed FTE result handle", [1, 1], [1, 1], [1, 2]),
     ],
 )
+@pytest.mark.parametrize("preserve_task_order", [True, False])
 def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalization_failure(
     monkeypatch,
+    preserve_task_order,
     fail_after,
     throw_after,
     release_failures,
@@ -10912,6 +10915,7 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
         worker_id = "worker-streaming-callback-failure"
 
         def __init__(self, task_id, value, *, release_failures=0):
+            self.value = value
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self._result = vane.ray_cxx.RayTaskResult.success([pa.table({"value": [value]})], [], None)
@@ -10921,7 +10925,9 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
             self.release_failures = release_failures
 
         def done(self):
-            return True
+            # Fix the failure position through readiness, independent of the
+            # manager's handle iteration order in unordered mode.
+            return self.value == 1 or worker.handles[0].ack_calls > 0
 
         def get_result_sync(self):
             self.get_result_sync_calls += 1
@@ -11019,18 +11025,118 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
         manager.worker_snapshots()
         manager.register_query_owner(query_id, query_id)
         with pytest.raises(Exception, match=message):
-            manager._wait_fte_query_streaming_for_test(query_id, 1.0, fail_after, throw_after)
+            manager._wait_fte_query_streaming_for_test(
+                query_id, 1.0, fail_after, throw_after, preserve_task_order=preserve_task_order
+            )
         assert [handle.ack_calls for handle in worker.handles] == expected_ack_calls
         assert [handle.release_calls for handle in worker.handles] == expected_release_calls_before_cleanup
         assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
 
         # Retrying the wait may finish pending handles, but must never invoke
         # publication again for the handle whose callback outcome was ambiguous.
-        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0, preserve_task_order=preserve_task_order) == 0
         assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
 
         manager.drop_query_fragments(query_id)
         assert [handle.release_calls for handle in worker.handles] == expected_release_calls_after_cleanup
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("late_selection", [False, True])
+def test_completion_order_drain_skips_pending_handles_and_refreshes_selection(monkeypatch, late_selection):
+    pa = pytest.importorskip("pyarrow")
+    acknowledged = []
+
+    class Handle:
+        worker_id = "worker-completion-order"
+
+        def __init__(self, query_id, partition):
+            self.partition = partition
+            self.task_id = _fake_task_attempt_id(
+                {
+                    "query_id": query_id,
+                    "fragment_execution_id": 0,
+                    "partition_id": partition,
+                    "attempt_id": 0,
+                }
+            )
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self.result_calls = self.release_calls = 0
+
+        def done(self):
+            return self.partition == 1 or 1 in acknowledged
+
+        def get_result_sync(self):
+            self.result_calls += 1
+            return vane.ray_cxx.RayTaskResult.success([pa.table({"value": [self.partition]})], [], None)
+
+        def ack(self):
+            acknowledged.append(self.partition)
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Worker:
+        def __init__(self):
+            self.status_calls = 0
+            self.handles = []
+
+        def fte_query_status(self, query_id):
+            self.status_calls += 1
+            selected = [0] if late_selection and self.status_calls == 1 else [0, 1]
+            return {
+                "failed": False,
+                "finished": len(acknowledged) == 2,
+                "selected_attempt_task_ids": [f"{query_id}.0.{partition}.0" for partition in selected],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            if self.handles:
+                return []
+            self.handles = [Handle(query_id, 0), Handle(query_id, 1)]
+            return list(self.handles)
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            pass
+
+        def finish_shutdown(self):
+            pass
+
+        def abort_shutdown(self):
+            pass
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-completion-order", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-completion-order"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+        assert manager._wait_fte_query_streaming_for_test(query_id, 2.0, preserve_task_order=False) == 2
+        assert acknowledged == [1, 0]
+        assert [handle.result_calls for handle in worker.handles] == [1, 1]
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
+        manager.drop_query_fragments(query_id)
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
     finally:
         manager.shutdown()
 

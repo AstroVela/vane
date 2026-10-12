@@ -42,6 +42,8 @@
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -272,9 +274,10 @@ public:
 	}
 
 	DuckDBResult<std::vector<MaterializedOutput>>
-	wait_query_finished_streaming(const std::string &query_id, double timeout_s,
-	                              MaterializedOutputCallback on_output) override {
-		return worker_manager_->wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+	wait_query_finished_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output,
+	                              bool preserve_task_order = true) override {
+		return worker_manager_->wait_fte_query_streaming(query_id, timeout_s, std::move(on_output),
+		                                                 preserve_task_order);
 	}
 
 	DuckDBResult<std::vector<MaterializedOutput>>
@@ -303,8 +306,10 @@ public:
 	DuckDBResult<void> execute_plan(std::shared_ptr<DistributedPipelineNode> pipeline_node,
 	                                std::shared_ptr<PlanTaskExecutor> task_executor,
 	                                UnboundedSender<MaterializedOutput> output_sender, TaskInputs initial_inputs = {},
-	                                MaterializedOutputCallback validate_incremental_output = {}) {
+	                                MaterializedOutputCallback validate_incremental_output = {},
+	                                bool completion_order = false) {
 		const bool bound_execution_errors = static_cast<bool>(validate_incremental_output);
+		const bool stream_outputs = completion_order || bound_execution_errors;
 		auto execution_error = [&](const DuckDBError &error) -> DuckDBResult<void> {
 			if (!bound_execution_errors) {
 				return DuckDBResult<void>::err(error);
@@ -481,9 +486,9 @@ public:
 					}
 					return output_sender.send(output);
 				};
-				auto wait_res = validate_incremental_output
+				auto wait_res = stream_outputs
 				                    ? fte_task_submitter->wait_query_finished_streaming(
-				                          query_id, FteQueryWaitTimeoutSeconds(), publish_output)
+				                          query_id, FteQueryWaitTimeoutSeconds(), publish_output, !completion_order)
 				                    : fte_task_submitter->wait_query_finished(query_id, FteQueryWaitTimeoutSeconds());
 				if (wait_res.is_err()) {
 					FteRunnerDebugLog(
@@ -497,11 +502,11 @@ public:
 				    "event=wait_query_done elapsed_ms=" + std::to_string(FteRunnerElapsedMs(execute_started_at)) +
 				    " query_id=" + FteRunnerFormatField(query_id) +
 				    " result=ok output_count=" + std::to_string(outputs.size()));
-				if (validate_incremental_output && !outputs.empty()) {
+				if (stream_outputs && !outputs.empty()) {
 					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 					    "streaming FTE result drain returned outputs outside its publication callback"));
 				}
-				if (!validate_incremental_output) {
+				if (!stream_outputs) {
 					for (auto &output : outputs) {
 						auto send_res = output_sender.send(std::move(output));
 						if (send_res.is_err()) {
@@ -962,6 +967,14 @@ public:
 				};
 			}
 			const bool bound_execution_errors = static_cast<bool>(validate_incremental_output);
+			// Only relax result delivery when both the public setting and the
+			// physical plan permit it. FIXED_ORDER sources, including ORDER BY
+			// and TopN, retain their SQL ordering contract.
+			// Write protocols keep their existing result/finalization behavior.
+			const bool completion_order =
+			    !copy_sink_node && !callback_sink_node && !data_sink_node &&
+			    !Settings::Get<PreserveInsertionOrderSetting>(*client_context_) &&
+			    !PhysicalPlanGenerator::PreserveInsertionOrder(*client_context_, physical_plan->Root());
 			if (extension_write_provider) {
 				extension_prepare_started = true;
 				try {
@@ -976,8 +989,8 @@ public:
 			}
 			execution_may_have_started = true;
 			task_executor->ScheduleTask([self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
-			                             initial_inputs_ptr, bound_execution_errors,
-			                             validate_incremental_output]() mutable {
+			                             initial_inputs_ptr, bound_execution_errors, validate_incremental_output,
+			                             completion_order]() mutable {
 				std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
 				auto publish_error = [&](const DuckDBError &error) {
 					execute_status->RecordError(error);
@@ -987,9 +1000,9 @@ public:
 				};
 				try {
 					output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
-					auto result =
-					    self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
-					                       std::move(*initial_inputs_ptr), std::move(validate_incremental_output));
+					auto result = self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
+					                                 std::move(*initial_inputs_ptr),
+					                                 std::move(validate_incremental_output), completion_order);
 					if (result.is_err()) {
 						publish_error(result.error());
 					}

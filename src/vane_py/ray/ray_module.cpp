@@ -625,7 +625,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def(
 	        "_wait_fte_query_streaming_for_test",
 	        [](RayWorkerManager &self, const string &query_id, double timeout_s, int64_t fail_after,
-	           int64_t throw_after) {
+	           int64_t throw_after, bool preserve_task_order) {
 		        size_t output_count = 0;
 		        auto on_output = [&output_count, fail_after,
 		                          throw_after](const duckdb::distributed::MaterializedOutput &) {
@@ -641,14 +641,16 @@ void register_ray_bindings(py::module_ &mod) {
 		        };
 		        auto res = [&]() {
 			        py::gil_scoped_release release;
-			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output),
+			                                             preserve_task_order);
 		        }();
 		        if (res.is_err()) {
 			        throw duckdb::InternalException(res.error().what());
 		        }
 		        return output_count;
 	        },
-	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1)
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1,
+	        py::arg("preserve_task_order") = true)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {

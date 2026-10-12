@@ -1515,15 +1515,17 @@ public:
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query_streaming(const string &query_id, double timeout_s,
-	                         duckdb::distributed::MaterializedOutputCallback on_output) override {
+	                         duckdb::distributed::MaterializedOutputCallback on_output,
+	                         bool preserve_task_order = true) override {
 		const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
-		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true, preserve_task_order);
 	}
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
-	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs,
+	    bool preserve_task_order = true) {
 		if (query_id.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
@@ -1633,9 +1635,9 @@ public:
 					              0.0,
 					              std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
 					        : -1.0;
-					auto stream_res =
-					    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
-					                       task_contexts.empty() ? nullptr : &task_contexts, true, on_output, true);
+					auto stream_res = DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+					                                     task_contexts.empty() ? nullptr : &task_contexts, true,
+					                                     on_output, true, preserve_task_order);
 					if (stream_res.is_err()) {
 						return stream_res;
 					}
@@ -1667,10 +1669,11 @@ public:
 				return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
 				                                 ::vane::CaptureError(coverage_res.error()));
 			}
-			auto drain_res = DrainResultHandles(
-			    query_id, remaining_timeout_s, selected_attempt_task_ids,
-			    task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
-			    stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
+			auto drain_res =
+			    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+			                       task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
+			                       stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {},
+			                       false, preserve_task_order);
 			if (drain_res.is_err()) {
 				return drain_res;
 			}
@@ -2465,7 +2468,7 @@ private:
 	                   const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	                       *task_context_filter,
 	                   bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output = {},
-	                   bool selected_only = false) {
+	                   bool selected_only = false, bool preserve_task_order = true) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		{
 			lock_guard<mutex> guard(mutex_);
@@ -2545,7 +2548,7 @@ private:
 			}
 		}
 		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
-		if (on_output) {
+		if (on_output && preserve_task_order) {
 			std::stable_sort(pending.begin(), pending.end(),
 			                 [](const std::unique_ptr<PythonTaskResultHandle> &lhs,
 			                    const std::unique_ptr<PythonTaskResultHandle> &rhs) {
@@ -2591,7 +2594,7 @@ private:
 				auto polled = handle->poll();
 				if (!polled.first) {
 					still_pending.push_back(std::move(handle));
-					if (on_output) {
+					if (on_output && preserve_task_order) {
 						for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
 							still_pending.push_back(std::move(pending[pending_index]));
 						}
@@ -2664,6 +2667,12 @@ private:
 				}
 			}
 			if (still_pending.empty()) {
+				break;
+			}
+			if (selected_only && !preserve_task_order) {
+				// Refresh selected attempts between readiness sweeps. Waiting on
+				// a lagging handle here would hide newly completed sibling tasks.
+				StorePythonTaskResultHandles(query_id, std::move(still_pending));
 				break;
 			}
 			if (std::chrono::steady_clock::now() >= deadline) {
