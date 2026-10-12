@@ -139,7 +139,7 @@ def test_unordered_reader_delivers_before_slow_task_finishes(ray_connection, tmp
 
 
 @pytest.mark.parametrize("query", ["ORDER BY value", "ORDER BY value DESC LIMIT 2 OFFSET 1", ""])
-def test_ordered_reader_waits_and_preserves_order(ray_connection, tmp_path, query):
+def test_ordered_reader_waits_and_honors_sql_order(ray_connection, tmp_path, query):
     if not query:
         ray_connection.execute("SET preserve_insertion_order=true")
     source = read_datasource(GatedSource(tmp_path), con=ray_connection)
@@ -153,8 +153,13 @@ def test_ordered_reader_waits_and_preserves_order(ray_connection, tmp_path, quer
             assert not future.done()
             (tmp_path / "release").touch()
             reader, first = future.result(timeout=30)
-            expected = [2, 1] if "DESC" in query else [0, 1, 2, 3]
-            assert first + reader.read_all().column(0).to_pylist() == expected
+            values = first + reader.read_all().column(0).to_pylist()
+            if query:
+                expected = [2, 1] if "DESC" in query else [0, 1, 2, 3]
+                assert values == expected
+            else:
+                # Partition collection order is unspecified without ORDER BY.
+                assert sorted(values) == [0, 1, 2, 3]
         finally:
             (tmp_path / "release").touch()
             if reader is None and not future.cancel():
