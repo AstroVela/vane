@@ -418,6 +418,8 @@ def test_input_copy_rejects_cross_connection_callbacks(tmp_path, monkeypatch, co
 )
 @pytest.mark.parametrize("action", ["execute", "bind", "close"])
 def test_input_kinds_reject_idle_sibling_entry(monkeypatch, source, configured, action):
+    if source == "pandas":
+        pytest.importorskip("pandas")
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -425,13 +427,14 @@ def test_input_kinds_reject_idle_sibling_entry(monkeypatch, source, configured, 
         import faulthandler
         import sys
         import numpy as np
-        import pandas as pd
         import pyarrow as pa
         import vane
         from vane.datasource import DataSource, DataSourceTask
         from vane.execution.request_admission import RequestAdmissionLimits
 
         source, configured, action = sys.argv[1:]
+        if source == "pandas":
+            import pandas as pd
         faulthandler.dump_traceback_later(15, exit=True)
         armed = False
         attempted = []
@@ -690,6 +693,8 @@ def test_filesystem_provider_finalizers_reject_connection_entry(monkeypatch, con
 @pytest.mark.parametrize("target", ["cursor", "sibling"])
 @pytest.mark.parametrize("action", ["execute", "close"])
 def test_input_metadata_callbacks_reject_connection_entry(monkeypatch, source, configured, target, action):
+    if source.startswith("pandas"):
+        pytest.importorskip("pandas")
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -697,7 +702,6 @@ def test_input_metadata_callbacks_reject_connection_entry(monkeypatch, source, c
         import faulthandler
         import sys
         import numpy as np
-        import pandas as pd
         import pyarrow as pa
         import vane
         from vane.datasource import DataSource, DataSourceTask
@@ -722,16 +726,19 @@ def test_input_metadata_callbacks_reject_connection_entry(monkeypatch, source, c
             else:
                 raise AssertionError("input metadata callback entered a connection")
 
-        class Frame(pd.DataFrame):
-            @property
-            def _constructor(self):
-                return Frame
-            def copy(self, *args, **kwargs):
-                callback("pandas_copy")
-                return super().copy(*args, **kwargs)
-            def keys(self):
-                callback("pandas_keys")
-                return super().keys()
+        if source.startswith("pandas"):
+            import pandas as pd
+
+            class Frame(pd.DataFrame):
+                @property
+                def _constructor(self):
+                    return Frame
+                def copy(self, *args, **kwargs):
+                    callback("pandas_copy")
+                    return super().copy(*args, **kwargs)
+                def keys(self):
+                    callback("pandas_keys")
+                    return super().keys()
 
         class Columns(dict):
             def keys(self):
