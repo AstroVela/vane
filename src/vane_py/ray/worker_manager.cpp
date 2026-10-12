@@ -366,7 +366,8 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
     const string &query_id, double timeout_s, const RayWorkerRuntime::QueryStatus *finished_status,
     const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
         *task_context_filter,
-    bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output, bool selected_only) {
+    bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output, bool selected_only,
+    bool preserve_task_order) {
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles;
 	{
 		lock_guard<mutex> guard(mutex_);
@@ -465,7 +466,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	}
 	const bool discard_unselected_outputs =
 	    !selected_only && finished_status && finished_status->selected_attempt_task_ids.empty();
-	if (on_output) {
+	if (on_output && preserve_task_order) {
 		std::stable_sort(handles.begin(), handles.end(),
 		                 [](const std::unique_ptr<RayWorkerRuntime::TaskResultHandleType> &lhs,
 		                    const std::unique_ptr<RayWorkerRuntime::TaskResultHandleType> &rhs) {
@@ -520,7 +521,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 			auto poll_res = handles[i]->poll();
 			if (!poll_res.first) {
-				if (on_output) {
+				if (on_output && preserve_task_order) {
 					break;
 				}
 				continue;
@@ -588,6 +589,16 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 		}
 		if (remaining == 0) {
+			break;
+		}
+		if (selected_only && !preserve_task_order) {
+			std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> pending_handles;
+			for (size_t i = 0; i < handles.size(); i++) {
+				if (!finished[i]) {
+					pending_handles.push_back(std::move(handles[i]));
+				}
+			}
+			StoreFteResultHandles(query_id, std::move(pending_handles));
 			break;
 		}
 		if (!had_progress) {
@@ -1486,15 +1497,16 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 
 DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 RayWorkerManager::wait_fte_query_streaming(const string &query_id, double timeout_s,
-                                           duckdb::distributed::MaterializedOutputCallback on_output) {
+                                           duckdb::distributed::MaterializedOutputCallback on_output,
+                                           bool preserve_task_order) {
 	const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
-	return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+	return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true, preserve_task_order);
 }
 
 DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerManager::WaitFteQuery(
     const string &query_id, double timeout_s,
     const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
-    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
+    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs, bool preserve_task_order) {
 	if (query_id.empty()) {
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 		    DuckDBError::value_error("query_id must be non-empty"));
@@ -1579,7 +1591,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 				        : -1.0;
 				const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
 				auto stream_res = DrainFteResultHandles(query_id, remaining_timeout_s, &status, task_context_filter,
-				                                        true, on_output, true);
+				                                        true, on_output, true, preserve_task_order);
 				if (stream_res.is_err()) {
 					return stream_res;
 				}
@@ -1622,7 +1634,8 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 		const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
 		auto drain_res = DrainFteResultHandles(
 		    query_id, remaining_timeout_s, has_finished_status ? &finished_status : nullptr, task_context_filter,
-		    stream_outputs, stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
+		    stream_outputs, stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false,
+		    preserve_task_order);
 		if (drain_res.is_err()) {
 			return drain_res;
 		}

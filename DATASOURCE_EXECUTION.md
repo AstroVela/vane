@@ -60,6 +60,37 @@ request returns exactly one slot. The native stream invalidates its execution
 context before teardown. Decoder and memory-probe failures return through the
 source error path; governed video exceptions retain their public categories.
 
+## Ray result delivery
+
+For a read whose rows do not require insertion order, use the connection setting
+`preserve_insertion_order=False`:
+
+```python
+import vane
+from vane.datasource import read_datasource
+
+con = vane.connect(config={"preserve_insertion_order": False})
+relation = read_datasource(source, con=con)
+with relation.to_arrow_reader(batch_size=1024) as reader:
+    for batch in reader:
+        consume(batch)
+```
+
+On Ray, plans that permit unordered output publish completed task results while
+other tasks are still running. A slow earlier task does not hold back a ready
+sibling. Results within each task keep their order; order between tasks is
+unspecified. This changes result delivery, without adding task admission limits
+or changing decoder and UDF backpressure.
+
+An explicit `ORDER BY` or TopN still preserves its required order. Blocking
+operators such as global sorts, aggregates, and materializing exchanges can
+still delay output. This setting does not remove those stage boundaries or
+stream unfinished task output. Write finalization keeps its existing contract.
+
+Readers can receive rows before a later task fails. Consume to successful EOF
+before treating the complete query as successful, and close readers when
+stopping early so outstanding query resources can be released.
+
 ## Regression checks
 
 Use an installed build, following [Development](DEVELOPMENT.md):
@@ -76,3 +107,12 @@ backpressure. Every query must return all 1,536 frame indices with their expecte
 multiplicities, without changing the resource limits. It has a deadline and
 cancels its own queries on failure. Separate tests cover memory recovery, FIFO
 admission, cancellation, and callbacks arriving before the scan returns `BLOCKED`.
+
+Ray result delivery has a separate local-cluster check. It gates a slow source
+task until the fast task's first result arrives, in both source orders, then
+checks ordered reads, late failures, and early reader close:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_ray_result_order.py
+scripts/run_installed_pytest.sh tests/fast/test_ray_result_contract.py -m 'not real_ray'
+```
