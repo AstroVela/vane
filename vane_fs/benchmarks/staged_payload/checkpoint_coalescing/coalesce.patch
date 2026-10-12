@@ -1,0 +1,111 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -59,9 +59,18 @@
+ 		if (worker.joinable())
+ 			worker.join();
+ 	}
+-	static int OnCommit(void *context, sqlite3 *, const char *, int frames) {
++	static int OnCommit(void *context, sqlite3 *writer, const char *, int frames) {
+ 		auto &self = *static_cast<Checkpointer *>(context);
+ 		if (self.Bytes(frames) >= START_BYTES) {
++			// Query the current WAL generation after COMMIT. Caching copied frames
++			// across a restart could subtract progress from a different generation.
++			// NOOP performs no backfill/sync and never waits for a checkpoint lock.
++			int log = -1, copied = -1;
++			auto code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &log, &copied);
++			if (code == SQLITE_OK && log >= copied && copied >= 0 && self.Bytes(log - copied) < START_BYTES)
++				return SQLITE_OK;
++			// An unknown/busy status conservatively retains the wake. Never report
++			// a status-query error from this hook after the write has committed.
+ 			{
+ 				std::lock_guard<std::mutex> lock(self.mutex);
+ 				self.requested = true;
+@@ -158,10 +167,10 @@
+ 					std::unique_ptr<Staging::CheckpointGuard> lease;
+ 					{
+ 						Staging::Guard publication(staging);
+-						// Only unpublished external data needs coalesced publication.
+-						// Once CLEAN, promptly backfill inline/namespace commits using
+-						// the original wake policy, even below the uncopied-byte budget.
+-						if (!retry && staging.Pending()) {
++						// Recheck pending work after a coalesced wake, including CLEAN
++						// namespace/inline commits. Another checkpoint may have caught up.
++						// A partial/failed pass keeps retrying without a further commit.
++						if (!retry) {
+ 							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+ 							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
+ 							           Bytes(frames - copied) < START_BYTES;
+--- a/tests/test_checkpoint_coalescing.cpp
++++ b/tests/test_checkpoint_coalescing.cpp
+@@ -8,7 +8,7 @@
+ 
+ static const auto foreground = std::this_thread::get_id();
+ static std::atomic<bool> hold_first {true}, waiting {false};
+-static std::atomic<int> worker_calls {0}, passive_calls {0};
++static std::atomic<int> worker_calls {0}, passive_calls {0}, partial_passes {0};
+ 
+ static void Require(bool value, const char *message) {
+ 	if (!value)
+@@ -34,8 +34,11 @@
+ 		}
+ 	}
+ 	auto code = __real_sqlite3_wal_checkpoint_v2(db, name, mode, frames, copied);
+-	if (background)
++	if (background) {
+ 		++worker_calls;
++		if (mode == SQLITE_CHECKPOINT_PASSIVE && code == SQLITE_OK && *frames > *copied)
++			++partial_passes;
++	}
+ 	return code;
+ }
+ struct Connection {
+@@ -105,24 +108,26 @@
+ 			staging.BeginBatch(writer.db);
+ 			writer.SQL("COMMIT");
+ 		}
++		auto calls = worker_calls.load();
+ 		for (int i = 0; i < 32; ++i) {
+-			auto calls = worker_calls.load();
+ 			worker.BeforeWrite(writer.db);
+ 			{
+ 				vane_fs::Staging::Guard publication(staging);
+ 				writer.SQL("INSERT INTO padding VALUES(zeroblob(4096))");
+ 			}
+-			Wait([&] { return worker_calls > calls; });
+ 			Require(passive_calls == 1, "Small WAL additions restarted a completed checkpoint");
+ 		}
+-		// A FULL publication on the same coordinator changes OPEN to CLEAN.
+-		// It must resume maintenance despite fewer than 16 MiB uncopied bytes.
++		std::this_thread::sleep_for(std::chrono::milliseconds(80));
++		Require(worker_calls == calls, "Small OPEN commits dispatched worker queries");
++		// FULL publishes data and the CLEAN fence without requiring immediate
++		// backfill of a small WAL tail. Durability is supplied by the real barrier.
+ 		{
+ 			vane_fs::Staging::Guard publication(staging);
+ 			staging.Publish(writer.db);
+ 			Require(!staging.Pending(), "Publication did not become CLEAN");
+ 		}
+-		Wait([] { return passive_calls > 1; });
++		std::this_thread::sleep_for(std::chrono::milliseconds(80));
++		Require(passive_calls == 1, "Small CLEAN tail dispatched backfill");
+ 		// Keep the original WAL generation pinned until its total frame count
+ 		// exceeds admission. Otherwise the next write can reuse it naturally.
+ 		worker.BeforeWrite(writer.db);
+@@ -130,6 +135,8 @@
+ 			vane_fs::Staging::Guard publication(staging);
+ 			writer.SQL("INSERT INTO padding VALUES(zeroblob(33554432))");
+ 		}
++		Wait([] { return partial_passes > 0; });
++		Require(!progress.CaughtUp(), "Reader did not pin the partial checkpoint");
+ 		reader.SQL("ROLLBACK");
+ 		// An already-started checkpoint must finish after the reader leaves,
+ 		// without needing another foreground commit to wake the worker.
+@@ -142,7 +149,7 @@
+ 		Require(std::filesystem::file_size(path + "-wal") <= 16777216,
+ 		        "Admission restart did not retain its original WAL bound");
+ 		sqlite3_wal_hook(writer.db, nullptr, nullptr);
+-		std::cout << "OPEN batching, CLEAN progress, reader release and WAL reuse passed\n";
++		std::cout << "OPEN/CLEAN dispatch coalescing, reader release and WAL reuse passed\n";
+ 		return 0;
+ 	} catch (const std::exception &error) {
+ 		hold_first = false;
