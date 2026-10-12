@@ -6058,16 +6058,8 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     executor._ref_bundle_output = False
     executor._task_futures_cv = threading.Condition()
     executor._task_futures_lock = executor._task_futures_cv
-    executor._task_futures = {future}
-    executor._task_future_meta = {
-        future: (
-            73,
-            1,
-            time.perf_counter(),
-            FakeAdmission(),
-            scope,
-        )
-    }
+    executor._task_futures = set()
+    executor._task_future_meta = {}
     executor._queue = deque()
     executor._result_admissions = deque()
     executor._queue_lock = threading.Lock()
@@ -6086,7 +6078,7 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
 
     monkeypatch.setattr(subprocess_exec, "_subprocess_debug_log", fail_debug_log)
 
-    executor._complete_task_submit(73, future)
+    executor._track_task_future(future, 73, 1, time.perf_counter(), FakeAdmission(), scope)
 
     assert events == ["debug", "release-admission"]
     assert executor._pending_batches == 0
@@ -9782,52 +9774,49 @@ def test_subprocess_worker_row_preserving_ref_bundle_requires_scalar_arg_count(p
 
 def test_subprocess_executor_close_escalates_scoped_pending_work(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
-
-    class FakeWorker:
-        def __init__(self) -> None:
-            self.cancelled = False
-            self.closed: list[bool] = []
-
-        def cancel_output_grants(self) -> None:
-            self.cancelled = True
-
-        def close(self, *, kill: bool = False) -> None:
-            self.closed.append(kill)
-
-    class FakeThreadPool:
-        def __init__(self) -> None:
-            self.shutdown_calls = []
-
-        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-            self.shutdown_calls.append({"wait": wait, "cancel_futures": cancel_futures})
+    from vane.execution.udf_lifecycle import ExecutionCancelledError
 
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.01")
-    executor = object.__new__(subprocess_exec.UDFExecutor)
-    executor._closed = False
-    executor._budget_wakeup_unregister = None
-    executor._task_futures_cv = threading.Condition()
-    executor._task_futures = {Future()}
-    executor._task_future_meta = {}
-    executor._execution_scopes_lock = threading.Lock()
-    scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
-    executor._execution_scopes = {scope}
-    executor._active_input_leases = set()
-    executor._active_input_leases_lock = threading.Lock()
-    executor._actor_pool = None
-    executor._task_pool = None
-    thread_pool = FakeThreadPool()
-    executor._executor = thread_pool
-    executor._workers = [FakeWorker()]
+    executor = subprocess_exec.UDFExecutor(
+        _subprocess_map_payload(lambda table: table, execution_backend="subprocess_task")
+    )
+    pool = executor._task_pool
+    release_pool = pool.release_ref
+    future = Future()
+    assert future.set_running_or_notify_cancel()
+    scope = executor._new_execution_scope()
+    executor._pending_batches = 1
+    executor._track_task_future(future, 1, 1, time.perf_counter(), None, scope)
+    events = []
 
-    done = threading.Event()
-    thread = threading.Thread(target=lambda: (executor.close(kill=False), done.set()), daemon=True)
-    thread.start()
+    def abort(scopes):
+        assert scopes == {scope}
+        assert scope.is_set()
+        events.append("abort")
+        # The backend terminates its invocation; normal completion cleanup
+        # must retire the future before close can drop this pool reference.
+        future.set_exception(ExecutionCancelledError("worker aborted"))
 
-    assert done.wait(timeout=1.0)
-    assert scope.is_set()
-    assert not executor._workers[0].cancelled
-    assert executor._workers[0].closed == [True]
-    assert thread_pool.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    def release(*, kill):
+        assert kill
+        assert not executor._task_futures
+        assert not executor._execution_scopes
+        assert scope.finished
+        events.append("release")
+        release_pool(kill=kill)
+
+    monkeypatch.setattr(pool, "abort_scopes", abort)
+    monkeypatch.setattr(pool, "release_ref", release)
+    try:
+        executor.close(kill=False)
+        assert events == ["abort", "release"]
+        assert executor._cleanup_finished
+        assert not executor.cleanup_pending()
+        assert executor._task_pool is None
+    finally:
+        if not future.done():
+            future.set_exception(ExecutionCancelledError("test cleanup"))
+        executor.close(kill=True)
 
 
 def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
@@ -9871,9 +9860,10 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
     assert executor._task_pool is None
 
 
-def test_subprocess_executor_close_continues_after_front_half_cleanup_failures():
+def test_subprocess_executor_close_continues_after_front_half_cleanup_failures(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.01")
     events: list[str] = []
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
 
@@ -9908,6 +9898,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
 
     executor = object.__new__(subprocess_exec.UDFExecutor)
     executor._closed = False
+    executor._cleanup_finished = False
     executor._lifecycle_lock = threading.RLock()
     executor._admission_authority = FakeAuthority()
     executor._queue = deque()
@@ -9950,6 +9941,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
             ".*planned budget wakeup failure"
             ".*planned abort failure"
             ".*planned future cancellation failure"
+            ".*pending UDF cleanup"
         ),
     ):
         executor.close(kill=True)
@@ -9962,8 +9954,19 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
         "cancel-waits",
         "abort",
         "cancel-future",
-        "release:True",
     ]
+    assert executor._task_pool is not None
+    assert executor._task_futures
+    assert not executor._cleanup_finished
+    assert executor._close_cleanup_pending
+
+    # Once the backend callback has retired, other cleanup errors must still
+    # be reported and must not prevent the remaining pool cleanup attempt.
+    executor._task_futures.clear()
+    executor._active_input_leases.clear()
+    with pytest.raises(RuntimeError, match="planned authority cleanup failure.*planned abort failure"):
+        executor.close(kill=True)
+    assert events[-1] == "release:True"
     assert executor._task_pool is None
 
 
@@ -10174,7 +10177,7 @@ def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypa
     assert executor._active_input_leases == set()
 
 
-def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_release():
+def test_subprocess_executor_timeout_retains_task_pool_until_cleanup_retry():
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -10190,6 +10193,9 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
 
     executor = object.__new__(subprocess_exec.UDFExecutor)
     executor._closed = False
+    executor._cleanup_finished = False
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
     executor._lifecycle_lock = threading.RLock()
     executor._admission_authority = None
     executor._queue = deque()
@@ -10209,13 +10215,13 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
         nonlocal cancel_wait_calls
         cancel_wait_calls += 1
         events.append(f"cancel-waits:{cancel_wait_calls}")
-        if cancel_wait_calls == 1:
-            return {scope}, []
-        return set(), [RuntimeError("planned escalation cleanup failure")]
+        errors = [RuntimeError("planned escalation cleanup failure")] if cancel_wait_calls == 2 else []
+        return {scope}, errors
 
     def cancel_futures():
         events.append("cancel-futures")
-        raise RuntimeError("planned future cancellation failure")
+        if events.count("cancel-futures") == 1:
+            raise RuntimeError("planned future cancellation failure")
 
     executor._cancel_local_shm_waits = cancel_waits
     executor._wait_for_pending_futures = lambda _timeout_s=None: False
@@ -10232,9 +10238,18 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
         "abort",
         "cancel-futures",
         "cancel-waits:2",
-        "release:True",
     ]
+    assert executor._task_pool is not None
+    assert not executor._cleanup_finished
+    assert executor._close_cleanup_pending
+
+    executor._wait_for_pending_futures = lambda _timeout_s=None: True
+    executor.close(kill=True)
+
+    assert events[-4:] == ["cancel-waits:3", "abort", "cancel-futures", "release:True"]
     assert executor._task_pool is None
+    assert executor._cleanup_finished
+    assert not executor._close_cleanup_pending
 
 
 def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
@@ -10391,14 +10406,14 @@ def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     executor._pending_lock = threading.Lock()
     executor._task_futures_cv = threading.Condition()
     executor._task_futures_lock = executor._task_futures_cv
-    executor._task_futures = {future}
-    executor._task_future_meta = {future: (None, 1, time.perf_counter(), None, scope)}
+    executor._task_futures = set()
+    executor._task_future_meta = {}
     executor._execution_scopes_lock = threading.Lock()
     executor._execution_scopes = {scope}
     executor._wakeup = None
     executor._wakeup_error = None
 
-    executor._complete_task_submit(None, future)
+    executor._track_task_future(future, None, 1, time.perf_counter(), None, scope)
 
     assert not executor._queue
     assert executor._pending_batches == 0

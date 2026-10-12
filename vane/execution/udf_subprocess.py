@@ -3666,7 +3666,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         )
         self._closed = False
         self._cleanup_finished = False
-        self._request_cleanup_pending = False
+        self._close_cleanup_pending = False
         self._finished_submitting = False
         self._wakeup: Callable[[], None] | None = None
         self._workers: list[_SingleSubprocessExecutor] = []
@@ -3964,8 +3964,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 try:
                     self._complete_task_submit(submit_id, done, cleanup_error=cleanup_error)
                 finally:
-                    if unit_task is not None:
-                        unit_task.finish()
+                    try:
+                        if unit_task is not None:
+                            unit_task.finish()
+                    finally:
+                        # Future.done() only covers backend execution. Retain
+                        # this owner through input, admission, scope and activity
+                        # cleanup before allowing close() to release its pool.
+                        with self._pending_lock:
+                            self._pending_batches = max(0, self._pending_batches - 1)
+                        with self._task_futures_cv:
+                            self._task_futures.discard(done)
+                            self._task_future_meta.pop(done, None)
+                            self._task_futures_cv.notify_all()
+                        self._notify_wakeup()
 
         future.add_done_callback(complete_task)
 
@@ -4142,15 +4154,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     admission.release()
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
-            with self._pending_lock:
-                self._pending_batches = max(0, self._pending_batches - 1)
-            with self._task_futures_cv:
-                self._task_futures.discard(future)
-                self._task_future_meta.pop(future, None)
-                self._task_futures_cv.notify_all()
             if scope is not None:
                 self._retire_execution_scope(scope)
-            self._notify_wakeup()
 
     def _submit_async(
         self,
@@ -4696,6 +4701,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         cancelled_scopes, wait_cleanup_errors = self._cancel_local_shm_waits()
         cleanup_errors.extend(wait_cleanup_errors)
         close_kill = bool(kill)
+        callbacks_finished = False
         if close_kill:
             actor_pool = self._actor_pool
             if actor_pool is not None:
@@ -4714,7 +4720,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             except BaseException as exc:
                 cleanup_errors.append(exc)
         else:
-            if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
+            callbacks_finished = self._wait_for_pending_futures(_subprocess_shutdown_grace_s())
+            if not callbacks_finished:
                 close_kill = True
                 actor_pool = self._actor_pool
                 if actor_pool is not None:
@@ -4734,21 +4741,19 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     cleanup_errors.append(exc)
                 _, escalation_cleanup_errors = self._cancel_local_shm_waits()
                 cleanup_errors.extend(escalation_cleanup_errors)
-        cancellation = getattr(self, "_request_cancellation", None)
-        if cancellation is not None or getattr(self, "_executor_cleanup", None) is not None:
-            # Worker termination can precede its future's transport cleanup or
-            # model replacement. Keep the request's owners until callbacks have
-            # run; a timeout leaves query cleanup retained for an explicit retry.
-            grace = 0.0 if self._request_cleanup_pending else _subprocess_shutdown_grace_s()
+        if not callbacks_finished:
+            # Worker termination can precede its future's completion cleanup.
+            # Standalone and query-bound executors retain the same ownership:
+            # closing a worker does not yet return its task admission.
+            grace = 0.0 if getattr(self, "_close_cleanup_pending", False) else _subprocess_shutdown_grace_s()
             if not self._wait_for_pending_futures(grace):
-                self._request_cleanup_pending = True
-                cleanup_errors.append(TimeoutError("request still has pending UDF cleanup"))
-                # Keep pool references as well as futures until callbacks have
-                # released outputs and physical slots. Native shutdown may
-                # discard its executor; the request cleanup scope retains it.
+                self._close_cleanup_pending = True
+                cleanup_errors.append(TimeoutError("executor still has pending UDF cleanup"))
+                # Retain futures and pool references for a later close retry.
+                # Waiting is per executor, so shared-pool peers can continue.
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]
-            self._request_cleanup_pending = False
+        self._close_cleanup_pending = False
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None

@@ -524,6 +524,13 @@ shutdown times out, the request stays `cancelling` and keeps its admission slot
 until callbacks release their outputs and execution slots and cleanup is retried
 through `request.shutdown()` or `runtime.close()`. This also applies without
 `task_limit`, `track_data`, or `data_limit`.
+
+Standalone local UDF executors follow the same completion boundary: a successful
+`close()` waits for their completion callbacks to release task admissions and
+finish scope and activity cleanup. A cleanup timeout retains the executor's
+futures and pool reference for an explicit close retry. The wait covers only
+that executor's invocations; other executors sharing the pool can keep running.
+
 Retries use each lease's shared-input ownership rules and each task's grant
 identities, so cleaning one request cannot release another request's data.
 Shared registered models remain resident. Shared-memory UDF outputs and their
