@@ -138,7 +138,8 @@ def test_pinned_consumer_can_progress_past_unrelated_inputs_once(monkeypatch):
     assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_output_owner_window_waits_for_physical_release_across_invocations(monkeypatch):
+@pytest.mark.parametrize("unrelated_pressure", [False, True])
+def test_output_owner_window_waits_for_physical_release_across_invocations(monkeypatch, unrelated_pressure):
     from vane.execution import ref_bundle as refs
     from vane.execution.udf_shm_store import LocalShmStore
 
@@ -146,6 +147,8 @@ def test_output_owner_window_waits_for_physical_release_across_invocations(monke
     monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     store = LocalShmStore(8192)
     store.add_client("owner-window")
+    if unrelated_pressure:
+        manager.acquire_allocation(1100)
 
     def output():
         grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
@@ -185,12 +188,15 @@ def test_output_owner_window_waits_for_physical_release_across_invocations(monke
         held_view.release()
         first.release()
         second.release()
+        if unrelated_pressure:
+            manager.release_allocation(1100)
         store.remove_client("owner-window")
     assert manager.snapshot()["usage_bytes"] == 0
     assert manager._owned_output_grants == {}
 
 
-def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch):
+@pytest.mark.parametrize("prior_owner", ["source", "intermediate"])
+def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch, prior_owner):
     from vane.execution import ref_bundle as refs
     from vane.execution.udf_shm_store import LocalShmStore
 
@@ -198,7 +204,7 @@ def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch):
     monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     store = LocalShmStore(8192)
     store.add_client("input-bridge")
-    prior = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    prior = manager.request_output_grant(1100, priority="consumer", owner_id=prior_owner)
     lease = store.allocate(128)
     ref = refs.LocalShmBlockRef(lease.allocation.identity, 128, allocation_lease=lease, input_owner_id="source")
     held = lease.fork()
@@ -228,7 +234,7 @@ def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch):
     assert manager._owned_input_allocations == {}
 
 
-@pytest.mark.parametrize("owner_id,outputs,strict", [("other", 1, False), ("source", 2, False), ("source", 1, True)])
+@pytest.mark.parametrize("owner_id,outputs,strict", [(None, 1, False), ("source", 2, False), ("source", 1, True)])
 def test_input_bridge_preserves_owner_window_and_strict_reservations(owner_id, outputs, strict):
     limit = [4000]
     manager = LocalShmBudgetManager(limit_factory=lambda: limit[0])
@@ -285,7 +291,7 @@ def test_failed_input_creation_returns_the_bridge_allowance(monkeypatch):
 
 @pytest.mark.parametrize(
     "owner_id,priority,strict",
-    [("source", "producer", False), ("other", "consumer", False), ("source", "consumer", True)],
+    [("source", "producer", False), (None, "consumer", False), ("source", "consumer", True)],
 )
 def test_owned_window_preserves_producer_owner_and_explicit_reservation_boundaries(owner_id, priority, strict):
     limit = [3000]

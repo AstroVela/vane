@@ -1460,14 +1460,16 @@ remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
 fork pin retains them. The input ACK records the consuming dependency without
 creating output credit; overlapping slices cannot multiply reserved bytes.
 Ordinary output admission allows a consumer holding live input to finish one
-complete block across the soft transport window. It also allows the same output
-source to bridge one retained prior block with a second block, so an actor that
-releases its previous input only after receiving the next batch can advance.
+complete block across the soft transport window. Each output source also has
+a bounded allowance to produce the next block, so an actor that releases its
+previous input only after receiving the next batch can advance. This includes
+sources with no live output of their own: in a longer pipeline, the retained
+block may belong to an intermediate operator.
 This additional allowance stops at two owned output grants across invocations;
 pending grants and converted grants count until their last physical lease is
 released. Descriptor release or an input ACK cannot reopen this allowance while
-a worker view or fork pin still holds the storage. The same source may allocate
-one next-call input while a prior output occupies this window; another input
+a worker view or fork pin still holds the storage. Each source may allocate
+one next-call input while it has room in this output window; another input
 must wait for that input's byte charge to be released. This lets the next call
 reach output admission without opening an unbounded input queue. Explicit per-task byte
 envelopes keep their hard boundary. The physical arena always enforces its own

@@ -177,21 +177,26 @@ def test_expanding_pipeline_releases_real_storage_under_small_budget(backend):
 
 
 @pytest.mark.parametrize(
-    "source_kind,source_backend,arena,copy_input",
+    "source_kind,source_backend,arena,copy_input,intermediate",
     [
-        ("generator", "subprocess_task", "16MiB", False),
-        ("table", "subprocess_task", "16MiB", False),
-        ("table", "subprocess_actor", "16MiB", False),
-        ("generator", "subprocess_task", "96KiB", False),
-        ("table", "subprocess_actor", "96KiB", False),
-        ("generator", "subprocess_task", "96KiB", True),
-        ("table", "subprocess_actor", "96KiB", True),
+        ("generator", "subprocess_task", "16MiB", False, False),
+        ("table", "subprocess_task", "16MiB", False, False),
+        ("table", "subprocess_actor", "16MiB", False, False),
+        ("generator", "subprocess_task", "96KiB", False, False),
+        ("table", "subprocess_actor", "96KiB", False, False),
+        ("generator", "subprocess_task", "96KiB", True, False),
+        ("table", "subprocess_actor", "96KiB", True, False),
+        ("table", "subprocess_actor", "16MiB", False, True),
+        ("table", "subprocess_actor", "16MiB", True, True),
     ],
 )
-def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind, source_backend, arena, copy_input):
+def test_actor_retaining_previous_input_can_receive_the_next_batch(
+    source_kind, source_backend, arena, copy_input, intermediate
+):
     script = textwrap.dedent(f"""
         import gc
         import threading
+        import time
         import pyarrow as pa
         import vane
         from vane.execution.ref_bundle import local_shm_budget_manager, local_shm_ref_budget_snapshot
@@ -202,12 +207,18 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind, 
                 yield pa.table({{'id': [value], 'payload': [b'x' * 65536]}})
 
         def materialize(batch):
+            if {intermediate!r}:
+                time.sleep(0.05)
             values = batch['id'].to_pylist()
             return pa.table({{'id': values, 'payload': [b'x' * 65536 for _ in values]}})
 
         class Materialize:
             def __call__(self, batch):
                 return materialize(batch)
+
+        class Copy:
+            def __call__(self, batch):
+                return pa.table(batch.to_pydict())
 
         class RetainingConsumer:
             def __init__(self):
@@ -231,7 +242,17 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind, 
                         execution_backend={source_backend!r}, batch_size=1, min_task_batch_size=1,
                         **({{'actor_number': 1}} if {source_backend!r} == 'subprocess_actor' else {{}}),
                         task_input_max_bytes=8, output_batch_size=1, output_target_max_bytes=1024,
-                    ).map_batches(
+                    )
+                    if {intermediate!r}:
+                        # The last actor retains Copy's output. Source has no
+                        # live output of its own when it needs its next input.
+                        rel = rel.map_batches(
+                            Copy, schema={{'id': 'BIGINT', 'payload': 'BLOB'}},
+                            execution_backend='subprocess_actor', actor_number=1,
+                            batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
+                            output_batch_size=1, output_target_max_bytes=1024,
+                        )
+                    rel = rel.map_batches(
                         RetainingConsumer, schema={{'id': 'BIGINT'}},
                         execution_backend='subprocess_actor', actor_number=1,
                         batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,

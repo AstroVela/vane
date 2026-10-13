@@ -543,6 +543,9 @@ def test_overflow_retirement_keeps_cleanup_owner_until_process_exits(
     monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 10_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    # Keep the producer waiting while testing overflow-worker retirement.
+    # Ordinary consumer progress may cross the soft transport budget.
+    reservation = manager.reserve_task_bytes(1, 1)
     manager.acquire_allocation(5000, name="held-output")
     source = udf_subprocess.UDFExecutor(
         payload(expand, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
@@ -659,6 +662,7 @@ def test_overflow_retirement_keeps_cleanup_owner_until_process_exits(
         for worker in retained:
             original_close(worker, kill=True)
         manager.release_allocation(5000, name="held-output")
+        reservation.release()
         source.close(kill=True)
         consumer.close(kill=True)
         if other_consumer is not None:

@@ -396,13 +396,14 @@ class LocalShmBudgetManager:
                     or self._usage_locked() == 0
                     or self._usage_locked() + requested <= limit
                     or (
-                        # A retained prior output may need the next call to
-                        # release it. Admit one input allocation to reach that
-                        # call, within the same bounded output window.
+                        # A downstream actor may retain another operator's
+                        # output until its next call. Each source needs one
+                        # input allocation to reach that call, even when none
+                        # of its own outputs remain live.
                         self._task_reservation_bytes == 0
                         and input_owner_id is not None
                         and not self._owned_input_allocations.get(input_owner_id)
-                        and 0 < len(self._owned_output_grants.get(input_owner_id, {})) < STREAM_BUFFER_BLOCKS
+                        and len(self._owned_output_grants.get(input_owner_id, {})) < STREAM_BUFFER_BLOCKS
                     )
                 )
 
@@ -897,10 +898,10 @@ class LocalShmBudgetManager:
                         and (
                             usage <= limit
                             or (consuming and not output_pending)
-                            # Bridge one retained prior output with the next
-                            # block that lets its consumer release it. Pending
-                            # grants count too, so this cannot grow the window.
-                            or 0 < owned_outputs < STREAM_BUFFER_BLOCKS
+                            # Pressure may belong to another operator in the
+                            # pipeline. Allow this source's initial block too;
+                            # pending and live grants still bound its window.
+                            or (owner_id is not None and owned_outputs < STREAM_BUFFER_BLOCKS)
                         )
                     )
 
