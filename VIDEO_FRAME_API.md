@@ -1,5 +1,35 @@
 # Streaming video frames
 
+## Inspecting media streams
+
+`vane.probe_media(file, connection=con)` is an eager Python value API for bounded
+audio/video container inspection. It accepts `File`, `AudioFile` and `VideoFile`,
+including logical byte ranges, and requires the `video` extra. It can also run
+inside a public Vane UDF. It does not load a model or select an ingest policy.
+
+```python
+probe = vane.probe_media(vane.File("clip.mkv"), connection=con)
+for stream in probe.streams:
+    print(stream.index, stream.kind, stream.codec, stream.language, stream.default)
+```
+
+The immutable `MediaProbe` reports format names, optional container duration and
+ordered `MediaStream` records. Stream times are in seconds on the container
+timeline, with the original rational time base retained. Video dimensions, audio
+sample rate/channels and default/forced/attached-picture dispositions are
+reported when applicable. Unknown values remain `None`. Declared language does
+not establish spoken language; an audio stream does not establish speech and a
+subtitle stream does not establish decoder support. Burned-in captions require
+separate visual processing.
+
+Detection inspects bytes rather than trusting the filename or MIME label.
+`max_bytes` defaults to 8 MiB (maximum 64 MiB); `buffer_size` defaults to 64 KiB.
+The probe reuses video metadata's range/read limits, bounded parser options and
+nested-I/O rejection. Errors use `VideoFileFormatError`/`VideoFileLimitError`;
+original I/O errors propagate. Exhausted probes never return a partial inventory.
+
+## Reading frames
+
 `vane.read_video_frames` and SQL `read_video_frames` emit one row per selected
 frame. The `data` column contains decoded `IMAGE('RGB', H, W)` values. Python
 fetches materialize them as UInt8 HWC NumPy arrays (`vane.Image` is a typing

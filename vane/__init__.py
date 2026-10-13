@@ -79,6 +79,7 @@ from vane._image_file import (
     image_file_metadata,
 )
 from vane._image_operators import convert_image, crop, decode_image, encode_image, image_hash, resize
+from vane._media_probe import MediaProbe, MediaStream, probe_media
 from vane._read_video_frames import read_video_frames
 from vane._video_clip import VideoClip, video_clip
 from vane._video_expressions import (
@@ -424,6 +425,9 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "MediaProbe",
+    "MediaStream",
+    "probe_media",
     "read_video_frames",
     "DEFAULT_EXTENSION_CATALOG_URL",
     "AudioFile",
