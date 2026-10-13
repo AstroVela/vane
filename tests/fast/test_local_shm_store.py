@@ -152,6 +152,25 @@ def test_direct_ipc_size_failure_does_not_leave_an_exported_mapping(monkeypatch,
     assert not (Path("/dev/shm") / created[0].name).exists()
 
 
+@pytest.mark.parametrize("size_delta", [-16, 16])
+def test_size_mismatch_cannot_overwrite_adjacent_allocation(pooled_shm_worker, size_delta):
+    block = refs.prepare_local_shm_block(pa.table({"blob": [b"x" * 4096]}))
+    block = replace(block, ipc_size_bytes=block.ipc_size_bytes + size_delta)
+    allocation = pooled_shm_worker.reserve_write(1, block.ipc_size_bytes)
+    guard = pooled_shm_worker.store.allocate(512)
+    region = pooled_shm_worker.store.buffer(guard.allocation)
+    region[:] = b"g" * 512
+    try:
+        with pytest.raises((pa.ArrowException, OSError, ValueError)):
+            refs.make_pooled_shm_descriptor([block], allocation=allocation, grant_id=1)
+        assert bytes(region) == b"g" * 512
+    finally:
+        region.release()
+        guard.release()
+        pooled_shm_worker.finish_write(1)
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 0
+
+
 def test_query_arena_pin_survives_last_worker_and_retries_failed_cleanup(monkeypatch):
     monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64KiB")
     query = storage.LocalQueryShmStore()
