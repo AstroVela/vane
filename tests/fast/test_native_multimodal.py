@@ -318,6 +318,178 @@ def test_worker_native_cleanup_acknowledges_only_a_stopped_engine(family, kind, 
         executor.close()
 
 
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("entry,failures", [("worker", 1), ("worker", 3), ("public", 1)])
+def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, family, backend, entry, failures):
+    import json
+    from pathlib import Path
+
+    import cloudpickle
+    import psutil
+    import pyarrow as pa
+
+    import vane
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import embed
+    from vane.ai.functions import _adapt_batch_wrapper_for_backend, _EmbedTextBatch
+    from vane.ai.providers._native_inference import NativeTextEmbedderDescriptor
+    from vane.pickle import dumps
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    marker = str(tmp_path / "engine-events.jsonl")
+
+    class WorkerEmbedding(NativeTextEmbedderDescriptor):
+        def instantiate(self):
+            import subprocess
+
+            install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
+            runtime = super().instantiate()
+            ensure = runtime._ensure_engine
+
+            def ensure_engine():
+                engine = ensure()
+                if hasattr(engine, "shutdown_attempts"):
+                    return engine
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(120)", marker],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                engine.shutdown_attempts = 0
+                shutdown = engine.shutdown
+
+                def record(event):
+                    with open(marker, "a") as output:
+                        output.write(json.dumps({"event": event, "pid": child.pid}) + "\n")
+
+                record("started")
+
+                def shutdown_once_ready():
+                    engine.shutdown_attempts += 1
+                    record("shutdown_attempt")
+                    if engine.shutdown_attempts <= failures:
+                        raise TimeoutError("native engine child is still running")
+                    shutdown()
+                    child.terminate()
+                    child.wait(timeout=5)
+                    record("stopped")
+
+                engine.shutdown = shutdown_once_ready
+                return engine
+
+            runtime._ensure_engine = ensure_engine
+            return runtime
+
+    descriptor = load_provider(family).get_text_embedder("configured-encoder", 2, options={"gpus_per_actor": 0})
+    descriptor.__class__ = WorkerEmbedding
+    worker = None
+    try:
+        if entry == "worker":
+            replies = []
+            recv = subprocess_exec._recv_message
+            checked_pending_submit = False
+
+            def observe_reply(sock):
+                nonlocal checked_pending_submit
+                msg_type, payload = recv(sock)
+                replies.append(msg_type)
+                if (
+                    msg_type == subprocess_exec._MSG_ERROR
+                    and backend == "subprocess_task"
+                    and failures == 3
+                    and not checked_pending_submit
+                ):
+                    import struct
+
+                    checked_pending_submit = True
+                    # Even an empty new request must not replace a task whose
+                    # executor still owns failed cleanup resources.
+                    empty = pa.table({"text": pa.array([], type=pa.string())})
+                    sink = pa.BufferOutputStream()
+                    with pa.ipc.new_stream(sink, empty.schema) as writer:
+                        writer.write_table(empty)
+                    assert worker is not None and worker._data_shm is not None
+                    size = subprocess_exec._write_ipc_to_shm(worker._data_shm, sink.getvalue().to_pybytes())
+                    subprocess_exec._send_message(sock, subprocess_exec._MSG_SUBMIT, struct.pack("<Q", size))
+                    retry_type, _ = recv(sock)
+                    assert retry_type == subprocess_exec._MSG_ERROR
+                if msg_type == subprocess_exec._MSG_ACK:
+                    assert '"event": "stopped"' in Path(marker).read_text()
+                return msg_type, payload
+
+            monkeypatch.setattr(subprocess_exec, "_recv_message", observe_reply)
+            wrapper = _EmbedTextBatch(descriptor, "text", "out", 2, max_retries=0)
+            worker = subprocess_exec._SingleSubprocessExecutor(
+                {
+                    "function_pickle": dumps(_adapt_batch_wrapper_for_backend(wrapper, backend)),
+                    "udf_name": "native_worker_cleanup_retry",
+                    "call_mode": "map_batches",
+                    "execution_backend": backend,
+                    "batch_size": 1,
+                    "output_schema": [{"name": "out", "type": "FLOAT[2]"}],
+                }
+            )
+            if backend == "subprocess_task":
+                with pytest.raises(Exception, match="TimeoutError"):
+                    worker.submit(pa.table({"text": ["hello"]}))
+                worker.close(kill=False)
+            else:
+                worker.submit(pa.table({"text": ["hello"]}))
+                if failures == 3:
+                    with pytest.raises(Exception, match="TimeoutError"):
+                        worker.close(kill=False)
+                else:
+                    worker.close(kill=False)
+            assert (subprocess_exec._MSG_ACK in replies) == (failures == 1)
+            if failures == 3:
+                assert replies.count(subprocess_exec._MSG_ERROR) == (2 if backend == "subprocess_task" else 1)
+        else:
+            base = type(load_provider(family))
+
+            class WorkerProvider(base):
+                def get_text_embedder(self, *args, **kwargs):
+                    return descriptor
+
+            with vane.connect() as connection:
+                relation = embed(
+                    connection.sql("select 'hello' as text"),
+                    vane.col("text"),
+                    provider=WorkerProvider(),
+                    model="configured-encoder",
+                    dimensions=2,
+                    gpus_per_actor=0,
+                    execution_backend=backend,
+                    max_retries=0,
+                )
+                if backend == "subprocess_task":
+                    with pytest.raises(Exception, match="TimeoutError"):
+                        relation.fetchall()
+                else:
+                    assert len(relation.fetchall()) == 1
+        events = [json.loads(line) for line in Path(marker).read_text().splitlines()]
+        assert [event["event"] for event in events] == ["started"] + ["shutdown_attempt"] * (failures + 1) + ["stopped"]
+        assert not psutil.pid_exists(events[0]["pid"])
+    finally:
+        try:
+            if worker is not None:
+                worker.close(kill=True)
+        finally:
+            if Path(marker).exists():
+                events = [json.loads(line) for line in Path(marker).read_text().splitlines()]
+                for pid in {event["pid"] for event in events}:
+                    try:
+                        child = psutil.Process(pid)
+                        if child.cmdline()[-1:] == [marker]:
+                            child.kill()
+                            psutil.wait_procs([child], timeout=5)
+                    except psutil.NoSuchProcess:
+                        pass
+
+
 def clip():
     return VideoClip((np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8, 3), dtype=np.uint8)), (0.125, 1.375), (4, 18))
 

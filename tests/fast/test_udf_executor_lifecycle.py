@@ -9734,17 +9734,15 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
-    monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
     monkeypatch.setattr(worker, "make_pooled_shm_descriptor", make_descriptor)
-    monkeypatch.setattr(worker, "configure_loaded_torch_threads", lambda: None)
 
-    _data_shm, msg_type, payload = worker._execute_task_submit(
-        {"call_mode": "map_batches"},
+    _data_shm, msg_type, payload = worker._execute_submit(
+        FakeRuntimeExecutor({"call_mode": "map_batches"}),
         pa.table({"x": [1, 2, 3]}),
         data_shm=None,
         produce_ref_bundle_output=True,
         submit_count=3,
-        log_submit=False,
+        finish_before_drain=True,
         sock=sock,
     )
 
@@ -9754,7 +9752,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     assert descriptor["metadata"] == [{"rows": [3], "num_rows": 1, "ipc_size_bytes": 1}]
     assert descriptor["names"] == ["rows"]
     assert created and created[0].finished
-    assert created[0].closed
+    assert not created[0].closed  # The worker control loop owns task cleanup.
 
 
 @pytest.mark.parametrize(

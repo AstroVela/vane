@@ -588,44 +588,6 @@ def _execute_submit(
     return data_shm, _MSG_OK, struct.pack("<Q", result_size)
 
 
-def _execute_task_submit(
-    payload: dict[str, Any],
-    input_table: pa.Table,
-    data_shm: shared_memory.SharedMemory,
-    produce_ref_bundle_output: bool,
-    submit_count: int,
-    log_submit: bool,
-    sock: socket.socket,
-    input_lease_id: int | None = None,
-) -> tuple[shared_memory.SharedMemory, int, bytes]:
-    if input_table.num_rows == 0:
-        return data_shm, _MSG_OK, struct.pack("<Q", 0)
-    executor = RuntimeUDFExecutor(_streaming_payload(payload), cache_callable=_callable_cache_enabled(payload))
-    configure_loaded_torch_threads()
-    try:
-        if log_submit:
-            _worker_thread_log(
-                "task_executor_ready",
-                payload,
-                submit_count=submit_count,
-                rows=input_table.num_rows,
-            )
-        return _execute_submit(
-            executor,
-            input_table,
-            data_shm,
-            produce_ref_bundle_output,
-            sock=sock,
-            submit_count=submit_count,
-            input_lease_id=input_lease_id,
-            finish_before_drain=True,
-        )
-    finally:
-        # close() flushes via finished_submitting() and releases the callable
-        # under its own finally, so cleanup runs even if the flush raises.
-        executor.close()
-
-
 def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str, shm_fd: int) -> None:
     sock = socket.socket(fileno=sock_fd)
     shm_client = initialize_worker_shm_client(shm_fd)
@@ -683,6 +645,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 raise ValueError("submit message payload must contain the shared-memory byte size")
 
             try:
+                if subprocess_mode == "task" and executor is not None:
+                    raise RuntimeError("subprocess task worker still owns an executor awaiting cleanup")
                 input_lease_id = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
@@ -733,16 +697,38 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         msg_type=msg_type,
                     )
                 if subprocess_mode == "task":
-                    data_shm, result_msg_type, result_payload = _execute_task_submit(
-                        payload,
-                        input_table,
-                        data_shm,
-                        produce_ref_bundle_output,
-                        submit_count,
-                        log_submit,
-                        sock,
-                        input_lease_id=input_lease_id,
-                    )
+                    if input_table.num_rows == 0:
+                        result_msg_type, result_payload = _MSG_OK, struct.pack("<Q", 0)
+                    else:
+                        # Publish ownership before setup or execution can fail.
+                        # A failed close remains owned by this control loop for
+                        # _MSG_CLOSE and final teardown; it cannot be replaced
+                        # by the next task or acknowledged as already cleaned.
+                        executor = RuntimeUDFExecutor(
+                            _streaming_payload(payload), cache_callable=_callable_cache_enabled(payload)
+                        )
+                        try:
+                            configure_loaded_torch_threads()
+                            if log_submit:
+                                _worker_thread_log(
+                                    "task_executor_ready",
+                                    payload,
+                                    submit_count=submit_count,
+                                    rows=input_table.num_rows,
+                                )
+                            data_shm, result_msg_type, result_payload = _execute_submit(
+                                executor,
+                                input_table,
+                                data_shm,
+                                produce_ref_bundle_output,
+                                sock=sock,
+                                submit_count=submit_count,
+                                input_lease_id=input_lease_id,
+                                finish_before_drain=True,
+                            )
+                        finally:
+                            executor.close()
+                            executor = None
                 else:
                     if executor is None:
                         raise RuntimeError("subprocess actor worker executor is not initialized")
