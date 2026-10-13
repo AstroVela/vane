@@ -43,7 +43,7 @@ def test_public_ie_join_preserves_equality_tail(tmp_path, mode):
 def test_public_ie_join_parallel_outer_payloads(tmp_path, mode):
     with (
         vane.connect(config={"threads": 1}) as local,
-        vane.Runtime(resources(tmp_path, cpus_per_worker=4)) as application,
+        vane.Runtime(resources(tmp_path, worker_count=1, cpus_per_worker=4)) as application,
         application.connect() as connection,
     ):
         for sql in IE_JOIN_CASES[-2:]:
