@@ -1,7 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
-// duckdb/execution/operator/join/physical_piecewise_merge_join.hpp
+// duckdb/execution/operator/join/physical_iejoin.hpp
 //
 //
 //===----------------------------------------------------------------------===//
@@ -26,6 +32,9 @@ public:
 	PhysicalIEJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &left,
 	               PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
 	               idx_t estimated_cardinality);
+	//! Restore ordered conditions; the plan deserializer attaches children and projection maps.
+	PhysicalIEJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> cond,
+	               JoinType join_type, idx_t estimated_cardinality);
 
 	vector<LogicalType> join_key_types;
 	vector<BoundOrderByNode> lhs_orders;
@@ -71,6 +80,9 @@ public:
 
 public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+
+private:
+	void InitializeOrders();
 };
 
 } // namespace duckdb

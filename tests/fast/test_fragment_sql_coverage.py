@@ -63,6 +63,26 @@ RANGE_JOIN_CASES += [
     for kind in ("inner", "left", "full outer")
 ]
 
+# Two range predicates cross another planner threshold: larger inputs use
+# IE_JOIN, including inside the native delimiter scope of a correlated COUNT.
+IE_JOIN_CASES = [
+    f"select a.range, (select count(*) from range({count}) b "
+    f"where b.range between a.range and a.range+1) n from range({count}) a"
+    for count in (0, 3, 10, 2000, 4097)
+]
+IE_JOIN_CASES += [
+    "select a.payload, b.payload from "
+    "(select case when range % 17=0 then null else range//2 end k, range+100 payload from range(2500)) a "
+    f"{kind} join "
+    "(select case when range % 13=0 then null else range//2 end k, range+200 payload from range(2300)) b "
+    "on a.k>=b.k and a.k<b.k+2 and a.payload<>b.payload"
+    for kind in ("inner", "left", "full outer")
+]
+IE_JOIN_EQUALITY_TAIL = (
+    "select a.range+100 payload_a, b.range+200 payload_b from range(2500) a join range(2300) b "
+    "on a.range>=b.range and a.range<b.range+2 and a.range%3=b.range%3"
+)
+
 DETERMINISTIC_LAMBDAS = [
     "select list_transform([range, null], lambda x: x+1) from range(4)",
     "select list_transform([range], lambda x: list_transform([x, x+1], lambda y: y*2)) from range(4)",
@@ -87,7 +107,7 @@ CONTEXT_READS = [
 
 
 @pytest.mark.parametrize("partitions", [1, 2, 5])
-@pytest.mark.parametrize("sql", SQL_CASES + RANGE_JOIN_CASES)
+@pytest.mark.parametrize("sql", SQL_CASES + RANGE_JOIN_CASES + IE_JOIN_CASES)
 def test_fragment_subqueries_and_shared_state(sql, partitions):
     with vane.connect(config={"threads": 1}) as connection:
         expected = connection.execute(sql).fetchall()
@@ -104,6 +124,31 @@ def test_correlated_inequality_crosses_native_join_threshold(count, operator):
         assert sorted(execute_graph(connection, compile_sql(connection, sql, partitions=2))) == [
             (row, min(row, count)) for row in range(10)
         ]
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+@pytest.mark.parametrize("count,operator", [(10, "PIECEWISE_MERGE_JOIN"), (2000, "IE_JOIN")])
+def test_correlated_between_crosses_native_ie_join_threshold(count, operator, partitions):
+    sql = (
+        f"select a.range, (select count(*) from range({count}) b "
+        f"where b.range between a.range and a.range+1) n from range({count}) a"
+    )
+    with vane.connect(config={"threads": 1}) as connection:
+        plan = connection.execute("explain (format json) " + sql).fetchone()[1]
+        assert operator in plan
+        expected = [(row, min(2, count - row)) for row in range(count)]
+        assert sorted(connection.execute(sql).fetchall()) == expected
+        assert sorted(execute_graph(connection, compile_sql(connection, sql, partitions))) == expected
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+def test_ie_join_preserves_range_conditions_before_equality_tail(partitions):
+    with vane.connect(config={"threads": 1, "prefer_range_joins": True}) as connection:
+        plan = connection.execute("explain (format json) " + IE_JOIN_EQUALITY_TAIL).fetchone()[1]
+        assert "IE_JOIN" in plan
+        expected = connection.execute(IE_JOIN_EQUALITY_TAIL).fetchall()
+        graph = compile_sql(connection, IE_JOIN_EQUALITY_TAIL, partitions)
+        assert Counter(execute_graph(connection, graph)) == Counter(expected)
 
 
 @pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])

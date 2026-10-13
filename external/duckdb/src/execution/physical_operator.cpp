@@ -61,6 +61,7 @@
 #include "duckdb/execution/operator/join/physical_positional_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
+#include "duckdb/execution/operator/join/physical_iejoin.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
@@ -1614,7 +1615,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		copy->write_empty_file = write_empty_file;
 		return unique_ptr<PhysicalOperator>(std::move(copy));
 	}
-	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN: {
+	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+	case PhysicalOperatorType::IE_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
 		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
 		auto left_map = deserializer.ReadProperty<PhysicalRangeJoin::ProjectionMapping>(105, "left_projection_map");
@@ -1622,8 +1624,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto unprojected = deserializer.ReadProperty<vector<LogicalType>>(107, "unprojected_types");
 		LogicalComparisonJoin logical_join(join_type);
 		logical_join.types = std::move(types);
-		auto join = make_uniq<PhysicalPiecewiseMergeJoin>(physical_plan, logical_join, std::move(conditions), join_type,
-		                                                  estimated_cardinality);
+		unique_ptr<PhysicalRangeJoin> join;
+		if (op_type == PhysicalOperatorType::IE_JOIN) {
+			join = make_uniq<PhysicalIEJoin>(physical_plan, logical_join, std::move(conditions), join_type,
+			                                 estimated_cardinality);
+		} else {
+			join = make_uniq<PhysicalPiecewiseMergeJoin>(physical_plan, logical_join, std::move(conditions), join_type,
+			                                             estimated_cardinality);
+		}
 		join->left_projection_map = std::move(left_map);
 		join->right_projection_map = std::move(right_map);
 		join->unprojected_types = std::move(unprojected);

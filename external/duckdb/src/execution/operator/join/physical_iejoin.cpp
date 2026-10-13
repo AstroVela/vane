@@ -26,12 +26,29 @@ PhysicalIEJoin::PhysicalIEJoin(PhysicalPlan &physical_plan, LogicalComparisonJoi
                                idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info)
     : PhysicalRangeJoin(physical_plan, op, PhysicalOperatorType::IE_JOIN, left, right, std::move(cond), join_type,
                         estimated_cardinality, std::move(pushdown_info)) {
+	InitializeOrders();
+}
+
+PhysicalIEJoin::PhysicalIEJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> cond,
+                               JoinType join_type, idx_t estimated_cardinality)
+    : PhysicalRangeJoin(physical_plan, op, PhysicalOperatorType::IE_JOIN, std::move(cond), join_type,
+                        estimated_cardinality) {
+	InitializeOrders();
+}
+
+void PhysicalIEJoin::InitializeOrders() {
 	// 1. let L1 (resp. L2) be the array of column X (resp. Y)
-	D_ASSERT(conditions.size() >= 2);
+	if (conditions.size() < 2) {
+		throw InvalidInputException("IE join requires two leading range conditions");
+	}
+	for (auto &condition : conditions) {
+		if (condition.left->return_type != condition.right->return_type) {
+			throw InvalidInputException("IE join condition types differ");
+		}
+		join_key_types.push_back(condition.left->return_type);
+	}
 	for (idx_t i = 0; i < 2; ++i) {
 		auto &cond = conditions[i];
-		D_ASSERT(cond.left->return_type == cond.right->return_type);
-		join_key_types.push_back(cond.left->return_type);
 
 		// Convert the conditions to sort orders
 		auto left = cond.left->Copy();
@@ -56,12 +73,6 @@ PhysicalIEJoin::PhysicalIEJoin(PhysicalPlan &physical_plan, LogicalComparisonJoi
 		}
 		lhs_orders.emplace_back(sense, OrderByNullType::NULLS_LAST, std::move(left));
 		rhs_orders.emplace_back(sense, OrderByNullType::NULLS_LAST, std::move(right));
-	}
-
-	for (idx_t i = 2; i < conditions.size(); ++i) {
-		auto &cond = conditions[i];
-		D_ASSERT(cond.left->return_type == cond.right->return_type);
-		join_key_types.push_back(cond.left->return_type);
 	}
 }
 

@@ -476,6 +476,7 @@ void CheckOperator(PhysicalOperator &op, idx_t children, bool scoped = false) {
 	case PhysicalOperatorType::CROSS_PRODUCT:
 	case PhysicalOperatorType::NESTED_LOOP_JOIN:
 	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+	case PhysicalOperatorType::IE_JOIN:
 	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
 	case PhysicalOperatorType::CTE:
 		if (children == 2) {
@@ -709,6 +710,7 @@ public:
 		case PhysicalOperatorType::CROSS_PRODUCT:
 		case PhysicalOperatorType::NESTED_LOOP_JOIN:
 		case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+		case PhysicalOperatorType::IE_JOIN:
 		case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
 			return Scoped(op);
 		default:
@@ -841,8 +843,9 @@ private:
 				auto &join = op.Cast<PhysicalHashJoin>();
 				join.filter_pushdown.reset();
 				join.join_stats.clear();
-			} else if (op.type == PhysicalOperatorType::PIECEWISE_MERGE_JOIN) {
-				op.Cast<PhysicalPiecewiseMergeJoin>().filter_pushdown.reset();
+			} else if (op.type == PhysicalOperatorType::PIECEWISE_MERGE_JOIN ||
+			           op.type == PhysicalOperatorType::IE_JOIN) {
+				static_cast<PhysicalRangeJoin &>(op).filter_pushdown.reset();
 			} else if (op.type == PhysicalOperatorType::TOP_N) {
 				op.Cast<PhysicalTopN>().dynamic_filter.reset();
 			}

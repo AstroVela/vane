@@ -35,8 +35,6 @@ public:
 	PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> cond,
 	                           JoinType join_type, idx_t estimated_cardinality);
 
-	void SerializeOperatorData(Serializer &serializer) const override;
-
 	vector<LogicalType> join_key_types;
 	vector<BoundOrderByNode> lhs_orders;
 	vector<BoundOrderByNode> rhs_orders;

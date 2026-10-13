@@ -7,7 +7,6 @@
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
 #include "duckdb/common/types/row/block_iterator.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -34,14 +33,6 @@ PhysicalPiecewiseMergeJoin::PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_pl
     : PhysicalRangeJoin(physical_plan, op, PhysicalOperatorType::PIECEWISE_MERGE_JOIN, std::move(cond), join_type,
                         estimated_cardinality) {
 	InitializeOrders();
-}
-
-void PhysicalPiecewiseMergeJoin::SerializeOperatorData(Serializer &serializer) const {
-	serializer.WriteProperty(103, "join_type", join_type);
-	serializer.WriteProperty(104, "conditions", conditions);
-	serializer.WriteProperty(105, "left_projection_map", left_projection_map);
-	serializer.WriteProperty(106, "right_projection_map", right_projection_map);
-	serializer.WriteProperty(107, "unprojected_types", unprojected_types);
 }
 
 void PhysicalPiecewiseMergeJoin::InitializeOrders() {

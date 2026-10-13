@@ -162,6 +162,9 @@ public:
 	vector<LogicalType> unprojected_types;
 
 public:
+	//! Range-join metadata shared by piecewise merge and IE join plans.
+	void SerializeOperatorData(Serializer &serializer) const override;
+
 	// Gather the result values and slice the payload columns to those values.
 	static void SliceSortedPayload(DataChunk &chunk, GlobalSortedTable &table, ExternalBlockIteratorState &state,
 	                               TupleDataChunkState &chunk_state, const idx_t chunk_idx,

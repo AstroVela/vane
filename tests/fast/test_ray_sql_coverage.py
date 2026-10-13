@@ -11,6 +11,8 @@ import vane
 from tests.fast.test_fragment_sql_coverage import (
     CONTEXT_READS,
     DETERMINISTIC_LAMBDAS,
+    IE_JOIN_CASES,
+    IE_JOIN_EQUALITY_TAIL,
     RANGE_JOIN_CASES,
     SQL_CASES,
     UNSTABLE_LAMBDAS,
@@ -22,11 +24,27 @@ pytestmark = [pytest.mark.real_ray, pytest.mark.usefixtures("ray_local")]
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_ie_join_preserves_equality_tail(tmp_path, mode):
+    with (
+        vane.connect(config={"threads": 1, "prefer_range_joins": True}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect(config={"prefer_range_joins": True}) as connection,
+    ):
+        expected = local.execute(IE_JOIN_EQUALITY_TAIL).fetchall()
+        with connection.query(
+            IE_JOIN_EQUALITY_TAIL, options=options(execution=60) if mode == "fte" else None
+        ) as result:
+            table = result.collect()
+            assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected)
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_subquery_and_cte_semantics(tmp_path, mode):
     limits = resources(tmp_path, max_active_queries=1, max_results=1, task_contexts_per_worker=64, io_concurrency=256)
     with vane.connect() as local, vane.Runtime(limits) as application, application.connect() as connection:
         # Reuse the worker pool so CTE state cannot accidentally survive a query.
-        for sql in SQL_CASES + RANGE_JOIN_CASES + SQL_CASES[-4:-2]:
+        for sql in SQL_CASES + RANGE_JOIN_CASES + IE_JOIN_CASES + SQL_CASES[-4:-2]:
             expected = local.execute(sql).fetchall()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 table = result.collect()
