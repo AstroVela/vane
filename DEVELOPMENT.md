@@ -64,6 +64,20 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+For the optional `qwen3_vl` provider, run
+`scripts/run_installed_pytest.sh tests/fast/test_qwen3_vl.py` before the base gate.
+Its CPU fixtures check lazy registration, tokenizer postprocessing, trained
+weight validation and media budgets without downloaded weights. Real processor
+tests also check exact video tokens, temporal boundaries, timestamps, mixed
+batches and unchanged image/text processing with an authored tokenizer/template.
+Tensor/SDK cases require the `qwen3_vl` extra. Separately validate a real local
+checkpoint on a BF16 CUDA worker through the default Ray runner: compare query
+and video inputs/vectors with that checkpoint's reference encodings, then
+exercise video ingestion, search and restart with the paired Context profile.
+Query parity alone does not validate video encoding. Record model/dependency
+identities and sampling settings; CPU fixtures do not establish model quality.
+See the [provider example](examples/qwen3_vl_sqr.py) for its fixed contract.
+
 ## Building a loadable extension artifact
 
 For the Gravitino Catalog and Fileset connector, see
