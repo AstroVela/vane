@@ -36,9 +36,6 @@ public:
 	QueryResultMemoryType memory_type;
 	PhysicalOperator &plan;
 	vector<string> names;
-	//! Opt in to flushing partial output between source batches, even when
-	//! intermediate filters produce no rows. Ordinary collectors do not opt in.
-	bool requires_periodic_flush = false;
 
 public:
 	static unique_ptr<PhysicalOperator> GetResultCollector(ClientContext &context, PreparedStatementData &data);
@@ -46,13 +43,6 @@ public:
 public:
 	//! The final method used to fetch the query result from this operator
 	virtual unique_ptr<QueryResult> GetResult(GlobalSinkState &state) const = 0;
-
-	//! Runs on the pipeline thread, with the same local state as Sink. BLOCKED
-	//! must register a wakeup and retain its pending output for a retry. A source
-	//! about to block forces a flush regardless of the collector's time budget.
-	virtual SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &, bool force) const {
-		return SinkResultType::NEED_MORE_INPUT;
-	}
 
 	bool IsSink() const override {
 		return true;

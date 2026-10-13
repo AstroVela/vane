@@ -3,6 +3,7 @@
 
 """Execution work scales with groups and frames rather than input batches."""
 
+import json
 import time
 from collections import Counter
 
@@ -17,6 +18,74 @@ from vane.execution.pipelined_plan import placement
 from vane.execution.pipelined_worker import _Query
 from vane.execution.plan import Distribution
 from vane.execution.worker_resources import pipelined_demand
+
+
+def profile_fragment_scans(connection, monkeypatch):
+    scans = []
+    execute = native._execute_fragment_for_test
+
+    def visit(node):
+        if node.get("operator_type") == "TABLE_SCAN" and node["extra_info"].get("Function") == "READ_PARQUET":
+            scans.append(node)
+        for child in node.get("children", []):
+            visit(child)
+
+    def profiled(*args):
+        rows = execute(*args)
+        visit(json.loads(connection.get_profiling_information("json")))
+        return rows
+
+    monkeypatch.setattr(native, "_execute_fragment_for_test", profiled)
+    connection.execute("PRAGMA enable_profiling='no_output'")
+    return scans
+
+
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("column_type", ["INTEGER", "BIGINT"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_broadcast_join_filters_local_parquet_scan(tmp_path, monkeypatch, partitions, column_type, enabled):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select range::{column_type} k from range(131072)) to '{path}' (row_group_size 2048)")
+        if not enabled:
+            connection.execute("set disabled_optimizers='join_filter_pushdown'")
+        sql = f"select p.k from read_parquet('{path}') p join (select range * 30001 k from range(3)) b using(k)"
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, partitions)
+        scans = profile_fragment_scans(connection, monkeypatch)
+        # Each load must own fresh filters, including when the same payload is
+        # reused for different source partitions or a second execution.
+        for _ in range(2):
+            scans.clear()
+            assert Counter(execute_graph(connection, graph)) == expected
+            assert scans
+            # Count rows leaving the scan, not wall time or rows after the join.
+            scanned = sum(scan["operator_cardinality"] for scan in scans)
+            if enabled:
+                # The native IN filter prunes row groups; it need not evaluate
+                # the IN list on every row inside a surviving group.
+                assert 3 <= scanned <= 3 * 2048
+            else:
+                assert scanned == 131072
+
+
+def test_broadcast_filters_keep_independent_probe_scans_separate(tmp_path, monkeypatch):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select range k from range(131072)) to '{path}' (row_group_size 2048)")
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side'")
+        sql = (
+            f"select p.k, q.k from (select a.k from read_parquet('{path}') a "
+            "join (select range * 30001 k from range(3)) b using(k)) p "
+            f"join (select c.k from read_parquet('{path}') c "
+            "join (select range * 20001 k from range(5)) d using(k)) q using(k)"
+        )
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, 3)
+        scans = profile_fragment_scans(connection, monkeypatch)
+        assert Counter(execute_graph(connection, graph)) == expected
+        assert scans
+        assert sum(scan["operator_cardinality"] for scan in scans) <= 8 * 2048
 
 
 @pytest.mark.parametrize(

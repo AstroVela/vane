@@ -960,9 +960,11 @@ void JoinFilterPushdownInfo::Serialize(Serializer &serializer) const {
 	serializer.WriteList(102, "probe_info", probe_info.size(), [&](Serializer::List &list, idx_t i) {
 		list.WriteObject([&](Serializer &item_serializer) {
 			vector<ColumnBinding> columns;
+			vector<LogicalType> storage_types;
 			columns.reserve(probe_info[i].columns.size());
 			for (auto &col : probe_info[i].columns) {
 				columns.push_back(col.probe_column_index);
+				storage_types.push_back(col.storage_type);
 			}
 			item_serializer.WriteProperty(1, "columns", columns);
 
@@ -972,8 +974,10 @@ void JoinFilterPushdownInfo::Serialize(Serializer &serializer) const {
 				dynamic_filters_id = state.GetId(probe_info[i].dynamic_filters);
 			}
 			item_serializer.WritePropertyWithDefault(2, "dynamic_filters_id", dynamic_filters_id);
+			item_serializer.WritePropertyWithDefault(3, "storage_types", storage_types);
 		});
 	});
+	serializer.WritePropertyWithDefault(103, "build_side_has_filter", build_side_has_filter, false);
 }
 
 unique_ptr<JoinFilterPushdownInfo> JoinFilterPushdownInfo::Deserialize(Deserializer &deserializer) {
@@ -997,9 +1001,19 @@ unique_ptr<JoinFilterPushdownInfo> JoinFilterPushdownInfo::Deserialize(Deseriali
 				auto &state = deserializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
 				info.dynamic_filters = state.GetFilters(dynamic_filters_id);
 			}
+			auto storage_types = item_deserializer.ReadPropertyWithDefault<vector<LogicalType>>(3, "storage_types");
+			if (!storage_types.empty()) {
+				if (storage_types.size() != info.columns.size()) {
+					throw SerializationException("join filter storage types do not match probe columns");
+				}
+				for (idx_t i = 0; i < storage_types.size(); i++) {
+					info.columns[i].storage_type = storage_types[i];
+				}
+			}
 			result->probe_info.push_back(std::move(info));
 		});
 	});
+	result->build_side_has_filter = deserializer.ReadPropertyWithDefault<bool>(103, "build_side_has_filter");
 	return result;
 }
 

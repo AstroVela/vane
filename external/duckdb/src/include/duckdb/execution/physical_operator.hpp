@@ -225,6 +225,12 @@ public:
 	//! a inside the GlobalSinkState.
 	virtual SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
 	virtual SinkResultType SinkBatch(ExecutionContext &context, ExecutionBatch &batch, OperatorSinkInput &input) const;
+	//! Flush partial output between source batches, including batches removed by filters.
+	//! BLOCKED retains pending output and registers a wakeup, just like Sink. A source
+	//! about to block forces a flush regardless of the sink's time budget.
+	virtual SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &, bool force) const {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	//! The combine is called when a single thread has completed execution of its part of the pipeline, it is the final
 	//! time that a specific LocalSinkState is accessible. This method can be called in parallel while other Sink() or
 	//! Combine() calls are active on the same GlobalSinkState.
