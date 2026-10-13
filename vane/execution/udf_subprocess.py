@@ -1387,6 +1387,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         _release_local_ref_bundle_result(result)
                         self._mark_broken("UDF output stream receiver failed", actor_lost=True)
                         raise
+                    finally:
+                        # Ownership moved to the receiver. A later terminal
+                        # error must not retain this block in its traceback.
+                        result = None
                     msg_type = None
                     continue
                 return result
