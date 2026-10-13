@@ -176,8 +176,19 @@ def test_expanding_pipeline_releases_real_storage_under_small_budget(backend):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("source_kind", ["generator", "table"])
-def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
+@pytest.mark.parametrize(
+    "source_kind,source_backend,arena,copy_input",
+    [
+        ("generator", "subprocess_task", "16MiB", False),
+        ("table", "subprocess_task", "16MiB", False),
+        ("table", "subprocess_actor", "16MiB", False),
+        ("generator", "subprocess_task", "96KiB", False),
+        ("table", "subprocess_actor", "96KiB", False),
+        ("generator", "subprocess_task", "96KiB", True),
+        ("table", "subprocess_actor", "96KiB", True),
+    ],
+)
+def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind, source_backend, arena, copy_input):
     script = textwrap.dedent(f"""
         import gc
         import threading
@@ -194,12 +205,16 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
             values = batch['id'].to_pylist()
             return pa.table({{'id': values, 'payload': [b'x' * 65536 for _ in values]}})
 
+        class Materialize:
+            def __call__(self, batch):
+                return materialize(batch)
+
         class RetainingConsumer:
             def __init__(self):
                 self.last = None
 
             def __call__(self, batch):
-                self.last = batch
+                self.last = batch.to_pydict() if {copy_input!r} else batch
                 return batch.select(['id'])
 
         try:
@@ -211,16 +226,25 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
                     generator = {source_kind!r} == 'generator'
                     rel = con.sql('select 1::BIGINT as id' if generator else 'select range::BIGINT as id from range(32)')
                     rel = rel.map_batches(
-                        expand if generator else materialize,
+                        expand if generator else (Materialize if {source_backend!r} == 'subprocess_actor' else materialize),
                         schema={{'id': 'BIGINT', 'payload': 'BLOB'}},
-                        execution_backend='subprocess_task', batch_size=1, min_task_batch_size=1,
+                        execution_backend={source_backend!r}, batch_size=1, min_task_batch_size=1,
+                        **({{'actor_number': 1}} if {source_backend!r} == 'subprocess_actor' else {{}}),
                         task_input_max_bytes=8, output_batch_size=1, output_target_max_bytes=1024,
                     ).map_batches(
                         RetainingConsumer, schema={{'id': 'BIGINT'}},
                         execution_backend='subprocess_actor', actor_number=1,
                         batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
                     )
-                    assert sorted(rel.to_arrow_table()['id'].to_pylist()) == list(range(32))
+                    if {arena!r} == '96KiB' and not {copy_input!r}:
+                        try:
+                            rel.to_arrow_table()
+                        except Exception as error:
+                            assert 'shared-memory output cannot make progress' in str(error), str(error)
+                        else:
+                            raise AssertionError('retained working set cannot fit in the arena')
+                    else:
+                        assert sorted(rel.to_arrow_table()['id'].to_pylist()) == list(range(32))
                 finally:
                     watchdog.cancel()
         finally:
@@ -228,6 +252,7 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
         gc.collect()
         assert local_shm_ref_budget_snapshot()['usage_bytes'] == 0
         assert local_shm_budget_manager()._owned_output_grants == {{}}
+        assert local_shm_budget_manager()._owned_input_allocations == {{}}
         assert local_shm_store_snapshot()['live_bytes'] == 0
     """)
     result = subprocess.run(
@@ -239,7 +264,7 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
             **os.environ,
             "VANE_RUNNER": "local-fast",
             "VANE_PROGRESS": "0",
-            "VANE_LOCAL_SHM_STORE_BYTES": "16MiB",
+            "VANE_LOCAL_SHM_STORE_BYTES": arena,
             "VANE_LOCAL_SHM_REF_BUDGET_BYTES": "32KiB",
         },
     )

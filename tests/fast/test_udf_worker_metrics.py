@@ -557,6 +557,7 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     [
         ("_MSG_INPUT_CONSUMED", "input_lease_id"),
         ("_MSG_INPUT_CONSUME_FAILED", "input_lease_id"),
+        ("_MSG_INPUT_RETAINED", "tokens"),
         ("_MSG_OUTPUT_GRANT_REQUEST", "size_bytes"),
         ("_MSG_OUTPUT_GRANT_RELEASE", "grant_id"),
     ],
@@ -1425,6 +1426,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     )
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
     before_owners = set(ref_bundle.local_shm_budget_manager()._owned_output_grants)
+    before_input_owners = dict(ref_bundle.local_shm_budget_manager()._owned_input_allocations)
     receive, acquire = local._recv_message, ref_bundle.acquire_allocation
     release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
     release_descriptor = local.release_local_shm_ref_bundle_descriptor
@@ -1450,8 +1452,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         injected.append(cleanup_failure)
         raise RuntimeError("injected adoption cleanup failure")
 
-    def fail_budget_callback(size, *, name="", output_owner=None):
-        release_budget(size, name=name, output_owner=output_owner)
+    def fail_budget_callback(size, *, name="", output_owner=None, input_owner_id=None):
+        release_budget(size, name=name, output_owner=output_owner, input_owner_id=input_owner_id)
         # Model a failing post-release notification, without leaking a test
         # allocation. The failed region acquisition remains the primary error.
         if descriptors and not injected:
@@ -1486,6 +1488,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     assert nonzero(metrics) == {field: 1}
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
     assert set(ref_bundle.local_shm_budget_manager()._owned_output_grants) == before_owners
+    assert ref_bundle.local_shm_budget_manager()._owned_input_allocations == before_input_owners
 
 
 @pytest.mark.parametrize("path", ["recv_header", "recv_payload", "send_submit", "send_grant", "send_finished"])

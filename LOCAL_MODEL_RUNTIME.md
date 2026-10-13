@@ -1466,12 +1466,18 @@ releases its previous input only after receiving the next batch can advance.
 This additional allowance stops at two owned output grants across invocations;
 pending grants and converted grants count until their last physical lease is
 released. Descriptor release or an input ACK cannot reopen this allowance while
-a worker view or fork pin still holds the storage. Explicit per-task byte
+a worker view or fork pin still holds the storage. The same source may allocate
+one next-call input while a prior output occupies this window; another input
+must wait for that input's byte charge to be released. This lets the next call
+reach output admission without opening an unbounded input queue. Explicit per-task byte
 envelopes keep their hard boundary. The physical arena always enforces its own
 capacity, including allocation rounding and fragmentation; it does not spill.
 If none of the waiting writers can fit an output even after every unrelated
 allocation is released, the arena reports a capacity error instead of waiting
-indefinitely on their pinned inputs.
+indefinitely on their pinned inputs. The pinned working set includes inputs
+reported as retained after a worker finishes its call and clears temporary
+references. These inputs may need another call before the actor can release
+them, so they cannot be assumed reclaimable while waiting for that next output.
 
 These bounds cover transport output, not arbitrary intermediate heap objects
 allocated inside user code before it returns or yields a table. A UDF that

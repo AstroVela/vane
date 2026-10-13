@@ -190,6 +190,99 @@ def test_output_owner_window_waits_for_physical_release_across_invocations(monke
     assert manager._owned_output_grants == {}
 
 
+def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("input-bridge")
+    prior = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    lease = store.allocate(128)
+    ref = refs.LocalShmBlockRef(lease.allocation.identity, 128, allocation_lease=lease, input_owner_id="source")
+    held = lease.fork()
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(manager.acquire_allocation, 128, input_owner_id="source", cancel_event=cancel)
+            try:
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+                ref.release()
+                assert manager.snapshot()["allocated_bytes"] == 128
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+                held.release()
+                assert pending.result(timeout=5) == 128
+                manager.release_allocation(128, input_owner_id="source")
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        held.release()
+        ref.release()
+        manager.release_output_grant(prior)
+        store.remove_client("input-bridge")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_input_allocations == {}
+
+
+@pytest.mark.parametrize("owner_id,outputs,strict", [("other", 1, False), ("source", 2, False), ("source", 1, True)])
+def test_input_bridge_preserves_owner_window_and_strict_reservations(owner_id, outputs, strict):
+    limit = [4000]
+    manager = LocalShmBudgetManager(limit_factory=lambda: limit[0])
+    grants = [manager.request_output_grant(1100, priority="consumer", owner_id="source") for _ in range(outputs)]
+    reservation = manager.reserve_task_bytes(10, 10) if strict else None
+    limit[0] = 1000
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(manager.acquire_allocation, 128, input_owner_id=owner_id, cancel_event=cancel)
+            try:
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+                with pytest.raises(RuntimeError, match="cancelled"):
+                    pending.result(timeout=5)
+    finally:
+        if reservation is not None:
+            reservation.release()
+        for grant in grants:
+            manager.release_output_grant(grant)
+    assert manager._owned_input_allocations == {}
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_failed_input_creation_returns_the_bridge_allowance(monkeypatch):
+    import pyarrow as pa
+
+    from vane.execution import ref_bundle as refs
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    create = refs._create_shm
+
+    def fail(*args, **kwargs):
+        raise OSError("input allocation failed")
+
+    try:
+        monkeypatch.setattr(refs, "_create_shm", fail)
+        with pytest.raises(OSError, match="input allocation failed"):
+            refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")
+        assert manager._owned_input_allocations == {}
+        monkeypatch.setattr(refs, "_create_shm", create)
+        result = refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")
+        result[1][0].release()
+        assert manager._owned_input_allocations == {}
+    finally:
+        manager.release_output_grant(grant)
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
 @pytest.mark.parametrize(
     "owner_id,priority,strict",
     [("source", "producer", False), ("other", "consumer", False), ("source", "consumer", True)],

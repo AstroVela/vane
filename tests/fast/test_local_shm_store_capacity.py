@@ -64,6 +64,79 @@ def test_output_larger_than_space_left_by_its_input_fails_promptly(store):
         held.release()
 
 
+@pytest.mark.parametrize("release_before_report", [False, True])
+def test_idle_worker_input_report_distinguishes_retained_views_from_pending_releases(
+    store, monkeypatch, release_before_report
+):
+    from vane.execution import udf_shm_store as storage
+
+    def current_store(client_id):
+        store.add_client(client_id)
+        return store
+
+    monkeypatch.setattr(storage, "current_store", current_store)
+    peer = storage.ParentShmPeer()
+    held = store.allocate(3072)
+    payload = {"block_refs": [{"allocation": held.allocation.descriptor()}]}
+    token = peer.borrow_inputs(payload)[0]
+    held.release()
+    scope = ExecutionCancellationScope("retained-input", 1)
+    try:
+        if release_before_report:
+            peer.release_read(token)
+        peer.retain_inputs({token})
+        if release_before_report:
+            store.wait_for_capacity(2048, (), scope, nullcontext)
+        else:
+            with pytest.raises(LocalShmStoreCapacityError, match="retained_input_bytes=3072"):
+                store.wait_for_capacity(2048, (), scope, nullcontext)
+            # Once another call starts, this reader can release independently
+            # of the waiting writer. Clearing the idle observation permits a wait.
+            peer.retain_inputs(set())
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext)
+                try:
+                    with pytest.raises(TimeoutError):
+                        pending.result(timeout=0.05)
+                    peer.release_read(token)
+                    pending.result(timeout=5)
+                finally:
+                    scope.cancel()
+    finally:
+        scope.cancel()
+        peer.close_after_exit()
+    assert store._retained_inputs == {}
+
+
+def test_idle_worker_report_wakes_an_already_waiting_writer(store, monkeypatch):
+    from vane.execution import udf_shm_store as storage
+
+    def current_store(client_id):
+        store.add_client(client_id)
+        return store
+
+    monkeypatch.setattr(storage, "current_store", current_store)
+    peer = storage.ParentShmPeer()
+    held = store.allocate(3072)
+    token = peer.borrow_inputs({"block_refs": [{"allocation": held.allocation.descriptor()}]})[0]
+    held.release()
+    scope = ExecutionCancellationScope("later-retained-report", 1)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext)
+            try:
+                with store._capacity_condition:
+                    assert store._capacity_condition.wait_for(lambda: bool(store._waiting_writes), timeout=5)
+                peer.retain_inputs({token})
+                with pytest.raises(LocalShmStoreCapacityError, match="retained_input_bytes=3072"):
+                    pending.result(timeout=5)
+            finally:
+                scope.cancel()
+    finally:
+        peer.close_after_exit()
+    assert store._retained_inputs == {}
+
+
 def test_mutually_blocked_writers_report_capacity_and_unblock_peer_on_cleanup(store):
     inputs = [store.allocate(2048), store.allocate(2048)]
     scopes = [ExecutionCancellationScope("cycle", index + 1) for index in range(2)]

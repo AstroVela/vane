@@ -357,6 +357,7 @@ class LocalShmStore:
         self._lock = threading.RLock()
         self._capacity_condition = threading.Condition(self._lock)
         self._waiting_writes: dict[tuple[str, int], tuple[int, set[int]]] = {}
+        self._retained_inputs: dict[str, set[int]] = {}
         self._shm: Any = None
         self._free = [(0, capacity)]
         self._live: dict[int, _LiveAllocation] = {}
@@ -472,10 +473,13 @@ class LocalShmStore:
                                 return
                             pinned = sum(self._live[g].capacity for g in generations if g in self._live)
                             blocked_inputs = set().union(*(g for _, g in self._waiting_writes.values()))
-                            # Only the waiting writers' inputs are necessarily
-                            # pinned. Optimistically reclaim every other region;
-                            # unrelated retained views cannot hide a cycle, and
-                            # views whose release could help still allow a wait.
+                            # An idle worker's retained input may require its
+                            # next call to release it. Include that working set
+                            # rather than waiting for an impossible next output.
+                            retained_inputs = set().union(*self._retained_inputs.values())
+                            blocked_inputs.update(retained_inputs)
+                            # Optimistically reclaim every other region so
+                            # unrelated views still allow a useful wait.
                             end = 0
                             largest_possible = 0
                             for entry in sorted(
@@ -489,9 +493,11 @@ class LocalShmStore:
                                 requested > largest_possible for requested, _ in self._waiting_writes.values()
                             )
                             if pinned + required > self.capacity or all_blocked:
+                                retained = sum(self._live[g].capacity for g in retained_inputs if g in self._live)
                                 raise LocalShmStoreCapacityError(
                                     f"shared-memory output cannot make progress: requested={size}, "
                                     f"pinned_input_bytes={pinned}, capacity={self.capacity}, "
+                                    f"retained_input_bytes={retained}, "
                                     f"largest_free={largest}, largest_possible_free={largest_possible}; "
                                     "reduce task input or output block size"
                                 )
@@ -755,6 +761,8 @@ class ParentShmPeer:
         self._lock = threading.RLock()
         self._ids = count(1)
         self._reads: dict[int, StoreLease] = {}
+        self._retained_tokens: set[int] = set()
+        self._retained_stores: set[LocalShmStore] = set()
         self._writes: dict[int, StoreLease] = {}
         self._closed = False
         self._reader_error: BaseException | None = None
@@ -824,12 +832,31 @@ class ParentShmPeer:
             raise
         return tokens
 
+    def retain_inputs(self, tokens: set[int]) -> None:
+        """Record post-call views, without taking additional physical leases."""
+        with self._lock:
+            self._retained_tokens = tokens.intersection(self._reads)
+            by_store: dict[LocalShmStore, set[int]] = {}
+            for token in self._retained_tokens:
+                lease = self._reads[token]
+                by_store.setdefault(lease.store, set()).add(lease.allocation.generation)
+            for store in self._retained_stores.union(by_store):
+                with store._capacity_condition:
+                    if generations := by_store.get(store):
+                        store._retained_inputs[self.client_id] = generations
+                    else:
+                        store._retained_inputs.pop(self.client_id, None)
+                    store._capacity_condition.notify_all()
+            self._retained_stores = set(by_store)
+
     def release_read(self, token: int) -> None:
         with self._lock:
             lease = self._reads.get(token)
             if lease is not None:
                 lease.release()
                 del self._reads[token]
+                if token in self._retained_tokens:
+                    self.retain_inputs(self._retained_tokens - {token})
 
     def reserve_write(self, grant_id: int, size: int) -> dict[str, Any]:
         with self._lock:
@@ -863,6 +890,7 @@ class ParentShmPeer:
         with self._lock:
             if self._closed:
                 return
+            self.retain_inputs(set())
             self.child_sock.close()
             with _fork_lock:
                 descendants_alive = self._lifetime.is_alive()
@@ -984,6 +1012,14 @@ class WorkerShmClient:
             return
         with _fork_lock:
             self._reads.clear()
+
+    def retained_inputs(self) -> list[int]:
+        self.check()
+        with _fork_lock:
+            # Releases already queued on the independent ownership channel
+            # must not appear retained just because the parent has not read
+            # them yet. Fork-only holds can be released independently.
+            return list(self._live_reads)
 
     def read_lease(self, value: dict[str, Any], token: int) -> _RemoteLease:
         self.check()

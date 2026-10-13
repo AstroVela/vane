@@ -129,6 +129,7 @@ _MSG_REF_BUNDLE_CHUNK = 0x11
 _MSG_OUTPUT_GRANT_FAILED = 0x12
 _MSG_STREAM_NEXT = 0x13
 _MSG_STREAM_CONTINUE = 0x14
+_MSG_INPUT_RETAINED = 0x15
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -1013,6 +1014,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             args,
             cancel_event=scope,
             wait_context=lambda: self._capacity_wait_context("shared_memory_input"),
+            input_owner_id=scope.owner_id,
             **({"task_reservation": reservation.transport} if reservation else {}),
         )
         lease_id = None
@@ -1062,6 +1064,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if msg_type not in (
             _MSG_INPUT_CONSUMED,
             _MSG_INPUT_CONSUME_FAILED,
+            _MSG_INPUT_RETAINED,
             _MSG_OUTPUT_GRANT_REQUEST,
             _MSG_OUTPUT_GRANT_RELEASE,
         ):
@@ -1070,6 +1073,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         # entering parent-side resource operations, which can fail independently.
         try:
             event = vane_pickle.loads(payload)
+            if msg_type == _MSG_INPUT_RETAINED:
+                if not isinstance(event, list) or any(type(token) is not int or token <= 0 for token in event):
+                    raise ValueError("invalid retained shared-memory input tokens")
+                return {"tokens": set(event)}
             if msg_type in (_MSG_INPUT_CONSUMED, _MSG_INPUT_CONSUME_FAILED):
                 decoded: dict[str, Any] = {"input_lease_id": int(event["input_lease_id"])}
                 if msg_type == _MSG_INPUT_CONSUME_FAILED and event.get("invalid_ipc_block") is not None:
@@ -1166,6 +1173,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         event = self._decode_submit_control_message(msg_type, payload)
         if event is None:
             return False
+        if msg_type == _MSG_INPUT_RETAINED:
+            if self._shm_peer is None:
+                raise RuntimeError("worker has no shared-memory ownership channel")
+            self._shm_peer.retain_inputs(event["tokens"])
+            return True
         if msg_type == _MSG_INPUT_CONSUMED:
             lease_id = event["input_lease_id"]
             consume_local_shm_input_lease(lease_id, name="udf-input")
@@ -1310,6 +1322,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     _MSG_REF_BUNDLE_CHUNK,
                     _MSG_ERROR,
                     _MSG_INPUT_CONSUMED,
+                    _MSG_INPUT_RETAINED,
                     _MSG_INPUT_CONSUME_FAILED,
                     _MSG_OUTPUT_GRANT_REQUEST,
                     _MSG_OUTPUT_GRANT_RELEASE,
@@ -1480,6 +1493,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 scope.raise_if_cancelled("UDF subprocess submit")
         try:
             try:
+                if self._shm_peer is not None:
+                    self._shm_peer.retain_inputs(set())
                 if any("allocation" in block for block in payload.get("block_refs", ())):
                     if self._shm_peer is None:
                         raise RuntimeError("worker has no shared-memory ownership channel")

@@ -61,6 +61,7 @@ _MSG_REF_BUNDLE_CHUNK = 0x11
 _MSG_OUTPUT_GRANT_FAILED = 0x12
 _MSG_STREAM_NEXT = 0x13
 _MSG_STREAM_CONTINUE = 0x14
+_MSG_INPUT_RETAINED = 0x15
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -788,6 +789,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         rows=input_table.num_rows,
                         result_msg_type=result_msg_type,
                     )
+                input_table = None
+                _send_message(sock, _MSG_INPUT_RETAINED, vane_pickle.dumps(shm_client.retained_inputs()))
                 _send_message(sock, result_msg_type, result_payload)
             except _TaskCancelledError as exc:
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
