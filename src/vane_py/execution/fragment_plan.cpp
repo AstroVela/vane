@@ -330,8 +330,19 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 			}
 			// Check before binding can evaluate table arguments. Function names do
 			// not define portability; native binding and serialization do.
+			// Overloads with different arities can have different stability (age).
+			// Unpacked COLUMNS can change the arity during binding, so keep checking
+			// every overload when the argument count is not yet known.
+			bool unpacked = false;
+			for (auto &child : function.children) {
+				unpacked |= child->GetExpressionType() == ExpressionType::OPERATOR_UNPACK;
+			}
 			for (auto &overload : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
-				CheckScalarFunction(overload);
+				const auto arguments = function.children.size();
+				if (unpacked || arguments == overload.arguments.size() ||
+				    (overload.HasVarArgs() && arguments > overload.arguments.size())) {
+					CheckScalarFunction(overload);
+				}
 			}
 		}
 	}

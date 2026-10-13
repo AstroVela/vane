@@ -107,6 +107,27 @@ CONTEXT_READS = [
     "select list_filter([range], lambda x: current_setting('threads')>0) from range(4)",
     "select list_reduce([range, range+1], lambda x,y: x+y+current_setting('threads')) from range(4)",
 ]
+UNSTABLE_AGES = [
+    sql
+    for timestamp in ("timestamp", "timestamptz")
+    for sql in (
+        f"select age({timestamp} '2000-01-01') from range(4)",
+        f"select age({timestamp} '2000-01-01' + range * interval '1 day') from range(4)",
+        f"select list_transform([range], lambda x: age({timestamp} '2000-01-01' + x * interval '1 day')) from range(4)",
+        f"select (select age({timestamp} '2000-01-01' + a.range * interval '1 day')) from range(4) a",
+    )
+]
+DETERMINISTIC_AGES = [
+    sql
+    for timestamp in ("timestamp", "timestamptz")
+    for sql in (
+        f"select age({timestamp} '2000-01-05', {timestamp} '2000-01-01')::varchar from range(4)",
+        f"select age({timestamp} '2000-01-05', {timestamp} '2000-01-01' + range * interval '1 day')::varchar "
+        "from range(4)",
+        f"select list_transform([range, null], lambda x: age({timestamp} '2000-01-05', "
+        f"{timestamp} '2000-01-01' + x * interval '1 day')::varchar) from range(4)",
+    )
+]
 
 
 @pytest.mark.parametrize("partitions", [1, 2, 5])
@@ -181,7 +202,7 @@ def test_ie_join_parallel_outer_tasks_own_null_payloads(threads):
 
 @pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
 @pytest.mark.parametrize("optimizers", ["default", "no_expression_rewriter", "disabled"])
-@pytest.mark.parametrize("sql", UNSTABLE_LAMBDAS + CONTEXT_READS)
+@pytest.mark.parametrize("sql", UNSTABLE_LAMBDAS + CONTEXT_READS + UNSTABLE_AGES)
 def test_context_reads_and_lambda_bodies_are_checked_before_optimization(sql, optimizers, entry):
     from tests.fast.test_execution_submission import options, prepare
     from vane.execution.query_options import DistributedMode
@@ -206,6 +227,38 @@ def test_deterministic_lambdas_survive_worker_plan_deserialization(sql):
         expected = connection.execute(sql).fetchall()
         graph = compile_sql(connection, sql, partitions=2)
         assert execute_graph(worker, graph) == expected
+
+
+@pytest.mark.parametrize("optimizers", ["default", "no_expression_rewriter", "disabled"])
+@pytest.mark.parametrize("sql", DETERMINISTIC_AGES)
+def test_binary_age_remains_portable(sql, optimizers):
+    with vane.connect(config={"threads": 4}) as connection, vane.connect(config={"threads": 1}) as worker:
+        if optimizers == "no_expression_rewriter":
+            connection.execute("set disabled_optimizers='expression_rewriter'")
+        elif optimizers == "disabled":
+            connection.execute("pragma disable_optimizer")
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        for _ in range(2):
+            assert execute_graph(worker, graph) == expected
+
+
+@pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
+@pytest.mark.parametrize("timestamp", ["timestamp", "timestamptz"])
+def test_unary_age_in_scan_argument_is_rejected_before_binding(tmp_path, entry, timestamp):
+    from tests.fast.test_execution_submission import options, prepare
+    from vane.execution.query_options import DistributedMode
+
+    missing = tmp_path / "missing.parquet"
+    sql = f"select * from read_parquet('{missing}', binary_as_string=(age({timestamp} '2000-01-01')>interval '0'))"
+    with vane.connect() as connection:
+        # Reject the unfrozen date before the binder evaluates the argument or
+        # tries to open the deliberately absent file.
+        with pytest.raises(vane.NotImplementedException, match="consistent across tasks and attempts: age"):
+            if entry == "compiler":
+                compile_sql(connection, sql)
+            else:
+                prepare(connection, sql, options=options(DistributedMode(entry)))
 
 
 @pytest.mark.parametrize(

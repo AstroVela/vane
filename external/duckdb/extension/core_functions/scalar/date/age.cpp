@@ -47,6 +47,8 @@ static void AgeFunction(DataChunk &input, ExpressionState &state, Vector &result
 ScalarFunctionSet AgeFun::GetFunctions() {
 	ScalarFunctionSet age("age");
 	auto unary_age = ScalarFunction({LogicalType::TIMESTAMP}, LogicalType::INTERVAL, AgeFunctionStandard);
+	// The implicit first argument is the current transaction's date.
+	unary_age.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 	unary_age.SetRequiresClientContext();
 	age.AddFunction(unary_age);
 	age.AddFunction(
