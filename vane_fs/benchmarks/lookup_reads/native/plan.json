@@ -1,0 +1,55 @@
+{
+  "identities": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/lookup_reads/run.py": "d027c9f85290181c4dc39961e43266e60bd21ff506675f89f6f4f630c2844a22",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/lookup_reads/probe.cpp": "9c3ae5760019ce54a958b5ac178c4806a41d8487ff7687766cc240724972a72b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline/build/python-release/libvane_fs.a": "8ff0010dd3af6765f7ed7dceb3d93f59534075c368ca2674356e1adfd179f248",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/native/baseline": "755cd3d2352c559a0afb7211b693c83b9cb4d2dbabf9843781298a91acf0d58f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": "d864efbd8d795309434ccd865fb25c726c28cbc7d510fedce12c936523f9fa8f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/python-release/libvane_fs.a": "1430a2f0bf390c207f2a70175778da7b4dc952e07827c202a304f8d3d79f06b5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/native/updated": "cd59a8f4d152d1ec1b10c601811508da7fb1d0deaabd6d4627f7d4d4af819dff"
+  },
+  "pairs": 6,
+  "orders": [
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ]
+  ],
+  "media": [
+    "tmpfs",
+    "ext4"
+  ],
+  "durability": [
+    "fsync",
+    "strict"
+  ],
+  "frozen_epoch": 1791855606.2243836,
+  "owned_build_test_overlap": false,
+  "cache_eviction": false,
+  "frequency_affinity_changes": false,
+  "scope": "Native lookup latency; first-pin release and validation are outside request timers"
+}
