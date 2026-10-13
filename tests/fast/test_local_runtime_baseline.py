@@ -13,6 +13,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
+from local_admission_helpers import linear_metadata
 from local_runtime_helpers import local_runtime_diagnostics
 
 import vane
@@ -209,6 +210,7 @@ def test_preparation_validation_does_not_block_reentrant_drain(monkeypatch):
             session_id=lambda: "session",
             session_config=lambda: {},
             collect_udf_nodes=lambda **kwargs: [{"node_id": "1", "payload": payload}],
+            collect_resource_graph_metadata=lambda **kwargs: linear_metadata([{"node_id": "1", "payload": payload}]),
         )
         fingerprint = udf_local_model._model_fingerprint
         with ThreadPoolExecutor(max_workers=1) as threads:

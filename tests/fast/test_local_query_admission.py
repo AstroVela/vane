@@ -478,7 +478,51 @@ def test_native_local_query_uses_shared_policy_by_default(monkeypatch, configure
     assert all(query.snapshot()["usage"]["heap_bytes"] == 0 for query in captured)
 
 
-def test_production_completion_waits_for_active_execution_but_retains_output_bytes():
+@pytest.mark.parametrize("produced_output", [False, True])
+@pytest.mark.parametrize("coordinated", [False, True])
+def test_finished_dispatcher_allows_later_parallel_dispatcher(produced_output, coordinated):
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation(), coordinator=LocalQueryCoordinator() if coordinated else None)
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    first = _authority(query, bindings["0"], pool)
+    lease = _take(first) if produced_output else None
+    output = (
+        query.own_output(lease.lease["query_policy_task"], 50, ExecutionCancellationScope("first", 1), lease)
+        if lease is not None
+        else None
+    )
+    second = next_lease = None
+    try:
+        # DuckDB can finish an empty local dispatcher before constructing the
+        # next one for the same UDF. Retained output also outlives a dispatcher.
+        first.finished_submitting()
+        if lease is not None:
+            lease.complete_execution()
+        retained = 50 if output is not None else 0
+        assert query.snapshot()["usage"]["object_store_bytes"] == retained
+        second = _authority(query, bindings["0"], pool)
+        next_lease = _take(second)
+        assert query.snapshot()["usage"]["cpu"] == 1
+        # Active tasks also carry the policy's pending-output estimate.
+        assert query.snapshot()["usage"]["object_store_bytes"] >= retained + 16
+        next_lease.complete_execution()
+        assert query.snapshot()["usage"]["object_store_bytes"] == retained
+    finally:
+        if output is not None:
+            output.release()
+        if lease is not None:
+            lease.release()
+        if next_lease is not None:
+            next_lease.release()
+        first.close()
+        if second is not None:
+            second.close()
+        query.shutdown()
+        pool.close()
+    assert query.snapshot()["usage"]["cpu"] == query.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_dispatcher_drain_waits_for_active_execution_and_retains_output_bytes():
     graph, bindings = _graph()
     query = LocalQueryAdmission(graph, _allocation())
     pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
@@ -487,9 +531,11 @@ def test_production_completion_waits_for_active_execution_but_retains_output_byt
     owner = query.own_output(lease.lease["query_policy_task"], 50, ExecutionCancellationScope("finish", 1), lease)
     try:
         authority.finished_submitting()
-        assert bindings["0"] not in query._completed_units
+        assert query.snapshot()["units"][bindings["0"]]["runnable"]
         lease.complete_execution()
-        assert bindings["0"] in query._completed_units
+        unit = query.snapshot()["units"][bindings["0"]]
+        assert not unit["runnable"]
+        assert not unit["completed"]
         assert query.snapshot()["usage"]["object_store_bytes"] == 50
         owner.release()
         assert query.snapshot()["usage"]["object_store_bytes"] == 0

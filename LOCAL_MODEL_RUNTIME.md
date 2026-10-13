@@ -2140,6 +2140,12 @@ placement remain backend responsibilities. DuckDB schedules local native
 operators and supplies their materialization ordering; local UDF concurrency does not depend on pipeline
 width or the number of Parquet row groups.
 
+DuckDB can create local dispatchers for the same UDF at different times. When
+the currently registered dispatchers drain, the UDF becomes temporarily idle
+and can accept a later dispatcher. Retained outputs stay charged throughout
+this transition. Materialization phase changes still require native ordering
+evidence; draining the current dispatchers does not seal UDF production.
+
 `VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
 `VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S` configure the same reservation and
 refresh policy for both runners. Concurrent local queries count distinct GPU
