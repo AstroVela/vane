@@ -945,7 +945,6 @@ class _EmbeddingBatch:
             return
         if not self._embedder_loop_bound:
             return
-        self._embedder = None
         close_error: Exception | None = None
         try:
             aclose = getattr(embedder, "aclose", None)
@@ -961,6 +960,8 @@ class _EmbeddingBatch:
                 "Embed cleanup",
                 close_error,
             ) from None
+        # A failed close must leave the provider reachable for executor retry.
+        self._embedder = None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -1301,7 +1302,6 @@ class _PromptBatch:
             return
         if not self._prompter_loop_bound:
             return
-        self._prompter = None
         close_error: Exception | None = None
         try:
             aclose = getattr(prompter, "aclose", None)
@@ -1317,6 +1317,8 @@ class _PromptBatch:
                 "Prompt cleanup",
                 close_error,
             ) from None
+        # A failed close must leave the provider reachable for executor retry.
+        self._prompter = None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.

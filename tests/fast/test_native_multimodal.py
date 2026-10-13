@@ -156,6 +156,168 @@ def sdk(monkeypatch):
     return install_sdk(monkeypatch.setitem)
 
 
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("failure", ["sync", "async", "cancelled"])
+def test_native_shutdown_failure_retains_engine_until_retry(family, failure, sdk):
+    import tempfile
+    from pathlib import Path
+
+    async def run():
+        runtime = load_provider(family).get_text_embedder("configured-encoder", 2).instantiate()
+        engine = runtime._ensure_engine()
+        processor = runtime.processor
+        original_shutdown = engine.shutdown
+        attempts = 0
+        error_type = asyncio.CancelledError if failure == "cancelled" else TimeoutError
+        directory = tempfile.TemporaryDirectory()
+        runtime._model_directory = directory
+
+        def shutdown():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise error_type("engine is still running")
+            original_shutdown()
+
+        async def async_shutdown():
+            await asyncio.sleep(0)
+            shutdown()
+
+        engine.shutdown = shutdown if failure == "sync" else async_shutdown
+        try:
+            with pytest.raises(error_type, match="engine is still running"):
+                await runtime.aclose()
+            assert not runtime.closed and engine.closed == 0
+            assert runtime.engine is engine and runtime.processor is processor
+            assert runtime._model_directory is directory and Path(directory.name).is_dir()
+            with pytest.raises(RuntimeError, match="closing or closed"):
+                runtime._ensure_engine()
+            await runtime.aclose()
+            assert runtime.closed and engine.closed == 1 and attempts == 2
+            assert runtime.engine is None and runtime.processor is None
+            assert runtime._model_directory is None and not Path(directory.name).exists()
+            await runtime.aclose()
+            assert engine.closed == 1 and attempts == 2
+        finally:
+            engine.shutdown = original_shutdown
+            await runtime.aclose()
+            directory.cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("started", [False, True])
+def test_native_model_directory_cleanup_retries_without_reclosing_engine(family, started, sdk):
+    import tempfile
+    from pathlib import Path
+
+    async def run():
+        runtime = load_provider(family).get_text_embedder("configured-encoder", 2).instantiate()
+        engine = runtime._ensure_engine() if started else None
+        directory = tempfile.TemporaryDirectory()
+        runtime._model_directory = directory
+        cleanup = directory.cleanup
+        attempts = 0
+
+        def cleanup_once_ready():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("model files are still busy")
+            cleanup()
+
+        directory.cleanup = cleanup_once_ready
+        try:
+            with pytest.raises(OSError, match="model files are still busy"):
+                await runtime.aclose()
+            assert not runtime.closed and runtime.engine is None
+            assert runtime._model_directory is directory and Path(directory.name).is_dir()
+            with pytest.raises(RuntimeError, match="closing or closed"):
+                runtime._ensure_engine()
+            await runtime.aclose()
+            assert runtime.closed and runtime._model_directory is None
+            assert attempts == 2 and not Path(directory.name).exists()
+            assert engine is None or engine.closed == 1
+            await runtime.aclose()
+            assert attempts == 2
+        finally:
+            directory.cleanup = cleanup
+            await runtime.aclose()
+            cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["vllm", "sglang"])
+@pytest.mark.parametrize("kind", ["embed", "prompt"])
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("failures", [1, 2])
+def test_worker_native_cleanup_acknowledges_only_a_stopped_engine(family, kind, backend, failures, sdk):
+    import pyarrow as pa
+
+    from vane.ai.functions import _adapt_batch_wrapper_for_backend, _EmbedTextBatch, _PromptBatch
+    from vane.execution._udf_runtime import UDFExecutor
+    from vane.execution.udf_subprocess_worker import _close_executor_with_retry
+    from vane.pickle import dumps
+
+    provider = load_provider(family)
+    options = {"gpus_per_actor": 0}
+    if kind == "embed":
+        wrapper = _EmbedTextBatch(
+            provider.get_text_embedder("configured-encoder", 2, options=options), "text", "out", 2
+        )
+    else:
+        descriptor = provider.get_prompter(
+            "configured-generator", options={**options, "media_mime_types": ["image/png"]}
+        )
+        wrapper = _PromptBatch(descriptor, ["text"], "out")
+    executor = UDFExecutor(
+        {
+            "function_pickle": dumps(_adapt_batch_wrapper_for_backend(wrapper, backend)),
+            "udf_name": "native_cleanup_retry",
+            "call_mode": "map_batches",
+            "execution_backend": backend,
+            "batch_size": 1,
+            "output_schema": [{"name": "out", "type": "FLOAT[2]" if kind == "embed" else "VARCHAR"}],
+        }
+    )
+    engine = None
+    try:
+        assert list(executor.iter_submit(pa.table({"text": ["hello"]})))
+        engine = sdk.engines[0]
+        original_shutdown = engine.shutdown
+        attempts = 0
+
+        def shutdown_once_ready():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= failures:
+                raise TimeoutError("native child processes are still running")
+            original_shutdown()
+
+        engine.shutdown = shutdown_once_ready
+        error = _close_executor_with_retry(executor)
+        if failures == 1:
+            assert error is None and executor._closed
+            assert engine.closed == 1 and attempts == 2
+        else:
+            assert error is not None and "TimeoutError" in str(error)
+            assert not executor._closed and engine.closed == 0 and attempts == 2
+            assert executor._async_runtime is not None and not engine.loop.is_closed()
+            with pytest.raises(RuntimeError, match="closing or closed"):
+                list(executor.iter_submit(pa.table({"text": ["new request"]})))
+            assert _close_executor_with_retry(executor) is None
+            assert executor._closed and engine.closed == 1 and attempts == 3
+        assert engine.loop.is_closed()
+        assert _close_executor_with_retry(executor) is None
+        assert engine.closed == 1 and attempts == failures + 1
+    finally:
+        if engine is not None:
+            engine.shutdown = original_shutdown
+        executor.close()
+
+
 def clip():
     return VideoClip((np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8, 3), dtype=np.uint8)), (0.125, 1.375), (4, 18))
 
@@ -996,7 +1158,7 @@ def test_vllm_engine_loads_separate_real_processor_with_original_weights(
 
 
 @pytest.mark.parametrize("failure", ["save", "engine", "shutdown"])
-def test_vllm_processor_model_view_is_cleaned_on_failures(tmp_path, failure, sdk, monkeypatch):
+def test_vllm_processor_model_view_survives_until_engine_cleanup(tmp_path, failure, sdk, monkeypatch):
     from pathlib import Path
 
     checkpoint = tmp_path / "model"
@@ -1036,7 +1198,15 @@ def test_vllm_processor_model_view_is_cleaned_on_failures(tmp_path, failure, sdk
                 runtime._ensure_engine()
             finally:
                 await runtime.aclose()
-        assert runtime._model_directory is None
+        if failure == "shutdown":
+            assert runtime.engine is sdk.engines[0] and not runtime.closed
+            assert runtime._model_directory is not None and directories[0].is_dir()
+            # Restore shutdown and retry while the selected processor is still
+            # available to the engine's child processes.
+            del runtime.engine.shutdown
+            await runtime.aclose()
+            assert sdk.engines[0].closed == 1
+        assert runtime._model_directory is None and runtime.closed
 
     asyncio.run(run())
     assert len(directories) == 1 and not directories[0].exists()

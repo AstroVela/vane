@@ -358,6 +358,7 @@ class _NativeRuntime:
         self.engine: Any = None
         self._model_directory: tempfile.TemporaryDirectory[str] | None = None
         self.closed = False
+        self._closing = False
         with _translate_missing_provider_dependency(descriptor.family, descriptor.family):
             from transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
                 AutoProcessor,
@@ -450,8 +451,8 @@ class _NativeRuntime:
         return directory.name
 
     def _ensure_engine(self) -> Any:
-        if self.closed:
-            raise RuntimeError("Native inference engine is closed")
+        if self.closed or self._closing:
+            raise RuntimeError("Native inference engine is closing or closed")
         if self.engine is None:
             family = self.descriptor.family
             with _translate_missing_provider_dependency(family, family):
@@ -493,18 +494,19 @@ class _NativeRuntime:
     async def aclose(self) -> None:
         if self.closed:
             return
+        self._closing = True
+        # The executor retains this runtime and its loop after a failed close.
+        # Keep the engine and its model files alive until shutdown succeeds.
+        if self.engine is not None:
+            result = self.engine.shutdown()
+            if inspect.isawaitable(result):
+                await result
+            self.engine = None
+        if self._model_directory is not None:
+            self._model_directory.cleanup()
+            self._model_directory = None
+        self.processor = None
         self.closed = True
-        engine, self.engine = self.engine, None
-        try:
-            if engine is not None:
-                result = engine.shutdown()
-                if inspect.isawaitable(result):
-                    await result
-        finally:
-            self.processor = None
-            if self._model_directory is not None:
-                self._model_directory.cleanup()
-                self._model_directory = None
 
     async def _vllm_result(self, stream: Any) -> Any:
         final = None
