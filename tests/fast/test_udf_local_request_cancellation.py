@@ -431,6 +431,7 @@ def test_cancel_native_output_wait_keeps_other_consumers_bytes(monkeypatch, acto
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": list(range(8192))}))
     held_bytes = manager.snapshot()["usage_bytes"]
+    reservation = manager.reserve_task_bytes(1, 1)
 
     def process(table):
         return pa.table({"x": [7] * 8192})
@@ -464,9 +465,11 @@ def test_cancel_native_output_wait_keeps_other_consumers_bytes(monkeypatch, acto
                         request.cancel()
                 request.shutdown()
                 assert request.state == ("cancelled" if execution_timeout is None else "execution_timed_out")
+                reservation.release()
                 assert manager.snapshot()["usage_bytes"] == held_bytes
                 assert manager.snapshot()["waiting_output_grants"] == 0
     finally:
+        reservation.release()
         for owner in held[1]:
             owner.release()
     assert manager.snapshot()["usage_bytes"] == 0
