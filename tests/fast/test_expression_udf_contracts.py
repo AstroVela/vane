@@ -410,7 +410,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             resource_graph=linear_metadata(nodes),
             plan_identity=f"gpu-order-{decorator_runner}-{resolved_runner}",
         )
-        assert len(pools) == 2
+        assert sum(isinstance(owner, FakeLocalPool) for owner in pools) == 1
         for owner in reversed(pools):
             owner.shutdown()
         assert len(created) == 1
