@@ -1,0 +1,1 @@
+Validation-wrapper preflight stopped before generating or running tests: the broad here-assignment marker occurs both in the wrapper and in a quoted nested generator replacement. Match the actual indented assignment line exactly. Runtime source, tests and measurement data were unchanged.

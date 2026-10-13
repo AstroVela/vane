@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "semantic_difference": "Remove only the whole-generation predicate; comments ignored and all other C++ tokens identical",
+  "control": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src/checkpoint.hpp",
+  "candidate": "/home/kaka/astrovela_vane-fs/vane_fs/build/clean-tail-budget-20261013/updated/src/checkpoint.hpp",
+  "removed_tokens": [
+    "Bytes",
+    "(",
+    "frames",
+    ")",
+    "<",
+    "START_BYTES",
+    "&&"
+  ]
+}
