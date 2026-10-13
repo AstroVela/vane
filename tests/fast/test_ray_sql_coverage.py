@@ -21,6 +21,9 @@ from tests.fast.test_fragment_sql_coverage import (
     UNSTABLE_AGES,
     UNSTABLE_LAMBDAS,
     UNSTABLE_TIMEZONES,
+    correlated_parquet_source,
+    correlated_partition_cases,
+    correlation_source,
 )
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -69,6 +72,29 @@ def test_public_ie_join_parallel_outer_payloads(tmp_path, mode):
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 table = result.collect()
                 assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected)
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("source_kind", ["range", "parquet"])
+def test_public_partitioned_correlated_queries(tmp_path, mode, source_kind):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        source = correlated_parquet_source(local, tmp_path) if source_kind == "parquet" else correlation_source()
+        cases = correlated_partition_cases(source)
+        cases += [f"select a.v, (select avg(b.v) from {source} b where b.k=a.k and b.v>a.v) av from {source} a"]
+        cases += correlated_partition_cases(correlation_source(), correlation_source(0))[:3]
+        cases += correlated_partition_cases(correlation_source(0), correlation_source())[:3]
+        for sql in cases:
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected), sql
+                assert result.execution_state == "SUCCEEDED"
             assert_idle(connection)
 
 

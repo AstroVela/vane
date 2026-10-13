@@ -217,6 +217,68 @@ Arrow results, dependency/resource metadata, timings and ownership snapshots.
 The increment's installed native SHA-256 is
 `037b0a352a805ac5a84f21e7ced41b5d40ee51e80b4a945490b9210595421e47`.
 
+## TPCH SF10 correlated partitions
+
+On 2026-10-13, Q17 and Q21 were measured before and after partitioning native
+delimiter scopes by a proven integer correlation key. The baseline installed
+native came from `1f5e7731a2`; the increment was built on `0c5b165b08` plus the
+correlated-partition change. The intervening review fixes are included, so this
+is a stack comparison rather than an isolated single-patch experiment.
+
+Local used 36 threads. Ray used two workers with 18 CPU slots each, two
+partitions and all advertised memory after required reservations. Baseline
+pipelined / FTE operator memory per worker was 27,323,357,184 / 26,905,368,576
+bytes; the increment used 25,289,068,544 / 25,097,426,944 bytes. The object store
+was 1 GiB, with 128 MiB exchange and 256 MiB staging budgets per worker.
+FTE kept the 160 GiB store/query accounting ceiling, 4 GiB source allowance
+and 2 GiB object ceiling. Each mode reused its runtime for alternating Q17/Q21
+runs. Timings include submission, full collection and successful close;
+comparison is excluded. The host was shared and OS caches were retained.
+
+| Query | Local after (s) | Pipelined median before → after (s) | FTE median before → after (s) |
+| --- | ---: | ---: | ---: |
+| Q17 | 0.421 | 39.577 → 31.076 | 60.807 → 51.079 |
+| Q21 | 1.203 | 50.277 → 31.789 | 59.348 → 47.785 |
+
+Each Ray median has three successful samples except baseline pipelined Q17,
+which has two; an earlier run missing the comparison schema was excluded.
+Local has one sample. All twelve increment Ray runs matched the full local
+values and schemas, with the documented HUGEINT profile and floating tolerance.
+Worker reservations, query/store ownership and result contexts retired after
+every query, and both Runtime snapshots were clean after close. Source sizes
+and nanosecond modification times remained unchanged. FTE submission still
+spends roughly 10–13 seconds creating query-owned snapshots; snapshot reuse is
+not part of this increment.
+
+Q17 now has six fragments, with its delimiter scope running in two partitions
+and a final gather aggregate. Q21 has twelve fragments, with both delimiter
+scopes partitioned by order key. Its 59,986,052-row inner lineitem exchange
+changed from one target to 29,992,594 and 29,993,458 rows across two targets.
+One-second diagnostic samples observed both Q17 delimiter tasks running.
+Other sampled exchange counters are lower bounds when cleanup preceded the
+last sample; they are not exact total traffic measurements.
+
+Two clean manual static reviews preceded one non-editable incremental Release
+build. Related tests passed 933 non-Ray and 60 real-Ray cases, with 18 optional
+`fsspec` skips. Test-only corrections addressed reserved aliases, unsupported
+macros and connection/optimizer setup; production code stayed unchanged after
+the build. The complete fast/release suites were not run.
+
+Artifacts are in `build/tpch-correlated-baseline-20261013/`,
+`build/tpch-correlated-after-20261013/` and
+`build/correlated-partition-20261013/`. They retain SQL, full Arrow results,
+graphs, timing samples, resource settings and lifecycle evidence. The increment
+native SHA-256 is
+`b34a0f6831a52cbcd1c6133d6223aa6a2690e7c771ea03b1ce47a10594c4d179`.
+
+After adding the separately reviewed IE_JOIN serialization and parallel outer
+payload fixes from #999, the combined stack passed 965 related non-Ray and
+64 real-Ray tests, with 18 optional `fsspec` skips. The Ray rerun explicitly
+disabled GPU discovery because host NVML failed before fixture startup; these
+SQL tests require only CPU resources. Its native SHA-256 is
+`12e32106ef84ecee5736f62369e404f815b1a9b6fac61209bef720958a7a5304`.
+This later regression build does not replace the benchmark identity above.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:

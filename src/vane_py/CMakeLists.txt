@@ -26,6 +26,7 @@ add_library(
   query_parameters.cpp
   dynamic_extension.cpp
   execution/fragment_plan.cpp
+  execution/correlated_partition.cpp
   execution/fragment_plan_bindings.cpp
   execution/local_query.cpp
   execution/direct_exchange.cpp
@@ -90,6 +91,8 @@ foreach(
   _fragment_file
   execution/fragment_plan.hpp
   execution/fragment_plan.cpp
+  execution/correlated_partition.hpp
+  execution/correlated_partition.cpp
   execution/fragment_plan_bindings.cpp
   execution/exchange_types.hpp
   execution/arrow_frame.hpp
