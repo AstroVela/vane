@@ -8,7 +8,13 @@ from collections import Counter
 import pytest
 
 import vane
-from tests.fast.test_fragment_sql_coverage import SQL_CASES
+from tests.fast.test_fragment_sql_coverage import (
+    CONTEXT_READS,
+    DETERMINISTIC_LAMBDAS,
+    RANGE_JOIN_CASES,
+    SQL_CASES,
+    UNSTABLE_LAMBDAS,
+)
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 
@@ -20,12 +26,34 @@ def test_public_subquery_and_cte_semantics(tmp_path, mode):
     limits = resources(tmp_path, max_active_queries=1, max_results=1, task_contexts_per_worker=64, io_concurrency=256)
     with vane.connect() as local, vane.Runtime(limits) as application, application.connect() as connection:
         # Reuse the worker pool so CTE state cannot accidentally survive a query.
-        for sql in SQL_CASES + SQL_CASES[-4:-2]:
+        for sql in SQL_CASES + RANGE_JOIN_CASES + SQL_CASES[-4:-2]:
             expected = local.execute(sql).fetchall()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 table = result.collect()
                 assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected), sql
                 assert result.execution_state == "SUCCEEDED"
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_lambda_validation_and_deterministic_execution(tmp_path, mode):
+    with (
+        vane.connect(config={"threads": 4}) as local,
+        vane.Runtime(resources(tmp_path, cpus_per_worker=1)) as application,
+        application.connect(config={"threads": 4}) as connection,
+    ):
+        for sql in UNSTABLE_LAMBDAS + CONTEXT_READS:
+            with pytest.raises(
+                vane.NotImplementedException, match="consistent across tasks|unfrozen connection context"
+            ):
+                connection.query(sql, options=options() if mode == "fte" else None)
+            assert_idle(connection)
+        for sql in DETERMINISTIC_LAMBDAS:
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options() if mode == "fte" else None) as result:
+                table = result.collect()
+                actual = list(zip(*(c.to_pylist() for c in table.columns)))
+                assert sorted(actual, key=repr) == sorted(expected, key=repr)
             assert_idle(connection)
 
 

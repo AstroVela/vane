@@ -60,6 +60,7 @@
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_positional_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
+#include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
@@ -1612,6 +1613,21 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		copy->return_type = return_type;
 		copy->write_empty_file = write_empty_file;
 		return unique_ptr<PhysicalOperator>(std::move(copy));
+	}
+	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN: {
+		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
+		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
+		auto left_map = deserializer.ReadProperty<PhysicalRangeJoin::ProjectionMapping>(105, "left_projection_map");
+		auto right_map = deserializer.ReadProperty<PhysicalRangeJoin::ProjectionMapping>(106, "right_projection_map");
+		auto unprojected = deserializer.ReadProperty<vector<LogicalType>>(107, "unprojected_types");
+		LogicalComparisonJoin logical_join(join_type);
+		logical_join.types = std::move(types);
+		auto join = make_uniq<PhysicalPiecewiseMergeJoin>(physical_plan, logical_join, std::move(conditions), join_type,
+		                                                  estimated_cardinality);
+		join->left_projection_map = std::move(left_map);
+		join->right_projection_map = std::move(right_map);
+		join->unprojected_types = std::move(unprojected);
+		return unique_ptr<PhysicalOperator>(std::move(join));
 	}
 	case PhysicalOperatorType::NESTED_LOOP_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");

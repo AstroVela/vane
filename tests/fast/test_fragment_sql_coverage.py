@@ -43,14 +43,96 @@ SQL_CASES = [
     "select distinct a.range % 3 from range(10) a, range(10) b where a.range=b.range",
 ]
 
+# Cross the native planner's nested-loop/merge-join threshold, including MARK
+# semantics for NULL and empty subqueries and the delimiter scan of COUNT(*).
+RANGE_JOIN_CASES = [
+    sql
+    for count in (0, 3, 10, 100)
+    for sql in (
+        f"select a.range, (select count(*) from range({count}) b where b.range < a.range) from range(10) a",
+        f"select a.range, (select count(*) from range({count}) b where b.range >= a.range) from range(10) a",
+        "select case when range=0 then null else range end < any "
+        f"(select case when range % 3=0 then null else range end from range({count})), "
+        "case when range=0 then null else range end > all "
+        f"(select case when range % 3=0 then null else range end from range({count})) from range(10)",
+    )
+]
+RANGE_JOIN_CASES += [
+    "select a.payload, b.payload from (select range k, range+100 payload from range(10)) a "
+    f"{kind} join (select range k, range+200 payload from range(10)) b on a.k < b.k"
+    for kind in ("inner", "left", "full outer")
+]
+
+DETERMINISTIC_LAMBDAS = [
+    "select list_transform([range, null], lambda x: x+1) from range(4)",
+    "select list_transform([range], lambda x: list_transform([x, x+1], lambda y: y*2)) from range(4)",
+    "select list_filter([range, range+1, null], lambda x: x%2=0) from range(4)",
+    "select list_reduce([range, range+1], lambda x,y: x+y) from range(4)",
+]
+UNSTABLE_LAMBDAS = [
+    "select list_transform([range], lambda x: current_timestamp) from range(4)",
+    "select array_transform([range], lambda x: [current_date, current_date]) from range(4)",
+    "select list_transform([range], lambda x: list_transform([x], lambda y: localtimestamp)) from range(4)",
+    "select list_filter([range], lambda x: current_timestamp>timestamp '2000-01-01') from range(4)",
+    "select list_reduce([range, range+1], lambda x,y: case when current_date>date '2000-01-01' then x else y end) "
+    "from range(4)",
+]
+CONTEXT_READS = [
+    "select current_setting('threads') from range(4)",
+    "select list_transform([range], lambda x: current_setting('threads')) from range(4)",
+    "select list_transform([range], lambda x: list_transform([x], lambda y: current_setting('threads'))) from range(4)",
+    "select list_filter([range], lambda x: current_setting('threads')>0) from range(4)",
+    "select list_reduce([range, range+1], lambda x,y: x+y+current_setting('threads')) from range(4)",
+]
+
 
 @pytest.mark.parametrize("partitions", [1, 2, 5])
-@pytest.mark.parametrize("sql", SQL_CASES)
+@pytest.mark.parametrize("sql", SQL_CASES + RANGE_JOIN_CASES)
 def test_fragment_subqueries_and_shared_state(sql, partitions):
     with vane.connect(config={"threads": 1}) as connection:
         expected = connection.execute(sql).fetchall()
         graph = compile_sql(connection, sql, partitions=partitions)
         assert Counter(execute_graph(connection, graph)) == Counter(expected)
+
+
+@pytest.mark.parametrize("count,operator", [(3, "NESTED_LOOP_JOIN"), (10, "PIECEWISE_MERGE_JOIN")])
+def test_correlated_inequality_crosses_native_join_threshold(count, operator):
+    sql = f"select a.range, (select count(*) from range({count}) b where b.range<a.range) from range(10) a"
+    with vane.connect(config={"threads": 1}) as connection:
+        plan = connection.execute("explain (format json) " + sql).fetchone()[1]
+        assert operator in plan
+        assert sorted(execute_graph(connection, compile_sql(connection, sql, partitions=2))) == [
+            (row, min(row, count)) for row in range(10)
+        ]
+
+
+@pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
+@pytest.mark.parametrize("optimizers", ["default", "no_expression_rewriter", "disabled"])
+@pytest.mark.parametrize("sql", UNSTABLE_LAMBDAS + CONTEXT_READS)
+def test_context_reads_and_lambda_bodies_are_checked_before_optimization(sql, optimizers, entry):
+    from tests.fast.test_execution_submission import options, prepare
+    from vane.execution.query_options import DistributedMode
+
+    with vane.connect(config={"threads": 4}) as connection:
+        if optimizers == "no_expression_rewriter":
+            connection.execute("set disabled_optimizers='expression_rewriter'")
+        elif optimizers == "disabled":
+            connection.execute("pragma disable_optimizer")
+        assert connection.execute(sql).to_arrow_table().num_rows == 4
+        with pytest.raises(vane.NotImplementedException, match="consistent across tasks|unfrozen connection context"):
+            if entry == "compiler":
+                compile_sql(connection, sql, partitions=2)
+            else:
+                prepare(connection, sql, options=options(DistributedMode(entry)))
+
+
+@pytest.mark.parametrize("sql", DETERMINISTIC_LAMBDAS)
+def test_deterministic_lambdas_survive_worker_plan_deserialization(sql):
+    # Ordinary references in the lambda body must remain scoped to that lambda.
+    with vane.connect(config={"threads": 4}) as connection, vane.connect(config={"threads": 1}) as worker:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        assert execute_graph(worker, graph) == expected
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
 #include "duckdb/common/types/row/block_iterator.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -24,8 +25,33 @@ PhysicalPiecewiseMergeJoin::PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_pl
                                                        unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
     : PhysicalRangeJoin(physical_plan, op, PhysicalOperatorType::PIECEWISE_MERGE_JOIN, left, right, std::move(cond),
                         join_type, estimated_cardinality, std::move(pushdown_info_p)) {
+	InitializeOrders();
+}
+
+PhysicalPiecewiseMergeJoin::PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op,
+                                                       vector<JoinCondition> cond, JoinType join_type,
+                                                       idx_t estimated_cardinality)
+    : PhysicalRangeJoin(physical_plan, op, PhysicalOperatorType::PIECEWISE_MERGE_JOIN, std::move(cond), join_type,
+                        estimated_cardinality) {
+	InitializeOrders();
+}
+
+void PhysicalPiecewiseMergeJoin::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "join_type", join_type);
+	serializer.WriteProperty(104, "conditions", conditions);
+	serializer.WriteProperty(105, "left_projection_map", left_projection_map);
+	serializer.WriteProperty(106, "right_projection_map", right_projection_map);
+	serializer.WriteProperty(107, "unprojected_types", unprojected_types);
+}
+
+void PhysicalPiecewiseMergeJoin::InitializeOrders() {
+	if (conditions.empty()) {
+		throw InvalidInputException("piecewise merge join requires a range condition");
+	}
 	for (auto &join_cond : conditions) {
-		D_ASSERT(join_cond.left->return_type == join_cond.right->return_type);
+		if (join_cond.left->return_type != join_cond.right->return_type) {
+			throw InvalidInputException("piecewise merge join condition types differ");
+		}
 		join_key_types.push_back(join_cond.left->return_type);
 
 		// Convert the conditions to sort orders
@@ -45,7 +71,9 @@ PhysicalPiecewiseMergeJoin::PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_pl
 		case ExpressionType::COMPARE_NOTEQUAL:
 		case ExpressionType::COMPARE_DISTINCT_FROM:
 			// Allowed in multi-predicate joins, but can't be first/sort.
-			D_ASSERT(!lhs_orders.empty());
+			if (lhs_orders.empty()) {
+				throw InvalidInputException("piecewise merge join requires a leading range condition");
+			}
 			lhs_orders.emplace_back(OrderType::INVALID, OrderByNullType::NULLS_LAST, std::move(left_expr));
 			rhs_orders.emplace_back(OrderType::INVALID, OrderByNullType::NULLS_LAST, std::move(right_expr));
 			break;

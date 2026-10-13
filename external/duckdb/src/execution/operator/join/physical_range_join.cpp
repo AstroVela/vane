@@ -313,6 +313,11 @@ PhysicalRangeJoin::PhysicalRangeJoin(PhysicalPlan &physical_plan, LogicalCompari
 	unprojected_types.insert(unprojected_types.end(), types.begin(), types.end());
 }
 
+PhysicalRangeJoin::PhysicalRangeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperatorType type,
+                                     vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality)
+    : PhysicalComparisonJoin(physical_plan, op, type, std::move(cond), join_type, estimated_cardinality) {
+}
+
 idx_t PhysicalRangeJoin::LocalSortedTable::MergeNulls(Vector &primary, const vector<JoinCondition> &conditions) {
 	// Merge the validity masks of the comparison keys into the primary
 	// Return the number of NULLs in the resulting chunk

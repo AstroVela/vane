@@ -10,6 +10,7 @@
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/physical_plan_inputs.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/function/aggregate/wide_integer.hpp"
 #include "duckdb/function/aggregate/wide_interval.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
@@ -290,6 +292,21 @@ void CheckFunctionOrigin(CatalogEntry &entry) {
 	}
 }
 
+void CheckScalarFunction(const ScalarFunction &function, bool bound = false) {
+	// Binder's scalar-subquery cardinality guard uses error(), marked volatile
+	// to defer its exception until execution. Explicit SQL calls are still checked.
+	if (function.GetStability() != FunctionStability::CONSISTENT && (!bound || function.name != "error")) {
+		throw NotImplementedException("fragment compiler requires expressions consistent across tasks and attempts: %s",
+		                              function.name);
+	}
+	// CONSISTENT alone does not promise portability. For example current_setting
+	// binds a value but rebinds it at the worker, whose execution settings differ.
+	if (function.IsClientContextRead()) {
+		throw NotImplementedException("fragment compiler does not support unfrozen connection context reads: %s",
+		                              function.name);
+	}
+}
+
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
@@ -314,10 +331,7 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 			// Check before binding can evaluate table arguments. Function names do
 			// not define portability; native binding and serialization do.
 			for (auto &overload : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
-				if (overload.GetStability() != FunctionStability::CONSISTENT) {
-					throw NotImplementedException(
-					    "fragment compiler requires expressions consistent across tasks and attempts: %s", name);
-				}
+				CheckScalarFunction(overload);
 			}
 		}
 	}
@@ -411,13 +425,20 @@ public:
 	void VisitExpression(unique_ptr<Expression> *expression) override {
 		// Query-stable functions (e.g. CURRENT_TIMESTAMP) also change across tasks
 		// and retries. Inspect each function before optional constant folding.
-		// Binder's scalar-subquery cardinality check uses error(), marked volatile
-		// only to defer its exception until the branch is actually evaluated.
-		if ((*expression)->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-		    (*expression)->Cast<BoundFunctionExpression>().function.GetStability() != FunctionStability::CONSISTENT &&
-		    (*expression)->Cast<BoundFunctionExpression>().function.name != "error") {
-			throw NotImplementedException(
-			    "fragment compiler requires expressions consistent across tasks and attempts");
+		if ((*expression)->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			auto &function = (*expression)->Cast<BoundFunctionExpression>();
+			CheckScalarFunction(function.function, true);
+			// Lambda bodies live in bind data, outside ordinary expression children.
+			// Recurse here as well so nested list functions cannot hide a context read.
+			if (function.function.HasBindLambdaCallback()) {
+				if (!function.bind_info) {
+					throw InternalException("bound lambda function has no bind data");
+				}
+				auto &body = function.bind_info->Cast<ListLambdaBindData>().lambda_expr;
+				if (body) {
+					VisitExpression(&body);
+				}
+			}
 		}
 		LogicalOperatorVisitor::VisitExpression(expression);
 	}
@@ -454,6 +475,7 @@ void CheckOperator(PhysicalOperator &op, idx_t children, bool scoped = false) {
 		break;
 	case PhysicalOperatorType::CROSS_PRODUCT:
 	case PhysicalOperatorType::NESTED_LOOP_JOIN:
+	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
 	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
 	case PhysicalOperatorType::CTE:
 		if (children == 2) {
@@ -686,6 +708,7 @@ public:
 		case PhysicalOperatorType::RIGHT_DELIM_JOIN:
 		case PhysicalOperatorType::CROSS_PRODUCT:
 		case PhysicalOperatorType::NESTED_LOOP_JOIN:
+		case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
 		case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
 			return Scoped(op);
 		default:
@@ -818,6 +841,8 @@ private:
 				auto &join = op.Cast<PhysicalHashJoin>();
 				join.filter_pushdown.reset();
 				join.join_stats.clear();
+			} else if (op.type == PhysicalOperatorType::PIECEWISE_MERGE_JOIN) {
+				op.Cast<PhysicalPiecewiseMergeJoin>().filter_pushdown.reset();
 			} else if (op.type == PhysicalOperatorType::TOP_N) {
 				op.Cast<PhysicalTopN>().dynamic_filter.reset();
 			}
