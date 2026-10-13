@@ -1,0 +1,13 @@
+{
+  "status": "RESOLVED_BEFORE_FIRST_MOUNT",
+  "failure": "Diagnostic runner requires trace/tests.json; the builder retained it as reused-tests.json.",
+  "runtime_source_or_binary_changed": false,
+  "measured_mounts": 0,
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/preflight/plan.json": "6e5dfc82e2f5e3de58b2d2da5d3c174c850272b6af5f246e4ff9af0ac46082f3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/preflight/run_fuse.py.txt": "83737cd25601cbc551d1b9589b67c1d786b0793f87af3fd3d208277fbf54be01",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/preflight/run-generator.py.txt": "50f05e892468198cd2d161474a4d8395f64c8b421c00d5e42bdf0017e76caa58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/preflight/analyze.py.txt": "4adf44c2f4c0cabd90f80e87c7083fa355e7e38063016ea78cd10ed05975b1b6"
+  },
+  "analysis_failure": "KeyError: workload; the reused publication record identifies a phase by phase_begin_ns."
+}
