@@ -2470,8 +2470,11 @@ def test_map_batches_tensor_nulls_through_local_exchange():
         embedding = embedding.combine_chunks() if hasattr(embedding, "combine_chunks") else embedding
         assert embedding.type.extension_name == "arrow.fixed_shape_tensor"
         validity = embedding.is_valid().to_numpy(zero_copy_only=False)
-        tensor = embedding.to_numpy_ndarray().reshape((len(embedding), -1))
-        sums = [float(values.sum()) if is_valid else None for is_valid, values in zip(validity, tensor, strict=False)]
+        # Dense NumPy tensors have no row validity bitmap. Convert only valid
+        # tensors and restore the original NULL positions in the Arrow result.
+        valid = embedding.filter(embedding.is_valid())
+        totals = iter(valid.to_numpy_ndarray().reshape((-1, 4)).sum(axis=1)) if len(valid) else iter(())
+        sums = [float(next(totals)) if is_valid else None for is_valid in validity]
         return pa.table(
             {
                 "x": pa.array(xs, type=pa.int64()),
