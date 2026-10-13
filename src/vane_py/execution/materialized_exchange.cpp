@@ -6,7 +6,7 @@
 #include "fragment_plan.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/local_file_system.hpp"
-#include "mbedtls_wrapper.hpp"
+#include "sha256.hpp"
 
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
@@ -18,7 +18,7 @@ namespace duckdb {
 namespace vane_execution {
 namespace {
 
-using Hash = duckdb_mbedtls::MbedTlsWrapper::SHA256State;
+using Hash = SHA256State;
 
 void Check(const arrow::Status &status) {
 	if (!status.ok()) {

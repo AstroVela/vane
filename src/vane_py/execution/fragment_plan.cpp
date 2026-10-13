@@ -1085,11 +1085,15 @@ private:
 		const bool broadcast = join.children[1].get().estimated_cardinality <= 32 &&
 		                       (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
 		                        join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI);
-		auto lk = ProjectKeys(left, left_keys);
-		left = Exchange(std::move(left), "hash", partitions, lk);
 		if (broadcast) {
-			right = Exchange(std::move(right), "broadcast", partitions);
+			// Every probe partition sees the complete build input. Preserve its
+			// existing distribution and fuse the probe subtree with the join;
+			// shuffling it by the join key adds no correctness guarantee here.
+			auto count = left.fragment.partition_count;
+			right = Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count);
 		} else {
+			auto lk = ProjectKeys(left, left_keys);
+			left = Exchange(std::move(left), "hash", partitions, lk);
 			auto rk = ProjectKeys(right, right_keys);
 			right = Exchange(std::move(right), "hash", partitions, rk);
 		}

@@ -2,6 +2,22 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
+## 已完成增量：广播 join 与校验吞吐
+
+基于 TPC-H SQL 覆盖，先减少已有计划中的不必要交换与校验 CPU 开销：
+
+- [x] 广播 join 保留 probe 子树及其分区数，单分区 probe 汇聚 build，避免额外 HASH 边。
+- [x] 固定宽度 DirectFrame 测量按行数计算；保留复制时的 selection、NULL 和嵌套边界检查。
+- [x] 冻结文件及物化交换使用 OpenSSL EVP SHA-256，保留完整性验证和查询级副本所有权。
+- [x] 连续两轮静态审查后统一构建，执行相关回归。
+- [x] 同样的 36 CPU/可用内存策略重跑 SF10 Q6/Q8/Q17/Q21，并扩展到全部 22 条，核对完整结果、耗时及资源清理。
+
+这一增量不改变相关子查询共享状态单元的分区方式。其并行化以及分布式运行时过滤仍需后续单独设计和测量。
+
+2026-10-13：相关非 Ray 1,295 项、真实 Ray 94 项通过，23 项因缺少可选依赖 fsspec 跳过。使用非 editable Release 安装；构建后的测试修正了保留字别名和依赖旧广播图形状的两个测试场景，未再修改 native。未运行全量 fast/release。
+
+SF10 三种模式各完成 22/22，Ray 的完整结果、schema 和返回顺序与 local 一致，查询及服务资源清理通过。四条同日对照的 pipelined 合计从 119.882 s 降到 103.739 s，FTE 从 310.514 s 降到 188.253 s。此为共享机器上的单样本；内存按各次启动的可用量分配，具体预算、逐条数据与限制见[吞吐验收](EXECUTION_ACCEPTANCE.md#tpch-sf10-broadcast-and-checksum-throughput)。
+
 ## 已完成增量：TPC-H SQL 覆盖
 
 目标是让相同 Parquet SQL 在 local、Ray pipelined、Ray FTE 执行全部 22 条查询并核对完整结果，不引入旧 runner fallback。

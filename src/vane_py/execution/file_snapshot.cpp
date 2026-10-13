@@ -6,7 +6,7 @@
 #include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "mbedtls_wrapper.hpp"
+#include "sha256.hpp"
 
 #include <filesystem>
 #include <mutex>
@@ -22,7 +22,7 @@
 namespace duckdb {
 namespace vane_execution {
 namespace {
-using Hash = duckdb_mbedtls::MbedTlsWrapper::SHA256State;
+using Hash = SHA256State;
 
 string UTF8Path(const std::filesystem::path &path) {
 	auto encoded = path.u8string();

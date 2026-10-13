@@ -100,6 +100,31 @@ def test_parquet_row_groups_and_decimal_partial_states(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_broadcast_probe_scans_and_small_builds_share_a_fragment(tmp_path, mode):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as local:
+        local.execute(
+            f"copy (select range i, case when range%7=0 then null else range%11 end k "
+            f"from range(16384)) to '{path}' (row_group_size 2048)"
+        )
+        queries = [
+            f"select count(*), sum(a.i)::bigint from read_parquet('{path}') a "
+            "join range(3) b on a.k=b.range join range(2) c on a.k=c.range",
+            f"select a.i, b.range from read_parquet('{path}') a left join "
+            "(select case when range=0 then null else range end as range from range(3)) b "
+            "on a.k is not distinct from b.range order by a.i limit 31",
+            f"select count(*) from read_parquet('{path}') a anti join range(3) b on a.k=b.range",
+            f"select a.i from read_parquet('{path}') a left join range(0) b on a.k=b.range order by a.i desc limit 17",
+        ]
+        expected = [local.execute(sql).to_arrow_table().to_pylist() for sql in queries]
+    with vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
+        for sql, rows in zip(queries, expected, strict=True):
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == rows
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_analytical_sql_and_repeated_execution(tmp_path, mode):
     with (
         vane.connect(backend="local") as local,
@@ -467,9 +492,9 @@ def test_waiting_pipelined_graph_precedes_next_fte_attempt(tmp_path, monkeypatch
         return original(owner, attempt)
 
     monkeypatch.setattr(RecoveryScheduler, "_release", hold_first)
-    # FTE occupies one context. The graph requires three contexts and
+    # FTE occupies one context. The broadcast graph requires two contexts and
     # must queue atomically; later FTE tasks cannot overtake it.
-    limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=3)
+    limits = resources(tmp_path, worker_count=1, partitions=1, task_contexts_per_worker=2)
     with vane.Runtime(limits) as application, application.connect() as connection, connection.cursor() as sibling:
         fte = connection.query("select range from range(19) order by range", options=options(execution=60))
         try:

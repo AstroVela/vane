@@ -3,6 +3,7 @@
 
 """Source copies precede optimization and remain the only replay inputs."""
 
+import hashlib
 import os
 
 import pytest
@@ -39,6 +40,26 @@ def run(spec):
             {},
             {source.source_id: [split.split_id for split in source.splits] for source in fragment.sources},
         )
+
+
+@pytest.mark.parametrize("rows", [0, 17, 10000])
+def test_snapshot_sha256_matches_independent_digest(tmp_path, rows):
+    path = tmp_path / "source.parquet"
+    with vane.connect(backend="local") as connection:
+        connection.execute(
+            f"copy (select range as value, md5(range::varchar) as payload from range({rows})) "
+            f"to '{path}' (compression uncompressed)"
+        )
+        original = path.read_bytes()
+        spec, used = stage(
+            connection, f"select value from read_parquet('{path}')", tmp_path / "snapshots", len(original)
+        )
+    digest = hashlib.sha256(original).hexdigest().encode()
+    assert used == len(original)
+    assert next((tmp_path / "snapshots").rglob("*.parquet")).read_bytes() == original
+    splits = [s for f in spec.graph.fragments for source in f.sources + f.source_dependencies for s in source.splits]
+    assert splits and all(digest in s.payload for s in splits)
+    assert len(run(spec)) == rows
 
 
 @pytest.mark.parametrize("predicate", ["", " where value > 10"])
