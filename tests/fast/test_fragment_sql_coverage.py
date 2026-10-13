@@ -46,6 +46,28 @@ SQL_CASES = [
     "select distinct a.range % 3 from range(10) a, range(10) b where a.range=b.range",
 ]
 
+# Ordered DISTINCT ON becomes FIRST without optimization and ARG_MIN_NULL with
+# optimization. Every group must see all rows before choosing its payloads.
+ORDERED_DISTINCT_CASES = [
+    "select distinct on (range % 3) range % 3 k, range v from range(17) order by k, v desc",
+    "select distinct on (range % 3) range % 3 k, range v from range(17) order by k, v asc",
+    "select distinct on (range % 3) range % 3 k, range v, "
+    "case when range>=14 then null else range::varchar end payload from range(17) order by k, v desc",
+    "select distinct on (range % 3, range % 2) range % 3 k, range % 2 j, range v "
+    "from range(31) order by k desc, j, v desc",
+    "select distinct on (range % 3) range % 3 k, 100-range payload from range(17) "
+    "order by k, range desc limit 2 offset 1",
+    "select distinct on (range % 3) range % 3 k, range v from range(0) order by k, v desc",
+    "select distinct on (range % 3) range % 3 k, range v from range(2) order by k, v desc",
+] + [
+    "select distinct on (k) k, sort_key, v, payload from (select "
+    "case when range%4=0 then null else range%4 end k, "
+    "case when range%5=0 then null else range%3 end sort_key, range v, "
+    "case when range%2=0 then null else range::varchar end payload from range(31)) "
+    f"order by k nulls {null_order}, sort_key desc nulls {null_order}, v desc"
+    for null_order in ("first", "last")
+]
+
 # Cross the native planner's nested-loop/merge-join threshold, including MARK
 # semantics for NULL and empty subqueries and the delimiter scan of COUNT(*).
 RANGE_JOIN_CASES = [
@@ -163,6 +185,17 @@ def test_fragment_subqueries_and_shared_state(sql, partitions):
         expected = connection.execute(sql).fetchall()
         graph = compile_sql(connection, sql, partitions=partitions)
         assert Counter(execute_graph(connection, graph)) == Counter(expected)
+
+
+@pytest.mark.parametrize("sql", ORDERED_DISTINCT_CASES)
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("optimizer", [True, False])
+def test_ordered_distinct_on_keeps_complete_groups(sql, partitions, optimizer):
+    with vane.connect(config={"threads": 1}) as connection:
+        if not optimizer:
+            connection.execute("pragma disable_optimizer")
+        expected = connection.execute(sql).fetchall()
+        assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
 
 
 @pytest.mark.parametrize("count,operator", [(3, "NESTED_LOOP_JOIN"), (10, "PIECEWISE_MERGE_JOIN")])

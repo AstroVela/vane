@@ -15,6 +15,7 @@ from tests.fast.test_fragment_sql_coverage import (
     DETERMINISTIC_TIMEZONES,
     IE_JOIN_CASES,
     IE_JOIN_EQUALITY_TAIL,
+    ORDERED_DISTINCT_CASES,
     RANGE_JOIN_CASES,
     SQL_CASES,
     UNSTABLE_AGES,
@@ -25,6 +26,19 @@ from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 
 pytestmark = [pytest.mark.real_ray, pytest.mark.usefixtures("ray_local")]
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_ordered_distinct_on_keeps_complete_groups(tmp_path, mode):
+    with vane.connect() as local, vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
+        for sql in ORDERED_DISTINCT_CASES:
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                actual = list(zip(*(column.to_pylist() for column in table.columns)))
+                assert actual == expected, sql
+                assert result.execution_state == "SUCCEEDED"
+            assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

@@ -997,9 +997,12 @@ private:
 			auto &aggregate = expression->Cast<BoundAggregateExpression>();
 			auto name = aggregate.function.name;
 			// Binder uses FIRST to retain an interval/collated group value, and
-			// ARG_MIN/MAX for collated MIN/MAX. Parsed SQL still admits only the
-			// public aggregate subset. Keep these native rewrites as complete groups.
-			const bool internal_rewrite = name == "first" || name == "arg_min" || name == "arg_max";
+			// ARG_MIN/MAX for collated MIN/MAX. Ordered DISTINCT ON becomes
+			// ARG_MIN_NULL over a native sort key, retaining NULL payloads.
+			// Parsed SQL still admits only the public aggregate subset. Keep
+			// these native rewrites as complete groups.
+			const bool internal_rewrite =
+			    name == "first" || name == "arg_min" || name == "arg_max" || name == "arg_min_null";
 			if (name != "count" && name != "count_star" && name != "sum" && name != "sum_no_overflow" &&
 			    name != "avg" && name != "min" && name != "max" && !internal_rewrite) {
 				throw NotImplementedException("unsupported distributed aggregate %s", name);
