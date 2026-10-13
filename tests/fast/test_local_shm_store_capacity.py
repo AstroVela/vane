@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 
 import pytest
@@ -104,6 +104,83 @@ def test_fallible_budget_notification_does_not_repeat_physical_release(store):
     lease.release()
     assert calls == ["released"]
     assert store.snapshot()["live_bytes"] == 0
+
+
+@pytest.mark.parametrize("unrelated_bytes", [0, 128])
+def test_mutually_blocked_writers_ignore_unrelated_retained_views(unrelated_bytes):
+    store = LocalShmStore(8192)
+    store.add_client("retained-cycle")
+    inputs = [store.allocate(3072), store.allocate(3072)]
+    unrelated = store.allocate(unrelated_bytes) if unrelated_bytes else None
+    scopes = [ExecutionCancellationScope("retained-cycle", index + 1) for index in range(2)]
+
+    def write(index):
+        try:
+            store.wait_for_capacity(4096, (inputs[index].allocation,), scopes[index], nullcontext)
+            return "ready"
+        except LocalShmStoreCapacityError:
+            return "capacity"
+        finally:
+            inputs[index].release()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            futures = [threads.submit(write, index) for index in range(2)]
+            try:
+                done, _ = wait(futures, timeout=5, return_when=FIRST_COMPLETED)
+                assert done, "no writer reported the capacity cycle"
+                assert any(future.result() == "capacity" for future in done)
+                # The unrelated view also fragments the newly freed region.
+                # After the cycle is reported, releasing it lets the peer fit.
+                if unrelated is not None:
+                    unrelated.release()
+                assert sorted(future.result(timeout=5) for future in futures) == ["capacity", "ready"]
+            finally:
+                for scope in scopes:
+                    scope.cancel()
+    finally:
+        for lease in inputs:
+            lease.release()
+        if unrelated is not None:
+            unrelated.release()
+        store.remove_client("retained-cycle")
+    assert store.snapshot()["live_allocations"] == 0
+
+
+def test_unrelated_allocation_can_still_release_space_for_waiting_writers():
+    store = LocalShmStore(8192)
+    store.add_client("reclaimable-space")
+    inputs = [store.allocate(1024), store.allocate(1024)]
+    unrelated = store.allocate(4096)
+    scopes = [ExecutionCancellationScope("reclaimable-space", index + 1) for index in range(2)]
+
+    def write(index):
+        try:
+            store.wait_for_capacity(3072, (inputs[index].allocation,), scopes[index], nullcontext)
+        finally:
+            inputs[index].release()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            futures = [threads.submit(write, index) for index in range(2)]
+            try:
+                with store._capacity_condition:
+                    assert store._capacity_condition.wait_for(lambda: len(store._waiting_writes) == 2, timeout=5)
+                for future in futures:
+                    with pytest.raises(TimeoutError):
+                        future.result(timeout=0.05)
+                unrelated.release()
+                for future in futures:
+                    future.result(timeout=5)
+            finally:
+                for scope in scopes:
+                    scope.cancel()
+    finally:
+        unrelated.release()
+        for lease in inputs:
+            lease.release()
+        store.remove_client("reclaimable-space")
+    assert store.snapshot()["live_allocations"] == 0
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")

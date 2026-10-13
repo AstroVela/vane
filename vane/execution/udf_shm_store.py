@@ -442,9 +442,9 @@ class LocalShmStore:
     ) -> None:
         """Wait for a physical release without owning a grant or a worker CPU.
 
-        A wait cannot resolve when every live region is an input of a writer
-        waiting for output space. Report that capacity boundary instead of
-        letting the producers and consumers wait on each other indefinitely.
+        A wait cannot resolve when no writer could fit even after every
+        unrelated allocation is released. Report that capacity boundary instead
+        of letting the writers wait on each other's inputs indefinitely.
         """
         self._require_owner()
         required = self.check_write_size(size)
@@ -472,14 +472,28 @@ class LocalShmStore:
                                 return
                             pinned = sum(self._live[g].capacity for g in generations if g in self._live)
                             blocked_inputs = set().union(*(g for _, g in self._waiting_writes.values()))
-                            all_blocked = self._live.keys() <= blocked_inputs and all(
-                                requested > largest for requested, _ in self._waiting_writes.values()
+                            # Only the waiting writers' inputs are necessarily
+                            # pinned. Optimistically reclaim every other region;
+                            # unrelated retained views cannot hide a cycle, and
+                            # views whose release could help still allow a wait.
+                            end = 0
+                            largest_possible = 0
+                            for entry in sorted(
+                                (self._live[g] for g in blocked_inputs if g in self._live),
+                                key=lambda entry: entry.allocation.offset,
+                            ):
+                                largest_possible = max(largest_possible, entry.allocation.offset - end)
+                                end = entry.allocation.offset + entry.capacity
+                            largest_possible = max(largest_possible, self.capacity - end)
+                            all_blocked = all(
+                                requested > largest_possible for requested, _ in self._waiting_writes.values()
                             )
                             if pinned + required > self.capacity or all_blocked:
                                 raise LocalShmStoreCapacityError(
                                     f"shared-memory output cannot make progress: requested={size}, "
                                     f"pinned_input_bytes={pinned}, capacity={self.capacity}, "
-                                    f"largest_free={largest}; reduce task input or output block size"
+                                    f"largest_free={largest}, largest_possible_free={largest_possible}; "
+                                    "reduce task input or output block size"
                                 )
                             self._capacity_condition.wait()
                     finally:

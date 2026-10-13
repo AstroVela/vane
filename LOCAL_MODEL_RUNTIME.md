@@ -1460,11 +1460,18 @@ remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
 fork pin retains them. The input ACK records the consuming dependency without
 creating output credit; overlapping slices cannot multiply reserved bytes.
 Ordinary output admission allows a consumer holding live input to finish one
-complete block across the soft transport window. That consumer waits for its
-previous output to be released before expanding again above the window, so
-unrelated upstream inputs cannot prevent downstream progress. Explicit per-task byte envelopes
-keep their hard boundary. The physical arena always enforces its own capacity,
-including allocation rounding and fragmentation; it does not spill.
+complete block across the soft transport window. It also allows the same output
+source to bridge one retained prior block with a second block, so an actor that
+releases its previous input only after receiving the next batch can advance.
+This additional allowance stops at two owned output grants across invocations;
+pending grants and converted grants count until their last physical lease is
+released. Descriptor release or an input ACK cannot reopen this allowance while
+a worker view or fork pin still holds the storage. Explicit per-task byte
+envelopes keep their hard boundary. The physical arena always enforces its own
+capacity, including allocation rounding and fragmentation; it does not spill.
+If none of the waiting writers can fit an output even after every unrelated
+allocation is released, the arena reports a capacity error instead of waiting
+indefinitely on their pinned inputs.
 
 These bounds cover transport output, not arbitrary intermediate heap objects
 allocated inside user code before it returns or yields a table. A UDF that

@@ -482,7 +482,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         )
         self._execution_scope_lock = threading.Lock()
         self._active_execution_scope: ExecutionCancellationScope | None = None
-        self._worker_lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+        self._worker_lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{uuid.uuid4().hex}", 1)
         self._close_lock = threading.Lock()
         self._startup_cancel_requested = threading.Event()
         self._active_input_leases: dict[int, ExecutionCancellationScope] = {}
@@ -682,7 +682,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 return cast("ExecutionCancellationScope", scope)
             lifetime_scope = getattr(self, "_worker_lifetime_scope", None)
             if lifetime_scope is None:
-                lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+                lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{uuid.uuid4().hex}", 1)
                 self._worker_lifetime_scope = lifetime_scope
             return cast("ExecutionCancellationScope", lifetime_scope)
 
@@ -1227,6 +1227,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                             name=f"udf-output-{request_id}",
                             priority=priority,
                             input_lease_id=input_lease_id,
+                            owner_id=scope.owner_id,
                             cancel_event=scope,
                             wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
                         )

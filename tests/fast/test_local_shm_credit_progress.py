@@ -136,3 +136,87 @@ def test_pinned_consumer_can_progress_past_unrelated_inputs_once(monkeypatch):
             ref.release()
         store.remove_client("consumer-progress")
     assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_output_owner_window_waits_for_physical_release_across_invocations(monkeypatch):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("owner-window")
+
+    def output():
+        grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+        owner = manager.output_grant_owner(grant)
+        lease = store.allocate(1100)
+        return refs.LocalShmBlockRef(
+            lease.allocation.identity,
+            1100,
+            allocation_lease=lease,
+            budget_bytes=manager.convert_output_grant_to_allocation(grant),
+            output_owner=owner,
+        )
+
+    first, second = output(), output()
+    held_view = first._allocation_lease.fork()
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant, 1100, priority="consumer", owner_id="source", cancel_event=cancel
+            )
+            try:
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+                first.release()
+                assert len(manager._owned_output_grants["source"]) == 2
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+                held_view.release()
+                grant = pending.result(timeout=5)
+                assert len(manager._owned_output_grants["source"]) == 2
+                manager.release_output_grant(grant)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        held_view.release()
+        first.release()
+        second.release()
+        store.remove_client("owner-window")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
+
+
+@pytest.mark.parametrize(
+    "owner_id,priority,strict",
+    [("source", "producer", False), ("other", "consumer", False), ("source", "consumer", True)],
+)
+def test_owned_window_preserves_producer_owner_and_explicit_reservation_boundaries(owner_id, priority, strict):
+    limit = [3000]
+    manager = LocalShmBudgetManager(limit_factory=lambda: limit[0])
+    first = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    reservation = manager.reserve_task_bytes(10, 10) if strict else None
+    limit[0] = 1000
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant, 1100, priority=priority, owner_id=owner_id, cancel_event=cancel
+            )
+            try:
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.05)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+                with pytest.raises(RuntimeError, match="cancelled"):
+                    pending.result(timeout=5)
+    finally:
+        if reservation is not None:
+            reservation.release()
+        manager.release_output_grant(first)
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}

@@ -174,3 +174,73 @@ def test_expanding_pipeline_releases_real_storage_under_small_budget(backend):
         },
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("source_kind", ["generator", "table"])
+def test_actor_retaining_previous_input_can_receive_the_next_batch(source_kind):
+    script = textwrap.dedent(f"""
+        import gc
+        import threading
+        import pyarrow as pa
+        import vane
+        from vane.execution.ref_bundle import local_shm_budget_manager, local_shm_ref_budget_snapshot
+        from vane.execution.udf_shm_store import local_shm_store_snapshot
+
+        def expand(batch):
+            for value in range(32):
+                yield pa.table({{'id': [value], 'payload': [b'x' * 65536]}})
+
+        def materialize(batch):
+            values = batch['id'].to_pylist()
+            return pa.table({{'id': values, 'payload': [b'x' * 65536 for _ in values]}})
+
+        class RetainingConsumer:
+            def __init__(self):
+                self.last = None
+
+            def __call__(self, batch):
+                self.last = batch
+                return batch.select(['id'])
+
+        try:
+            with vane.connect(config={{'threads': 4}}) as con:
+                watchdog = threading.Timer(15, con.interrupt)
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    generator = {source_kind!r} == 'generator'
+                    rel = con.sql('select 1::BIGINT as id' if generator else 'select range::BIGINT as id from range(32)')
+                    rel = rel.map_batches(
+                        expand if generator else materialize,
+                        schema={{'id': 'BIGINT', 'payload': 'BLOB'}},
+                        execution_backend='subprocess_task', batch_size=1, min_task_batch_size=1,
+                        task_input_max_bytes=8, output_batch_size=1, output_target_max_bytes=1024,
+                    ).map_batches(
+                        RetainingConsumer, schema={{'id': 'BIGINT'}},
+                        execution_backend='subprocess_actor', actor_number=1,
+                        batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
+                    )
+                    assert sorted(rel.to_arrow_table()['id'].to_pylist()) == list(range(32))
+                finally:
+                    watchdog.cancel()
+        finally:
+            vane.teardown_runner()
+        gc.collect()
+        assert local_shm_ref_budget_snapshot()['usage_bytes'] == 0
+        assert local_shm_budget_manager()._owned_output_grants == {{}}
+        assert local_shm_store_snapshot()['live_bytes'] == 0
+    """)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_LOCAL_SHM_STORE_BYTES": "16MiB",
+            "VANE_LOCAL_SHM_REF_BUDGET_BYTES": "32KiB",
+        },
+    )
+    assert result.returncode == 0, result.stderr

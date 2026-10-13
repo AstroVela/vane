@@ -520,11 +520,14 @@ def test_fork_exit_finalizers_preserve_parent_data_and_skip_inherited_locks(scen
             refs._unlink_shared_memory_name(name)
 
 
-def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_shm_worker):
+@pytest.mark.parametrize("owner_id", [None, "source"])
+def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_shm_worker, monkeypatch, owner_id):
     peer = pooled_shm_worker
+    manager = refs.LocalShmBudgetManager(limit_factory=lambda: peer.store.capacity)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     blocks = [refs.prepare_local_shm_block(pa.table({"x": [value]})) for value in (11, 22)]
     size = sum(block.ipc_size_bytes for block in blocks)
-    grant = refs.request_local_shm_output_grant(size)
+    grant = refs.request_local_shm_output_grant(size, owner_id=owner_id)
     allocation = peer.reserve_write(grant, size)
     descriptor = refs.make_pooled_shm_descriptor(blocks, allocation=allocation, grant_id=grant)
     result = refs.make_local_shm_ref_bundle_result_from_descriptor(descriptor)
@@ -535,9 +538,45 @@ def test_published_blocks_share_one_allocation_and_pin_it_independently(pooled_s
     second.release()
     assert kept.to_pylist() == [22]
     assert peer.store.snapshot()["live_allocations"] == 1
+    if owner_id is not None:
+        assert manager._owned_output_grants[owner_id][grant].owner_bytes == size
     del kept
     gc.collect()
     assert peer.store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
+
+
+@pytest.mark.parametrize("invalid_block", [0, 1])
+def test_failed_descriptor_adoption_keeps_only_attached_output_ownership(pooled_shm_worker, monkeypatch, invalid_block):
+    peer = pooled_shm_worker
+    manager = refs.LocalShmBudgetManager(limit_factory=lambda: peer.store.capacity)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    blocks = [refs.prepare_local_shm_block(pa.table({"x": [value]})) for value in (11, 22)]
+    size = sum(block.ipc_size_bytes for block in blocks)
+    grant = refs.request_local_shm_output_grant(size, owner_id="source")
+    allocation = peer.reserve_write(grant, size)
+    descriptor = refs.make_pooled_shm_descriptor(blocks, allocation=allocation, grant_id=grant)
+    region = peer.store.buffer(storage.ShmAllocation.parse(allocation))
+    try:
+        offset = descriptor["block_refs"][invalid_block]["allocation_offset"]
+        region[offset : offset + 8] = bytes(8)
+    finally:
+        region.release()
+    try:
+        with pytest.raises(refs.InvalidLocalShmReferenceError, match="invalid local_shm result reference"):
+            refs.make_local_shm_ref_bundle_result_from_descriptor(descriptor)
+        retained = blocks[0].ipc_size_bytes if invalid_block == 1 else 0
+        assert manager.snapshot()["usage_bytes"] == retained
+        if retained:
+            assert manager._owned_output_grants["source"][grant].owner_bytes == retained
+        else:
+            assert manager._owned_output_grants == {}
+    finally:
+        peer.finish_write(grant)
+    assert peer.store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
 
 
 @pytest.mark.parametrize("field,value", [("allocation_offset", 1), ("ipc_size_bytes", 1), ("shm_name", "foreign")])
