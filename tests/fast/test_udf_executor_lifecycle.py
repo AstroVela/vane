@@ -4689,11 +4689,14 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
 
     captured: dict[str, object] = {}
 
-    def fake_request(size, *, name="", priority="producer", input_lease_id=None, cancel_event=None, wait_context=None):
+    def fake_request(
+        size, *, name="", priority="producer", input_lease_id=None, owner_id=None, cancel_event=None, wait_context=None
+    ):
         captured["size"] = size
         captured["name"] = name
         captured["priority"] = priority
         captured["input_lease_id"] = input_lease_id
+        captured["owner_id"] = owner_id
         captured["cancel_event"] = cancel_event
         assert callable(wait_context)
         return 77
@@ -4721,6 +4724,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
             "priority": "consumer",
             "input_lease_id": 123,
             "cancel_event": scope,
+            "owner_id": scope.owner_id,
         }
     finally:
         parent_sock.close()
@@ -10558,6 +10562,7 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
         name="",
         priority="producer",
         input_lease_id=None,
+        owner_id=None,
         cancel_event=None,
         wait_context=None,
     ):
@@ -10572,6 +10577,7 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
             name=name,
             priority=priority,
             input_lease_id=input_lease_id,
+            owner_id=owner_id,
             cancel_event=cancel_event,
             wait_context=wait_context,
         )
@@ -10638,6 +10644,7 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
         name="",
         priority="producer",
         input_lease_id=None,
+        owner_id=None,
         cancel_event=None,
         wait_context=None,
     ):
@@ -10652,6 +10659,7 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
             name=name,
             priority=priority,
             input_lease_id=input_lease_id,
+            owner_id=owner_id,
             cancel_event=cancel_event,
             wait_context=wait_context,
         )
