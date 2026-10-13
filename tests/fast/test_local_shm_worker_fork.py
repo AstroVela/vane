@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker input views survive fork, worker loss and inherited finalizers."""
+"""Forked input views stay pinned until reader exit or executor shutdown."""
 
 import json
 import os
@@ -73,6 +73,8 @@ def fork_reader(view):
             tracker._pid = None
         if action == 'descendant' and os.fork() != 0:
             os._exit(0)
+        values = view.tolist() if kind == 'numpy' else view.to_pylist()
+        publish('initial', json.dumps(values))
         publish('ready', str(os.getpid()))
         wait_for(lambda: (root / 'read').exists())
         values = view.tolist() if kind == 'numpy' else view.to_pylist()
@@ -84,6 +86,10 @@ def fork_reader(view):
         'watcher_failure': ['planned worker fork watcher failure'],
     }.get(action, [])
     assert errors == expected, errors
+    if action == 'late_close':
+        # The exit callback must expose a live reader before process-group
+        # cleanup terminates it after the worker exits.
+        wait_for(lambda: (root / 'ready').exists())
     def reap(child):
         _, status = os.waitpid(child, 0)
         assert os.waitstatus_to_exitcode(status) == 0
@@ -154,8 +160,25 @@ try:
     if action == 'late_close':
         consumer.close(kill=False)
     wait_for(lambda: (root / 'ready').exists())
+    assert json.loads((root / 'initial').read_text()) == [11] * 2048
     if action == 'descendant':
         wait_for(lambda: (root / 'reaped').exists())
+    if action == 'worker_exit':
+        # Retire only the storage peer after unexpected worker death. The
+        # executor still owns its descendants until its eventual close.
+        consumer._proc.kill()
+        consumer._proc.wait(timeout=5)
+        consumer._shm_peer.close_after_exit()
+    if action != 'late_close':
+        # Give last-buffer notifications time to reach the driver before reuse.
+        time.sleep(0.15)
+        producer.submit(pa.table({'x': [22] * 2048}))
+        second = result(producer)
+        allocation = second[1][0]._allocation_lease.allocation
+        assert allocation.store_id == slot.store_id
+        assert allocation.shm_name == slot.shm_name
+        assert allocation.offset != slot.offset
+        release(second)
     if action in ('close', 'kill', 'descendant', 'cleanup_retry'):
         peer = consumer._shm_peer
         if action == 'cleanup_retry':
@@ -180,34 +203,41 @@ try:
             consumer.close(kill=False)
         else:
             consumer.close(kill=True)
-    # Give last-buffer notifications time to reach the driver before reuse.
-    time.sleep(0.15)
-    producer.submit(pa.table({'x': [22] * 2048}))
-    second = result(producer)
-    assert second[1][0]._allocation_lease.allocation.offset != slot.offset
-    release(second)
     if action in ('close', 'kill', 'descendant', 'cleanup_retry', 'late_close'):
-        producer.close(kill=True)
-        assert store.snapshot()['live_allocations'] == 1
-        assert (Path('/dev/shm') / slot.shm_name).exists()
-    (root / 'read').touch()
-    wait_for(lambda: (root / 'observed').exists())
-    assert json.loads((root / 'observed').read_text()) == [11] * 2048
-    (root / 'exit').touch()
-    if action in ('close', 'kill', 'descendant', 'cleanup_retry', 'late_close'):
+        # Explicit close owns the reader too. Reuse is allowed only after
+        # process-group cleanup confirms that it can no longer read the arena.
         pid = int((root / 'ready').read_text())
         _, status = os.waitpid(pid, 0)
-        assert os.waitstatus_to_exitcode(status) == 0
-        # No allocator access: the watcher must reclaim an idle arena.
-        wait_for(lambda: not (Path('/dev/shm') / slot.shm_name).exists())
-    else:
-        wait_for(lambda: (root / 'reaped').exists())
-        if action in ('pipe_failure', 'watcher_failure'):
-            consumer.close(kill=True)
+        assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
+        assert consumer._cleanup_finished
         wait_for(lambda: store.snapshot()['live_allocations'] == 0)
         reused = store.allocate(slot.size)
         assert reused.allocation.offset == slot.offset
+        assert reused.allocation.generation != slot.generation
         reused.release()
+    else:
+        if action == 'worker_exit':
+            producer.close(kill=True)
+            assert store.snapshot()['live_allocations'] == 1
+            assert (Path('/dev/shm') / slot.shm_name).exists()
+        (root / 'read').touch()
+        wait_for(lambda: (root / 'observed').exists())
+        assert json.loads((root / 'observed').read_text()) == [11] * 2048
+        (root / 'exit').touch()
+        if action == 'worker_exit':
+            pid = int((root / 'ready').read_text())
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+            # No allocator access: the watcher must reclaim an idle arena.
+            wait_for(lambda: not (Path('/dev/shm') / slot.shm_name).exists())
+        else:
+            wait_for(lambda: (root / 'reaped').exists())
+            if action in ('pipe_failure', 'watcher_failure'):
+                consumer.close(kill=True)
+            wait_for(lambda: store.snapshot()['live_allocations'] == 0)
+            reused = store.allocate(slot.size)
+            assert reused.allocation.offset == slot.offset
+            reused.release()
     print(json.dumps({'intact': True, 'reclaimed': True}), flush=True)
 finally:
     (root / 'read').touch()
@@ -240,7 +270,18 @@ finally:
 @pytest.mark.parametrize("kind", ["arrow", "numpy"])
 @pytest.mark.parametrize(
     "action",
-    ["reuse", "actor", "close", "kill", "descendant", "cleanup_retry", "late_close", "pipe_failure", "watcher_failure"],
+    [
+        "reuse",
+        "actor",
+        "worker_exit",
+        "close",
+        "kill",
+        "descendant",
+        "cleanup_retry",
+        "late_close",
+        "pipe_failure",
+        "watcher_failure",
+    ],
 )
 def test_worker_fork_retains_remote_views_through_reuse_and_worker_exit(tmp_path, kind, action):
     result = subprocess.run(

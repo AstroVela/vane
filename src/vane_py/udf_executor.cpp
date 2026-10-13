@@ -3638,6 +3638,22 @@ public:
 		actor_handles_.reset();
 	}
 
+	void Cancel() override {
+		uint64_t slot_id = 0;
+		{
+			lock_guard<mutex> submit_guard(submit_lock_);
+			cancelled_ = true;
+			if (registered_) {
+				slot_id = slot_id_;
+			}
+		}
+		if (slot_id != 0) {
+			// Retirement fences callbacks and releases task/output leases. Keep
+			// the wrapper alive for concurrent capacity notifications and stats.
+			GlobalPythonDispatcher::Instance().Unregister(slot_id);
+		}
+	}
+
 	idx_t Submit(DataChunk &args, DataChunk &rows, ClientContext &context) override {
 		idx_t submit_id = 0;
 		TrySubmit(args, rows, context, submit_id);
@@ -4017,6 +4033,9 @@ private:
 	}
 
 	void EnsureRegistered(ClientContext &context) {
+		if (cancelled_) {
+			throw InvalidInputException("UDF executor has been cancelled");
+		}
 		if (registered_) {
 			return;
 		}
@@ -4041,6 +4060,7 @@ private:
 	uint64_t slot_generation_ = 0;
 	shared_ptr<ExecutorSlot> slot_;
 	bool registered_ = false;
+	bool cancelled_ = false; // Protected by submit_lock_.
 	bool input_pressure_observed_ = false;
 	mutex submit_lock_;
 	idx_t next_submit_id_ = 1;

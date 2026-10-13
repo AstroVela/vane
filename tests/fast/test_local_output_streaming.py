@@ -129,6 +129,119 @@ def test_block_arrives_before_producer_finishes_and_retains_task_ownership(runti
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("completion_stage", ["before", "after"])
+@pytest.mark.parametrize("timeout", [False, True], ids=["wait", "retry"])
+def test_close_owns_completion_cleanup_without_stopping_shared_pool_peer(
+    runtime, monkeypatch, tmp_path, backend, completion_stage, timeout
+):
+    def produce(table):
+        value = table.column(0)[0].as_py()
+        yield pa.table({"x": [value]})
+        gate = tmp_path / str(value)
+        deadline = time.monotonic() + 20
+        while not gate.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("stream was not resumed")
+            time.sleep(0.01)
+        yield pa.table({"x": [value + 10]})
+
+    class Actor:
+        def __call__(self, table):
+            return produce(table)
+
+    payload = _payload(
+        Actor if backend == "subprocess_actor" else produce,
+        execution_backend=backend,
+        actor_number=2,
+    )
+    pool = udf_subprocess.LocalSubprocessActorPool(payload, 2) if backend == "subprocess_actor" else None
+    options = {"local_actor_pool": pool} if pool is not None else None
+    first, peer = [udf_subprocess.UDFExecutor(payload, options) for _ in range(2)]
+    owned_pool = first._actor_pool if pool is not None else first._task_pool
+    assert owned_pool is (peer._actor_pool if pool is not None else peer._task_pool)
+    entered, release, waiting = (threading.Event() for _ in range(3))
+    complete = first._complete_task_submit
+    wait = first._wait_for_pending_futures
+
+    def pause():
+        entered.set()
+        assert release.wait(15), "completion cleanup was not resumed"
+
+    def delayed_completion(*args, **kwargs):
+        if completion_stage == "before":
+            pause()
+        complete(*args, **kwargs)
+        if completion_stage == "after":
+            pause()
+
+    def observe_wait(timeout_s=None):
+        waiting.set()
+        return wait(timeout_s)
+
+    monkeypatch.setattr(first, "_complete_task_submit", delayed_completion)
+    monkeypatch.setattr(first, "_wait_for_pending_futures", observe_wait)
+    monkeypatch.setattr(udf_subprocess, "_subprocess_shutdown_grace_s", lambda: 0.05 if timeout else 10)
+    try:
+        for executor, value in ((first, 1), (peer, 2)):
+            assert executor.request_task_admission(0)
+            executor.submit_with_id(value, pa.table({"x": [value]}))
+            assert _consume(_next(executor)) == {"x": [value]}
+
+        with ThreadPoolExecutor(1) as closer:
+            closing = closer.submit(first.close, kill=True)
+            try:
+                assert entered.wait(10)
+                assert waiting.wait(5), "close skipped completion cleanup"
+                if timeout:
+                    with pytest.raises(RuntimeError, match="pending UDF cleanup"):
+                        closing.result(timeout=5)
+                    # Retrying while the callback is blocked keeps the same
+                    # owner; it must not claim cleanup succeeded on the retry.
+                    with pytest.raises(RuntimeError, match="pending UDF cleanup"):
+                        first.close(kill=True)
+                else:
+                    assert not closing.done()
+                assert not first._cleanup_finished
+                assert first._task_futures and all(f.done() for f in first._task_futures)
+                assert (first._actor_pool if pool is not None else first._task_pool) is owned_pool
+                if pool is None:
+                    assert owned_pool.ref_count == 2
+                    expected_cpu = 2 if completion_stage == "before" else 1
+                    assert runtime.execution_capacity.resource_snapshot()["usage"]["cpu"] == expected_cpu
+            finally:
+                release.set()
+            if not timeout:
+                closing.result(timeout=10)
+        assert wait(10)
+        first.close(kill=True)
+        assert first._cleanup_finished
+        assert not first.cleanup_pending()
+        assert not first._task_futures
+        assert not first._task_future_meta
+        assert not first._execution_scopes
+        assert first._actor_pool is first._task_pool is None
+        if pool is None:
+            assert owned_pool.ref_count == 1
+            assert runtime.execution_capacity.resource_snapshot()["usage"]["cpu"] == 1
+
+        # The peer was still executing while the first owner drained. Its
+        # second block and terminal response prove close did not abort it.
+        (tmp_path / "2").touch()
+        assert _consume(_next(peer)) == {"x": [12]}
+        assert _next(peer) == (ref_bundle.SUBMIT_RESULT_MARKER, 2, None)
+        peer.close(kill=True)
+    finally:
+        release.set()
+        (tmp_path / "1").touch()
+        (tmp_path / "2").touch()
+        first._wait_for_pending_futures(10)
+        first.close(kill=True)
+        peer.close(kill=True)
+        if pool is not None:
+            pool.shutdown(kill=True)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 @pytest.mark.parametrize("cancel_at", ["descriptor", "adopted"])
 @pytest.mark.parametrize("streaming", [False, True])
 def test_cancelled_response_never_contaminates_the_next_invocation(

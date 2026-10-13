@@ -225,7 +225,7 @@ jobs:
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
-          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media;gravitino -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
@@ -244,6 +244,38 @@ jobs:
 
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Exercise the native Gravitino provider
+        if: matrix.python-version == '3.12'
+        env:
+          VANE_TEST_GRAVITINO: provider
+        run: |
+          cmake --build build --target gravitino_loadable_extension --parallel 2
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/duckdb/extension/gravitino/gravitino.duckdb_extension \
+            "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension"
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python -I scripts/build_extension_wheel.py \
+            --artifact "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension" \
+            --extension-name gravitino --test-only \
+            --output-directory "$RUNNER_TEMP/gravitino/wheels" \
+            --platform-tag "$platform_tag" --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND curl AND BSD-3-Clause AND Zlib" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt
+          python -m pip install --no-deps "$RUNNER_TEMP"/gravitino/wheels/*.whl
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m 'not real_ray'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m real_ray
+
+      - name: Upload the signed Gravitino test provider
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-gravitino-provider-3.12
+          path: ${{ runner.temp }}/gravitino/wheels/*.whl
+          if-no-files-found: error
 
       - name: Build and verify the signed test extension wheel
         if: matrix.python-version == '3.12'
@@ -349,6 +381,23 @@ jobs:
             tests/fast/test_image_to_tensor.py
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py
+
+      # The optional package owns SQLite; the base wheel only consumes its
+      # versioned C reader interface. Exercise both installed wheels together.
+      - name: Exercise the optional native VaneFS reader
+        if: matrix.python-version == '3.12'
+        env:
+          SKBUILD_BUILD_DIR: ${{ github.workspace }}/vane_fs/build/python-release
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vane_fs/vcpkg_installed/x64-linux-release
+        run: |
+          "$VCPKG_ROOT/vcpkg" install \
+            --x-manifest-root="$PWD/vane_fs" --x-install-root="$PWD/vane_fs/vcpkg_installed" \
+            --triplet=x64-linux-release --host-triplet=x64-linux-release \
+            --clean-buildtrees-after-build --clean-packages-after-build
+          python -m pip install './vane_fs[test]' --no-build-isolation
+          python -I -c 'import vane, vane_fs, av, numpy, PIL; assert hasattr(vane.DuckDBPyConnection, "_register_vane_fs")'
+          scripts/run_installed_pytest.sh "$PWD/vane_fs/tests/test_vane.py" --rootdir="$PWD/vane_fs" --timeout=60
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'
@@ -585,7 +634,7 @@ jobs:
             phase: shared-ray
             shard_index: 0
             shard_count: 1
-            process_timeout: 1800
+            process_timeout: 2400
           - label: isolated Ray owners
             phase: owner-ray
             shard_index: 0
@@ -709,6 +758,100 @@ jobs:
             test-results/local-runtime/
           if-no-files-found: warn
           retention-days: 14
+
+  gravitino-tests:
+    name: Gravitino integration tests
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_TEST_GRAVITINO: provider
+      VANE_TEST_GRAVITINO_URL: http://127.0.0.1:8090
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Download the matching Gravitino provider
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-gravitino-provider-3.12
+          path: dist/gravitino
+
+      - name: Install the built wheels and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --force-reinstall dist/*.whl dist/gravitino/*.whl pytest
+          python -m pip check
+
+      - name: Start Gravitino 1.3
+        run: |
+          gravitino_files="$RUNNER_TEMP/vane-gravitino-files"
+          mkdir -p "$gravitino_files"
+          chmod 755 "$gravitino_files"
+          echo "VANE_TEST_GRAVITINO_SHARED_DIR=$gravitino_files" >> "$GITHUB_ENV"
+          docker run --detach \
+            --name vane-gravitino \
+            --memory 2g --cpus 2 \
+            --env GRAVITINO_MEM='-Xms256m -Xmx768m -XX:MaxMetaspaceSize=256m' \
+            --env GRAVITINO_AUX_SERVICE_NAMES= \
+            --mount "type=bind,source=$gravitino_files,target=$gravitino_files" \
+            --publish 127.0.0.1:8090:8090 \
+            apache/gravitino:1.3.0@sha256:04c74cee17946865fa20186c032fda2ed7d1722468e2d58aa32114ea3b35b057
+
+      - name: Wait for Gravitino readiness
+        run: |
+          for attempt in {1..90}; do
+            if curl --fail --silent --max-time 2 "$VANE_TEST_GRAVITINO_URL/api/health/ready" > /dev/null; then
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Status}}' vane-gravitino)" != "running" ]]; then
+              echo "Gravitino stopped before becoming ready" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Gravitino did not become ready within the startup budget" >&2
+          exit 1
+
+      - name: Run native Gravitino acceptance
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh -o addopts= \
+              -m 'external_service and not real_ray' tests/fast/test_gravitino_live.py
+
+      - name: Run Ray Gravitino acceptance
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh -o addopts= \
+              -m 'external_service and real_ray' tests/fast/test_gravitino_live.py
+
+      - name: Print Gravitino logs on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: docker logs --tail 200 vane-gravitino
+
+      - name: Stop Gravitino
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker rm --force vane-gravitino
 
   milvus-tests:
     name: Milvus integration test
@@ -1076,6 +1219,7 @@ jobs:
       - native-windows
       - fast-tests
       - doris-tests
+      - gravitino-tests
       - milvus-tests
       - qdrant-tests
       - ai-tests
@@ -1087,6 +1231,7 @@ jobs:
           AI_TESTS_RESULT: ${{ needs.ai-tests.result }}
           FAST_TESTS_RESULT: ${{ needs.fast-tests.result }}
           DORIS_TESTS_RESULT: ${{ needs.doris-tests.result }}
+          GRAVITINO_TESTS_RESULT: ${{ needs.gravitino-tests.result }}
           MILVUS_TESTS_RESULT: ${{ needs.milvus-tests.result }}
           QDRANT_TESTS_RESULT: ${{ needs.qdrant-tests.result }}
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
@@ -1119,10 +1264,11 @@ jobs:
                 "$NATIVE_WINDOWS_RESULT" != "$expected_result" ||
                 "$FAST_TESTS_RESULT" != "$expected_result" ||
                 "$DORIS_TESTS_RESULT" != "$expected_result" ||
+                "$GRAVITINO_TESTS_RESULT" != "$expected_result" ||
                 "$MILVUS_TESTS_RESULT" != "$expected_result" ||
                 "$QDRANT_TESTS_RESULT" != "$expected_result" ||
                 "$AI_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, native-macos=$NATIVE_MACOS_RESULT, native-windows=$NATIVE_WINDOWS_RESULT, fast-tests=$FAST_TESTS_RESULT, doris-tests=$DORIS_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, native-macos=$NATIVE_MACOS_RESULT, native-windows=$NATIVE_WINDOWS_RESULT, fast-tests=$FAST_TESTS_RESULT, doris-tests=$DORIS_TESTS_RESULT, gravitino-tests=$GRAVITINO_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 

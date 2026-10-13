@@ -273,8 +273,10 @@ class FailingConcurrentPrompter:
     def __init__(self) -> None:
         self.slow_started = asyncio.Event()
         self.cancelled = 0
+        self.started: list[str] = []
 
     async def prompt(self, messages: tuple) -> str:
+        self.started.append(messages[0])
         if messages[0] == "slow":
             self.slow_started.set()
             try:
@@ -387,9 +389,34 @@ def test_prompt_failure_cancels_and_drains_sibling_requests(runtime) -> None:
     wrapper.bind_async_runtime(runtime.run)
 
     with pytest.raises(RuntimeError, match="Prompt execution; upstream error: RuntimeError"):
-        wrapper(pa.table({"text": ["slow", "fail"]}))
+        wrapper(pa.table({"text": ["slow", "fail", "queued"]}))
 
     assert descriptor.prompter.cancelled == 1
+    assert descriptor.prompter.started == ["slow", "fail"]
+
+
+def test_prompt_terminal_failure_stops_sibling_retries(runtime) -> None:
+    calls = []
+    ready = asyncio.Event()
+
+    class Prompter:
+        async def prompt(self, messages):
+            calls.append(messages[0])
+            if messages[0] == "fatal":
+                await ready.wait()
+                raise ValueError("terminal input failure")
+            ready.set()
+            raise RetryAfterError(0, status=503)
+
+    descriptor = types.SimpleNamespace(instantiate=Prompter)
+    wrapper = _PromptBatch(descriptor, ["text"], "response", max_concurrency_per_actor=2, max_retries=3)
+    wrapper.bind_async_runtime(runtime.run)
+    try:
+        with pytest.raises(RuntimeError, match="upstream error: ValueError"):
+            wrapper(pa.table({"text": ["fatal", "retry", "queued"]}))
+        assert calls == ["fatal", "retry"]
+    finally:
+        wrapper.close()
 
 
 def test_embed_chunking_drives_chunks_on_the_bound_loop(runtime) -> None:

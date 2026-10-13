@@ -1525,6 +1525,7 @@ def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors(media):
                 'describe',
                 {media},
                 provider := 'vllm',
+                model := 'configured-text-model',
                 on_error := 'ignore'
             )
         """).fetchall()

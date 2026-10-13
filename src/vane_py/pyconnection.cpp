@@ -6,6 +6,7 @@
 
 #include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/query_parameters.hpp"
+#include "vane_python/vane_fs.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_input_callback.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
@@ -885,10 +886,14 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 
 void DuckDBPyConnection::UnregisterFilesystem(const py::str &name) {
 	auto query_lock = LockForQuery();
-	auto &database = con.GetDatabase();
-	auto &fs = database.GetFileSystem();
-
-	fs.ExtractSubSystem(name);
+	const string subsystem = name;
+	py::gil_scoped_release release;
+	unique_ptr<FileSystem> removed;
+	{
+		lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
+		removed = con.GetDatabase().GetFileSystem().ExtractSubSystem(subsystem);
+	}
+	// Destroy Python objects after releasing the registration lock.
 }
 
 void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
@@ -897,12 +902,9 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper gil_wrapper;
 
-	auto &database = con.GetDatabase();
 	if (!py::isinstance<AbstractFileSystem>(filesystem)) {
 		throw InvalidInputException("Bad filesystem instance");
 	}
-
-	auto &fs = database.GetFileSystem();
 
 	auto protocol = filesystem.attr("protocol");
 	if (protocol.is_none() || py::str("abstract").equal(protocol)) {
@@ -939,13 +941,36 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 		directory_semantics = py::isinstance(filesystem, local_filesystem);
 	}
 
+	py::gil_scoped_release release;
+	lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
+	auto &fs = con.GetDatabase().GetFileSystem();
+	for (const auto &name : protocols) {
+		if (name == "vanefs_native") {
+			throw InvalidInputException("The vanefs_native filesystem name is reserved for the native VaneFS reader");
+		}
+		if (name == "vanefs") {
+			for (const auto &registered : fs.ListSubSystems()) {
+				if (registered == "vanefs_native") {
+					throw InvalidInputException(
+					    "Python and native VaneFS filesystems require separate Vane database instances");
+				}
+			}
+		}
+	}
 	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
+}
+
+static vector<string> ReadFileSystemNames(DuckDBPyConnection &connection) {
+	// Callers hold the connection lock. ExtractSubSystem moves a pointer
+	// shared by registry snapshots, so copy names under the registration lock.
+	py::gil_scoped_release release;
+	lock_guard<mutex> registration_guard(VaneFSRegistrationLock());
+	return connection.con.GetDatabase().GetFileSystem().ListSubSystems();
 }
 
 py::list DuckDBPyConnection::ListFilesystems() {
 	auto query_lock = LockForQuery();
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
+	auto subsystems = ReadFileSystemNames(*this);
 	py::list names;
 	for (auto &name : subsystems) {
 		names.append(py::str(name));
@@ -1009,8 +1034,7 @@ py::list DuckDBPyConnection::ExtractStatements(const string &query) {
 
 bool DuckDBPyConnection::FileSystemIsRegistered(const string &name) {
 	auto query_lock = LockForQuery();
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
+	auto subsystems = ReadFileSystemNames(*this);
 	return std::find(subsystems.begin(), subsystems.end(), name) != subsystems.end();
 }
 
@@ -1352,6 +1376,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	connection_module.def("__del__", &DuckDBPyConnection::Close);
 
 	InitializeConnectionMethods(connection_module);
+	InitializeVaneFS(connection_module);
 	connection_module.def("configure_local_runtime", &DuckDBPyConnection::ConfigureLocalRuntime,
 	                      "Configure shared admission for local-fast read-only queries before creating cursors");
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,

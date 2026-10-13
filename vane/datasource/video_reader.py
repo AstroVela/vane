@@ -16,9 +16,7 @@ import importlib
 import logging
 import math
 import os
-import threading
-import time
-from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -28,6 +26,8 @@ import numpy.typing as npt
 import pyarrow as pa
 
 from vane.datasource import DataSource, DataSourceTask
+from vane.datasource._iterator import _DataSourceWait
+from vane.datasource._video_admission import _DecodeAdmission, _MemoryAdmission
 
 if TYPE_CHECKING:
     import vane
@@ -79,11 +79,9 @@ def _read_positive_int_env(name: str, default: int) -> int:
 # Admission control is process-local to each engine Worker and prevents that
 # Worker from starting another decoder under host-memory pressure.
 _MAX_CONCURRENT_DECODES = _read_positive_int_env("VANE_MAX_CONCURRENT_DECODES", 1)
-_decode_semaphore = threading.Semaphore(_MAX_CONCURRENT_DECODES)
 _MEM_HIGH_WATERMARK = float(os.environ.get("VANE_DECODE_MEM_HIGH_PCT", "80"))
 _MEM_LOW_WATERMARK = float(os.environ.get("VANE_DECODE_MEM_LOW_PCT", "70"))
 _MEM_CHECK_INTERVAL = 2.0
-_ADMISSION_INTERRUPT_CHECK_INTERVAL = 0.1
 try:
     _MEM_MIN_AVAILABLE_MB = max(0, int(os.environ.get("VANE_DECODE_MIN_AVAILABLE_MB", "4096")))
 except Exception:
@@ -91,41 +89,26 @@ except Exception:
 _MEM_MIN_AVAILABLE_BYTES = _MEM_MIN_AVAILABLE_MB * 1024**2
 
 
-def _wait_interruptibly(seconds: float, check_interrupted: Callable[[], None]) -> None:
-    deadline = time.monotonic() + seconds
-    while True:
-        check_interrupted()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(_ADMISSION_INTERRUPT_CHECK_INTERVAL, remaining))
+def _new_decode_admission() -> _DecodeAdmission:
+    memory = _MemoryAdmission(
+        lambda: _import_video_dependency("psutil", "psutil").virtual_memory(),
+        _MEM_MIN_AVAILABLE_BYTES,
+        _MEM_HIGH_WATERMARK,
+        _MEM_LOW_WATERMARK,
+    )
+    return _DecodeAdmission(_MAX_CONCURRENT_DECODES, memory, _MEM_CHECK_INTERVAL)
 
 
-def _wait_for_memory(check_interrupted: Callable[[], None]) -> None:
-    """Wait before opening a decoder when the host is above its admission watermark."""
-    psutil = _import_video_dependency("psutil", "psutil")
+_decode_admission = _new_decode_admission()
 
-    def has_capacity(memory: Any) -> bool:
-        if _MEM_MIN_AVAILABLE_BYTES > 0 and memory.available >= _MEM_MIN_AVAILABLE_BYTES:
-            return True
-        return bool(memory.percent < _MEM_HIGH_WATERMARK)
 
-    def has_recovered(memory: Any) -> bool:
-        if _MEM_MIN_AVAILABLE_BYTES > 0 and memory.available >= _MEM_MIN_AVAILABLE_BYTES:
-            return True
-        return bool(memory.percent < _MEM_LOW_WATERMARK)
+def _reset_decode_admission_after_fork() -> None:
+    global _decode_admission
+    _decode_admission = _new_decode_admission()
 
-    check_interrupted()
-    memory = psutil.virtual_memory()
-    if has_capacity(memory):
-        check_interrupted()
-        return
-    while True:
-        _wait_interruptibly(_MEM_CHECK_INTERVAL, check_interrupted)
-        memory = psutil.virtual_memory()
-        if has_recovered(memory):
-            check_interrupted()
-            return
+
+if os.name == "posix":
+    os.register_at_fork(after_in_child=_reset_decode_admission_after_fork)
 
 
 class VideoReadError(RuntimeError):
@@ -833,17 +816,17 @@ def _decode_video_guarded(
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
     execution_context: _DataSourceExecutionContext,
-) -> Generator[pa.RecordBatch, None, None]:
-    check_interrupted = execution_context._check_interrupted
-    acquired = False
+) -> Generator[pa.RecordBatch | _DataSourceWait, None, None]:
+    permit = None
     try:
-        _wait_for_memory(check_interrupted)
-        while True:
-            check_interrupted()
-            if _decode_semaphore.acquire(timeout=_ADMISSION_INTERRUPT_CHECK_INTERVAL):
-                acquired = True
-                break
-        check_interrupted()
+        execution_context._check_interrupted()
+        permit = _decode_admission.request()
+        # The native DataSource bridge subscribes to readiness and deschedules
+        # this task. Keep the permit until decoder closure, including while
+        # downstream backpressure suspends the batch generator.
+        yield permit
+        execution_context._check_interrupted()
+        permit.check_admitted()
         yield from _decode_video_with_policy(
             value,
             options=options,
@@ -857,8 +840,8 @@ def _decode_video_guarded(
             execution_context._capture_video_error(error)
         raise
     finally:
-        if acquired:
-            _decode_semaphore.release()
+        if permit is not None:
+            permit.close()
 
 
 def _split_video_file_groups(
@@ -905,7 +888,9 @@ class VideoFrameTask(DataSourceTask):
     def execute(self) -> Iterator[pa.RecordBatch]:
         raise RuntimeError("VideoFrameTask must be executed by datasource_scan with an explicit query context")
 
-    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+    def _execute_with_context(
+        self, execution_context: _DataSourceExecutionContext
+    ) -> Iterator[pa.RecordBatch | _DataSourceWait]:
         yield from _decode_video_guarded(
             self.video_file,
             options=self.options,
@@ -933,7 +918,9 @@ class LimitedVideoFrameTask(DataSourceTask):
     def execute(self) -> Iterator[pa.RecordBatch]:
         raise RuntimeError("LimitedVideoFrameTask must be executed by datasource_scan with an explicit query context")
 
-    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+    def _execute_with_context(
+        self, execution_context: _DataSourceExecutionContext
+    ) -> Iterator[pa.RecordBatch | _DataSourceWait]:
         remaining = self.max_frames
         for value in self.files:
             if remaining <= 0:
@@ -944,6 +931,9 @@ class LimitedVideoFrameTask(DataSourceTask):
                 max_output_frames=remaining,
                 execution_context=execution_context,
             ):
+                if isinstance(batch, _DataSourceWait):
+                    yield batch
+                    continue
                 remaining -= batch.num_rows
                 yield batch
                 if remaining <= 0:
@@ -958,7 +948,9 @@ class _VideoFrameGroupTask(DataSourceTask):
     def execute(self) -> Iterator[pa.RecordBatch]:
         raise RuntimeError("Video frame group tasks require an explicit datasource_scan query context")
 
-    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+    def _execute_with_context(
+        self, execution_context: _DataSourceExecutionContext
+    ) -> Iterator[pa.RecordBatch | _DataSourceWait]:
         for value in self.files:
             yield from _decode_video_guarded(
                 value,
@@ -1183,7 +1175,9 @@ class _IndexedImageVideoTask(DataSourceTask):
     def execute(self) -> Iterator[pa.RecordBatch]:
         raise RuntimeError("Indexed video tasks require an explicit datasource_scan query context")
 
-    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+    def _execute_with_context(
+        self, execution_context: _DataSourceExecutionContext
+    ) -> Iterator[pa.RecordBatch | _DataSourceWait]:
         remaining = self.frame_limit
         for value, index in zip(self.files, self.indexes, strict=True):
             if remaining is not None and remaining <= 0:
@@ -1196,6 +1190,9 @@ class _IndexedImageVideoTask(DataSourceTask):
             )
             try:
                 for batch in batches:
+                    if isinstance(batch, _DataSourceWait):
+                        yield batch
+                        continue
                     if remaining is not None:
                         remaining -= batch.num_rows
                     yield batch

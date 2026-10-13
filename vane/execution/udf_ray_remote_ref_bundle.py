@@ -23,7 +23,6 @@ class RemoteUDFRefBundleMixin:
         _payload: dict[str, Any]
         _pick_ready_actor_on_node: Callable[[str, int], tuple[int, Any]]
         _take_task_admission: Callable[[], Any]
-        _wait_for_ready_actor: Callable[[], None]
         actors: list[Any]
 
     def _submit_ref_bundle_one(
@@ -39,7 +38,6 @@ class RemoteUDFRefBundleMixin:
         task_block_refs = _resolve_ref_bundle_task_refs(block_refs)
 
         def _submit_after_lease(task_payload: dict[str, Any]) -> Any:
-            self._wait_for_ready_actor()
             actor_idx, actor = self._pick_ready_actor_on_node(
                 task_payload["node_id"],
                 task_payload["actor_index"],

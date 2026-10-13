@@ -533,10 +533,15 @@ class WriteSummary:
 class DataSinkWriteError(RuntimeError):
     """A DataSink did not finish with a known applied outcome."""
 
-    def __init__(self, summary: WriteSummary, detail: str) -> None:
+    def __init__(self, summary: WriteSummary, detail: str, *, original_error: BaseException | None = None) -> None:
+        from vane.ai import DiagnosticError
+
         self.summary = summary
         self.operation_id = summary.operation_id
         self.outcome = summary.outcome
+        self.primary_error = (
+            DiagnosticError("DataSink execution", original_error) if original_error is not None else None
+        )
         if type(detail) is str:
             detail_text = detail
         else:
@@ -546,8 +551,8 @@ class DataSinkWriteError(RuntimeError):
             f"DataSink operation {summary.operation_id} ended with outcome {summary.outcome.value}: {self.detail}"
         )
 
-    def __reduce__(self) -> tuple[Any, tuple[WriteSummary, str]]:
-        return (_restore_datasink_write_error, (self.summary, self.detail))
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        return (_restore_datasink_write_error, (self.summary, self.detail, self.primary_error))
 
 
 class _InterruptedDataSinkWriteError(DataSinkWriteError):
@@ -557,8 +562,9 @@ class _InterruptedDataSinkWriteError(DataSinkWriteError):
 def _restore_datasink_write_error(
     summary: WriteSummary,
     detail: str,
+    original_error: BaseException | None,
 ) -> DataSinkWriteError:
-    return DataSinkWriteError(summary, detail)
+    return DataSinkWriteError(summary, detail, original_error=original_error)
 
 
 class DataSinkWorker(ABC):
@@ -823,6 +829,10 @@ def _make_batch_actor(
     key_validation: _KeyValidation | None,
 ) -> type[Any]:
     class DataSinkBatchActor:
+        # Open, write, abort and close must share the actor owner thread for
+        # thread-affine clients. This is an internal UDF runtime adapter.
+        _vane_udf_owner_thread = True
+
         # DataSink owns retries at the full-operation boundary. The native UDF
         # payload consumes this private marker to disable Ray actor task replay.
         _vane_datasink_no_task_retries = True
@@ -1083,7 +1093,11 @@ def _unknown_error(
     warnings: tuple[str, ...] = (),
 ) -> DataSinkWriteError:
     detail = error if isinstance(error, str) else _safe_error_summary(error)
-    return DataSinkWriteError(_summary(context, WriteOutcome.UNKNOWN, results, warnings), detail)
+    return DataSinkWriteError(
+        _summary(context, WriteOutcome.UNKNOWN, results, warnings),
+        detail,
+        original_error=error if isinstance(error, BaseException) else None,
+    )
 
 
 def _interrupted_error(
@@ -1095,6 +1109,7 @@ def _interrupted_error(
     return _InterruptedDataSinkWriteError(
         _summary(context, WriteOutcome.UNKNOWN, results, warnings),
         _safe_error_summary(error),
+        original_error=error,
     )
 
 
@@ -1162,7 +1177,7 @@ def _error_after_retries(error: DataSinkWriteError, retry_count: int) -> DataSin
             warnings=summary.warnings,
         )
         detail = f"an earlier attempt had an UNKNOWN outcome; final attempt was aborted: {detail}"
-    return DataSinkWriteError(summary, detail)
+    return DataSinkWriteError(summary, detail, original_error=error.primary_error)
 
 
 def _execute_datasink_once(
@@ -1218,21 +1233,27 @@ def _execute_datasink_once(
             raise TypeError(f"Runner.run_datasink() returned {type(native_result).__name__}, expected a mapping")
         warnings = _cleanup_warnings(native_result)
         results = _results_from_native(context.operation_id, native_result)
+        from vane.ai import DiagnosticError
+
+        # Raw outcome text and warnings are not trusted diagnostic envelopes.
+        diagnostic = native_result.get("outcome_diagnostic")
+        if not isinstance(diagnostic, DiagnosticError):
+            diagnostic = None
         if native_result["outcome_unknown"]:
             detail = native_result.get("outcome_error")
             if not isinstance(detail, str) or not detail:
                 detail = "distributed execution may have applied external writes"
-            if native_result["outcome_cancelled"]:
-                raise _InterruptedDataSinkWriteError(
-                    _summary(context, WriteOutcome.UNKNOWN, results, warnings),
-                    detail,
-                )
-            raise _unknown_error(context, results, detail, warnings)
+            error_type = _InterruptedDataSinkWriteError if native_result["outcome_cancelled"] else DataSinkWriteError
+            raise error_type(
+                _summary(context, WriteOutcome.UNKNOWN, results, warnings), detail, original_error=diagnostic
+            )
         if native_result["outcome_aborted"]:
             detail = native_result.get("outcome_error")
             if not isinstance(detail, str) or not detail:
                 detail = "DataSink input was rejected before workers opened"
-            raise _aborted_error(context, results, detail, warnings)
+            raise DataSinkWriteError(
+                _summary(context, WriteOutcome.ABORTED, results, warnings), detail, original_error=diagnostic
+            )
         return _summary(context, WriteOutcome.APPLIED, results, warnings)
     except DataSinkWriteError:
         raise
@@ -1324,7 +1345,7 @@ def write_datasink(
                     terminal_error = (
                         _error_after_retries(error, retries_performed)
                         if retries_performed
-                        else DataSinkWriteError(error.summary, error.detail)
+                        else DataSinkWriteError(error.summary, error.detail, original_error=error.primary_error)
                     )
                     raise terminal_error from error.__cause__
                 if retries_performed:
@@ -1338,7 +1359,7 @@ def write_datasink(
                     f"{carried.detail}; framework retry {retries_performed} could not start: "
                     f"{_safe_error_summary(error)}"
                 )
-                raise DataSinkWriteError(carried.summary, detail) from error
+                raise DataSinkWriteError(carried.summary, detail, original_error=carried.primary_error) from error
             if retries_performed:
                 return _summary_after_retries(summary, retries_performed)
             return summary

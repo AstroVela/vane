@@ -12,6 +12,7 @@ import pytest
 
 import vane
 from vane import pickle as vane_pickle
+from vane.ai import DiagnosticError, summarize_error
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataAdmissionWaitLimits
@@ -545,7 +546,8 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
             _release_local_ref_bundle_result(block)
             result = executor.take_ready_result()
             error = result if submit_id is None else result[2]
-            assert isinstance(error, OSError)
+            assert isinstance(error, DiagnosticError)
+            assert summarize_error(error) == "OSError"
             assert "reservation completion failure" in str(error)
             executor.stats()
             assert strict_transport.snapshot()["usage_bytes"] == 0

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import pickle
 import threading
@@ -360,11 +361,13 @@ def _make_local_query_driver_actor():
     runner._leased_result_partition_refs = {}
     runner._result_partition_ref_counters = {}
     runner._query_resource_graphs = {}
+    runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
     runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._udf_actor_timeout_cleanup_pending = set()
     runner._active_udf_actor_by_unit = {}
     runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}
@@ -636,6 +639,7 @@ def test_maintenance_loops_continue_after_pre311_asyncio_timeout(
             runner._query_resource_maintenance_error = ""
             runner._query_resource_maintenance_failures = 0
             runner._maintain_query_resources_once = lambda: maintenance_calls.append(None)
+            runner._expire_pending_udf_actor_pools = lambda **_kwargs: None
             maintenance_loop = runner_cls._query_resource_maintenance_loop
 
         wait_calls = 0
@@ -1366,6 +1370,8 @@ def test_close_plan_cancels_queued_copy_before_connection_teardown(monkeypatch):
 
 
 def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
+    from vane.ai import DiagnosticError
+
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
     logical_plan = _FakeLogicalPlan(physical_plan)
@@ -1374,7 +1380,10 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             on_execution_started()
-            runner._query_terminal_errors["copy-query-terminal"] = "Ray actor UDF pool initialization failed"
+            runner._query_terminal_errors["copy-query-terminal"] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
             return _committed_copy_result(ok=True)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1402,6 +1411,7 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     assert outcome.write_state == "committed"
     assert outcome.cleanup_state == "complete"
     assert any("Ray actor UDF pool initialization failed" in warning for warning in outcome.cleanup_warnings)
+    assert any("max_model_len" in warning for warning in outcome.cleanup_warnings)
 
 
 def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatch):
@@ -1759,6 +1769,63 @@ def test_query_driver_marks_unknown_result_when_cancelled_during_teardown(monkey
     assert plan_id not in runner._plan_lifecycles
 
 
+@pytest.mark.parametrize("returned", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outcome(
+    monkeypatch, returned, cleanup_failure
+):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-late-initialization"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            runner._query_terminal_errors[plan_id] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
+            if returned:
+                return {
+                    "outcome_unknown": True,
+                    "outcome_aborted": False,
+                    "outcome_cancelled": False,
+                    "outcome_error": "FTE worker reservation failed: query_failed",
+                    "write_results": [],
+                    "data_sink_cleanup_warnings": [],
+                }
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+    def teardown(_self, actual_plan_id, expected_lifecycle):
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            cleanup = RayTaskError("close", "private traceback", OSError(5, "private path"))
+            raise driver._QueryCleanupDiagnostic("private cleanup", (cleanup,))
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
+
+    try:
+        result = asyncio.run(_run_actor_datasink_plan(runner, logical_plan))
+    finally:
+        cls._shutdown_driver_executors(runner)
+    assert result["outcome_unknown"] is True
+    assert result["outcome_aborted"] is False
+    assert result["outcome_cancelled"] is False
+    summary = summarize_error(pickle.loads(pickle.dumps(result["outcome_diagnostic"])))
+    assert "max_model_len" in summary and "private" not in summary
+    if cleanup_failure:
+        assert "cleanup: OSError (errno=5)" in summary
+
+
 def test_query_driver_marks_failed_execution_when_cancelled_during_cleanup(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "datasink-failed-then-cancelled-during-cleanup"
@@ -2064,7 +2131,10 @@ def test_query_driver_owner_discard_releases_pending_copy_cleanup_terminal():
     assert cls._copy_operation_terminal_record(runner, operation_id) is None
 
 
-def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, late_init):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2075,6 +2145,11 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise ValueError("planned failure before commit")
 
     def _teardown(_self, actual_plan_id):
@@ -2093,7 +2168,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
         lambda: _run_actor_copy_plan(runner, logical_plan),
         lambda: _run_actor_copy_plan(runner, logical_plan),
     ):
-        with pytest.raises(ValueError, match="planned failure before commit"):
+        with pytest.raises(DiagnosticError if late_init else ValueError):
             asyncio.run(operation())
 
     recovered = asyncio.run(
@@ -2106,12 +2181,22 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     )
 
     assert recovered.outcome is None
-    assert isinstance(recovered.error, ValueError)
-    assert str(recovered.error) == "planned failure before commit"
+    if late_init:
+        assert isinstance(recovered.error, DiagnosticError)
+        assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(recovered.error)))
+    else:
+        assert isinstance(recovered.error, ValueError)
+        assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
 
 
-def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-native-outcome-unknown"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2132,6 +2217,11 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             return unknown_result
 
     def _teardown(_self, actual_plan_id):
@@ -2139,6 +2229,8 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2158,8 +2250,20 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         assert error.value.manifest_path.endswith("/manifest.txt")
         assert error.value.committed_marker_path.endswith("/committed")
         assert error.value.safe_to_retry is False
-        assert error.value.cleanup_warnings == ()
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        elif not cleanup_failure:
+            assert error.value.cleanup_warnings == ()
         assert "readback was inconclusive" in str(error.value)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyOutcomeUnknownError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2176,7 +2280,13 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert plan_calls == 1
 
 
-def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-result-unavailable"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2187,6 +2297,11 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise driver.CopyResultUnavailableError(
                 plan_id,
                 "planned result marshalling failure",
@@ -2197,6 +2312,8 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2214,6 +2331,18 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         assert error.value.write_state == "committed"
         assert error.value.safe_to_retry is False
         assert "planned result marshalling failure" in str(error.value)
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyResultUnavailableError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.write_state == "committed"
+        assert restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2396,6 +2525,17 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert restored.cleanup_warnings == error.cleanup_warnings
     assert restored.safe_to_retry is False
     assert str(restored) == str(error)
+
+
+def test_copy_recovery_unknown_error_retains_safe_cause_after_serialization():
+    from vane.ai import summarize_error
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as caught:
+        driver._raise_copy_outcome_unknown("copy-recovery", OSError(errno.EIO, "private recovery path"))
+    restored = pickle.loads(pickle.dumps(caught.value))
+    assert restored.operation_id == "copy-recovery" and restored.safe_to_retry is False
+    assert "OSError (errno=5)" in summarize_error(restored)
+    assert "private" not in summarize_error(restored)
 
 
 def test_copy_result_unavailable_error_preserves_terminal_state_across_serialization():
@@ -4130,7 +4270,8 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
         query_id=query_id,
         query_connection=query_connection,
     )
-    runner._query_terminal_errors[query_id] = "planned terminal marker"
+    terminal_error = RuntimeError("planned terminal marker")
+    runner._query_terminal_errors[query_id] = terminal_error
     fragment_drops = []
     monkeypatch.setattr(
         cls,
@@ -4147,7 +4288,7 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
     assert runner._plan_query_ids[plan_id] == query_id
     assert runner._plan_connections[plan_id] is query_connection
     assert plan_id in runner._sessions[_TEST_SESSION_ID].plan_ids
-    assert runner._query_terminal_errors[query_id] == "planned terminal marker"
+    assert runner._query_terminal_errors[query_id] is terminal_error
 
     cls._teardown_plan_resources(runner, plan_id)
 
@@ -4300,6 +4441,130 @@ def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
         assert get_query_resource_manager(query_id) is manager
     finally:
         release_query_resource_manager(query_id, reason="test_complete")
+
+
+@pytest.mark.parametrize(
+    "drop_fragments,fail_actor_cleanup",
+    [(True, False), (False, False), (True, True)],
+    ids=["running-query", "before-fragment-start", "actor-cleanup-retry"],
+)
+def test_plan_teardown_releases_actor_lock_before_waiting_for_phase_pump(
+    monkeypatch, drop_fragments, fail_actor_cleanup
+):
+    from vane.runners.ray import fte_fragment_scheduler
+    from vane.runners.ray.query_resource_runtime import (
+        clear_query_resource_managers,
+        get_query_resource_manager,
+    )
+
+    async def scenario():
+        query_id = "phase-pump-during-plan-teardown"
+        cls, runner = _make_local_query_driver_actor()
+        loop = asyncio.get_running_loop()
+        runner._query_resource_admission_loop = loop
+        runner._ensure_query_resource_admission_state()
+        runner._query_resource_lock = threading.RLock()
+        runner._synchronize_query_allocations = lambda: ()
+        manager = _bind_test_query_resource_owner(runner, query_id)
+        unit_id = manager.graph.units[0].resource_unit_id
+        manager.update_unit_state(unit_id, runnable=False, completed=True)
+        assert manager.pending_allocation_frontier() is not None
+        if not drop_fragments:
+            lifecycle = driver._PlanLifecycle(query_id, _TEST_SESSION_ID, "query")
+            lifecycle.set_query_id(query_id)
+            assert lifecycle.begin_startup()
+            assert lifecycle.finish_setup(succeeded=False)
+            runner._plan_lifecycles[query_id] = lifecycle
+
+        phase_entered = threading.Event()
+        phase_returned = threading.Event()
+        fte_drained = threading.Event()
+        original_transition = runner._transition_query_execution_phase
+
+        def transition(*args):
+            phase_entered.set()
+            original_transition(*args)
+            phase_returned.set()
+
+        runner._transition_query_execution_phase = transition
+
+        class _Pool:
+            def __init__(self):
+                self.actors = [object()]
+                self.shutdown_calls = 0
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+                assert query_id in runner._plan_teardowns_in_progress
+                if self.shutdown_calls == 1:
+                    # Enter the real phase transition while actor cleanup owns
+                    # the lifecycle lock, then let teardown reach its pump wait.
+                    loop.call_soon_threadsafe(runner._schedule_query_fte_admission_pump, query_id)
+                    assert phase_entered.wait(2.0)
+                    assert not phase_returned.is_set()
+                    if fail_actor_cleanup:
+                        raise RuntimeError("planned actor cleanup failure")
+                self.actors.clear()
+
+        pool = _Pool()
+        runner._active_udf_actors = [pool]
+        runner._active_udf_actors_by_plan[query_id] = [pool]
+        runner._active_udf_actor_by_unit[query_id] = {unit_id: pool}
+
+        def drain(actual_query_id):
+            assert actual_query_id == query_id
+            assert phase_returned.is_set()
+            fte_drained.set()
+
+        monkeypatch.setattr(fte_fragment_scheduler, "drain_fte_resource_admission_change", drain)
+        runner._wait_for_query_fte_admission_pump = lambda qid: cls._wait_for_query_fte_admission_pump(
+            runner, qid, timeout_s=2.0
+        )
+        fragment_releases = []
+
+        def drop_after_fence(actual_query_id, *, release_resources):
+            runner._fence_query_resource_admission_for_teardown(actual_query_id)
+            assert fte_drained.is_set()
+            fragment_releases.append(release_resources)
+            if release_resources:
+                runner._release_query_resources(
+                    actual_query_id,
+                    reason="test_fragments_dropped",
+                    admission_fenced=True,
+                    execution_quiesced=True,
+                )
+
+        # Use a native-free fragment drop while retaining the production
+        # teardown, actor cleanup, phase transition, admission fence and wait.
+        runner._drop_query_fragments_after_admission_fence_sync = drop_after_fence
+        if fail_actor_cleanup:
+            with pytest.raises(RuntimeError, match="planned actor cleanup failure") as exc_info:
+                await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+            assert "timed out" not in str(exc_info.value)
+            assert get_query_resource_manager(query_id) is manager
+            assert query_id in runner._plan_lifecycles
+            assert runner._active_udf_actors_by_plan[query_id] == [pool]
+            assert runner._query_fte_admission_pumps == {}
+
+        await asyncio.wait_for(asyncio.to_thread(runner._teardown_plan_resources, query_id), 5.0)
+        assert phase_returned.is_set()
+        assert fte_drained.is_set()
+        assert fragment_releases == ([False, True] if fail_actor_cleanup else [True] if drop_fragments else [])
+        assert pool.shutdown_calls == (2 if fail_actor_cleanup else 1)
+        assert runner._active_udf_actors == []
+        assert runner._query_fte_admission_pumps == {}
+        assert runner._query_fte_admission_done_events == {}
+        assert runner._query_udf_actor_lifecycle_locks == {}
+        assert query_id not in runner._plan_session_ids
+        assert query_id not in runner._plan_lifecycles
+        assert query_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+        with pytest.raises(KeyError):
+            get_query_resource_manager(query_id)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        clear_query_resource_managers()
 
 
 def test_concurrent_plan_teardown_runs_owned_cleanup_once(monkeypatch):
@@ -5872,6 +6137,8 @@ def test_fte_output_publication_validates_metadata_without_hard_estimate_caps():
 
 
 class _RequiredFteWorkerCallbacks:
+    manager_instance_id = "manager-test"
+
     @property
     def worker_incarnation_id(self):
         return f"incarnation-{self.worker_id}"
@@ -5964,6 +6231,48 @@ class _FakeFteStatusWorker(_RequiredFteWorkerCallbacks):
         return [_FakeOutputLeaseOwner() for _ in outputs]
 
 
+_TEST_STATUS_OBSERVATIONS = []
+
+
+@pytest.fixture(autouse=True)
+def _settle_test_status_observations():
+    yield
+    for watcher in _TEST_STATUS_OBSERVATIONS:
+        watcher.stop()
+    for watcher in _TEST_STATUS_OBSERVATIONS:
+        watcher.join(2.0)
+        assert not watcher.is_alive()
+    _TEST_STATUS_OBSERVATIONS.clear()
+
+
+class _ObservedFteWorkerTaskHandle(driver.FteWorkerTaskHandle):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from vane.runners.fte.fte_scheduler import FteEventHandlers, FteQueryScheduler
+        from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
+
+        scheduler = FteQueryScheduler(self.task_id.query_id)
+        scheduler.set_handlers(
+            FteEventHandlers(
+                on_worker_failed=lambda event: self.worker_handle.mark_fte_worker_failed(
+                    event.worker_id, event.error, worker_incarnation_id=event.worker_incarnation_id
+                ),
+            )
+        )
+        self.observer = FteAttemptStatusWatcher(
+            scheduler=scheduler,
+            attempt_id=self.task_id,
+            worker=self.worker_handle,
+            completion=self.status_completion,
+        )
+        _TEST_STATUS_OBSERVATIONS.append(self.observer)
+
+    def _ensure_started(self):
+        if not self._is_done and self._result is None and self._error is None:
+            self.observer.start()
+        super()._ensure_started()
+
+
 def _wait_batch_ready(handle, timeout_s=2.0):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -5977,7 +6286,7 @@ def _wait_batch_ready(handle, timeout_s=2.0):
 def test_fte_worker_task_handle_finishes_via_status_wait():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert handle.done() is False
     worker.status = {"state": "FINISHED", "stats": [1, 2, 3]}
@@ -5986,7 +6295,7 @@ def test_fte_worker_task_handle_finishes_via_status_wait():
     result = handle.get_result_sync()
     assert result.ok
     assert result.result_schema is None
-    assert worker.calls[0] == ("wait", task_id, -1, handle.status_wait_timeout_s)
+    assert worker.calls[0] == ("wait", task_id, None, handle.observer.wait_timeout_s)
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -5994,7 +6303,7 @@ def test_fte_worker_task_status_transition_uses_dedicated_executor(monkeypatch):
     worker = _FakeFteStatusWorker()
     worker.status = {"state": "FINISHED", "stats": [1]}
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     original_apply_status = handle._apply_status
     transition_threads = []
 
@@ -6053,7 +6362,7 @@ def test_fte_worker_task_handle_starts_one_watcher_under_concurrent_polling(
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6112,7 +6421,7 @@ def test_fte_explicit_ack_wins_atomically_over_concurrent_cancel():
         "partition_id": 2,
         "attempt_id": 0,
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-finish-cancel"},
@@ -6168,7 +6477,7 @@ def test_fte_terminal_record_failure_is_not_masked_by_adopted_result():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {
             "query_id": "q",
             "fragment_execution_id": 1,
@@ -6197,7 +6506,7 @@ def test_fte_worker_task_handle_requires_status_wait_protocol():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(RuntimeError, match="must provide fte_wait_task_status_async"):
-        driver.FteWorkerTaskHandle(task_id, _StatusOnlyWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _StatusOnlyWorker())
 
 
 def test_fte_worker_task_handle_requires_worker_id():
@@ -6207,7 +6516,7 @@ def test_fte_worker_task_handle_requires_worker_id():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(AttributeError, match="worker_id"):
-        driver.FteWorkerTaskHandle(task_id, _NoWorkerIdWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _NoWorkerIdWorker())
 
 
 def test_fte_worker_task_handle_requires_worker_incarnation_id():
@@ -6223,7 +6532,7 @@ def test_fte_worker_task_handle_requires_worker_incarnation_id():
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     with pytest.raises(AttributeError, match="worker_incarnation_id"):
-        driver.FteWorkerTaskHandle(task_id, _NoWorkerIncarnationIdWorker())
+        _ObservedFteWorkerTaskHandle(task_id, _NoWorkerIncarnationIdWorker())
 
 
 def test_fte_worker_task_handle_finishes_with_result_payload():
@@ -6234,7 +6543,7 @@ def test_fte_worker_task_handle_finishes_with_result_payload():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], schema, [9]),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6283,7 +6592,7 @@ def test_fte_worker_task_handle_rolls_back_new_output_owners_when_replacing_owne
         64,
         _RaisingPreviousOwner(),
     )
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6306,7 +6615,7 @@ def test_fte_worker_task_handle_releases_partial_invalid_ownership_transfer():
             return [self.owner]
 
     worker = _InvalidTransferWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6345,7 +6654,7 @@ def test_fte_worker_task_handle_releases_adopted_and_remote_results_when_ack_fai
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-result"},
@@ -6384,7 +6693,7 @@ def test_fte_worker_task_handle_defers_attempt_selection_to_query_commit():
         "state": "FINISHED",
         "result": (["loser-ref"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "loser-lease"},
@@ -6415,7 +6724,7 @@ def test_fte_worker_task_handle_acks_remote_result_once():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
@@ -6435,7 +6744,7 @@ def test_fte_worker_task_handle_ack_does_not_release_remote_result():
         "state": "FINISHED",
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
@@ -6450,7 +6759,7 @@ def test_fte_worker_task_handle_ack_does_not_release_remote_result():
 def test_fte_worker_task_handle_release_result_payload_calls_worker_once():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     handle.release_result_payload()
     handle.release_result_payload()
@@ -6465,7 +6774,7 @@ def test_fte_worker_task_handle_does_not_adopt_payload_after_release():
 
     worker = _TrackingWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         query_task_lease={"lease_id": "lease-released-result"},
@@ -6509,7 +6818,7 @@ def test_fte_worker_task_handle_enqueues_result_controls_without_sync_rpc():
 
     worker = _QueuedControlWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     handle._result = driver.RayTaskResult.success([], [1], None)
 
     assert handle.get_result_sync().ok
@@ -6532,7 +6841,7 @@ def test_fte_worker_task_handle_does_not_publish_finished_status_event():
     worker = _EventWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {"state": "FINISHED", "stats": [1]}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
 
@@ -6553,7 +6862,7 @@ def test_fte_worker_task_handle_does_not_publish_failed_status_event():
             "message": "remote failed",
         },
     }
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     assert _wait_batch_ready(handle) == [0]
 
@@ -6580,7 +6889,7 @@ def test_fte_worker_task_handle_does_not_adopt_retry_from_data_plane():
         def handle_fte_task_status(self, _status):
             raise AssertionError("the authoritative status watcher owns retry scheduling")
 
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _EventWorker(),
     )
@@ -6613,18 +6922,18 @@ def test_fte_worker_task_handle_malformed_status_fails_worker_and_records_termin
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _MalformedStatusWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
 
-    with pytest.raises(RuntimeError, match="failed to apply FTE task status.*MALFORMED"):
+    with pytest.raises(ValueError, match="unknown FTE task state.*MALFORMED"):
         asyncio.run(handle.get_result())
 
     assert handle.done() is True
     assert len(worker.worker_failures) == 1
     assert worker.worker_failures[0][0] == "worker-malformed-status"
-    assert "status protocol failed" in str(worker.worker_failures[0][1])
+    assert "unknown FTE task state" in str(worker.worker_failures[0][1])
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -6649,7 +6958,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
 
     oom_error = driver.ray.exceptions.OutOfMemoryError("Ray killed the worker for memory pressure")
     worker = _OomStatusWorker(oom_error)
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6660,8 +6969,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
     assert len(worker.worker_failures) == 1
     worker_id, published_error = worker.worker_failures[0]
     assert worker_id == "worker-oom-status"
-    assert "status wait failed" in str(published_error)
-    assert published_error.__cause__ is oom_error
+    assert published_error is oom_error
     from vane.runners.ray.fte_fragment_scheduler import _worker_failure_payload
 
     assert (
@@ -6700,7 +7008,7 @@ def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
 
     failure = _UnprintableError()
     worker = _StatusWorker(failure)
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6711,8 +7019,7 @@ def test_fte_worker_task_handle_publishes_failure_with_unprintable_message():
     assert len(worker.worker_failures) == 1
     worker_id, published_error = worker.worker_failures[0]
     assert worker_id == "worker-unprintable-status"
-    assert str(published_error).endswith("<unprintable _UnprintableError>")
-    assert published_error.__cause__ is failure
+    assert published_error is failure
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
@@ -6744,7 +7051,7 @@ def test_fte_worker_task_handle_rejects_mismatched_status_identity():
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _MismatchedStatusWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6776,7 +7083,7 @@ def test_fte_worker_task_handle_treats_query_deadline_as_hard_failure():
             self.terminal_attempts.append(str(driver.FteTaskAttemptId.coerce(task_id)))
 
     worker = _DeadlineWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6792,7 +7099,7 @@ def test_fte_worker_task_handle_rejects_exchange_finish_without_final_info():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
     worker.status = {"state": "FINISHED"}
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         task_context_info={"exchange_sink_instance": {"attempt_id": 0}},
@@ -6811,7 +7118,7 @@ def test_fte_worker_task_handle_accepts_exchange_finish_with_spooling_stats():
         "state": "FINISHED",
         "spooling_output_stats": {"rows": 3},
     }
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         task_id,
         worker,
         task_context_info={"exchange_sink_instance": {"attempt_id": 0}},
@@ -6846,12 +7153,12 @@ def test_fte_worker_task_handle_uses_status_long_poll_when_available():
 
     worker = _LongPollWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     result = asyncio.run(handle.get_result())
 
     assert result.ok
-    assert worker.calls == [("wait", task_id, -1, handle.status_wait_timeout_s)]
+    assert worker.calls == [("wait", task_id, None, handle.observer.wait_timeout_s)]
 
 
 def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
@@ -6862,7 +7169,7 @@ def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
             time.sleep(60)
             return {"state": "RUNNING", "task_id": task_id, "version": 1}
 
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _SlowLongPollWorker(),
     )
@@ -6873,6 +7180,46 @@ def test_fte_worker_task_handle_get_result_sync_accepts_prepopulated_result():
 
     assert result.ok
     assert handle.done() is True
+
+
+def test_result_consumer_cancellation_preserves_the_schedulers_status_observation():
+    entered = threading.Event()
+    release = Future()
+
+    class _PendingWorker(_RequiredFteWorkerCallbacks):
+        worker_id = "worker-shared-status"
+        calls = 0
+
+        async def fte_wait_task_status_async(self, task_id, _min_version, _timeout_s):
+            self.calls += 1
+            entered.set()
+            await asyncio.shield(asyncio.wrap_future(release))
+            return {"task_id": task_id, "state": "FINISHED", "version": 1, "stats": [17]}
+
+    worker = _PendingWorker()
+    handle = _ObservedFteWorkerTaskHandle(
+        {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
+        worker,
+    )
+
+    async def exercise():
+        consumer = asyncio.create_task(handle.get_result())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            assert not handle.status_completion.done()
+            assert handle.observer.is_alive()
+        finally:
+            release.set_result(None)
+        await asyncio.to_thread(handle.observer.join, 2.0)
+        assert not handle.observer.is_alive()
+        assert handle.status_completion.result()["stats"] == [17]
+        assert handle.observer.scheduler.stats().processed_events == 1
+        assert worker.calls == 1
+
+    asyncio.run(exercise())
 
 
 def test_fte_worker_task_handle_publishes_worker_loss_without_adopting_retry():
@@ -6900,14 +7247,14 @@ def test_fte_worker_task_handle_publishes_worker_loss_without_adopting_retry():
         def mark_fte_worker_failed(self, worker_id, error, *, worker_incarnation_id):
             self.calls.append(("mark_failed", worker_id, error))
             return [
-                driver.FteWorkerTaskHandle(
+                _ObservedFteWorkerTaskHandle(
                     {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 1},
                     _RetryWorker(),
                 )
             ]
 
     worker = _LostWorker()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         worker,
     )
@@ -6938,7 +7285,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
         worker_id = "coordinator"
 
         def __init__(self):
-            self.retry = driver.FteWorkerTaskHandle(
+            self.retry = _ObservedFteWorkerTaskHandle(
                 {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 1},
                 _RetryWorker(),
             )
@@ -6963,7 +7310,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
             return coordinator.pop_fte_result_handle_for_task(task_id)
 
     coordinator = _Coordinator()
-    handle = driver.FteWorkerTaskHandle(
+    handle = _ObservedFteWorkerTaskHandle(
         {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0},
         _LostWorker(),
     )
@@ -6979,7 +7326,7 @@ def test_fte_worker_task_handle_does_not_pop_scheduler_result_registry_after_wor
 def test_fte_worker_task_handle_failed_status_raises_result_error():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
     worker.status = {
         "state": "FAILED",
         "failure": {
@@ -6997,7 +7344,7 @@ def test_fte_worker_task_handle_failed_status_raises_result_error():
 def test_fte_worker_task_handle_cancel_calls_worker():
     worker = _FakeFteStatusWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    handle = driver.FteWorkerTaskHandle(task_id, worker)
+    handle = _ObservedFteWorkerTaskHandle(task_id, worker)
 
     handle.cancel()
 
@@ -7408,7 +7755,12 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
         )
 
 
-def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery():
+@pytest.mark.parametrize("during_poll", [False, True])
+@pytest.mark.parametrize("failure", ["provider", "timeout"])
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(during_poll, failure):
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
     query_id = "query-placement-lost"
@@ -7416,7 +7768,22 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
+    if failure == "provider":
+        terminal_error = DiagnosticError(
+            "Ray actor UDF pool initialization failed",
+            TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+        )
+    else:
+        terminal_error = TimeoutError("Ray actor UDF pool initialization timed out: CPU=1, GPU=1 per actor")
+    if during_poll:
+
+        def failed_poll():
+            runner._query_terminal_errors[query_id] = terminal_error
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+        runner.curr_streams[plan_id].next_nowait = failed_poll
+    else:
+        runner._query_terminal_errors[query_id] = terminal_error
     teardown_calls = []
 
     def _teardown(actual_plan_id):
@@ -7426,38 +7793,82 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     runner._teardown_plan_resources = _teardown
 
-    with pytest.raises(RuntimeError, match="Ray actor UDF pool initialization failed"):
-        asyncio.run(
-            cls.get_next_partition(
-                runner,
-                _TEST_RUNTIME_OWNER_ID,
-                _TEST_SESSION_ID,
-                plan_id,
+    try:
+        with pytest.raises(type(terminal_error), match="Ray actor UDF pool initialization") as caught:
+            asyncio.run(
+                cls.get_next_partition(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    plan_id,
+                )
             )
-        )
+    finally:
+        release_query_resource_manager(query_id, reason="test_complete")
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
-    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
-
-    release_query_resource_manager(query_id, reason="test_complete")
+    # asyncio bridges concurrent Future timeouts into a new TimeoutError.
+    assert type(caught.value) is type(terminal_error)
+    restored = pickle.loads(pickle.dumps(caught.value))
+    if failure == "provider":
+        assert "max_model_len" in summarize_error(restored)
+    else:
+        assert str(restored) == str(terminal_error)
 
 
 def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "terminal-cleanup-plan"
     query_id = "terminal-cleanup-query"
-    runner._query_terminal_errors[query_id] = "fixed actor placement was lost"
+    terminal_error = DiagnosticError(
+        "Ray actor UDF pool initialization failed",
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+    )
+    runner._query_terminal_errors[query_id] = terminal_error
     cleanup_error = RuntimeError("planned terminal teardown failure")
     runner._teardown_plan_resources = lambda *_args, **_kwargs: (_ for _ in ()).throw(cleanup_error)
 
     with pytest.raises(driver.QueryExecutionCleanupError) as error:
         cls._finish_terminal_query(runner, plan_id, query_id)
 
-    assert isinstance(error.value.primary_error, RuntimeError)
-    assert str(error.value.primary_error) == "fixed actor placement was lost"
+    assert error.value.primary_error is terminal_error
+    assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(error.value)))
     assert error.value.cleanup_errors == (cleanup_error,)
     assert error.value.__cause__ is error.value.primary_error
+
+
+@pytest.mark.parametrize("ray_wrapped", [False, True])
+def test_terminal_query_serializes_cleanup_diagnostics_after_ownership_is_released(ray_wrapped):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
+
+    cls, runner = _make_local_query_driver_actor()
+    query_id = "terminal-cleanup-diagnostic"
+    runner._query_terminal_errors[query_id] = DiagnosticError(
+        "actor initialization", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    cleanup_errors = (OSError(errno.EIO, "private cleanup path"), OSError(errno.ENOSPC, "private journal path"))
+    if ray_wrapped:
+        cleanup_errors = tuple(RayTaskError("cleanup", "private traceback", error) for error in cleanup_errors)
+
+    def teardown(plan_id):
+        runner._query_terminal_errors.pop(query_id)
+        raise driver._QueryCleanupDiagnostic("private cleanup message", cleanup_errors)
+
+    runner._teardown_plan_resources = teardown
+    with pytest.raises(DiagnosticError) as caught:
+        cls._finish_terminal_query(runner, "terminal-plan", query_id)
+    serialized = pickle.dumps(caught.value)
+    assert b"private" not in serialized
+    for error in (caught.value, pickle.loads(serialized)):
+        summary = summarize_error(error)
+        assert "max_model_len" in summary
+        assert "; cleanup: OSError (errno=5)" in summary and "OSError (errno=28)" in summary
+    assert query_id not in runner._query_terminal_errors
 
 
 def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():
@@ -12849,3 +13260,76 @@ def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypat
         ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
         ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
     ]
+
+
+def test_expired_client_kills_udf_actor_before_joining_active_operation():
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-udf-startup"
+    _bind_test_plan_session(runner, plan_id)
+    actor_killed = threading.Event()
+    operation_started = threading.Event()
+    session = runner._sessions[_TEST_SESSION_ID]
+    events = []
+
+    class Pool:
+        actors = [object()]
+        _vane_retired = False
+
+        def shutdown(self, *, kill):
+            assert kill is True
+            assert session.connection.closed is False
+            events.append("kill")
+            self.actors = []
+            actor_killed.set()
+
+    pool = Pool()
+    runner._active_udf_actors = [pool]
+    runner._active_udf_actors_by_plan = {plan_id: [pool]}
+    runner._active_udf_actor_by_unit = {plan_id: {"actor": pool}}
+
+    def cleanup(actual_plan_id):
+        assert actual_plan_id == plan_id
+        assert session.active_operations == 0
+        events.append("teardown")
+        session.plan_ids.discard(plan_id)
+        runner._plan_session_ids.pop(plan_id)
+
+    runner._cleanup_finished_plan = cleanup
+
+    def native_operation():
+        operation_started.set()
+        assert actor_killed.wait(timeout=5)
+        assert session.connection.closed is False
+        events.append("operation-exit")
+
+    async def expire():
+        async def operation():
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+            try:
+                await driver._run_in_executor_with_owned_side_effects(
+                    runner._get_driver_native_executor(),
+                    native_operation,
+                )
+            finally:
+                cls._end_session_operation(session)
+
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(operation_started.wait, 2)
+        runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1
+        assert cls._mark_expired_client_leases(runner, now=1) == (_TEST_RUNTIME_OWNER_ID,)
+        assert (
+            await asyncio.wait_for(
+                cls._detach_client_owner(runner, _TEST_RUNTIME_OWNER_ID, expired=True),
+                timeout=5,
+            )
+            is False
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(expire())
+    assert events == ["kill", "operation-exit", "teardown"]
+    assert session.connection.closed is True
+    assert runner._active_udf_actors == []

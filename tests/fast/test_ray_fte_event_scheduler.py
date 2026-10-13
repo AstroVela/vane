@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
-import time
 from collections import deque
 from concurrent.futures import Future
 
@@ -24,13 +24,13 @@ from vane.runners.fte.fte_events import (
     WorkerReservationCompleted,
 )
 from vane.runners.fte.fte_scheduler import (
-    FteAttemptStatusWatcher,
     FteEventDrivenTaskSource,
     FteEventHandlers,
     FteQueryScheduler,
     FteRetryDelayResult,
     FteSchedulerRegistry,
 )
+from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 from vane.runners.ray.safe_get import QueryDeadlineExceeded
 
 
@@ -883,7 +883,7 @@ def test_attempt_status_watcher_enqueues_terminal_status_event():
         worker_incarnation_id = "incarnation-a"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             return {
                 "state": "FINISHED",
                 "task_id": task_id,
@@ -940,7 +940,7 @@ def test_attempt_status_watcher_enqueues_running_progress_before_terminal():
                 },
             ]
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             self.min_versions.append(min_version)
             return {"task_id": task_id, **self.statuses.pop(0)}
 
@@ -958,7 +958,6 @@ def test_attempt_status_watcher_enqueues_running_progress_before_terminal():
         attempt_id=attempt_id,
         worker=worker,
         wait_timeout_s=0,
-        poll_interval_s=0.001,
     )
 
     assert watcher.start() is True
@@ -979,7 +978,7 @@ def test_attempt_status_watcher_marks_scheduler_failed_when_handler_fails():
         worker_incarnation_id = "incarnation-handler-failure"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             return {
                 "state": "FINISHED",
                 "task_id": task_id,
@@ -1022,7 +1021,7 @@ def test_attempt_status_watcher_requires_status_wait_protocol():
         wait_timeout_s=0,
     )
 
-    with pytest.raises(TypeError, match="fte_wait_task_status must be callable"):
+    with pytest.raises(TypeError, match="fte_wait_task_status_async must be callable"):
         watcher.start()
 
 
@@ -1032,7 +1031,7 @@ def test_attempt_status_watcher_reports_malformed_status():
         worker_incarnation_id = "incarnation-malformed"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             return "not-a-status-dict"
 
     scheduler = FteSchedulerRegistry().get_or_create("query-watch-malformed")
@@ -1048,7 +1047,6 @@ def test_attempt_status_watcher_reports_malformed_status():
         attempt_id=attempt_id,
         worker=_Worker(),
         wait_timeout_s=0,
-        poll_interval_s=0.001,
     )
 
     try:
@@ -1067,7 +1065,7 @@ def test_attempt_status_watcher_reports_unknown_task_state_as_worker_failure():
         worker_incarnation_id = "incarnation-unknown-state"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             return {
                 "state": "MALFORMED",
                 "task_id": task_id,
@@ -1087,7 +1085,6 @@ def test_attempt_status_watcher_reports_unknown_task_state_as_worker_failure():
         attempt_id=attempt_id,
         worker=_Worker(),
         wait_timeout_s=0,
-        poll_interval_s=0.001,
     )
 
     try:
@@ -1109,7 +1106,7 @@ def test_attempt_status_watcher_treats_query_deadline_as_hard_failure():
         worker_incarnation_id = "incarnation-query-deadline"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             raise QueryDeadlineExceeded("query deadline expired before Ray ObjectRef get")
 
     scheduler = FteSchedulerRegistry().get_or_create("query-watch-deadline")
@@ -1125,7 +1122,6 @@ def test_attempt_status_watcher_treats_query_deadline_as_hard_failure():
         attempt_id=attempt_id,
         worker=_Worker(),
         wait_timeout_s=0,
-        poll_interval_s=0.001,
     )
 
     assert watcher.start() is True
@@ -1152,7 +1148,7 @@ def test_attempt_status_watcher_reports_failure_with_unprintable_message():
         worker_incarnation_id = "incarnation-unprintable-failure"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             raise error
 
     scheduler = FteSchedulerRegistry().get_or_create("query-watch-unprintable-failure")
@@ -1168,7 +1164,6 @@ def test_attempt_status_watcher_reports_failure_with_unprintable_message():
         attempt_id=attempt_id,
         worker=_Worker(),
         wait_timeout_s=0,
-        poll_interval_s=0.001,
     )
 
     assert watcher.start() is True
@@ -1178,7 +1173,7 @@ def test_attempt_status_watcher_reports_failure_with_unprintable_message():
     assert calls == [("worker-unprintable-failure", error)]
 
 
-def test_attempt_status_watcher_join_observes_real_thread_lifecycle():
+def test_attempt_status_watcher_join_observes_async_wait_cleanup():
     entered = threading.Event()
 
     class _Worker:
@@ -1186,9 +1181,12 @@ def test_attempt_status_watcher_join_observes_real_thread_lifecycle():
         worker_incarnation_id = "incarnation-slow-status"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             entered.set()
-            time.sleep(0.2)
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0.05)
             return {
                 "state": "RUNNING",
                 "task_id": task_id,
@@ -1202,7 +1200,6 @@ def test_attempt_status_watcher_join_observes_real_thread_lifecycle():
         attempt_id=attempt_id,
         worker=_Worker(),
         wait_timeout_s=1,
-        poll_interval_s=0.001,
     )
 
     assert watcher.start() is True

@@ -778,6 +778,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
             raise ValueError(f"{artifact.path}: Vane sdist contains an unexpected archive root: {name!r}")
 
     required_paths = (
+        "vane_fs/include/vane_fs/reader_abi.h",
         "DUCKDB_FORK_REVISION",
         "DUCKDB_SOURCE_ID",
         "DUCKDB_UPSTREAM_VERSION",
@@ -852,6 +853,18 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         _require_sdist_path(names, f"external/duckdb/extension/{domain}/{domain}_functions.cpp", artifact.path)
     for relative_path in ("extension.cmake", "media_reader.cpp", "image_convert.cpp", "include/media_reader.hpp"):
         _require_sdist_path(names, f"external/duckdb/extension/media_common/{relative_path}", artifact.path)
+    for relative_path in (
+        "CMakeLists.txt",
+        "gravitino_catalog.cpp",
+        "gravitino_client.cpp",
+        "gravitino_extension.cpp",
+        "gravitino_filesystem.cpp",
+        "gravitino_functions.cpp",
+        "include/gravitino_catalog.hpp",
+        "include/gravitino_client.hpp",
+        "include/gravitino_extension.hpp",
+    ):
+        _require_sdist_path(names, f"external/duckdb/extension/gravitino/{relative_path}", artifact.path)
 
     source_id_name = _require_sdist_path(names, "DUCKDB_SOURCE_ID", artifact.path)
     source_id = artifact.read(source_id_name).decode("ascii").strip()

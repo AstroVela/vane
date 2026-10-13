@@ -524,6 +524,13 @@ shutdown times out, the request stays `cancelling` and keeps its admission slot
 until callbacks release their outputs and execution slots and cleanup is retried
 through `request.shutdown()` or `runtime.close()`. This also applies without
 `task_limit`, `track_data`, or `data_limit`.
+
+Standalone local UDF executors follow the same completion boundary: a successful
+`close()` waits for their completion callbacks to release task admissions and
+finish scope and activity cleanup. A cleanup timeout retains the executor's
+futures and pool reference for an explicit close retry. The wait covers only
+that executor's invocations; other executors sharing the pool can keep running.
+
 Retries use each lease's shared-input ownership rules and each task's grant
 identities, so cleaning one request cannot release another request's data.
 Shared registered models remain resident. Shared-memory UDF outputs and their
@@ -1280,6 +1287,19 @@ Worker acquisition retries retained retirements before spawning or waiting for
 a free slot. A failed retry returns a task error and its execution resources;
 shared-pool peers do not wait indefinitely behind an unclosed retired worker.
 
+Each subprocess worker starts its own session. Its process group and observed
+engine descendants remain owned after the worker PID exits. Shutdown terminates
+remaining live descendants before confirming cleanup or returning process
+capacity. A failed termination retains that owner for a later close; inherited
+fork finalizers cannot signal the parent's workers. A zombie has already
+released execution resources and is left for its parent to reap.
+
+When a cached task callable fails to close, the executor and its original async
+loop remain owned outside the idle callable LRU. The same cache key must finish
+that cleanup before another task binds a new loop. Clearing the idle cache does
+not discard outstanding cleanup. Runtime close captures bounded exception types
+and numeric diagnostics before transporting the error, including cleanup errno.
+
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
 `TaskAdmissionQueueFull`; native execution surfaces this as a query error.
@@ -1443,12 +1463,15 @@ When a UDF forks, the worker also pins all live remote input leases, including
 views retained by an earlier invocation. Last-buffer notifications wait for the
 inheriting child and its descendants to exit or exec. One lifetime pipe per
 worker, transferred at startup, lets the parent retain outstanding input regions
-even if the worker exits before those descendants. Worker shutdown transfers
-these leases to arena pins; they keep preventing reuse and page reclamation
-until the inherited writers close. Ordinary batches do not allocate additional
-descriptors. Worker-client cleanup and inherited input finalizers check the
-creator PID before touching locks, release queues, or sockets, so a fork child's
-normal exit cannot shut down its parent's release channel.
+even if the worker exits before those descendants. Retiring the storage peer
+after unexpected worker exit transfers these leases to arena pins; they keep
+preventing reuse and page reclamation until the inherited writers close.
+Explicit executor shutdown first terminates the worker's process group and
+observed descendants, including fork readers, before retiring its storage peer.
+Ordinary batches do not allocate additional descriptors. Worker-client cleanup
+and inherited input finalizers check the creator PID before touching locks,
+release queues, or sockets, so a fork child's normal exit cannot shut down its
+parent's release channel.
 
 `VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
 `auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of

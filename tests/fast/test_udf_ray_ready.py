@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -53,7 +55,15 @@ class _Actor:
         self.run_ref_bundle_stream = _Method(**method_kwargs)
 
 
-def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
+class _InitRef:
+    def __init__(self, future):
+        self._future = future
+
+    def future(self):
+        return self._future
+
+
+def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None, init_refs=None):
     from vane.execution.udf_ray import RemoteUDFExecutor, UDFActorPool
 
     pool = UDFActorPool._from_handles(
@@ -61,6 +71,7 @@ def _executor(actors, *, dispatch_indices=None, payload=None, node_ids=None):
         payload=payload or _payload(),
         actor_node_ids=node_ids or ["node-a"] * len(actors),
         actor_dispatch_indices=(set(range(len(actors))) if dispatch_indices is None else dispatch_indices),
+        actor_init_refs=init_refs,
     )
     return RemoteUDFExecutor(
         pool,
@@ -96,6 +107,12 @@ def _run_after_lease(executor, monkeypatch, *, actor_index=0):
 
     monkeypatch.setattr(remote_submit, "TaskLeaseObjectRefGenerator", _start_immediately)
     monkeypatch.setattr(remote_ref_bundle, "TaskLeaseObjectRefGenerator", _start_immediately)
+
+
+def _submit_kind(executor, kind):
+    if kind == "table":
+        return executor.submit_with_id(1, pa.table({"value": [42]}))
+    return executor.submit_ref_bundle_with_id(1, [object()], [None], [{"num_rows": 1, "size_bytes": 8}], ["value"])
 
 
 def test_actor_dispatch_uses_only_dispatch_eligible_actor(monkeypatch):
@@ -161,9 +178,127 @@ def test_no_dispatch_eligible_actor_is_a_hard_error_after_admission(monkeypatch)
     executor = _executor([actor], dispatch_indices=set())
     _run_after_lease(executor, monkeypatch)
 
-    with pytest.raises(RuntimeError, match="no ready actors"):
+    with pytest.raises(RuntimeError, match="actor_index=0, but that actor is not ready"):
         executor.submit_with_id(2, pa.table({"value": [1]}))
     assert actor.run_block_stream.remote_calls == []
+
+
+@pytest.mark.parametrize("kind", ["table", "ref_bundle"])
+@pytest.mark.parametrize("actor_index", [0, 1])
+def test_first_actor_dispatch_precedes_executor_ready_notification(monkeypatch, kind, actor_index):
+    actors = [_Actor(), _Actor()]
+    futures = [Future(), Future()]
+    callback_entered, callback_release = threading.Event(), threading.Event()
+
+    def delay_notification(_future):
+        callback_entered.set()
+        assert callback_release.wait(10)
+
+    # A completed Future can already grant admission in the driver while an
+    # earlier callback keeps the executor's notification from running.
+    futures[actor_index].add_done_callback(delay_notification)
+    executor = _executor(
+        actors,
+        dispatch_indices=set(),
+        payload=_payload(actor_pool_size=2),
+        node_ids=["", ""],
+        init_refs=[_InitRef(future) for future in futures],
+    )
+    _run_after_lease(executor, monkeypatch, actor_index=actor_index)
+    completion = threading.Thread(target=lambda: futures[actor_index].set_result("node-a"))
+    completion.start()
+    try:
+        assert callback_entered.wait(5)
+        assert not executor._ready_actor_set and not executor._ready_probe_refs
+        assert futures[actor_index].done()
+        assert _submit_kind(executor, kind) == "generator"
+        selected = getattr(actors[actor_index], "run_block_stream" if kind == "table" else "run_ref_bundle_stream")
+        assert len(selected.remote_calls) == 1
+        assert selected.remote_calls[0][1]["payload"]["actor_index"] == actor_index
+        assert not actors[1 - actor_index].run_block_stream.remote_calls
+        assert not actors[1 - actor_index].run_ref_bundle_stream.remote_calls
+        assert executor._ready_actor_set == {actor_index}
+        assert executor._actors_obj.actor_node_ids[actor_index] == "node-a"
+        callback_release.set()
+        completion.join(5)
+        assert not completion.is_alive()
+        executor._refresh_actor_readiness()
+        assert executor._ready_actor_indices == [actor_index]
+        pending_ref = executor._actors_obj._init_refs[1 - actor_index]
+        assert executor._pending_ready_refs == {pending_ref: 1 - actor_index}
+    finally:
+        callback_release.set()
+        completion.join(5)
+        executor.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["table", "ref_bundle"])
+def test_admission_waits_for_local_init_result_delivery(monkeypatch, kind):
+    resolving = threading.Event()
+
+    class ObservedFuture(Future):
+        def result(self, timeout=None):
+            resolving.set()
+            return super().result(timeout=timeout)
+
+    actors = [_Actor(), _Actor()]
+    future = ObservedFuture()
+    executor = _executor(
+        actors,
+        dispatch_indices=set(),
+        payload=_payload(actor_pool_size=2),
+        node_ids=["", ""],
+        init_refs=[_InitRef(Future()), _InitRef(future)],
+    )
+    _run_after_lease(executor, monkeypatch, actor_index=1)
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "5")
+
+    def deliver_result():
+        assert resolving.wait(5)
+        future.set_result("node-a")
+
+    # Driver admission has already confirmed initialization. The same result
+    # reaches the executor only once submission starts resolving its local ref.
+    completion = threading.Thread(target=deliver_result)
+    completion.start()
+    try:
+        assert not future.done()
+        assert _submit_kind(executor, kind) == "generator"
+        assert executor._ready_actor_set == {1}
+        selected = getattr(actors[1], "run_block_stream" if kind == "table" else "run_ref_bundle_stream")
+        assert len(selected.remote_calls) == 1
+        assert not actors[0].run_block_stream.remote_calls
+        assert not actors[0].run_ref_bundle_stream.remote_calls
+    finally:
+        resolving.set()
+        completion.join(5)
+        executor.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["table", "ref_bundle"])
+@pytest.mark.parametrize("outcome", ["pending", "failed", "empty_node"])
+def test_admitted_actor_still_requires_successful_initialization(monkeypatch, kind, outcome):
+    actor, future = _Actor(), Future()
+    executor = _executor([actor], dispatch_indices=set(), node_ids=[""], init_refs=[_InitRef(future)])
+    _run_after_lease(executor, monkeypatch)
+    monkeypatch.setattr(executor, "_notify_ready_ref_ready", lambda _ref: None)
+    if outcome == "failed":
+        future.set_exception(ValueError("model initialization failed"))
+        error_type, message = ValueError, "model initialization failed"
+    elif outcome == "empty_node":
+        future.set_result("")
+        error_type, message = RuntimeError, "without a runtime node identity"
+    else:
+        monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.01")
+        error_type, message = TimeoutError, ""
+    try:
+        with pytest.raises(error_type, match=message):
+            _submit_kind(executor, kind)
+        assert not actor.run_block_stream.remote_calls
+        assert not actor.run_ref_bundle_stream.remote_calls
+        assert not executor._ready_actor_set
+    finally:
+        executor.shutdown()
 
 
 def test_actor_submit_failure_marks_actor_unavailable_without_cross_actor_retry(monkeypatch):

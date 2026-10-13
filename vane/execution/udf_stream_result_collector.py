@@ -1969,6 +1969,10 @@ class UDFStreamResultCollector:
             record.terminal_signal_observed = True
             details = remote_error["exception_details"]
             if details is not None:
+                if details["kind"] == "diagnostic":
+                    from vane.ai._errors import _restore_diagnostic_error
+
+                    raise _restore_diagnostic_error(remote_error["exception_message"], details["summary"]) from None
                 from vane.ai.provider import ProviderCapabilityError
 
                 raise ProviderCapabilityError._from_safe_summary(

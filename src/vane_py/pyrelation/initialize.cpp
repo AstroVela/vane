@@ -336,9 +336,9 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	relation_module.def("_take_udf_actor_cleanup_warnings", &DuckDBPyRelation::TakeUDFActorCleanupWarnings);
 	relation_module.def(
 	    "map_batches",
-	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
-	       const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
-	       const Optional<py::object> &min_task_batch_size,
+	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema, const string &batch_format,
+	       const py::object &zero_copy_batch, const Optional<py::object> &batch_size,
+	       const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
 	       const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
 	       const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
 	       const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
@@ -346,17 +346,46 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	       const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes,
 	       py::kwargs kwargs) {
 		    RejectMapBatchesUnsupportedKwargs(kwargs);
-		    return self.MapBatches(fun, schema, batch_size, output_batch_size, min_task_batch_size,
-		                           preserve_compute_batch_boundaries, cpus, gpus, memory_bytes, execution_backend,
-		                           actor_number, ray_actor_thread_policy, target_max_batch_bytes, task_input_max_bytes,
-		                           output_target_max_bytes);
+		    return self.MapBatches(fun, schema, batch_format, zero_copy_batch, batch_size, output_batch_size,
+		                           min_task_batch_size, preserve_compute_batch_boundaries, cpus, gpus, memory_bytes,
+		                           execution_backend, actor_number, ray_actor_thread_policy, target_max_batch_bytes,
+		                           task_input_max_bytes, output_target_max_bytes);
 	    },
-	    "Apply a Python function or callable class to batches of rows. Retrying Task and Actor backends may replay "
+	    "Apply a Python function or callable class to batches of rows. batch_format selects pyarrow.Table, "
+	    "dict[str, numpy.ndarray], pandas.DataFrame, or cudf.DataFrame input and output. Non-null fixed-shape tensor "
+	    "columns are N-D arrays in NumPy batches; non-null fixed-size IMAGE columns are NHWC arrays. Nullable "
+	    "tensor/IMAGE columns and variable-size IMAGE columns are object arrays of per-row ndarrays or None. "
+	    "Tensor NULL elements and nested NumPy NULL values are retained as None inside object arrays. "
+	    "Boolean and date tensor elements retain their NumPy types when non-null. "
+	    "Nested fixed-shape tensors use per-value ndarrays in NumPy and pandas. Other Arrow extensions use typed "
+	    "Arrow scalars in object columns; NumPy timezone-aware timestamps, TIME/TIME_NS, INTERVAL and decimals also "
+	    "retain immutable Arrow scalars to preserve time precision, calendar components and decimal types, including "
+	    "the default HUGEINT storage. UNION values in object columns use one-row Arrow arrays to retain "
+	    "member tags, including NULL members. "
+	    "Timezone-naive NumPy timestamps retain their original time unit, including nanoseconds. "
+	    "Floating scalar NaNs in pandas object columns and nested leaves remain valid; use None or pandas.NA for NULL. "
+	    "IMAGE pixels retain their mode-specific dtype without resizing or color conversion. pandas tensor/IMAGE "
+	    "columns use per-row ndarrays. Nullable ordinary NumPy columns use numpy.ma.MaskedArray. "
+	    "zero_copy_batch=True (default) exposes read-only NumPy input buffers, sharing Arrow storage where "
+	    "possible; merging chunks, converting dtypes and representing NULL elements can allocate. "
+	    "Set zero_copy_batch=False with batch_format='numpy' for detached writable input arrays. "
+	    "NumPy and pandas IMAGE outputs must contain HWC ndarrays or None. "
+	    "Tensor output casts reject fractional or out-of-range values for integer elements. "
+	    "pandas Arrow-backed Tensor outputs may use flat Arrow list storage; dimensions are restored from the "
+	    "declared Tensor shape before checked element conversion, including tensors nested in containers. "
+	    "NumPy, pandas and cuDF outputs must use the selected format. The default pyarrow "
+	    "format also accepts existing dict outputs. batch_size controls each UDF call. Ordinary synchronous Ray "
+	    "Actor map_batches may group several complete compute batches into one transport task using the input "
+	    "byte budget; ready Actors can receive smaller complete batches immediately. Input end and byte pressure "
+	    "drain short tails. Explicit min_task_batch_size retains its upstream-block soft-minimum semantics. "
+	    "Retrying Task and Actor "
+	    "backends may replay "
 	    "a call after failure; exactly-once execution is not provided, so external effects must be idempotent. "
 	    "Callable classes use Actor backends: "
 	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
 	    "failures may reconstruct an Actor and reset its local state.",
-	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
+	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_format") = "pyarrow",
+	    py::arg("zero_copy_batch") = py::bool_(true), py::arg("batch_size") = py::none(),
 	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
 	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),
 	    py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(), py::arg("execution_backend") = py::none(),

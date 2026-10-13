@@ -145,6 +145,8 @@ public:
 	virtual bool TrySubmitRefBundleWithRetainedBytes(LazyRefDataChunk &bundle, DataChunk &rows, ClientContext &context,
 	                                                 idx_t retained_input_bytes, idx_t &submit_id) = 0;
 	virtual void FinishedSubmitting(ClientContext &context) = 0;
+	// Retire admission and outstanding streams when no consumer needs more rows.
+	virtual void Cancel() = 0;
 	virtual bool AllTasksFinished(ClientContext &context) = 0;
 	virtual bool SupportsAsyncWakeup() = 0;
 	virtual UDFWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) = 0;

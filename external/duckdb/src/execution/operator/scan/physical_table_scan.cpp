@@ -185,6 +185,33 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 
 	TableFunctionInput data(bind_data.get(), l_state.local_state.get(), g_state.global_state.get());
 
+	if (function.poll_function) {
+		if (function.function || function.in_out_function) {
+			throw InternalException("polling table source has multiple execution callbacks");
+		}
+		{
+			auto guard = g_state.Lock();
+			g_state.RemoveBlockedTask(guard, &l_state);
+			if (!g_state.CanBlock(guard)) {
+				return SourceResultType::FINISHED;
+			}
+		}
+		auto result = function.poll_function(context.client, data, chunk, input.interrupt_state);
+		if (result == SourceResultType::HAVE_MORE_OUTPUT && chunk.size() == 0) {
+			throw InternalException("polling table source returned HAVE_MORE_OUTPUT without rows");
+		}
+		if (result != SourceResultType::HAVE_MORE_OUTPUT && chunk.size() != 0) {
+			throw InternalException("blocked or finished polling table source returned rows");
+		}
+		if (result == SourceResultType::BLOCKED) {
+			// Admission is an external wakeup source. LIMIT/early completion
+			// must also wake this task even if admission never becomes ready.
+			auto guard = g_state.Lock();
+			return g_state.BlockTask(guard, &l_state, input.interrupt_state) ? SourceResultType::BLOCKED
+			                                                                 : SourceResultType::FINISHED;
+		}
+		return result;
+	}
 	if (function.function) {
 		data.async_result = AsyncResultType::IMPLICIT;
 
@@ -426,7 +453,7 @@ bool PhysicalTableScan::Equals(const PhysicalOperator &other_p) const {
 }
 
 bool PhysicalTableScan::ParallelSource() const {
-	if (distributed_scan_empty || !function.function) {
+	if (distributed_scan_empty || (!function.function && !function.poll_function)) {
 		// table in-out functions cannot be executed in parallel as part of a PhysicalTableScan
 		// since they have only a single input row
 		return false;

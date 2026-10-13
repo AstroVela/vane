@@ -104,12 +104,14 @@ class _OwnedUDFActorPoolsError(OwnedActorPoolsError):
         *,
         owned_actor_pools: list[Any],
         creation_error: BaseException,
+        cleanup_errors: tuple[BaseException, ...] = (),
     ) -> None:
         super().__init__(
             _bounded_actor_cleanup_text(message),
             owned_actor_pools=owned_actor_pools,
             creation_error=creation_error,
         )
+        self.cleanup_errors = cleanup_errors
 
 
 def _actor_pool_terminated(pool: Any) -> bool:
@@ -135,6 +137,11 @@ def _with_actor_thread_env(
 
 
 class UDFActorPoolBase:
+    # Set by the query driver when it registers ownership of the pool.
+    _vane_init_deadline: float
+    _vane_init_timeout: float
+    _vane_init_timed_out: bool
+
     def __init__(
         self,
         payload: dict[str, Any],
@@ -181,6 +188,11 @@ class UDFActorPoolBase:
 
         self.actors: list[Any] = []
         self._init_refs: list[Any] = []
+        self._confirmed_ready: set[int] = set()
+        self._vane_retired = False
+        self._vane_location_nonce = ""
+        self._vane_readiness_futures: list[Any] = []
+        self._vane_init_errors: dict[int, BaseException] = {}
         try:
             for actor_index in range(concurrency):
                 self.actors.append(Actor.options(**actor_options[actor_index]).remote())
@@ -198,11 +210,6 @@ class UDFActorPoolBase:
                     creation_error=creation_error,
                 ) from creation_error
             raise
-        self._confirmed_ready: set[int] = set()
-        self._vane_retired = False
-        self._vane_location_nonce = ""
-        self._vane_readiness_futures: list[Any] = []
-        self._vane_init_errors: dict[int, BaseException] = {}
 
     @staticmethod
     def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
@@ -275,6 +282,10 @@ class UDFActorPoolBase:
         if not kill and actors:
             close_refs: list[tuple[int, Any]] = []
             for actor_index, actor in enumerate(actors):
+                # An actor still waiting for capacity cannot run a close RPC.
+                # It has never been eligible for UDF work; terminate it directly.
+                if actor_index not in self._confirmed_ready:
+                    continue
                 try:
                     close_refs.append((actor_index, actor.close_executor.remote()))
                 except BaseException as exc:
@@ -305,8 +316,11 @@ class UDFActorPoolBase:
 
         kill_errors: list[str] = []
         remaining_actors: list[Any] = []
+        remaining_ready: set[int] = set()
         for actor_index, actor in enumerate(actors):
             if actor_index in close_failed_indices:
+                if actor_index in self._confirmed_ready:
+                    remaining_ready.add(len(remaining_actors))
                 remaining_actors.append(actor)
                 continue
             try:
@@ -316,8 +330,11 @@ class UDFActorPoolBase:
                     kill_errors,
                     _actor_cleanup_failure("kill", actor_index, exc),
                 )
+                if actor_index in self._confirmed_ready:
+                    remaining_ready.add(len(remaining_actors))
                 remaining_actors.append(actor)
         self.actors = remaining_actors
+        self._confirmed_ready = remaining_ready
         if not remaining_actors:
             self._init_refs = []
             self._payload_ref = None
@@ -367,8 +384,12 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
     return value
 
 
-def _actor_init_timeout_s() -> float | None:
-    return configured_ray_get_timeout_s(_positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S"))
+def _actor_init_timeout_s() -> float:
+    # Ray may wait indefinitely for capacity. Bound first readiness even when
+    # neither a query deadline nor an ObjectRef timeout was configured.
+    timeout = configured_ray_get_timeout_s(_positive_float_env("VANE_RAY_ACTOR_INIT_TIMEOUT_S", 300.0))
+    assert timeout is not None
+    return timeout
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -413,10 +434,7 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
     timeout_s: float | None = None
     try:
         timeout_s = _actor_init_timeout_s()
-        if timeout_s is None:
-            resolved_node_ids = resolve_object_refs_blocking(refs)
-        else:
-            resolved_node_ids = resolve_object_refs_blocking(refs, timeout=timeout_s)
+        resolved_node_ids = resolve_object_refs_blocking(refs, timeout=timeout_s)
         node_ids = [str(node_id or "").strip() for node_id in resolved_node_ids]
         if len(node_ids) != len(actors) or any(not node_id for node_id in node_ids):
             raise RuntimeError("UDF actor initialization did not return one Ray node_id per actor")
@@ -510,14 +528,19 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
                 actors_obj.actor_node_ids[actor_index] = node_id
                 actors_obj._confirmed_ready.add(actor_index)
                 ready_nodes[actor_index] = node_id
+            if first_failure is not None:
+                # A failed initializer can still hold the resources needed by
+                # the remaining actors. Waiting for them can never finish on
+                # a full cluster. A resolved failure is terminal for this pool,
+                # including when another actor became ready at the same time.
+                count = f"all {failure_count}" if failure_count == len(refs) else str(failure_count)
+                raise RuntimeError(
+                    _bounded_actor_cleanup_text(
+                        f"{count} UDF actors failed during initialization: " + "; ".join(failure_details)
+                    )
+                ) from first_failure
             if ready_nodes:
                 return ready_nodes
-        if first_failure is not None:
-            raise RuntimeError(
-                _bounded_actor_cleanup_text(
-                    f"all {failure_count} UDF actors failed during initialization: " + "; ".join(failure_details)
-                )
-            ) from first_failure
         raise RuntimeError("all UDF actors finished initialization without becoming ready")
     except BaseException as readiness_error:
         try:
@@ -531,6 +554,7 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
                 ),
                 owned_actor_pools=[actors_obj],
                 creation_error=readiness_error,
+                cleanup_errors=(cleanup_error,),
             ) from readiness_error
         raise
 

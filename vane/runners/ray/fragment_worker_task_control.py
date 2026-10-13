@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +44,10 @@ from vane.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
 )
+
+# Cancellation may wait for Ray's IO thread. It must never run on the event
+# loop that drives status progress and query lifecycle callbacks.
+_FTE_CANCEL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vane-fte-cancel")
 
 
 class FteControlBarrierPendingError(RuntimeError):
@@ -587,10 +592,30 @@ class FteWorkerTaskControlMixin:
             assert last_error is not None
             raise last_error
 
+        cancellation: asyncio.Future[Any] | None = None
+
+        async def cancel_wait() -> None:
+            nonlocal cancellation
+            if cancellation is None:
+                cancellation = asyncio.get_running_loop().run_in_executor(
+                    _FTE_CANCEL_EXECUTOR, self._cancel_fte_control_ref, ref, None
+                )
+            interrupted = False
+            while not cancellation.done():
+                try:
+                    await asyncio.shield(cancellation)
+                except asyncio.CancelledError:
+                    # Keep the single cancellation action owned until it has
+                    # really settled, including repeated caller cancellation.
+                    interrupted = True
+            cancellation.result()
+            if interrupted:
+                raise asyncio.CancelledError
+
         try:
             resolved_timeout_s = configured_ray_get_timeout_s(client_timeout_s)
         except BaseException:
-            self._cancel_fte_control_ref(ref, None)
+            await cancel_wait()
             raise
 
         ref_waiter = asyncio.ensure_future(ref)
@@ -604,47 +629,28 @@ class FteWorkerTaskControlMixin:
                     timeout=resolved_timeout_s,
                 )
                 if not done:
-                    self._cancel_fte_control_ref(ref, None)
+                    await cancel_wait()
                     ref_waiter.cancel()
                     configured_ray_get_timeout_s(None)
                     raise TimeoutError(f"fte_wait_task_status did not complete within {resolved_timeout_s:.3f}s")
                 raw_status = ref_waiter.result()
         except asyncio.CancelledError:
-            self._cancel_fte_control_ref(ref, None)
+            await cancel_wait()
             ref_waiter.cancel()
             raise
         except BaseException as exc:
             restored_error = restore_remote_ray_exception(exc)
             if restored_error is None:
                 raise
+        finally:
+            if not ref_waiter.done():
+                ref_waiter.cancel()
+            await asyncio.gather(ref_waiter, return_exceptions=True)
         if restored_error is not None:
             # Raise outside the handler so Python does not replace a restored
             # remote exception context with the local RayTaskError.
             raise restored_error
 
-        if not isinstance(raw_status, dict):
-            raise TypeError("worker actor fte_wait_task_status must return a dict")
-        return dict(raw_status)
-
-    def fte_wait_task_status_interruptible(
-        self,
-        task_id: str | dict[str, Any],
-        min_version: int | None,
-        timeout_s: float | None,
-        stop_event: Any,
-    ) -> dict[str, Any]:
-        server_timeout_s = None if timeout_s is None else max(0.0, float(timeout_s))
-        client_timeout_s = None
-        if server_timeout_s is not None:
-            client_timeout_s = max(30.0, server_timeout_s + 5.0)
-        raw_status = self._fte_control_rpc(
-            "fte_wait_task_status",
-            task_id,
-            min_version,
-            server_timeout_s,
-            timeout_s=client_timeout_s,
-            cancel_event=stop_event,
-        )
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_wait_task_status must return a dict")
         return dict(raw_status)

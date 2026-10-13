@@ -1,0 +1,2360 @@
+{
+  "measured_on": "2026-10-05",
+  "hardware": {
+    "cpu": "Intel Xeon E5-2686 v4 @ 2.30GHz",
+    "logical_cpus": 36,
+    "memory_kib": 65739000,
+    "filesystem": "ext4"
+  },
+  "scope": "Native C++ core, warm OS cache, synchronous=FULL, three repetitions per profile; no FUSE throughput or cold-cache measurements",
+  "change": "CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload)",
+  "percentile_method": "Sorted pooled samples at floor((n-1)*p); GC also reports all three samples",
+  "before_index": {
+    "started_utc": "2026-10-05T06:20:14.645889+00:00",
+    "platform": "Linux-6.11.0-24-generic-x86_64-with-glibc2.39",
+    "logical_cpus": 36,
+    "binary_sha256": "b05c03f57a6b20bd41845716054859feb608112e4384236f6308aa03d799c42e",
+    "git_head": "3095a34737d991097ed5f9737b89761736678050",
+    "source_sha256": {
+      "CMakeLists.txt": "50ba4d2387e4f5940101c918ebb2811ae220e12f2cfca6bdf5c821233df1af4a",
+      "benchmarks/run.py": "8fd7ff32c1f1598ff68f2f19dc2fae858c4bb429dcf69271f55bef9349b27299",
+      "include/vane_fs/workspace.hpp": "b91ee2c9eca90b69a2cd5f18864e2c9d95c06418821ca5869bc63c143ae30f94",
+      "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "src/fuse.cpp": "ada9bf3a70344e43df87ab1eae7f673e3fb45decddaddd6c11bbeed081927027",
+      "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "src/python.cpp": "777d76650e34feb1be68413125716cee4f2c15dca21355a22a629ce6def9e9cc",
+      "src/workspace.cpp": "02c8de77b48bd2d7bea52317da850191a5e6fe1c2f8e2c2bcd85e6fe61f156ab",
+      "vcpkg.json": "14723a31d36ec981814663fca70a073b1f3d6f7884c63dfdb12717d196025da4"
+    },
+    "cache_policy": "warm OS cache; no cache eviction; synchronous=FULL; WAL autocheckpoint defaults",
+    "finished_utc": "2026-10-05T06:24:18.959110+00:00",
+    "raw_artifacts": {
+      "results.json": {
+        "path_from_component": "build/benchmarks-20261005/results.json",
+        "sha256": "784ee1829d85ebb86396941e3b7d48e968c75747d57f687c5c406241f9431487"
+      },
+      "cleanup.json": {
+        "path_from_component": "build/benchmarks-20261005/cleanup.json",
+        "sha256": "92df28c257d239eabf6046719b3d65aa1ac4c5c45d80e3b925c1a90eb8c737e2"
+      }
+    },
+    "generated_data_removed_bytes": 448352256,
+    "profiles": {
+      "small-1k": {
+        "config": {
+          "depth": 16,
+          "files": 1000,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 1,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.861184,
+            "p95": 27.563721,
+            "min": 2.371744,
+            "max": 65.928173
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.340112,
+            "p95": 0.402698,
+            "min": 0.177476,
+            "max": 0.463235
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.010672,
+            "p95": 3.285699,
+            "min": 2.650793,
+            "max": 32.592344
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.434183,
+            "p95": 2.543751,
+            "min": 2.14634,
+            "max": 32.603996
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.378434,
+            "p95": 2.518385,
+            "min": 2.199511,
+            "max": 2.5618
+          },
+          "gc": {
+            "count": 3,
+            "p50": 198.60797,
+            "p95": 198.60797,
+            "min": 196.420386,
+            "max": 217.254378
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.664135,
+            "p95": 2.825484,
+            "min": 2.41958,
+            "max": 8.096014
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 8.263506,
+            "p95": 13.124965,
+            "min": 6.642004,
+            "max": 13.746594
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 48.1869,
+            "p95": 48.1869,
+            "min": 47.769656,
+            "max": 48.45752
+          },
+          "small_file_create": {
+            "count": 3000,
+            "p50": 3.331205,
+            "p95": 4.274032,
+            "min": 2.342798,
+            "max": 33.800226
+          }
+        },
+        "gc_ms_per_run": [
+          196.420386,
+          198.60797,
+          217.254378
+        ],
+        "sequential_write_mib_s_per_run": [
+          20.75252818,
+          20.63663184,
+          20.93379111
+        ],
+        "parallel_total_ms_per_run": [
+          1334.166154,
+          1332.067137,
+          7432.608657
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              1320,
+              1320,
+              1320
+            ],
+            "block_versions": [
+              1384,
+              1384,
+              1384
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              6963200,
+              6963200,
+              6963200
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1131,
+              1131,
+              1131
+            ],
+            "page_count": [
+              1738,
+              1738,
+              1738
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4185952,
+              4185952,
+              4185952
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              1256,
+              1256,
+              1256
+            ],
+            "block_versions": [
+              1256,
+              1256,
+              1256
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              6709248,
+              6709248,
+              6709248
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "page_count": [
+              1645,
+              1645,
+              1645
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4185952,
+              4185952,
+              4185952
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              1260,
+              1260,
+              1260
+            ],
+            "block_versions": [
+              1260,
+              1260,
+              1260
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              9113600,
+              9113600,
+              9113600
+            ],
+            "dirent_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "free_pages": [
+              645,
+              645,
+              645
+            ],
+            "inode_versions": [
+              1004,
+              1004,
+              1004
+            ],
+            "page_count": [
+              2302,
+              2302,
+              2302
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4185952,
+              4185952,
+              4185952
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              1820,
+              1820,
+              1820
+            ],
+            "block_versions": [
+              1389,
+              1389,
+              1389
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              9113600,
+              9113600,
+              9113600
+            ],
+            "dirent_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1134,
+              1134,
+              1134
+            ],
+            "page_count": [
+              2302,
+              2302,
+              2302
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              4185952,
+              4185952,
+              4185952
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              1256,
+              1256,
+              1256
+            ],
+            "block_versions": [
+              1256,
+              1256,
+              1256
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              6709248,
+              6709248,
+              6709248
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "page_count": [
+              1638,
+              1638,
+              1638
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4185952,
+              4185952,
+              4185952
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      },
+      "small-10k": {
+        "config": {
+          "depth": 16,
+          "files": 10000,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 1,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.75263,
+            "p95": 3.071622,
+            "min": 2.188102,
+            "max": 32.228314
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.362954,
+            "p95": 0.411244,
+            "min": 0.305843,
+            "max": 0.562836
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.097003,
+            "p95": 3.56191,
+            "min": 2.784613,
+            "max": 32.389321
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.493226,
+            "p95": 3.529726,
+            "min": 2.06205,
+            "max": 13.167147
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.422775,
+            "p95": 4.193726,
+            "min": 2.198065,
+            "max": 7.812259
+          },
+          "gc": {
+            "count": 3,
+            "p50": 4537.992513,
+            "p95": 4537.992513,
+            "min": 4361.690419,
+            "max": 5096.26193
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.684111,
+            "p95": 2.825985,
+            "min": 2.428881,
+            "max": 4.455147
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 7.996396,
+            "p95": 10.837787,
+            "min": 5.871081,
+            "max": 11.60669
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 42.625265,
+            "p95": 42.625265,
+            "min": 39.873621,
+            "max": 46.772361
+          },
+          "small_file_create": {
+            "count": 30000,
+            "p50": 3.42398,
+            "p95": 8.263436,
+            "min": 2.347252,
+            "max": 629.337612
+          }
+        },
+        "gc_ms_per_run": [
+          4361.690419,
+          4537.992513,
+          5096.26193
+        ],
+        "sequential_write_mib_s_per_run": [
+          25.07923722,
+          21.38014799,
+          23.4602647
+        ],
+        "parallel_total_ms_per_run": [
+          1319.261009,
+          1326.381183,
+          1437.506853
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              10320,
+              10320,
+              10320
+            ],
+            "block_versions": [
+              10384,
+              10384,
+              10384
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              54935552,
+              54935552,
+              54935552
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10131,
+              10131,
+              10131
+            ],
+            "page_count": [
+              13506,
+              13506,
+              13506
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              10256,
+              10256,
+              10256
+            ],
+            "block_versions": [
+              10256,
+              10256,
+              10256
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              54935552,
+              54935552,
+              54935552
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "page_count": [
+              13415,
+              13415,
+              13415
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              10260,
+              10260,
+              10260
+            ],
+            "block_versions": [
+              10260,
+              10260,
+              10260
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              57532416,
+              57532416,
+              57532416
+            ],
+            "dirent_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "free_pages": [
+              645,
+              645,
+              645
+            ],
+            "inode_versions": [
+              10004,
+              10004,
+              10004
+            ],
+            "page_count": [
+              14071,
+              14071,
+              14071
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              10820,
+              10820,
+              10820
+            ],
+            "block_versions": [
+              10389,
+              10389,
+              10389
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              57532416,
+              57532416,
+              57532416
+            ],
+            "dirent_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10134,
+              10134,
+              10134
+            ],
+            "page_count": [
+              14071,
+              14071,
+              14071
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              10256,
+              10256,
+              10256
+            ],
+            "block_versions": [
+              10256,
+              10256,
+              10256
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              53604352,
+              53604352,
+              53604352
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "page_count": [
+              13408,
+              13408,
+              13408
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      },
+      "large-64mib": {
+        "config": {
+          "depth": 16,
+          "files": 100,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 64,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.802058,
+            "p95": 2.947056,
+            "min": 2.21479,
+            "max": 36.568178
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.344086,
+            "p95": 0.379621,
+            "min": 0.289559,
+            "max": 0.505262
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.143214,
+            "p95": 3.745746,
+            "min": 2.34189,
+            "max": 31.708924
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.434678,
+            "p95": 2.603726,
+            "min": 2.007656,
+            "max": 30.785119
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.486949,
+            "p95": 2.58011,
+            "min": 2.293407,
+            "max": 2.99708
+          },
+          "gc": {
+            "count": 3,
+            "p50": 12404.65463,
+            "p95": 12404.65463,
+            "min": 12221.80477,
+            "max": 12584.29974
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.741729,
+            "p95": 2.955544,
+            "min": 2.561801,
+            "max": 31.294065
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 389.765893,
+            "p95": 436.183818,
+            "min": 373.445152,
+            "max": 439.041335
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 1879.859415,
+            "p95": 1879.859415,
+            "min": 1756.546932,
+            "max": 1889.504979
+          },
+          "small_file_create": {
+            "count": 300,
+            "p50": 3.361182,
+            "p95": 3.698806,
+            "min": 2.557719,
+            "max": 32.144522
+          }
+        },
+        "gc_ms_per_run": [
+          12404.65463,
+          12584.29974,
+          12221.80477
+        ],
+        "sequential_write_mib_s_per_run": [
+          33.87130529,
+          36.43512099,
+          34.04509906
+        ],
+        "parallel_total_ms_per_run": [
+          1346.300478,
+          1324.553521,
+          1329.487476
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              16548,
+              16548,
+              16548
+            ],
+            "block_versions": [
+              16612,
+              16612,
+              16612
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              79933440,
+              79933440,
+              79933440
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              231,
+              231,
+              231
+            ],
+            "page_count": [
+              19550,
+              19550,
+              19550
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              81732592,
+              81732592,
+              81732592
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              16484,
+              16484,
+              16484
+            ],
+            "block_versions": [
+              16484,
+              16484,
+              16484
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              79683584,
+              79683584,
+              79683584
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              103,
+              103,
+              103
+            ],
+            "page_count": [
+              19461,
+              19461,
+              19461
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              81732592,
+              81732592,
+              81732592
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              16488,
+              16488,
+              16488
+            ],
+            "block_versions": [
+              16488,
+              16488,
+              16488
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              82083840,
+              82083840,
+              82083840
+            ],
+            "dirent_versions": [
+              103,
+              103,
+              103
+            ],
+            "free_pages": [
+              644,
+              644,
+              644
+            ],
+            "inode_versions": [
+              104,
+              104,
+              104
+            ],
+            "page_count": [
+              20114,
+              20114,
+              20114
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              81732592,
+              81732592,
+              81732592
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              17048,
+              17048,
+              17048
+            ],
+            "block_versions": [
+              16617,
+              16617,
+              16617
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              82083840,
+              82083840,
+              82083840
+            ],
+            "dirent_versions": [
+              103,
+              103,
+              103
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              234,
+              234,
+              234
+            ],
+            "page_count": [
+              20114,
+              20114,
+              20114
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              81732592,
+              81732592,
+              81732592
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              16484,
+              16484,
+              16484
+            ],
+            "block_versions": [
+              16484,
+              16484,
+              16484
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              79683584,
+              79683584,
+              79683584
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              103,
+              103,
+              103
+            ],
+            "page_count": [
+              19454,
+              19454,
+              19454
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              81732592,
+              81732592,
+              81732592
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      }
+    }
+  },
+  "after_index": {
+    "started_utc": "2026-10-05T06:28:28.119573+00:00",
+    "platform": "Linux-6.11.0-24-generic-x86_64-with-glibc2.39",
+    "logical_cpus": 36,
+    "binary_sha256": "24d06d44a6e597cd04bba29ada2f264d411cf0c944509c8360ad3b2928db626f",
+    "git_head": "3095a34737d991097ed5f9737b89761736678050",
+    "source_sha256": {
+      "CMakeLists.txt": "50ba4d2387e4f5940101c918ebb2811ae220e12f2cfca6bdf5c821233df1af4a",
+      "benchmarks/run.py": "8fd7ff32c1f1598ff68f2f19dc2fae858c4bb429dcf69271f55bef9349b27299",
+      "include/vane_fs/workspace.hpp": "b91ee2c9eca90b69a2cd5f18864e2c9d95c06418821ca5869bc63c143ae30f94",
+      "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "src/fuse.cpp": "ada9bf3a70344e43df87ab1eae7f673e3fb45decddaddd6c11bbeed081927027",
+      "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "src/python.cpp": "777d76650e34feb1be68413125716cee4f2c15dca21355a22a629ce6def9e9cc",
+      "src/workspace.cpp": "f5d0c70dadf0be50a18a905b5662fd4f44914b25709b3149680815077ad6402f",
+      "vcpkg.json": "14723a31d36ec981814663fca70a073b1f3d6f7884c63dfdb12717d196025da4"
+    },
+    "cache_policy": "warm OS cache; no cache eviction; synchronous=FULL; WAL autocheckpoint defaults",
+    "finished_utc": "2026-10-05T06:31:51.409591+00:00",
+    "raw_artifacts": {
+      "results.json": {
+        "path_from_component": "build/benchmarks-20261005-indexed/results.json",
+        "sha256": "5c518fe6ae027f8beb9b87de04aaaeebccd8764644cbb0f9c472c6b25b8ec49a"
+      },
+      "cleanup.json": {
+        "path_from_component": "build/benchmarks-20261005-indexed/cleanup.json",
+        "sha256": "2361d71fe7cbd33b8ee14d133d5fb4c417c8a85f15e5d02afdc75d2904f41738"
+      }
+    },
+    "generated_data_removed_bytes": 452775936,
+    "profiles": {
+      "small-1k": {
+        "config": {
+          "depth": 16,
+          "files": 1000,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 1,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.921925,
+            "p95": 66.062547,
+            "min": 2.174493,
+            "max": 2581.194883
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.345629,
+            "p95": 0.397257,
+            "min": 0.168941,
+            "max": 0.494923
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.236512,
+            "p95": 29.872475,
+            "min": 2.698339,
+            "max": 65.506287
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.439406,
+            "p95": 3.993415,
+            "min": 2.061438,
+            "max": 45.50744
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.455645,
+            "p95": 24.434952,
+            "min": 2.294168,
+            "max": 51.159286
+          },
+          "gc": {
+            "count": 3,
+            "p50": 16.000845,
+            "p95": 16.000845,
+            "min": 15.946196,
+            "max": 16.520618
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.741346,
+            "p95": 20.971573,
+            "min": 2.124559,
+            "max": 39.554917
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 8.041393,
+            "p95": 12.382727,
+            "min": 6.650751,
+            "max": 13.672912
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 55.075842,
+            "p95": 55.075842,
+            "min": 45.156598,
+            "max": 56.616723
+          },
+          "small_file_create": {
+            "count": 3000,
+            "p50": 3.401587,
+            "p95": 5.230404,
+            "min": 2.316478,
+            "max": 40.604721
+          }
+        },
+        "gc_ms_per_run": [
+          15.946196,
+          16.000845,
+          16.520618
+        ],
+        "sequential_write_mib_s_per_run": [
+          17.66262593,
+          18.15678097,
+          22.14515806
+        ],
+        "parallel_total_ms_per_run": [
+          1881.740196,
+          1579.320973,
+          5223.889601
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              1320,
+              1320,
+              1320
+            ],
+            "block_versions": [
+              1384,
+              1384,
+              1384
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              6995968,
+              6995968,
+              6995968
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1131,
+              1131,
+              1131
+            ],
+            "page_count": [
+              1756,
+              1756,
+              1756
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4713312,
+              4713312,
+              4713312
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              1256,
+              1256,
+              1256
+            ],
+            "block_versions": [
+              1256,
+              1256,
+              1256
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              6774784,
+              6774784,
+              6774784
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "page_count": [
+              1661,
+              1661,
+              1661
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4713312,
+              4713312,
+              4713312
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              1260,
+              1260,
+              1260
+            ],
+            "block_versions": [
+              1260,
+              1260,
+              1260
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              9269248,
+              9502720,
+              9330688
+            ],
+            "dirent_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "free_pages": [
+              645,
+              645,
+              645
+            ],
+            "inode_versions": [
+              1004,
+              1004,
+              1004
+            ],
+            "page_count": [
+              2320,
+              2320,
+              2320
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              11400072,
+              9706752,
+              7782712
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              1820,
+              1820,
+              1820
+            ],
+            "block_versions": [
+              1389,
+              1389,
+              1389
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              9269248,
+              9060352,
+              9330688
+            ],
+            "dirent_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1134,
+              1134,
+              1134
+            ],
+            "page_count": [
+              2320,
+              2320,
+              2320
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              11400072,
+              9706752,
+              7782712
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              1256,
+              1256,
+              1256
+            ],
+            "block_versions": [
+              1256,
+              1256,
+              1256
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              6774784,
+              6774784,
+              6774784
+            ],
+            "dirent_versions": [
+              1002,
+              1002,
+              1002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              1003,
+              1003,
+              1003
+            ],
+            "page_count": [
+              1654,
+              1654,
+              1654
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4713312,
+              4713312,
+              4713312
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      },
+      "small-10k": {
+        "config": {
+          "depth": 16,
+          "files": 10000,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 1,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.808704,
+            "p95": 3.093515,
+            "min": 2.080053,
+            "max": 32.124417
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.359621,
+            "p95": 0.402827,
+            "min": 0.231452,
+            "max": 0.568823
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.200679,
+            "p95": 3.572313,
+            "min": 2.872936,
+            "max": 32.645825
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.524536,
+            "p95": 3.085792,
+            "min": 2.117614,
+            "max": 31.152389
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.413978,
+            "p95": 2.526515,
+            "min": 2.251468,
+            "max": 2.653303
+          },
+          "gc": {
+            "count": 3,
+            "p50": 72.133625,
+            "p95": 72.133625,
+            "min": 69.305313,
+            "max": 82.613331
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.670591,
+            "p95": 3.06536,
+            "min": 2.453673,
+            "max": 18.374406
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 7.173654,
+            "p95": 10.342525,
+            "min": 6.1119,
+            "max": 10.432149
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 43.217304,
+            "p95": 43.217304,
+            "min": 42.612287,
+            "max": 44.276004
+          },
+          "small_file_create": {
+            "count": 30000,
+            "p50": 3.413577,
+            "p95": 8.368473,
+            "min": 2.407824,
+            "max": 956.976425
+          }
+        },
+        "gc_ms_per_run": [
+          82.613331,
+          72.133625,
+          69.305313
+        ],
+        "sequential_write_mib_s_per_run": [
+          23.46740976,
+          23.13887974,
+          22.58559738
+        ],
+        "parallel_total_ms_per_run": [
+          1351.042013,
+          1310.476556,
+          1321.514765
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              10320,
+              10320,
+              10320
+            ],
+            "block_versions": [
+              10384,
+              10384,
+              10384
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              55779328,
+              55779328,
+              55779328
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10131,
+              10131,
+              10131
+            ],
+            "page_count": [
+              13636,
+              13636,
+              13636
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              10256,
+              10256,
+              10256
+            ],
+            "block_versions": [
+              10256,
+              10256,
+              10256
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              55459840,
+              55459840,
+              55459840
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "page_count": [
+              13543,
+              13543,
+              13543
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              10260,
+              10260,
+              10260
+            ],
+            "block_versions": [
+              10260,
+              10260,
+              10260
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              58167296,
+              58167296,
+              58167296
+            ],
+            "dirent_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "free_pages": [
+              646,
+              646,
+              646
+            ],
+            "inode_versions": [
+              10004,
+              10004,
+              10004
+            ],
+            "page_count": [
+              14201,
+              14201,
+              14201
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              10820,
+              10820,
+              10820
+            ],
+            "block_versions": [
+              10389,
+              10389,
+              10389
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              57724928,
+              57724928,
+              57724928
+            ],
+            "dirent_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10134,
+              10134,
+              10134
+            ],
+            "page_count": [
+              14201,
+              14201,
+              14201
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              10256,
+              10256,
+              10256
+            ],
+            "block_versions": [
+              10256,
+              10256,
+              10256
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              54116352,
+              54116352,
+              54116352
+            ],
+            "dirent_versions": [
+              10002,
+              10002,
+              10002
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              10003,
+              10003,
+              10003
+            ],
+            "page_count": [
+              13536,
+              13536,
+              13536
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              4218912,
+              4218912,
+              4218912
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      },
+      "large-64mib": {
+        "config": {
+          "depth": 16,
+          "files": 100,
+          "forks": 64,
+          "iterations": 100,
+          "large_mib": 64,
+          "writers": 4
+        },
+        "sqlite": "3.53.2",
+        "compiler": "GNU-13.3.0",
+        "build_type": "Release",
+        "validated_runs": 3,
+        "timings_ms": {
+          "contended_write": {
+            "count": 1200,
+            "p50": 2.819348,
+            "p95": 9.456517,
+            "min": 2.139377,
+            "max": 532.997452
+          },
+          "directory_lookup": {
+            "count": 300,
+            "p50": 0.336392,
+            "p95": 0.408287,
+            "min": 0.169392,
+            "max": 0.541449
+          },
+          "first_write_after_fork": {
+            "count": 192,
+            "p50": 3.179399,
+            "p95": 3.806828,
+            "min": 2.749924,
+            "max": 31.809396
+          },
+          "fork_flat": {
+            "count": 192,
+            "p50": 2.346649,
+            "p95": 2.537321,
+            "min": 2.028508,
+            "max": 9.113302
+          },
+          "fork_nested": {
+            "count": 48,
+            "p50": 2.449743,
+            "p95": 2.592032,
+            "min": 2.187431,
+            "max": 40.277291
+          },
+          "gc": {
+            "count": 3,
+            "p50": 60.212146,
+            "p95": 60.212146,
+            "min": 57.994064,
+            "max": 61.895452
+          },
+          "same_block_write": {
+            "count": 300,
+            "p50": 2.701766,
+            "p95": 3.018287,
+            "min": 2.179185,
+            "max": 31.209999
+          },
+          "sequential_read": {
+            "count": 15,
+            "p50": 423.809335,
+            "p95": 469.548508,
+            "min": 379.757594,
+            "max": 520.192926
+          },
+          "sequential_write": {
+            "count": 3,
+            "p50": 1962.026745,
+            "p95": 1962.026745,
+            "min": 1913.021098,
+            "max": 2052.368443
+          },
+          "small_file_create": {
+            "count": 300,
+            "p50": 3.235939,
+            "p95": 3.662581,
+            "min": 2.543777,
+            "max": 31.360006
+          }
+        },
+        "gc_ms_per_run": [
+          60.212146,
+          57.994064,
+          61.895452
+        ],
+        "sequential_write_mib_s_per_run": [
+          32.61933109,
+          33.45493684,
+          31.18348473
+        ],
+        "parallel_total_ms_per_run": [
+          1486.147759,
+          1418.887079,
+          1487.591651
+        ],
+        "observations_per_run": {
+          "after_first_writes": {
+            "block_payloads": [
+              16548,
+              16548,
+              16548
+            ],
+            "block_versions": [
+              16612,
+              16612,
+              16612
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              80756736,
+              80756736,
+              80756736
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              231,
+              231,
+              231
+            ],
+            "page_count": [
+              19762,
+              19762,
+              19762
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              83030392,
+              83030392,
+              83030392
+            ]
+          },
+          "after_forks": {
+            "block_payloads": [
+              16484,
+              16484,
+              16484
+            ],
+            "block_versions": [
+              16484,
+              16484,
+              16484
+            ],
+            "branches": [
+              65,
+              65,
+              65
+            ],
+            "database_bytes": [
+              80543744,
+              80543744,
+              80543744
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              103,
+              103,
+              103
+            ],
+            "page_count": [
+              19671,
+              19671,
+              19671
+            ],
+            "snapshots": [
+              64,
+              64,
+              64
+            ],
+            "wal_bytes": [
+              83030392,
+              83030392,
+              83030392
+            ]
+          },
+          "after_gc": {
+            "block_payloads": [
+              16488,
+              16488,
+              16488
+            ],
+            "block_versions": [
+              16488,
+              16488,
+              16488
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              83255296,
+              83214336,
+              83214336
+            ],
+            "dirent_versions": [
+              103,
+              103,
+              103
+            ],
+            "free_pages": [
+              645,
+              645,
+              645
+            ],
+            "inode_versions": [
+              104,
+              104,
+              104
+            ],
+            "page_count": [
+              20326,
+              20326,
+              20326
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              83030392,
+              83030392,
+              83030392
+            ]
+          },
+          "before_gc": {
+            "block_payloads": [
+              17048,
+              17048,
+              17048
+            ],
+            "block_versions": [
+              16617,
+              16617,
+              16617
+            ],
+            "branches": [
+              81,
+              81,
+              81
+            ],
+            "database_bytes": [
+              82792448,
+              83214336,
+              83214336
+            ],
+            "dirent_versions": [
+              103,
+              103,
+              103
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              234,
+              234,
+              234
+            ],
+            "page_count": [
+              20326,
+              20326,
+              20326
+            ],
+            "snapshots": [
+              80,
+              80,
+              80
+            ],
+            "wal_bytes": [
+              83030392,
+              83030392,
+              83030392
+            ]
+          },
+          "populated": {
+            "block_payloads": [
+              16484,
+              16484,
+              16484
+            ],
+            "block_versions": [
+              16484,
+              16484,
+              16484
+            ],
+            "branches": [
+              1,
+              1,
+              1
+            ],
+            "database_bytes": [
+              80543744,
+              80543744,
+              80543744
+            ],
+            "dirent_versions": [
+              102,
+              102,
+              102
+            ],
+            "free_pages": [
+              0,
+              0,
+              0
+            ],
+            "inode_versions": [
+              103,
+              103,
+              103
+            ],
+            "page_count": [
+              19664,
+              19664,
+              19664
+            ],
+            "snapshots": [
+              0,
+              0,
+              0
+            ],
+            "wal_bytes": [
+              83030392,
+              83030392,
+              83030392
+            ]
+          }
+        },
+        "collected_per_run": [
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          },
+          {
+            "payloads": 560,
+            "snapshots": 80,
+            "versions": 259
+          }
+        ]
+      }
+    }
+  }
+}

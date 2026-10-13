@@ -787,6 +787,88 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
         _release_corrupted_descriptors(descriptors)
 
 
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("failure", ["invalid_ipc", "truncated_ipc_body"])
+@pytest.mark.timeout(60)
+def test_failed_stream_receiver_does_not_retain_transferred_output(monkeypatch, backend, failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    receive = local._recv_message
+    decode_handler = local._SingleSubprocessExecutor._result_decode_error_handler
+    track_future = local.UDFExecutor._track_task_future
+    decode_started = threading.Event()
+    receiver_failed = threading.Event()
+    descriptors, sockets, futures = [], [], []
+
+    def receive_until_decode_failure(sock):
+        if sockets and sock is sockets[0] and not receiver_failed.is_set():
+            # The consumer retires the producer before the terminal frame.
+            # Retain the resulting Future/error so GC cannot mask a stale
+            # reference to the already-published block in the receiver frame.
+            assert decode_started.wait(10), "consumer did not decode the corrupted block"
+            receiver_failed.set()
+            raise EOFError("injected receiver EOF after deferred decoding failure")
+        message, payload = receive(sock)
+        if message == local._MSG_REF_BUNDLE_CHUNK and not descriptors:
+            descriptor = vane_pickle.loads(payload)
+            descriptors.append(descriptor)
+            sockets.append(sock)
+            _corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch)
+        return message, payload
+
+    def observe_decode_failure(worker):
+        handler = decode_handler(worker)
+        assert handler is not None
+
+        def failed(error):
+            decode_started.set()
+            handler(error)
+
+        return failed
+
+    def retain_future(executor, future, *args, **kwargs):
+        futures.append(future)
+        return track_future(executor, future, *args, **kwargs)
+
+    monkeypatch.setattr(local, "_recv_message", receive_until_decode_failure)
+    monkeypatch.setattr(local._SingleSubprocessExecutor, "_result_decode_error_handler", observe_decode_failure)
+    monkeypatch.setattr(local.UDFExecutor, "_track_task_future", retain_future)
+    try:
+        with vane.connect(config={"threads": 2}) as connection:
+            runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 4))
+
+            def query():
+                return connection.sql("SELECT 1::BIGINT AS x").map_batches(
+                    _Actor if backend == "subprocess_actor" else _task,
+                    schema={"pid": "BIGINT"},
+                    execution_backend=backend,
+                    **({"actor_number": 1} if backend == "subprocess_actor" else {}),
+                )
+
+            with pytest.raises(Exception):
+                query().fetchall()
+            assert decode_started.is_set() and receiver_failed.is_set()
+            assert len(descriptors) == len(futures) == 1
+            assert futures[0].done()
+            error = futures[0].exception()
+            assert error is not None
+            assert error.__traceback__ is not None
+            snapshot = runtime.resource_snapshot()
+            outcomes = {key: value for key, value in snapshot["worker_failures"].items() if value}
+            outcomes.pop("shutdown_workers", None)
+            assert outcomes == {"worker_losses": 1}
+            assert snapshot["request_admission"]["active_requests"] == 0
+            assert snapshot["request_admission"]["failed_executions"] == 1
+            # Neither the retained Future nor its error may own consumed data.
+            with pytest.raises(ValueError):
+                ref_bundle.acquire_allocation(descriptors[0]["block_refs"][0]["allocation"])
+            assert query().fetchall()[0][0] > 0
+            assert runtime.resource_snapshot()["worker_failures"]["worker_losses"] == 1
+    finally:
+        _release_corrupted_descriptors(descriptors)
+
+
 @pytest.mark.parametrize("failure", ["invalid_ipc", "metadata_ipc_size"])
 @pytest.mark.parametrize("track_data", [False, True])
 def test_native_invalid_result_replaces_registered_model_worker(monkeypatch, failure, track_data):

@@ -224,6 +224,10 @@ public:
 		return GetFileSystem().ListSubSystems();
 	}
 
+	bool CanHandleFile(const string &path) override {
+		return GetFileSystem().CanHandleFile(path);
+	}
+
 protected:
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
 	                                        optional_ptr<FileOpener> opener = nullptr) override {

@@ -931,6 +931,31 @@ def test_list_files_accepts_literal_glob_directory(duckdb_cursor, tmp_path, lite
     assert vane.list_files(str(empty_directory), connection=duckdb_cursor).fetchall() == []
 
 
+def test_list_files_can_disable_glob_expansion(duckdb_cursor, tmp_path):
+    literal = tmp_path / "clips[1]"
+    neighbor = tmp_path / "clips1"
+    literal.mkdir()
+    neighbor.mkdir()
+    (literal / "nested").mkdir()
+    child = literal / "part[1].txt"
+    child.write_text("literal")
+    nested = literal / "nested" / "other.txt"
+    nested.write_text("nested")
+    (neighbor / "missing.txt").write_text("wrong root")
+    (literal / "part2.txt").write_text("must not match part[2].txt")
+    query = "SELECT url FROM list_files(?, glob => false) ORDER BY url"
+    assert duckdb_cursor.execute(query, [[str(child)]]).fetchall() == [(str(child),)]
+    assert duckdb_cursor.execute(query, [str(literal)]).fetchall() == [(str(literal / "part2.txt"),), (str(child),)]
+    for missing in (literal / "missing.txt", literal / "part[2].txt"):
+        with pytest.raises(vane.IOException, match="does not exist"):
+            duckdb_cursor.execute(query, [str(missing)]).fetchall()
+    assert duckdb_cursor.execute(
+        "SELECT url FROM list_files(?, recursive => true, glob => false) ORDER BY url", [str(literal)]
+    ).fetchall() == sorted([(str(child),), (str(literal / "part2.txt"),), (str(nested),)])
+    with pytest.raises(vane.BinderException, match="glob cannot be NULL"):
+        duckdb_cursor.execute("SELECT * FROM list_files(?, glob => NULL)", [str(literal)])
+
+
 def test_list_files_treats_ipv6_authority_as_literal(duckdb_cursor, tmp_path):
     class IPv6HTTPServer(http.server.ThreadingHTTPServer):
         address_family = socket.AF_INET6

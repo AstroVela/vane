@@ -1632,6 +1632,9 @@ static py::list CaptureAttachedDatabaseSnapshot(DuckDBPyConnection &conn_wrapper
 		}
 
 		auto &catalog = database->GetCatalog();
+		if (!catalog.RequiresAttachmentForPlanDeserialization()) {
+			continue;
+		}
 		auto options = database->GetAttachOptions();
 		options["type"] = Value(catalog.GetCatalogType());
 		if (database->IsReadOnly()) {

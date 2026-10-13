@@ -20,6 +20,9 @@ namespace duckdb {
 
 struct StreamingUDFState;
 
+// Deterministically drain an event on another thread before its publisher resumes.
+vector<idx_t> TestStreamingOutputCapacityPublication();
+
 class PhysicalStreamingUDF : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::STREAMING_UDF;

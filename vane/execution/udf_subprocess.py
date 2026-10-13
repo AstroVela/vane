@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
+from vane.execution._subprocess_error import capture_cleanup, decode_error, native_result_error
 from vane.execution._udf_runtime import _bounded_close_error
 from vane.execution.local_resource_graph import LocalResourceUnitContext
 from vane.execution.ref_bundle import (
@@ -92,6 +93,7 @@ from vane.execution.udf_lifecycle import (
 from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
 from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
+from vane.execution.udf_process_group import WorkerProcessGroup
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_shm_store import ParentShmPeer
 from vane.execution.udf_threading import (
@@ -460,6 +462,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._finished_submitting = False
         self._closed = False
         self._cleanup_finished = False
+        self._owner_pid = os.getpid()
+        self._process_group: WorkerProcessGroup | None = None
         self._broken_error: str | None = None
         self._actor_lost = False
         self._worker_lifecycle = WorkerLifecycle()
@@ -504,6 +508,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._payload_shm,
             self._data_shm,
             self._shm_peer,
+            self._process_group,
         )
 
     def _start_worker(
@@ -556,11 +561,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 cmd,
                 pass_fds=(child_fd, shm_fd),
                 close_fds=True,
+                start_new_session=True,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=None if _subprocess_debug_enabled() else subprocess.DEVNULL,
             )
+            self._process_group = WorkerProcessGroup(self._proc.pid)
             child_sock.close()
             self._startup_child_sock = None
             self._shm_peer.child_sock.close()
@@ -570,8 +577,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 timeout_s=_subprocess_control_timeout_s(),
             )
             if msg_type == _MSG_ERROR:
-                self._mark_broken(payload_data.decode("utf-8", errors="replace"))
-                raise RuntimeError(self._broken_error)
+                message, diagnostic = decode_error(payload_data)
+                self._mark_reported_error(message, diagnostic=diagnostic, graceful_close=False)
+                raise diagnostic
             self._raise_if_startup_cancelled()
 
             # The worker has loaded the payload. The parent no longer needs this shm.
@@ -874,14 +882,17 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._broken_error = error
         self.close(kill=not graceful_close)
 
-    def _mark_reported_error(self, error: str) -> None:
+    def _mark_reported_error(
+        self, error: str, *, diagnostic: BaseException | None = None, graceful_close: bool = True
+    ) -> None:
         self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
         try:
-            self._mark_broken(error, graceful_close=True)
+            self._mark_broken(error, graceful_close=graceful_close)
         except BaseException as cleanup_error:
-            raise RuntimeError(
-                f"{error}; graceful broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
-            ) from cleanup_error
+            message = f"{error}; graceful broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
+            if diagnostic is not None:
+                raise capture_cleanup(message, diagnostic, cleanup_error) from None
+            raise RuntimeError(message) from cleanup_error
 
     def _mark_broken_after_cleanup_failure(self, error: BaseException) -> str:
         try:
@@ -1306,9 +1317,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     raise RuntimeError(error) from cleanup_error
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
-                error = payload.decode("utf-8", errors="replace")
-                self._mark_reported_error(error)
-                raise RuntimeError(error)
+                message, diagnostic = decode_error(payload)
+                self._mark_reported_error(message, diagnostic=diagnostic)
+                raise diagnostic
             if msg_type == _MSG_TASK_CANCELLED:
                 error = payload.decode("utf-8", errors="replace") or "UDF subprocess task cancelled"
                 scope = self._current_execution_scope()
@@ -1382,6 +1393,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         _release_local_ref_bundle_result(result)
                         self._mark_broken("UDF output stream receiver failed", actor_lost=True)
                         raise
+                    finally:
+                        # Ownership moved to the receiver. A later terminal
+                        # error must not retain this block in its traceback.
+                        result = None
                     msg_type = None
                     continue
                 return result
@@ -1583,9 +1598,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._mark_broken(f"UDF subprocess finished_submitting failed: {exc}", actor_lost=True)
             raise RuntimeError(self._broken_error) from exc
         if msg_type == _MSG_ERROR:
-            error = payload.decode("utf-8", errors="replace")
-            self._mark_reported_error(error)
-            raise RuntimeError(error)
+            message, diagnostic = decode_error(payload)
+            self._mark_reported_error(message, diagnostic=diagnostic)
+            raise diagnostic
         self._finished_submitting = True
 
     def all_tasks_finished(self) -> bool:
@@ -1626,6 +1641,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         cancel_requested = getattr(self, "_startup_cancel_requested", None)
         if cancel_requested is not None:
             cancel_requested.set()
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            try:
+                process_group.capture()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
@@ -1653,6 +1674,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError(f"UDF subprocess startup cancellation failed: {details}") from cleanup_errors[0]
 
     def close(self, kill: bool = False) -> None:
+        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
+            return
         close_lock = getattr(self, "_close_lock", None)
         if close_lock is None:
             close_lock = threading.Lock()
@@ -1696,6 +1719,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         proc = self._proc
         sock = self._sock
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            # Capture before asking the engine/worker to exit; escaped engine
+            # descendants remain owned even after they are reparented.
+            process_group.capture()
         shutdown_error: BaseException | None = None
         graceful_error: BaseException | None = None
         finalizer_cleanup_failed = False
@@ -1709,9 +1737,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     sock.settimeout(remaining)
                 msg_type, payload = _recv_message(sock)
                 if msg_type == _MSG_ERROR:
-                    graceful_error = RuntimeError(
-                        "UDF subprocess graceful shutdown failed: " + payload.decode("utf-8", errors="replace")
-                    )
+                    _, graceful_error = decode_error(payload, prefix="UDF subprocess graceful shutdown failed: ")
                 elif msg_type != _MSG_ACK:
                     graceful_error = RuntimeError(
                         f"UDF subprocess graceful shutdown returned unexpected message type {msg_type:#x}"
@@ -1747,6 +1773,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 if shutdown_error is None:
                     shutdown_error = exc
 
+        if process_group is not None:
+            try:
+                process_group.close(_subprocess_control_timeout_s())
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._process_group = None
+
         if sock is not None:
             try:
                 sock.close()
@@ -1775,7 +1809,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._proc = proc
         else:
             self._proc = None
-        if self._proc is None and self._shm_peer is not None:
+        if self._proc is None and getattr(self, "_process_group", None) is None and self._shm_peer is not None:
             try:
                 self._shm_peer.close_after_exit()
             except BaseException as exc:
@@ -1802,7 +1836,15 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             and not active_output_grants
             and all(
                 getattr(self, attribute, None) is None
-                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm", "_shm_peer")
+                for attribute in (
+                    "_proc",
+                    "_sock",
+                    "_startup_child_sock",
+                    "_payload_shm",
+                    "_data_shm",
+                    "_shm_peer",
+                    "_process_group",
+                )
             )
         )
         finalizer = getattr(self, "_finalizer", None)
@@ -1819,7 +1861,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             cleanup_errors.append(graceful_error)
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
-            raise RuntimeError(f"UDF subprocess close failed: {details}") from cleanup_errors[0]
+            raise capture_cleanup(f"UDF subprocess close failed: {details}", *cleanup_errors) from cleanup_errors[0]
 
     def __del__(self) -> None:
         try:
@@ -3663,7 +3705,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         )
         self._closed = False
         self._cleanup_finished = False
-        self._request_cleanup_pending = False
+        self._close_cleanup_pending = False
         self._finished_submitting = False
         self._wakeup: Callable[[], None] | None = None
         self._workers: list[_SingleSubprocessExecutor] = []
@@ -3961,8 +4003,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 try:
                     self._complete_task_submit(submit_id, done, cleanup_error=cleanup_error)
                 finally:
-                    if unit_task is not None:
-                        unit_task.finish()
+                    try:
+                        if unit_task is not None:
+                            unit_task.finish()
+                    finally:
+                        # Future.done() only covers backend execution. Retain
+                        # this owner through input, admission, scope and activity
+                        # cleanup before allowing close() to release its pool.
+                        with self._pending_lock:
+                            self._pending_batches = max(0, self._pending_batches - 1)
+                        with self._task_futures_cv:
+                            self._task_futures.discard(done)
+                            self._task_future_meta.pop(done, None)
+                            self._task_futures_cv.notify_all()
+                        self._notify_wakeup()
 
         future.add_done_callback(complete_task)
 
@@ -4059,7 +4113,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     ) -> None:
         item: Any | None = None
         result: Any | None = None
-        failed = False
+        error: BaseException | None = None
         debug_meta: (
             tuple[
                 int | None,
@@ -4080,10 +4134,14 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._record_output_budget_result(result)
             item = self._submit_result_item(submit_id, result)
         except BaseException as exc:
-            failed = True
+            error = exc
+            if cleanup_error is not None and cleanup_error is not exc:
+                message = (
+                    f"{_bounded_close_error(error)}; UDF input cleanup failed: {_bounded_close_error(cleanup_error)}"
+                )
+                error = capture_cleanup(message, error, cleanup_error)
             _release_local_ref_bundle_result(result)
             result = None
-            item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
         finally:
             with self._task_futures_lock:
                 debug_meta = self._task_future_meta.get(future)
@@ -4098,10 +4156,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         # Reservation cleanup is part of this task's result,
                         # just like task_scope.finish(). Poisoning wakeups can
                         # skip result consumption and strand its pool slot.
-                        if not failed:
+                        if error is None:
                             _release_local_ref_bundle_result(result)
                             result = None
-                            item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
+                            error = exc
+                        else:
+                            message = f"{_bounded_close_error(error)}; UDF execution cleanup failed: {_bounded_close_error(exc)}"
+                            error = capture_cleanup(message, error, exc)
                 try:
                     if _should_debug_submit(debug_seq):
                         _subprocess_debug_log(
@@ -4111,6 +4172,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         )
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
+            if error is not None:
+                # Capture every completion failure after both cleanup stages,
+                # before native result consumption discards exception types.
+                item = self._submit_result_item(submit_id, native_result_error(error))
             if item is not None:
                 with self._queue_lock:
                     if self._closed:
@@ -4128,15 +4193,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     admission.release()
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
-            with self._pending_lock:
-                self._pending_batches = max(0, self._pending_batches - 1)
-            with self._task_futures_cv:
-                self._task_futures.discard(future)
-                self._task_future_meta.pop(future, None)
-                self._task_futures_cv.notify_all()
             if scope is not None:
                 self._retire_execution_scope(scope)
-            self._notify_wakeup()
 
     def _submit_async(
         self,
@@ -4682,6 +4740,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         cancelled_scopes, wait_cleanup_errors = self._cancel_local_shm_waits()
         cleanup_errors.extend(wait_cleanup_errors)
         close_kill = bool(kill)
+        callbacks_finished = False
         if close_kill:
             actor_pool = self._actor_pool
             if actor_pool is not None:
@@ -4700,7 +4759,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             except BaseException as exc:
                 cleanup_errors.append(exc)
         else:
-            if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
+            callbacks_finished = self._wait_for_pending_futures(_subprocess_shutdown_grace_s())
+            if not callbacks_finished:
                 close_kill = True
                 actor_pool = self._actor_pool
                 if actor_pool is not None:
@@ -4720,21 +4780,19 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     cleanup_errors.append(exc)
                 _, escalation_cleanup_errors = self._cancel_local_shm_waits()
                 cleanup_errors.extend(escalation_cleanup_errors)
-        cancellation = getattr(self, "_request_cancellation", None)
-        if cancellation is not None or getattr(self, "_executor_cleanup", None) is not None:
-            # Worker termination can precede its future's transport cleanup or
-            # model replacement. Keep the request's owners until callbacks have
-            # run; a timeout leaves query cleanup retained for an explicit retry.
-            grace = 0.0 if self._request_cleanup_pending else _subprocess_shutdown_grace_s()
+        if not callbacks_finished:
+            # Worker termination can precede its future's completion cleanup.
+            # Standalone and query-bound executors retain the same ownership:
+            # closing a worker does not yet return its task admission.
+            grace = 0.0 if getattr(self, "_close_cleanup_pending", False) else _subprocess_shutdown_grace_s()
             if not self._wait_for_pending_futures(grace):
-                self._request_cleanup_pending = True
-                cleanup_errors.append(TimeoutError("request still has pending UDF cleanup"))
-                # Keep pool references as well as futures until callbacks have
-                # released outputs and physical slots. Native shutdown may
-                # discard its executor; the request cleanup scope retains it.
+                self._close_cleanup_pending = True
+                cleanup_errors.append(TimeoutError("executor still has pending UDF cleanup"))
+                # Retain futures and pool references for a later close retry.
+                # Waiting is per executor, so shared-pool peers can continue.
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]
-            self._request_cleanup_pending = False
+        self._close_cleanup_pending = False
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None
@@ -4783,7 +4841,12 @@ def _cleanup_subprocess_executor(
     payload_shm: shared_memory.SharedMemory | None,
     data_shm: shared_memory.SharedMemory | None,
     shm_peer: ParentShmPeer | None = None,
+    process_group: WorkerProcessGroup | None = None,
 ) -> None:
+    if process_group is not None:
+        if process_group.owner_pid != os.getpid():
+            return
+        process_group.capture()
     if sock is not None:
         try:
             if proc is not None and proc.poll() is None:
@@ -4803,6 +4866,8 @@ def _cleanup_subprocess_executor(
             proc.wait(timeout=_subprocess_control_timeout_s())
         except Exception:
             pass
+    if process_group is not None:
+        process_group.close(_subprocess_control_timeout_s())
     for shm in (payload_shm, data_shm):
         if shm is None:
             continue

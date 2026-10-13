@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+    from vane.ai._errors import DiagnosticError
+
 
 _ARROW_DATASET_PRELOAD_LOCK = threading.Lock()
 _ARROW_DATASET_PRELOADED: bool = False
@@ -207,7 +209,21 @@ def _record_copy_cleanup_errors(
         return False
     warnings = [f"{stage} failed: {_copy_error_detail(error)}" for error in cleanup_errors]
     primary_error.add_cleanup_warnings(*warnings)
+    primary_error.capture_diagnostics(cleanup_errors=tuple(cleanup_errors))
     return True
+
+
+def _local_write_diagnostic(primary_error: BaseException, cleanup_errors: list[BaseException]) -> DiagnosticError:
+    from vane.ai._errors import DiagnosticError
+
+    if not cleanup_errors:
+        return DiagnosticError("Local write execution", primary_error)
+    # Snapshot actual exception objects after cleanup. Warning strings and
+    # exception notes are debugging text, not trusted diagnostic transport.
+    failure = RuntimeError("Local write cleanup failed")
+    failure.__cause__ = primary_error
+    failure.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+    return DiagnosticError("Local write execution and cleanup", failure)
 
 
 def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[BaseException]:
@@ -428,6 +444,12 @@ class _InProcessFragmentExecutor:
         self._in_flight = 0
         self._closing = False
         self._closed = False
+        self._diagnostic: DiagnosticError | None = None
+
+    @property
+    def diagnostic(self) -> DiagnosticError | None:
+        with self._resources_lock:
+            return self._diagnostic
 
     @property
     def close_timeout_s(self) -> float:
@@ -595,19 +617,32 @@ class _InProcessFragmentExecutor:
                 except Exception:
                     pass
                 raise RuntimeError("local fragment executor is closing")
-            return self._get_plan_runner().execute_native(
-                cursor,
-                execution_plan,
-                scan_split_batch_map or None,
-                exchange_source_task_map or None,
-                _copy_output_info_from_context(context),
-                request_payload.get("exchange_sink_instance"),
-                request_payload.get("fte_scan_source_queues"),
-                request_payload.get("fte_exchange_source_queues"),
-                request_payload.get("dynamic_filter_domains"),
-                request_payload.get("native_progress_callback"),
-                {"task_id": str(task_attempt_id)},
-            )
+            plan_runner = self._get_plan_runner()
+            try:
+                return plan_runner.execute_native(
+                    cursor,
+                    execution_plan,
+                    scan_split_batch_map or None,
+                    exchange_source_task_map or None,
+                    _copy_output_info_from_context(context),
+                    request_payload.get("exchange_sink_instance"),
+                    request_payload.get("fte_scan_source_queues"),
+                    request_payload.get("fte_exchange_source_queues"),
+                    request_payload.get("dynamic_filter_domains"),
+                    request_payload.get("native_progress_callback"),
+                    {"task_id": str(task_attempt_id)},
+                )
+            except (RuntimeError, ValueError) as error:
+                from vane.ai._errors import _native_query_diagnostic
+
+                # Native FTE later stringifies/truncates fragment failures. Keep
+                # the first typed diagnostic on this query's executor beforehand.
+                diagnostic = _native_query_diagnostic(error)
+                if diagnostic is not None:
+                    with self._resources_lock:
+                        if self._diagnostic is None:
+                            self._diagnostic = diagnostic
+                raise
         finally:
             try:
                 # Operator state can retain cursor-owned resources. Destroy
@@ -681,6 +716,8 @@ class LocalRunner(Runner):
         future = None
         cancellation_future = None
         cancellation_deadline = None
+        cancellation_errors: list[BaseException] = []
+        finalization_errors: list[BaseException] = []
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -747,7 +784,6 @@ class LocalRunner(Runner):
             except (vane.InterruptException, KeyboardInterrupt) as interruption:
                 if future is None:
                     raise
-                cancellation_errors = []
                 try:
                     fragment_executor.request_shutdown()
                 except BaseException as error:
@@ -824,6 +860,7 @@ class LocalRunner(Runner):
                     try:
                         renderer.finish(final_state="FINISHED" if write_succeeded else None)
                     except Exception as error:
+                        _append_local_cleanup_error(finalization_errors, error)
                         if (
                             not _record_copy_cleanup_errors(
                                 primary_error,
@@ -838,6 +875,7 @@ class LocalRunner(Runner):
                     execution_owner = cancellation_future if cancellation_future is not None else future
                     write_executor.shutdown(wait=execution_owner is None or execution_owner.done(), cancel_futures=True)
                 except Exception as error:
+                    _append_local_cleanup_error(finalization_errors, error)
                     if (
                         not _record_copy_cleanup_errors(
                             primary_error,
@@ -853,11 +891,13 @@ class LocalRunner(Runner):
                     raise progress_error
         except BaseException as error:
             if write_succeeded and not isinstance(error, CopyResultUnavailableError):
-                raise CopyResultUnavailableError(
+                unavailable = CopyResultUnavailableError(
                     query_id,
                     f"local write result handling failed after commit: {_copy_error_detail(error)}",
                     tuple(result["copy_cleanup_warnings"]),
-                ) from error
+                )
+                unavailable.capture_diagnostics(primary_error=error, cleanup_errors=tuple(finalization_errors))
+                raise unavailable from error
             raise
         finally:
             primary_error = sys.exc_info()[1]
@@ -885,13 +925,26 @@ class LocalRunner(Runner):
                 "local write resource shutdown",
                 cleanup_errors,
             )
+            if isinstance(primary_error, (CopyOutcomeUnknownError, CopyResultUnavailableError)):
+                primary_error.capture_diagnostics(
+                    primary_error=fragment_executor.diagnostic
+                    or (primary_error.__cause__ if primary_error.primary_error is None else None),
+                    cleanup_errors=tuple(cancellation_errors),
+                )
+            elif isinstance(primary_error, Exception) and not isinstance(primary_error, vane.InterruptException):
+                diagnostic = fragment_executor.diagnostic
+                all_cleanup_errors = [*finalization_errors, *cancellation_errors, *cleanup_errors]
+                if diagnostic is not None or all_cleanup_errors:
+                    raise _local_write_diagnostic(diagnostic or primary_error, all_cleanup_errors) from None
             if write_succeeded and primary_error is None and cleanup_errors:
                 details = "; ".join(_copy_error_detail(error) for error in cleanup_errors)
-                raise CopyResultUnavailableError(
+                unavailable = CopyResultUnavailableError(
                     query_id,
                     f"failed to shut down local write resources: {details}",
                     tuple(result["copy_cleanup_warnings"]),
-                ) from cleanup_errors[0]
+                )
+                unavailable.capture_diagnostics(cleanup_errors=tuple(cleanup_errors))
+                raise unavailable from cleanup_errors[0]
 
     def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
         """Execute one DataSink attempt with the local FTE backend."""
@@ -913,6 +966,7 @@ class LocalRunner(Runner):
         renderer = None
         result: dict[str, Any] | None = None
         progress_diagnostics: list[tuple[str, BaseException]] = []
+        finalization_errors: list[BaseException] = []
         write_future: Any | None = None
 
         def append_warning(stage: str, error: BaseException) -> None:
@@ -981,6 +1035,7 @@ class LocalRunner(Runner):
                     backend,
                     fragment_executor,
                 ):
+                    _append_local_cleanup_error(finalization_errors, shutdown_error)
                     if result is not None:
                         append_warning(stage, shutdown_error)
                     elif primary_error is not None:
@@ -999,6 +1054,7 @@ class LocalRunner(Runner):
                     try:
                         renderer.finish(final_state="FINISHED" if result is not None else None)
                     except BaseException as progress_error:
+                        _append_local_cleanup_error(finalization_errors, progress_error)
                         if result is not None:
                             append_warning("DataSink progress finalization", progress_error)
                         elif primary_error is not None:
@@ -1029,12 +1085,31 @@ class LocalRunner(Runner):
                 "DataSink local resource shutdown",
                 cleanup_errors,
             )
+            all_cleanup_errors = [
+                *(error for _, error in progress_diagnostics),
+                *finalization_errors,
+                *cleanup_errors,
+            ]
             if result is not None:
                 for cleanup_warning in cleanup_warnings:
                     _append_datasink_cleanup_warning(result, cleanup_warning)
+                from vane.ai._errors import _capture_native_datasink_diagnostic
+
+                _capture_native_datasink_diagnostic(result, diagnostic=fragment_executor.diagnostic)
+                if (
+                    result.get("outcome_unknown") is True or result.get("outcome_aborted") is True
+                ) and all_cleanup_errors:
+                    result["outcome_diagnostic"] = _local_write_diagnostic(
+                        result.get("outcome_diagnostic") or RuntimeError("DataSink execution failed"),
+                        all_cleanup_errors,
+                    )
             elif primary_error is not None:
                 for cleanup_warning in cleanup_warnings:
                     _add_exception_note(primary_error, cleanup_warning)
+                if isinstance(primary_error, Exception) and not isinstance(primary_error, vane.InterruptException):
+                    diagnostic = fragment_executor.diagnostic
+                    if diagnostic is not None or all_cleanup_errors:
+                        raise _local_write_diagnostic(diagnostic or primary_error, all_cleanup_errors) from None
             elif cleanup_errors:
                 details = "; ".join(cleanup_warnings)
                 raise RuntimeError(f"failed to shut down local DataSink resources: {details}") from cleanup_errors[0]

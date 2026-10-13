@@ -40,6 +40,7 @@
 #include "duckdb.hpp"
 #include "duckdb/execution/distributed/utils/stream.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 
 namespace py = pybind11;
 
@@ -1175,6 +1176,8 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
 	m.def("_wake_udf_executor_slots_for_testing", &WakeUDFExecutorSlotsForTesting);
+	m.def("_test_streaming_output_capacity_publication", &TestStreamingOutputCapacityPublication,
+	      py::call_guard<py::gil_scoped_release>());
 	m.def("_pause_udf_dispatcher_wait_for_testing", &PauseUDFDispatcherWaitForTesting);
 	try {
 		py::module_::import("atexit").attr("register")(m.attr("_shutdown_udf_executor_dispatcher"));
