@@ -15,6 +15,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/aggregate/wide_integer.hpp"
+#include "duckdb/function/aggregate/wide_interval.hpp"
 
 namespace duckdb {
 
@@ -47,6 +48,37 @@ struct IntervalAvgState {
 	void Combine(const IntervalAvgState &other) {
 		this->count += other.count;
 		this->value = AddOperator::Operation<interval_t, interval_t, interval_t>(this->value, other.value);
+	}
+};
+
+// A signed 128-bit sum holds uint64_t rows of every native interval component.
+// Partial states must retain these sums, not finalized interval subtotals.
+struct WideIntervalAvgState {
+	uint64_t count;
+	hugeint_t months, days, micros;
+
+	void Initialize() {
+		count = 0;
+		months = days = micros = 0;
+	}
+	void AddCount(uint64_t increment) {
+		if (increment > NumericLimits<uint64_t>::Maximum() - count) {
+			throw OutOfRangeException("Overflow in wide interval average row count");
+		}
+		count += increment;
+	}
+	void Add(const interval_t &value, uint64_t increment) {
+		AddCount(increment);
+		const hugeint_t n(0, increment);
+		months += hugeint_t(value.months) * n;
+		days += hugeint_t(value.days) * n;
+		micros += hugeint_t(value.micros) * n;
+	}
+	void Combine(const WideIntervalAvgState &other) {
+		AddCount(other.count);
+		months += other.months;
+		days += other.days;
+		micros += other.micros;
 	}
 };
 
@@ -171,15 +203,16 @@ struct WideIntegerAverageOperation : public WideIntegerOperation {
 	}
 };
 
-void HugeintAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+void NarrowAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
 	serializer.WriteProperty(1, "wide_accumulator", false);
 }
 
-void WideIntegerAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
+void WideAvgSerialize(Serializer &serializer, const optional_ptr<FunctionData>, const AggregateFunction &) {
 	serializer.WriteProperty(1, "wide_accumulator", true);
 }
 
 unique_ptr<FunctionData> HugeintAvgDeserialize(Deserializer &deserializer, AggregateFunction &function);
+unique_ptr<FunctionData> IntervalAvgDeserialize(Deserializer &deserializer, AggregateFunction &function);
 
 struct NumericAverageOperation : public BaseSumOperation<AverageSetOperation, RegularAdd> {
 	template <class T, class STATE>
@@ -242,6 +275,54 @@ struct IntervalAverageOperation : public BaseSumOperation<AverageSetOperation, I
 	}
 };
 
+struct WideIntervalAverageOperation {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.Initialize();
+	}
+	template <class STATE, class OP>
+	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
+		target.Combine(source);
+	}
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void Operation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &) {
+		state.Add(value, 1);
+	}
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void ConstantOperation(STATE &state, const INPUT_TYPE &value, AggregateUnaryInput &, idx_t count) {
+		state.Add(value, count);
+	}
+	static bool IgnoreNull() {
+		return true;
+	}
+	template <class RESULT_TYPE, class STATE>
+	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
+		if (state.count == 0) {
+			finalize_data.ReturnNull();
+			return;
+		}
+		const hugeint_t count(0, state.count);
+		auto months = state.months / count;
+		auto days = state.days / count;
+		auto micros = state.micros / count;
+		auto months_remainder = state.months % count;
+		auto days_remainder = state.days % count;
+		auto micros_remainder = state.micros % count;
+		// Match native IntervalAverageOperation's borrowing and rounding, with
+		// wide intermediate arithmetic and checked conversion only at the end.
+		months_remainder *= Interval::DAYS_PER_MONTH;
+		days += months_remainder / count;
+		days_remainder += months_remainder % count;
+		days_remainder *= Interval::MICROS_PER_DAY;
+		micros_remainder += days_remainder / count;
+		micros += micros_remainder;
+		if (!Hugeint::TryCast(months, target.months) || !Hugeint::TryCast(days, target.days) ||
+		    !Hugeint::TryCast(micros, target.micros)) {
+			throw OutOfRangeException("Overflow in interval average finalization");
+		}
+	}
+};
+
 struct TimeTZAverageOperation : public BaseSumOperation<AverageSetOperation, AddToHugeint> {
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &aggr_unary) {
@@ -289,13 +370,17 @@ AggregateFunction GetAverageAggregate(PhysicalType type) {
 		auto function =
 		    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, hugeint_t, double, HugeintAverageOperation>(
 		        LogicalType::HUGEINT, LogicalType::DOUBLE);
-		function.SetSerializeCallback(HugeintAvgSerialize);
+		function.SetSerializeCallback(NarrowAvgSerialize);
 		function.SetDeserializeCallback(HugeintAvgDeserialize);
 		return function;
 	}
 	case PhysicalType::INTERVAL: {
-		return AggregateFunction::UnaryAggregate<IntervalAvgState, interval_t, interval_t, IntervalAverageOperation>(
-		    LogicalType::INTERVAL, LogicalType::INTERVAL);
+		auto function =
+		    AggregateFunction::UnaryAggregate<IntervalAvgState, interval_t, interval_t, IntervalAverageOperation>(
+		        LogicalType::INTERVAL, LogicalType::INTERVAL);
+		function.SetSerializeCallback(NarrowAvgSerialize);
+		function.SetDeserializeCallback(IntervalAvgDeserialize);
+		return function;
 	}
 	default:
 		throw InternalException("Unimplemented average aggregate");
@@ -325,6 +410,20 @@ unique_ptr<FunctionData> HugeintAvgDeserialize(Deserializer &deserializer, Aggre
 	return DecimalAverageBindData(arguments[0]);
 }
 
+unique_ptr<FunctionData> IntervalAvgDeserialize(Deserializer &deserializer, AggregateFunction &function) {
+	const auto wide = deserializer.ReadProperty<bool>(1, "wide_accumulator");
+	auto name = function.name;
+	auto original_arguments = function.original_arguments;
+	if (function.arguments.size() != 1 || function.arguments[0] != LogicalType::INTERVAL ||
+	    deserializer.Get<const LogicalType &>() != LogicalType::INTERVAL) {
+		throw SerializationException("invalid wide interval average signature");
+	}
+	function = wide ? WideIntervalAvgFunction() : GetAverageAggregate(PhysicalType::INTERVAL);
+	function.name = std::move(name);
+	function.original_arguments = std::move(original_arguments);
+	return nullptr;
+}
+
 unique_ptr<FunctionData> BindDecimalAvg(ClientContext &context, AggregateFunction &function,
                                         vector<unique_ptr<Expression>> &arguments) {
 	auto decimal_type = arguments[0]->return_type;
@@ -343,8 +442,19 @@ AggregateFunction WideIntegerAvgFunction(const LogicalType &input_type) {
 	    input_type, LogicalType::DOUBLE);
 	function.name = "avg";
 	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-	function.SetSerializeCallback(WideIntegerAvgSerialize);
+	function.SetSerializeCallback(WideAvgSerialize);
 	function.SetDeserializeCallback(HugeintAvgDeserialize);
+	return function;
+}
+
+AggregateFunction WideIntervalAvgFunction() {
+	auto function =
+	    AggregateFunction::UnaryAggregate<WideIntervalAvgState, interval_t, interval_t, WideIntervalAverageOperation>(
+	        LogicalType::INTERVAL, LogicalType::INTERVAL);
+	function.name = "avg";
+	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	function.SetSerializeCallback(WideAvgSerialize);
+	function.SetDeserializeCallback(IntervalAvgDeserialize);
 	return function;
 }
 
@@ -354,7 +464,7 @@ AggregateFunctionSet AvgFun::GetFunctions() {
 	auto decimal =
 	    AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr, nullptr, nullptr,
 	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr, BindDecimalAvg);
-	decimal.SetSerializeCallback(HugeintAvgSerialize);
+	decimal.SetSerializeCallback(NarrowAvgSerialize);
 	decimal.SetDeserializeCallback(HugeintAvgDeserialize);
 	avg.AddFunction(decimal);
 	avg.AddFunction(GetAverageAggregate(PhysicalType::INT16));

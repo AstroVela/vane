@@ -95,6 +95,7 @@ public:
 	DirectWrite TryWrite(const string &producer, idx_t sequence, DataChunk &input, const vector<idx_t> &rows,
 	                     idx_t offset, idx_t count, ExchangeWakeup wakeup = {});
 	idx_t FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_t offset) const;
+	idx_t FrameSize(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count) const;
 	idx_t LastSequence(const string &producer) const;
 	DirectProducerStatus ProducerStatus(const string &producer) const;
 	bool ProducerDrained(const string &producer) const;

@@ -35,8 +35,15 @@ def _demand(resources: Any, contexts: int, links: int, staging_per_link: int) ->
 def pipelined_demand(resources: Any, index: int, tasks: list[str], routes: list[dict[str, Any]]) -> dict[str, int]:
     from vane._native import execution_runtime as native
 
-    links = sum((r["source_worker"] == index) + (r["target_worker"] == index) for r in routes)
-    return _demand(resources, len(tasks), links, native.DirectFlight.staging_per_link(resources.exchange.frame_bytes))
+    links = sum(
+        (r["source_worker"] == index) + (r["target_worker"] == index)
+        for r in routes
+        if r["source_worker"] != r["target_worker"]
+    )
+    local = sum(r["source_worker"] == r["target_worker"] == index for r in routes)
+    demand = _demand(resources, len(tasks), links, native.DirectFlight.staging_per_link(resources.exchange.frame_bytes))
+    demand["exchange"] += local * resources.exchange.window_bytes
+    return demand
 
 
 def materialized_demand(resources: Any, binding: Any) -> dict[str, int]:

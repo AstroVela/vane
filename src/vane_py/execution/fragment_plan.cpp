@@ -4,6 +4,7 @@
 #include "fragment_plan.hpp"
 #include "file_snapshot.hpp"
 #include "exchange_types.hpp"
+#include "parquet_split.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
@@ -15,6 +16,9 @@
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/aggregate/wide_integer.hpp"
+#include "duckdb/function/aggregate/wide_interval.hpp"
+#include "duckdb/function/scalar/generic_common.hpp"
+#include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -117,7 +121,8 @@ void ReadIdentity(Deserializer &deserializer, const string &kind) {
 } // namespace
 
 string EngineIdentity() {
-	return string(DuckDB::SourceID()) + ":fragment:" + VANE_FRAGMENT_BUILD_ID;
+	// Exported aggregate states require the same native ABI as well as code.
+	return string(DuckDB::SourceID()) + ":" + DuckDB::Platform() + ":fragment:" + VANE_FRAGMENT_BUILD_ID;
 }
 
 string SerializeSchema(const vector<LogicalType> &types) {
@@ -312,7 +317,8 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 	    expression, [&](ParsedExpression &child) { CheckParsedExpression(context, child); });
 }
 
-SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data);
+SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data,
+                         ClientContext *context = nullptr, idx_t partitions = 1);
 
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
@@ -456,14 +462,18 @@ string EncodeFile(const OpenFileInfo &file) {
 	});
 }
 
-SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data) {
+SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bind_data, ClientContext *context,
+                         idx_t partitions) {
 	SourceSpec source;
 	source.source_id = id;
 	source.function_name = name;
 	source.capability = PARQUET_CAPABILITY;
 	source.codec = PARQUET_CODEC;
 	source.requires_snapshot = true;
-	for (auto &file : ParquetBind(bind_data).file_list->GetAllFiles()) {
+	auto &bind = ParquetBind(bind_data);
+	auto files =
+	    context && partitions > 1 ? PlanParquetRowGroups(*context, bind, partitions) : bind.file_list->GetAllFiles();
+	for (auto &file : files) {
 		DistributedScanSplit split;
 		split.split_id = "file" + std::to_string(source.splits.size());
 		split.payload = EncodeFile(file);
@@ -502,7 +512,7 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 		source.source_id = source_id;
 		source.function_name = scan.function.name;
 		if (IsParquetScan(scan.function.name)) {
-			source = ParquetSource(source_id, scan.function.name, scan.bind_data.get());
+			source = ParquetSource(source_id, scan.function.name, scan.bind_data.get(), &context, partitions);
 			auto &bind = ParquetBind(scan.bind_data.get());
 			// Copy drops cached coordinator readers; workers receive files only
 			// through their explicit assignments, never by re-expanding a glob.
@@ -740,19 +750,6 @@ private:
 		Wrap(projection, child);
 		return columns;
 	}
-	unique_ptr<Expression> BindAggregate(const string &name, vector<unique_ptr<Expression>> children,
-	                                     unique_ptr<Expression> filter = nullptr) {
-		auto &entry = Catalog::GetEntry<AggregateFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, name);
-		CheckFunctionOrigin(entry);
-		FunctionBinder binder(context);
-		ErrorData error;
-		auto index = binder.BindFunction(name, entry.functions, children, error);
-		if (!index.IsValid()) {
-			error.Throw();
-		}
-		return binder.BindAggregateFunction(entry.functions.GetFunctionByOffset(index.GetIndex()), std::move(children),
-		                                    std::move(filter));
-	}
 	PhysicalOperator &MakeAggregate(vector<unique_ptr<Expression>> groups, vector<unique_ptr<Expression>> aggregates) {
 		vector<LogicalType> types;
 		for (auto &group : groups) {
@@ -783,23 +780,21 @@ private:
 			    name != "avg" && name != "min" && name != "max" && !internal_rewrite) {
 				throw NotImplementedException("unsupported distributed aggregate %s", name);
 			}
-			split = split && !aggregate.IsDistinct() && !aggregate.order_bys && !internal_rewrite;
+			split = split && !aggregate.IsDistinct() && !aggregate.order_bys && !internal_rewrite &&
+			        aggregate.function.HasStateCombineCallback() &&
+			        (!aggregate.function.HasBindCallback() || name == "sum_no_overflow") &&
+			        !aggregate.function.HasStateDestructorCallback();
 			// MIN/MAX(x, n) return the n extreme values as a list. Applying
 			// unary MIN/MAX to partial lists compares whole lists, not elements.
 			if ((name == "min" || name == "max") && aggregate.children.size() != 1) {
 				split = false;
 			}
-			// A DECIMAL SUM accumulator uses the full signed 128-bit domain. A
-			// partition's subtotal can exceed DECIMAL(38,s) even when cancellation
-			// across partitions leaves a valid final result. Exchange original rows
-			// and finalize complete groups instead of transporting that subtotal as
-			// a SQL DECIMAL value with insufficient precision. HUGEINT input can
-			// also overflow a partition accumulator despite a valid complete sum.
-			// Check the input type, so ordinary BIGINT SUM can still be split.
+			// Export private state, not a finalized SQL subtotal. 128-bit inputs
+			// need the wide accumulator on both sides of the exchange: a partition
+			// may exceed the SQL range even when the final group fits.
 			if ((name == "sum" || name == "sum_no_overflow") &&
 			    (aggregate.return_type.id() == LogicalTypeId::DECIMAL ||
 			     aggregate.children[0]->return_type.id() == LogicalTypeId::HUGEINT)) {
-				split = false;
 				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
 					// Whole-group input can still arrive with all positive values
 					// first. Widen the private state and check range at finalization.
@@ -807,16 +802,16 @@ private:
 					wide_aggregate = true;
 				}
 			}
-			// Native integer/decimal AVG divides an exact accumulator in long
-			// double; a scalar DOUBLE SUM/COUNT would round too early. Temporal
-			// AVG also has native rounding rules. Keep complete groups for those
-			// overloads instead of approximating their finalization.
+			// AVG merges its native sum/count state and finalizes once, preserving
+			// decimal scaling and temporal rounding instead of dividing DOUBLEs.
 			if (name == "avg" && (aggregate.return_type != LogicalType::DOUBLE ||
 			                      (aggregate.children[0]->return_type.id() != LogicalTypeId::FLOAT &&
 			                       aggregate.children[0]->return_type.id() != LogicalTypeId::DOUBLE))) {
-				split = false;
 				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
 					aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
+				} else if (aggregate.children[0]->return_type.id() == LogicalTypeId::INTERVAL) {
+					aggregate.function = WideIntervalAvgFunction();
 					wide_aggregate = true;
 				}
 			}
@@ -848,38 +843,14 @@ private:
 			final_groups.push_back(make_uniq<BoundReferenceExpression>(groups[i]->return_type, i));
 			output.push_back(make_uniq<BoundReferenceExpression>(groups[i]->return_type, i));
 		}
-		auto add = [&](unique_ptr<Expression> partial, const string &merge) -> unique_ptr<Expression> {
-			vector<unique_ptr<Expression>> input;
-			input.push_back(make_uniq<BoundReferenceExpression>(partial->return_type, groups.size() + partials.size()));
-			partials.push_back(std::move(partial));
-			auto final = BindAggregate(merge, std::move(input));
-			auto reference = make_uniq<BoundReferenceExpression>(final->return_type, groups.size() + finals.size());
-			finals.push_back(std::move(final));
-			return std::move(reference);
-		};
 		for (auto &expression : aggregates) {
 			auto &aggregate = expression->Cast<BoundAggregateExpression>();
-			auto name = aggregate.function.name;
-			unique_ptr<Expression> result;
-			if (name == "avg") {
-				auto sum = add(BindAggregate("sum", Copy(aggregate.children),
-				                             aggregate.filter ? aggregate.filter->Copy() : nullptr),
-				               "sum");
-				auto count = add(BindAggregate("count", Copy(aggregate.children),
-				                               aggregate.filter ? aggregate.filter->Copy() : nullptr),
-				                 "sum");
-				vector<unique_ptr<Expression>> args;
-				args.push_back(BoundCastExpression::AddCastToType(context, std::move(sum), LogicalType::DOUBLE));
-				args.push_back(BoundCastExpression::AddCastToType(context, std::move(count), LogicalType::DOUBLE));
-				ErrorData error;
-				result = FunctionBinder(context).BindScalarFunction(DEFAULT_SCHEMA, "/", std::move(args), error);
-				if (!result) {
-					error.Throw();
-				}
-			} else {
-				result = add(aggregate.Copy(), name == "min" || name == "max" ? name : "sum");
-			}
-			output.push_back(BoundCastExpression::AddCastToType(context, std::move(result), aggregate.return_type));
+			auto partial =
+			    ExportAggregateFunction::Bind(unique_ptr_cast<Expression, BoundAggregateExpression>(aggregate.Copy()));
+			auto column = groups.size() + partials.size();
+			finals.push_back(distributed::BindMergeAggregate(aggregate, partial->return_type, column));
+			partials.push_back(std::move(partial));
+			output.push_back(make_uniq<BoundReferenceExpression>(aggregate.return_type, column));
 		}
 		auto &partial = MakeAggregate(Copy(groups), std::move(partials));
 		Wrap(partial, child);
@@ -1043,6 +1014,7 @@ void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, 
 			}
 			file.extended_info->options["vane_snapshot_sha256"] = Value(found->second.sha256);
 			file.extended_info->options["vane_snapshot_bytes"] = Value::UBIGINT(found->second.bytes);
+			file.extended_info->options["vane_snapshot_identity"] = Value(found->second.identity);
 			split.payload = EncodeFile(file);
 		}
 		source.codec = FROZEN_PARQUET_CODEC;
@@ -1359,34 +1331,10 @@ void SetConnectionSetting(ClientContext &context, const string &name, const Valu
 	}
 }
 
-string FileStamp(ClientContext &context, const OpenFileInfo &file) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.IsPathAbsolute(file.path)) {
-		throw NotImplementedException("submission file sources require absolute local paths");
-	}
-	auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
-	if (!handle->file_system.IsLocalFileSystem()) {
-		throw NotImplementedException("submission file sources require regular local files visible to workers");
-	}
-	auto stats = handle->Stats();
-	if (stats.file_type != FileType::FILE_TYPE_REGULAR) {
-		throw NotImplementedException("submission file sources require regular local files visible to workers");
-	}
-	// timestamp_t retains microseconds; the native nanosecond fraction preserves
-	// the remaining precision from the same file-handle stat operation.
-	auto fraction = stats.extended_file_info.find("mtime_nsec");
-	if (fraction == stats.extended_file_info.end()) {
-		throw NotImplementedException("submission file sources require precise local modification times");
-	}
-	auto mtime_nsec = fraction->second.GetValue<int64_t>();
-	if (mtime_nsec < 0 || mtime_nsec >= 1000000000) {
-		throw IOException("invalid local file modification time fraction");
-	}
+string FileStamp(const OpenFileInfo &file, const string &identity) {
 	return Encode([&](Serializer &serializer) {
 		serializer.WriteProperty(1, "path", file.path);
-		serializer.WriteProperty(2, "size", stats.file_size);
-		serializer.WriteProperty(3, "mtime", stats.last_modification_time.value);
-		serializer.WriteProperty(4, "mtime_nsec", mtime_nsec);
+		serializer.WriteProperty(2, "identity", identity);
 	});
 }
 
@@ -1438,19 +1386,18 @@ string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool
 			for (auto &split : source.splits) {
 				auto file = DecodeFile(split.payload);
 				if (!file.extended_info || !file.extended_info->options.count("vane_snapshot_sha256") ||
-				    !file.extended_info->options.count("vane_snapshot_bytes")) {
+				    !file.extended_info->options.count("vane_snapshot_bytes") ||
+				    !file.extended_info->options.count("vane_snapshot_identity")) {
 					throw SerializationException("frozen source has no content identity");
 				}
 				auto &options = file.extended_info->options;
-				auto stamp = FileStamp(context, file);
-				auto hash = FileFingerprint(context, file);
-				auto handle = FileSystem::GetFileSystem(context).OpenFile(file, FileFlags::FILE_FLAGS_READ);
-				if (hash != options.at("vane_snapshot_sha256").GetValue<string>() ||
-				    idx_t(handle->GetFileSize()) != options.at("vane_snapshot_bytes").GetValue<idx_t>()) {
+				auto identity = FileIdentity(context, file);
+				if (identity != options.at("vane_snapshot_identity").GetValue<string>()) {
 					throw InvalidInputException("immutable FTE source snapshot changed");
 				}
 				if (stamped_files.insert(file.path).second) {
-					versions.push_back(stamp + hash);
+					versions.push_back(FileStamp(file, identity) +
+					                   options.at("vane_snapshot_sha256").GetValue<string>());
 				}
 			}
 			return;
@@ -1463,7 +1410,7 @@ string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool
 			for (auto &split : source.splits) {
 				auto file = DecodeFile(split.payload);
 				if (stamped_files.insert(file.path).second) {
-					versions.push_back(FileStamp(context, file));
+					versions.push_back(FileStamp(file, FileIdentity(context, file)));
 				}
 			}
 		}

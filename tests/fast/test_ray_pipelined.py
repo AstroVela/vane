@@ -96,7 +96,7 @@ def test_process_loss_after_partial_delivery(victim):
 
 
 def test_group_capacity_failure_rolls_back_before_start():
-    with vane.Runtime(resources(io_concurrency=2)) as application, application.connect() as connection:
+    with vane.Runtime(resources(io_concurrency=1)) as application, application.connect() as connection:
         with pytest.raises(Exception, match="capacity"):
             connection.query("select range from range(20)")
         assert len(connection.query_runtime.pool.workers) == 2

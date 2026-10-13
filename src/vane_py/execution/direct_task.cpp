@@ -11,6 +11,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 
 #include <set>
+#include <chrono>
 
 namespace duckdb {
 namespace vane_execution {
@@ -120,6 +121,20 @@ void ObserveBuilds(PhysicalOperator &op, DirectTaskProgress &progress) {
 
 class DirectSinkLocal : public LocalSinkState {
 public:
+	using Clock = std::chrono::steady_clock;
+	Clock::time_point next_flush = Clock::now() + std::chrono::milliseconds(10);
+	struct Buffer {
+		unique_ptr<ColumnDataCollection> data;
+		idx_t bytes = 0;
+		idx_t Count() const {
+			return data ? data->Count() : 0;
+		}
+		void Reset() {
+			data.reset();
+			bytes = 0;
+		}
+	};
+	vector<vector<Buffer>> buffers;
 	bool initialized = false;
 	idx_t output = 0;
 	idx_t channel = 0;
@@ -153,7 +168,63 @@ public:
 		return make_uniq<DirectSinkGlobal>(context);
 	}
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &) const override {
-		return make_uniq<DirectSinkLocal>();
+		auto state = make_uniq<DirectSinkLocal>();
+		state->buffers.resize(outputs.size());
+		for (idx_t i = 0; i < outputs.size(); i++) {
+			state->buffers[i].resize(outputs[i].channels.size());
+		}
+		return std::move(state);
+	}
+	bool Flush(DirectSinkLocal::Buffer &buffer, const DirectOutput &output, DirectChannel &channel,
+	           const InterruptState &interrupt) const {
+		if (!buffer.Count()) {
+			return true;
+		}
+		if (!channel.HasConsumers()) {
+			buffer.Reset();
+			return true;
+		}
+		ColumnDataScanState scan;
+		DataChunk chunk;
+		buffer.data->InitializeScan(scan);
+		buffer.data->InitializeScanChunk(chunk);
+		buffer.data->Scan(scan, chunk);
+		D_ASSERT(chunk.size() == buffer.Count());
+		vector<idx_t> rows;
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			rows.push_back(row);
+		}
+		auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk, rows, 0,
+		                               rows.size(), Wakeup(interrupt));
+		if (result == DirectWrite::BLOCKED) {
+			progress->output_blocked.store(true);
+			return false;
+		}
+		buffer.Reset();
+		return true;
+	}
+	SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &input, bool force) const override {
+		if (!inputs.empty()) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		auto now = DirectSinkLocal::Clock::now();
+		if (!force && now < state.next_flush) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		progress->output_blocked.store(false);
+		bool live = false;
+		for (idx_t out = 0; out < outputs.size(); out++) {
+			for (idx_t target = 0; target < outputs[out].channels.size(); target++) {
+				auto &channel = *outputs[out].channels[target];
+				live = channel.HasConsumers() || live;
+				if (!Flush(state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
+					return SinkResultType::BLOCKED;
+				}
+			}
+		}
+		state.next_flush = now + std::chrono::milliseconds(10);
+		return live ? SinkResultType::NEED_MORE_INPUT : SinkResultType::FINISHED;
 	}
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
 		progress->output_blocked.store(false);
@@ -165,6 +236,11 @@ public:
 			}
 		}
 		if (!live) {
+			for (auto &out : state.buffers) {
+				for (auto &buffer : out) {
+					buffer.Reset();
+				}
+			}
 			state.ResetBatchInput();
 			return SinkResultType::FINISHED;
 		}
@@ -193,14 +269,51 @@ public:
 			auto &output = outputs[state.output];
 			for (; state.channel < output.channels.size(); state.channel++, state.offset = 0) {
 				auto &channel = *output.channels[state.channel];
+				auto &buffer = state.buffers[state.output][state.channel];
 				auto &rows = state.selections[state.output][state.channel];
 				while (state.offset < rows.size()) {
 					// Closed targets discard their remaining rows before sizing a
 					// frame. HasConsumers still reports a sticky channel error.
 					if (!channel.HasConsumers()) {
+						buffer.Reset();
 						break;
 					}
+					if (buffer.Count() == channel.limits.frame_rows &&
+					    !Flush(buffer, output, channel, input.interrupt_state)) {
+						return SinkResultType::BLOCKED;
+					}
 					auto count = channel.FrameRows(chunk, rows, state.offset);
+					count = MinValue<idx_t>(count, channel.limits.frame_rows - buffer.Count());
+					auto bytes = channel.FrameSize(chunk, rows, state.offset, count);
+					if (buffer.Count() && bytes > channel.limits.frame_bytes - buffer.bytes) {
+						if (!Flush(buffer, output, channel, input.interrupt_state)) {
+							return SinkResultType::BLOCKED;
+						}
+						continue;
+					}
+					// Forward input-driven tasks immediately. Local scans coalesce
+					// until the frame fills or their periodic pipeline flush fires,
+					// including when later scan batches are entirely filtered out.
+					if (inputs.empty() && (buffer.Count() || (count < channel.limits.frame_rows &&
+					                                          count == rows.size() - state.offset))) {
+						if (!buffer.data) {
+							// The bounded coalescer is an operator allocation charged
+							// to DuckDB's buffer pool, separately from channel credit.
+							buffer.data = make_uniq<ColumnDataCollection>(BufferAllocator::Get(context.client), types);
+						}
+						SelectionVector selection(count);
+						for (idx_t i = 0; i < count; i++) {
+							selection.set_index(i, rows[state.offset + i]);
+						}
+						DataChunk selected;
+						selected.InitializeEmpty(types);
+						selected.Reference(chunk);
+						selected.Slice(selection, count);
+						buffer.data->Append(selected);
+						buffer.bytes += bytes;
+						state.offset += count;
+						continue;
+					}
 					auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk,
 					                               rows, state.offset, count, Wakeup(input.interrupt_state));
 					if (result == DirectWrite::BLOCKED) {
@@ -212,12 +325,29 @@ public:
 					}
 					state.offset += count;
 				}
+				if ((buffer.Count() == channel.limits.frame_rows || buffer.bytes == channel.limits.frame_bytes) &&
+				    !Flush(buffer, output, channel, input.interrupt_state)) {
+					return SinkResultType::BLOCKED;
+				}
 			}
 		}
-		// The executor owns the input batch while BLOCKED; only row offsets are
-		// retained here. Resume cannot replay any accepted frame or target.
+		// The executor owns the input batch while BLOCKED. Copied rows belong to
+		// the bounded coalescer; resume never replays an accepted row or target.
 		state.ResetBatchInput();
 		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkCombineResultType Combine(ExecutionContext &, OperatorSinkCombineInput &input) const override {
+		progress->output_blocked.store(false);
+		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		for (idx_t out = 0; out < outputs.size(); out++) {
+			for (idx_t channel = 0; channel < outputs[out].channels.size(); channel++) {
+				if (!Flush(state.buffers[out][channel], outputs[out], *outputs[out].channels[channel],
+				           input.interrupt_state)) {
+					return SinkCombineResultType::BLOCKED;
+				}
+			}
+		}
+		return SinkCombineResultType::FINISHED;
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &) const override {
 		progress->output_blocked.store(false);

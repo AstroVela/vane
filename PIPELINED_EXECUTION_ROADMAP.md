@@ -2,6 +2,32 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
+## 当前增量：SF10 执行吞吐
+
+针对单文件 SF10 Q1/Q6 暴露的明细交换、小帧、重复全文哈希和空闲 worker：
+
+- [x] COUNT/SUM/AVG 使用原生可合并状态，HUGEINT/宽 DECIMAL 保留 192-bit 累加器与最终范围检查。
+- [x] DirectCollector 有界拼批；同 worker 共用 channel，扣除多余网络 staging；有进展时持续 pump。
+- [x] 文件复制时一次计算哈希，后续通过文件身份与精确 mtime/ctime 验证冻结版本。
+- [x] Parquet 按 row group 分片，保留重复引用、Hive 和 file_row_number。
+- [x] 连续两轮静态审查通过后增量构建，完成相关原生/交换/快照/Ray 回归。
+- [x] 同 CPU/内存配置重跑 SF10 Q1/Q6，校验完整结果并记录交换行数、帧数、提交耗时和资源清理；FTE Q1 的对象预留调整见下表。
+
+设计与边界见[大文件与交换吞吐](PIPELINED_EXECUTION_DESIGN.md#大文件与交换吞吐)。2026-10-12 验证：相关非 Ray 1,209 项、真实 Ray 85 项通过；23 项因缺少可选依赖 fsspec 跳过。完成非 editable Release 安装、格式、ruff、mypy 和许可证检查；未运行全量 fast/release。
+
+单机 SF10 单次对比，耗时从 `query()` 到读取全部结果并关闭；local 4 threads/4 GiB，Ray 2 workers × 2 CPUs/每 worker 2 GiB、2 partitions。OS 缓存未清空，本次每个计时查询创建新的 Runtime，不作为正式 TPC-H 成绩。
+
+| 查询 | local 本次 | pipelined 优化前 → 本次 | FTE 优化前 → 本次 |
+| --- | ---: | ---: | ---: |
+| Q1 | 2.13 s | 87.53 → 2.92 s | 300 s 执行期限超时 → 21.77 s* |
+| Q6 | 0.84 s | 25.44 → 2.71 s | 231.54 → 21.14 s |
+
+Q1 pipelined 沿用基线成功重试的 256 MiB staging，其他查询仍为 128 MiB。*FTE Q1 原配置先报容量不足：新计划的 7 个输出对象各预留 6 GiB，超过 30 GiB 查询总额度；成功复测只将单对象上限降为 1 GiB，查询/存储总额度、CPU 和内存均保持不变。这项配置差异不能计作完全相同配置的速度比较。
+
+全部成功查询与 local 的 schema、完整结果一致。单独诊断确认 Q1 source 交换从 59,142,609 条明细降为 8 条状态（4 帧），Q6 从 1,139,264 条明细/29,291 帧降为 2 条状态/2 帧；两个 worker 均有实际 source 输出。lineitem 的 489 个 row group 分为 29,982,720 与 30,003,332 行。所有成功及失败尝试的查询、结果、worker 配额和快照目录均已清理。
+
+FTE 的提交阶段仍约 19–20 s，后续性能工作应单独评估不可变数据版本/快照复用，以及按实际封存大小收紧物化对象预留。此次没有引入跨查询快照缓存。原始计时、计数器及关闭快照保存在本 checkout 的 `build/tpch-sf10-performance-20261011/`；测试与静态 review 记录为 `build/execution-performance-*.log/json/txt`。
+
 P0 原开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292，已通过 PR #935 合入 integration/pipelined-execution。P1.1 已通过 PR #943 合入同一集成分支，提交为 9f956003ae。P1.2 已通过 PR #944 合入同一集成分支，提交为 31191cae217d。P2 通过 PR #962 合入同一集成分支，提交为 68b5407a4ca4。P3 从此提交切出 feat/materialized-exchange，完成物化 I/O、不可变文件输入、恢复调度及公开 FTE 结果，已通过 PR #963 合入 a69e60ca43d9。P4 已通过 PR #970 合入 integration/pipelined-execution，提交为 5d41a675e6。P5.1 从该提交切出 refactor/execution-cutover。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
 
 ## 实施规则

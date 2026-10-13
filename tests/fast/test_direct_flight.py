@@ -89,6 +89,56 @@ def test_receiver_close_unblocks_full_window(pair):
     assert receiver.active_links == 0
 
 
+@pytest.mark.parametrize("reject_close", [False, True])
+def test_receiver_close_fences_data_cancellation_before_control_reply(reject_close):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    close_requested, reply_allowed = threading.Event(), threading.Event()
+    schema = pa.schema([("c0", pa.int64())])
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            def batches():
+                assert close_requested.wait(10)
+                raise flight.FlightCancelledError("direct consumer closed")
+                yield  # Keep the cancellation behind the schema handshake.
+
+            return flight.GeneratorStream(schema, batches())
+
+        def do_action(self, context, action):
+            if action.type == "vane.direct.close":
+                close_requested.set()
+                assert reply_allowed.wait(10)
+                if reject_close:
+                    raise flight.FlightInternalError("source failure at close")
+                yield flight.Result(b"closed")
+            else:
+                yield flight.Result(b"running")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection)
+    sender, receiver = Sender(("127.0.0.1", 0)), service()
+    try:
+        receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "close-probe", target, "producer", 20)
+        eventually(lambda: receiver.ready, bool)
+        target.close_consumer("consumer")
+        assert close_requested.wait(5)
+        eventually(lambda: receiver.ready, lambda ready: not ready)
+        # The data RPC has been canceled while the close reply is still held.
+        # Stopping an unused input must not turn that cancellation into failure.
+        assert not target.snapshot()["error"]
+        reply_allowed.set()
+        if reject_close:
+            error = eventually(lambda: target.snapshot()["error"], bool)
+            assert "source failure at close" in error
+    finally:
+        reply_allowed.set()
+        close_requested.set()
+        receiver.close()
+        sender.shutdown()
+
+
 def test_lost_server_is_failure(pair):
     sender, receiver, source, target = pair
     sender.close()

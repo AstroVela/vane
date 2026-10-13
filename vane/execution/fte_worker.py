@@ -179,14 +179,15 @@ class MaterializedAttempt:
     def _run(self) -> None:
         try:
             while not self.stop.is_set():
-                self.service.pump(1)
+                progressed = self.service.pump(1)
                 status = self.status()
                 if status["error"]:
                     self.cancel(status["error"])
                     return
                 if status["sealed"]:
                     return
-                self.stop.wait(0.002)
+                if not progressed:
+                    self.stop.wait(0.002)
         except BaseException as error:
             self.cancel(str(error))
 

@@ -319,7 +319,10 @@ AggregateFunction MakeExportAggregateFunction(const BoundAggregateExpression &ch
 	if (!bound_function.HasStateCombineCallback()) {
 		throw BinderException("Cannot use EXPORT_STATE for non-combinable function %s", bound_function.name);
 	}
-	if (bound_function.HasBindCallback()) {
+	// SUM_NO_OVERFLOW is already bound by the optimizer. Its binder only
+	// rejects direct SQL calls; the native accumulator is fixed-size and has
+	// no binding-dependent update/combine state.
+	if (bound_function.HasBindCallback() && bound_function.name != "sum_no_overflow") {
 		throw BinderException("Cannot use EXPORT_STATE on aggregate functions with custom binders");
 	}
 	if (bound_function.HasStateDestructorCallback()) {

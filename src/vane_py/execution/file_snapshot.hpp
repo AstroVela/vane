@@ -13,13 +13,15 @@ struct FrozenFile {
 	string path;
 	idx_t bytes;
 	string sha256;
+	string identity;
 };
 
 // Copy before binding/optimization. Files remain owned by the query store,
 // including partial copies on failure, until its cleanup succeeds.
 string FrozenFilePath(ClientContext &context, const string &source, const string &directory);
 FrozenFile FreezeFile(ClientContext &context, const string &source, const string &destination, idx_t remaining);
-string FileFingerprint(ClientContext &context, const OpenFileInfo &source);
+// Stable across reads, sensitive to rewrites (even restored mtime) and replacement.
+string FileIdentity(ClientContext &context, const OpenFileInfo &source);
 
 // Open-description locks, not POSIX process-associated record locks: closing
 // another lease in the same process must not unlock this owner's reservation.

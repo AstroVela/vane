@@ -143,6 +143,11 @@ private:
 
 enum class AggregateSplitStrategy { SingleStage, PartialFinal };
 
+// Merge an exported, fixed-size aggregate state using the original native
+// combine/finalize functions, including its bound parameters and private codec.
+DUCKDB_API unique_ptr<BoundAggregateExpression> BindMergeAggregate(const BoundAggregateExpression &aggregate,
+                                                                   const LogicalType &state_type, idx_t column);
+
 /// A valid aggregate can require complete input rows instead of exported states.
 /// Invalid expressions and failures while constructing a split remain errors.
 struct GroupByAggSplit {

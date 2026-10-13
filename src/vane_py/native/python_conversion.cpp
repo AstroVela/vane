@@ -636,6 +636,9 @@ struct PythonValueConversion {
 		case LogicalTypeId::BLOB:
 			result = Value::BLOB(blob, blob_size);
 			break;
+		case LogicalTypeId::AGGREGATE_STATE:
+			result = Value::AGGREGATE_STATE(target_type, blob, blob_size);
+			break;
 		case LogicalTypeId::BIT:
 			result = Value::BIT(string(const_char_ptr_cast(blob), blob_size));
 			break;
@@ -933,6 +936,7 @@ struct PythonVectorConversion {
 		auto &result_type = result.GetType();
 		switch (result_type.id()) {
 		case LogicalTypeId::BLOB:
+		case LogicalTypeId::AGGREGATE_STATE:
 			FlatVector::GetData<string_t>(result)[result_offset] =
 			    StringVector::AddStringOrBlob(result, const_char_ptr_cast(blob), blob_size);
 			break;

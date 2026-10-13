@@ -67,7 +67,8 @@ def test_frozen_files_and_pruned_dependencies_ignore_original_changes(tmp_path, 
 
 
 @pytest.mark.parametrize("predicate", ["", " where value > 10"])
-def test_frozen_content_digest_detects_damage_with_unchanged_stat(tmp_path, predicate):
+@pytest.mark.parametrize("change", ["rewrite", "replace"])
+def test_frozen_identity_detects_damage_with_restored_mtime(tmp_path, predicate, change):
     path = tmp_path / "original.parquet"
     directory = tmp_path / "snapshots"
     with vane.connect(backend="local") as connection:
@@ -75,7 +76,10 @@ def test_frozen_content_digest_detects_damage_with_unchanged_stat(tmp_path, pred
         spec, _ = stage(connection, f"select value from read_parquet('{path}')" + predicate, directory)
     frozen = next(directory.rglob("*.parquet"))
     stamp, original = frozen.stat(), frozen.read_bytes()
-    frozen.write_bytes(original[:10] + bytes([original[10] ^ 1]) + original[11:])
+    target = frozen.with_suffix(".replacement") if change == "replace" else frozen
+    target.write_bytes(original[:10] + bytes([original[10] ^ 1]) + original[11:])
+    if change == "replace":
+        target.replace(frozen)
     os.utime(frozen, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
     with pytest.raises(Exception, match="snapshot changed"):
         run(spec)
