@@ -160,7 +160,6 @@ public:
 	                vector<DirectOutput> outputs_p, shared_ptr<DirectTaskProgress> progress_p)
 	    : PhysicalResultCollector(*data.physical_plan, data), inputs(std::move(inputs_p)),
 	      outputs(std::move(outputs_p)), progress(std::move(progress_p)) {
-		requires_periodic_flush = inputs.empty();
 	}
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
@@ -205,6 +204,9 @@ public:
 		return true;
 	}
 	SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &input, bool force) const override {
+		if (!inputs.empty()) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
 		auto now = DirectSinkLocal::Clock::now();
 		if (!force && now < state.next_flush) {

@@ -278,6 +278,7 @@ struct Link {
 	std::thread reader;
 	std::thread watcher;
 	std::atomic<bool> done {false};
+	std::atomic<bool> closing {false};
 	std::atomic<bool> ready {false};
 	std::shared_ptr<Signal> signal = std::make_shared<Signal>();
 
@@ -302,6 +303,18 @@ struct Link {
 	}
 	void Fail(const string &reason) {
 		channel->Abort(reason);
+		Stop();
+	}
+	void CloseConsumer() {
+		// The server can cancel the data RPC before replying to the close RPC.
+		// Fence that expected cancellation without canceling our stream before
+		// the server has recorded the close. Control failures still propagate.
+		closing = true;
+		try {
+			Action("close");
+		} catch (const std::exception &error) {
+			Fail(error.what());
+		}
 		Stop();
 	}
 	void Read(double timeout, idx_t wire_limit) {
@@ -353,8 +366,7 @@ struct Link {
 					auto state =
 					    channel->TryWrite(producer, sequence + 1, chunk, rows, 0, rows.size(), signal->Wakeup());
 					if (state == DirectWrite::CLOSED) {
-						Action("close");
-						Stop();
+						CloseConsumer();
 						return;
 					}
 					if (state == DirectWrite::ACCEPTED) {
@@ -369,7 +381,8 @@ struct Link {
 				}
 			}
 		} catch (const std::exception &error) {
-			if (!done) {
+			ready = false;
+			if (!done && !closing) {
 				Fail(error.what());
 			}
 		}
@@ -382,8 +395,7 @@ struct Link {
 					return;
 				}
 				if (!channel->HasConsumers()) {
-					Action("close");
-					Stop();
+					CloseConsumer();
 					return;
 				}
 				if (Action("status") == "closed") {
@@ -393,7 +405,7 @@ struct Link {
 				signal->changed.wait_for(guard, std::chrono::milliseconds(25));
 			}
 		} catch (const std::exception &error) {
-			if (!done) {
+			if (!done && !closing) {
 				Fail(error.what());
 			}
 		}
