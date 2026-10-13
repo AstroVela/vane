@@ -1335,12 +1335,14 @@ TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_
 	vector<idx_t> right_projection_map;
 	vector<LogicalType> delim_types;
 	auto pushdown_info = make_uniq<JoinFilterPushdownInfo>();
+	pushdown_info->build_side_has_filter = true;
 	pushdown_info->join_condition.push_back(0);
 	pushdown_info->min_max_aggregates.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
 	JoinFilterPushdownFilter pushdown_filter;
 	pushdown_filter.dynamic_filters = make_shared_ptr<DynamicTableFilterSet>();
 	JoinFilterPushdownColumn pushdown_column;
 	pushdown_column.probe_column_index = ColumnBinding(0, 0);
+	pushdown_column.storage_type = LogicalType::SMALLINT;
 	pushdown_filter.columns.push_back(pushdown_column);
 	pushdown_info->probe_info.push_back(std::move(pushdown_filter));
 
@@ -1380,9 +1382,11 @@ TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_
 	REQUIRE(join_ptr->rhs_output_columns.col_types.size() == 1);
 	REQUIRE(join_ptr->payload_columns.col_types.empty());
 	REQUIRE(join_ptr->filter_pushdown != nullptr);
+	REQUIRE(join_ptr->filter_pushdown->build_side_has_filter);
 	REQUIRE(join_ptr->filter_pushdown->join_condition.size() == 1);
 	REQUIRE(join_ptr->filter_pushdown->probe_info.size() == 1);
 	REQUIRE(join_ptr->filter_pushdown->probe_info[0].columns.size() == 1);
+	REQUIRE(join_ptr->filter_pushdown->probe_info[0].columns[0].storage_type == LogicalType::SMALLINT);
 	REQUIRE(join_ptr->filter_pushdown->probe_info[0].dynamic_filters != nullptr);
 	REQUIRE(join_ptr->filter_pushdown->min_max_aggregates.size() == 1);
 
