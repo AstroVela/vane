@@ -128,6 +128,32 @@ DETERMINISTIC_AGES = [
         f"{timestamp} '2000-01-01' + x * interval '1 day')::varchar) from range(4)",
     )
 ]
+UNSTABLE_TIMEZONES = [
+    "select timezone('America/New_York', timetz '12:00:00+00')::varchar from range(4)",
+    "select timezone(case when range%2=0 then 'America/New_York' else 'UTC' end, "
+    "timetz '12:00:00+00')::varchar from range(4)",
+    "select (timetz '12:00:00+00' at time zone 'America/New_York')::varchar from range(4)",
+    "select list_transform([range], lambda x: timezone(case when x%2=0 then 'America/New_York' else 'UTC' end, "
+    "timetz '12:00:00+00')::varchar) from range(4)",
+    "select (select timezone(case when a.range%2=0 then 'America/New_York' else 'UTC' end, "
+    "timetz '12:00:00+00')::varchar) from range(4) a",
+    "select coalesce(timezone('America/New_York', timetz '12:00:00+00'), timetz '00:00:00+00')::varchar from range(4)",
+    "select timezone('America/New_York', null::timetz)::varchar from range(4)",
+]
+DETERMINISTIC_TIMEZONES = [
+    sql
+    for timestamp in ("timestamp", "timestamptz")
+    for sql in (
+        f"select timezone('America/New_York', {timestamp} '2020-11-01 12:00:00+00')::varchar from range(4)",
+        "select timezone(case when range%2=0 then 'America/New_York' else 'UTC' end, "
+        f"{timestamp} '2020-11-01 12:00:00+00' + range * interval '1 day')::varchar from range(4)",
+        "select list_transform([range, null], lambda x: timezone('America/New_York', "
+        f"{timestamp} '2020-11-01 12:00:00+00' + x * interval '1 day')::varchar) from range(4)",
+    )
+] + [
+    "select timezone(interval '1 hour', timetz '12:00:00+00')::varchar from range(4)",
+    "select timezone(timestamptz '2020-11-01 12:00:00+02') from range(4)",
+]
 
 
 @pytest.mark.parametrize("partitions", [1, 2, 5])
@@ -202,7 +228,7 @@ def test_ie_join_parallel_outer_tasks_own_null_payloads(threads):
 
 @pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
 @pytest.mark.parametrize("optimizers", ["default", "no_expression_rewriter", "disabled"])
-@pytest.mark.parametrize("sql", UNSTABLE_LAMBDAS + CONTEXT_READS + UNSTABLE_AGES)
+@pytest.mark.parametrize("sql", UNSTABLE_LAMBDAS + CONTEXT_READS + UNSTABLE_AGES + UNSTABLE_TIMEZONES)
 def test_context_reads_and_lambda_bodies_are_checked_before_optimization(sql, optimizers, entry):
     from tests.fast.test_execution_submission import options, prepare
     from vane.execution.query_options import DistributedMode
@@ -218,6 +244,8 @@ def test_context_reads_and_lambda_bodies_are_checked_before_optimization(sql, op
                 compile_sql(connection, sql, partitions=2)
             else:
                 prepare(connection, sql, options=options(DistributedMode(entry)))
+        # The guard belongs to this planner, not the connection's later queries.
+        assert connection.execute(sql).to_arrow_table().num_rows == 4
 
 
 @pytest.mark.parametrize("sql", DETERMINISTIC_LAMBDAS)
@@ -230,8 +258,8 @@ def test_deterministic_lambdas_survive_worker_plan_deserialization(sql):
 
 
 @pytest.mark.parametrize("optimizers", ["default", "no_expression_rewriter", "disabled"])
-@pytest.mark.parametrize("sql", DETERMINISTIC_AGES)
-def test_binary_age_remains_portable(sql, optimizers):
+@pytest.mark.parametrize("sql", DETERMINISTIC_AGES + DETERMINISTIC_TIMEZONES)
+def test_deterministic_temporal_overloads_remain_portable(sql, optimizers):
     with vane.connect(config={"threads": 4}) as connection, vane.connect(config={"threads": 1}) as worker:
         if optimizers == "no_expression_rewriter":
             connection.execute("set disabled_optimizers='expression_rewriter'")
@@ -255,6 +283,24 @@ def test_unary_age_in_scan_argument_is_rejected_before_binding(tmp_path, entry, 
         # Reject the unfrozen date before the binder evaluates the argument or
         # tries to open the deliberately absent file.
         with pytest.raises(vane.NotImplementedException, match="consistent across tasks and attempts: age"):
+            if entry == "compiler":
+                compile_sql(connection, sql)
+            else:
+                prepare(connection, sql, options=options(DistributedMode(entry)))
+
+
+@pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
+def test_timetz_timezone_is_checked_before_table_argument_evaluation(tmp_path, entry):
+    from tests.fast.test_execution_submission import options, prepare
+    from vane.execution.query_options import DistributedMode
+
+    missing = tmp_path / "missing.parquet"
+    sql = (
+        f"select * from read_parquet('{missing}', binary_as_string="
+        "(timezone('America/New_York', timetz '12:00:00+00')::varchar <> ''))"
+    )
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="consistent across tasks and attempts: timezone"):
             if entry == "compiler":
                 compile_sql(connection, sql)
             else:

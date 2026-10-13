@@ -331,18 +331,33 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 			// Check before binding can evaluate table arguments. Function names do
 			// not define portability; native binding and serialization do.
 			// Overloads with different arities can have different stability (age).
-			// Unpacked COLUMNS can change the arity during binding, so keep checking
-			// every overload when the argument count is not yet known.
+			// Unpacked COLUMNS can change the arity during binding.
 			bool unpacked = false;
 			for (auto &child : function.children) {
 				unpacked |= child->GetExpressionType() == ExpressionType::OPERATOR_UNPACK;
 			}
+			vector<reference<ScalarFunction>> candidates;
+			bool has_portable_candidate = false;
 			for (auto &overload : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
 				const auto arguments = function.children.size();
 				if (unpacked || arguments == overload.arguments.size() ||
 				    (overload.HasVarArgs() && arguments > overload.arguments.size())) {
-					CheckScalarFunction(overload);
+					candidates.push_back(overload);
+					has_portable_candidate |=
+					    overload.GetStability() == FunctionStability::CONSISTENT && !overload.IsClientContextRead();
 				}
+			}
+			for (auto &candidate : candidates) {
+				auto &overload = candidate.get();
+				// Timezone overloads have the same arity but different time dependencies.
+				// Defer query-stable candidates to the selected-overload callback, which
+				// runs before any binding-time evaluation. Side effects/context reads
+				// are still rejected here, before source staging.
+				if (has_portable_candidate && overload.GetStability() == FunctionStability::CONSISTENT_WITHIN_QUERY &&
+				    !overload.IsClientContextRead()) {
+					continue;
+				}
+				CheckScalarFunction(overload);
 			}
 		}
 	}
@@ -1246,6 +1261,8 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		// the resolved entry before macro expansion or table-argument evaluation;
 		// child binders inherit this callback, while real columns need no lookup.
 		planner.binder->SetCatalogLookupCallback(CheckFunctionOrigin);
+		planner.binder->SetScalarFunctionCallback(
+		    [](const ScalarFunction &function) { CheckScalarFunction(function, true); });
 		planner.CreatePlan(std::move(parser.statements[0]));
 		if (!planner.plan || !planner.properties.IsReadOnly() || planner.properties.parameter_count) {
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");

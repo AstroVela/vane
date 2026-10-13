@@ -334,6 +334,10 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunctionCatalogE
 
 	// found a matching function!
 	auto bound_function = func.functions.GetFunctionByOffset(best_function.GetIndex());
+	auto active_binder = binder ? binder : this->binder;
+	if (active_binder) {
+		active_binder->CheckScalarFunction(bound_function);
+	}
 
 	// If any of the parameters are NULL, the function will just be replaced with a NULL constant.
 	// We try to give the NULL constant the correct type, but we have to do this without binding the function,
@@ -651,6 +655,12 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
+	// Also cover callers that already selected an overload, before its bind
+	// callback can evaluate an expression or replace it with a constant.
+	auto active_binder = binder ? binder : this->binder;
+	if (active_binder) {
+		active_binder->CheckScalarFunction(bound_function);
+	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
 	ResolveTemplateTypes(bound_function, children);
 

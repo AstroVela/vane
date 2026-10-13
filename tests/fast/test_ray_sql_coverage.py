@@ -12,12 +12,14 @@ from tests.fast.test_fragment_sql_coverage import (
     CONTEXT_READS,
     DETERMINISTIC_AGES,
     DETERMINISTIC_LAMBDAS,
+    DETERMINISTIC_TIMEZONES,
     IE_JOIN_CASES,
     IE_JOIN_EQUALITY_TAIL,
     RANGE_JOIN_CASES,
     SQL_CASES,
     UNSTABLE_AGES,
     UNSTABLE_LAMBDAS,
+    UNSTABLE_TIMEZONES,
 )
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -100,6 +102,22 @@ def test_public_age_rejects_transaction_date_and_keeps_explicit_dates(tmp_path, 
                 connection.query(sql, options=options() if mode == "fte" else None)
             assert_idle(connection)
         for sql in DETERMINISTIC_AGES:
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options() if mode == "fte" else None) as result:
+                table = result.collect()
+                actual = list(zip(*(c.to_pylist() for c in table.columns)))
+                assert sorted(actual, key=repr) == sorted(expected, key=repr)
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_timezone_checks_selected_overload(tmp_path, mode):
+    with vane.connect() as local, vane.Runtime(resources(tmp_path)) as application, application.connect() as connection:
+        for sql in UNSTABLE_TIMEZONES:
+            with pytest.raises(vane.NotImplementedException, match="consistent across tasks and attempts: timezone"):
+                connection.query(sql, options=options() if mode == "fte" else None)
+            assert_idle(connection)
+        for sql in DETERMINISTIC_TIMEZONES:
             expected = local.execute(sql).fetchall()
             with connection.query(sql, options=options() if mode == "fte" else None) as result:
                 table = result.collect()
