@@ -320,7 +320,7 @@ def test_worker_native_cleanup_acknowledges_only_a_stopped_engine(family, kind, 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
-@pytest.mark.parametrize("entry,failures", [("worker", 1), ("worker", 3), ("public", 1)])
+@pytest.mark.parametrize("entry,failures", [("worker", 1), ("worker", 3), ("worker", 5), ("public", 1)])
 def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, family, backend, entry, failures):
     import json
     from pathlib import Path
@@ -439,13 +439,13 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
                 worker.close(kill=False)
             else:
                 worker.submit(pa.table({"text": ["hello"]}))
-                if failures == 3:
+                if failures >= 3:
                     with pytest.raises(Exception, match="TimeoutError"):
                         worker.close(kill=False)
                 else:
                     worker.close(kill=False)
             assert (subprocess_exec._MSG_ACK in replies) == (failures == 1)
-            if failures == 3:
+            if failures >= 3:
                 assert replies.count(subprocess_exec._MSG_ERROR) == (2 if backend == "subprocess_task" else 1)
         else:
             base = type(load_provider(family))
@@ -471,8 +471,15 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
                 else:
                     assert len(relation.fetchall()) == 1
         events = [json.loads(line) for line in Path(marker).read_text().splitlines()]
-        assert [event["event"] for event in events] == ["started"] + ["shutdown_attempt"] * (failures + 1) + ["stopped"]
-        assert not psutil.pid_exists(events[0]["pid"])
+        exhausted = failures >= (5 if backend == "subprocess_task" else 4)
+        attempts = (5 if backend == "subprocess_task" else 4) if exhausted else failures + 1
+        assert [event["event"] for event in events] == ["started"] + ["shutdown_attempt"] * attempts + (
+            [] if exhausted else ["stopped"]
+        )
+        if exhausted and psutil.pid_exists(events[0]["pid"]):
+            assert psutil.Process(events[0]["pid"]).status() == psutil.STATUS_ZOMBIE
+        else:
+            assert not psutil.pid_exists(events[0]["pid"])
     finally:
         try:
             if worker is not None:
@@ -486,7 +493,7 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
                         if child.cmdline()[-1:] == [marker]:
                             child.kill()
                             psutil.wait_procs([child], timeout=5)
-                    except psutil.NoSuchProcess:
+                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
                         pass
 
 

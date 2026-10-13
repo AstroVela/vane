@@ -897,6 +897,8 @@ class _EmbeddingBatch:
 
     def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
+        if self._embedder is not None and self._embedder_loop_bound and self._run_async != run_async:
+            raise RuntimeError("cannot rebind an async provider before its cleanup completes")
         self._run_async = run_async
 
     def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:
@@ -1261,6 +1263,8 @@ class _PromptBatch:
 
     def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
+        if self._prompter is not None and self._prompter_loop_bound and self._run_async != run_async:
+            raise RuntimeError("cannot rebind an async provider before its cleanup completes")
         self._run_async = run_async
 
     def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:

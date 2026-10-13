@@ -93,6 +93,7 @@ from vane.execution.udf_lifecycle import (
 from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
 from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
+from vane.execution.udf_process_group import WorkerProcessGroup
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_shm_store import ParentShmPeer
 from vane.execution.udf_threading import (
@@ -461,6 +462,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._finished_submitting = False
         self._closed = False
         self._cleanup_finished = False
+        self._owner_pid = os.getpid()
+        self._process_group: WorkerProcessGroup | None = None
         self._broken_error: str | None = None
         self._actor_lost = False
         self._worker_lifecycle = WorkerLifecycle()
@@ -505,6 +508,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._payload_shm,
             self._data_shm,
             self._shm_peer,
+            self._process_group,
         )
 
     def _start_worker(
@@ -557,11 +561,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 cmd,
                 pass_fds=(child_fd, shm_fd),
                 close_fds=True,
+                start_new_session=True,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=None if _subprocess_debug_enabled() else subprocess.DEVNULL,
             )
+            self._process_group = WorkerProcessGroup(self._proc.pid)
             child_sock.close()
             self._startup_child_sock = None
             self._shm_peer.child_sock.close()
@@ -1635,6 +1641,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         cancel_requested = getattr(self, "_startup_cancel_requested", None)
         if cancel_requested is not None:
             cancel_requested.set()
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            try:
+                process_group.capture()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
@@ -1662,6 +1674,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError(f"UDF subprocess startup cancellation failed: {details}") from cleanup_errors[0]
 
     def close(self, kill: bool = False) -> None:
+        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
+            return
         close_lock = getattr(self, "_close_lock", None)
         if close_lock is None:
             close_lock = threading.Lock()
@@ -1705,6 +1719,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         proc = self._proc
         sock = self._sock
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            # Capture before asking the engine/worker to exit; escaped engine
+            # descendants remain owned even after they are reparented.
+            process_group.capture()
         shutdown_error: BaseException | None = None
         graceful_error: BaseException | None = None
         finalizer_cleanup_failed = False
@@ -1754,6 +1773,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 if shutdown_error is None:
                     shutdown_error = exc
 
+        if process_group is not None:
+            try:
+                process_group.close(_subprocess_control_timeout_s())
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._process_group = None
+
         if sock is not None:
             try:
                 sock.close()
@@ -1782,7 +1809,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._proc = proc
         else:
             self._proc = None
-        if self._proc is None and self._shm_peer is not None:
+        if self._proc is None and getattr(self, "_process_group", None) is None and self._shm_peer is not None:
             try:
                 self._shm_peer.close_after_exit()
             except BaseException as exc:
@@ -1809,7 +1836,15 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             and not active_output_grants
             and all(
                 getattr(self, attribute, None) is None
-                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm", "_shm_peer")
+                for attribute in (
+                    "_proc",
+                    "_sock",
+                    "_startup_child_sock",
+                    "_payload_shm",
+                    "_data_shm",
+                    "_shm_peer",
+                    "_process_group",
+                )
             )
         )
         finalizer = getattr(self, "_finalizer", None)
@@ -1826,7 +1861,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             cleanup_errors.append(graceful_error)
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
-            raise RuntimeError(f"UDF subprocess close failed: {details}") from cleanup_errors[0]
+            raise capture_cleanup(f"UDF subprocess close failed: {details}", *cleanup_errors) from cleanup_errors[0]
 
     def __del__(self) -> None:
         try:
@@ -4806,7 +4841,12 @@ def _cleanup_subprocess_executor(
     payload_shm: shared_memory.SharedMemory | None,
     data_shm: shared_memory.SharedMemory | None,
     shm_peer: ParentShmPeer | None = None,
+    process_group: WorkerProcessGroup | None = None,
 ) -> None:
+    if process_group is not None:
+        if process_group.owner_pid != os.getpid():
+            return
+        process_group.capture()
     if sock is not None:
         try:
             if proc is not None and proc.poll() is None:
@@ -4826,6 +4866,8 @@ def _cleanup_subprocess_executor(
             proc.wait(timeout=_subprocess_control_timeout_s())
         except Exception:
             pass
+    if process_group is not None:
+        process_group.close(_subprocess_control_timeout_s())
     for shm in (payload_shm, data_shm):
         if shm is None:
             continue

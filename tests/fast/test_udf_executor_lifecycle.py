@@ -2924,7 +2924,9 @@ def test_udf_runtime_close_does_not_transport_raw_oversized_provider_failure():
     with pytest.raises(RuntimeError, match="error text exceeds") as exc_info:
         executor.close()
 
-    assert type(exc_info.value) is RuntimeError
+    from vane.ai._errors import DiagnosticError
+
+    assert type(exc_info.value) is DiagnosticError
     assert len(str(exc_info.value).encode("utf-8")) <= MAX_CLOSE_ERROR_BYTES
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None

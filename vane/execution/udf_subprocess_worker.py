@@ -763,10 +763,12 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
         except Exception:
             pass
     finally:
+        cleanup_error = None
         if executor is not None:
-            _close_executor_with_retry(executor)
-            executor = None
-            gc.collect()
+            cleanup_error = _close_executor_with_retry(executor)
+            if cleanup_error is None:
+                executor = None
+                gc.collect()
         shm_client.close()
         try:
             payload_shm.close()
@@ -780,6 +782,10 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             sock.close()
         except Exception:
             pass
+        if cleanup_error is not None:
+            # Failed engine cleanup is not a successful worker exit. The
+            # parent still owns this worker's process group and descendants.
+            raise cleanup_error
 
 
 def _main(argv: list[str]) -> int:

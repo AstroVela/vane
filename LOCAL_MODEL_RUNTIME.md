@@ -1287,6 +1287,19 @@ Worker acquisition retries retained retirements before spawning or waiting for
 a free slot. A failed retry returns a task error and its execution resources;
 shared-pool peers do not wait indefinitely behind an unclosed retired worker.
 
+Each subprocess worker starts its own session. Its process group and observed
+engine descendants remain owned after the worker PID exits. Shutdown terminates
+remaining live descendants before confirming cleanup or returning process
+capacity. A failed termination retains that owner for a later close; inherited
+fork finalizers cannot signal the parent's workers. A zombie has already
+released execution resources and is left for its parent to reap.
+
+When a cached task callable fails to close, the executor and its original async
+loop remain owned outside the idle callable LRU. The same cache key must finish
+that cleanup before another task binds a new loop. Clearing the idle cache does
+not discard outstanding cleanup. Runtime close captures bounded exception types
+and numeric diagnostics before transporting the error, including cleanup errno.
+
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
 `TaskAdmissionQueueFull`; native execution surfaces this as a query error.

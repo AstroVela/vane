@@ -34,10 +34,10 @@ def decode_error(payload: bytes, *, prefix: str = "") -> tuple[str, DiagnosticEr
     return message, diagnostic
 
 
-def capture_cleanup(message: str, primary: BaseException, cleanup: BaseException) -> DiagnosticError:
+def capture_cleanup(message: str, primary: BaseException, *cleanup: BaseException) -> DiagnosticError:
     failure = RuntimeError(message)
     failure.primary_error = primary  # type: ignore[attr-defined]
-    failure.cleanup_errors = (cleanup,)  # type: ignore[attr-defined]
+    failure.cleanup_errors = cleanup  # type: ignore[attr-defined]
     summary = summarize_error(failure)
     return _restore_diagnostic_error(_diagnostic_message(summary, message), summary)
 
