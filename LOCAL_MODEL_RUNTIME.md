@@ -1463,12 +1463,15 @@ When a UDF forks, the worker also pins all live remote input leases, including
 views retained by an earlier invocation. Last-buffer notifications wait for the
 inheriting child and its descendants to exit or exec. One lifetime pipe per
 worker, transferred at startup, lets the parent retain outstanding input regions
-even if the worker exits before those descendants. Worker shutdown transfers
-these leases to arena pins; they keep preventing reuse and page reclamation
-until the inherited writers close. Ordinary batches do not allocate additional
-descriptors. Worker-client cleanup and inherited input finalizers check the
-creator PID before touching locks, release queues, or sockets, so a fork child's
-normal exit cannot shut down its parent's release channel.
+even if the worker exits before those descendants. Retiring the storage peer
+after unexpected worker exit transfers these leases to arena pins; they keep
+preventing reuse and page reclamation until the inherited writers close.
+Explicit executor shutdown first terminates the worker's process group and
+observed descendants, including fork readers, before retiring its storage peer.
+Ordinary batches do not allocate additional descriptors. Worker-client cleanup
+and inherited input finalizers check the creator PID before touching locks,
+release queues, or sockets, so a fork child's normal exit cannot shut down its
+parent's release channel.
 
 `VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
 `auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
