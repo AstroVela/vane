@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import nullcontext
 
 import pytest
@@ -39,7 +40,7 @@ def test_physical_wait_wakes_on_release_or_cancellation(store, cancel):
         future = threads.submit(store.wait_for_capacity, 1024, (), scope, wait_context)
         try:
             assert waiting.wait(timeout=5)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeoutError):
                 future.result(timeout=0.05)
             if cancel:
                 scope.cancel("query stopped")
@@ -96,7 +97,7 @@ def test_idle_worker_input_report_distinguishes_retained_views_from_pending_rele
             with ThreadPoolExecutor(max_workers=1) as threads:
                 pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext)
                 try:
-                    with pytest.raises(TimeoutError):
+                    with pytest.raises(FutureTimeoutError):
                         pending.result(timeout=0.05)
                     peer.release_read(token)
                     pending.result(timeout=5)
@@ -240,7 +241,7 @@ def test_unrelated_allocation_can_still_release_space_for_waiting_writers():
                 with store._capacity_condition:
                     assert store._capacity_condition.wait_for(lambda: len(store._waiting_writes) == 2, timeout=5)
                 for future in futures:
-                    with pytest.raises(TimeoutError):
+                    with pytest.raises(FutureTimeoutError):
                         future.result(timeout=0.05)
                 unrelated.release()
                 for future in futures:

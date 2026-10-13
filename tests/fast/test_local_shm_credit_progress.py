@@ -5,6 +5,7 @@
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import pytest
 
@@ -50,10 +51,10 @@ def test_consumer_escape_admits_one_complete_block_then_waits_for_release():
     with ThreadPoolExecutor(max_workers=1) as threads:
         waiting = threads.submit(manager.request_output_grant, 350, priority="consumer", cancel_event=cancel)
         try:
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeoutError):
                 waiting.result(timeout=0.1)
             allocation = manager.convert_output_grant_to_allocation(first)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeoutError):
                 waiting.result(timeout=0.1)
             manager.release_allocation(allocation)
             second = waiting.result(timeout=5)
@@ -77,7 +78,7 @@ def test_producer_and_explicit_reservations_do_not_use_consumer_escape(strict):
             manager.request_output_grant, 350, priority="consumer" if strict else "producer", cancel_event=cancel
         )
         try:
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeoutError):
                 pending.result(timeout=0.1)
             assert manager.snapshot()["usage_bytes"] == (920 if strict else 900)
         finally:
@@ -120,7 +121,7 @@ def test_pinned_consumer_can_progress_past_unrelated_inputs_once(monkeypatch):
                 manager.request_output_grant, 512, priority="consumer", input_lease_id=lease, cancel_event=cancel
             )
             try:
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     waiting.result(timeout=0.1)
                 output.release()
                 next_grant = waiting.result(timeout=5)
@@ -171,11 +172,11 @@ def test_output_owner_window_waits_for_physical_release_across_invocations(monke
                 manager.request_output_grant, 1100, priority="consumer", owner_id="source", cancel_event=cancel
             )
             try:
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
                 first.release()
                 assert len(manager._owned_output_grants["source"]) == 2
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
                 held_view.release()
                 grant = pending.result(timeout=5)
@@ -213,11 +214,11 @@ def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch, prior_
         with ThreadPoolExecutor(max_workers=1) as threads:
             pending = threads.submit(manager.acquire_allocation, 128, input_owner_id="source", cancel_event=cancel)
             try:
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
                 ref.release()
                 assert manager.snapshot()["allocated_bytes"] == 128
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
                 held.release()
                 assert pending.result(timeout=5) == 128
@@ -246,7 +247,7 @@ def test_input_bridge_preserves_owner_window_and_strict_reservations(owner_id, o
         with ThreadPoolExecutor(max_workers=1) as threads:
             pending = threads.submit(manager.acquire_allocation, 128, input_owner_id=owner_id, cancel_event=cancel)
             try:
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
             finally:
                 cancel.set()
@@ -306,7 +307,7 @@ def test_owned_window_preserves_producer_owner_and_explicit_reservation_boundari
                 manager.request_output_grant, 1100, priority=priority, owner_id=owner_id, cancel_event=cancel
             )
             try:
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     pending.result(timeout=0.05)
             finally:
                 cancel.set()
