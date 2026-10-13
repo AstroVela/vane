@@ -1,0 +1,2371 @@
+{
+  "status": "PASS",
+  "started_epoch": 1791891356.5168147,
+  "runs": [
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 2960,
+      "phase_begin_ns": 49397793,
+      "phase_end_ns": 441841423,
+      "initialization_seconds": 0.049376648,
+      "phase_seconds": 0.39244363,
+      "total_seconds": 0.441838463,
+      "first_durable_seconds": 0.05295824,
+      "close_seconds": 0.006886766,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 12854432,
+      "content_and_integrity": true,
+      "operation_ns": [
+        3563581,
+        2855528,
+        2688359,
+        2772562,
+        2997394,
+        3186321,
+        3114482,
+        2889180,
+        3247427,
+        2918129,
+        3127340,
+        3019169,
+        2967839,
+        3023406,
+        3164260,
+        2939901,
+        3308725,
+        3214627,
+        2974711,
+        3114467,
+        3044283,
+        3154358,
+        2916607,
+        3133484,
+        3151936,
+        3319958,
+        3237127,
+        3124583,
+        2884079,
+        3142065,
+        3090922,
+        3220147,
+        3368850,
+        2975676,
+        2968450,
+        3202598,
+        2917132,
+        3788183,
+        3268728,
+        2870657,
+        3187188,
+        3189833,
+        3221778,
+        3175652,
+        3161429,
+        2997693,
+        2603692,
+        2708796,
+        3279215,
+        2967931,
+        3237371,
+        3147573,
+        2851148,
+        3215888,
+        3132848,
+        2885813,
+        3427755,
+        3263172,
+        3285747,
+        3807412,
+        3341888,
+        3509428,
+        3519854,
+        3231154,
+        2726497,
+        2640391,
+        2776234,
+        2701271,
+        2810870,
+        3231843,
+        2770663,
+        3252761,
+        2925900,
+        3267045,
+        3004429,
+        3009043,
+        2713848,
+        3345483,
+        3178435,
+        3513947,
+        3023794,
+        3203424,
+        2884837,
+        3269105,
+        2940626,
+        3278976,
+        2724181,
+        2697435,
+        2823643,
+        2759719,
+        2912077,
+        2672474,
+        2639701,
+        2853192,
+        3223899,
+        3064959,
+        3152635,
+        3052451,
+        3256555,
+        3008792,
+        3331186,
+        3358296,
+        2886181,
+        2869534,
+        2782570,
+        2835850,
+        2794481,
+        2887385,
+        3377429,
+        2844597,
+        3449800,
+        3242379,
+        2981013,
+        3457911,
+        2859253,
+        3178439,
+        3163020,
+        2737353,
+        2887744,
+        2923454,
+        3286959,
+        2941964,
+        3231446,
+        2826844,
+        2895471,
+        2843520,
+        2740236,
+        3273822
+      ],
+      "sdk": "fsync",
+      "variant": "baseline",
+      "rep": 0,
+      "pid": 3730959,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-0-baseline/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-small128-0-baseline.json"
+      ],
+      "start": 1791891376.517963,
+      "end": 1791891377.033973
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 4416,
+      "phase_begin_ns": 47794588,
+      "phase_end_ns": 496479671,
+      "initialization_seconds": 0.047774352,
+      "phase_seconds": 0.448685083,
+      "total_seconds": 0.496475255,
+      "first_durable_seconds": 0.085556447,
+      "close_seconds": 0.006850503,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        37766450,
+        2826585,
+        2830528,
+        2919494,
+        2980534,
+        3006717,
+        3011393,
+        3115086,
+        3111067,
+        3025449,
+        3024503,
+        3078180,
+        3025649,
+        3027195,
+        3098340,
+        3061675,
+        2999913,
+        2983697,
+        3014272,
+        3011053,
+        2992055,
+        3026618,
+        3025570,
+        3024724,
+        2992955,
+        3001767,
+        2974758,
+        2999216,
+        2961014,
+        3079242,
+        2879673,
+        2990627,
+        3010302,
+        2941670,
+        3004355,
+        3119902,
+        3038272,
+        3059764,
+        2989467,
+        2972750,
+        3067172,
+        2986945,
+        3029950,
+        3059958,
+        3053218,
+        3085906,
+        3087406,
+        3056593,
+        3060187,
+        2995561,
+        3162901,
+        3136845,
+        3106855,
+        3073152,
+        3168147,
+        3168287,
+        3133754,
+        3204618,
+        3041447,
+        3149403,
+        3011923,
+        3102725,
+        3056722,
+        3168137,
+        3098447,
+        3007664,
+        3110161,
+        3135141,
+        3071911,
+        3043475,
+        31689100,
+        3175478,
+        3245619,
+        3035570,
+        3104450,
+        3117292,
+        3035094,
+        3128274,
+        3122833,
+        3033776,
+        3174167,
+        3048062,
+        3051465,
+        3039025,
+        3059511,
+        3206886,
+        3103800,
+        3040663,
+        2992812,
+        3005099,
+        3050148,
+        3061985,
+        2977102,
+        3124272,
+        2995454,
+        3139387,
+        3015038,
+        3304328,
+        3016715,
+        2837573,
+        2728102,
+        2850754,
+        2720424,
+        3012956,
+        2799392,
+        2585741,
+        2480701,
+        2513777,
+        2402623,
+        2493579,
+        2636371,
+        2834023,
+        2862455,
+        2848219,
+        2877856,
+        2833036,
+        2820662,
+        2759128,
+        3079871,
+        3301291,
+        3310466,
+        3045173,
+        3035720,
+        3018113,
+        3070501,
+        3143409,
+        3020818,
+        2999706
+      ],
+      "sdk": "fsync",
+      "variant": "reserved",
+      "rep": 0,
+      "pid": 3730970,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-0-reserved/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-small128-0-reserved.json"
+      ],
+      "start": 1791891377.1237273,
+      "end": 1791891377.6896315
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 3907,
+      "phase_begin_ns": 38171680,
+      "phase_end_ns": 465883967,
+      "initialization_seconds": 0.038150799,
+      "phase_seconds": 0.427712287,
+      "total_seconds": 0.46588006,
+      "first_durable_seconds": 0.076121158,
+      "close_seconds": 0.007053556,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        37953602,
+        2586823,
+        2554932,
+        2480971,
+        2352608,
+        2472465,
+        2402032,
+        2470681,
+        2466848,
+        2501305,
+        2425078,
+        2536201,
+        2425798,
+        2636385,
+        2742297,
+        2876184,
+        3223950,
+        2829768,
+        2868100,
+        2902737,
+        2980368,
+        3013498,
+        3097139,
+        2991801,
+        3007059,
+        3011376,
+        2987095,
+        2944517,
+        3033295,
+        3023056,
+        2990797,
+        3056970,
+        3169433,
+        3040920,
+        3078605,
+        3148146,
+        3077501,
+        3108956,
+        3072695,
+        3079328,
+        3083688,
+        3045528,
+        3711217,
+        3032845,
+        3103173,
+        3020944,
+        2991708,
+        3119419,
+        3091306,
+        3074282,
+        3244228,
+        3124105,
+        3167280,
+        3113779,
+        3325135,
+        3306560,
+        3208110,
+        3235623,
+        3193248,
+        3287136,
+        3157991,
+        3141025,
+        3127236,
+        3266524,
+        3181768,
+        3237350,
+        3201073,
+        3262932,
+        3326313,
+        3617408,
+        3703807,
+        3384947,
+        3162294,
+        3060397,
+        3080714,
+        3188899,
+        2971793,
+        3127030,
+        3111103,
+        3031991,
+        3102215,
+        3035820,
+        3057923,
+        3220137,
+        3226273,
+        3207157,
+        3011573,
+        3074842,
+        2833236,
+        2716278,
+        3318418,
+        3115150,
+        3179921,
+        3221762,
+        3163612,
+        3258406,
+        3010356,
+        3384425,
+        3369630,
+        3185337,
+        3368410,
+        3314292,
+        3151134,
+        3314165,
+        2927186,
+        2793543,
+        2799591,
+        2982398,
+        3054651,
+        3161617,
+        3279905,
+        3220750,
+        3311286,
+        3196250,
+        3121384,
+        3148812,
+        3150666,
+        3161886,
+        3139050,
+        3264646,
+        3075086,
+        3192335,
+        3258845,
+        3269699,
+        3141322,
+        3279261,
+        3231748,
+        3227989
+      ],
+      "sdk": "fsync",
+      "variant": "reserved",
+      "rep": 1,
+      "pid": 3730978,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-1-reserved/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-small128-1-reserved.json"
+      ],
+      "start": 1791891377.7843113,
+      "end": 1791891378.3503566
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 3926,
+      "phase_begin_ns": 52060843,
+      "phase_end_ns": 482793121,
+      "initialization_seconds": 0.052007412,
+      "phase_seconds": 0.430732278,
+      "total_seconds": 0.482789195,
+      "first_durable_seconds": 0.056147804,
+      "close_seconds": 0.007249783,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 12854432,
+      "content_and_integrity": true,
+      "operation_ns": [
+        4090905,
+        2789832,
+        2765243,
+        2808691,
+        2749008,
+        2937739,
+        3312224,
+        3278552,
+        3320482,
+        3180924,
+        3514998,
+        3345884,
+        3259470,
+        3214915,
+        3041512,
+        3260123,
+        3333502,
+        3343121,
+        3337458,
+        3320635,
+        3308475,
+        3299969,
+        3288090,
+        3369337,
+        3248049,
+        3270228,
+        3080292,
+        3287396,
+        3221158,
+        3323843,
+        3296171,
+        3338495,
+        3473571,
+        3324167,
+        3316590,
+        3301296,
+        3240816,
+        3368410,
+        3139676,
+        3424260,
+        3355525,
+        3390792,
+        3340253,
+        3358221,
+        3454506,
+        3397793,
+        3361595,
+        3364919,
+        3449056,
+        3467921,
+        3539479,
+        3425449,
+        3143808,
+        3441552,
+        3670468,
+        3406484,
+        3482674,
+        3461424,
+        3456147,
+        3525204,
+        3440818,
+        3413686,
+        3360751,
+        3475703,
+        3075831,
+        3034998,
+        3079095,
+        3567188,
+        3319997,
+        3117492,
+        3495347,
+        3381379,
+        3544045,
+        3386757,
+        3580119,
+        3542704,
+        3224917,
+        3587444,
+        2967523,
+        3408853,
+        3525948,
+        3440938,
+        3470530,
+        3458748,
+        3526690,
+        3462963,
+        2959681,
+        2846218,
+        3054597,
+        3534237,
+        3462758,
+        3456124,
+        3279031,
+        3408176,
+        3364547,
+        3671823,
+        3102611,
+        3700269,
+        3514128,
+        3509781,
+        3603154,
+        3499209,
+        3270274,
+        3855201,
+        3177625,
+        2970980,
+        3014530,
+        3535527,
+        3431219,
+        3538854,
+        3651001,
+        3413636,
+        3706491,
+        3706890,
+        3244494,
+        3468124,
+        3544385,
+        3365368,
+        3593313,
+        3547957,
+        3324460,
+        3492723,
+        3531590,
+        3602748,
+        3587351,
+        3952661,
+        3129487,
+        3561999
+      ],
+      "sdk": "fsync",
+      "variant": "baseline",
+      "rep": 1,
+      "pid": 3730988,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-1-baseline/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-small128-1-baseline.json"
+      ],
+      "start": 1791891378.447547,
+      "end": 1791891379.0136163
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 3274,
+      "phase_begin_ns": 21656457,
+      "phase_end_ns": 343885657,
+      "initialization_seconds": 0.021631893,
+      "phase_seconds": 0.3222292,
+      "total_seconds": 0.343882383,
+      "first_durable_seconds": 0.343881469,
+      "close_seconds": 0.004534829,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 10283552,
+      "content_and_integrity": true,
+      "operation_ns": [
+        322228662
+      ],
+      "sdk": "fsync",
+      "variant": "baseline",
+      "rep": 0,
+      "pid": 3730997,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-0-baseline/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-write64-0-baseline.json"
+      ],
+      "start": 1791891379.1029637,
+      "end": 1791891379.6690388
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 5982,
+      "phase_begin_ns": 84374255,
+      "phase_end_ns": 460024685,
+      "initialization_seconds": 0.084346206,
+      "phase_seconds": 0.37565043,
+      "total_seconds": 0.460018703,
+      "first_durable_seconds": 0.460017869,
+      "close_seconds": 0.003446049,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        375649935
+      ],
+      "sdk": "fsync",
+      "variant": "reserved",
+      "rep": 0,
+      "pid": 3731000,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-0-reserved/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-write64-0-reserved.json"
+      ],
+      "start": 1791891380.0377212,
+      "end": 1791891380.704135
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 5652,
+      "phase_begin_ns": 43258055,
+      "phase_end_ns": 412117483,
+      "initialization_seconds": 0.043236533,
+      "phase_seconds": 0.368859428,
+      "total_seconds": 0.412111831,
+      "first_durable_seconds": 0.412110941,
+      "close_seconds": 0.005759248,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        368858966
+      ],
+      "sdk": "fsync",
+      "variant": "reserved",
+      "rep": 1,
+      "pid": 3731058,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-1-reserved/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-write64-1-reserved.json"
+      ],
+      "start": 1791891381.095932,
+      "end": 1791891381.7119598
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 6869,
+      "phase_begin_ns": 19441193,
+      "phase_end_ns": 375854989,
+      "initialization_seconds": 0.019418568,
+      "phase_seconds": 0.356413796,
+      "total_seconds": 0.37584812,
+      "first_durable_seconds": 0.375847225,
+      "close_seconds": 0.004624909,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 10283552,
+      "content_and_integrity": true,
+      "operation_ns": [
+        356413330
+      ],
+      "sdk": "fsync",
+      "variant": "baseline",
+      "rep": 1,
+      "pid": 3731063,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-1-baseline/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fsync-write64-1-baseline.json"
+      ],
+      "start": 1791891382.1024086,
+      "end": 1791891382.7185004
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 6371,
+      "phase_begin_ns": 28362716,
+      "phase_end_ns": 450561764,
+      "initialization_seconds": 0.028333915,
+      "phase_seconds": 0.422199048,
+      "total_seconds": 0.450555393,
+      "first_durable_seconds": 0.031971505,
+      "close_seconds": 0.006843408,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 12854432,
+      "content_and_integrity": true,
+      "operation_ns": [
+        3615270,
+        2861446,
+        2682754,
+        2664350,
+        3066631,
+        3133094,
+        3190469,
+        3118905,
+        3232445,
+        3332920,
+        3290698,
+        3159449,
+        3243921,
+        3150253,
+        3227515,
+        3105537,
+        3321039,
+        3188618,
+        2869751,
+        3230493,
+        3233693,
+        3141949,
+        3025907,
+        3017519,
+        3387701,
+        3178156,
+        3253827,
+        3321076,
+        3262255,
+        3243274,
+        3251909,
+        3211936,
+        3501210,
+        3306760,
+        3368990,
+        3461631,
+        3139817,
+        3331817,
+        3170347,
+        3282426,
+        3381597,
+        3297882,
+        3257712,
+        3317344,
+        3220299,
+        3174297,
+        3330931,
+        3275145,
+        3218003,
+        3238914,
+        3840604,
+        3398738,
+        3274011,
+        3380854,
+        3519419,
+        3182386,
+        3410803,
+        3308366,
+        3221211,
+        3382892,
+        3275676,
+        3310777,
+        3399864,
+        3412081,
+        3391577,
+        3448653,
+        3458495,
+        3504702,
+        3235103,
+        3361822,
+        3236699,
+        3341257,
+        3363197,
+        3320736,
+        3311165,
+        3304595,
+        3147403,
+        3335077,
+        3382453,
+        3259497,
+        3420484,
+        3228352,
+        3378613,
+        3444807,
+        3295044,
+        3403899,
+        3394882,
+        3304552,
+        3051645,
+        3362710,
+        3385663,
+        3365751,
+        3229194,
+        3227771,
+        3265314,
+        3486611,
+        3297371,
+        3474104,
+        3327189,
+        3209899,
+        3521876,
+        3599340,
+        3390069,
+        3286134,
+        3476485,
+        3530432,
+        3092766,
+        3506837,
+        3490021,
+        3358744,
+        3538881,
+        3305165,
+        3608539,
+        3504358,
+        3265680,
+        3304086,
+        3523743,
+        3208149,
+        3435635,
+        3457438,
+        3355631,
+        3266587,
+        3335678,
+        3106041,
+        3431065,
+        3504932,
+        3034256,
+        2958489
+      ],
+      "sdk": "fdatasync",
+      "variant": "baseline",
+      "rep": 0,
+      "pid": 3731092,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-0-baseline/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-small128-0-baseline.json"
+      ],
+      "start": 1791891383.0877793,
+      "end": 1791891383.6037164
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 6343,
+      "phase_begin_ns": 433181004,
+      "phase_end_ns": 5410829348,
+      "initialization_seconds": 0.433142105,
+      "phase_seconds": 4.977648344,
+      "total_seconds": 5.410823005,
+      "first_durable_seconds": 1.561807577,
+      "close_seconds": 0.149550143,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        1128633217,
+        2279792,
+        2106197,
+        75342949,
+        2103033,
+        2115607,
+        70009586,
+        2226344,
+        2285581,
+        72800887,
+        2192812,
+        2278558,
+        75916648,
+        2146715,
+        2151224,
+        82845708,
+        2210381,
+        2185374,
+        169499929,
+        2170098,
+        2163885,
+        73974559,
+        2215721,
+        2188068,
+        69874944,
+        2199162,
+        2197857,
+        73244839,
+        2470766,
+        81474063,
+        73896617,
+        76047073,
+        2266644,
+        77897291,
+        71976143,
+        75744151,
+        77058390,
+        2287312,
+        71520829,
+        2170616,
+        2187946,
+        75281496,
+        2215115,
+        2248938,
+        75982699,
+        2199916,
+        2224137,
+        71384694,
+        2265507,
+        2146618,
+        145448544,
+        2222522,
+        2157068,
+        89514523,
+        2410444,
+        2340854,
+        70964897,
+        2222256,
+        2156417,
+        74021817,
+        2174431,
+        2186004,
+        75381087,
+        2167477,
+        2131422,
+        71597630,
+        2277776,
+        2213504,
+        74399499,
+        2168997,
+        2231017,
+        76115003,
+        2301462,
+        2134050,
+        70476828,
+        2234598,
+        2063536,
+        75669868,
+        2222002,
+        2195316,
+        75658809,
+        2151868,
+        2132583,
+        71221011,
+        1918131,
+        1887054,
+        78775801,
+        2082835,
+        2110701,
+        75877749,
+        1906185,
+        1791571,
+        71184498,
+        2110684,
+        2089992,
+        74534208,
+        1945625,
+        2243197,
+        141710847,
+        2335181,
+        2290388,
+        71160977,
+        2069890,
+        2182599,
+        75136803,
+        2250665,
+        2060722,
+        75839778,
+        2079022,
+        2046520,
+        71017288,
+        2206269,
+        2291762,
+        75142286,
+        2124335,
+        2117945,
+        78036494,
+        2104761,
+        2141905,
+        71166324,
+        2123178,
+        2142883,
+        75146589,
+        2165581,
+        2129411,
+        76276982,
+        2069937,
+        2115016
+      ],
+      "sdk": "fdatasync",
+      "variant": "reserved",
+      "rep": 0,
+      "pid": 3731094,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-0-reserved/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-small128-0-reserved.json"
+      ],
+      "start": 1791891383.6923914,
+      "end": 1791891389.3214202
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 3168,
+      "phase_begin_ns": 485660582,
+      "phase_end_ns": 880561673,
+      "initialization_seconds": 0.485629962,
+      "phase_seconds": 0.394901091,
+      "total_seconds": 0.880558505,
+      "first_durable_seconds": 0.669115184,
+      "close_seconds": 0.005811292,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        183458334,
+        2107909,
+        2015729,
+        1948176,
+        1874310,
+        1963172,
+        2023143,
+        1694790,
+        1720682,
+        1609586,
+        1613744,
+        1629018,
+        2001772,
+        1674791,
+        1773488,
+        1689811,
+        1671149,
+        1655977,
+        1476636,
+        1581811,
+        1538813,
+        1470223,
+        1463219,
+        1644985,
+        1781820,
+        2005793,
+        1754635,
+        1493564,
+        1563779,
+        1601548,
+        1447792,
+        1597110,
+        1612625,
+        1507670,
+        1510931,
+        1530881,
+        1480019,
+        1896583,
+        1483498,
+        1452051,
+        1502506,
+        1462480,
+        1484056,
+        1475566,
+        1504973,
+        1888004,
+        1623219,
+        1679607,
+        1662354,
+        1684668,
+        1592754,
+        1533938,
+        1696608,
+        1696964,
+        1728306,
+        1709628,
+        1594883,
+        1568661,
+        1641190,
+        1653209,
+        1704026,
+        1892878,
+        2025704,
+        1948703,
+        1779199,
+        1562247,
+        1638083,
+        1730180,
+        1893672,
+        2004989,
+        2002488,
+        2000732,
+        1526495,
+        1465631,
+        1618785,
+        1699033,
+        1681434,
+        1630722,
+        1756944,
+        1803532,
+        1624735,
+        1503312,
+        1454128,
+        1559069,
+        1688013,
+        1683572,
+        1584286,
+        1586013,
+        1586088,
+        1619136,
+        1625510,
+        1571823,
+        1487249,
+        1533660,
+        1579424,
+        1549436,
+        1612714,
+        1699269,
+        1706127,
+        1704806,
+        1704303,
+        1612674,
+        1533263,
+        1653635,
+        1847503,
+        1632285,
+        1572211,
+        1582859,
+        1528302,
+        1463440,
+        1641740,
+        1545204,
+        1638285,
+        1636584,
+        1472894,
+        1460950,
+        1509237,
+        1511880,
+        1611266,
+        1590644,
+        1619023,
+        1711086,
+        1858451,
+        2071885,
+        1977394,
+        2100663,
+        1551294,
+        1512591
+      ],
+      "sdk": "fdatasync",
+      "variant": "reserved",
+      "rep": 1,
+      "pid": 3731309,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-1-reserved/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-small128-1-reserved.json"
+      ],
+      "start": 1791891389.4176688,
+      "end": 1791891390.384828
+    },
+    {
+      "status": "PASS",
+      "workload": "small128",
+      "total_begin_ns": 3765,
+      "phase_begin_ns": 18629404,
+      "phase_end_ns": 437510280,
+      "initialization_seconds": 0.018611281,
+      "phase_seconds": 0.418880876,
+      "total_seconds": 0.437506515,
+      "first_durable_seconds": 0.021793211,
+      "close_seconds": 0.006721338,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        3120,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 12854432,
+      "content_and_integrity": true,
+      "operation_ns": [
+        3167803,
+        2656476,
+        2511821,
+        2635376,
+        2674932,
+        2658434,
+        2863623,
+        2906218,
+        3055786,
+        2932746,
+        3021144,
+        3034147,
+        2995849,
+        3172320,
+        3163204,
+        2678231,
+        3045292,
+        3053337,
+        3003548,
+        3106261,
+        3050519,
+        3062495,
+        2736565,
+        2994069,
+        2834245,
+        3215287,
+        3097753,
+        2963607,
+        2775202,
+        3136652,
+        3023401,
+        2999616,
+        2944366,
+        3119299,
+        3305327,
+        3196621,
+        3292922,
+        2803353,
+        2805854,
+        2982508,
+        2997609,
+        5128948,
+        3122530,
+        3173944,
+        3065415,
+        31579849,
+        3130405,
+        3112297,
+        2895616,
+        2788662,
+        3381787,
+        3129206,
+        2679730,
+        2887577,
+        3064424,
+        2832671,
+        2823405,
+        3221098,
+        3050388,
+        2981420,
+        3022035,
+        2715263,
+        2722143,
+        3058589,
+        2998103,
+        2872692,
+        3137106,
+        2904169,
+        2768364,
+        2758417,
+        2829625,
+        2968297,
+        3220079,
+        3178693,
+        3246401,
+        3168883,
+        3008382,
+        2900859,
+        3167461,
+        2887078,
+        3223866,
+        3128880,
+        2857868,
+        3514520,
+        3140119,
+        2696562,
+        2812987,
+        3128820,
+        3126874,
+        3160435,
+        3206116,
+        3233946,
+        3141312,
+        2927567,
+        3258432,
+        3312424,
+        2946099,
+        3371871,
+        3745809,
+        3182139,
+        3404461,
+        3502894,
+        3168250,
+        3370501,
+        3266302,
+        3029742,
+        2903746,
+        3003913,
+        3177895,
+        2704798,
+        3320930,
+        2756046,
+        2940945,
+        3114638,
+        3234169,
+        3127732,
+        2905453,
+        2925303,
+        3209888,
+        3044620,
+        2920173,
+        3254138,
+        3237299,
+        3185621,
+        3024261,
+        3241648,
+        2778629,
+        2725709
+      ],
+      "sdk": "fdatasync",
+      "variant": "baseline",
+      "rep": 1,
+      "pid": 3731320,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-1-baseline/db.sqlite",
+        "small128",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-small128-1-baseline.json"
+      ],
+      "start": 1791891390.4824028,
+      "end": 1791891390.9982142
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 5735,
+      "phase_begin_ns": 17960489,
+      "phase_end_ns": 332647062,
+      "initialization_seconds": 0.017939764,
+      "phase_seconds": 0.314686573,
+      "total_seconds": 0.332641327,
+      "first_durable_seconds": 0.332640527,
+      "close_seconds": 0.002990881,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 10283552,
+      "content_and_integrity": true,
+      "operation_ns": [
+        314686172
+      ],
+      "sdk": "fdatasync",
+      "variant": "baseline",
+      "rep": 0,
+      "pid": 3731323,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-0-baseline/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-write64-0-baseline.json"
+      ],
+      "start": 1791891391.0873556,
+      "end": 1791891391.653269
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 4963,
+      "phase_begin_ns": 35340808,
+      "phase_end_ns": 405692962,
+      "initialization_seconds": 0.035322274,
+      "phase_seconds": 0.370352154,
+      "total_seconds": 0.405687999,
+      "first_durable_seconds": 0.405687202,
+      "close_seconds": 0.011769589,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        370351812
+      ],
+      "sdk": "fdatasync",
+      "variant": "reserved",
+      "rep": 0,
+      "pid": 3731394,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-0-reserved/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-write64-0-reserved.json"
+      ],
+      "start": 1791891392.0216155,
+      "end": 1791891392.637945
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 4363,
+      "phase_begin_ns": 34585637,
+      "phase_end_ns": 371581300,
+      "initialization_seconds": 0.034566991,
+      "phase_seconds": 0.336995663,
+      "total_seconds": 0.371576937,
+      "first_durable_seconds": 0.371576132,
+      "close_seconds": 0.002208193,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 16777216,
+      "final_wal_bytes": 16777216,
+      "content_and_integrity": true,
+      "operation_ns": [
+        336995203
+      ],
+      "sdk": "fdatasync",
+      "variant": "reserved",
+      "rep": 1,
+      "pid": 3731403,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-reserved-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-1-reserved/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-write64-1-reserved.json"
+      ],
+      "start": 1791891393.0273898,
+      "end": 1791891393.5931466
+    },
+    {
+      "status": "PASS",
+      "workload": "write64",
+      "total_begin_ns": 6715,
+      "phase_begin_ns": 19321925,
+      "phase_end_ns": 348000580,
+      "initialization_seconds": 0.019301331,
+      "phase_seconds": 0.328678655,
+      "total_seconds": 0.347993865,
+      "first_durable_seconds": 0.347993104,
+      "close_seconds": 0.003427577,
+      "wal_before": [
+        39,
+        0
+      ],
+      "wal_after": [
+        2496,
+        0
+      ],
+      "initial_wal_bytes": 160712,
+      "final_wal_bytes": 10283552,
+      "content_and_integrity": true,
+      "operation_ns": [
+        328678321
+      ],
+      "sdk": "fdatasync",
+      "variant": "baseline",
+      "rep": 1,
+      "pid": 3731411,
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fdatasync-baseline-diagnostic",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-1-baseline/db.sqlite",
+        "write64",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/fdatasync-write64-1-baseline.json"
+      ],
+      "start": 1791891393.984111,
+      "end": 1791891394.5499713
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-0-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "aa0e828171706e055fbaad4791375be9305fa220f2650b2081f952add92e178a"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156362,
+          "sha256": "f66a9fdd48691ccafc1ad98dfbab80eb7da6ec95c8612aa7881ce2301b12e49c"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 14560112,
+          "sha256": "132da71120f659585ba0d8cf3b759f41e8049959e1c1500a48218c364c5da7c6"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "519e5f5870ee6c6b114c08fa2994fdc84a985a3f0e41405ffa40c4ca17f82767"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "a8cfe49091b8ede4df89395343aedfecc51d20e79adc39e53e445779c3fbfeab"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-0-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "466f6488287613a7ab8904dc6629768db4a6fffa82883813f09ece515be3d206"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156629,
+          "sha256": "2a570a152d73e20d82e4e3c8a10d829d69d8c57f7dada8c0078b081512eb0434"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "0c88737e450d2050edc1c322759f3b2e50a3d8d4d5b9d5535bb304154cbce9a3"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "76d55b2cdeb90e02030df067f7338ee520f368e905a748e913786883227dcbb0"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "f1bc3c9eb5a5998c7356fe025e7ad2005e3265eea7c4520d9bafe7ab9a956df2"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-1-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "c1e88f3223e90d1f2c4dd80fa84cd58f948ede3bb4408dc1c5392ec3901e562a"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156685,
+          "sha256": "5ee882caf646af5ce6b771df7aa24926e0bbf31c5d8bd4d2a60490f903f28429"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "001906933a1ebf133492ddc8a493ad40aac29af2086d230128e1a1e8d043ffd0"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "964bc3cbc3454f3276f896aa750ef016600fce3277519cc7e86a094ae6654190"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "fa36b70bdd77351e80df96b71667201934411b8708d06c2df029644dbefd6c05"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-small128-1-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "7eb0044a111893c39e880d2fcdecf277950ec9a2302734b6ab006058ad9b4f87"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156635,
+          "sha256": "fd0b0298aab546d1894ccff1350b4790ff4b76368ded6bd1d2928be69cec2f29"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 14560112,
+          "sha256": "3341dd9d8b3afac501576a77e638fc1dc66edb5914a43b13075ac459f0928621"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "8f73c61d6a88d12d0763ffa822e1f6797053381b7a499c2fd586c8aa9a27f6ac"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "0e896fc12704f5d71e5339c344418d2b3de38027328a3fb5effc717c537ea938"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-0-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "b1871088719716b45b2d614407dad77c95786a37b2f5c2b47b139db5e995a816"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19756,
+          "sha256": "5cce12d7ab97db19cee32e1d4f8517a8d1fd1f93d63187e1501ddacdff5f0de2"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 10324752,
+          "sha256": "cb9c0bcdd4c3c1d4d10c2ef608a9c907db725129e1880f60b80d09e87e8d4894"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "ed41db7f4e8b024dc952fa1644c6261bbc2d0f80e9247f1aa86727a55117d59b"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "8da77c0d07564f0cddb3817cc7a145a06096604cee3422400521b6024863d0b8"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-0-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "36fffc9639b40e43c4cc2f03a5341aa03bf350d1de0f6fe963e4c921d99f6013"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19885,
+          "sha256": "251880f57bac3453c8f02e88b70c8dfb92777a9de020fe5d1d1b449be9440037"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "27bb9fbe31443561ade3afbb752cc378b1085c997a08a28d43fb05ada52634ed"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "5ca507c5d578cf9b444af8d9a7253d92540fccf00e0364f139122a29773b2e7e"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "c4b6399f92d5b2a74d6e57c9da897614fdbe85f5d9a3c47ec01a3d5649df346d"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-1-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "8d631831040e5c390cd58f2f0289c3b2e8ff75d4231ff0aa28870c649341ae70"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19872,
+          "sha256": "5dfde9c3f8f3cf340b0dfa5bee2746bf2e8daae27c49de7ff6e39ed5de46b999"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "5a61e5f1b622aaff6d23c2b244d755906f6160515db2dceaa8189b1b7c8c9286"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "bdf49046e78447f273b2e78d9544ebc34c13a601c39430a724c94fb151a66d19"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "d9238500d8a0b1fd28625828aec6895b3de7dd312acefa3655c46224f4f15e3a"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fsync-write64-1-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "23ef97c91ee199e02d60ffc9f7e59c1b78822822263ff76205593596913d979a"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19736,
+          "sha256": "206390d788112da6b0ee56b1eb7103d4531a2b6861fd2a70e9ba899e6de29488"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 10324752,
+          "sha256": "b01c911be063fea6347b5eb221007c966e3f801a770f38448ef649dc35d7f33e"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "9dff8d897b8a5ac0aea632e733e06307a2c15431834ae44ab9abce1f8bd4617a"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "f0560fb7e881052f1b99a2b682196babae331832261af3e4648ff8c87e22292f"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-0-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "6f7415cdaed1031900d6ba75bbb1889393ee113eacf88e54d93f18d583bf5b4f"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 157059,
+          "sha256": "8c50468e1310b5ec06cfad64b21aec64f1d5ab40841cc2986cfe6979a781b889"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 14560112,
+          "sha256": "401bb9145c9a4530f9d3b52ef8fb70bea7950247c7d880c8e2a414415d5f0865"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "662639e062727bfadb940ee1c2489c4ee5cc766945e9d5f43714ce918692c0d0"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "93718315903a3a006a67cc535e684aea5519822d9c87ce73d04fa4614d60f7b4"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-0-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "09ddee0f9bba3bed989e7f6c9f265c607a3b14cf73a2f9c16ba2b53f63c55d2d"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 160078,
+          "sha256": "3783f54d1cb99382a7844bb2bd542b0d47745bcb58c24b17a67e8e6e49d22a05"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "6b481f776bd7ba84f8ae07e85cfd038e26aa78c9030e5f54045d221a8cb2990d"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "b3d8c066a2d5b022e1a73410bd7186892ffdbc669b911ac320d50c419efb6869"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "463fa1fd2f3ca068fb598045abed43b0e4a94e6ee9f374fb48b9173509f406c5"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-1-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "443f05828c726a2bd3139d9250f363e07b1866542b3e1ea9357bd3736fa2466d"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156908,
+          "sha256": "469bc547154486f724cf475305bbfb31d40cd8ca297aa968815229ee7dba53f1"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "9768083bfbc3155246fb47d568098a1a6005b0eb9ebc7286fe92865e9d7ca824"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "6cf4e970d6f87fa5cf70f89671ea5c862c6092f2d46fdf48711c045c62ef02c7"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "f6af82f4622768a556ba37bba8f95d4471c3e75bcf1574840f59a623af1ec6c2"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-small128-1-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "e0333f0047f714a894a6f3c26496361347763f83e1994c38835f085e3ce315cc"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 156727,
+          "sha256": "c412f4b9e470068204642f0673191e162be478f23bf90c8aedcaf9540c552455"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 14560112,
+          "sha256": "79201dae9a6d678c3f892724a59ba21999d0623af32b810d38b2d186296f7ce3"
+        },
+        "db.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "7efbe104b3a38a7374e3ecf1ab0192b13d66c24003ba0c56405412c27893305d"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "934b4926ba917fab5e12694713fc1891965d0d6112bd5b499c038abeb6c103fd"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-0-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "f47fdce79cc50eee944aa417b2a98f887b4231c75c4dc31dad63e1322e0b6256"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19730,
+          "sha256": "c7520cce9ffbee63ae3a722d47afabaaa1bedc347609dccbc7684b9ccc5cf64a"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 10324752,
+          "sha256": "9100daa9db298a9e709fa1a7f5324b0aff947dd1403557c7fd3e992a96c9488f"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "fa37b4a0a0bb8a794d5eeb41d5483d005c5f73fd92ebf70f7d31f4f7f749d13b"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "4d720461254ba8bcf93c0c36d4f338bff8ab564741b84458bac4808a03913247"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-0-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "29b22781b37fca1355ba27f596fd6c087d2fa9c009237cbec6f2462fc7ea6376"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19843,
+          "sha256": "b0790f77d974ae79eaf15ac705b1b026398832a33b2c833bd168b73a320b01e2"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "08d4b6f44ea952f56ad0a17b8d65a4e2c7341bc61838e4a5e7d227498d75eb2e"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "eff214314788d74b2d5379f5244bc8eba3f5c6a61760e0b547ffece614bb35e5"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "8656135800bec7949106f14ebd2c69b9c9e78660ea0cf21ae3289462af6083e6"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-1-reserved",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "693299e0389df7a20576d416d58192e5cdddf34121b8c06aa874ba47fb2b4ee0"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19840,
+          "sha256": "c6a0c553139e2ce30b3464bf16a9baaa0a8965d7c9c679a8b1594ac35789f6c2"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 16777216,
+          "sha256": "2c8a24fa5f5d1e9b99143a40f4a8394949e18ec6f8298688ebedbc5634fa6b81"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "4dff717f4cf3c0fa7ed82c9f261eac003072999db61313896ec7948fead0ee62"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "be95bd8d31dc9747829c3eced40e92314684a315cde8916e20e247260bce91eb"
+        }
+      }
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/diagnostic/owned-fdatasync-write64-1-baseline",
+      "removed": true,
+      "process_stopped": true,
+      "mount_absent": true,
+      "files": {
+        "db.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "db.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "93858224dd1a3b35791c4cb25f53f772fde78d3f1e9ff9a4af95a573c869f759"
+        },
+        "db.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.request-costs.json": {
+          "bytes": 19691,
+          "sha256": "d44807cdf8316974bae81d73ad66a57107ae9b1c2c16da9a938c98cbc5dacce2"
+        },
+        "db.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite-wal": {
+          "bytes": 10324752,
+          "sha256": "978ea165bd82297028dda0dcb5e092ab402d676efb3e840600febcf67914dc2b"
+        },
+        "db.sqlite.payload": {
+          "bytes": 67112960,
+          "sha256": "7971f68d66bdd86b54c3907c47ca37095faf2b9461623b84a9bc945256d9797b"
+        },
+        "db.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "db.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "a435b30374d21cc2a97c25dec0f1621e541ef618a91453137a0ae159494356ed"
+        }
+      }
+    }
+  ],
+  "ended_epoch": 1791891395.4670885,
+  "free_bytes_after": 92855914496,
+  "monitor_stopped": true
+}

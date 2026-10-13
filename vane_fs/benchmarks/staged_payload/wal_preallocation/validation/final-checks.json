@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "epoch": 1791892560.8531733,
+  "related_only": true,
+  "checks": {
+    "format_changed_sources": "PASS",
+    "ruff_no_fix": "PASS",
+    "whitespace": "PASS",
+    "copyleft": {
+      "source_inventory": "passed",
+      "native_profile": "passed",
+      "installed_notices": []
+    },
+    "changed_source_spdx": "PASS"
+  },
+  "unchanged_optional_spdx_issue": "Five older experimental sources; not rerun or modified"
+}
