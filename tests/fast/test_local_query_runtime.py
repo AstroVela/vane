@@ -1012,8 +1012,10 @@ def test_datasource_input_reentry_is_rejected_before_connection_locks(native_env
                 yield pa.record_batch({"x": [1]})
 
             relation = callback_relation(connection, batches)
+            # Exercise the deadline-managed path without letting setup expire
+            # before the callback whose reentry guard this test must observe.
             runtime = connection.configure_local_runtime(
-                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1 if timed else None
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=5.0 if timed else None
             )
             try:
                 assert relation.fetchall() == [(1,)]
@@ -1066,8 +1068,10 @@ def test_datasource_input_file_operations_check_reentry(native_environment, tmp_
         faulthandler.dump_traceback_later(8, exit=True)
         path, entry, target = sys.argv[1:]
         with vane.connect(config={"threads": 2}) as parent:
+            # Keep deadline handling enabled while allowing input setup to
+            # reach the callback whose FILE reentry guard is under test.
             runtime = parent.configure_local_runtime(
-                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=5.0
             )
             with parent.cursor() as cursor, parent.cursor() as sibling:
                 executing = parent if target == "connection" else cursor
