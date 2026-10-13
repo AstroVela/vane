@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import gc
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypeVar
 
 import numpy as np
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
-from vane.ai._video_embedding import VideoInputSpec
+from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.protocols import (
     ImageEmbedderDescriptor,
     TextEmbedderDescriptor,
@@ -28,7 +30,7 @@ from vane.ai.typing import UDFOptions
 
 PROVIDER = "qwen3_vl"
 INSTRUCTION = "Represent the user's input."
-CONTRACT = {
+CONTRACT: dict[str, Any] = {
     "device": "cuda",
     "dtype": "bfloat16",
     "attention": "sdpa",
@@ -46,12 +48,15 @@ CONTRACT = {
 }
 
 
+_DescriptorT = TypeVar("_DescriptorT", bound="_Descriptor")
+
+
 @dataclass
 class _Descriptor:
     model: str
     dimensions: int = 2048
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.dimensions) is not int or self.dimensions != CONTRACT["dimensions"]:
             raise EmbeddingConfigurationError("The Qwen3-VL SQR encoder requires dimensions=2048")
         if (
@@ -62,27 +67,27 @@ class _Descriptor:
         ):
             raise EmbeddingConfigurationError("The Qwen3-VL SQR encoder requires an absolute local checkpoint path")
 
-    def get_provider(self):
+    def get_provider(self) -> str:
         return PROVIDER
 
-    def get_model(self):
+    def get_model(self) -> str:
         return self.model
 
-    def get_options(self):
+    def get_options(self) -> dict[str, Any]:
         return dict(CONTRACT)
 
-    def get_dimensions(self):
+    def get_dimensions(self) -> int:
         return self.dimensions
 
-    def get_udf_options(self):
+    def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=1)
 
-    def instantiate(self):
+    def instantiate(self) -> Qwen3VLEmbedder:
         return Qwen3VLEmbedder(self.model)
 
 
 class Qwen3VLTextDescriptor(_Descriptor, TextEmbedderDescriptor):
-    def supports_chunking(self):
+    def supports_chunking(self) -> bool:
         return False
 
 
@@ -91,41 +96,51 @@ class Qwen3VLImageDescriptor(_Descriptor, ImageEmbedderDescriptor):
 
 
 class Qwen3VLVideoDescriptor(_Descriptor, VideoEmbedderDescriptor):
-    def get_input_spec(self):
+    def get_input_spec(self) -> VideoInputSpec:
         return VideoInputSpec(max_frames=CONTRACT["max_frames"], max_input_bytes=CONTRACT["max_input_bytes"])
 
-    def supports_image_queries(self):
+    def supports_image_queries(self) -> bool:
         return True
 
 
 class Qwen3VLProvider(Provider):
-    def __init__(self, name=None):
+    def __init__(self, name: str | None = None) -> None:
         if name not in (None, PROVIDER):
             raise EmbeddingConfigurationError("The Qwen3-VL encoding identity cannot be renamed")
 
     @property
-    def name(self):
+    def name(self) -> str:
         return PROVIDER
 
     @staticmethod
-    def _descriptor(cls, model, dimensions, options):
+    def _descriptor(
+        cls: type[_DescriptorT], model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> _DescriptorT:
         # Vane consumes normalization/execution options before this factory.
         # This provider has one trained encoding contract, with no role overrides.
         if options:
             raise EmbeddingConfigurationError("The Qwen3-VL SQR encoder accepts no encoding overrides")
+        if model is None:
+            raise EmbeddingConfigurationError("The Qwen3-VL SQR encoder requires an absolute local checkpoint path")
         return cls(model, dimensions if dimensions is not None else CONTRACT["dimensions"])
 
-    def get_text_embedder(self, model=None, dimensions=None, *, options=None):
+    def get_text_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> Qwen3VLTextDescriptor:
         return self._descriptor(Qwen3VLTextDescriptor, model, dimensions, options)
 
-    def get_image_embedder(self, model=None, dimensions=None, *, options=None):
+    def get_image_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> Qwen3VLImageDescriptor:
         return self._descriptor(Qwen3VLImageDescriptor, model, dimensions, options)
 
-    def get_video_embedder(self, model=None, dimensions=None, *, options=None):
+    def get_video_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> Qwen3VLVideoDescriptor:
         return self._descriptor(Qwen3VLVideoDescriptor, model, dimensions, options)
 
 
-def pool_last(hidden, mask):
+def pool_last(hidden: Any, mask: Any) -> Any:
     """Keep the last real token, including an appended EOS, in padded batches."""
     import torch
 
@@ -135,7 +150,7 @@ def pool_last(hidden, mask):
     return hidden[torch.arange(hidden.shape[0], device=hidden.device), positions].float()
 
 
-def video_payload(clip):
+def video_payload(clip: VideoClip) -> tuple[np.ndarray[Any, Any], dict[str, Any]]:
     """Preserve the caller's exact frames and absolute microsecond timestamps."""
     count = len(clip.frames)
     if not 2 <= count <= CONTRACT["max_frames"] or count % 2:
@@ -164,7 +179,7 @@ def video_payload(clip):
 
 
 class Qwen3VLEmbedder:
-    def __init__(self, path):
+    def __init__(self, path: str) -> None:
         with (
             _translate_missing_provider_dependency(PROVIDER, "torch"),
             _translate_missing_provider_dependency(PROVIDER, "safetensors"),
@@ -173,10 +188,14 @@ class Qwen3VLEmbedder:
             _translate_missing_provider_dependency(PROVIDER, "PIL"),
         ):
             import torch
-            from safetensors import safe_open
-            from transformers import AutoConfig, AutoProcessor, Qwen3VLModel
+            from safetensors import safe_open  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                AutoConfig,
+                AutoProcessor,
+                Qwen3VLModel,
+            )
 
-            self.model = None
+            self.model: Any = None
             if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
                 raise EmbeddingConfigurationError("The selected Qwen BF16 provider requires a CUDA GPU supporting BF16")
             config = AutoConfig.from_pretrained(path, local_files_only=True, trust_remote_code=False)
@@ -237,7 +256,7 @@ class Qwen3VLEmbedder:
                 raise EmbeddingConfigurationError("The local checkpoint lacks the exact trained Qwen model weights")
             self.model = model.to("cuda").eval().requires_grad_(False)
 
-    def _text_inputs(self, texts):
+    def _text_inputs(self, texts: list[str]) -> dict[str, Any]:
         conversations = [
             [
                 {"role": "system", "content": INSTRUCTION},
@@ -257,7 +276,7 @@ class Qwen3VLEmbedder:
             raise EmbeddingConfigurationError("Query exceeds the trained SQR token budget; truncation is forbidden")
         return inputs
 
-    def _infer(self, inputs):
+    def _infer(self, inputs: dict[str, Any]) -> list[np.ndarray[Any, Any]]:
         import torch
 
         if inputs["attention_mask"].sum(1).max().item() > CONTRACT["max_input_tokens"]:
@@ -277,10 +296,10 @@ class Qwen3VLEmbedder:
                 raise EmbeddingConfigurationError("Qwen returned a zero embedding")
             return list(torch.nn.functional.normalize(pooled, dim=-1).cpu().numpy())
 
-    def embed_text(self, texts):
+    def embed_text(self, texts: list[str]) -> list[np.ndarray[Any, Any]]:
         return self._infer(self._text_inputs(texts)) if texts else []
 
-    def embed_video(self, clips):
+    def embed_video(self, clips: list[VideoClip]) -> list[np.ndarray[Any, Any]]:
         if not clips:
             return []
         payloads = [video_payload(clip) for clip in clips]
@@ -305,7 +324,7 @@ class Qwen3VLEmbedder:
         )
         return self._infer(inputs)
 
-    def embed_image(self, images):
+    def embed_image(self, images: list[np.ndarray[Any, Any]]) -> list[np.ndarray[Any, Any]]:
         if not images:
             return []
         for frame in images:
@@ -333,12 +352,12 @@ class Qwen3VLEmbedder:
         )
         return self._infer(inputs)
 
-    def close(self):
+    def close(self) -> None:
         import torch
 
         self.model = None
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         self.close()
