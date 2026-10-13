@@ -16,6 +16,7 @@
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/aggregate/wide_integer.hpp"
+#include "duckdb/function/aggregate/wide_interval.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -808,6 +809,9 @@ private:
 			                       aggregate.children[0]->return_type.id() != LogicalTypeId::DOUBLE))) {
 				if (aggregate.children[0]->return_type.InternalType() == PhysicalType::INT128) {
 					aggregate.function = WideIntegerAvgFunction(aggregate.children[0]->return_type);
+					wide_aggregate = true;
+				} else if (aggregate.children[0]->return_type.id() == LogicalTypeId::INTERVAL) {
+					aggregate.function = WideIntervalAvgFunction();
 					wide_aggregate = true;
 				}
 			}

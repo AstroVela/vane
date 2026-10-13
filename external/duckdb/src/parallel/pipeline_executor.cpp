@@ -7,6 +7,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 
 #include "duckdb/execution/external_block.hpp"
+#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -18,6 +19,19 @@
 namespace duckdb {
 
 namespace {
+
+SinkResultType FlushCollector(ExecutionContext &context, PhysicalOperator &sink, LocalSinkState &local,
+                              InterruptState &interrupt, bool force = false) {
+	if (sink.type != PhysicalOperatorType::RESULT_COLLECTOR) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	auto &collector = sink.Cast<PhysicalResultCollector>();
+	if (!collector.requires_periodic_flush) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	OperatorSinkInput input {*sink.sink_state, local, interrupt};
+	return collector.FlushPending(context, input, force);
+}
 
 idx_t ExecutionBatchSize(const ExecutionBatch &batch) {
 	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
@@ -496,9 +510,24 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 			SourceResultType source_result = SourceResultType::BLOCKED;
 			if (!next_batch_blocked) {
 				// "Regular" path: fetch a chunk from the source and push it through the pipeline
+				auto flush = FlushCollector(context, *pipeline.sink, *local_sink_state, interrupt_state);
+				if (flush == SinkResultType::BLOCKED) {
+					return PipelineExecuteResult::INTERRUPTED;
+				}
+				if (flush == SinkResultType::FINISHED) {
+					FinishProcessing();
+					exhausted_pipeline = true;
+					break;
+				}
 				source_chunk.Reset();
 				source_result = FetchFromSource(source_chunk);
 				if (source_result == SourceResultType::BLOCKED) {
+					if (FlushCollector(context, *pipeline.sink, *local_sink_state, interrupt_state, true) ==
+					    SinkResultType::FINISHED) {
+						FinishProcessing();
+						exhausted_pipeline = true;
+						continue;
+					}
 					return PipelineExecuteResult::INTERRUPTED;
 				}
 				if (source_result == SourceResultType::FINISHED) {
@@ -606,6 +635,15 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 				// consumed views before asking the source for more: it may need their
 				// shared-memory credit to make progress. Blocked retries and operators
 				// with more output take the earlier branches and keep their input.
+				auto flush = FlushCollector(context, *pipeline.sink, *local_sink_state, interrupt_state);
+				if (flush == SinkResultType::BLOCKED) {
+					return PipelineExecuteResult::INTERRUPTED;
+				}
+				if (flush == SinkResultType::FINISHED) {
+					FinishProcessing();
+					exhausted_pipeline = true;
+					break;
+				}
 				D_ASSERT(in_process_operators.empty());
 				for (auto &batch : intermediate_batches) {
 					*batch = ExecutionBatch();
@@ -619,6 +657,12 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 				}
 				source_result = FetchFromSourceBatch(source_batch);
 				if (source_result == SourceResultType::BLOCKED) {
+					if (FlushCollector(context, *pipeline.sink, *local_sink_state, interrupt_state, true) ==
+					    SinkResultType::FINISHED) {
+						FinishProcessing();
+						exhausted_pipeline = true;
+						continue;
+					}
 					return PipelineExecuteResult::INTERRUPTED;
 				}
 				if (source_result == SourceResultType::FINISHED) {

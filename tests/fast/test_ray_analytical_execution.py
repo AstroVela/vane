@@ -31,6 +31,7 @@ from tests.fast.test_analytical_fragment_compiler import (
     scaled_wide_value,
     wide_aggregate_queries,
 )
+from tests.fast.test_execution_performance import interval_average_queries
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -55,6 +56,32 @@ QUERIES = [
     "select a.range a, b.range b from range(101) a full join range(121) b using(range) order by b.range nulls last, a.range",
     "select range % 13 k, sum(range::decimal(15,2)) s from range(100) group by k order by s desc limit 5",
 ]
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_interval_average_preserves_wide_partition_states(tmp_path, mode):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        for sql in interval_average_queries():
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert [tuple(row.values()) for row in result.collect().to_pylist()] == expected, sql
+            assert_idle(connection)
+
+
+def test_sparse_pipelined_scan_limit_returns_before_scan_completion(tmp_path):
+    limits = replace(resources(tmp_path), exchange=DirectExchangeLimits())
+    with vane.Runtime(limits) as application, application.connect() as connection:
+        # Warm actor startup before applying a short execution deadline.
+        connection.query("select 1").collect()
+        deadline = vane.QueryExecutionOptions(vane.RayExecution(), 30, 5, 30)
+        sql = "select range from range(1000000000000) where range<100 or range>=999999999900 limit 1"
+        with connection.query(sql, options=deadline) as result:
+            assert result.collect().to_pylist() == [{"range": 0}]
+        assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

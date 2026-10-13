@@ -9,7 +9,7 @@ from collections import Counter
 import pytest
 
 import vane
-from tests.fast.test_direct_exchange import collect, submission
+from tests.fast.test_direct_exchange import collect, next_batch, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -90,6 +90,91 @@ def test_sparse_batches_are_coalesced_before_exchange(threads):
             assert state["accepted_rows"] == len(expected)
             assert state["accepted_frames"] <= (len(expected) + 127) // 128 + threads
             assert state["peak_bytes"] <= limits.window_bytes
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("limit", [False, True])
+def test_sparse_scan_flushes_before_another_nonempty_batch(threads, limit):
+    # The next matching scan batch is hours away. A partial frame must leave the
+    # collector while later source batches are being completely filtered out.
+    sql = "select range from range(1000000000000) where range<100 or range>=999999999900"
+    if limit:
+        sql += " limit 1"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection, sql, partitions=2, timeout=2)
+        with InProcessTaskService(connection, spec) as service:
+            service.start()
+            if limit:
+                assert collect(service) == [(0,)]
+            else:
+                status, batch = next_batch(service)
+                assert status == "data"
+                assert batch.to_rows() == [(row,) for row in range(100)]
+                batch.close()
+                assert service.result.snapshot()["accepted_rows"] == 100
+
+
+def interval_average_queries():
+    cases = []
+    for unit, negative, positive in (
+        ("months", -2000000000, 1000000000),
+        ("days", -2000000000, 1000000000),
+        ("microseconds", -8000000000000000000, 4000000000000000000),
+    ):
+        source = (
+            f"select range, case when range=0 then interval '{negative} {unit}' "
+            f"when range<3 then interval '0 {unit}' else interval '{positive} {unit}' end v from range(6)"
+        )
+        cases.append(f"select avg(v)::varchar, avg(-v)::varchar, count(v) from ({source})")
+        cases.append(f"select avg(distinct v)::varchar, avg(v) filter(where range<>1)::varchar from ({source})")
+        cases.append(f"select range % 2 k, avg(v)::varchar from ({source}) group by k order by k")
+    cases.extend(
+        [
+            "select avg(interval '3 months -4 days 5 microseconds' * range)::varchar, "
+            "avg(interval '-2 months 1 day -7 microseconds' * range)::varchar from range(7)",
+            "select avg(null::interval)::varchar from range(9)",
+            "select avg(interval '1 day')::varchar from range(0)",
+        ]
+    )
+    return cases
+
+
+@pytest.mark.parametrize("partitions", [1, 2, 3])
+@pytest.mark.parametrize("sql", interval_average_queries())
+def test_interval_average_uses_wide_partial_and_complete_states(sql, partitions):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        # Keep interval components native between stages: Python timedelta has
+        # a smaller day range and normalizes microseconds into days.
+        spec = submission(connection, sql, partitions=partitions)
+        limits = DirectExchangeLimits(4096, 1024, 64, 2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_interval_average_combines_overflowing_subtotals_in_either_order(reverse):
+    sql = interval_average_queries()[3]  # The review's day-overflow input.
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        producer, final = graph.fragments
+        states = []
+        for partition in range(2):
+            assignments = {
+                source.source_id: [split.split_id for split in source.splits[partition::2]]
+                for source in producer.sources
+            }
+            rows = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
+            assert len(rows) == 1 and all(isinstance(value, bytes) for value in rows[0])
+            states.extend(rows)
+        if reverse:
+            states.reverse()
+        assert (
+            native._execute_fragment_for_test(connection, final.native_plan, {final.inputs[0].port_id: states}, {})
+            == expected
+        )
 
 
 def test_same_worker_edges_share_channels_and_reserve_no_flight_staging(monkeypatch):

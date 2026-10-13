@@ -11,6 +11,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 
 #include <set>
+#include <chrono>
 
 namespace duckdb {
 namespace vane_execution {
@@ -120,6 +121,8 @@ void ObserveBuilds(PhysicalOperator &op, DirectTaskProgress &progress) {
 
 class DirectSinkLocal : public LocalSinkState {
 public:
+	using Clock = std::chrono::steady_clock;
+	Clock::time_point next_flush = Clock::now() + std::chrono::milliseconds(10);
 	struct Buffer {
 		unique_ptr<ColumnDataCollection> data;
 		idx_t bytes = 0;
@@ -157,6 +160,7 @@ public:
 	                vector<DirectOutput> outputs_p, shared_ptr<DirectTaskProgress> progress_p)
 	    : PhysicalResultCollector(*data.physical_plan, data), inputs(std::move(inputs_p)),
 	      outputs(std::move(outputs_p)), progress(std::move(progress_p)) {
+		requires_periodic_flush = inputs.empty();
 	}
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
@@ -199,6 +203,26 @@ public:
 		}
 		buffer.Reset();
 		return true;
+	}
+	SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &input, bool force) const override {
+		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		auto now = DirectSinkLocal::Clock::now();
+		if (!force && now < state.next_flush) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		progress->output_blocked.store(false);
+		bool live = false;
+		for (idx_t out = 0; out < outputs.size(); out++) {
+			for (idx_t target = 0; target < outputs[out].channels.size(); target++) {
+				auto &channel = *outputs[out].channels[target];
+				live = channel.HasConsumers() || live;
+				if (!Flush(state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
+					return SinkResultType::BLOCKED;
+				}
+			}
+		}
+		state.next_flush = now + std::chrono::milliseconds(10);
+		return live ? SinkResultType::NEED_MORE_INPUT : SinkResultType::FINISHED;
 	}
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
 		progress->output_blocked.store(false);
@@ -265,9 +289,9 @@ public:
 						}
 						continue;
 					}
-					// Input-driven tasks may wait indefinitely for another upstream
-					// frame. Forward their available rows immediately; coalesce only
-					// local scans, which can keep producing until their own EOF.
+					// Forward input-driven tasks immediately. Local scans coalesce
+					// until the frame fills or their periodic pipeline flush fires,
+					// including when later scan batches are entirely filtered out.
 					if (inputs.empty() && (buffer.Count() || (count < channel.limits.frame_rows &&
 					                                          count == rows.size() - state.offset))) {
 						if (!buffer.data) {
