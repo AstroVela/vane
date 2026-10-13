@@ -40,6 +40,21 @@ def test_public_ie_join_preserves_equality_tail(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_ie_join_parallel_outer_payloads(tmp_path, mode):
+    with (
+        vane.connect(config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path, cpus_per_worker=4)) as application,
+        application.connect() as connection,
+    ):
+        for sql in IE_JOIN_CASES[-2:]:
+            expected = local.execute(sql).fetchall()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                table = result.collect()
+                assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected)
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_subquery_and_cte_semantics(tmp_path, mode):
     limits = resources(tmp_path, max_active_queries=1, max_results=1, task_contexts_per_worker=64, io_concurrency=256)
     with vane.connect() as local, vane.Runtime(limits) as application, application.connect() as connection:

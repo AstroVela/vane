@@ -921,7 +921,9 @@ public:
 	{
 		auto &op = gsource.op;
 		auto &allocator = Allocator::Get(client);
-		unprojected.InitializeEmpty(op.unprojected_types);
+		// A parallel source can receive an outer task before any matching rows.
+		// Its NULL payload columns need storage even without a previous Reference.
+		unprojected.Initialize(allocator, op.unprojected_types);
 		lpayload.Initialize(allocator, op.children[0].get().GetTypes());
 		rpayload.Initialize(allocator, op.children[1].get().GetTypes());
 

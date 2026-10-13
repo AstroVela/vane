@@ -3,6 +3,9 @@
 
 """Native SQL semantics across subquery and shared-state fragment boundaries."""
 
+import subprocess
+import sys
+import textwrap
 from collections import Counter
 
 import pytest
@@ -149,6 +152,31 @@ def test_ie_join_preserves_range_conditions_before_equality_tail(partitions):
         expected = connection.execute(IE_JOIN_EQUALITY_TAIL).fetchall()
         graph = compile_sql(connection, IE_JOIN_EQUALITY_TAIL, partitions)
         assert Counter(execute_graph(connection, graph)) == Counter(expected)
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_ie_join_parallel_outer_tasks_own_null_payloads(threads):
+    # A source thread can start with unmatched rows without ever producing an
+    # inner match. Run in a child so an invalid native payload fails one test.
+    script = textwrap.dedent(
+        """
+        import sys
+        from collections import Counter
+        import vane
+        from tests.fast.test_fragment_sql_coverage import IE_JOIN_CASES
+        from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
+
+        with vane.connect(config={"threads": int(sys.argv[1])}) as connection:
+            for sql in IE_JOIN_CASES[-2:]:
+                assert "IE_JOIN" in connection.execute("explain (format json) " + sql).fetchone()[1]
+                for _ in range(3):
+                    rows = connection.execute(sql).fetchall()
+                    assert any(a is None or b is None for a, b in rows)
+                    assert Counter(execute_graph(connection, compile_sql(connection, sql, 3))) == Counter(rows)
+        """
+    )
+    completed = subprocess.run([sys.executable, "-c", script, str(threads)], capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("entry", ["compiler", "pipelined", "fte"])
