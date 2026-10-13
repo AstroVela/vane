@@ -311,6 +311,12 @@ class Qwen3VLEmbedder:
             for _ in clips
         ]
         prompts = self.processor.apply_chat_template(conversations, tokenize=False, add_generation_prompt=True)
+        # Transformers 5.12.1 expands only the video token, adding a vision
+        # boundary pair for each temporal patch. Remove the checkpoint template's
+        # outer pair first, preserving the reference processor's video encoding.
+        video_token = self.processor.video_token
+        wrapped_video = f"{self.processor.vision_start_token}{video_token}{self.processor.vision_end_token}"
+        prompts = [prompt.replace(wrapped_video, video_token) for prompt in prompts]
         inputs = self.processor(
             text=prompts,
             videos=[p[0] for p in payloads],

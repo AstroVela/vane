@@ -154,6 +154,140 @@ def test_default_special_token_postprocessing_and_query_budget():
 
 
 @pytest.fixture
+def real_processor():
+    pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    # An authored byte tokenizer preserves timestamps and every boundary token.
+    # Exercise the real SDK without fetching checkpoint assets or model weights.
+    special = [
+        "[UNK]",
+        "[PAD]",
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|video_pad|>",
+        "<|image_pad|>",
+    ]
+    vocabulary = special + sorted(tokenizers.pre_tokenizers.ByteLevel.alphabet())
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.BPE({token: i for i, token in enumerate(vocabulary)}, merges=[], unk_token="[UNK]")
+    )
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = tokenizers.decoders.ByteLevel()
+    tokenizer.post_processor = tokenizers.processors.TemplateProcessing(
+        single="$A <|endoftext|>", special_tokens=[("<|endoftext|>", 2)]
+    )
+    fast = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token=special[0],
+        pad_token=special[1],
+        eos_token=special[2],
+        additional_special_tokens=special[3:],
+        model_input_names=["input_ids", "attention_mask"],
+    )
+    template = """
+{%- for message in messages -%}
+    {{- '<|im_start|>' + message.role + '\n' -}}
+    {%- if message.content is string -%}
+        {{- message.content -}}
+    {%- else -%}
+        {%- for item in message.content -%}
+            {%- if item.type == 'video' -%}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' -}}
+            {%- elif item.type == 'image' -%}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+            {%- else -%}
+                {{- item.text -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}
+"""
+    return transformers.Qwen3VLProcessor(
+        tokenizer=fast,
+        image_processor=transformers.Qwen2VLImageProcessor(patch_size=16, temporal_patch_size=2, merge_size=2),
+        video_processor=transformers.Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2),
+        chat_template=template,
+    )
+
+
+@pytest.mark.parametrize("counts", [(2,), (4,), (64,), (2, 4)])
+@pytest.mark.parametrize("wrapped", [True, False])
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+def test_real_video_processor_matches_reference_temporal_tokens(real_processor, counts, wrapped):
+    torch = pytest.importorskip("torch")
+    if not wrapped:
+        real_processor.chat_template = real_processor.chat_template.replace(
+            "<|vision_start|><|video_pad|><|vision_end|>", "<|video_pad|>"
+        )
+    encoder = Qwen3VLEmbedder.__new__(Qwen3VLEmbedder)
+    encoder.processor = real_processor
+    encoder._infer = lambda inputs: inputs
+    sources = [clip(count=count, size=32 * (i + 1)) for i, count in enumerate(counts)]
+    inputs = encoder.embed_video(sources)
+    expected_prompts = []
+    for source in sources:
+        # Reference contract: a timestamp followed by one vision-boundary pair
+        # per two-frame patch. There is no outer pair enclosing the whole video.
+        patches = []
+        spatial_tokens = (source.frames[0].shape[0] // 32) ** 2
+        for i in range(0, len(source.frames), 2):
+            timestamp = (source.frame_times[i] + source.frame_times[i + 1]) / 2
+            patches.append(
+                f"<{timestamp:.1f} seconds><|vision_start|>" + "<|video_pad|>" * spatial_tokens + "<|vision_end|>"
+            )
+        expected_prompts.append(
+            f"<|im_start|>system\n{INSTRUCTION}<|im_end|>\n<|im_start|>user\n"
+            + "".join(patches)
+            + "<|im_end|>\n<|im_start|>assistant\n"
+        )
+    expected = real_processor.tokenizer(expected_prompts, add_special_tokens=True, padding=True, return_tensors="pt")
+    assert torch.equal(inputs["input_ids"], expected["input_ids"])
+    assert torch.equal(inputs["attention_mask"], expected["attention_mask"])
+    for i, count in enumerate(counts):
+        ids = inputs["input_ids"][i][inputs["attention_mask"][i].bool()].tolist()
+        assert ids.count(real_processor.vision_start_token_id) == count // 2
+        assert ids.count(real_processor.vision_end_token_id) == count // 2
+        assert ids[-1] == real_processor.tokenizer.eos_token_id
+        assert inputs["video_grid_thw"][i].tolist() == [count // 2, 2 * (i + 1), 2 * (i + 1)]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+def test_real_image_processor_keeps_its_single_vision_boundary_pair(real_processor):
+    encoder = Qwen3VLEmbedder.__new__(Qwen3VLEmbedder)
+    encoder.processor = real_processor
+    encoder._infer = lambda inputs: inputs
+    inputs = encoder.embed_image([np.zeros((64, 64, 3), dtype=np.uint8)])
+    prompt = (
+        f"<|im_start|>system\n{INSTRUCTION}<|im_end|>\n<|im_start|>user\n<|vision_start|>"
+        + "<|image_pad|>" * 4
+        + "<|vision_end|><|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert inputs["input_ids"][0].tolist() == real_processor.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+
+
+def test_real_processor_text_keeps_literal_video_tokens(real_processor):
+    encoder = Qwen3VLEmbedder.__new__(Qwen3VLEmbedder)
+    encoder.processor = real_processor
+    query = "Explain <|vision_start|><|video_pad|><|vision_end|>."
+    inputs = encoder._text_inputs([query])
+    prompt = (
+        f"<|im_start|>system\n{INSTRUCTION}<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert inputs["input_ids"][0].tolist() == real_processor.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+
+
+@pytest.fixture
 def sdk(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
     safetensors = pytest.importorskip("safetensors.torch")
@@ -182,6 +316,9 @@ def sdk(monkeypatch, tmp_path):
     class Qwen3VLProcessor:
         tokenizer = Tokenizer()
         video_processor = SimpleNamespace(patch_size=16, merge_size=2, temporal_patch_size=2)
+        video_token = "<|video_pad|>"
+        vision_start_token = "<|vision_start|>"
+        vision_end_token = "<|vision_end|>"
 
         def apply_chat_template(self, conversations, **options):
             state.calls.append((conversations, options))
