@@ -279,6 +279,76 @@ SQL tests require only CPU resources. Its native SHA-256 is
 `12e32106ef84ecee5736f62369e404f815b1a9b6fac61209bef720958a7a5304`.
 This later regression build does not replace the benchmark identity above.
 
+## Broadcast runtime filters and pipeline stability
+
+The increment based on `304b9e110287` repairs two failures in the integration
+stack. Partial-output flushing now uses the sink's virtual interface: an
+operator tagged `RESULT_COLLECTOR` need not inherit `PhysicalResultCollector`.
+Flight receivers mark an intentional close before sending the control RPC,
+then cancel their data stream after the reply. Expected data cancellation
+during that interval does not abort the query; a failed close RPC still does.
+The new controlled-close regression fails against the preceding implementation.
+
+Broadcast joins retain runtime filters only for probe scans still inside their
+fragment. An exchange clears the eligible scan set. Serialized operators share
+filter IDs, while every fragment load creates fresh filter objects. The codec
+also preserves storage types and the build-side filtering flag. Hash-partitioned
+joins and filters targeting another fragment remain excluded.
+
+Regression coverage checks Parquet scan output with filtering enabled and
+disabled, INTEGER/BIGINT keys, one/two/five partitions, independent probe scans
+and repeated execution. It bounds surviving row groups rather than timing or
+post-join result rows. The affected suites passed 689 Python tests, three real
+Ray tests (LIMIT close and pipelined/FTE broadcast joins), and 358 native tests.
+The native run includes both collector cases that failed in CI, plan
+serialization and distributed execution.
+
+The base release gate ran 4,892 non-Ray cases: 4,846 passed, 45 skipped and one
+existing lifecycle test failed because it called the deprecated
+`fetch_record_batch()` under warnings-as-errors. The test now calls the
+equivalent `to_arrow_reader(batch_size=2)` and retains its resource assertions;
+both delivery variants passed in isolation. Resuming the original launcher
+with `PYTEST_ADDOPTS=--lf` passed that case, all 207 shared-cluster Ray cases and
+both cluster-owner cases. Formatting, Ruff and the copyleft inventory passed.
+This validation used Linux and Python 3.12.
+
+A focused comparison on 2026-10-13 used one shared Parquet input with 8,388,608
+rows, 8,192-row groups and columns `k = range::INTEGER`,
+`payload = range % 1000`. The query joined `k` with
+`SELECT range * 300001 AS k FROM range(3)` and returned `sum(payload) = 3`.
+Both configurations used the same installed
+binary, one native thread, four partitions and bounded in-process channels
+(64 KiB windows, 16 KiB frames, 512 rows, four slots). The control disabled
+`join_filter_pushdown`; the other configuration enabled it. Native profiles
+counted rows leaving the Parquet scans separately from the timed runs.
+
+After one warmup per configuration, seven samples alternated execution order.
+The measured total includes task preparation, full result collection and close;
+SQL compilation, input generation, profiling and cleanup are excluded.
+The host was shared and OS caches were retained. No build or test from this
+validation was running during the comparison.
+
+| Metric | Filters disabled | Filters enabled |
+| --- | ---: | ---: |
+| Parquet scan output rows | 8,388,608 | 18,371 |
+| Median native task execution (ms) | 158.9 | 32.6 |
+| Median task preparation (ms) | 5.0 | 5.0 |
+| Median prepare/execute/close total (ms) | 163.9 | 37.7 |
+| Intermediate channel accepted rows | 7 | 7 |
+
+The total median improves by 4.34x in this in-process synthetic workload. The
+native IN filter prunes row groups, so surviving scan rows need not equal the
+three matching join keys. This measurement covers local scan/probe work;
+cross-fragment filtering, FTE snapshot reuse and a new SF10 timing sweep remain
+separate increments.
+
+`build/review-validation/` retains the benchmark script, implementation patch,
+source identity, configurations, profiles, all samples, result hashes and test
+logs. `filter-benchmark.json` contains the measurements and
+`cleanup-manifest.json` records removed generated inputs, including the initial
+attempt that failed the database-setting compatibility check before timing.
+The 42,238,471-byte benchmark input was removed after validation.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:
