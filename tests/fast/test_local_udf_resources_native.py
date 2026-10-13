@@ -241,6 +241,8 @@ def test_real_transport_wait_is_attributed_and_cancellation_or_release_retires_i
         },
     )
     occupied = transport.acquire_allocation(70_000)
+    # Require a real wait rather than the consumer's first-output soft overage.
+    competing_task = transport.reserve_task_bytes(1, 1)
     refs = []
     try:
         assert executor.request_task_admission(0)
@@ -259,11 +261,13 @@ def test_real_transport_wait_is_attributed_and_cancellation_or_release_retires_i
             assert not isinstance(result[2], BaseException), result[2]
             refs.extend(result[2][1])
             query.shutdown()
-            ledger.close()
+            # A streamed block can precede the terminal task cleanup callback.
+            ledger.close(timeout=15)
             usage = ledger.unit_snapshots()["unit"]["usage"]
             assert usage["output_bytes"] == usage["retained_bytes"] > (65_536 if kind == "output" else 0)
         _wait(lambda: not any(value for key, value in activity.snapshot().items() if key.endswith("_tasks")))
     finally:
+        competing_task.release()
         transport.release_allocation(occupied)
         executor.close(kill=True)
         if actor_pool:
