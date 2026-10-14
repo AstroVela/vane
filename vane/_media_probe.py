@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vane._file import _positive_buffer_size
 from vane._video_file import (
@@ -59,7 +59,7 @@ class MediaProbe:
     streams: tuple[MediaStream, ...]
 
 
-def _seconds(value, time_base, *, duration=False):
+def _seconds(value: int | None, time_base: Fraction | None, *, duration: bool = False) -> float | None:
     if value is None or time_base is None:
         return None
     result = float(value * time_base)
@@ -70,11 +70,11 @@ def _seconds(value, time_base, *, duration=False):
     return result
 
 
-def _known_positive(value):
+def _known_positive(value: int | None) -> int | None:
     return value if value is not None and value > 0 else None
 
 
-def _inspect_media(container, av) -> MediaProbe:
+def _inspect_media(container: Any, av: Any) -> MediaProbe:
     formats = tuple(sorted(_container_format_names(container)))
     streams = []
     for stream in container.streams:
@@ -140,7 +140,7 @@ def probe_media(
     _load_av()
     with value.open(buffer_size=1, connection=connection) as reader:
 
-        def read_at(offset, size):
+        def read_at(offset: int, size: int) -> bytes:
             reader.seek(offset)
             return reader.read(size)
 
