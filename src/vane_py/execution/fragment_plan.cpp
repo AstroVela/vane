@@ -59,6 +59,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/planner.hpp"
 
 #include <algorithm>
@@ -610,6 +611,7 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 	CheckOperator(op, op.children.size());
 	PlanNode node;
 	node.types = op.types;
+	unique_ptr<FunctionData> coordinator_bind;
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &scan = op.Cast<PhysicalTableScan>();
 		if (!scan.function.HasSerializationCallbacks()) {
@@ -627,6 +629,7 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 			auto worker_bind = bind.Copy();
 			worker_bind->Cast<MultiFileBindData>().file_list =
 			    make_shared_ptr<SimpleMultiFileList>(vector<OpenFileInfo>());
+			coordinator_bind = std::move(scan.bind_data);
 			scan.bind_data = std::move(worker_bind);
 		} else {
 			if (!scan.function.HasDistributedScanCallbacks()) {
@@ -640,7 +643,9 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 			source.splits = callbacks.plan_splits(TableFunctionDistributedScanPlanningInput(
 			    input, partitions, FileSystem::GetFileSystem(context), &context));
 			// Only the independently owned worker bind crosses the process boundary.
-			scan.bind_data = callbacks.create_worker_bind(input);
+			auto worker_bind = callbacks.create_worker_bind(input);
+			coordinator_bind = std::move(scan.bind_data);
+			scan.bind_data = std::move(worker_bind);
 		}
 		std::set<string> ids;
 		for (auto &split : source.splits) {
@@ -661,6 +666,11 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 		serializer.GetSerializationData().SetCustom(filters);
 		op.SerializeNode(serializer);
 	});
+	if (coordinator_bind) {
+		// A correlated key filter can compile this scan again. Preserve its
+		// coordinator files/splits; only the serialized bind is worker-only.
+		op.Cast<PhysicalTableScan>().bind_data = std::move(coordinator_bind);
+	}
 	return node;
 }
 
@@ -888,6 +898,46 @@ private:
 		return false;
 	}
 
+	DistributedSubtree FilterCorrelatedInput(PhysicalOperator &op, DistributedSubtree input, idx_t key,
+	                                         const CorrelatedKeySource &filter) {
+		// Duplicate only a small scan whose key domain is much smaller than the
+		// input. The native SEMI join preserves duplicates on the probe and uses
+		// null-safe equality so this necessary condition cannot discard NULL keys.
+		auto &source = *filter.source;
+		if (EstimatedExchangeBytes(source) > 8 * 1024 * 1024 ||
+		    double(source.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
+		    double(source.estimated_cardinality) * input.fragment.partition_count >= double(op.estimated_cardinality)) {
+			return input;
+		}
+		auto domain = Build(source);
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(make_uniq<BoundReferenceExpression>(op.types[key], filter.column));
+		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {op.types[key]}, std::move(expressions),
+		                                                 source.estimated_cardinality);
+		projection.children.push_back(source);
+		Wrap(projection, domain);
+		auto count = input.fragment.partition_count;
+		domain = Exchange(std::move(domain), count == 1 ? "gather" : "broadcast", count);
+		vector<JoinCondition> conditions;
+		JoinCondition condition;
+		condition.left = make_uniq<BoundReferenceExpression>(op.types[key], key);
+		condition.right = make_uniq<BoundReferenceExpression>(op.types[key], 0);
+		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+		conditions.push_back(std::move(condition));
+		LogicalComparisonJoin logical(JoinType::SEMI);
+		logical.types = op.types;
+		auto &join = plan.Make<PhysicalHashJoin>(logical, op, projection, std::move(conditions), JoinType::SEMI,
+		                                         op.estimated_cardinality);
+		auto node = Node(join);
+		node.children.push_back(std::move(input.fragment.root));
+		node.children.push_back(std::move(domain.fragment.root));
+		input.fragment.root = std::move(node);
+		for (auto &edge : domain.incoming) {
+			input.incoming.push_back(std::move(edge));
+		}
+		return input;
+	}
+
 	DistributedSubtree Scoped(PhysicalOperator &root) {
 		DistributedSubtree result;
 		CorrelatedPartition partitioning;
@@ -920,7 +970,13 @@ private:
 						keys.push_back(partition_input->second.GetIndex());
 					}
 				}
-				auto input = Exchange(Build(op), distribution, result.fragment.partition_count, keys);
+				auto child = Build(op);
+				auto filter = partitioning.filters.find(&op);
+				if (partitioned && filter != partitioning.filters.end()) {
+					child =
+					    FilterCorrelatedInput(op, std::move(child), partition_input->second.GetIndex(), filter->second);
+				}
+				auto input = Exchange(std::move(child), distribution, result.fragment.partition_count, keys);
 				bindings.names.emplace(&op, input.fragment.root.input_port);
 				node.children.push_back(std::move(input.fragment.root));
 				for (auto &edge : input.incoming) {

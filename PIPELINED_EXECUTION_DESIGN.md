@@ -908,6 +908,10 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 关联 delimiter 的分区由独立的 locality 分析决定，分析先于计划修改。只选择原生整数关联键；owner 输入按该键 HASH，同一关联键的外层行、去重缓存和内部完整聚合组属于同一分区。分析沿 projection、filter、hash join 与分组键追踪关联键，只认可直接引用和优化器证明无损的整数压缩/解压。等值条件能证明独立输入具有同类型关联键时，该输入也 HASH；其他完整独立输入可以 BROADCAST。外连接不能保留广播侧的未匹配行，分组的每个 grouping set 必须包含关联键，省略的分组列不能继续传播键身份。多个候选键按可避免广播的估计行数选择，例如 Q21 使用订单键而非供应商不等式。
 
+直接与当前 delimiter scan 做 INNER join 的独立输入，可以在 HASH 交换前增加必要条件过滤。规划器从 owner 的原样关联键向下追踪直接 projection、filter 和 INNER hash join，找到包含全部候选键的 Parquet 扫描；不穿过外连接、类型转换、聚合或嵌套共享状态。只复制估计不超过 8 MiB、估计行数少于待过滤输入八分之一且复制流量更小的扫描。键列经 BROADCAST（单消费分区时 GATHER）送到输入 fragment，原生 SEMI join 使用 NULL 安全等值过滤，保留 probe 重复行；原 delimiter 仍执行实际匹配与聚合。这能避免 Q17 将整张内层 lineitem 送入相关子查询，但不保证所有相关计划都适用。
+
+被重复规划的扫描保留协调端原始文件和 split 绑定，只有序列化的工作端副本去掉文件列表。额外扫描仍有显式 source assignment，遵守相同的文件版本检查和 FTE 冻结路径；不复制可能返回不同结果的任意表函数。
+
 每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
 
 这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。

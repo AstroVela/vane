@@ -412,3 +412,57 @@ def test_parallel_exchange_preserves_ordered_result_batches(tail):
         with InProcessTaskService(connection, spec, DirectExchangeLimits(8192, 4096, 128, 1)) as service:
             service.start()
             assert collect(service) == expected
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("join_key", ["p.k", "p.j"])
+def test_correlated_average_filters_fact_rows_before_exchange(tmp_path, threads, join_key):
+    fact, keys = tmp_path / "fact.parquet", tmp_path / "keys.parquet"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        connection.execute(
+            f"copy (select range%4096 k, range%97 v from range(131072)) to '{fact}' (row_group_size 2048)"
+        )
+        connection.execute(
+            f"copy (select range k, (range+1999)%4096 j, range in (2,2001,4001) keep from range(4096)) to '{keys}'"
+        )
+        sql = (
+            f"select p.k, f.v from read_parquet('{fact}') f join read_parquet('{keys}') p on f.k={join_key} "
+            f"where p.keep and f.v < (select 0.2*avg(i.v) from read_parquet('{fact}') i where i.k=p.k) "
+            "order by p.k, f.v"
+        )
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(32768, 8192, 128, 2)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=2), limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [channel.snapshot() for channel in service.channels.values()]
+            # The repeated fact scan can match only keys from the small outer
+            # input. Send those rows, not all 131072 facts, into the delimiter.
+            assert sum(state["accepted_rows"] for state in states) < 2048
+            assert all(state["peak_bytes"] <= limits.window_bytes for state in states)
+
+
+@pytest.mark.parametrize("partitions", [1, 3])
+@pytest.mark.parametrize("kind", ["inner", "left"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("key", ["f.k", "p.k"])
+def test_correlated_key_filter_preserves_nulls_duplicates_and_outer_rows(tmp_path, partitions, kind, comparison, key):
+    fact, keys = tmp_path / "fact.parquet", tmp_path / "keys.parquet"
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute("set disabled_optimizers='deliminator'")
+        connection.execute(
+            "copy (select range i, case when range%37=0 then null else range%1024 end k, "
+            f"range%97 v from range(65536)) to '{fact}' (row_group_size 2048)"
+        )
+        connection.execute(f"copy (select k::bigint k from (values (2), (2), (7), (null), (null)) t(k)) to '{keys}'")
+        sql = (
+            f"select f.i, p.k, (select avg(i.v) from read_parquet('{fact}') i "
+            f"where i.k {comparison} {key}) a from read_parquet('{fact}') f "
+            f"{kind} join read_parquet('{keys}') p on f.k {comparison} p.k "
+            "where f.i<128 order by f.i, p.k nulls first"
+        )
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(32768, 8192, 128, 2)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=partitions), limits) as service:
+            service.start()
+            assert collect(service) == expected

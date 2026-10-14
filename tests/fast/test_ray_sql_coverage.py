@@ -99,6 +99,30 @@ def test_public_partitioned_correlated_queries(tmp_path, mode, source_kind):
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_correlated_key_filter_repeats_bound_parquet_scan(tmp_path, mode):
+    fact, keys = tmp_path / "fact.parquet", tmp_path / "keys.parquet"
+    config = {"threads": 4}
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config=config) as local,
+        vane.Runtime(limits) as application,
+        application.connect(config=config) as connection,
+    ):
+        local.execute(f"copy (select range%4096 k, range%97 v from range(131072)) to '{fact}' (row_group_size 2048)")
+        local.execute(f"copy (select range k, range in (2,2001,4001) keep from range(4096)) to '{keys}'")
+        sql = (
+            f"select p.k, f.v from read_parquet('{fact}') f join read_parquet('{keys}') p on f.k=p.k "
+            f"where p.keep and f.v < (select 0.2*avg(i.v) from read_parquet('{fact}') i where i.k=p.k) "
+            "order by p.k, f.v"
+        )
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        for _ in range(2):
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_subquery_and_cte_semantics(tmp_path, mode):
     limits = resources(tmp_path, max_active_queries=1, max_results=1, task_contexts_per_worker=64, io_concurrency=256)
     with vane.connect() as local, vane.Runtime(limits) as application, application.connect() as connection:

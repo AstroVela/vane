@@ -609,3 +609,83 @@ hashes, SQL, resource settings, output counts/hashes and cleanup manifests.
 Owned Ray processes stop before their temporary and spill directories are
 removed. Original inputs are preserved; repeated full result outputs are not
 retained.
+
+## Filtering correlated inputs before exchange (2026-10-15)
+
+Q17's partitioned delimiter still received the entire repeated lineitem scan,
+although only a small set of filtered part keys could contribute. The planner
+now proves a superset of the owner's correlation keys through unchanged
+projections, filters and inner hash joins to a small Parquet scan. It broadcasts
+that key column and applies a native null-safe SEMI join before the correlated
+input's hash exchange. Probe duplicates are preserved and the original
+delimiter retains all matching and aggregation semantics. The estimate must
+fit 8 MiB, have fewer than one eighth of the input rows, and cost less replica
+traffic than the input. Outer joins, casts, aggregates, nested scopes and
+arbitrary table functions are not traversed to derive a key source.
+
+Repeated source planning also retains the original coordinator bind after
+serializing its worker copy. Otherwise, compiling the same Parquet scan twice
+would enumerate an empty file list on its second use. Both copies keep explicit
+source assignments and the existing pipelined/FTE source contracts.
+
+A fresh comparison freezes the preceding `4b5d2e2d4d` checkout's installed
+`0.3.0.dev96` runtime and compares it with the new `0.3.0.dev97` build. It uses
+the same SF10 files, two 18-CPU workers, two partitions, resource limits, driver
+and timing boundaries as the preceding experiment. No builds or tests run
+concurrently with either timing pass.
+
+| Measurement, seconds | Fresh frozen baseline | Key filter | Local, candidate pass |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 63.151 | **59.351** | 9.141 |
+| Q17, median of three | 4.419 | **0.611** | 0.403 |
+| Q21, median of three | 9.893 | 9.445 | 1.259 |
+| Q6, first pass | 0.390 | 0.404 | 0.216 |
+
+Q17 falls **86.2%** and takes **1.52 times local**. The complete-pass total falls
+6.0%, but remains **6.49 times local**. The baseline local total is 9.260
+seconds. Q21's small variation is not attributed to the filter: its large
+correlated inputs remain. This change does not establish general parity with
+local. Q21, Q18, Q8 and Q5 remain substantial contributors to the total.
+
+Each full comparison contains 52 matching samples, including two extra
+Q17/Q21 repetitions in both modes. A separate nine-sample pipelined control
+gives Q17/Q21 medians of 0.617/9.575 seconds and a Q6 median of 0.405 seconds.
+Ordered results use the existing numeric tolerance; all queries return
+reservations and result ownership to zero.
+
+Separate completed native direct-exchange diagnostics confirm the work
+reduction without relying on timing: Q17's repeated fact input falls from
+**59,986,052 to 61,385 rows** across its two hash partitions. Total accepted
+channel rows fall from 60,049,484 to 126,861, including the additional key
+channel; shared broadcast channels are counted once. Both diagnostics match
+local results, respect the configured byte windows and return channel credit.
+These are in-process native work counts, not Ray network byte measurements or
+additional timing samples.
+
+The new regression retains the delimiter with default optimizer settings on a
+selective Parquet fixture, comparing exact results and bounded exchange rows
+with the former runtime. Semantic cases
+cover one/three partitions, NULL-safe and ordinary equality, duplicate keys,
+outer rows, join-key and payload-key lineage, and one/four native threads.
+Related compiler, SQL, performance and FTE-source tests pass (1175 cases); the
+145-case performance module also passes after finalizing the default-optimizer
+fixture. Ten targeted public Ray cases pass across the affected run and the
+corrected-fixture rerun, exercising the repeated scan in both execution modes
+and existing correlated/source checks. The complete release suite is not rerun.
+
+Native SHA-256 identities, in frozen baseline/candidate order:
+
+```text
+11f9e4c40e39605d83848eeaa9ef9542853f3cae15548eb004fd417bb132b409
+671df83774f6ba8c5bbcf5b5103873d8cdbecd19715f0463abaf1fbe2c8b2422
+```
+
+Evidence is retained under `build/pipelined-key-filter-20261014/` (the run
+started before midnight): `baseline-full/`, `candidate-full/`,
+`candidate-focus/`, `comparison.json`, `comparison.csv`, the native work-count
+reports, source patch, test logs and frozen acceptance driver. The driver's
+SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Configurations retain code/package/input identities and output counts/hashes.
+Owned Ray processes stop before temporary/spill cleanup; source files remain
+unchanged and the shared local result cache is removed after comparison.
