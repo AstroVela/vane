@@ -1481,19 +1481,20 @@ and cleanup before reuse.
 
 Stream permits do not release storage or task resources. Pooled allocations
 remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
-fork pin retains them. The input ACK records the consuming dependency without
-creating output credit; overlapping slices cannot multiply reserved bytes.
+fork pin retains them. The input ACK records the consuming dependency and
+returns the acknowledged output's progress credit. Overlapping slices cannot
+multiply reserved bytes.
 Ordinary output admission allows a consumer holding live input to finish one
 complete block across the soft transport window. Each output source also has
 a bounded allowance to produce the next block, so an actor that releases its
 previous input only after receiving the next batch can advance. This includes
 sources with no live output of their own: in a longer pipeline, the retained
 block may belong to an intermediate operator.
-This additional allowance stops at two owned output grants across invocations;
-pending grants and converted grants count until their last physical lease is
-released. Descriptor release or an input ACK cannot reopen this allowance while
-a worker view or fork pin still holds the storage. Each source may allocate
-one next-call input while it has room in this output window; another input
+This additional allowance stops at two pending or unconsumed outputs per source
+across invocations. A downstream input ACK returns that output's progress credit,
+even while a worker view or fork pin retains its storage. The physical allocation
+and byte charge remain until the last lease is released. Each source may allocate
+one next-call input while it has room in this progress window; another input
 must wait for that input's byte charge to be released. This lets the next call
 reach output admission without opening an unbounded input queue. Explicit per-task byte
 envelopes keep their hard boundary. The physical arena always enforces its own
@@ -1521,7 +1522,7 @@ small IPC metadata changes between batches do not strand a nearly usable slot.
 Physical capacity includes this rounding.
 
 Stream-window permits are independent of storage ownership. Input acknowledgments
-do not release pooled output bytes or reserve replacement output credit. Pooled
+return progress credits without reserving replacement output bytes. Pooled
 output bytes remain charged to the transport budget until the allocation's last
 physical lease, including worker views and fork pins, is released. Before sending
 an input, the parent registers a read lease for the receiving worker. Arrow and
@@ -2160,6 +2161,37 @@ that replacement startup without waiting for the model to finish loading.
 Execution completion returns the task/actor slot immediately; managed output
 bytes remain charged through queued results, zero-copy Arrow/NumPy views,
 remote readers, and inherited views protected by the shared-memory store.
+
+Shared-memory progress credits and physical bytes have separate lifetimes.
+The per-producer soft-budget window counts pending and unconsumed outputs.
+A downstream input ACK returns that output's progress credit, even when an
+actor retains a zero-copy view across calls. Its physical allocation and byte
+charge remain live until the last view or fork owner releases them. Consequently,
+multiple actors can receive replacement inputs without requiring their old
+views to disappear first. Explicit task byte envelopes remain strict.
+
+Each output request reports the worker's live input views, including views from
+earlier calls. Physical-capacity waits use this snapshot, idle retained views,
+and queued outputs of the input streams used by waiting consumers. The current
+call's upstream producer identities are recorded independently of live views
+and persist until the call completes or is cancelled. An all-NULL input can
+retain no physical views while its next batch still needs the occupied actor
+slot; releasing input storage must not erase that stream dependency. Physical
+leases held only by fork descendants or pending release notifications can be
+released independently and are excluded from the worker's blocking views.
+Queued-input inference requires a live parent lease: a region with zero parent
+references, held only by fork descendants, can release independently and must
+not be classified as queued work merely because it has no input reader.
+Queued input is not assumed reclaimable merely because it belongs to another
+allocation: its next invocation may require the very actor slot occupied by the
+waiting writer.
+A current read owner in another worker, or an unrelated stream, still permits
+an independent release. This is a conservative admission boundary: an input
+whose consumer has not started is not evidence that a capacity wait can finish.
+When these dependencies leave no contiguous region large enough for any waiting
+output, execution reports a capacity error with pinned, retained, and queued
+input bytes. Reducing input/output blocks or increasing the arena addresses this
+hard capacity boundary; increasing the soft reference budget does not.
 
 Explicit local `DataAdmissionLimits` remain an additional application limit.
 Their byte-accounting tests verify these differences from default soft admission:

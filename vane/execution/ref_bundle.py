@@ -86,6 +86,7 @@ class _InputLease:
     submit_id: int | None
     decode_error_handlers: tuple[Callable[[BaseException], None] | None, ...] = ()
     physical_inputs: tuple[_LiveAllocation, ...] = ()
+    output_owners: tuple[_OutputGrant, ...] = ()
     state: str = "active"
     pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
     releasing: bool = False
@@ -100,6 +101,7 @@ class _OutputGrant:
     input_lease_id: int | None = None
     owner_id: str | None = None
     owner_bytes: int = 0
+    consumed: bool = False
     state: str = "active"
 
 
@@ -284,8 +286,8 @@ class LocalShmBudgetManager:
         self._consuming_inputs: dict[int, tuple[_LiveAllocation, ...]] = {}
         self._consuming_outputs: dict[int, tuple[_LiveAllocation, ...]] = {}
         self._output_grants: dict[int, _OutputGrant] = {}
-        # Converted grants remain counted until their physical storage is
-        # released, including views kept across invocation generations.
+        # Physical byte ownership can outlive input ACKs. Only unconsumed
+        # grants occupy the progress window across invocation generations.
         self._owned_output_grants: dict[str, dict[int, _OutputGrant]] = {}
         self._owned_input_allocations: dict[str, int] = {}
         self._input_ref_holds: dict[tuple[str, Any], _InputRefHold] = {}
@@ -384,7 +386,7 @@ class LocalShmBudgetManager:
                         self._task_reservation_bytes == 0
                         and input_owner_id is not None
                         and not self._owned_input_allocations.get(input_owner_id)
-                        and len(self._owned_output_grants.get(input_owner_id, {})) < STREAM_BUFFER_BLOCKS
+                        and self._unconsumed_outputs_locked(input_owner_id) < STREAM_BUFFER_BLOCKS
                     )
                 )
 
@@ -522,6 +524,11 @@ class LocalShmBudgetManager:
                 submit_id=submit_id,
                 decode_error_handlers=decode_error_handlers,
                 physical_inputs=tuple(physical_inputs.values()),
+                output_owners=tuple(
+                    ref._progress_owner
+                    for ref in lease_refs
+                    if isinstance(ref, LocalShmBlockRef) and ref._progress_owner is not None
+                ),
             )
             self._input_lease_bytes += lease_bytes
             _shm_debug_log(
@@ -572,6 +579,8 @@ class LocalShmBudgetManager:
                 holds = self._release_input_holds_locked(lease.holds, lease_id=lease_id, state=lease.state)
                 lease.pending_holds = {hold.key: hold for hold in holds}
                 if lease.state == "consumed":
+                    for owner in lease.output_owners:
+                        owner.consumed = True
                     if lease.physical_inputs:
                         self._consuming_inputs[lease_id] = lease.physical_inputs
                     self._input_consumed_count += 1
@@ -621,11 +630,14 @@ class LocalShmBudgetManager:
             self._consuming_inputs.pop(int(lease_id), None)
             self._consuming_outputs.pop(int(lease_id), None)
 
-    def consuming_inputs(self, lease_id: int | None) -> tuple[ShmAllocation, ...]:
+    def consuming_input_producers(self, lease_id: int | None) -> frozenset[str]:
+        """Keep upstream dependencies until the call ends, even after its views release."""
         if lease_id is None:
-            return ()
+            return frozenset()
         with self._cond:
-            return tuple(entry.allocation for entry in self._consuming_inputs.get(lease_id, ()) if entry.retained)
+            return frozenset(
+                entry.producer_id for entry in self._consuming_inputs.get(lease_id, ()) if entry.producer_id is not None
+            )
 
     def output_grant_input(self, grant_id: int | None) -> int | None:
         if grant_id is None:
@@ -640,6 +652,11 @@ class LocalShmBudgetManager:
         with self._cond:
             grant = self._output_grants.get(grant_id)
             return grant if grant is not None and grant.owner_id is not None else None
+
+    def _unconsumed_outputs_locked(self, owner_id: str | None) -> int:
+        if owner_id is None:
+            return 0
+        return sum(not grant.consumed for grant in self._owned_output_grants.get(owner_id, {}).values())
 
     def _release_output_owner_locked(self, grant: _OutputGrant | None, size: int) -> None:
         if grant is None or grant.owner_id is None:
@@ -872,7 +889,7 @@ class LocalShmBudgetManager:
                         input_lease_id is not None
                         and any(entry.retained for entry in self._consuming_outputs.get(input_lease_id, ()))
                     )
-                    owned_outputs = len(self._owned_output_grants.get(owner_id, {})) if owner_id is not None else 0
+                    owned_outputs = self._unconsumed_outputs_locked(owner_id)
                     return (
                         priority == "consumer"
                         and self._task_reservation_bytes == 0
@@ -881,7 +898,7 @@ class LocalShmBudgetManager:
                             or (consuming and not output_pending)
                             # Pressure may belong to another operator in the
                             # pipeline. Allow this source's initial block too;
-                            # pending and live grants still bound its window.
+                            # pending and unread grants still bound its window.
                             or (owner_id is not None and owned_outputs < STREAM_BUFFER_BLOCKS)
                         )
                     )
@@ -1538,6 +1555,9 @@ class LocalShmBlockRef:
         self.name = str(name)
         self._owner_pid = os.getpid()
         self._output_owner = output_owner
+        # This observation returns progress credit on input ACK, independently
+        # of the byte charge attached to the allocation and its exported views.
+        self._progress_owner = output_owner
         self._input_owner_id = input_owner_id
         self.size = int(size)
         self.owner = bool(owner)

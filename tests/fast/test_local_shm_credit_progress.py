@@ -43,6 +43,39 @@ def test_repeated_input_slices_do_not_multiply_reserved_bytes():
     assert manager.snapshot()["usage_bytes"] == 0
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_consumed_input_streams_remain_dependencies_after_physical_release(cancel):
+    from vane.execution.ref_bundle import LocalShmBlockRef
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    store = LocalShmStore(4096)
+    store.add_client("stream-dependencies")
+    inputs = []
+    for producer in ("left", "right", "left", None):
+        physical = store.allocate(256, producer_id=producer)
+        inputs.append(LocalShmBlockRef(physical.allocation.identity, 256, allocation_lease=physical))
+    lease = manager.create_input_lease(inputs, 1024)
+    try:
+        manager.consume_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        assert store.snapshot()["live_bytes"] == 0
+        assert manager.consuming_input_producers(lease) == frozenset({"left", "right"})
+        assert manager.consuming_input_producers(None) == frozenset()
+        if cancel:
+            manager.cancel_input_lease(lease)
+        else:
+            manager.finish_consuming(lease)
+        assert manager.consuming_input_producers(lease) == frozenset()
+    finally:
+        manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        store.remove_client("stream-dependencies")
+    assert store.snapshot()["live_allocations"] == 0
+
+
 def test_consumer_escape_admits_one_complete_block_then_waits_for_release():
     manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
     manager.acquire_allocation(900)
@@ -192,6 +225,67 @@ def test_output_owner_window_waits_for_physical_release_across_invocations(monke
         if unrelated_pressure:
             manager.release_allocation(1100)
         store.remove_client("owner-window")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
+
+
+def test_input_ack_returns_progress_credit_while_exported_views_keep_byte_charges(monkeypatch):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("consumed-window")
+    inputs, views, leases = [], [], []
+    cancel = threading.Event()
+    try:
+        for _ in range(2):
+            grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+            owner = manager.output_grant_owner(grant)
+            physical = store.allocate(1100)
+            ref = refs.LocalShmBlockRef(
+                physical.allocation.identity,
+                1100,
+                allocation_lease=physical,
+                budget_bytes=manager.convert_output_grant_to_allocation(grant),
+                output_owner=owner,
+            )
+            inputs.append(ref)
+            views.append(physical.fork())
+            leases.append(manager.create_input_lease([ref], 1100))
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant,
+                1100,
+                priority="consumer",
+                owner_id="source",
+                cancel_event=cancel,
+            )
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                manager.consume_input_lease(leases[0])
+                grant = pending.result(timeout=5)
+                # The actor can receive its replacement batch, but both old
+                # physical allocations remain charged through their views.
+                assert manager.snapshot()["allocated_bytes"] == 2200
+                assert len(manager._owned_output_grants["source"]) == 3
+                assert manager._unconsumed_outputs_locked("source") == 2
+                manager.consume_input_lease(leases[0])  # ACK replay cannot create another slot.
+                assert manager._unconsumed_outputs_locked("source") == 2
+                manager.release_output_grant(grant)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        for lease in leases:
+            manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        for view in views:
+            view.release()
+        store.remove_client("consumed-window")
     assert manager.snapshot()["usage_bytes"] == 0
     assert manager._owned_output_grants == {}
 
