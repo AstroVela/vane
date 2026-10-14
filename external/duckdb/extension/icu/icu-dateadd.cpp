@@ -279,6 +279,7 @@ struct ICUDateAdd : public ICUDateFunc {
 	template <typename TA, typename OP>
 	static ScalarFunction GetUnaryAgeFunction(const LogicalTypeId &left_type) {
 		auto function = GetUnaryDateFunction<TA, interval_t, OP>(left_type, LogicalType::INTERVAL);
+		function.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 		function.SetRequiresClientContext();
 		return function;
 	}

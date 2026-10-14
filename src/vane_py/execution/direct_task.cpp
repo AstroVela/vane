@@ -445,7 +445,7 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 	std::set<string> used;
 	auto plan = Load(
 	    context, task->fragment,
-	    [&](PhysicalPlan &owner, const string &port, const vector<LogicalType> &types) -> PhysicalOperator & {
+	    [&](PhysicalPlan &owner, const string &port, const vector<LogicalType> &types) -> unique_ptr<PhysicalOperator> {
 		    auto input = inputs.find(port);
 		    if (input == inputs.end()) {
 			    throw InvalidInputException("missing direct input port %s", port);
@@ -453,7 +453,7 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 		    used.insert(port);
 		    auto blocked = make_shared_ptr<atomic<bool>>(false);
 		    task->progress->input_blocked.push_back(blocked);
-		    return owner.Make<DirectSource>(types, input->second, blocked);
+		    return make_uniq<DirectSource>(owner, types, input->second, blocked);
 	    },
 	    assignments);
 	ObserveBuilds(plan->Root(), *task->progress);

@@ -149,6 +149,9 @@ public:
 	PhysicalRangeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperatorType type,
 	                  PhysicalOperator &left, PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
 	                  idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info);
+	//! Restore an already ordered range join; children are attached by the plan deserializer.
+	PhysicalRangeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperatorType type,
+	                  vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality);
 
 	// Projection mappings
 	using ProjectionMapping = vector<column_t>;
@@ -159,6 +162,9 @@ public:
 	vector<LogicalType> unprojected_types;
 
 public:
+	//! Range-join metadata shared by piecewise merge and IE join plans.
+	void SerializeOperatorData(Serializer &serializer) const override;
+
 	// Gather the result values and slice the payload columns to those values.
 	static void SliceSortedPayload(DataChunk &chunk, GlobalSortedTable &table, ExternalBlockIteratorState &state,
 	                               TupleDataChunkState &chunk_state, const idx_t chunk_idx,

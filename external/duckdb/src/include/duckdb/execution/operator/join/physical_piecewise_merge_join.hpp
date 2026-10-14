@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -25,6 +31,9 @@ public:
 	PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &left,
 	                           PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
 	                           idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info);
+	//! Deserialization constructor: preserves the serialized condition order and projection maps.
+	PhysicalPiecewiseMergeJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> cond,
+	                           JoinType join_type, idx_t estimated_cardinality);
 
 	vector<LogicalType> join_key_types;
 	vector<BoundOrderByNode> lhs_orders;
@@ -75,6 +84,8 @@ public:
 	}
 
 private:
+	void InitializeOrders();
+
 	// resolve joins that output max N elements (SEMI, ANTI, MARK)
 	void ResolveSimpleJoin(ExecutionContext &context, DataChunk &input, DataChunk &chunk, OperatorState &state) const;
 	// resolve joins that can potentially output N*M elements (INNER, LEFT, FULL)

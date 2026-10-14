@@ -35,6 +35,16 @@
 
 namespace duckdb {
 
+void Binder::SetScalarFunctionCallback(std::function<void(const ScalarFunction &)> callback) {
+	global_binder_state->scalar_function_callback = std::move(callback);
+}
+
+void Binder::CheckScalarFunction(const ScalarFunction &function) const {
+	if (global_binder_state->scalar_function_callback) {
+		global_binder_state->scalar_function_callback(function);
+	}
+}
+
 idx_t Binder::GetBinderDepth() const {
 	return depth;
 }

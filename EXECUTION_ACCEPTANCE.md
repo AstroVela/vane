@@ -75,6 +75,89 @@ SUM/AVG must retain the correct result even when positive prefixes exceed the
 128-bit accumulator range. This controls actual arrival order instead of relying
 on a timing delay.
 
+## TPCH SF10 coverage acceptance
+
+On 2026-10-12, all 22 Parquet TPC-H queries completed through local execution,
+Ray pipelined and Ray FTE. Both Ray modes use the fragment compiler and native
+TaskRuntime. Shared CTE, delimiter and MARK/SINGLE state stays in one native
+subtree; independent inputs are still partitioned. This extends SQL coverage
+without a local or legacy-FTE execution fallback. It does not establish support
+for windows, ASOF joins, recursive CTEs or every native function.
+
+Local used its default 36 threads and 50.1 GiB memory limit. Ray used two workers
+with 18 CPU slots each and two partitions; operator memory used the node's
+advertised memory after exchange, staging and result-service reservations. The
+per-worker operator budgets were 28,414,316,544 bytes for pipelined and
+27,768,844,288 bytes for the initial FTE sweep. Available memory varies at Ray
+startup; each run records its actual budget. The object store was 1 GiB, with
+128 MiB exchange and 256 MiB staging per worker. The worker pool was reused
+within each mode.
+
+These are single-machine, single-sample measurements with OS caches left intact,
+not an official TPC-H score. Elapsed time covers `query()`, complete collection
+and successful close; result comparison and Ray startup are excluded. Local
+`query()` does most work synchronously, so its submission time is not comparable
+to asynchronous Ray submission. All rows, duplicate counts, schemas and returned
+row sequences matched local. Floating values use relative tolerance `1e-9` and
+absolute tolerance `1e-6`. Q12's SQL HUGEINT reference column is widened from
+local `decimal128(38,0)` to the documented Ray `decimal256(39,0)` profile; actual
+results are not cast for comparison.
+
+| Query | Local (s) | Pipelined (s) | FTE (s) |
+| --- | ---: | ---: | ---: |
+| Q01 | 0.523 | 1.611 | 21.567 |
+| Q02 | 0.140 | 9.668 | 17.756 |
+| Q03 | 0.371 | 12.141 | 54.268 |
+| Q04 | 0.279 | 18.086 | 34.689 |
+| Q05 | 0.406 | 19.920 | 81.892 |
+| Q06 | 0.211 | 0.429 | 20.901 |
+| Q07 | 0.415 | 9.244 | 53.785 |
+| Q08 | 0.506 | 16.479 | 95.864 |
+| Q09 | 0.836 | 21.732 | 125.515 |
+| Q10 | 0.468 | 7.672 | 47.930 |
+| Q11 | 0.063 | 2.606 | 10.799 |
+| Q12 | 0.282 | 6.696 | 32.038 |
+| Q13 | 0.544 | 5.514 | 13.647 |
+| Q14 | 0.298 | 2.824 | 23.682 |
+| Q15 | 0.295 | 0.641 | 20.528 |
+| Q16 | 0.172 | 6.330 | 10.545 |
+| Q17 | 0.376 | 49.236 | 97.866 |
+| Q18 | 0.649 | 25.203 | 69.960 |
+| Q19 | 0.407 | 4.622 | 26.439 |
+| Q20 | 0.332 | 7.283 | 36.420 |
+| Q21 | 1.163 | 58.828 | 89.903 |
+| Q22 | 0.146 | 7.413 | 11.261 |
+| **Total** | **8.882** | **294.178** | **997.256** |
+
+The initial FTE store/query accounting ceiling was 128 GiB, with 4 GiB for
+sources and 2 GiB per output object. Q8 has 63 outputs including broadcast
+copies, requiring up to 130 GiB of reservations. It first failed at 95.452 s
+with insufficient materialized storage capacity. Its successful retry used a
+fresh store with a 160 GiB store/query ceiling and the same CPU allocation,
+memory sizing policy, source allowance and per-object ceiling. The FTE total
+sums the successful samples; it excludes that failed attempt and is not one
+uninterrupted sweep. These limits are accounting ceilings, not preallocated
+disk space. No storage accounting or cross-query snapshot cache was added.
+
+Every query checked that query/result ownership and worker reservations had
+retired. Closing each Runtime left no registered sessions, result contexts,
+worker reservations, store allocations or source snapshots. The original
+Parquet sizes and nanosecond modification times remained unchanged.
+
+Artifacts are retained in this checkout at
+`build/tpch-sf10-coverage-20261012/`: `samples.jsonl`, `timings.csv`,
+`final-validation.json`, SQL and full Arrow results, per-query diagnostics,
+run metadata and closed-runtime snapshots. Initial benchmark setup failures
+(worker import path and an omitted result-reader memory reservation) are kept
+separately; neither executed SQL. Production source is `4549ccaf9e`; the installed
+native SHA256 is
+`848049001800c07779e0c9e541ecdac681848da5e1ed26bf9135148f29f19703`.
+
+Related regressions passed 1,094 non-Ray and 94 real-Ray cases; 23 optional
+`fsspec` cases were skipped. No complete fast/release suite was run. The new
+subquery and CTE regression modules are included in the release launcher and
+source-package manifest.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:
@@ -87,7 +170,7 @@ The same connection and worker pool are reused across each sequence:
 - Two FTE worker losses before a downstream attempt commits. Retries must use
   the same input identity and a new fence, deliver exact results without
   duplicates, and leave the pool usable for pipelined queries.
-- Unsupported window, median, inequality-join and UUID queries are rejected
+- Unsupported window, median, ASOF-join and UUID queries are rejected
   without falling back to local execution; all admission/storage ownership is
   released and a supported query still succeeds.
 - A real long-running filter alternates a 60-second execution deadline and a

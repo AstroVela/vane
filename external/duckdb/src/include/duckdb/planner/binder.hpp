@@ -35,6 +35,8 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/common/enums/copy_option_mode.hpp"
 
+#include <functional>
+
 //! fwd declare
 namespace duckdb_re2 {
 class RE2;
@@ -57,6 +59,7 @@ class LogicalVacuum;
 class ColumnList;
 class ExternalDependency;
 class TableFunction;
+class ScalarFunction;
 class TableStorageInfo;
 class BoundConstraint;
 class AtClause;
@@ -186,6 +189,8 @@ struct GlobalBinderState {
 	vector<unique_ptr<UsingColumnSet>> using_column_sets;
 	//! The set of parameter expressions bound by this binder
 	optional_ptr<BoundParameterMap> parameters;
+	//! Validate selected scalar overloads before binding or evaluating their arguments.
+	std::function<void(const ScalarFunction &)> scalar_function_callback;
 };
 
 // QueryBinderState is state shared WITHIN a query, a new query-binder state is created when binding inside e.g. a view
@@ -252,6 +257,8 @@ public:
 	BoundStatement BindAlterAddIndex(BoundStatement &result, CatalogEntry &entry, unique_ptr<AlterInfo> alter_info);
 
 	void SetCatalogLookupCallback(catalog_entry_callback_t callback);
+	void SetScalarFunctionCallback(std::function<void(const ScalarFunction &)> callback);
+	void CheckScalarFunction(const ScalarFunction &function) const;
 	void BindCreateViewInfo(CreateViewInfo &base);
 	static void BindView(ClientContext &context, const SelectStatement &stmt, const string &catalog_name,
 	                     const string &schema_name, optional_ptr<LogicalDependencyList> dependencies,

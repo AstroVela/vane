@@ -450,6 +450,15 @@ void ICUToTimeTZ::AddCasts(ExtensionLoader &loader) {
 }
 
 struct ICUTimeZoneFunc : public ICUDateFunc {
+	static unique_ptr<FunctionData> BindTimeTZ(ClientContext &context, ScalarFunction &bound_function,
+	                                           vector<unique_ptr<Expression>> &arguments) {
+		auto data = make_uniq<BindData>(context);
+		// TIMETZ has no date; its target offset depends on the transaction date.
+		// Anchor every call in this transaction to the same instant.
+		SetTime(data->calendar.get(), MetaTransaction::Get(context).start_timestamp);
+		return std::move(data);
+	}
+
 	template <typename OP, typename T>
 	static void Execute(DataChunk &input, ExpressionState &state, Vector &result) {
 		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
@@ -488,8 +497,11 @@ struct ICUTimeZoneFunc : public ICUDateFunc {
 		                               Execute<ICUFromNaiveTimestamp, timestamp_t>, Bind));
 		set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::TIMESTAMP_TZ}, LogicalType::TIMESTAMP,
 		                               Execute<ICUToNaiveTimestamp, timestamp_t>, Bind));
-		set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::TIME_TZ}, LogicalType::TIME_TZ,
-		                               Execute<ICUToTimeTZ, dtime_tz_t>, Bind));
+		auto timetz = ScalarFunction({LogicalType::VARCHAR, LogicalType::TIME_TZ}, LogicalType::TIME_TZ,
+		                             Execute<ICUToTimeTZ, dtime_tz_t>, BindTimeTZ);
+		timetz.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
+		timetz.SetRequiresClientContext();
+		set.AddFunction(std::move(timetz));
 		for (auto &func : set.functions) {
 			func.SetFallible();
 		}

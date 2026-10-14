@@ -208,7 +208,7 @@ def test_unsupported_queries_fail_without_fallback_and_release_admission(tmp_pat
     queries = [
         "select row_number() over () from range(9)",
         "select median(range) from range(9)",
-        "select a.range from range(2) a join range(3) b on a.range<b.range",
+        "select a.range from range(2) a asof join range(3) b on a.range>=b.range",
         "select '00000000-0000-0000-0000-000000000001'::uuid",
     ]
     evidence = Evidence(tmp_path / "unsupported", mode=mode)

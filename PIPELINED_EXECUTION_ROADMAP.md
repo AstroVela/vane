@@ -2,7 +2,34 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
-## 当前增量：SF10 执行吞吐
+## 已完成增量：TPC-H SQL 覆盖
+
+目标是让相同 Parquet SQL 在 local、Ray pipelined、Ray FTE 执行全部 22 条查询并核对完整结果，不引入旧 runner fallback。
+
+- [x] 将函数名白名单改为确定性内置 scalar function 检查；允许优化器处理逗号连接和子查询。
+- [x] 为 CTE、delimiter、MARK/SINGLE 保留完整原生状态边界，独立输入继续走 fragment/exchange。
+- [x] 递归校验子查询中的函数及数据源，保留优化依赖；传递标量子查询多行设置。
+- [x] 增加 NULL/空输入、相关查询、多行错误、CTE 生命周期和两种 Ray 模式的回归用例。
+- [x] 连续两轮静态审查后统一构建，执行相关回归。
+- [x] 实际执行 SF10 全部 22 条并核对 local 结果、记录时序及资源清理。
+
+共享状态单元暂以单分区执行，性能范围见[子查询与共享状态的原生执行边界](PIPELINED_EXECUTION_DESIGN.md#子查询与共享状态的原生执行边界)。此次补齐 TPC-H 所需的 SQL 覆盖；窗口、ASOF、递归 CTE 等限制仍保留。
+
+2026-10-12：相关非 Ray 1,094 项、真实 Ray 94 项通过，23 项因缺少可选依赖 fsspec 跳过。构建后的回归补齐了空外层输入消除 delimiter 后的相关 hash join；原有拒绝测试按新的支持范围调整并复测。未运行全量 fast/release。
+
+SF10 的 local、pipelined、FTE 均完成 22/22；两种 Ray 模式的完整结果、返回顺序与 local 对照通过。Q12 的 HUGEINT 按已有 Ray Arrow profile 将 local 参考列无损宽化为 decimal256(39,0)。每条查询结束后检查配额清零，Runtime 关闭后无存活 session、worker 预留和结果 context，数据源未改变。
+
+| 模式 | 成功样本总耗时 | 其中提交阶段 |
+| --- | ---: | ---: |
+| local | 8.882 s | 8.839 s |
+| Ray pipelined | 294.178 s | 4.236 s |
+| Ray FTE | 997.256 s | 410.784 s |
+
+local 使用默认 36 threads/50.1 GiB，Ray 使用 2 workers × 18 CPUs，算子内存取启动时 Ray 可用内存扣除 exchange、staging 和结果服务预留。单机、单样本、未清空 OS 缓存，耗时含完整读取和关闭；两个后端的提交阶段含义不同，不能据此直接比较编译耗时。FTE Q8 首轮因 63 个输出的保守预留超出 128 GiB 计费额度而失败，单独提高 store/query 上限到 160 GiB 后通过；表中采用成功重试耗时。额度并非物理预分配空间，未改变存储计费实现。逐条数据和配置差异见[SF10 验收](EXECUTION_ACCEPTANCE.md#tpch-sf10-coverage-acceptance)。
+
+后续性能工作应优先测量相关子查询共享状态单元的分区方式、join 过滤和交换量，以及 FTE 的快照准备与物化开销。此次没有加入跨查询快照缓存。原始日志、完整 Arrow 结果、运行脚本和清理快照位于本 checkout 的 `build/tpch-sf10-coverage-20261012/`。
+
+## 已完成增量：SF10 执行吞吐
 
 针对单文件 SF10 Q1/Q6 暴露的明细交换、小帧、重复全文哈希和空闲 worker：
 

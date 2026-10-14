@@ -220,7 +220,9 @@ def test_native_aggregate_rewrites_and_accumulator_bounds(sql, partitions):
         assert execute_graph(connection, compile_sql(connection, sql, partitions)) == expected
 
 
-@pytest.mark.parametrize("call", ["first(range)", "arg_min(range, range)", "arg_max(range, range)"])
+@pytest.mark.parametrize(
+    "call", ["first(range)", "arg_min(range, range)", "arg_max(range, range)", "arg_min_null(range, range)"]
+)
 def test_internal_aggregate_rewrites_do_not_expand_parsed_sql_subset(call):
     with vane.connect(backend="local") as connection:
         with pytest.raises(vane.NotImplementedException, match="does not support function"):
