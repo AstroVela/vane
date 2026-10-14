@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "fragment_plan.hpp"
+#include "file_snapshot.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
@@ -118,7 +119,8 @@ py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const s
 
 py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
                            const vector<idx_t> &hash_columns, bool require_replay,
-                           const string &snapshot_directory = "", idx_t source_budget = 0) {
+                           const string &snapshot_directory = "", idx_t source_budget = 0,
+                           SourceSnapshotCache *source_cache = nullptr) {
 	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
@@ -128,8 +130,8 @@ py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, co
 	{
 		py::gil_scoped_release release;
 		snapshot = CaptureConnection(context);
-		graph =
-		    Compile(context, sql, query_id, partitions, hash_columns, snapshot_directory, source_budget, &source_bytes);
+		graph = Compile(context, sql, query_id, partitions, hash_columns, snapshot_directory, source_budget,
+		                &source_bytes, source_cache);
 		for (auto &fragment : graph.fragments) {
 			sources.push_back(CaptureSources(context, fragment, require_replay));
 		}
@@ -329,6 +331,9 @@ void ValidateHash(DuckDBPyConnection &connection, const string &schema, const st
 
 void RegisterExecutionPlanBindings(py::module_ &module) {
 	auto execution = module.def_submodule("execution_plan", "Native distributed fragment compiler and loader");
+	py::class_<SourceSnapshotCache, std::shared_ptr<SourceSnapshotCache>>(execution, "SourceSnapshotCache")
+	    .def(py::init<const string &, idx_t>(), py::arg("directory"), py::arg("capacity_bytes"))
+	    .def("snapshot", &SourceSnapshotCache::Snapshot, py::call_guard<py::gil_scoped_release>());
 	execution.def("engine_identity", &vane_execution::EngineIdentity);
 	execution.def("compile", &CompileGraph, py::arg("connection"), py::arg("sql"), py::arg("query_id"),
 	              py::arg("partition_count"), py::arg("hash_columns"));
@@ -342,15 +347,16 @@ void RegisterExecutionPlanBindings(py::module_ &module) {
 	execution.def(
 	    "stage_submission",
 	    [](DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
-	       const vector<idx_t> &hash_columns, const string &directory, idx_t source_budget) {
+	       const vector<idx_t> &hash_columns, const string &directory, idx_t source_budget,
+	       const std::shared_ptr<SourceSnapshotCache> &source_cache) {
 		    if (directory.empty() || !source_budget || source_budget > (1ULL << 40)) {
 			    throw InvalidInputException("FTE staging requires a directory and finite source storage budget");
 		    }
 		    return CompileSubmission(connection, sql, query_id, partitions, hash_columns, true, directory,
-		                             source_budget);
+		                             source_budget, source_cache.get());
 	    },
 	    py::arg("connection"), py::arg("sql"), py::arg("query_id"), py::arg("partition_count"), py::arg("hash_columns"),
-	    py::arg("directory"), py::arg("source_budget"));
+	    py::arg("directory"), py::arg("source_budget"), py::arg("source_cache") = nullptr);
 	execution.def("compiler_capabilities", &CompilerCapabilities, py::arg("connection"));
 	execution.def("inspect_submitted_fragment", &InspectSubmittedFragment, py::arg("connection"), py::arg("payload"),
 	              py::arg("connection_snapshot"), py::arg("source_snapshot"), py::arg("require_replay"));

@@ -10,6 +10,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <set>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -111,7 +112,8 @@ string FrozenFilePath(ClientContext &context, const string &source, const string
 	return UTF8Path(target / "data.parquet");
 }
 
-FrozenFile FreezeFile(ClientContext &context, const string &source, const string &target, idx_t remaining) {
+FrozenFile FreezeFile(ClientContext &context, const string &source, const string &target, idx_t remaining,
+                      bool *created) {
 	namespace paths = std::filesystem;
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto input = fs.OpenFile(source, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
@@ -127,6 +129,9 @@ FrozenFile FreezeFile(ClientContext &context, const string &source, const string
 	auto output = local.OpenFile(UTF8Path(destination),
 	                             FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE |
 	                                 FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE | FileFlags::FILE_FLAGS_PRIVATE);
+	if (created) {
+		*created = true;
+	}
 	auto size = input->GetFileSize();
 	auto sha = Fingerprint(context, *input, output.get(), remaining);
 	if (input->GetFileSize() != size) {
@@ -139,6 +144,111 @@ FrozenFile FreezeFile(ClientContext &context, const string &source, const string
 	// validate that same inode/version instead of rehashing its entire contents.
 	auto path = UTF8Path(destination);
 	return {path, idx_t(size), sha, FileIdentity(context, OpenFileInfo(path))};
+}
+
+struct SourceSnapshotCache::Impl {
+	Impl(string directory_p, idx_t capacity_p) : directory(std::move(directory_p)), capacity(capacity_p) {
+	}
+	const string directory;
+	const idx_t capacity;
+	mutable std::mutex lock;
+	std::map<string, FrozenFile> files;
+	std::set<string> failed_cleanup;
+	idx_t used = 0;
+	idx_t hits = 0;
+	idx_t misses = 0;
+	idx_t bypasses = 0;
+};
+
+SourceSnapshotCache::SourceSnapshotCache(const string &directory, idx_t capacity)
+    : impl(make_uniq<Impl>(directory, capacity)) {
+	namespace paths = std::filesystem;
+	LocalFileSystem fs;
+	if (!capacity || capacity > (1ULL << 40) || !fs.IsPathAbsolute(directory) || directory.find('=') != string::npos ||
+	    directory.find('\0') != string::npos ||
+	    paths::weakly_canonical(paths::u8path(directory)) != paths::u8path(directory)) {
+		throw InvalidInputException("source snapshot cache requires a canonical directory and finite capacity");
+	}
+	paths::create_directories(paths::u8path(directory));
+}
+
+SourceSnapshotCache::~SourceSnapshotCache() {
+}
+
+FrozenFile SourceSnapshotCache::Freeze(ClientContext &context, const string &source, const string &destination,
+                                       idx_t remaining) {
+	namespace paths = std::filesystem;
+	std::unique_lock<std::mutex> guard(impl->lock);
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	auto relative = paths::weakly_canonical(paths::u8path(source)).lexically_relative(paths::u8path(impl->directory));
+	if (!relative.empty() && *relative.begin() != paths::u8path("..")) {
+		throw InvalidInputException(
+		    "source patterns include snapshot cache files; use a store outside the input dataset");
+	}
+	auto version = FileIdentity(context, OpenFileInfo(source));
+	// FileIdentity starts with the exact byte size, then the inode and precise
+	// modification/change timestamps. A restored mtime cannot reuse a rewrite.
+	auto bytes = idx_t(std::stoull(version.substr(0, version.find(':'))));
+	if (bytes > remaining) {
+		throw OutOfMemoryException("file snapshots exceed reserved storage capacity");
+	}
+	Hash hash;
+	hash.AddBytes(reinterpret_cast<const_data_ptr_t>(version.data()), version.size());
+	auto directory = UTF8Path(paths::u8path(impl->directory) / Finish(hash));
+	auto target = FrozenFilePath(context, source, directory);
+	auto check_source = [&]() {
+		if (FileIdentity(context, OpenFileInfo(source)) != version ||
+		    FrozenFilePath(context, source, directory) != target) {
+			throw IOException("file changed while freezing query input");
+		}
+	};
+	auto found = impl->files.find(target);
+	if (found != impl->files.end()) {
+		check_source();
+		if (FileIdentity(context, OpenFileInfo(found->second.path)) != found->second.identity) {
+			throw IOException("cached source snapshot changed");
+		}
+		impl->hits++;
+		return found->second;
+	}
+	// Bound both data and metadata, including failed fills. Full caches use the
+	// ordinary query-owned path without evicting files borrowed by live readers.
+	if (bytes > impl->capacity - impl->used || impl->misses >= 4096 || impl->failed_cleanup.count(target)) {
+		impl->bypasses++;
+		guard.unlock();
+		return FreezeFile(context, source, destination, remaining);
+	}
+	impl->misses++;
+	impl->used += bytes;
+	bool created = false;
+	try {
+		auto frozen = FreezeFile(context, source, target, bytes, &created);
+		check_source();
+		impl->files.emplace(target, frozen);
+		return frozen;
+	} catch (...) {
+		std::error_code error;
+		if (created) {
+			paths::remove(paths::u8path(target), error);
+		}
+		if (error) {
+			// Failed deletion keeps its complete charge until the cache lease
+			// is retired. Never offer these partial bytes to another query.
+			impl->failed_cleanup.insert(target);
+		} else {
+			impl->used -= bytes;
+		}
+		throw;
+	}
+}
+
+std::map<string, idx_t> SourceSnapshotCache::Snapshot() const {
+	std::lock_guard<std::mutex> guard(impl->lock);
+	return {{"capacity_bytes", impl->capacity}, {"used_bytes", impl->used},
+	        {"entries", impl->files.size()},    {"hits", impl->hits},
+	        {"misses", impl->misses},           {"bypasses", impl->bypasses}};
 }
 
 struct StoreGuard::Impl {

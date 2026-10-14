@@ -34,7 +34,7 @@ def options(*, attempts=3, backoff=0, execution=30, delivery=30):
     )
 
 
-def assert_idle(connection, *, allow_dead_workers=False):
+def assert_idle(connection, *, allow_dead_workers=False, source_cache_bytes=0):
     import ray
 
     runtime = connection.query_runtime
@@ -48,7 +48,7 @@ def assert_idle(connection, *, allow_dead_workers=False):
             if not allow_dead_workers:
                 raise
     for store in runtime.stores.values():
-        assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+        assert store.snapshot() == {"queries": int(bool(source_cache_bytes)), "reserved_bytes": source_cache_bytes}
 
 
 def close_result(result):
@@ -214,6 +214,74 @@ def test_file_snapshot_precedes_optimization_and_survives_original_change(tmp_pa
                 local.execute(f"copy (select 100 as value) to '{path}' (overwrite true)")
             assert sorted(result.collect().column("value").to_pylist()) == ([] if predicate else [1, 2, 3])
         assert_idle(connection)
+
+
+def test_source_cache_reuses_versions_across_sessions_and_releases_on_runtime_close(tmp_path):
+    path = tmp_path / "input.parquet"
+    sql = f"select value from read_parquet('{path}')"
+    config = resources(tmp_path)
+    cache_bytes = 4 << 20
+    config = replace(config, exchange_stores=(replace(config.exchange_stores[0], source_cache_bytes=cache_bytes),))
+    with vane.connect(backend="local") as local:
+        local.execute(f"copy (select 42 as value) to '{path}'")
+    with vane.Runtime(config) as application:
+        with application.connect(execution="fte") as first, application.connect(execution="fte") as second:
+            with first.query(sql) as retained:
+                store = retained.context._reader.store
+                assert second.query(sql).collect().column("value").to_pylist() == [42]
+                assert store._cache.snapshot()["entries"] == 1
+                assert store._cache.snapshot()["hits"] == 1
+                with vane.connect(backend="local") as local:
+                    local.execute(f"copy (select 100 as value) to '{path}' (overwrite true)")
+                assert second.query(sql).collect().column("value").to_pylist() == [100]
+                assert retained.collect().column("value").to_pylist() == [42]
+            assert store._cache.snapshot()["entries"] == 2
+            assert_idle(first, source_cache_bytes=cache_bytes)
+        assert store.snapshot() == {"queries": 1, "reserved_bytes": cache_bytes}
+        directory = store._cache_lease.directory
+        assert len(list(directory.rglob("*.parquet"))) == 2
+    assert not directory.exists()
+    assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+
+
+def test_worker_loss_replays_cached_version_after_original_changes(tmp_path, monkeypatch):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    path = tmp_path / "input.parquet"
+    sql = f"select value from read_parquet('{path}')"
+    config = resources(tmp_path)
+    cache_bytes = 4 << 20
+    config = replace(config, exchange_stores=(replace(config.exchange_stores[0], source_cache_bytes=cache_bytes),))
+    with vane.connect(backend="local") as local:
+        local.execute(f"copy (select range as value from range(100)) to '{path}'")
+    dispatch, killed = RecoveryScheduler._dispatch, []
+
+    def lose_worker(owner, index, partition, binding, upstream):
+        admitted = dispatch(owner, index, partition, binding, upstream)
+        if admitted and not killed:
+            attempt = owner.active[index]
+            killed.append(attempt.reservation.token)
+            with vane.connect(backend="local") as local:
+                local.execute(f"copy (select 999 as value) to '{path}' (overwrite true)")
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    with vane.Runtime(config) as application, application.connect(execution="fte") as connection:
+        assert sorted(connection.query(sql).collect().column("value").to_pylist()) == list(range(100))
+        with monkeypatch.context() as patch:
+            patch.setattr(RecoveryScheduler, "_dispatch", lose_worker)
+            with connection.query(sql, options=options()) as result:
+                scheduler = result.context._reader
+                assert sorted(result.collect().column("value").to_pylist()) == list(range(100))
+        attempts = [token for token in scheduler.history if token.task_id == killed[0].task_id]
+        assert len(attempts) == 2
+        assert attempts[0].input_id == attempts[1].input_id
+        assert attempts[0].worker_epoch != attempts[1].worker_epoch
+        assert scheduler.store._cache.snapshot()["hits"] == 1
+        assert connection.query(sql).collect().column("value").to_pylist() == [999]
+        assert_idle(connection, source_cache_bytes=cache_bytes)
 
 
 @pytest.mark.parametrize("partitions", [1, 2])

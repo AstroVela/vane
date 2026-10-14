@@ -311,7 +311,17 @@ class CommitCoordinator:
             raise RuntimeError(self._error or "materialized query is closing")
 
     def _usage(self) -> int:
-        return self._source_bytes + sum(o.max_bytes for r in self._reservations.values() for o in r.objects)
+        # Only verified commits have a fixed size. Live and failed attempts
+        # keep their full allowance until native I/O has stopped and discard
+        # succeeds; committed data stays charged while readers can retain it.
+        committed = {
+            manifest.token.fence: sum(obj.metadata.bytes for obj in manifest.objects)
+            for manifest in self._committed.values()
+        }
+        return self._source_bytes + sum(
+            committed[fence] if fence in committed else sum(obj.max_bytes for obj in reservation.objects)
+            for fence, reservation in self._reservations.items()
+        )
 
     def _publish_fence(self, task_id: str, fence: str | None) -> None:
         from vane.execution.fte_store import replace_metadata

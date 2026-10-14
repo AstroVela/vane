@@ -15,6 +15,7 @@ import pytest
 from vane import IOException
 from vane._native import execution_runtime as native
 from vane.execution.fte_store import ActiveStoreLease, ExchangeStore, StorePool, replace_metadata
+from vane.execution.materialized_store import StorageCleanupPending
 
 
 def pool(tmp_path, **changes):
@@ -64,6 +65,144 @@ def test_registration_cannot_change_existing_store_capacity(tmp_path):
     original = pool(tmp_path)
     with pytest.raises(ValueError, match="conflicting"):
         StorePool(replace(original.config, capacity_bytes=8192))
+
+
+@pytest.mark.parametrize("capacity", [-1, True, 4096, (1 << 40) + 1])
+def test_source_cache_requires_a_finite_separate_store_reservation(tmp_path, capacity):
+    with pytest.raises(ValueError, match="cache|capacity"):
+        pool(tmp_path, source_cache_bytes=capacity)
+
+
+def test_source_cache_is_charged_until_explicit_store_close(tmp_path):
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+    try:
+        cache = store.source_cache(query)
+        assert cache.snapshot()["capacity_bytes"] == 1024
+        assert store.snapshot() == {"queries": 2, "reserved_bytes": 3072}
+        query.close(lambda: None)
+        assert store.snapshot() == {"queries": 1, "reserved_bytes": 1024}
+        store.close()
+        assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+    finally:
+        query.close(lambda: None)
+        store.close()
+
+
+def test_worker_source_pin_survives_coordinator_pin_release(tmp_path):
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+    store.source_cache(query)
+    worker = ActiveStoreLease(query.to_dict())
+    cache_directory = store._cache_lease.directory
+    sentinel = cache_directory / "borrowed.parquet"
+    sentinel.write_bytes(b"native reader owns these bytes")
+    try:
+        # Model loss of the coordinator's source pin: the worker must own an
+        # independent lock, rather than depending on the sending process.
+        for source in query._source_pins:
+            source.close()
+        with pytest.raises(StorageCleanupPending, match="participants"):
+            store.close()
+        assert sentinel.read_bytes() == b"native reader owns these bytes"
+        assert store.snapshot()["reserved_bytes"] == 3072
+        worker.close()
+        query.close(lambda: None)
+        store.close()
+        assert not cache_directory.exists()
+        assert store.snapshot()["reserved_bytes"] == 0
+    finally:
+        worker.close()
+        query.close(lambda: None)
+        store.close()
+
+
+def test_idle_source_cache_renews_its_lease(tmp_path):
+    store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=0.5)
+    query = store.reserve("query")
+    try:
+        store.source_cache(query)
+        query.close(lambda: None)
+        time.sleep(0.65)
+        pin = ActiveStoreLease(store._cache_lease.to_dict())
+        try:
+            pin.check()
+        finally:
+            pin.close()
+    finally:
+        query.close(lambda: None)
+        store.close()
+
+
+def test_failed_source_cache_creation_returns_its_reservation(tmp_path, monkeypatch):
+    from vane._native import execution_plan
+
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+
+    def fail(*args):
+        raise RuntimeError("cache creation failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(execution_plan, "SourceSnapshotCache", fail)
+            with pytest.raises(RuntimeError, match="cache creation failed"):
+                store.source_cache(query)
+        assert store.snapshot() == {"queries": 1, "reserved_bytes": 2048}
+        store.source_cache(query)
+        assert store.snapshot()["reserved_bytes"] == 3072
+    finally:
+        query.close(lambda: None)
+        store.close()
+
+
+def test_failed_source_cache_heartbeat_fences_later_queries(tmp_path, monkeypatch):
+    store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=0.5)
+    first = store.reserve("first")
+    second = None
+    try:
+        store.source_cache(first)
+        first.close(lambda: None)
+
+        def fail():
+            raise OSError("cache heartbeat failed")
+
+        monkeypatch.setattr(store._cache_lease, "renew", fail)
+        deadline = time.monotonic() + 5
+        while store._cache_error is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        second = store.reserve("second")
+        with pytest.raises(RuntimeError, match="source snapshot cache lease failed"):
+            store.source_cache(second)
+        assert store.snapshot()["reserved_bytes"] == 3072
+    finally:
+        first.close(lambda: None)
+        if second is not None:
+            second.close(lambda: None)
+        store.close()
+    assert store.snapshot()["reserved_bytes"] == 0
+
+
+@pytest.mark.parametrize("invalid", ["recursive", "foreign_store", "too_many"])
+def test_source_lease_wire_rejects_unbounded_or_foreign_pins(tmp_path, invalid):
+    store, other = pool(tmp_path), pool(tmp_path / "other")
+    query, foreign = store.reserve("query"), other.reserve("foreign")
+    wire = query.to_dict()
+    if invalid == "recursive":
+        wire["source_leases"] = [wire]
+    elif invalid == "foreign_store":
+        wire["source_leases"] = [foreign.to_dict()]
+    else:
+        wire["source_leases"] = [foreign.to_dict(), foreign.to_dict()]
+    try:
+        with pytest.raises(ValueError, match="source cache"):
+            ActiveStoreLease(wire)
+        query.close(lambda: None)
+        assert store.snapshot()["reserved_bytes"] == 0
+    finally:
+        query.close(lambda: None)
+        foreign.close(lambda: None)
 
 
 def test_live_native_pin_blocks_query_cleanup(tmp_path):

@@ -1177,12 +1177,13 @@ void FilePatterns(ParsedExpression &expression, vector<string> &patterns, bool a
 }
 
 void StageFileArguments(ClientContext &context, SelectStatement &select, const string &directory, idx_t budget,
-                        unordered_map<string, FrozenFile> &frozen, idx_t &used) {
+                        unordered_map<string, FrozenFile> &frozen, idx_t &used, SourceSnapshotCache *cache) {
 	struct FileScan {
 		TableFunctionRef &ref;
 		vector<OpenFileInfo> files;
 	};
 	vector<FileScan> scans;
+	unordered_map<string, string> references;
 	auto &fs = FileSystem::GetFileSystem(context);
 	// Expand every scan before writing: the snapshot directory can be inside a
 	// recursive input glob. Keep repeated references in their original order.
@@ -1233,17 +1234,19 @@ void StageFileArguments(ClientContext &context, SelectStatement &select, const s
 				throw InterruptException();
 			}
 			auto target = FrozenFilePath(context, file.path, directory);
-			auto existing = frozen.find(target);
-			if (existing == frozen.end()) {
+			auto existing = references.find(target);
+			if (existing == references.end()) {
 				if (frozen.size() >= 4096) {
 					throw InvalidInputException("FTE source file count exceeds limit");
 				}
-				auto snapshot = FreezeFile(context, file.path, target, budget - used);
+				auto snapshot = cache ? cache->Freeze(context, file.path, target, budget - used)
+				                      : FreezeFile(context, file.path, target, budget - used);
 				used += snapshot.bytes;
-				existing = frozen.emplace(target, std::move(snapshot)).first;
+				existing = references.emplace(target, snapshot.path).first;
+				frozen.emplace(existing->second, std::move(snapshot));
 			}
-			paths.push_back(Value(existing->second.path));
-			files.emplace_back(existing->second.path);
+			paths.push_back(Value(existing->second));
+			files.emplace_back(existing->second);
 		}
 		auto &function = scan.ref.function->Cast<FunctionExpression>();
 		function.children[0] = make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths)));
@@ -1278,7 +1281,7 @@ void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, 
 
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns, const string &snapshot_directory, idx_t source_budget,
-                      idx_t *source_bytes) {
+                      idx_t *source_bytes, SourceSnapshotCache *source_cache) {
 	CheckPartitions(partitions);
 	auto trimmed_id = query_id;
 	StringUtil::Trim(trimmed_id);
@@ -1306,7 +1309,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 			    }
 		    });
 		if (!snapshot_directory.empty()) {
-			StageFileArguments(context, select, snapshot_directory, source_budget, frozen, used);
+			StageFileArguments(context, select, snapshot_directory, source_budget, frozen, used, source_cache);
 		}
 		Planner planner(context);
 		// Column references can become SQL value functions during binding. Check

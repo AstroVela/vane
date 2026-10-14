@@ -375,6 +375,28 @@ def test_stage_barrier_idempotent_commit_and_immutable_roundtrip(commits):
         commits.discard(first.token)
 
 
+def test_verified_commit_reclaims_unused_capacity_while_preserving_inputs(commits):
+    commits.source_bytes(256)
+    reserved, manifest = sealed_attempt(commits)
+    path = commits.store.path(manifest.objects[0].key)
+    actual_bytes = path.stat().st_size
+    assert commits.snapshot()["reserved_bytes"] == 256 + (1 << 20)
+    with pytest.raises(RuntimeError, match="capacity"):
+        commits.begin("b", "worker-2", object_bytes=3 << 20)
+
+    commits.commit(manifest)
+    assert commits.snapshot()["reserved_bytes"] == 256 + actual_bytes
+    commits.begin("b", "worker-2", object_bytes=3 << 20)
+    assert commits.snapshot()["reserved_bytes"] == 256 + actual_bytes + (3 << 20)
+    assert commits.commit(manifest) is manifest
+    assert commits.snapshot()["reserved_bytes"] == 256 + actual_bytes + (3 << 20)
+    assert read_object(path, reserved.objects[0].output.schema, manifest.objects[0].metadata.to_dict()) == [
+        (1,),
+        (2,),
+        (3,),
+    ]
+
+
 @pytest.mark.parametrize("change", ["worker_epoch", "attempt", "input_id", "engine", "schema", "key"])
 def test_foreign_or_changed_manifest_cannot_commit(commits, change):
     _, manifest = sealed_attempt(commits)
@@ -404,7 +426,10 @@ def test_retry_fences_late_success_and_replays_fixed_input(commits):
     with pytest.raises(ValueError, match="stale"):
         commits.commit(late)
     commits.commit(winner)
+    actual_bytes = second.store.path(second.objects[0].key).stat().st_size
+    assert commits.snapshot()["reserved_bytes"] == (1 << 20) + actual_bytes
     commits.discard(first.token)
+    assert commits.snapshot()["reserved_bytes"] == actual_bytes
     assert commits.snapshot()["committed_tasks"] == 1
     assert not first.store.path(first.objects[0].key).exists()
     assert second.store.path(second.objects[0].key).exists()
@@ -426,6 +451,7 @@ def test_fencing_can_win_while_commit_verifies_storage(commits, monkeypatch, act
         committing = pool.submit(commits.commit, manifest)
         try:
             assert entered.wait(5)
+            assert commits.snapshot()["reserved_bytes"] == 1 << 20
             change = (
                 pool.submit(commits.cancel, "query canceled")
                 if action == "cancel"
@@ -454,7 +480,9 @@ def test_read_lease_pins_committed_objects_through_cleanup(commits):
                 (2,),
                 (3,),
             ]
-        assert commits.snapshot()["reserved_bytes"] == 2 << 20
+        assert commits.snapshot()["reserved_bytes"] == sum(
+            commits.store.path(obj.key).stat().st_size for attempt in stage.attempts for obj in attempt.objects
+        )
     commits.close()
     assert commits.snapshot()["reserved_bytes"] == 0
 
@@ -473,7 +501,7 @@ def test_cleanup_failure_keeps_storage_reservation(commits, monkeypatch):
     monkeypatch.setattr(materialized_store.shutil, "rmtree", fail_remove)
     with pytest.raises(OSError, match="storage unavailable"):
         commits.close()
-    assert commits.snapshot()["reserved_bytes"] == 1 << 20
+    assert commits.snapshot()["reserved_bytes"] == reserved.store.path(reserved.objects[0].key).stat().st_size
     assert commits.snapshot()["error"] == "original query failure"
     assert reserved.store.path(reserved.objects[0].key).exists()
     monkeypatch.setattr(materialized_store.shutil, "rmtree", remove)
@@ -516,6 +544,7 @@ def test_commit_verifies_each_object_before_acceptance(commits, damage):
     with pytest.raises(Exception):
         commits.commit(manifest)
     assert commits.snapshot()["committed_tasks"] == 0
+    assert commits.snapshot()["reserved_bytes"] == 1 << 20
     with pytest.raises(RuntimeError, match="uncommitted"):
         commits.seal_stage("stage")
 
@@ -540,6 +569,7 @@ def test_store_identity_and_object_paths_are_fenced(commits, tmp_path):
 def test_storage_location_changes_block_cleanup_without_returning_quota(commits, tmp_path, change):
     reserved, manifest = sealed_attempt(commits)
     commits.commit(manifest)
+    actual_bytes = reserved.store.path(reserved.objects[0].key).stat().st_size
     if change == "identity":
         marker = tmp_path / "store" / "store.json"
         original = marker.read_bytes()
@@ -560,7 +590,7 @@ def test_storage_location_changes_block_cleanup_without_returning_quota(commits,
     try:
         with pytest.raises(ValueError, match="identity|symlink"):
             commits.close()
-        assert commits.snapshot()["reserved_bytes"] == 1 << 20
+        assert commits.snapshot()["reserved_bytes"] == actual_bytes
     finally:
         restore()
     assert reserved.store.path(reserved.objects[0].key).exists()

@@ -212,6 +212,8 @@ with vane.Runtime(resources) as runtime, runtime.connect() as connection:
 
 `runtime.connect(execution="fte")` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
 
+重复查询同一批文件时，可以设置 `ExchangeStore(source_cache_bytes=4 << 30, ...)`，在同一个 Runtime 的会话之间复用未变化的输入快照。默认值为 0，保持每查询复制。缓存独立预留存储容量，必须满足 `query_bytes + source_cache_bytes <= capacity_bytes`；缓存目录所在的 store 应位于输入数据集之外，避免递归 glob 扫描到保留副本。缓存满后回退到查询独享副本，`Runtime.close()` 清理缓存并归还配额。
+
 嵌入式 Runtime 的调用进程必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。独立 Server 已提供固定的公开控制与结果端口及双端口 TLS；远程 Client 只需访问这些公开端点，不加入 Ray，详见 [Server 设计](SERVER_DESIGN.md)。
 
 连接提供默认值，query 提交时冻结快照。同一 Ray 连接的并发查询可以选择不同分布式策略，不修改进程环境；local 连接拒绝分布式策略 override。已经提交的查询不能原地切换目标。Relation 等上层表达入口如继续提供，也必须提交到同一个 QuerySpec 入口。
@@ -525,7 +527,7 @@ MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel
 
 SharedDirectoryStore 要求所有参与者访问同一个绝对路径和 `store_id`，支持独占创建、原子 hard link 发布和文件 sync。目录必须由部署方放在独立于计算 worker 的共享存储上；路径名称与 marker 只能校验身份和可见性，无法证明挂载的物理故障域。当前测试验证独立生产进程退出后数据保留，不宣称本地临时目录可承受整台存储节点失效。
 
-CommitCoordinator 按阶段接收固定的逻辑 task、输入指纹和全部输出分区声明；下游指纹包含实际已提交的上游 manifest，不能在上游选定之前伪造。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。存储配额按对象最大预留长度计费，成功清理后才释放。
+CommitCoordinator 按阶段接收固定的逻辑 task、输入指纹和全部输出分区声明；下游指纹包含实际已提交的上游 manifest，不能在上游选定之前伪造。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。未提交对象按最大长度预留；完成完整验证且被 coordinator 选为成功输出后，改按实际封存长度计费，归还未用额度。仍保留对象实际占用，直到成功清理。
 
 commit 先核对 engine、查询、task、输入、epoch、fence、分区、schema 和对象预算，在决策锁外读取对象并发布不可变 `attempt.json`，最后再次验证 fence 并选择唯一成功输出。取消或新 attempt 可以在慢存储验证期间抢先生效。相同提交重复到达返回既有决定，冲突提交报错。`attempt.json` 是封存记录；即使文件存在，也不代表已被接受。只有本次 coordinator 的提交表选中的 attempt 可以进入 StageManifest。
 
@@ -533,7 +535,11 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 ### P3.2 不可变文件输入
 
-[file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制、核对源文件两次 SHA-256 与元数据，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
+[file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制并计算 SHA-256，核对复制前后的精确文件状态，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
+
+启用 `source_cache_bytes` 后，`SourceSnapshotCache` 按物理源路径、Hive 分区值、文件大小、文件身份、纳秒修改时间和变更时间区分版本。命中前再次检查原文件版本和缓存文件身份；改写后恢复 mtime、替换或删除原文件均不能误用旧版本。首次复制保留原有哈希、状态与 sync 校验；命中避免重复复制和哈希，worker 对冻结输入的校验保持不变。并发查询只复制同一版本一次，单个查询的 `source_bytes` 上限在命中时仍适用。
+
+缓存每个 Runtime/store 独立，最多 1 TiB 数据和 4096 次填充尝试，不做持久索引恢复或淘汰；容量或条目额度耗尽后使用普通查询独享副本。旧版本保留到 Runtime 关闭，后续查询可以缓存新版本，已有查询及其重试继续使用原版本。失败复制尝试删除部分文件，删除失败则保留完整计费且不供复用。缓存属于独立的、持续续租的存储 allocation；每个借用查询、worker 和结果服务分别持有共享租约锁，清理必须等待所有读者释放。空闲时 `StorePool.snapshot()` 因此仍包含一个缓存 allocation 和它的完整容量预留；Runtime 关闭后才归零。
 
 创建任何快照前，先展开整个查询所有 scan 的路径模式，固定每个 scan 的完整文件引用列表并检查模式与引用数量。列表保留顺序和重复引用，之后才按快照身份去重复制和计费。exchange store 位于递归 glob 目录内时，本次复制产生的文件不会成为后续模式的新输入；展开时已存在且匹配的文件仍是合法输入。
 
@@ -547,7 +553,7 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 [RecoveryScheduler](vane/execution/recovery_runtime.py) 使用 P2 的 worker 池与 native TaskService，每个阶段按 worker 数量分批运行，每个查询在一个 worker 上至多运行一个 attempt。所有 stage task 提交后才声明下一阶段的输入。worker actor 禁用自动重启和 RPC 自动重放；未提交 attempt 遇到 RayActorError 时，scheduler 创建新 epoch 的 worker，按固定输入生成新 fence。Ray 状态探测读取独立 native production/error 快照，不等待 pump 执行锁；准备和源文件校验受查询执行期限约束。
 
-[StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量，exchange 按各对象最大长度预留。失败 attempt 未清理完成时继续占用配额。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
+[StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量（命中共享缓存时也保守计入），exchange 在提交验证前按各对象最大长度预留，接受提交后改按实际封存长度计费。失败或过期 attempt 未清理完成时继续保留完整预留。启用的快照缓存另占 source_cache_bytes，不从查询额度中挪用。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
 
 每个查询具有随机 namespace、lease_id 和有限到期时间。coordinator 独立线程续租；worker 与 ResultService 独立线程检查 lease/fence，过期即取消 native 执行并清理。所有 native 参与者持有查询共享锁，attempt 另有 I/O 锁。查询锁位于数据目录外的 `allocations/<namespace>.lock`，不会被递归删除带走。删除必须取得独占锁；Unix 使用 open-description flock，Windows 使用 LockFileEx，不能用会被同进程其他 close 释放的进程级锁替代。
 
