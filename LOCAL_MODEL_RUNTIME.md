@@ -1346,12 +1346,12 @@ allowing already prepared queries to finish.
 The shared query admission gate closes before model draining starts, so
 task-only preparation cannot enter between the two drain operations.
 
-The runtime allowance is released when execution finishes, even if its result
-has not yet been consumed. The existing pool slot remains attached to that
-buffered result until consumption or cleanup. Shared-memory output references
-keep their existing byte accounting until downstream releases them. A slow
-consumer therefore still bounds buffering in its pool without monopolizing
-another model's runtime execution allowance.
+The runtime allowance and task pool slot are released when execution finishes,
+even if the result has not yet been consumed. Buffered results retain their
+output ownership, and shared-memory references keep their byte accounting until
+downstream releases them. Output flow control bounds buffering independently of
+execution slots. Releasing an older result cannot release a newer invocation
+that has reused its slot.
 
 `resource_snapshot()["task_admission"]` reports the limits, `running_tasks`,
 `ready_tasks`, `queued_tasks`, `waiting_tasks`, `resuming_tasks`, query owners,

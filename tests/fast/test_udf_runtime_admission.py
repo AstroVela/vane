@@ -146,7 +146,7 @@ def test_full_queue_rejects_without_reserving_capacity_and_can_be_retried(admiss
     h.take(refused).release()
 
 
-def test_runtime_execution_completion_does_not_release_buffered_result_slot(admission):
+def test_runtime_execution_completion_reuses_slot_before_result_consumption(admission):
     h = admission()
     pool = h.pool()
     first, same_pool, other_pool = h.authority(pool=pool), h.authority(pool=pool), h.authority()
@@ -157,14 +157,25 @@ def test_runtime_execution_completion_does_not_release_buffered_result_slot(admi
     lease.complete_execution()
     lease.complete_execution()
     assert pool.active_lease_count == 1
-    assert same_pool.state()["state"] == "requested"
+    assert first._capacity.active_lease_count == 0
+    assert same_pool.state()["state"] == "ready"
+    assert other_pool.state()["state"] == "requested"
+    next_lease = h.take(same_pool)
+    # Late result cleanup must not release the call that reused this slot.
+    lease.release()
+    lease.release()
+    assert pool.active_lease_count == 1
+    assert same_pool._capacity.active_lease_count == 1
+    assert h.runtime.snapshot()["running_tasks"] == 1
+    assert other_pool.state()["state"] == "requested"
+    next_lease.complete_execution()
+    assert pool.active_lease_count == 0
     assert other_pool.state()["state"] == "ready"
     h.take(other_pool).release()
     assert h.runtime.snapshot()["running_tasks"] == 0
     assert h.runtime.snapshot()["ready_tasks"] == 0
-    lease.release()
-    assert same_pool.state()["state"] == "ready"
-    h.take(same_pool).release()
+    next_lease.release()
+    assert pool.active_lease_count == 0
 
 
 def test_query_cancel_releases_waiting_and_ready_but_retains_running_tasks(admission):
@@ -329,7 +340,7 @@ def test_suspended_task_retains_global_worker_until_completion_but_not_result_co
     assert h.runtime.snapshot()["running_tasks"] == 1
     lease.complete_execution()
     assert second.state()["available"]
-    assert pool.active_lease_count == 1
+    assert pool.active_lease_count == 0
     assert capacity.reserved_slots == 1
     lease.release()
     lease.complete_execution()
@@ -873,7 +884,7 @@ def test_memory_wait_yields_capacity_and_resumes_before_new_work_without_releasi
             release(claimed)
             lease.complete_execution()
             assert not producer._query.cleanup_pending()
-            assert producer._capacity.active_lease_count == 1
+            assert producer._capacity.active_lease_count == 0
             assert fresh.state()["state"] == "ready"
         finally:
             scope.cancel()
@@ -917,7 +928,7 @@ def test_cancelled_memory_wait_retains_cleanup_owner_and_never_spends_bytes_or_c
             lease.complete_execution()
             assert not producer._query.cleanup_pending()
             assert h.runtime.snapshot()["waiting_tasks"] == 0
-            assert producer._capacity.active_lease_count == 1
+            assert producer._capacity.active_lease_count == 0
             consumer_lease.complete_execution()
         finally:
             scope.cancel()
