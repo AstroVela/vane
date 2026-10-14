@@ -2127,6 +2127,11 @@ the same dynamically learned pending-generator window. An undeclared UDF heap
 commitment is zero; worker RSS high-water marks do not become an additional
 local concurrency limit. Native plan preparation installs this policy even
 when `track_data`, `track_graph`, and explicit runtime limits are omitted.
+Ordinary native `CREATE TABLE AS` and `INSERT` queries retain their DuckDB write
+semantics when they include subprocess UDFs. Their resource graph includes the
+UDF inputs and the native write sink as a materialization boundary. This does
+not extend the configured local request runtime's read-only SQL contract or
+enable distributed execution of these native writes.
 
 Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
 soft budgets, split those budgets between live queries, and preserve downstream
@@ -2161,6 +2166,13 @@ that replacement startup without waiting for the model to finish loading.
 Execution completion returns the task/actor slot immediately; managed output
 bytes remain charged through queued results, zero-copy Arrow/NumPy views,
 remote readers, and inherited views protected by the shared-memory store.
+
+A local result bundle is one publication, even when it contains several IPC
+blocks. Query output admission reserves its complete byte count atomically,
+then assigns each physical block an independent lease. A liveness grant covers
+the complete bundle and returns only after every part is handed off or released.
+Retained parts remain charged individually until their last physical owner
+releases them; releasing one part does not free another part's charge.
 
 Shared-memory progress credits and physical bytes have separate lifetimes.
 The per-producer soft-budget window counts pending and unconsumed outputs.
