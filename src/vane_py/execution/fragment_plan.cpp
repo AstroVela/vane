@@ -57,6 +57,7 @@
 #include "duckdb/parser/tableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -789,10 +790,10 @@ public:
 		if (found != probe_filters.end()) {
 			for (auto &filter : found->second) {
 				auto count = result.fragment.partition_count;
-				auto domain =
-				    ExchangeFrom(filter.producer, filter.build->types, count == 1 ? "gather" : "broadcast", count);
-				result = SemiFilter(op, std::move(result), filter.column, *filter.build, std::move(domain),
-				                    filter.build_column);
+				auto domain = ExchangeFrom(filter.domain_producer, filter.domain->types,
+				                           count == 1 ? "gather" : "broadcast", count);
+				result = SemiFilter(op, std::move(result), filter.column, *filter.domain, std::move(domain),
+				                    filter.keys_only ? 0 : filter.build_column, filter.hashed);
 			}
 		}
 		return result;
@@ -911,16 +912,61 @@ private:
 		PhysicalOperator *build = nullptr;
 		idx_t build_column = 0;
 		string producer;
+		PhysicalOperator *domain = nullptr;
+		string domain_producer;
+		bool keys_only = false;
+		bool hashed = false;
 	};
 	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
+
+	bool HasFilteredAggregate(const PhysicalOperator &op) {
+		if (op.type == PhysicalOperatorType::FILTER) {
+			auto child = &op.children[0].get();
+			while (child->type == PhysicalOperatorType::PROJECTION) {
+				child = &child->children[0].get();
+			}
+			if (child->type == PhysicalOperatorType::HASH_GROUP_BY ||
+			    child->type == PhysicalOperatorType::PERFECT_HASH_GROUP_BY) {
+				return true;
+			}
+		}
+		if (op.type != PhysicalOperatorType::PROJECTION && op.type != PhysicalOperatorType::FILTER &&
+		    op.type != PhysicalOperatorType::HASH_JOIN) {
+			return false;
+		}
+		for (auto &child : op.children) {
+			if (HasFilteredAggregate(child.get())) {
+				return true;
+			}
+		}
+		return false;
+	}
 
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
 		EarlyProbeFilter result;
 		auto &build = join.children[1].get();
 		if (partitions == 1 || (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
-		    !join.filter_pushdown || !join.filter_pushdown->build_side_has_filter || !build.estimated_cardinality ||
-		    EstimatedExchangeBytes(build) > 8 * 1024 * 1024 || !BroadcastJoin(join, partitions)) {
+		    !join.filter_pushdown || !join.filter_pushdown->build_side_has_filter || !build.estimated_cardinality) {
 			return result;
+		}
+		const bool broadcast = BroadcastJoin(join, partitions);
+		if (broadcast && EstimatedExchangeBytes(build) > 8 * 1024 * 1024) {
+			return result;
+		}
+		if (!broadcast) {
+			// Reuse the original producer directly for its hash join. Computed
+			// or repeated build keys still use the ordinary projection path.
+			std::set<idx_t> keys;
+			for (auto &condition : join.conditions) {
+				if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
+				    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+					continue;
+				}
+				if (condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+				    !keys.insert(condition.right->Cast<BoundReferenceExpression>().index).second) {
+					return result;
+				}
+			}
 		}
 		for (auto &condition : join.conditions) {
 			if ((condition.comparison != ExpressionType::COMPARE_EQUAL &&
@@ -937,6 +983,10 @@ private:
 			EarlyProbeFilter target;
 			auto column = condition.left->Cast<BoundReferenceExpression>().index;
 			auto op = &join.children[0].get();
+			if (!broadcast) {
+				target.input = op;
+				target.column = column;
+			}
 			while (column < op->types.size() && op->types[column] == condition.left->return_type) {
 				if (op->type == PhysicalOperatorType::PROJECTION) {
 					auto &expression = *op->Cast<PhysicalProjection>().select_list[column];
@@ -964,14 +1014,78 @@ private:
 					break;
 				}
 			}
-			if (target.input && double(build.estimated_cardinality) * 8 < double(target.input->estimated_cardinality) &&
-			    EstimatedExchangeBytes(build) * partitions < EstimatedExchangeBytes(*target.input)) {
+			if (!target.input) {
+				continue;
+			}
+			auto key_bytes =
+			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
+			target.keys_only = !broadcast;
+			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024;
+			if (target.hashed) {
+				// HAVING estimates can hide a tiny build. A distinct hash domain
+				// has at most 65536 entries even when that estimate is wrong.
+				// Collisions only retain extra probes; the original join is exact.
+				if (!HasFilteredAggregate(build) || target.input->estimated_cardinality <= 8 * 65536) {
+					continue;
+				}
+				key_bytes = 65536 * 9;
+			} else if (double(build.estimated_cardinality) * 8 >= double(target.input->estimated_cardinality)) {
+				continue;
+			}
+			auto traffic = broadcast ? EstimatedExchangeBytes(build) * partitions
+			                         : EstimatedExchangeBytes(build) + key_bytes * partitions;
+			if (traffic < EstimatedExchangeBytes(*target.input)) {
 				target.build = &build;
 				target.build_column = condition.right->Cast<BoundReferenceExpression>().index;
 				return target;
 			}
 		}
 		return result;
+	}
+
+	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column) {
+		FunctionBinder binder(context);
+		ErrorData error;
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundReferenceExpression>(type, column));
+		auto hash = binder.BindScalarFunction(DEFAULT_SCHEMA, "hash", std::move(arguments), error);
+		if (error.HasError()) {
+			throw InternalException("cannot bind join filter hash: %s", error.Message());
+		}
+		arguments.clear();
+		arguments.push_back(std::move(hash));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(65535)));
+		auto bucket = binder.BindScalarFunction(DEFAULT_SCHEMA, "&", std::move(arguments), error);
+		if (error.HasError()) {
+			throw InternalException("cannot bind join filter bucket: %s", error.Message());
+		}
+		return bucket;
+	}
+
+	void BuildKeyDomain(EarlyProbeFilter &filter) {
+		auto &build = *filter.build;
+		auto domain = ExchangeFrom(filter.producer, build.types, "hash", partitions, {filter.build_column});
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(
+		    filter.hashed ? HashBucket(build.types[filter.build_column], filter.build_column)
+		                  : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
+		auto type = expressions[0]->return_type;
+		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {type}, std::move(expressions),
+		                                                 build.estimated_cardinality);
+		projection.children.push_back(build);
+		Wrap(projection, domain);
+		filter.domain = &projection;
+		if (filter.hashed) {
+			vector<unique_ptr<Expression>> groups;
+			groups.push_back(make_uniq<BoundReferenceExpression>(type, 0));
+			auto &partial = MakeAggregate(Copy(groups), {});
+			Wrap(partial, domain);
+			domain = Exchange(std::move(domain), "gather", 1);
+			auto &complete = MakeAggregate(std::move(groups), {});
+			Wrap(complete, domain);
+			filter.domain = &complete;
+		}
+		filter.domain_producer = Finish(std::move(domain));
 	}
 
 	bool HasScopedState(const PhysicalOperator &op) {
@@ -1026,13 +1140,14 @@ private:
 	}
 
 	DistributedSubtree SemiFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
-	                              DistributedSubtree domain, idx_t build_key) {
+	                              DistributedSubtree domain, idx_t build_key, bool hashed = false) {
 		// NULL-safe equality is only a necessary condition; the original
 		// join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
-		condition.left = make_uniq<BoundReferenceExpression>(op.types[key], key);
-		condition.right = make_uniq<BoundReferenceExpression>(op.types[key], build_key);
+		condition.left =
+		    hashed ? HashBucket(op.types[key], key) : make_uniq<BoundReferenceExpression>(op.types[key], key);
+		condition.right = make_uniq<BoundReferenceExpression>(build.types[build_key], build_key);
 		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 		conditions.push_back(std::move(condition));
 		LogicalComparisonJoin logical(JoinType::SEMI);
@@ -1310,6 +1425,11 @@ private:
 			// Both the original join and the early SEMI build drain this shared
 			// producer before probing. Never rescan or recompute the build side.
 			filter.producer = Finish(Build(join.children[1]));
+			filter.domain = filter.build;
+			filter.domain_producer = filter.producer;
+			if (filter.keys_only) {
+				BuildKeyDomain(filter);
+			}
 			probe_filters[filter.input].push_back(filter);
 			left = Build(join.children[0]);
 			auto &filters = probe_filters.at(filter.input);
@@ -1347,8 +1467,16 @@ private:
 		} else {
 			auto lk = ProjectKeys(left, left_keys);
 			left = Exchange(std::move(left), "hash", partitions, lk);
-			auto rk = ProjectKeys(right, right_keys);
-			right = Exchange(std::move(right), "hash", partitions, rk);
+			if (filter.input) {
+				vector<idx_t> rk;
+				for (auto &key : right_keys) {
+					rk.push_back(key->Cast<BoundReferenceExpression>().index);
+				}
+				right = ExchangeFrom(filter.producer, filter.build->types, "hash", partitions, rk);
+			} else {
+				auto rk = ProjectKeys(right, right_keys);
+				right = Exchange(std::move(right), "hash", partitions, rk);
+			}
 		}
 		// Broadcast supplies the complete build input before the local probe
 		// scan starts. An exchange clears local_filters: filters must not cross

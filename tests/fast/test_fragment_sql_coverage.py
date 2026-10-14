@@ -178,6 +178,32 @@ DETERMINISTIC_TIMEZONES = [
 ]
 
 
+def large_join_key_query(connection, path, domain="exact", kind="inner", comparison="="):
+    connection.execute(
+        "copy (select range i, case when range%8192=0 then null else range%65536 end k, "
+        f"'fact-'||range::varchar payload from range(1048576)) to '{path}' (row_group_size 2048)"
+    )
+    key = "case when range%8192=0 then null else range%65536 end"
+    if domain == "dense":
+        # More distinct input keys than the filter's fixed domain bound.
+        key = key.replace("range%65536", "range%262144")
+    if domain == "exact":
+        build = (
+            f"select {key} k, 'build-'||range::varchar v, 'other-'||range::varchar w "
+            "from range(327680) where range%1024=0"
+        )
+        output = ", b.v, b.w" if kind in ("inner", "left") else ""
+    else:
+        total = "sum(range*1024)" if domain == "dense" else "sum(range)"
+        predicate = f"{total}%1024={'-1' if domain == 'empty' else '0'}"
+        build = f"select {key} k, {total} s from range(2000000) group by k having {predicate}"
+        output = ", b.s" if kind in ("inner", "left") else ""
+    return (
+        f"select p.i, p.k, p.payload{output} from read_parquet('{path}') p "
+        f"{kind} join ({build}) b on p.k {comparison} b.k order by all"
+    )
+
+
 def early_join_filter_query(connection, path, kind="inner", comparison="=", *, wide_probe=False):
     extra = ", 'fact-' || range::varchar fact_payload" if wide_probe else ""
     payload = "f.fact_payload || o.payload as payload" if wide_probe else "o.payload"

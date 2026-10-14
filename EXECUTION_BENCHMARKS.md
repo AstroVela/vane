@@ -875,3 +875,109 @@ driver SHA-256 remains
 Configurations preserve code/package/input identities and output counts/hashes.
 Owned processes stop before temporary/spill cleanup; the shared oracle is
 removed after comparison, and original inputs remain unchanged.
+
+## Projected and bounded join key domains (2026-10-15)
+
+Q5's selective build carries wide payloads and exceeds the complete-build
+broadcast cap. Q18's HAVING emits only 624 order keys but estimates 7,583,683
+rows, exceeding even a projected key-domain cap. Both therefore lost local
+build filtering at hash exchange. Completed baseline diagnostics count
+59,986,052 fact rows crossing exchange in each query, plus 15,000,000 orders
+in Q18.
+
+The planner can now reuse the original build producer for its original hash
+join and a separate key projection. Exact key domains retain the 8 MiB
+estimated-key and eightfold row-selectivity guards. A filtered aggregate
+subtree whose keys exceed that estimate can instead produce
+`hash(key) & 65535`, deduplicated locally and globally before broadcast.
+This domain never exceeds 65,536 UBIGINT entries. Collisions only retain
+extra probe rows: the original join still checks exact keys, NULLs, duplicate
+multiplicity and residual conditions. Dense domains may provide no pruning.
+
+Both paths require native build-filter metadata and estimate added full-build
+plus key-replica traffic below the target input exchange. Hashed domains also
+require more than 524,288 estimated probe rows. Computed or repeated original
+build hash keys retain their ordinary projection path. The original build is
+not recomputed, the complete-build broadcast cap is unchanged, and shared
+consumers drain the build before probing under existing exchange credits.
+
+A fresh SF10 comparison freezes `58b3eacfe6`'s installed `0.3.0.dev99`
+runtime and compares it with `0.3.0.dev100`. Both use two 18-CPU workers,
+two partitions, 16 GiB operator memory per worker and public exchange limits.
+Timing includes submission through complete collection and close; startup
+and comparisons are excluded. The host and OS caches remain shared, and this
+task runs no builds or tests during measurement.
+
+| First-pass measurement, seconds | Frozen baseline | Key domains | Local, candidate pass |
+|---|---:|---:|---:|
+| All 22 queries | 44.641 | **30.256** | 9.003 |
+| Q3 | 3.234 | **0.762** | 0.376 |
+| Q5 | 7.242 | **0.899** | 0.401 |
+| Q7 | 1.694 | **0.824** | 0.407 |
+| Q18 | 8.254 | **2.731** | 0.697 |
+
+The complete pass falls **32.2%**, remaining **3.36 times local**. Separate
+three-repetition controls measure Q5 at **6.570 to 0.894 seconds (86.4%)**,
+and Q18 at **8.316 to 2.646 seconds (68.2%)**. Q8/Q21 control medians are
+0.841/2.100 before and 0.860/2.031 after; their small variation is not
+attributed to this change. The two full runs each have 52 matching samples,
+and the two Q5/Q18/Q8/Q21 controls each add 12.
+
+Q11/Q12 initially rise in the single full pass (1.505/2.373 to 1.747/2.908
+seconds), prompting additional three-repetition controls. Those medians are
+1.756/2.796 before and 1.908/2.565 after: Q12's slowdown does not repeat,
+while Q11 remains 8.7% higher with overlapping sample ranges. Their complete
+serialized graphs are identical after normalizing only the engine identity.
+Q3/Q7 acquire the additional key-domain stage. These controls add 12 matching
+samples, for **140 matching samples total**; the timing variation is retained
+rather than attributed to a changed Q11/Q12 plan.
+
+| Accepted channel rows | Frozen baseline | Key domains |
+|---|---:|---:|
+| Q5 fact input | 59,986,052 | **1,825,856** |
+| Q5 filtered orders | 2,275,919 | **456,771** |
+| Q5 all channels, including added build/key branches | 63,119,038 | **4,653,776** |
+| Q18 outer fact input | 59,986,052 | **573,177** |
+| Q18 orders input | 15,000,000 | **142,848** |
+| Q18 all channels, including added build/key branches | 91,488,847 | **17,222,552** |
+
+The native diagnostics count each shared broadcast channel once, not network
+bytes. All four results match local exactly and pairwise output hashes agree;
+byte bounds hold and credits return to zero. Q18 still exchanges 15,000,000
+partial aggregate groups and all 1,499,999 customer rows. Q12/Q18/Q10 remain
+the largest full-pass contributors at 2.908/2.731/2.614 seconds.
+
+The incremental non-editable Release build passes **1408 affected
+native/compiler/SQL/performance/FTE-source/exchange/graph cases**. A focused
+24-case run also passes; eight volume regressions fail on the frozen previous
+runtime after matching exact results. Coverage includes one/four threads,
+two/three partitions, single-slot windows, NULLs and duplicates, multiple and
+repeated join keys, residual conditions, outer/anti joins and cancellation
+under subprocess deadlines.
+
+The strengthened dense-domain fixture has **262,113 distinct raw keys** and
+still broadcasts at most 65,536 hash values; it and the empty-domain case
+pass separately. An earlier version of that fixture selected ordinary small
+build broadcast because its HAVING estimate was lower, so its assertion did
+not exercise the hashed path. The fixture was corrected without changing
+production code. **Eighteen targeted real-Ray cases pass**, including both
+public modes and consumer loss after either projected or hashed key-domain
+builds commit. Recovery preserves input identity and changes the attempt
+fence. The full release suite and large-query FTE timings are not rerun.
+
+Native SHA-256 identities, in baseline/candidate order:
+
+```text
+3af8f715201c469ca65296997d3fd8777ce863a99d82dd5eee5a9dde5a801c2d
+758aaff0642304993ba57c9378a22f77214a79af5565bccbc2034465da3a2f46
+```
+
+Evidence is retained under `build/pipelined-key-domain-20261015/`: all six
+timing runs, `comparison.json`, `comparison.csv`, four completed native work
+reports, normalized plan comparisons, source patch, test logs and fixture
+corrections. The frozen driver SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Owned processes stop before temporary/spill cleanup. The shared oracle cache
+is removed after recording its hashes; configurations retain input identities,
+result row counts/hashes and cleanup manifests. Original SF10 inputs remain
+unchanged.

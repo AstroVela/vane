@@ -26,6 +26,7 @@ from tests.fast.test_fragment_sql_coverage import (
     correlated_partition_cases,
     correlation_source,
     early_join_filter_query,
+    large_join_key_query,
 )
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -161,7 +162,23 @@ def test_public_join_filter_before_exchange(tmp_path, mode):
             assert_idle(connection)
 
 
-@pytest.mark.parametrize("query_kind", ["correlated", "join"])
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("domain", ["exact", "hashed"])
+def test_public_key_domain_before_hash_exchange(tmp_path, mode, domain):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = large_join_key_query(local, tmp_path / "fact.parquet", domain)
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90) if mode == "fte" else None) as result:
+            assert result.collect().to_pylist() == expected
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed"])
 def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch, query_kind):
     import ray
 
@@ -192,11 +209,15 @@ def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, mo
         vane.Runtime(limits) as application,
         application.connect() as connection,
     ):
-        sql = (
-            early_join_filter_query(local, tmp_path / "fact.parquet", wide_probe=True)
-            if query_kind == "join"
-            else correlated_owner_queries(local, tmp_path / "fact.parquet", "is not distinct from")["nested"]
-        )
+        path = tmp_path / "fact.parquet"
+        if query_kind in ("exact", "hashed"):
+            sql = large_join_key_query(local, path, query_kind)
+        else:
+            sql = (
+                early_join_filter_query(local, path, wide_probe=True)
+                if query_kind == "join"
+                else correlated_owner_queries(local, path, "is not distinct from")["nested"]
+            )
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=90)) as result:
             scheduler = result.context._reader

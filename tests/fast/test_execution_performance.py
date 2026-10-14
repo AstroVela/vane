@@ -14,7 +14,11 @@ import pytest
 
 import vane
 from tests.fast.test_direct_exchange import channel, collect, next_batch, prepare_root_task, submission
-from tests.fast.test_fragment_sql_coverage import correlated_owner_queries, early_join_filter_query
+from tests.fast.test_fragment_sql_coverage import (
+    correlated_owner_queries,
+    early_join_filter_query,
+    large_join_key_query,
+)
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -494,6 +498,82 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
 
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("domain", ["exact", "hashed"])
+def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, partitions, domain):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain)
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        sources = {
+            f.fragment_id for f in spec.graph.fragments if any(s.function_name == "read_parquet" for s in f.sources)
+        }
+        fact_edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [c.snapshot() for c in service.channels.values()]
+            fact_rows = sum(
+                c.snapshot()["accepted_rows"]
+                for name, c in service.channels.items()
+                if name.split("/")[0] in fact_edges
+            )
+            assert fact_edges and fact_rows < 65536
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+        assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+
+
+@pytest.mark.parametrize("domain", ["dense", "empty"])
+def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, domain):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain) + " limit 4096"
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            broadcasts = [e.exchange_id for e in spec.graph.exchanges if e.distribution is Distribution.BROADCAST]
+            assert broadcasts
+            for edge in broadcasts:
+                assert service.channels[edge].snapshot()["accepted_rows"] <= 65536
+
+
+@pytest.mark.parametrize("condition", ["multiple", "repeated", "residual"])
+def test_key_domain_keeps_original_join_conditions(tmp_path, condition):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = large_join_key_query(connection, tmp_path / "fact.parquet")
+        if condition == "multiple":
+            sql = sql.replace("k, 'build-'", "k, range%7 j, 'build-'")
+            extra = "p.i%7 = b.j"
+        elif condition == "repeated":
+            extra = "p.i%65536 = b.k"
+        else:
+            extra = "p.i > length(b.v)*1000"
+        sql = sql.replace("order by all", f"and {extra} order by all")
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=3), limits) as service:
+            service.start()
+            assert collect(service) == expected
+
+
+@pytest.mark.parametrize("domain", ["exact", "hashed"])
+@pytest.mark.parametrize("kind", ["inner", "left", "anti"])
+def test_key_domain_preserves_null_safe_and_outer_matches(tmp_path, domain, kind):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain, kind, "is not distinct from")
+        sql += " limit 4096"
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=2), limits) as service:
+            service.start()
+            assert collect(service) == expected
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("partitions", [2, 3])
 @pytest.mark.parametrize("kind", ["inner", "semi"])
 def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, threads, partitions, kind):
     config = {"threads": threads, "disabled_optimizers": "join_order,build_side_probe_side"}
@@ -514,7 +594,7 @@ def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, thre
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("query_kind", ["correlated", "join"])
+@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed"])
 def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
@@ -524,7 +604,9 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
         from pathlib import Path
         import vane
         from tests.fast.test_direct_exchange import submission
-        from tests.fast.test_fragment_sql_coverage import correlated_owner_queries, early_join_filter_query
+        from tests.fast.test_fragment_sql_coverage import (
+            correlated_owner_queries, early_join_filter_query, large_join_key_query,
+        )
         from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 
         config = {"threads": int(sys.argv[2])}
@@ -532,8 +614,11 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
             config["disabled_optimizers"] = "join_order,build_side_probe_side"
         with vane.connect(backend="local", config=config) as connection:
             path = Path(sys.argv[1]) / "fact.parquet"
-            sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"
-                   else correlated_owner_queries(connection, path)["nested"])
+            if sys.argv[3] in ("exact", "hashed"):
+                sql = large_join_key_query(connection, path, sys.argv[3])
+            else:
+                sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"
+                       else correlated_owner_queries(connection, path)["nested"])
             limits = DirectExchangeLimits(4096, 1024, 4, 1)
             spec = submission(connection, sql, partitions=3)
             with InProcessTaskService(connection, spec, limits) as service:
