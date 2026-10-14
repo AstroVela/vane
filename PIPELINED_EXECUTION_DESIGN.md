@@ -296,7 +296,7 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 | COUNT、SUM、AVG、具有可导出固定状态的单参数 MIN/MAX | source 分区执行 native partial，交换带类型的 AGGREGATE_STATE；final 调用原函数 combine/finalize，GROUP BY 使用 HASH，无分组使用 GATHER；FILTER 只在 partial 应用 |
 | DISTINCT、带排序的聚合、双参数 MIN/MAX(x,n)、具有动态状态的 MIN/MAX、Binder 内部聚合改写 | 原始行按 group key 分区后执行完整 native aggregate，保留去重、排序和动态状态的所有权 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
-| BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入，probe 子树保留原分区并与 join 合并；probe 只有一个分区时改为 GATHER build；其他 join 两侧按等值键 HASH；不能广播会产生重复未匹配 build 行的 join |
+| BROADCAST | INNER/LEFT/SEMI/ANTI 的小 build 按下述大小与流量规则广播，probe 子树保留原分区并与 join 合并；probe 只有一个分区时改为 GATHER build；其他 join 两侧按等值键 HASH；不能广播会产生重复未匹配 build 行的 join |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
 | TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
@@ -325,7 +325,9 @@ Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row grou
 
 DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量阶段不逐值转换向量。实际复制仍解析 dictionary/constant selection 与 NULL；字符串和嵌套列仍遍历选中的有效内容，检查子数组边界及 frame_bytes，不改变 credit 计费。
 
-DirectCollector 为本地扫描的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。依赖上游 exchange 的任务立即转发可用结果，避免等待下一批输入时扣住已有结果。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。
+DirectCollector 为本地扫描和上游 exchange 输入的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。执行器每 10 ms 检查尾批，并在等待上游输入前强制尝试发送，避免把已有结果扣在空闲生产者之后。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。默认 frame_rows 为原生向量容量 2048，frame_bytes 仍为 64 KiB，窗口仍为 1 MiB/16 帧；宽行继续按字节上限拆分。
+
+普通等值 INNER/LEFT/SEMI/ANTI join 的 build 估计不超过 32 行时保留小表广播策略。更大的 build 仅在估计交换大小不超过 8 MiB，且额外副本的流量不超过省下的 probe 重分区流量时广播；分区数为 N 时比较 `(N-1) × build_bytes <= probe_bytes`。估算包含定长类型宽度、有效性开销及每个变长标量 64 字节，缺少长度统计的嵌套类型继续使用原来的小行数策略。该阈值用于计划选择，实际执行仍受 operator memory 与通道窗口约束。广播保留 probe 分区和同一 fragment 内的扫描动态过滤。
 
 FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
 

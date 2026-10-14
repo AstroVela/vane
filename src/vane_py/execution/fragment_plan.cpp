@@ -691,6 +691,39 @@ struct DistributedSubtree {
 	std::set<const DynamicTableFilterSet *> local_filters;
 };
 
+double EstimatedExchangeBytes(const PhysicalOperator &op) {
+	double width = 0;
+	for (auto &type : op.types) {
+		auto physical = type.InternalType();
+		if (physical == PhysicalType::LIST || physical == PhysicalType::STRUCT || physical == PhysicalType::ARRAY) {
+			// No length statistics are available for nested values here. Keep
+			// these inputs on the small-row fallback rather than guessing.
+			return NumericLimits<double>::Maximum();
+		}
+		// Include validity and a conservative string payload estimate. This is
+		// a planning estimate; execution still enforces the operator budget.
+		width += 1 + (physical == PhysicalType::VARCHAR ? 64 : GetTypeIdSize(physical));
+	}
+	return double(op.estimated_cardinality) * width;
+}
+
+bool BroadcastJoin(const PhysicalHashJoin &join, idx_t probe_partitions) {
+	if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT && join.join_type != JoinType::SEMI &&
+	    join.join_type != JoinType::ANTI) {
+		return false;
+	}
+	auto &build = join.children[1].get();
+	if (build.estimated_cardinality <= 32) {
+		return true;
+	}
+	const auto build_bytes = EstimatedExchangeBytes(build);
+	// Broadcasting sends N copies of the build instead of shuffling both
+	// sides once. Bound each replica and require its extra traffic to fit in
+	// the probe traffic saved. Fusing the probe also preserves scan filters.
+	return build_bytes <= 8 * 1024 * 1024 &&
+	       build_bytes * double(probe_partitions - 1) <= EstimatedExchangeBytes(join.children[0]);
+}
+
 class AnalyticalPlanner {
 public:
 	AnalyticalPlanner(ClientContext &context, PhysicalPlan &plan, FragmentGraph &graph, idx_t partitions)
@@ -1116,9 +1149,7 @@ private:
 		if (left_keys.empty() || !join.delim_types.empty()) {
 			throw NotImplementedException("distributed hash join requires uncorrelated equality keys");
 		}
-		const bool broadcast = join.children[1].get().estimated_cardinality <= 32 &&
-		                       (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
-		                        join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI);
+		const bool broadcast = BroadcastJoin(join, left.fragment.partition_count);
 		if (broadcast) {
 			// Every probe partition sees the complete build input. Preserve its
 			// existing distribution and fuse the probe subtree with the join;

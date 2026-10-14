@@ -204,9 +204,6 @@ public:
 		return true;
 	}
 	SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &input, bool force) const override {
-		if (!inputs.empty()) {
-			return SinkResultType::NEED_MORE_INPUT;
-		}
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
 		auto now = DirectSinkLocal::Clock::now();
 		if (!force && now < state.next_flush) {
@@ -291,11 +288,10 @@ public:
 						}
 						continue;
 					}
-					// Forward input-driven tasks immediately. Local scans coalesce
-					// until the frame fills or their periodic pipeline flush fires,
-					// including when later scan batches are entirely filtered out.
-					if (inputs.empty() && (buffer.Count() || (count < channel.limits.frame_rows &&
-					                                          count == rows.size() - state.offset))) {
+					// Coalesce sparse scan and exchange inputs. The executor flushes
+					// periodically and before waiting for more input, so a partial
+					// frame cannot be stranded behind an idle upstream producer.
+					if (buffer.Count() || (count < channel.limits.frame_rows && count == rows.size() - state.offset)) {
 						if (!buffer.data) {
 							// The bounded coalescer is an operator allocation charged
 							// to DuckDB's buffer pool, separately from channel credit.

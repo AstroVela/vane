@@ -10,7 +10,7 @@ from collections import Counter
 import pytest
 
 import vane
-from tests.fast.test_direct_exchange import collect, next_batch, submission
+from tests.fast.test_direct_exchange import channel, collect, next_batch, prepare_root_task, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -281,9 +281,10 @@ def test_same_worker_edges_share_channels_and_reserve_no_flight_staging(monkeypa
 @pytest.mark.parametrize("kind", ["inner", "left", "semi", "anti"])
 @pytest.mark.parametrize("partitions", [1, 2, 5])
 @pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
-def test_broadcast_join_keeps_probe_partitions(kind, partitions, comparison):
-    left = "(select range i, case when range%7=0 then null else range%11 end k from range(43))"
-    right = "(select case when range=0 then null else range%3 end k from range(7))"
+@pytest.mark.parametrize("build_rows", [7, 70])
+def test_broadcast_join_keeps_probe_partitions(kind, partitions, comparison, build_rows):
+    left = "(select range i, case when range%7=0 then null else range%111 end k from range(430))"
+    right = f"(select case when range=0 then null else range%31 end k from range({build_rows}))"
     sql = f"select a.i, a.k from {left} a {kind} join {right} b on a.k {comparison} b.k"
     with vane.connect(backend="local", config={"threads": 1}) as connection:
         connection.execute("pragma disable_optimizer")
@@ -311,8 +312,8 @@ def test_broadcast_join_does_not_replicate_a_single_probe_partition():
 @pytest.mark.parametrize("threads", [1, 4])
 def test_broadcast_chain_filters_and_aggregates_before_exchange(threads):
     sql = (
-        "select count(*) from range(100000) a join range(3) b on a.range%11=b.range "
-        "join range(2) c on a.range%11=c.range"
+        "select count(*) from range(100000) a join range(300) b on a.range%511=b.range "
+        "join range(200) c on a.range%511=c.range"
     )
     limits = DirectExchangeLimits(32768, 8192, 128, 2)
     with vane.connect(backend="local", config={"threads": threads}) as connection:
@@ -324,5 +325,65 @@ def test_broadcast_chain_filters_and_aggregates_before_exchange(threads):
             states = [channel.snapshot() for channel in service.channels.values()]
             # Only small build rows and partial aggregates cross channels. The
             # large probe stays in its scan partitions until after filtering.
-            assert sum(s["accepted_rows"] for s in states) < 64
+            assert sum(s["accepted_rows"] for s in states) < 2 * (300 + 200) + 64
             assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+
+
+@pytest.mark.parametrize(
+    "probe_rows, build_rows, partitions, broadcast",
+    [(10000, 1000, 2, True), (10000, 1000, 16, False), (10000000, 1000000, 2, False)],
+)
+def test_broadcast_join_bounds_replica_size_and_traffic(probe_rows, build_rows, partitions, broadcast):
+    sql = f"select a.range from range({probe_rows}) a join range({build_rows}) b on a.range=b.range"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        graph = compile_sql(connection, sql, partitions)
+    assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is broadcast
+    assert any(e.distribution is Distribution.HASH for e in graph.exchanges) is not broadcast
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_exchange_input_coalesces_and_flushes_while_waiting_for_more_rows(threads):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        spec = submission(connection)
+        source = channel(connection, window=8192, frame=1024, rows=64, slots=64)
+        output = channel(connection, window=1024, frame=1024, rows=64, slots=1)
+        source.add_producer("upstream")
+        output.add_producer("task")
+        source.seal_producers()
+        output.seal_producers()
+        for sequence in range(1, 65):
+            assert source._write_rows("upstream", sequence, [(sequence,)] * 4) == "accepted"
+        service = prepare_root_task(connection, spec, [(source, "client")], [output])
+        try:
+            service.start("task", "start")
+            rows = []
+
+            def receive(count):
+                deadline = time.monotonic() + 10
+                while len(rows) < count:
+                    service.pump(1)
+                    status, batch = output.poll("client")
+                    assert status != "end"
+                    if batch is not None:
+                        rows.extend(batch.to_rows())
+                        batch.close()
+                    assert time.monotonic() < deadline
+
+            receive(256)
+            # Backpressure uses a single output slot. Input frames must still
+            # combine instead of becoming 64 separate transport messages.
+            assert output.snapshot()["accepted_frames"] < 16
+            assert source._write_rows("upstream", 65, [(999,)]) == "accepted"
+            receive(257)  # The partial frame is visible before upstream EOF.
+            source.finish("upstream", 65)
+            deadline = time.monotonic() + 10
+            while service.status()[0]["state"] != "FINISHED":
+                service.pump(1)
+                assert time.monotonic() < deadline
+            assert output.poll("client")[0] == "end"
+            assert Counter(rows) == Counter([(value,) for value in range(1, 65) for _ in range(4)] + [(999,)])
+            assert source.snapshot()["bytes"] == output.snapshot()["bytes"] == 0
+        finally:
+            service.cancel("test cleanup")
+            service.release()
