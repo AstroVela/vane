@@ -404,3 +404,117 @@ These generated directories are not committed. The related tests passed
 **170 cases, with one optional ADBC skip**. No full release/fast suite was run.
 Cross-host deployment and release qualification, plus the historical intermittent
 Flight timeout investigation, remain separate work.
+
+## Flight and versioned FTE snapshots (2026-10-14)
+
+This comparison uses SF10 Parquet inputs: eight files totaling 3,951,712,526
+bytes, with 59,986,052 lineitem rows. Local uses 36 threads and 32 GiB of operator
+memory; Ray uses two 18-CPU workers, two partitions and 16 GiB of operator memory
+per worker. There is one active query/result, 64 task contexts per worker,
+256 I/O slots, 128 MiB of exchange buffers and 256 MiB of staging buffers per
+worker. The benchmark alone pins the Ray object store to 1 GiB. Channels retain
+the default 1 MiB/64 KiB/1024-row/16-slot limits. The shared host retains OS
+caches; no concurrent builds or tests ran during these comparisons. These are
+single-host measurements, not a TPC-H score or storage-node fault qualification.
+
+The baseline is `0920b4472d80b1452fd12862d23fcb0e09c8ead8`, with installed
+`vane-ai 0.3.0.dev89`. Flight measurements use `dca23aba162d66a7b870099118169312ec0e5dfa`
+and `0.3.0.dev90`; the completed FTE qualification uses
+`e152596e1c303c1f5387f40b0550b69ae9dbfcb7` and `0.3.0.dev92`.
+All use Python 3.12.13, Ray 2.59.0, PyArrow 26.0.0 and NumPy 2.5.4.
+Native SHA-256 identities, respectively, are:
+
+```text
+4905c50120f8bcbdc6406ddb4e6aaa3a60db45a96bdb4d15d8461aaf192ad7e1
+1605c8eac585ade521462a996c2097794b5a48b01f31069de6f4bb2d0ee4dc01
+1569820530f4bcc72f549dc7a931a6c8aa9f685d1b11e3dcdad86421bb0ee9b5
+```
+
+Every measured query includes complete collection and successful result cleanup.
+Ray startup, the initial `select 1`, equality checks and Runtime shutdown are
+outside the timing window. Results match the ordered local oracle, with float
+tolerances of `rel=1e-9, abs=1e-6`; local HUGEINT `decimal128(38, 0)` results are
+normalized to the native `decimal256(39, 0)` representation. Inputs, code
+identities, configurations, output row counts and
+hashes are retained. Each run removes its owned source copies, materialized data,
+spill and Ray temporary directories after cleanup; the original inputs remain.
+
+Flight now permits four outstanding frames and releases their leases on
+cumulative acknowledgements. Final success still waits for the last ACK, and
+the larger staging requirement is charged before admission. The complete
+22-query pipelined pass fell from **258.07 to 117.24 seconds**; local remained
+9.06/8.99 seconds. Three-sample pipelined Q17/Q21 medians changed from
+36.55/38.05 seconds to **12.06/15.97 seconds**. These two completed modes contain
+52 validated samples. Their enclosing run subsequently failed on uncached FTE
+Q8's 120-second delivery deadline, so it is not a successful three-mode run.
+
+The source attribution run measured the entire `stage_ray_query` call, including
+copy/hash/sync, binding and compilation. Before reuse, Q6 spent **12.27 of 13.30
+seconds** there (92%); Q17 spent **15.65 of 90.28 seconds** (17%). With a 4 GiB
+version cache, a separate three-query Q6 run at `5796d4e9ad` measured:
+
+| Q6 sample | Source preparation, s | Complete query, s |
+|---|---:|---:|
+| First copy | 18.256 | 18.754 |
+| First cache hit | 0.060 | 0.536 |
+| Second cache hit | 0.060 | 0.544 |
+
+Final-code Q6 cache hits in the full passes took 0.033–0.065 seconds to prepare,
+with 0.52–2.03-second total latency. First copies retain their original cost;
+storage variability remains visible in complete-query times. Reuse is opt-in
+through `ExchangeStore.source_cache_bytes`, defaults to zero, and applies to
+unchanged input versions within one Runtime. Cached versions retain a separately
+charged lease until Runtime shutdown. Full caches fall back to private copies.
+
+Verified materialized commits now return their unused maximum allowance while
+retaining the actual sealed bytes. Live, failed and stale attempts retain their
+maximum allowance until safe cleanup. The qualification reduced `query_bytes`
+from 160 to **32 GiB**, added a separate **4 GiB** cache reservation, and kept the
+160 GiB store capacity, 4 GiB source limit and 2 GiB object limit. The largest
+observed query charge was **17.52 GiB**. Q17's peak changed from 40.52 to 13.24 GiB;
+Q9's fresh original control charged 89.56 GiB versus 17.52 GiB with verified-size
+accounting. The cache copied eight versions once (3,951,712,526 bytes), recorded
+77 hits and no capacity bypasses, and returned its entire reservation on close.
+
+The final FTE correctness/storage qualification completed all 22 queries plus
+two additional Q17/Q21 repetitions: **26 matching samples**. It explicitly uses
+600-second execution and delivery limits; the original profile used a
+120-second delivery limit. A final-code run at that original limit still timed
+out on Q9. The original Q9 control took 143.13 seconds, including 23.51 seconds
+of submission, leaving 119.61 seconds for execution, delivery and cleanup.
+A separate original Q9 control using the same 600-second qualification limit
+completed in 129.16 seconds; the final cached Q9 sample took 96.98 seconds.
+Production timeout defaults are unchanged. The longer qualification establishes
+correct results and bounded storage, not compliance with the 120-second profile.
+
+For context, the new full FTE pass totaled 766.22 seconds, including 32.15 seconds
+of submission and 30.47 seconds of source preparation. The historical successful
+baseline totaled 1237.25 seconds and 460.53 seconds of submission under the
+stricter delivery limit. Three-sample FTE Q17/Q21 medians were 78.88/96.93 seconds,
+versus historical 115.20/113.52 seconds. Current Q17 samples ranged from 69.01 to
+92.71 seconds and Q21 from 79.55 to 105.93 seconds; these figures do not establish
+a universal end-to-end speedup or eliminate the remaining gap to local execution.
+
+Two earlier cache acceptance attempts exposed metadata-lock contention. Lease
+sync held the global quota lock for up to 13.04 seconds, causing heartbeats or
+orphan scans to fail. Renewal now serializes with its own lease's close while
+publishing outside the quota lock; opportunistic orphan scans defer if that
+lock is busy. The final qualification recorded no lock/renewal errors, with a
+maximum observed global hold below 0.48 seconds despite a 12.02-second renewal.
+Tests cover expiry, slow renewal, independent admission and cleanup ownership.
+
+The 64 KiB materialized I/O buffers were also measured independently on four
+million BIGINT rows (33,406,689 sealed bytes). Three-sample median write/read
+times changed from 0.554/0.454 to 0.497/0.440 seconds; write/read syscalls fell from
+15,634/16,149 to 510/1,025. Sealed-file hashes were identical. This microbenchmark
+does not establish a large-query FTE speedup by itself.
+
+Retained evidence is under `build/pr-stack-acceptance-20261014/`:
+`execution-optimization-summary.json`, `execution-optimization-timings.csv`,
+the frozen drivers and per-run configuration/validation/cleanup manifests.
+`sf10-source-cache-qualified-600/` is the successful final FTE qualification;
+`sf10-source-cache-full/`, `sf10-source-cache-full-v2/` and
+`sf10-source-cache-full-v3/` retain the failed attempts and their diagnostics.
+The qualification driver SHA-256 is
+`01689859fb32231ed257c673d0504550f45c7a38a8808af361bd5da328c8a6d2`.
+Generated benchmark artifacts are not committed.

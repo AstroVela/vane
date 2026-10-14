@@ -214,6 +214,8 @@ with vane.Runtime(resources) as runtime, runtime.connect() as connection:
 
 重复查询同一批文件时，可以设置 `ExchangeStore(source_cache_bytes=4 << 30, ...)`，在同一个 Runtime 的会话之间复用未变化的输入快照。默认值为 0，保持每查询复制。缓存独立预留存储容量，必须满足 `query_bytes + source_cache_bytes <= capacity_bytes`；缓存目录所在的 store 应位于输入数据集之外，避免递归 glob 扫描到保留副本。缓存满后回退到查询独享副本，`Runtime.close()` 清理缓存并归还配额。
 
+SF10 的首次复制、缓存命中、配额峰值及超时限制见 [性能测量](EXECUTION_BENCHMARKS.md#flight-and-versioned-fte-snapshots-2026-10-14)。
+
 嵌入式 Runtime 的调用进程必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。独立 Server 已提供固定的公开控制与结果端口及双端口 TLS；远程 Client 只需访问这些公开端点，不加入 Ray，详见 [Server 设计](SERVER_DESIGN.md)。
 
 连接提供默认值，query 提交时冻结快照。同一 Ray 连接的并发查询可以选择不同分布式策略，不修改进程环境；local 连接拒绝分布式策略 override。已经提交的查询不能原地切换目标。Relation 等上层表达入口如继续提供，也必须提交到同一个 QuerySpec 入口。
