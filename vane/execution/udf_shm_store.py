@@ -480,6 +480,9 @@ class LocalShmStore:
                             # the invocation currently waiting for this write.
                             # A batch already borrowed by another worker has an
                             # independent execution owner and can still progress.
+                            # With no parent leases, an allocation remains live
+                            # only for fork descendants, whose exit is independent
+                            # of the queued consumer.
                             input_producers = {self._live[g].producer_id for g in blocked_inputs if g in self._live} - {
                                 None
                             }
@@ -488,6 +491,7 @@ class LocalShmStore:
                                 for g, entry in self._live.items()
                                 if g not in blocked_inputs
                                 and entry.producer_id in input_producers
+                                and entry.refs > 0
                                 and not entry.input_readers
                             }
                             blocked_inputs.update(queued_inputs)

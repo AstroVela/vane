@@ -200,6 +200,92 @@ def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_
     assert store.snapshot()["live_allocations"] == 0
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds():
+    script = r"""
+import os
+import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+import pytest
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
+from vane.execution.udf_shm_store import LocalShmStore, LocalShmStoreCapacityError
+
+store = LocalShmStore(4096)
+store.add_client('fork-capacity')
+previous = store.allocate(3072, producer_id='upstream')
+slot = previous.allocation
+view = store.buffer(slot)
+view[:] = b'x' * len(view)
+budget_released = threading.Event()
+store.retain_budget(slot, budget_released.set)
+read_gate, write_gate = os.pipe()
+pid = os.fork()
+if pid == 0:
+    signal.alarm(15)
+    os.close(write_gate)
+    assert os.read(read_gate, 1) == b'1'
+    assert bytes(view) == b'x' * 3072
+    os._exit(0)
+os.close(read_gate)
+view.release()
+current = None
+reaped = False
+scope = ExecutionCancellationScope('fork-capacity', 1)
+try:
+    # Allocate after fork so the child holds only the previous input.
+    current = store.allocate(1024, producer_id='upstream')
+    with store._lock:
+        assert store._live[slot.generation].forks
+    # A live parent reference can still belong to a queued batch. Having
+    # a fork owner as well does not make that batch independently releasable.
+    with pytest.raises(LocalShmStoreCapacityError, match='queued_input_bytes=3072'):
+        store.wait_for_capacity(2048, (current.allocation,), scope, nullcontext)
+    previous.release()
+    with store._lock:
+        entry = store._live[slot.generation]
+        assert entry.refs == 0 and entry.forks and not entry.input_readers
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        pending = threads.submit(store.wait_for_capacity, 2048, (current.allocation,), scope, nullcontext)
+        try:
+            with store._capacity_condition:
+                waiting = store._capacity_condition.wait_for(lambda: bool(store._waiting_writes), timeout=2)
+            if not waiting:
+                pending.result(timeout=1)
+                raise AssertionError('fork-only input did not enter a capacity wait')
+            # Excluding a fork-only hold from the dependency set must neither
+            # return its byte charge nor permit reuse while the child reads it.
+            assert not budget_released.is_set()
+            with pytest.raises(LocalShmStoreCapacityError):
+                store.allocate(2048)
+            os.write(write_gate, b'1')
+            _, status = os.waitpid(pid, 0)
+            reaped = True
+            assert os.waitstatus_to_exitcode(status) == 0
+            pending.result(timeout=5)
+            assert budget_released.wait(5)
+            output = store.allocate(2048)
+            assert output.allocation.offset == slot.offset
+            output.release()
+        finally:
+            scope.cancel()
+finally:
+    os.close(write_gate)
+    if not reaped:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    previous.release()
+    if current is not None:
+        current.release()
+    store.remove_client('fork-capacity')
+assert store.snapshot()['live_allocations'] == 0
+assert store.snapshot()['mapped_capacity_bytes'] == 0
+"""
+    result = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("previous_view", ["retained", "pending_release", "released"])
 def test_waiting_worker_pins_only_reported_views_from_earlier_calls(store, monkeypatch, previous_view):
     from vane.execution import udf_shm_store as storage

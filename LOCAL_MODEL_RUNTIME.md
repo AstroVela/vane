@@ -2174,9 +2174,12 @@ earlier calls. Physical-capacity waits use this snapshot, idle retained views,
 and queued outputs of the input streams used by waiting consumers. Physical
 leases held only by fork descendants or pending release notifications can be
 released independently and are excluded from the worker's blocking views.
-Queued input is not
-assumed reclaimable merely because it belongs to another allocation: its next
-invocation may require the very actor slot occupied by the waiting writer.
+Queued-input inference requires a live parent lease: a region with zero parent
+references, held only by fork descendants, can release independently and must
+not be classified as queued work merely because it has no input reader.
+Queued input is not assumed reclaimable merely because it belongs to another
+allocation: its next invocation may require the very actor slot occupied by the
+waiting writer.
 A current read owner in another worker, or an unrelated stream, still permits
 an independent release. This is a conservative admission boundary: an input
 whose consumer has not started is not evidence that a capacity wait can finish.

@@ -62,6 +62,7 @@ release_tests=(
 local_runtime_tests=(
   "$project_root/tests/fast/test_local_task_scheduling.py"
   "$project_root/tests/fast/test_local_shm_credit_progress.py"
+  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_actor_retaining_previous_input_can_receive_the_next_batch[generator-subprocess_task-16MiB-False-False-2]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-2-192KiB-False]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-4-320KiB-True]"
