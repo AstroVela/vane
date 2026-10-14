@@ -25,6 +25,7 @@ from tests.fast.test_fragment_sql_coverage import (
     correlated_parquet_source,
     correlated_partition_cases,
     correlation_source,
+    early_join_filter_query,
 )
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -140,7 +141,28 @@ def test_public_correlated_owner_keys_and_shared_branches(tmp_path, mode):
                 assert_idle(connection)
 
 
-def test_fte_correlated_owner_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_join_filter_before_exchange(tmp_path, mode):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        for index, (kind, comparison) in enumerate(
+            [("inner", "="), ("semi", "="), ("left", "="), ("anti", "is not distinct from")]
+        ):
+            sql = early_join_filter_query(local, tmp_path / f"fact-{index}.parquet", kind, comparison, wide_probe=True)
+            if kind in ("left", "anti"):
+                sql += " limit 4096"
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=90) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("query_kind", ["correlated", "join"])
+def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch, query_kind):
     import ray
 
     from vane.execution.recovery_runtime import RecoveryScheduler
@@ -149,7 +171,7 @@ def test_fte_correlated_owner_reuses_committed_fanout_after_worker_loss(tmp_path
 
     def lose_once(scheduler, index, partition, binding, upstream):
         admitted = dispatch(scheduler, index, partition, binding, upstream)
-        # Kill a consumer after an owner shared by several stages has committed.
+        # Kill a consumer after a build shared by several stages has committed.
         producers = {
             e.producer_fragment_id for e in scheduler.spec.graph.exchanges if e.producer_fragment_id in upstream
         }
@@ -170,7 +192,11 @@ def test_fte_correlated_owner_reuses_committed_fanout_after_worker_loss(tmp_path
         vane.Runtime(limits) as application,
         application.connect() as connection,
     ):
-        sql = correlated_owner_queries(local, tmp_path / "fact.parquet", "is not distinct from")["nested"]
+        sql = (
+            early_join_filter_query(local, tmp_path / "fact.parquet", wide_probe=True)
+            if query_kind == "join"
+            else correlated_owner_queries(local, tmp_path / "fact.parquet", "is not distinct from")["nested"]
+        )
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=90)) as result:
             scheduler = result.context._reader

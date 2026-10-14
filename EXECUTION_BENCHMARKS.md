@@ -778,3 +778,100 @@ driver SHA-256 remains
 Configurations retain package/input identities and output counts/hashes.
 Owned processes stop before temporary/spill cleanup, and the shared oracle
 cache is removed after comparison. Original SF10 inputs remain unchanged.
+
+## Selective join filters before earlier hash exchanges (2026-10-15)
+
+Q8 and Q21 still lost small-build filtering at an earlier hash boundary. Q8
+exchanged the full lineitem input before applying its selective part join;
+Q21 exchanged every late lineitem before its selective supplier join. The
+planner now traces an unchanged integral probe key through projections,
+filters and the probe side of inner/semi joins, placing a necessary SEMI
+condition before an earlier hash exchange. Computed keys, LIMIT, aggregation,
+outer joins and shared scopes stop the traversal. The original join retains
+all matching, duplicate and NULL semantics.
+
+This path requires native join-filter metadata indicating a filtered build,
+an existing broadcast-eligible inner/semi join, a nonzero build estimate no
+larger than 8 MiB, fewer than one eighth of the target input rows, and less
+additional replica traffic than that input exchange. The original join and
+the early filter share the same complete build output; neither its scans nor
+joins are recomputed. Both branches drain the build before probing. The
+additional edge remains subject to existing credit and reservation limits.
+
+A fresh comparison freezes `845f34bdf9`'s installed `0.3.0.dev98` runtime and
+compares it with `0.3.0.dev99`. It retains the same SF10 inputs, two 18-CPU
+workers, two partitions, limits and timing boundaries. This task runs no
+concurrent builds or tests during measurement; the host and OS caches remain
+shared.
+
+| Measurement, seconds | Fresh frozen baseline | Early filter | Local, candidate pass |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 54.299 | **44.925** | 8.921 |
+| Q8, first pass | 6.739 | **0.765** | 0.507 |
+| Q21, median of three | 4.226 | **2.095** | 1.178 |
+| Q17, median of three | 0.571 | 0.596 | 0.385 |
+| Q18, first pass | 8.312 | 8.069 | 0.686 |
+| Q5, first pass | 7.240 | 6.760 | 0.408 |
+
+The complete pass falls **17.3%**, but remains **5.04 times local**. The
+baseline local total is 9.021 seconds. Each full run has 52 matching samples.
+Separate three-repetition controls for Q5/Q8/Q18/Q21 each add 12 matching
+samples: Q8's median falls from **7.361 to 0.824 seconds (88.8%)**, and Q21's
+from **4.615 to 2.202 seconds (52.3%)**. The two sets of observations are
+retained separately. Q5/Q18 control medians are 6.639/8.685 seconds before and
+6.569/8.374 after; their variation is not attributed to this change. Q17 keeps
+its earlier scan-key filter. Ordered comparisons use the existing numeric
+tolerance and return all query, result and worker reservations to zero.
+
+Completed native direct-exchange diagnostics confirm the work reduction:
+
+| Accepted channel rows | Frozen baseline | Early filter |
+|---|---:|---:|
+| Q8 fact input before the order join | 59,986,052 | **403,487** |
+| Q8 all channels, including the added build branch | 61,309,338 | **1,740,225** |
+| Q21 outer fact input before the order join | 37,929,348 | **1,522,366** |
+| Q21 all channels, including the added build branch | 55,437,498 | **19,034,526** |
+
+These diagnostics use public exchange windows and count each shared broadcast
+channel once; they are not network byte measurements or timing samples. All
+four results match local exactly, respect byte bounds, and return all credit.
+Source records identify the original tables and retain the same scan count.
+
+Q18 remains expensive: local profiling shows 624 qualifying order keys, while
+the filtered aggregate is estimated at 7,583,683 rows. The current static
+broadcast bounds therefore leave large exchanges in place. Q18 and Q5 remain
+the largest complete-pass contributors; this change does not solve uncertain
+build cardinalities or establish parity for the full query set.
+
+The final related native/compiler/SQL/FTE-source/exchange/graph run passes
+**1385 cases**. The **20 focused filter, boundary and cancellation cases** also
+pass after finalizing the fixtures. Eight new volume regressions fail on the
+frozen former runtime while matching local results. They cover duplicate/NULL
+keys, inner/semi joins, one/four threads, two/three partitions and single-slot
+windows. Further cases check preserved outer rows, computed keys, LIMIT,
+aggregates, multiple filters and cancellation under a subprocess deadline.
+
+**Twelve targeted Ray cases pass** across the affected run and final-fixture
+rerun. The new public fixtures use default optimizer settings and a wider
+probe payload to preserve the intended plan. Earlier fixture attempts used a
+database-only optimizer setting that worker preparation correctly rejected;
+worker configuration contracts are unchanged. FTE worker-loss coverage proves
+that a failed consumer reuses its committed shared build with the same input
+identity and a new fence. The full release suite and large-query FTE timings
+are not rerun.
+
+Native SHA-256 identities, in frozen baseline/candidate order:
+
+```text
+9093f928fb2f3806b1b96ced415ed0320644cbd164b9d1def51b460a769b4ace
+3af8f715201c469ca65296997d3fd8777ce863a99d82dd5eee5a9dde5a801c2d
+```
+
+Evidence is retained under `build/pipelined-join-filter-20261015/`: both full
+and focus controls, `comparison.json`, `comparison.csv`, the four native work
+reports, source patch, profiles, test logs and cleanup manifests. The frozen
+driver SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Configurations preserve code/package/input identities and output counts/hashes.
+Owned processes stop before temporary/spill cleanup; the shared oracle is
+removed after comparison, and original inputs remain unchanged.

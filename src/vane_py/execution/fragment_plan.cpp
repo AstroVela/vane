@@ -784,6 +784,21 @@ public:
 	}
 
 	DistributedSubtree Build(PhysicalOperator &op) {
+		auto result = BuildOperator(op);
+		auto found = probe_filters.find(&op);
+		if (found != probe_filters.end()) {
+			for (auto &filter : found->second) {
+				auto count = result.fragment.partition_count;
+				auto domain =
+				    ExchangeFrom(filter.producer, filter.build->types, count == 1 ? "gather" : "broadcast", count);
+				result = SemiFilter(op, std::move(result), filter.column, *filter.build, std::move(domain),
+				                    filter.build_column);
+			}
+		}
+		return result;
+	}
+
+	DistributedSubtree BuildOperator(PhysicalOperator &op) {
 		CheckOperator(op, op.children.size());
 		switch (op.type) {
 		case PhysicalOperatorType::CTE:
@@ -890,6 +905,74 @@ private:
 	// Nodes have independent payloads, but join and scan references must share
 	// an ID namespace. Each loaded fragment gets a fresh set of filter objects.
 	DynamicTableFilterSerializationState filter_serialization;
+	struct EarlyProbeFilter {
+		PhysicalOperator *input = nullptr;
+		idx_t column = 0;
+		PhysicalOperator *build = nullptr;
+		idx_t build_column = 0;
+		string producer;
+	};
+	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
+
+	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
+		EarlyProbeFilter result;
+		auto &build = join.children[1].get();
+		if (partitions == 1 || (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
+		    !join.filter_pushdown || !join.filter_pushdown->build_side_has_filter || !build.estimated_cardinality ||
+		    EstimatedExchangeBytes(build) > 8 * 1024 * 1024 || !BroadcastJoin(join, partitions)) {
+			return result;
+		}
+		for (auto &condition : join.conditions) {
+			if ((condition.comparison != ExpressionType::COMPARE_EQUAL &&
+			     condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
+			    condition.left->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+			    condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+			    !condition.left->return_type.IsIntegral() ||
+			    condition.left->return_type != condition.right->return_type) {
+				continue;
+			}
+			// Move only a necessary condition through unchanged projections,
+			// filters and the probe side of inner/semi joins. Stop at cardinality
+			// boundaries, computed keys, preserved outer rows and shared scopes.
+			EarlyProbeFilter target;
+			auto column = condition.left->Cast<BoundReferenceExpression>().index;
+			auto op = &join.children[0].get();
+			while (column < op->types.size() && op->types[column] == condition.left->return_type) {
+				if (op->type == PhysicalOperatorType::PROJECTION) {
+					auto &expression = *op->Cast<PhysicalProjection>().select_list[column];
+					if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+						break;
+					}
+					column = expression.Cast<BoundReferenceExpression>().index;
+					op = &op->children[0].get();
+				} else if (op->type == PhysicalOperatorType::FILTER) {
+					op = &op->children[0].get();
+				} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+					auto &probe = op->Cast<PhysicalHashJoin>();
+					if ((probe.join_type != JoinType::INNER && probe.join_type != JoinType::SEMI) ||
+					    !probe.delim_types.empty() || column >= probe.lhs_output_columns.col_idxs.size()) {
+						break;
+					}
+					column = probe.lhs_output_columns.col_idxs[column];
+					op = &probe.children[0].get();
+					if (!BroadcastJoin(probe, partitions) && column < op->types.size() &&
+					    op->types[column] == condition.left->return_type) {
+						target.input = op;
+						target.column = column;
+					}
+				} else {
+					break;
+				}
+			}
+			if (target.input && double(build.estimated_cardinality) * 8 < double(target.input->estimated_cardinality) &&
+			    EstimatedExchangeBytes(build) * partitions < EstimatedExchangeBytes(*target.input)) {
+				target.build = &build;
+				target.build_column = condition.right->Cast<BoundReferenceExpression>().index;
+				return target;
+			}
+		}
+		return result;
+	}
 
 	bool HasScopedState(const PhysicalOperator &op) {
 		if (op.type == PhysicalOperatorType::DELIM_SCAN || op.type == PhysicalOperatorType::CTE_SCAN ||
@@ -939,17 +1022,22 @@ private:
 		projection.children.push_back(*keys.source);
 		Wrap(projection, domain);
 		domain = Exchange(std::move(domain), count == 1 ? "gather" : "broadcast", count);
+		return SemiFilter(op, std::move(input), key, projection, std::move(domain), 0);
+	}
+
+	DistributedSubtree SemiFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
+	                              DistributedSubtree domain, idx_t build_key) {
 		// NULL-safe equality is only a necessary condition; the original
-		// delimiter join still decides matches. SEMI preserves probe duplicates.
+		// join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
 		condition.left = make_uniq<BoundReferenceExpression>(op.types[key], key);
-		condition.right = make_uniq<BoundReferenceExpression>(op.types[key], 0);
+		condition.right = make_uniq<BoundReferenceExpression>(op.types[key], build_key);
 		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 		conditions.push_back(std::move(condition));
 		LogicalComparisonJoin logical(JoinType::SEMI);
 		logical.types = op.types;
-		auto &join = plan.Make<PhysicalHashJoin>(logical, op, projection, std::move(conditions), JoinType::SEMI,
+		auto &join = plan.Make<PhysicalHashJoin>(logical, op, build, std::move(conditions), JoinType::SEMI,
 		                                         op.estimated_cardinality);
 		auto node = Node(join);
 		node.children.push_back(std::move(input.fragment.root));
@@ -1216,8 +1304,23 @@ private:
 		return child;
 	}
 	DistributedSubtree Join(PhysicalHashJoin &join) {
-		auto left = Build(join.children[0]);
-		auto right = Build(join.children[1]);
+		auto filter = PlanProbeFilter(join);
+		DistributedSubtree left, right;
+		if (filter.input) {
+			// Both the original join and the early SEMI build drain this shared
+			// producer before probing. Never rescan or recompute the build side.
+			filter.producer = Finish(Build(join.children[1]));
+			probe_filters[filter.input].push_back(filter);
+			left = Build(join.children[0]);
+			auto &filters = probe_filters.at(filter.input);
+			filters.pop_back();
+			if (filters.empty()) {
+				probe_filters.erase(filter.input);
+			}
+		} else {
+			left = Build(join.children[0]);
+			right = Build(join.children[1]);
+		}
 		vector<unique_ptr<Expression>> left_keys, right_keys;
 		for (auto &condition : join.conditions) {
 			if (condition.comparison == ExpressionType::COMPARE_EQUAL ||
@@ -1238,7 +1341,9 @@ private:
 			// existing distribution and fuse the probe subtree with the join;
 			// shuffling it by the join key adds no correctness guarantee here.
 			auto count = left.fragment.partition_count;
-			right = Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count);
+			right = filter.input
+			            ? ExchangeFrom(filter.producer, filter.build->types, count == 1 ? "gather" : "broadcast", count)
+			            : Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count);
 		} else {
 			auto lk = ProjectKeys(left, left_keys);
 			left = Exchange(std::move(left), "hash", partitions, lk);

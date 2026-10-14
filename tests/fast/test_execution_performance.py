@@ -14,7 +14,7 @@ import pytest
 
 import vane
 from tests.fast.test_direct_exchange import channel, collect, next_batch, prepare_root_task, submission
-from tests.fast.test_fragment_sql_coverage import correlated_owner_queries
+from tests.fast.test_fragment_sql_coverage import correlated_owner_queries, early_join_filter_query
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -493,7 +493,29 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-def test_correlated_owner_fanout_releases_blocked_branches_on_close(tmp_path, threads):
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("kind", ["inner", "semi"])
+def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, threads, partitions, kind):
+    config = {"threads": threads, "disabled_optimizers": "join_order,build_side_probe_side"}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = early_join_filter_query(connection, tmp_path / "fact.parquet", kind)
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [channel.snapshot() for channel in service.channels.values()]
+            # The wide order side remains partitioned, but nearly all fact rows
+            # must be removed before crossing the hash boundary.
+            assert sum(state["accepted_rows"] for state in states) < 140000
+            assert all(state["peak_bytes"] <= limits.window_bytes for state in states)
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 2
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("query_kind", ["correlated", "join"])
+def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
         """
@@ -502,12 +524,17 @@ def test_correlated_owner_fanout_releases_blocked_branches_on_close(tmp_path, th
         from pathlib import Path
         import vane
         from tests.fast.test_direct_exchange import submission
-        from tests.fast.test_fragment_sql_coverage import correlated_owner_queries
+        from tests.fast.test_fragment_sql_coverage import correlated_owner_queries, early_join_filter_query
         from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 
-        with vane.connect(backend="local", config={"threads": int(sys.argv[2])}) as connection:
-            sql = correlated_owner_queries(connection, Path(sys.argv[1]) / "fact.parquet")["nested"]
-            limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        config = {"threads": int(sys.argv[2])}
+        if sys.argv[3] == "join":
+            config["disabled_optimizers"] = "join_order,build_side_probe_side"
+        with vane.connect(backend="local", config=config) as connection:
+            path = Path(sys.argv[1]) / "fact.parquet"
+            sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"
+                   else correlated_owner_queries(connection, path)["nested"])
+            limits = DirectExchangeLimits(4096, 1024, 4, 1)
             spec = submission(connection, sql, partitions=3)
             with InProcessTaskService(connection, spec, limits) as service:
                 service.start()
@@ -515,8 +542,55 @@ def test_correlated_owner_fanout_releases_blocked_branches_on_close(tmp_path, th
                 while not any(c.snapshot()["write_blocks"] for c in service.channels.values()):
                     assert time.monotonic() < deadline, service.snapshot()
                     service.pump(1)
-                service.cancel("cancel shared owner branches")
+                service.cancel("cancel shared build branches")
             assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
         """
     )
-    subprocess.run([sys.executable, "-c", script, str(tmp_path), str(threads)], check=True, timeout=30, cwd=tmp_path)
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(threads), query_kind], check=True, timeout=30, cwd=tmp_path
+    )
+
+
+@pytest.mark.parametrize("kind", ["left", "anti"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_early_join_filter_preserves_outer_and_null_matches(tmp_path, kind, comparison):
+    config = {"threads": 4, "disabled_optimizers": "join_order,build_side_probe_side"}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = early_join_filter_query(connection, tmp_path / "fact.parquet", kind, comparison)
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=3), limits) as service:
+            service.start()
+            assert collect(service) == expected
+
+
+@pytest.mark.parametrize("boundary", ["computed", "limit", "aggregate", "multiple"])
+def test_early_join_filter_respects_projection_and_cardinality_boundaries(tmp_path, boundary):
+    disabled = "join_order,build_side_probe_side"
+    with vane.connect(backend="local", config={"threads": 4, "disabled_optimizers": disabled}) as connection:
+        sql = early_join_filter_query(connection, tmp_path / "fact.parquet")
+        if boundary == "computed":
+            sql = sql.replace("on a.k = b.k", "on a.k%1024 = b.k")
+        elif boundary == "limit":
+            sql = sql.replace("o using(i)) a", "o using(i) order by f.i limit 1) a")
+        elif boundary == "aggregate":
+            sql = sql.replace("select f.i, f.k, o.payload", "select min(f.i) i, f.k, max(o.payload) payload")
+            sql = sql.replace("o using(i)) a", "o using(i) group by f.k) a").replace("on a.k = b.k", "on a.i = b.k")
+        else:
+            sql = sql.replace(
+                "order by a.i, a.payload",
+                "join (select range k from range(4096) where range%1024=0) c on a.k=c.k order by a.i, a.payload",
+            )
+        # An oracle without dynamic filters also checks that moving a necessary
+        # condition does not change LIMIT or aggregate input semantics.
+        connection.execute(f"set disabled_optimizers='{disabled},join_filter_pushdown'")
+        expected = connection.execute(sql).fetchall()
+        if boundary == "limit":
+            assert expected == []  # The first fact has a NULL key.
+        connection.execute(f"set disabled_optimizers='{disabled}'")
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=3), limits) as service:
+            service.start()
+            assert collect(service) == expected
+            if boundary == "multiple":
+                assert sum(c.snapshot()["accepted_rows"] for c in service.channels.values()) < 140000

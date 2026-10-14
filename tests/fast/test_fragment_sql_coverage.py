@@ -178,6 +178,26 @@ DETERMINISTIC_TIMEZONES = [
 ]
 
 
+def early_join_filter_query(connection, path, kind="inner", comparison="=", *, wide_probe=False):
+    extra = ", 'fact-' || range::varchar fact_payload" if wide_probe else ""
+    payload = "f.fact_payload || o.payload as payload" if wide_probe else "o.payload"
+    connection.execute(
+        "copy (select range i, case when range%4096=0 then null else range%4096 end k "
+        f"{extra} from range(131072)) to '{path}' (row_group_size 2048)"
+    )
+    # The wide order payload keeps the first join above the broadcast limit.
+    # A later selective build has duplicate and NULL keys and can filter facts
+    # before that first hash exchange without executing the build twice.
+    # A wider probe also retains this orientation with default optimizers.
+    return (
+        f"select a.i, a.k, a.payload from (select f.i, f.k, {payload} "
+        f"from read_parquet('{path}') f join "
+        "(select range i, 'order-' || range::varchar as payload from range(131072)) o using(i)) a "
+        f"{kind} join (select case when range%4096=0 then null else range%4096 end k "
+        f"from range(8192) where range%512=0) b on a.k {comparison} b.k order by a.i, a.payload"
+    )
+
+
 def correlated_owner_queries(connection, path, comparison="="):
     connection.execute(
         "copy (select case when range%65536=0 then null else range%4096 end k, range%97 v "

@@ -331,6 +331,10 @@ DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipelin
 
 普通等值 INNER/LEFT/SEMI/ANTI join 的 build 估计不超过 32 行时保留小表广播策略。更大的 build 仅在估计交换大小不超过 8 MiB，且额外副本的流量不超过省下的 probe 重分区流量时广播；分区数为 N 时比较 `(N-1) × build_bytes <= probe_bytes`。估算包含定长类型宽度、有效性开销及每个变长标量 64 字节，缺少长度统计的嵌套类型继续使用原来的小行数策略。该阈值用于计划选择，实际执行仍受 operator memory 与通道窗口约束。广播保留 probe 分区和同一 fragment 内的扫描动态过滤。
 
+若 INNER/SEMI 广播 join 的原生过滤信息表明 build 含选择条件，还可把必要的整数键过滤提前到 probe 子树中更早的 HASH 交换之前。只沿原样 projection、filter 与 INNER/SEMI join 的 probe 输出追踪直接引用；遇到计算键、LIMIT、聚合、外连接或共享作用域时停止下移。build 估计必须已知、不超过 8 MiB、行数少于目标输入八分之一，额外广播流量也必须小于该输入的估计交换量。没有跨越 HASH 边时继续使用原有同 fragment 动态过滤。
+
+提前过滤通过原生 NULL 安全 SEMI join 保留 probe 重复行，最终 join 仍负责实际匹配和输出重复次数。原 join 与提前过滤分支共用同一 build fragment 的完整输出，不复制扫描或重算 join；两个分支都先消费 build 再读取 probe，额外通道仍计入原来的窗口预留。FTE 两个下游绑定同一已提交 producer 的各自输出，失败消费者沿用输入身份并更换 fence。该路径不放宽广播大小，也不根据运行后的实际小结果忽略原来的基数估计。
+
 FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
 
 冻结文件、物化对象及帧校验使用已有 OpenSSL 依赖的 EVP SHA-256 实现，内容身份仍为标准 SHA-256。每个流独立持有摘要状态并检查 EVP 返回值。文件复制、取消检查、封存及物化读取前的整对象验证继续执行；每次查询仍创建自己的冻结副本，不共享跨查询快照。
