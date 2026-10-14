@@ -342,6 +342,17 @@ def test_broadcast_join_bounds_replica_size_and_traffic(probe_rows, build_rows, 
     assert any(e.distribution is Distribution.HASH for e in graph.exchanges) is not broadcast
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_broadcast_join_does_not_assume_narrow_build_rows(nested):
+    payload = "[range] payload" if nested else ", ".join(f"range+{i} p{i}" for i in range(20))
+    sql = f"select * from range(10000000) a join (select range, {payload} from range(100000)) b using(range)"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        graph = compile_sql(connection, sql, 2)
+    assert any(e.distribution is Distribution.HASH for e in graph.exchanges)
+    assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 def test_exchange_input_coalesces_and_flushes_while_waiting_for_more_rows(threads):
     with vane.connect(backend="local", config={"threads": threads}) as connection:
@@ -387,3 +398,17 @@ def test_exchange_input_coalesces_and_flushes_while_waiting_for_more_rows(thread
         finally:
             service.cancel("test cleanup")
             service.release()
+
+
+@pytest.mark.parametrize("tail", ["", " limit 5000 offset 4000"])
+def test_parallel_exchange_preserves_ordered_result_batches(tail):
+    sql = (
+        "select case when range%11=0 then null else range%31 end k, range i "
+        "from range(131072) order by k desc nulls first, i desc" + tail
+    )
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        with InProcessTaskService(connection, spec, DirectExchangeLimits(8192, 4096, 128, 1)) as service:
+            service.start()
+            assert collect(service) == expected

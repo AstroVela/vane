@@ -1143,6 +1143,98 @@ with vane.connect(backend='local', config={'threads': int(sys.argv[1])}) as conn
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_parallel_exchange_tasks_share_credit_without_losing_wakeups(threads, cancel):
+    script = r"""
+import runpy, sys, time
+from collections import Counter
+import vane
+
+helpers = runpy.run_path(sys.argv[1])
+threads, cancel = int(sys.argv[2]), sys.argv[3] == 'True'
+with vane.connect(backend='local', config={'threads': threads}) as connection:
+    spec = helpers['submission'](connection)
+    source = helpers['channel'](connection, window=8192, frame=1024, rows=64, slots=16)
+    output = helpers['channel'](connection, window=1024, frame=1024, rows=64, slots=1)
+    source.add_producer('upstream')
+    output.add_producer('task')
+    source.seal_producers()
+    output.seal_producers()
+    service = helpers['prepare_root_task'](connection, spec, [(source, 'client')], [output])
+    retained = None
+    try:
+        service.start('task', 'start')
+        deadline = time.monotonic() + 5
+        # All source tasks wait on the same empty consumer before publication.
+        # Its single channel callback must wake the complete waiter group.
+        while source.snapshot()['read_blocks'] < threads:
+            service.pump(1)
+            assert time.monotonic() < deadline, source.snapshot()
+            time.sleep(0.001)
+        for sequence in range(1, 13):
+            assert source._write_rows('upstream', sequence, [(sequence,)] * 64) == 'accepted'
+        source.finish('upstream', 12)
+        deadline = time.monotonic() + 5
+        while retained is None:
+            service.pump(1)
+            _, batch = output.poll('client')
+            if batch is not None:
+                rows = batch.to_rows()
+                sequences = [batch.sequence]
+                retained = batch.slice(0, 1)
+                batch.close()
+            assert time.monotonic() < deadline
+        # The borrowed output consumes the only slot. Every scheduled task
+        # must be able to hold a distinct input while waiting for that credit.
+        while True:
+            service.pump(1)
+            state = source.snapshot()
+            held = state['outstanding_frames'] - state['queued_frames']
+            if held >= threads:
+                break
+            assert time.monotonic() < deadline, (threads, state)
+            time.sleep(0.001)
+        if cancel:
+            service.cancel('cancel parallel tasks')
+            service.release()
+            assert source.snapshot()['bytes'] == 0
+            assert retained.num_rows == 1
+            assert output.snapshot()['bytes'] > 0
+            retained.close()  # Credit callback after native task teardown.
+        else:
+            retained.close()
+            deadline = time.monotonic() + 5
+            while True:
+                service.pump(1)
+                status, batch = output.poll('client')
+                if status == 'end':
+                    break
+                if batch is not None:
+                    rows.extend(batch.to_rows())
+                    sequences.append(batch.sequence)
+                    batch.close()
+                assert time.monotonic() < deadline, service.status()
+            assert Counter(rows) == Counter({(value,): 64 for value in range(1, 13)})
+            assert sequences == list(range(1, 13))
+        assert source.snapshot()['bytes'] == output.snapshot()['bytes'] == 0
+        assert source.snapshot()['peak_bytes'] <= 8192
+        assert output.snapshot()['peak_bytes'] <= 1024
+    finally:
+        service.cancel('test cleanup')
+        service.release()
+        if retained is not None:
+            retained.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, __file__, str(threads), str(cancel)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("hash_columns", [(), (0, 1)])
 @pytest.mark.parametrize("threads", [1, 4])
 def test_parquet_streams_owned_string_frames_and_nullable_hash_keys(tmp_path, hash_columns, threads):

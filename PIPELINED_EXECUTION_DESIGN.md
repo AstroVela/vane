@@ -327,6 +327,8 @@ DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量�
 
 DirectCollector 为本地扫描和上游 exchange 输入的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。执行器每 10 ms 检查尾批，并在等待上游输入前强制尝试发送，避免把已有结果扣在空闲生产者之后。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。默认 frame_rows 为原生向量容量 2048，frame_bytes 仍为 64 KiB，窗口仍为 1 MiB/16 帧；宽行继续按字节上限拆分。
 
+DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipeline 在配置的线程数内并行执行，仍遵守中间算子的并行能力。显式 ORDER BY 的固定顺序输出继续使用串行 collector。每个原生任务独立持有输入、行选择和上述拼批缓存；缓存计入 operator memory，不扩大通道 credit。一个通道的单个读写回调通过共享等待集合唤醒所有已阻塞任务：状态检查与任务登记在同一把等待锁内完成，回调取出集合后在锁外唤醒。源端轮询游标受锁保护，但释放输入向量引用时不持有该锁；收集端将同一 producer 的序号分配与帧发布一起串行化。等待集合只持有引擎的弱任务回调，取消或销毁任务后的延迟 credit 归还仍然安全；全部任务 Combine 完成后才发布 FINISH。
+
 普通等值 INNER/LEFT/SEMI/ANTI join 的 build 估计不超过 32 行时保留小表广播策略。更大的 build 仅在估计交换大小不超过 8 MiB，且额外副本的流量不超过省下的 probe 重分区流量时广播；分区数为 N 时比较 `(N-1) × build_bytes <= probe_bytes`。估算包含定长类型宽度、有效性开销及每个变长标量 64 字节，缺少长度统计的嵌套类型继续使用原来的小行数策略。该阈值用于计划选择，实际执行仍受 operator memory 与通道窗口约束。广播保留 probe 分区和同一 fragment 内的扫描动态过滤。
 
 FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
