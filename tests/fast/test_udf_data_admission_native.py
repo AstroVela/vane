@@ -782,6 +782,17 @@ def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited, mo
         result = _wait_result(first)
         assert not isinstance(result, BaseException)
         refs.extend(result[1])
+        # Execution completion wakes the query admission pump asynchronously.
+        # Wait for its callback to record the refusal without consuming it.
+        authority = second._admission_authority
+        deadline = time.monotonic() + 5
+        while True:
+            with authority._lock:
+                recorded = authority._wakeup_refusal is not None
+            if recorded:
+                break
+            assert time.monotonic() < deadline, "queued admission did not record its byte refusal"
+            time.sleep(0.01)
         # A transport notification can arrive after the pool callback has
         # recorded a byte refusal but before the dispatcher reads it.
         strict_transport.wake_waiters()
