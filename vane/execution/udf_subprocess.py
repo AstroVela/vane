@@ -3676,6 +3676,7 @@ def ensure_local_subprocess_actor_pools_for_nodes(
     plan_identity: Any = None,
     session_id: str | None = None,
     set_handles: Callable[[dict[str, Any]], None] | None = None,
+    startup_cancellation: ExecutionCancellationScope | None = None,
 ) -> tuple[
     list[
         LocalSubprocessActorPool
@@ -3755,7 +3756,11 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             node_id = str(node.get("node_id"))
             pool_size = _local_actor_pool_size_from_node(node, raw_payload)
             executor_options = dict(node.get("executor_options") or {})
-            cancellation = executor_options.get("local_request_cancellation")
+            cancellation = (
+                startup_cancellation
+                if startup_cancellation is not None
+                else executor_options.get("local_request_cancellation")
+            )
             if cancellation is not None:
                 if not isinstance(cancellation, ExecutionCancellationScope):
                     raise TypeError("local_request_cancellation must be ExecutionCancellationScope")

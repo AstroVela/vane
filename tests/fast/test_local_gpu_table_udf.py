@@ -165,8 +165,16 @@ def test_cancellation_during_spawn_is_delivered_after_child_is_owned(monkeypatch
     assert not local_gpu_devices._owners.occupied
 
 
-@pytest.mark.parametrize("action", ["interrupt", "deadline"])
-def test_query_cancellation_reaps_discovery_before_returning_request_slot(monkeypatch, tmp_path, action):
+@pytest.mark.parametrize(
+    "configured,terminal,action",
+    [
+        (True, "fetchall", "interrupt"),
+        (True, "fetchall", "deadline"),
+        (False, "fetchall", "interrupt"),
+        (False, "write_parquet", "interrupt"),
+    ],
+)
+def test_query_cancellation_reaps_discovery(monkeypatch, tmp_path, configured, terminal, action):
     from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestExecutionTimeout
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -193,15 +201,30 @@ def test_query_cancellation_reaps_discovery_before_returning_request_slot(monkey
         return child
 
     monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    discover = local_gpu_devices.discover_gpu_devices
+    scopes = []
+
+    def discover_with_scope(*, cancellation=None):
+        scopes.append(cancellation)
+        return discover(cancellation=cancellation)
+
+    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", discover_with_scope)
     with vane.connect(config={"threads": 2}) as connection:
-        runtime = connection.configure_local_runtime(
-            request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1 if action == "deadline" else None
+        runtime = (
+            connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1 if action == "deadline" else None
+            )
+            if configured
+            else None
         )
         relation = connection.sql("SELECT 7 AS x").map_batches(
             DeviceActor, schema={"x": vane.sqltypes.INTEGER, "device": vane.sqltypes.VARCHAR}, actor_number=1, gpus=1
         )
+        output = tmp_path / "output.parquet"
         with ThreadPoolExecutor(max_workers=1) as clients:
-            future = clients.submit(relation.fetchall)
+            future = clients.submit(
+                relation.fetchall if terminal == "fetchall" else lambda: relation.write_parquet(str(output))
+            )
             try:
                 deadline = time.monotonic() + 10
                 while not entered.exists():
@@ -211,21 +234,74 @@ def test_query_cancellation_reaps_discovery_before_returning_request_slot(monkey
                     time.sleep(0.01)
                 if action == "interrupt":
                     connection.interrupt()
-                expected = RequestCancelled if action == "interrupt" else RequestExecutionTimeout
-                with pytest.raises(expected):
+                expected = (
+                    (RequestCancelled if action == "interrupt" else RequestExecutionTimeout)
+                    if configured
+                    else vane.Error
+                )
+                with pytest.raises(expected) as cancelled:
                     future.result(timeout=3)
+                if not configured:
+                    assert "interrupt" in str(cancelled.value).lower() or "cancel" in str(cancelled.value).lower()
                 assert len(children) == 1 and children[0].returncode is not None
                 assert children[0].stdout.closed and children[0].stderr.closed
-                state = runtime.resource_snapshot()["request_admission"]
-                assert state["active_requests"] == state["cancelling_requests"] == 0
+                assert scopes[0] is not None and scopes[0].is_set()
+                assert not output.exists()
+                if runtime is not None:
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cancelling_requests"] == 0
                 assert not local_gpu_devices._owners.occupied
                 assert connection.execute("SELECT 9").fetchall() == [(9,)]
+                if action == "interrupt":
+                    release.touch()
+                    assert relation.fetchall() == [(7, DEVICES[0])]
+                    assert scopes[1] is not scopes[0] and not scopes[1].is_set()
+                    assert not local_gpu_devices._owners.occupied
             finally:
                 release.touch()
                 try:
                     future.result(timeout=5)
-                except (RequestCancelled, RequestExecutionTimeout):
+                except (RequestCancelled, RequestExecutionTimeout, vane.Error):
                     pass
+
+
+def test_ordinary_query_interrupt_during_startup_scope_creation(monkeypatch):
+    from vane.execution import udf_lifecycle
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    entered = threading.Event()
+    release = threading.Event()
+    discovery_calls = []
+
+    class DelayedScope(ExecutionCancellationScope):
+        def __init__(self, owner_id, generation):
+            entered.set()
+            assert release.wait(10)
+            super().__init__(owner_id, generation)
+
+    def unexpected_discovery(**kwargs):
+        discovery_calls.append(kwargs)
+        pytest.fail("unexpected GPU discovery")
+
+    monkeypatch.setattr(udf_lifecycle, "ExecutionCancellationScope", DelayedScope)
+    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", unexpected_discovery)
+    with vane.connect(config={"threads": 2}) as connection:
+        relation = connection.sql("SELECT 7 AS x").map_batches(
+            DeviceActor, schema={"x": vane.sqltypes.INTEGER, "device": vane.sqltypes.VARCHAR}, actor_number=1, gpus=1
+        )
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            future = clients.submit(relation.fetchall)
+            try:
+                assert entered.wait(5)
+                connection.interrupt()
+                release.set()
+                with pytest.raises(vane.Error, match="(?i)interrupt|cancel"):
+                    future.result(timeout=3)
+                assert discovery_calls == []
+                assert not local_gpu_devices._owners.occupied
+                assert connection.execute("SELECT 9").fetchall() == [(9,)]
+            finally:
+                release.set()
 
 
 def test_replica_reservation_is_atomic_under_contention(inventory):
