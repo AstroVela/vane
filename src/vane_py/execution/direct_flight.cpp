@@ -3,6 +3,7 @@
 
 #include "direct_flight.hpp"
 #include "arrow_frame.hpp"
+#include "exchange_signal.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -26,7 +27,7 @@ namespace duckdb {
 namespace vane_execution {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+constexpr idx_t MAX_INFLIGHT_FRAMES = 4;
 
 void Check(const arrow::Status &status, const string &operation = "") {
 	if (!status.ok()) {
@@ -40,28 +41,11 @@ T Unwrap(arrow::Result<T> value, const string &operation = "") {
 	return std::move(value).ValueOrDie();
 }
 
-struct Signal : public std::enable_shared_from_this<Signal> {
-	std::mutex lock;
-	std::condition_variable changed;
-	void Wait() {
-		std::unique_lock<std::mutex> guard(lock);
-		changed.wait_for(guard, std::chrono::milliseconds(10));
-	}
-	ExchangeWakeup Wakeup() {
-		std::weak_ptr<Signal> weak = shared_from_this();
-		return [weak]() {
-			if (auto signal = weak.lock()) {
-				signal->changed.notify_all();
-			}
-		};
-	}
-};
-
 struct Endpoint {
 	shared_ptr<DirectChannel> channel;
 	string consumer;
 	std::mutex lock;
-	shared_ptr<DirectBatch> lease;
+	std::deque<shared_ptr<DirectBatch>> leases;
 	idx_t sent = 0;
 	idx_t acknowledged = 0;
 	bool opened = false;
@@ -69,7 +53,7 @@ struct Endpoint {
 	std::condition_variable idle;
 	bool finished = false;
 	bool closed = false;
-	std::shared_ptr<Signal> signal = std::make_shared<Signal>();
+	std::shared_ptr<ExchangeSignal> signal = std::make_shared<ExchangeSignal>();
 };
 
 struct Registry {
@@ -120,7 +104,7 @@ public:
 					if (endpoint->closed) {
 						return arrow::Status::Cancelled("direct consumer closed");
 					}
-					pending = bool(endpoint->lease);
+					pending = endpoint->leases.size() >= MAX_INFLIGHT_FRAMES;
 				}
 				if (pending) {
 					endpoint->signal->Wait();
@@ -147,7 +131,9 @@ public:
 						chunk.Initialize(Allocator::DefaultAllocator(), endpoint->channel->types, 0);
 						metadata = "F:" + std::to_string(endpoint->sent);
 					} else {
-						endpoint->lease = batch;
+						// Every unacknowledged frame keeps its channel credit. The
+						// transport also has a fixed, separately reserved flight window.
+						endpoint->leases.push_back(batch);
 						batch->Reference(chunk);
 						metadata = "D:" + std::to_string(++endpoint->sent);
 					}
@@ -227,7 +213,7 @@ public:
 			if (!snapshot.error.empty()) {
 				return arrow::Status::IOError(snapshot.error);
 			}
-			shared_ptr<DirectBatch> release;
+			std::deque<shared_ptr<DirectBatch>> release;
 			string response;
 			{
 				std::lock_guard<std::mutex> guard(endpoint->lock);
@@ -238,23 +224,26 @@ public:
 					    argument[0] == '-') {
 						return arrow::Status::Invalid("invalid direct cumulative ACK");
 					}
-					if (sequence > endpoint->acknowledged) {
-						endpoint->acknowledged = sequence;
-						release = std::move(endpoint->lease);
+					if (!endpoint->closed && sequence > endpoint->acknowledged) {
+						while (endpoint->acknowledged < sequence) {
+							release.push_back(std::move(endpoint->leases.front()));
+							endpoint->leases.pop_front();
+							endpoint->acknowledged++;
+						}
 					}
 				} else if (action.type == "vane.direct.close") {
 					endpoint->closed = true;
-					release = std::move(endpoint->lease);
+					release.swap(endpoint->leases);
 				} else if (action.type != "vane.direct.status") {
 					return arrow::Status::Invalid("unknown direct Flight action");
 				}
 				response = endpoint->closed ? "closed" : endpoint->finished ? "finished" : "running";
 			}
-			release.reset();
+			release.clear();
 			if (action.type == "vane.direct.close") {
 				endpoint->channel->CloseConsumer(endpoint->consumer);
 			}
-			endpoint->signal->changed.notify_all();
+			endpoint->signal->Notify();
 			std::vector<arrow::flight::Result> values;
 			values.push_back({arrow::Buffer::FromString(response)});
 			result->reset(new arrow::flight::SimpleResultStream(std::move(values)));
@@ -280,7 +269,10 @@ struct Link {
 	std::atomic<bool> done {false};
 	std::atomic<bool> closing {false};
 	std::atomic<bool> ready {false};
-	std::shared_ptr<Signal> signal = std::make_shared<Signal>();
+	std::atomic<idx_t> received {0};
+	std::atomic<idx_t> acknowledged {0};
+	std::shared_ptr<ExchangeSignal> signal = std::make_shared<ExchangeSignal>();
+	std::shared_ptr<ExchangeSignal> control_signal = std::make_shared<ExchangeSignal>();
 
 	string Action(const string &name, const string &argument = "") {
 		arrow::flight::FlightCallOptions options;
@@ -299,7 +291,8 @@ struct Link {
 	void Stop() {
 		done = true;
 		stop.RequestStop();
-		signal->changed.notify_all();
+		signal->Notify();
+		control_signal->Notify();
 	}
 	void Fail(const string &reason) {
 		channel->Abort(reason);
@@ -343,6 +336,14 @@ struct Link {
 				}
 				auto metadata = message.app_metadata->ToString();
 				if (metadata == "F:" + std::to_string(sequence) && message.data->num_rows() == 0) {
+					// Data receipt can overlap ACKs, but successful EOF must still
+					// wait for the final control outcome, including a failed ACK.
+					while (!done && acknowledged.load() < sequence) {
+						signal->Wait();
+					}
+					if (done) {
+						return;
+					}
 					channel->Finish(producer, sequence);
 					finished = true;
 					continue;
@@ -377,7 +378,10 @@ struct Link {
 				chunk.Destroy();
 				message.data.reset();
 				if (!done) {
-					Action("ack", std::to_string(++sequence));
+					// The accepted native copy owns receiver credit. Let the control
+					// thread ACK cumulatively while this thread receives the next frame.
+					received = ++sequence;
+					control_signal->Notify();
 				}
 			}
 		} catch (const std::exception &error) {
@@ -398,11 +402,18 @@ struct Link {
 					CloseConsumer();
 					return;
 				}
-				if (Action("status") == "closed") {
+				auto sequence = received.load();
+				auto advanced = sequence > acknowledged.load();
+				if (Action(advanced ? "ack" : "status", advanced ? std::to_string(sequence) : "") == "closed") {
 					throw IOException("upstream direct Flight endpoint closed");
 				}
-				std::unique_lock<std::mutex> guard(signal->lock);
-				signal->changed.wait_for(guard, std::chrono::milliseconds(25));
+				acknowledged = sequence;
+				if (advanced) {
+					signal->Notify();
+				}
+				if (received.load() == sequence) {
+					control_signal->Wait(std::chrono::milliseconds(25));
+				}
 			}
 		} catch (const std::exception &error) {
 			if (!done && !closing) {
@@ -429,7 +440,7 @@ struct DirectFlight::Impl {
 
 	Impl(const string &host, const string &advertise, idx_t maximum, idx_t staging, idx_t frame, int port,
 	     const string &certificate, const string &private_key)
-	    : max_links(maximum), frame_bytes(frame), wire_limit(DirectFlight::StagingPerLink(frame) / 4) {
+	    : max_links(maximum), frame_bytes(frame), wire_limit(4 * frame + (1 << 16)) {
 		if (!maximum || maximum > 4096 || staging / DirectFlight::StagingPerLink(frame) < maximum || host.empty() ||
 		    advertise.empty() || port < 0 || port > 65535 || certificate.empty() != private_key.empty()) {
 			throw InvalidInputException("direct Flight requires finite links and reserved staging capacity");
@@ -452,9 +463,9 @@ idx_t DirectFlight::StagingPerLink(idx_t frame_bytes) {
 	if (!frame_bytes || frame_bytes > (1ULL << 28)) {
 		throw InvalidInputException("direct Flight frame_bytes must be between 1 and 256 MiB");
 	}
-	// Native/Arrow encode or decode buffers plus IPC and bounded gRPC payload.
+	// Four in-flight wire frames plus native/Arrow conversion and IPC buffers.
 	// Fixed allowance covers schema/metadata and per-column aligned padding.
-	return 16 * frame_bytes + (1 << 18);
+	return (4 * MAX_INFLIGHT_FRAMES + 16) * frame_bytes + (1 << 18);
 }
 
 void DirectFlight::ExportSchema(const vector<LogicalType> &types, const vector<string> &names, ArrowSchema *out) {
@@ -536,14 +547,15 @@ void DirectFlight::Revoke(const string &ticket) {
 		}
 		endpoint = entry->second;
 	}
-	shared_ptr<DirectBatch> release;
+	std::deque<shared_ptr<DirectBatch>> release;
 	{
 		std::lock_guard<std::mutex> guard(endpoint->lock);
 		endpoint->closed = true;
-		release = std::move(endpoint->lease);
+		release.swap(endpoint->leases);
 	}
+	release.clear();
 	endpoint->channel->CloseConsumer(endpoint->consumer);
-	endpoint->signal->changed.notify_all();
+	endpoint->signal->Notify();
 	{
 		std::unique_lock<std::mutex> guard(endpoint->lock);
 		if (!endpoint->idle.wait_for(guard, std::chrono::seconds(2), [&]() { return !endpoint->active_stream; })) {
@@ -565,7 +577,8 @@ bool DirectFlight::Delivered(const string &ticket) const {
 	if (!error.empty()) {
 		throw IOException("%s", error);
 	}
-	return endpoint->finished && !endpoint->closed && endpoint->acknowledged == endpoint->sent && !endpoint->lease;
+	return endpoint->finished && !endpoint->closed && endpoint->acknowledged == endpoint->sent &&
+	       endpoint->leases.empty();
 }
 
 void DirectFlight::Cancel(const string &reason) {
@@ -577,7 +590,7 @@ void DirectFlight::Cancel(const string &reason) {
 	std::lock_guard<std::mutex> registry_guard(impl->registry->lock);
 	for (auto &item : impl->registry->endpoints) {
 		item.second->channel->Abort(reason);
-		item.second->signal->changed.notify_all();
+		item.second->signal->Notify();
 	}
 }
 

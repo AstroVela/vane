@@ -16,10 +16,10 @@ from vane._native import execution_runtime as native
 from vane.execution.compiler import compile_fragment_graph
 
 
-def make_channel(connection, sql="select 1::bigint as value"):
+def make_channel(connection, sql="select 1::bigint as value", *, slots=1):
     graph = compile_fragment_graph(connection, sql, query_id="flight-schema")
     root = next(f for f in graph.fragments if f.fragment_id == graph.result.fragment_id)
-    channel = native.DirectChannel(root.outputs[0].schema, native.DirectLimits(128, 128, 3, 1), 1, ["consumer"])
+    channel = native.DirectChannel(root.outputs[0].schema, native.DirectLimits(128, 128, 3, slots), 1, ["consumer"])
     channel.add_producer("producer")
     channel.seal_producers()
     return channel
@@ -65,6 +65,112 @@ def test_native_flight_data_ack_and_finish(pair):
     eventually(lambda: target.poll("consumer"), lambda result: result[0] == "end")
     batch.close()
     assert target.snapshot()["bytes"] == 0
+
+
+@pytest.mark.parametrize("terminal", ["finish", "close"])
+def test_flight_window_retains_credit_until_cumulative_ack(terminal):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    with vane.connect(backend="local") as connection:
+        source = make_channel(connection, slots=4)
+    sender = service()
+    client = reader = None
+    try:
+        sender.publish("window", source, "consumer")
+        for sequence in range(1, 5):
+            assert source._write_rows("producer", sequence, [(sequence,)]) == "accepted"
+        client = flight.FlightClient(sender.location)
+        reader = client.do_get(flight.Ticket("window"), flight.FlightCallOptions(timeout=5))
+        for sequence in range(1, 5):
+            batch = reader.read_chunk()
+            assert batch.app_metadata.to_pybytes() == f"D:{sequence}".encode()
+            assert batch.data.column(0).to_pylist() == [sequence]
+        assert source.snapshot()["outstanding_frames"] == 4
+        assert source._write_rows("producer", 5, [(5,)]) == "blocked"
+
+        def ack(sequence):
+            return list(client.do_action(flight.Action("vane.direct.ack", f"{sequence}\nwindow".encode())))
+
+        ack(2)
+        ack(2)  # Duplicate ACKs cannot release later frames.
+        assert source.snapshot()["outstanding_frames"] == 2
+        assert source._write_rows("producer", 5, [(5,)]) == "accepted"
+        assert reader.read_chunk().app_metadata.to_pybytes() == b"D:5"
+        with pytest.raises(pa.ArrowInvalid, match="ACK"):
+            ack(6)
+        assert source.snapshot()["outstanding_frames"] == 3
+        if terminal == "finish":
+            ack(5)
+            source.finish("producer", 5)
+            assert reader.read_chunk().app_metadata.to_pybytes() == b"F:5"
+            with pytest.raises(StopIteration):
+                reader.read_chunk()
+        else:
+            list(client.do_action(flight.Action("vane.direct.close", b"\nwindow")))
+            # An ACK already in transit may arrive after close released every lease.
+            assert ack(5)[0].body.to_pybytes() == b"closed"
+        assert source.snapshot()["bytes"] == 0
+        assert source.snapshot()["peak_bytes"] <= 128
+    finally:
+        if reader is not None:
+            reader.cancel()
+        if client is not None:
+            client.close()
+        sender.close()
+
+
+@pytest.mark.parametrize("reject_ack", [False, True])
+def test_receiver_continues_within_credit_while_ack_reply_is_pending(reject_ack):
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    entered, release = threading.Event(), threading.Event()
+    schema = pa.schema([("c0", pa.int64())])
+
+    class Sender(flight.FlightServerBase):
+        def do_get(self, context, ticket):
+            def batches():
+                for sequence in range(1, 5):
+                    yield pa.record_batch([[sequence]], schema=schema), f"D:{sequence}".encode()
+                yield pa.record_batch([[]], schema=schema), b"F:4"
+
+            return flight.GeneratorStream(schema, batches())
+
+        def do_action(self, context, action):
+            if action.type == "vane.direct.ack":
+                entered.set()
+                assert release.wait(10)
+                if reject_ack:
+                    raise flight.FlightInternalError("injected ACK failure")
+            yield flight.Result(b"running")
+
+    with vane.connect(backend="local") as connection:
+        target = make_channel(connection, slots=4)
+    sender, receiver = Sender(("127.0.0.1", 0)), service()
+    try:
+        receiver.subscribe(f"grpc://127.0.0.1:{sender.port}", "pending-ack", target, "producer", 20)
+        assert entered.wait(5)
+        eventually(lambda: target.snapshot()["accepted_frames"], lambda frames: frames == 4)
+        assert target.snapshot()["finished_producers"] == 0
+        release.set()
+        if reject_ack:
+            error = eventually(lambda: target.snapshot()["error"], bool)
+            assert "injected ACK failure" in error
+            assert target.snapshot()["finished_producers"] == 0
+            return
+        for sequence in range(1, 5):
+            state, batch = target.poll("consumer")
+            assert state == "data"
+            assert batch.to_rows() == [(sequence,)]
+            batch.close()
+        eventually(lambda: target.poll("consumer")[0], lambda state: state == "end")
+        assert target.snapshot()["bytes"] == 0
+        assert not target.snapshot()["error"]
+    finally:
+        release.set()
+        receiver.close()
+        sender.shutdown()
 
 
 def test_error_after_eof_stays_visible(pair):

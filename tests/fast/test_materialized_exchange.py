@@ -132,6 +132,16 @@ def test_materialized_native_types(tmp_path, sql_type, value):
     assert read_object(path, schema, metadata) == expected
 
 
+def test_large_materialized_stream_preserves_rows_and_content_identity(tmp_path):
+    schema = schema_for()
+    path = tmp_path / "large.mat"
+    rows = [(value,) for value in range(3001)]
+    metadata = write_object(path, schema, rows)
+    assert metadata["bytes"] > 2 * 65536
+    assert metadata["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert read_object(path, schema, metadata) == rows
+
+
 def test_empty_object_is_sealed_with_schema(tmp_path):
     schema = schema_for()
     path = tmp_path / "empty.mat"

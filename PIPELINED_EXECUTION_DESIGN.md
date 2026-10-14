@@ -521,7 +521,7 @@ MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel
 
 整数使用 64 位小端编码。空分区也必须写入带 schema 和文件尾的对象。写端排空已封闭生产者后写入文件尾，sync 并关闭文件，才报告封存完成；关闭 writer 不删除文件。读端先以固定 64 KiB 缓冲核对整个文件的大小、SHA-256、schema 和文件尾，再逐帧校验、解码和交付；缺失、截断、变更或元数据不匹配均以错误结束。EOF 与 reader 完成状态在同一取消锁内发布，读到 EOF 后立即 close 不会把成功交付改为取消。
 
-每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 256 KiB` 的 staging，另外持有 channel 的窗口预算。native I/O 同时只处理一个帧，等待容量时保留所有权。每个 attempt 启动前在同一个 worker 账本中预留 context、operator share、channel window、native staging 和 I/O 槽；两个策略同时运行也不能突破各项容量。这些约束不等价于完整的进程 RSS 硬限。
+每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 320 KiB` 的 staging，其中额外的 64 KiB 用于顺序文件缓冲，另外持有 channel 的窗口预算。文件缓冲合并帧头、校验和与 payload 的小块读写，保持对象格式和内容校验和不变；写端在 sync 前排空缓冲，读端仍先验证整个对象。native I/O 同时只处理一个帧，等待容量时保留所有权。每个 attempt 启动前在同一个 worker 账本中预留 context、operator share、channel window、native staging 和 I/O 槽；两个策略同时运行也不能突破各项容量。这些约束不等价于完整的进程 RSS 硬限。
 
 SharedDirectoryStore 要求所有参与者访问同一个绝对路径和 `store_id`，支持独占创建、原子 hard link 发布和文件 sync。目录必须由部署方放在独立于计算 worker 的共享存储上；路径名称与 marker 只能校验身份和可见性，无法证明挂载的物理故障域。当前测试验证独立生产进程退出后数据保留，不宣称本地临时目录可承受整台存储节点失效。
 
@@ -673,11 +673,11 @@ P1.2 的预算保证限定为通道拥有的实际值缓冲；operator 输入/�
 
 [direct_flight.cpp](src/vane_py/execution/direct_flight.cpp) 实现独立的 native Flight 服务，与旧 shuffle server 没有 ticket 或执行路径适配。传输对象先获得有限的 link 数量和 staging 预留，publish/subscribe 消耗这些额度。每条路由绑定完整的 query、attempt、双方 worker epoch、exchange、分区、schema 指纹、routing version 和随机 capability；服务按已注册 ticket 的完整字节匹配，日志与错误不回显凭据。
 
-DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流第一版只允许一个未确认帧；服务端保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，并 ACK 上游，所有权由发送窗口转入接收窗口。
+DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流最多允许四个未确认帧，同时受 native channel 的字节和帧数额度约束；服务端为每帧保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，由控制线程异步累计 ACK 上游，读取线程继续接收额度内的后续帧。关闭会释放全部发送 lease，随后到达的 ACK 只返回已关闭状态。
 
-每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
+每个 link 的 staging 上界预留为 `32 * frame_bytes + 256 KiB`，覆盖四个在途帧、Arrow/native 编解码和 IPC payload；单条 gRPC 接收消息限制仍为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅复用有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。Flight 与物化 I/O 的单等待者信号会保留通知，避免在检查状态和进入等待之间错过唤醒；读取和控制线程各有独立信号。
 
-数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
+接收端在最后一个 ACK 成功后才向 native channel 发布 FINISH，ACK 失败不能晚于成功的 EOF。数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 
 [pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。服务共享的 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
 
