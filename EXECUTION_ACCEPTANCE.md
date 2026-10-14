@@ -349,6 +349,32 @@ logs. `filter-benchmark.json` contains the measurements and
 attempt that failed the database-setting compatibility check before timing.
 The 42,238,471-byte benchmark input was removed after validation.
 
+## Materialized input short-circuit completion
+
+The Python 3.11 CI run for correlated partitions failed with
+`materialized reader lost its consumers` in the Parquet FTE case. Native task
+cleanup closes its inputs when execution finishes, including when an empty
+join build makes further probe input unnecessary. A materialized reader could
+still be waiting for channel credit and incorrectly abort the successful task
+when every consumer closed.
+
+The reader now treats that loss of demand as completion and publishes FINISH
+at its last accepted sequence. It still verifies the complete object's checksum
+before delivery and retains explicit cancellation and prior channel errors.
+Borrowed batches keep their leases until their final release.
+
+Two controlled regressions reproduced the CI error before the fix: closing
+before the first frame, and closing while the reader is blocked behind a
+borrowed frame. After an incremental non-editable Release build, both passed,
+as did closed-consumer checksum/abort controls. The affected Python suites
+passed 741 cases; ten public Ray cases covered correlated queries, shared CTEs,
+broadcast joins and scalar-cardinality failures. The existing native engine
+suites passed 358 cases / 259,600 assertions. Validation used Linux and
+Python 3.12; the original failure occurred on Python 3.11.
+
+Reproduction, build and validation logs are retained in
+`build/pr-stack-acceptance-20261014/`.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:

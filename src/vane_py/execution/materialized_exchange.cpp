@@ -332,7 +332,10 @@ struct MaterializedIO::Impl {
 				CheckRunning();
 				auto state = channel->TryWrite(identity, frames + 1, chunk, selection, 0, count, signal->Wakeup());
 				if (state == DirectWrite::CLOSED) {
-					throw IOException("materialized reader lost its consumers");
+					// A task can finish without consuming its entire input (for
+					// example, an empty join build). The object was verified above;
+					// losing all demand is successful short-circuit completion.
+					return expected;
 				}
 				if (state == DirectWrite::ACCEPTED) {
 					break;
@@ -352,7 +355,7 @@ struct MaterializedIO::Impl {
 			// Publish EOF and completion under the same cancellation lock.
 			// Closing immediately after EOF must not abort successful delivery.
 			if (!writing) {
-				channel->Finish(identity, result.frames);
+				channel->Finish(identity, channel->LastSequence(identity));
 			}
 			state.object = std::move(result);
 			state.done = true;
