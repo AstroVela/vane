@@ -518,3 +518,94 @@ the frozen drivers and per-run configuration/validation/cleanup manifests.
 The qualification driver SHA-256 is
 `01689859fb32231ed257c673d0504550f45c7a38a8808af361bd5da328c8a6d2`.
 Generated benchmark artifacts are not committed.
+
+## Pipelined exchange planning and native parallelism (2026-10-14)
+
+The next comparison uses the same SF10 inputs, two 18-CPU workers, two
+partitions, operator budgets, one active query/result, and timing boundaries
+described above. The frozen installed baseline is the `e152596e1c` runtime
+(`0.3.0.dev92`); its source changes are contained in PR head `e9daa6abdc`.
+No concurrent builds or tests run during measurement. The acceptance driver
+does not sample live diagnostics or profile stacks. Ray startup and the initial
+`select 1` are excluded, while query submission, complete collection and
+successful result close are included. Every sample matches the same ordered
+local oracle and returns query, result and worker reservations to zero.
+
+Three changes reduce work before increasing native parallelism:
+
+- Broadcast selection retains the existing tiny-build path and also accepts
+  estimated builds up to 8 MiB when their extra replicas cost no more than
+  shuffling the probe. It includes row widths and partition count, and avoids
+  guessing nested-value widths. This preserves the probe scan and its native
+  dynamic filters within the fragment.
+- The default frame row limit increases from 1024 to the native vector size of
+  2048. The 64 KiB frame, 1 MiB window and 16-slot limits stay the same; wide
+  rows still split at the byte limit.
+- Sparse exchange inputs use the existing bounded collector coalescer. It
+  flushes periodically, before waiting for more input and at completion. A
+  one-slot regression reduces 64 four-row inputs to fewer than 16 output frames
+  and delivers a final partial frame before upstream EOF.
+
+Native exchange sources and unordered collectors then permit the scheduler's
+configured parallelism. Shared waiter groups multiplex the channel's single
+read/write callback without dropping blocked tasks. Sequence allocation and
+publication are serialized, while each task retains its own input and partial
+output. Explicit fixed-order output keeps a serial collector. Four-thread
+tests exercise empty-input wakeups, retained one-slot output credit, exact
+rows/sequences, cancellation and credit return after task destruction; ordered
+NULL results and LIMIT/OFFSET are compared exactly with local execution.
+
+| Measurement, seconds | Frozen baseline | Work reduction (`935c3346b8`) | With parallelism (`b837df7137`) | Local, final run |
+|---|---:|---:|---:|---:|
+| All 22 queries, one complete pass | 117.172 | 94.322 | **64.832** | 9.170 |
+| Q17, median of three | 11.818 | 5.352 | **5.068** | 0.384 |
+| Q21, median of three | 15.397 | 11.425 | **10.370** | 1.170 |
+| Q7, first pass | 5.957 | 4.193 | **1.802** | 0.409 |
+| Q9, first pass | 9.801 | 6.130 | **2.607** | 0.914 |
+
+Each full run contains 52 matching samples: both modes run all 22 queries and
+two extra repetitions of Q17/Q21. Local complete-pass totals are
+9.025/9.130/9.170 seconds. The pipelined total falls 44.7% from the fresh frozen
+baseline; native parallelism contributes a further 31.3% reduction from the
+work-reduction candidate. This remains **7.07 times local**, with substantial
+shuffle and correlated-plan work still present. These single-host samples do
+not establish parity with local or a speedup for every query. Q6, for example,
+takes 0.390/0.397/0.416 seconds across the three first passes.
+
+Separate three-repetition controls distinguish the changes: broadcast planning
+alone gives a Q17 median of 7.991 seconds; using 2048-row frames gives 5.331
+seconds. Q21 changes from 15.467 to 11.676 seconds in those controls. Adding
+coalescing gives Q17/Q21 medians of 5.264/11.557 seconds; it mainly addresses
+sparse output rather than those two queries. A subsequent parallel control
+gives 4.945/11.057 seconds. Diagnostic and native stack-profile runs are retained
+separately and are not included in these timing comparisons.
+
+A final one-second diagnostic sampler still observes at least 57.25 million
+rows on Q17's remaining large exchange, while its filtered outer input exchanges
+only 61,385 rows. Q21 still sends 59.99 million and 37.93 million rows through
+two separate exchanges. These counts include outgoing endpoints only; live
+snapshots before completion are lower bounds, not final traffic totals. The two
+workers average 13.9/14.1 CPU cores during these Q17/Q21 diagnostic samples out
+of 36 configured cores. Reducing raw input before correlated/hash boundaries
+and the remaining transport/wakeup costs are the next targets; parallel task
+eligibility alone does not make their physical work equivalent to local.
+
+Installed native SHA-256 identities, in baseline/work-reduction/parallel order:
+
+```text
+1569820530f4bcc72f549dc7a931a6c8aa9f685d1b11e3dcdad86421bb0ee9b5
+5b225a4c34e2c1023e89aa1ceee132b3db7d051bdc764e8b3c6018b044fb15fa
+11f9e4c40e39605d83848eeaa9ef9542853f3cae15548eb004fd417bb132b409
+```
+
+The candidates use installed `vane-ai 0.3.0.dev95` and `0.3.0.dev96` with
+Python 3.12.13, Ray 2.59.0, PyArrow 26.0.0 and NumPy 2.5.4. Retained evidence is
+under `build/pipelined-local-gap-20261014/`: `baseline-full/`, `candidate-full/`,
+`parallel-full/`, `parallel-comparison.json`, `parallel-comparison.csv`, the
+control and diagnostic runs, and the frozen acceptance driver. Its SHA-256 is
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Configurations include installed Python-file hashes, native identity, input
+hashes, SQL, resource settings, output counts/hashes and cleanup manifests.
+Owned Ray processes stop before their temporary and spill directories are
+removed. Original inputs are preserved; repeated full result outputs are not
+retained.
