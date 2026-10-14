@@ -117,7 +117,6 @@ def require_idle_owners(resources):
         "usage_bytes",
         "active_input_leases",
         "active_input_ref_holds",
-        "active_output_credits",
         "waiting_output_grants",
     ):
         if transport[field] != 0:

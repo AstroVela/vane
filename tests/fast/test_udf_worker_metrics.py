@@ -557,6 +557,7 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     [
         ("_MSG_INPUT_CONSUMED", "input_lease_id"),
         ("_MSG_INPUT_CONSUME_FAILED", "input_lease_id"),
+        ("_MSG_INPUT_RETAINED", "tokens"),
         ("_MSG_OUTPUT_GRANT_REQUEST", "size_bytes"),
         ("_MSG_OUTPUT_GRANT_RELEASE", "grant_id"),
     ],
@@ -608,7 +609,7 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
     )
     _marker, refs, metadata, names = subprocess_exec.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
     payload, lease_id = subprocess_exec._make_local_ref_bundle_worker_payload_with_lease(
-        refs, None, metadata, names, submit_id=None, name="test-input", reserve_output_credit=False
+        refs, None, metadata, names, submit_id=None, name="test-input"
     )
     assert payload is not None
     # Keep the real lease alive, but send an unreadable descriptor so the worker
@@ -1121,7 +1122,7 @@ def test_chained_decode_failure_cannot_notify_or_release_unowned_inputs(monkeypa
     try:
         result = _submit_single(producer, 1)
         ref = result[1][0]
-        foreign_lease = ref_bundle.create_local_shm_input_lease(result[1], reserve_output_credit=False)
+        foreign_lease = ref_bundle.create_local_shm_input_lease(result[1])
         _corrupt_shm_result({"block_refs": [ref_bundle._local_shm_descriptor_from_ref(ref)]}, "invalid_ipc")
         monkeypatch.setattr(local, "_recv_message", invalid_failure)
         with pytest.raises(RuntimeError):
@@ -1271,6 +1272,8 @@ def test_standalone_deferred_decode_failure_precedes_cleanup_and_preserves_categ
 @pytest.mark.parametrize("failure", [pa.ArrowInvalid, pa.ArrowMemoryError, OSError])
 @pytest.mark.parametrize("cleanup_failure", [False, True])
 def test_pooled_decode_failure_precedes_worker_cleanup_and_preserves_category(monkeypatch, failure, cleanup_failure):
+    import traceback
+
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -1324,6 +1327,13 @@ def test_pooled_decode_failure_precedes_worker_cleanup_and_preserves_category(mo
                 ref.release()
     assert worker._cleanup_finished
     assert nonzero(metrics) == {field: 1}
+    # The injected decoder's traceback still holds its BufferReader argument.
+    # Keep charging that live view after worker/descriptor cleanup; only the
+    # last physical buffer release may return its transport bytes.
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before + result[1][0].size
+    traceback.clear_frames(decode_error.__traceback__)
+    if cleanup_failure:
+        traceback.clear_frames(cleanup_error.__traceback__)
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
 
 
@@ -1415,6 +1425,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
     )
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    before_owners = set(ref_bundle.local_shm_budget_manager()._owned_output_grants)
+    before_input_owners = dict(ref_bundle.local_shm_budget_manager()._owned_input_allocations)
     receive, acquire = local._recv_message, ref_bundle.acquire_allocation
     release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
     release_descriptor = local.release_local_shm_ref_bundle_descriptor
@@ -1440,8 +1452,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         injected.append(cleanup_failure)
         raise RuntimeError("injected adoption cleanup failure")
 
-    def fail_budget_callback(size, *, name=""):
-        release_budget(size, name=name)
+    def fail_budget_callback(size, *, name="", output_owner=None, input_owner_id=None):
+        release_budget(size, name=name, output_owner=output_owner, input_owner_id=input_owner_id)
         # Model a failing post-release notification, without leaking a test
         # allocation. The failed region acquisition remains the primary error.
         if descriptors and not injected:
@@ -1475,6 +1487,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     assert worker._cleanup_finished
     assert nonzero(metrics) == {field: 1}
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+    assert set(ref_bundle.local_shm_budget_manager()._owned_output_grants) == before_owners
+    assert ref_bundle.local_shm_budget_manager()._owned_input_allocations == before_input_owners
 
 
 @pytest.mark.parametrize("path", ["recv_header", "recv_payload", "send_submit", "send_grant", "send_finished"])

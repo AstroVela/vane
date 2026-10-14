@@ -331,6 +331,8 @@ def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consume
     consumer_model = h.model(lambda table: pa.table({"length": [len(table.column(0)[0].as_py())]}), DEVICES[1:])
     producer, consumer = h.executor(producer_model), h.executor(consumer_model)
     held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"blob": [b"c" * 3000]}))
+    # Exercise a real output wait despite ordinary soft-budget progress.
+    reservation = manager.reserve_task_bytes(1, 1)
     output = None
     try:
         _admit(producer)
@@ -352,6 +354,7 @@ def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consume
         assert _demand(producer_model[0]) == _demand(consumer_model[0]) == 0
         assert h.runtime.snapshot()["waiting_tasks"] == 0
     finally:
+        reservation.release()
         udf_subprocess._release_local_ref_bundle_result(output)
         udf_subprocess._release_local_ref_bundle_result(held)
     assert manager.snapshot()["usage_bytes"] == 0

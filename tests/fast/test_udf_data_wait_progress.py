@@ -88,7 +88,7 @@ class _Workload:
     def consume(self, task, output):
         assert output.to_table().equals(self.table)
         ref_bundle.track_local_shm_inputs(task, [output])
-        lease = ref_bundle.create_local_shm_input_lease([output], reserve_output_credit=False)
+        lease = ref_bundle.create_local_shm_input_lease([output])
         task.hold_input_transport(self.transport, lease)
 
     def close(self):

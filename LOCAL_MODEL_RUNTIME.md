@@ -1385,7 +1385,7 @@ request tracebacks.
 
 - A task borrows its shared-memory inputs before dispatching them to a worker.
   The borrow lasts through backend completion, including failure or cancellation
-  cleanup. A worker's input ACK can return transport-budget credit earlier; it
+  cleanup. A worker's input ACK can return independent input-transport capacity earlier; it
   does not end this data borrow. Failed input cleanup keeps the borrow charged
   and the query active until transport cleanup succeeds. Query `shutdown()`
   retries those input leases, including partially released inputs and failures
@@ -1438,6 +1438,53 @@ path. Common tests exercise that owner against both local and Ray managers.
 Strict retained-byte admission and output-completion reservations are described
 below. Data accounting alone preserves the observational behavior above.
 
+## Streaming output backpressure
+
+Ray and local subprocess UDFs share the downstream event/byte window policy in
+`vane.execution.udf_stream_backpressure`. An empty native DATA window stops
+reading further blocks. A nonempty soft byte window accepts one complete block
+that exceeds its target, then waits for new downstream capacity. Terminal,
+error, and cancellation messages do not consume DATA capacity.
+
+Each task or actor invocation has a two-block unread producer window. Ray
+enforces this with four generator objects (a data/metadata pair per block).
+The local stream adapter grants a permit before the worker advances its UDF
+output iterator, and returns it when the capacity-aware native reader takes
+that block. A slow consumer therefore pauses fanout inside the invocation.
+The window belongs to the invocation, not the reusable worker. Cancellation
+wakes a blocked producer, and the worker must complete its terminal protocol
+and cleanup before reuse.
+
+Stream permits do not release storage or task resources. Pooled allocations
+remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
+fork pin retains them. The input ACK records the consuming dependency without
+creating output credit; overlapping slices cannot multiply reserved bytes.
+Ordinary output admission allows a consumer holding live input to finish one
+complete block across the soft transport window. Each output source also has
+a bounded allowance to produce the next block, so an actor that releases its
+previous input only after receiving the next batch can advance. This includes
+sources with no live output of their own: in a longer pipeline, the retained
+block may belong to an intermediate operator.
+This additional allowance stops at two owned output grants across invocations;
+pending grants and converted grants count until their last physical lease is
+released. Descriptor release or an input ACK cannot reopen this allowance while
+a worker view or fork pin still holds the storage. Each source may allocate
+one next-call input while it has room in this output window; another input
+must wait for that input's byte charge to be released. This lets the next call
+reach output admission without opening an unbounded input queue. Explicit per-task byte
+envelopes keep their hard boundary. The physical arena always enforces its own
+capacity, including allocation rounding and fragmentation; it does not spill.
+If none of the waiting writers can fit an output even after every unrelated
+allocation is released, the arena reports a capacity error instead of waiting
+indefinitely on their pinned inputs. The pinned working set includes inputs
+reported as retained after a worker finishes its call and clears temporary
+references. These inputs may need another call before the actor can release
+them, so they cannot be assumed reclaimable while waiting for that next output.
+
+These bounds cover transport output, not arbitrary intermediate heap objects
+allocated inside user code before it returns or yields a table. A UDF that
+materializes its entire result before yielding still owns that heap allocation.
+
 ## Reusable local output storage
 
 Local subprocess workers write output into a bounded shared-memory arena owned
@@ -1449,8 +1496,10 @@ Large allocations use size classes with at most 6.25% rounding overhead, so
 small IPC metadata changes between batches do not strand a nearly usable slot.
 Physical capacity includes this rounding.
 
-Storage ownership is independent of transport admission. Input acknowledgments
-may return transport credit, but do not release physical buffers. Before sending
+Stream-window permits are independent of storage ownership. Input acknowledgments
+do not release pooled output bytes or reserve replacement output credit. Pooled
+output bytes remain charged to the transport budget until the allocation's last
+physical lease, including worker views and fork pins, is released. Before sending
 an input, the parent registers a read lease for the receiving worker. Arrow and
 NumPy views retain this lease through the underlying buffer owner, including
 views saved in actor state after a task returns. Last-buffer notifications use a
@@ -1480,12 +1529,18 @@ the arena's virtual size is not its resident memory. Each worker maps the entire
 arena on first use and retains that mapping across tasks. Processes using
 `RLIMIT_AS` must leave room for this mapping in addition to their heap and IPC
 buffers; set `VANE_LOCAL_SHM_STORE_BYTES` explicitly when testing within a fixed
-address-space allowance. This limit is separate from
+address-space allowance. The automatic transport budget uses half of the configured
+or automatically sized arena, including on small `/dev/shm` mounts, leaving space
+for a consuming stage's output. The arena limit is separate from
 `VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
-outputs, not model heap or the existing input/control allocations. When live
-buffers or fragmentation prevent an allocation, the task receives an explicit
-capacity error instead of waiting while holding input buffers. Release retained
-views or increase the store capacity before retrying.
+outputs, not model heap or the existing input/control allocations. Ordinary
+outputs wait for physical releases when live buffers or fragmentation temporarily
+prevent an allocation, releasing their byte grant and worker CPU while waiting.
+Cancellation wakes this wait. If the current input plus output cannot fit, or
+all live regions are inputs of writers waiting for output space, admission reports
+a capacity error instead of waiting cyclically. Explicit byte envelopes retain
+their strict capacity error. Reduce input/output block sizes, release retained
+views, or increase the store capacity when the working set cannot fit.
 
 On Linux, closing the last worker decommits wholly free pages. Returned Arrow
 views remain valid after runtime shutdown; the arena closes after the last view
@@ -1582,9 +1637,9 @@ can occur after user code has run, so it never authorizes replay of that UDF.
 Choose smaller batches or larger explicit bounds for oversized work.
 
 An admitted task draws input allocations and output grants from its protected
-transport reservation, without a second byte wait. Legacy transport users see
+transport reservation, without a second byte wait. Other transport users see
 that reservation in the same shared-memory budget. Input ACKs do not create
-another output credit for these tasks. Cancellation, failed submission/startup,
+output reservations. Cancellation, failed submission/startup,
 worker exit, and unused grants return their unused envelopes exactly once.
 The task reservation keeps track of consumed output grants until they become
 result allocations or are released. At backend completion it also retries any

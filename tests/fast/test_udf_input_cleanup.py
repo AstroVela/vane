@@ -244,7 +244,6 @@ def test_query_retry_during_input_ack_retains_owner(monkeypatch, fails):
                     query.shutdown()
                 assert query.cleanup_pending()
                 assert manager.input_lease_pending(lease_id)
-                assert manager.snapshot()["output_credit_bytes"] == 0
             finally:
                 proceed.set()
             if fails:
@@ -255,7 +254,6 @@ def test_query_retry_during_input_ack_retains_owner(monkeypatch, fails):
     query.shutdown()
     assert not query.cleanup_pending()
     assert not manager.input_lease_pending(lease_id)
-    assert manager.snapshot()["output_credit_bytes"] == 0
 
 
 def test_failed_cleanup_retry_preserves_another_querys_shared_input():
