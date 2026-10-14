@@ -176,6 +176,133 @@ def test_expanding_pipeline_releases_real_storage_under_small_budget(backend):
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("release", ["fork", "notification"])
+def test_output_capacity_waits_for_independent_historical_input_release(tmp_path, release):
+    if release == "fork" and not hasattr(os, "fork"):
+        pytest.skip("requires fork")
+    gate = tmp_path / "release-input"
+    script = textwrap.dedent(f"""
+        import gc
+        import os
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+        import pyarrow as pa
+        import vane
+        from vane.execution import udf_shm_store as storage
+        from vane.execution.ref_bundle import local_shm_ref_budget_snapshot
+
+        gate = Path({str(gate)!r})
+        release = {release!r}
+        observed = threading.Event()
+        waiting_store = []
+        wait_for_capacity = storage.LocalShmStore.wait_for_capacity
+
+        def observe_wait(store, *args):
+            waiting_store.append(store)
+            observed.set()
+            return wait_for_capacity(store, *args)
+
+        storage.LocalShmStore.wait_for_capacity = observe_wait
+
+        def await_release():
+            deadline = time.monotonic() + 20
+            while not gate.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('historical input release was not allowed')
+                time.sleep(0.01)
+
+        if release == 'notification':
+            release_read = storage.ParentShmPeer.release_read
+            def delayed_release(peer, token):
+                lease = peer._reads.get(token)
+                if lease is not None and lease.allocation.size > 65536:
+                    await_release()
+                release_read(peer, token)
+            storage.ParentShmPeer.release_read = delayed_release
+
+        def expand(batch):
+            yield pa.table({{'payload': [b'x' * 65536]}})
+            yield pa.table({{'payload': [b'second']}})
+
+        class Consume:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, batch):
+                self.calls += 1
+                if self.calls == 1:
+                    if release == 'fork':
+                        pid = os.fork()
+                        if pid == 0:
+                            try:
+                                await_release()
+                            finally:
+                                os._exit(0)
+                        threading.Thread(target=os.waitpid, args=(pid, 0), daemon=True).start()
+                    return pa.table({{'payload': [b'small']}})
+                return pa.table({{'payload': [b'y' * 65536]}})
+
+        def allow_release_after_wait():
+            try:
+                assert observed.wait(15), 'query never reached physical capacity pressure'
+                store = waiting_store[0]
+                # The capacity check holds this lock until it actually waits or
+                # fails. Only a real wait can expose a registered waiting writer.
+                with store._capacity_condition:
+                    assert store._capacity_condition.wait_for(lambda: bool(store._waiting_writes), timeout=5)
+            finally:
+                gate.touch()
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                released = threads.submit(allow_release_after_wait)
+                try:
+                    with vane.connect(config={{'threads': 4}}) as con:
+                        watchdog = threading.Timer(20, con.interrupt)
+                        watchdog.daemon = True
+                        watchdog.start()
+                        try:
+                            relation = con.sql('select 1::BIGINT as id').map_batches(
+                                expand, schema={{'payload': 'BLOB'}}, execution_backend='subprocess_task',
+                                batch_size=1, min_task_batch_size=1, task_input_max_bytes=8,
+                                output_batch_size=1, output_target_max_bytes=1024,
+                            ).map_batches(
+                                Consume, schema={{'payload': 'BLOB'}}, execution_backend='subprocess_actor',
+                                actor_number=1, batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
+                                output_batch_size=1, output_target_max_bytes=1024,
+                            )
+                            result = relation.to_arrow_table()
+                            assert result['payload'].to_pylist() == [b'small', b'y' * 65536]
+                            del result
+                        finally:
+                            watchdog.cancel()
+                    released.result(timeout=10)
+                finally:
+                    gate.touch()
+        finally:
+            vane.teardown_runner()
+            gc.collect()
+            assert storage.local_shm_store_snapshot()['live_bytes'] == 0
+            assert local_shm_ref_budget_snapshot()['usage_bytes'] == 0
+    """)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_LOCAL_SHM_STORE_BYTES": "128KiB",
+            "VANE_LOCAL_SHM_REF_BUDGET_BYTES": "auto",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     "source_kind,source_backend,arena,copy_input,intermediate,actors",
     [

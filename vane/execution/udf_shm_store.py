@@ -887,10 +887,17 @@ class ParentShmPeer:
             raise
         return tokens
 
-    def input_allocations(self) -> tuple[ShmAllocation, ...]:
-        """All reads this worker can release, including views from earlier calls."""
+    def input_allocations(self, tokens: set[int]) -> tuple[ShmAllocation, ...]:
+        """Resolve the worker's local views, excluding independently releasable leases."""
         with self._lock:
-            return tuple(lease.allocation for lease in self._reads.values() if not lease._released)
+            # Physical reads also include fork-only holds and release messages
+            # still in flight. Only the worker knows which views block its call.
+            # A reported token may already have arrived on the release channel.
+            return tuple(
+                lease.allocation
+                for token in tokens
+                if (lease := self._reads.get(token)) is not None and not lease._released
+            )
 
     def retain_inputs(self, tokens: set[int]) -> None:
         """Record post-call views, without taking additional physical leases."""

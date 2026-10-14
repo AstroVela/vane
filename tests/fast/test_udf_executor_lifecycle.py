@@ -4649,6 +4649,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
                 "size_bytes": 128,
                 "priority": "consumer",
                 "input_lease_id": 123,
+                "input_tokens": [],
             }
         )
         assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
@@ -9167,7 +9168,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pool
     executor._sock = _FakeControlSocket()
     executor._proc = None
 
-    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer", "input_tokens": []})
     assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] >= before + 4096
 
@@ -9433,7 +9434,7 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
     assert executor._cleanup_finished
 
 
-def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch):
+def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9530,7 +9531,9 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
 
 
 @pytest.mark.parametrize("call_mode", ["map", "map_batches_rows"])
-def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(monkeypatch, call_mode):
+def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(
+    monkeypatch, call_mode, pooled_shm_worker
+):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9588,7 +9591,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
     assert [table.column("keep").to_pylist() for table in captured] == [["a", "b"], ["c"]]
 
 
-def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
+def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 

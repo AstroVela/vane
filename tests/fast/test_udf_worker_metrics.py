@@ -516,7 +516,7 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     )
     release_grant = subprocess_exec.release_local_shm_output_grant
     before = subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"]
-    event = vane_pickle.dumps({"request_id": 1, "size_bytes": 296})
+    event = vane_pickle.dumps({"request_id": 1, "size_bytes": 296, "input_tokens": []})
 
     def fail_response(*_args):
         assert worker._proc.poll() is None
@@ -549,6 +549,19 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     assert worker._cleanup_finished
     assert subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
     assert nonzero(metrics) == {field: 1}
+
+
+@pytest.mark.parametrize("tokens", [None, {}, [0], [-1], [True], ["1"]])
+def test_output_grant_rejects_malformed_input_view_snapshot(monkeypatch, tokens):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    worker = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    failures = []
+    monkeypatch.setattr(worker, "_record_worker_protocol_failure", failures.append)
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 296, "input_tokens": tokens})
+    with pytest.raises(ValueError, match="invalid output grant shared-memory input tokens") as error:
+        worker._decode_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
+    assert failures == [error.value]
 
 
 @pytest.mark.parametrize(

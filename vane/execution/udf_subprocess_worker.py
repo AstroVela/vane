@@ -38,7 +38,7 @@ from vane.execution.udf_row_preserving import (
     fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
-from vane.execution.udf_shm_store import initialize_worker_shm_client
+from vane.execution.udf_shm_store import initialize_worker_shm_client, worker_shm_client
 from vane.execution.udf_threading import configure_loaded_torch_threads
 
 _MSG_READY = 0x01
@@ -428,6 +428,7 @@ def _request_output_grant(
         "worker_pid": os.getpid(),
         "size_bytes": int(size),
         "priority": "consumer",
+        "input_tokens": worker_shm_client().retained_inputs(),
     }
     if input_lease_id is not None:
         payload["input_lease_id"] = int(input_lease_id)

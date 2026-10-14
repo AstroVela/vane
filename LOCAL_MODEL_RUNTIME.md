@@ -2169,9 +2169,12 @@ charge remain live until the last view or fork owner releases them. Consequently
 multiple actors can receive replacement inputs without requiring their old
 views to disappear first. Explicit task byte envelopes remain strict.
 
-Physical-capacity waits include all current worker reads (including views from
-earlier calls), idle retained views, and queued
-outputs of the input streams used by waiting consumers. Queued input is not
+Each output request reports the worker's live input views, including views from
+earlier calls. Physical-capacity waits use this snapshot, idle retained views,
+and queued outputs of the input streams used by waiting consumers. Physical
+leases held only by fork descendants or pending release notifications can be
+released independently and are excluded from the worker's blocking views.
+Queued input is not
 assumed reclaimable merely because it belongs to another allocation: its next
 invocation may require the very actor slot occupied by the waiting writer.
 A current read owner in another worker, or an unrelated stream, still permits

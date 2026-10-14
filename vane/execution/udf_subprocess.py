@@ -1037,11 +1037,17 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 return decoded
             if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
                 input_lease_id_raw = event.get("input_lease_id")
+                input_tokens = event["input_tokens"]
+                if not isinstance(input_tokens, list) or any(
+                    type(token) is not int or token <= 0 for token in input_tokens
+                ):
+                    raise ValueError("invalid output grant shared-memory input tokens")
                 return {
                     "request_id": int(event.get("request_id", 0)),
                     "size_bytes": int(event["size_bytes"]),
                     "priority": str(event.get("priority") or "consumer"),
                     "input_lease_id": int(input_lease_id_raw) if input_lease_id_raw is not None else None,
+                    "input_tokens": set(input_tokens),
                 }
             return {"grant_id": int(event["grant_id"])}
         except Exception as exc:
@@ -1190,8 +1196,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         grant_id = 0
                         self._shm_peer.store.wait_for_capacity(
                             size,
-                            local_shm_budget_manager().consuming_inputs(input_lease_id)
-                            + self._shm_peer.input_allocations(),
+                            self._shm_peer.input_allocations(event["input_tokens"]),
                             scope,
                             lambda: self._capacity_wait_context("shared_memory_output"),
                         )

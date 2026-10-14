@@ -200,7 +200,8 @@ def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_
     assert store.snapshot()["live_allocations"] == 0
 
 
-def test_waiting_worker_pins_views_from_earlier_calls(store, monkeypatch):
+@pytest.mark.parametrize("previous_view", ["retained", "pending_release", "released"])
+def test_waiting_worker_pins_only_reported_views_from_earlier_calls(store, monkeypatch, previous_view):
     from vane.execution import udf_shm_store as storage
 
     def current_store(client_id):
@@ -214,21 +215,35 @@ def test_waiting_worker_pins_views_from_earlier_calls(store, monkeypatch):
         old_token = peer.borrow_inputs({"block_refs": [{"allocation": previous.allocation.descriptor()}]})[0]
         peer.retain_inputs({old_token})
         peer.retain_inputs(set())  # The next call starts but still holds the old view.
-        peer.borrow_inputs({"block_refs": [{"allocation": current.allocation.descriptor()}]})
+        current_token = peer.borrow_inputs({"block_refs": [{"allocation": current.allocation.descriptor()}]})[0]
         previous.release()
         current.release()
-        with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
-            store.wait_for_capacity(
-                2048,
-                peer.input_allocations(),
-                ExecutionCancellationScope("history", 2),
-                nullcontext,
-            )
+        tokens = {current_token}
+        if previous_view != "pending_release":
+            tokens.add(old_token)
+        if previous_view == "released":
+            # The release channel may overtake the control message's snapshot.
+            peer.release_read(old_token)
+        scope = ExecutionCancellationScope("history", 2)
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(store.wait_for_capacity, 2048, peer.input_allocations(tokens), scope, nullcontext)
+            try:
+                if previous_view == "retained":
+                    with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
+                        pending.result(timeout=5)
+                else:
+                    if previous_view == "pending_release":
+                        with pytest.raises(FutureTimeoutError):
+                            pending.result(timeout=0.05)
+                        peer.release_read(old_token)
+                    pending.result(timeout=5)
+            finally:
+                scope.cancel()
     finally:
         previous.release()
         current.release()
         peer.close_after_exit()
-    assert peer.input_allocations() == ()
+    assert peer.input_allocations({old_token, current_token}) == ()
 
 
 def test_fallible_budget_notification_does_not_repeat_physical_release(store):
