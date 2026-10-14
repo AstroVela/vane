@@ -890,9 +890,13 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 编译器先遍历完整 SQL，包括表达式中的子查询、表子查询及 CTE 定义，再进入绑定。确定性内置 scalar function 按 catalog 来源和稳定性检查，不再维护函数名白名单。用户宏、UDF、带副作用及仅查询内稳定的函数继续拒绝；Binder 生成的标量子查询多行检查保留原生异常。所有文件引用在任何快照复制前完成展开，优化前的数据源依赖仍参与 worker 快照校验。
 
-普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter 及 MARK/SINGLE 连接包含共享工作表或全局 NULL/基数语义，作为一个单分区原生子树序列化。子树内可独立执行的输入继续递归规划，经显式 GATHER 输入端口送入；文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter 及 MARK/SINGLE 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
 
-这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。没有切换回 local 或旧 FTE manager 的路径。第一版以完整组语义为先，相关子查询、CTE 消费及 MARK/SINGLE 的执行单元只有一个分区，可能成为性能瓶颈。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。
+关联 delimiter 的分区由独立的 locality 分析决定，分析先于计划修改。只选择原生整数关联键；owner 输入按该键 HASH，同一关联键的外层行、去重缓存和内部完整聚合组属于同一分区。分析沿 projection、filter、hash join 与分组键追踪关联键，只认可直接引用和优化器证明无损的整数压缩/解压。等值条件能证明独立输入具有同类型关联键时，该输入也 HASH；其他完整独立输入可以 BROADCAST。外连接不能保留广播侧的未匹配行，分组的每个 grouping set 必须包含关联键，省略的分组列不能继续传播键身份。多个候选键按可避免广播的估计行数选择，例如 Q21 使用订单键而非供应商不等式。
+
+每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
+
+这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。
 
 P4 使用 `vane.analytical-types:4`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 

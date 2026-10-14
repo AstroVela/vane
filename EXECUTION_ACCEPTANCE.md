@@ -217,6 +217,164 @@ Arrow results, dependency/resource metadata, timings and ownership snapshots.
 The increment's installed native SHA-256 is
 `037b0a352a805ac5a84f21e7ced41b5d40ee51e80b4a945490b9210595421e47`.
 
+## TPCH SF10 correlated partitions
+
+On 2026-10-13, Q17 and Q21 were measured before and after partitioning native
+delimiter scopes by a proven integer correlation key. The baseline installed
+native came from `1f5e7731a2`; the increment was built on `0c5b165b08` plus the
+correlated-partition change. The intervening review fixes are included, so this
+is a stack comparison rather than an isolated single-patch experiment.
+
+Local used 36 threads. Ray used two workers with 18 CPU slots each, two
+partitions and all advertised memory after required reservations. Baseline
+pipelined / FTE operator memory per worker was 27,323,357,184 / 26,905,368,576
+bytes; the increment used 25,289,068,544 / 25,097,426,944 bytes. The object store
+was 1 GiB, with 128 MiB exchange and 256 MiB staging budgets per worker.
+FTE kept the 160 GiB store/query accounting ceiling, 4 GiB source allowance
+and 2 GiB object ceiling. Each mode reused its runtime for alternating Q17/Q21
+runs. Timings include submission, full collection and successful close;
+comparison is excluded. The host was shared and OS caches were retained.
+
+| Query | Local after (s) | Pipelined median before → after (s) | FTE median before → after (s) |
+| --- | ---: | ---: | ---: |
+| Q17 | 0.421 | 39.577 → 31.076 | 60.807 → 51.079 |
+| Q21 | 1.203 | 50.277 → 31.789 | 59.348 → 47.785 |
+
+Each Ray median has three successful samples except baseline pipelined Q17,
+which has two; an earlier run missing the comparison schema was excluded.
+Local has one sample. All twelve increment Ray runs matched the full local
+values and schemas, with the documented HUGEINT profile and floating tolerance.
+Worker reservations, query/store ownership and result contexts retired after
+every query, and both Runtime snapshots were clean after close. Source sizes
+and nanosecond modification times remained unchanged. FTE submission still
+spends roughly 10–13 seconds creating query-owned snapshots; snapshot reuse is
+not part of this increment.
+
+Q17 now has six fragments, with its delimiter scope running in two partitions
+and a final gather aggregate. Q21 has twelve fragments, with both delimiter
+scopes partitioned by order key. Its 59,986,052-row inner lineitem exchange
+changed from one target to 29,992,594 and 29,993,458 rows across two targets.
+One-second diagnostic samples observed both Q17 delimiter tasks running.
+Other sampled exchange counters are lower bounds when cleanup preceded the
+last sample; they are not exact total traffic measurements.
+
+Two clean manual static reviews preceded one non-editable incremental Release
+build. Related tests passed 933 non-Ray and 60 real-Ray cases, with 18 optional
+`fsspec` skips. Test-only corrections addressed reserved aliases, unsupported
+macros and connection/optimizer setup; production code stayed unchanged after
+the build. The complete fast/release suites were not run.
+
+Artifacts are in `build/tpch-correlated-baseline-20261013/`,
+`build/tpch-correlated-after-20261013/` and
+`build/correlated-partition-20261013/`. They retain SQL, full Arrow results,
+graphs, timing samples, resource settings and lifecycle evidence. The increment
+native SHA-256 is
+`b34a0f6831a52cbcd1c6133d6223aa6a2690e7c771ea03b1ce47a10594c4d179`.
+
+After adding the separately reviewed IE_JOIN serialization and parallel outer
+payload fixes from #999, the combined stack passed 965 related non-Ray and
+64 real-Ray tests, with 18 optional `fsspec` skips. The Ray rerun explicitly
+disabled GPU discovery because host NVML failed before fixture startup; these
+SQL tests require only CPU resources. Its native SHA-256 is
+`12e32106ef84ecee5736f62369e404f815b1a9b6fac61209bef720958a7a5304`.
+This later regression build does not replace the benchmark identity above.
+
+## Broadcast runtime filters and pipeline stability
+
+The increment based on `304b9e110287` repairs two failures in the integration
+stack. Partial-output flushing now uses the sink's virtual interface: an
+operator tagged `RESULT_COLLECTOR` need not inherit `PhysicalResultCollector`.
+Flight receivers mark an intentional close before sending the control RPC,
+then cancel their data stream after the reply. Expected data cancellation
+during that interval does not abort the query; a failed close RPC still does.
+The new controlled-close regression fails against the preceding implementation.
+
+Broadcast joins retain runtime filters only for probe scans still inside their
+fragment. An exchange clears the eligible scan set. Serialized operators share
+filter IDs, while every fragment load creates fresh filter objects. The codec
+also preserves storage types and the build-side filtering flag. Hash-partitioned
+joins and filters targeting another fragment remain excluded.
+
+Regression coverage checks Parquet scan output with filtering enabled and
+disabled, INTEGER/BIGINT keys, one/two/five partitions, independent probe scans
+and repeated execution. It bounds surviving row groups rather than timing or
+post-join result rows. The affected suites passed 689 Python tests, three real
+Ray tests (LIMIT close and pipelined/FTE broadcast joins), and 358 native tests.
+The native run includes both collector cases that failed in CI, plan
+serialization and distributed execution.
+
+The base release gate ran 4,892 non-Ray cases: 4,846 passed, 45 skipped and one
+existing lifecycle test failed because it called the deprecated
+`fetch_record_batch()` under warnings-as-errors. The test now calls the
+equivalent `to_arrow_reader(batch_size=2)` and retains its resource assertions;
+both delivery variants passed in isolation. Resuming the original launcher
+with `PYTEST_ADDOPTS=--lf` passed that case, all 207 shared-cluster Ray cases and
+both cluster-owner cases. Formatting, Ruff and the copyleft inventory passed.
+This validation used Linux and Python 3.12.
+
+A focused comparison on 2026-10-13 used one shared Parquet input with 8,388,608
+rows, 8,192-row groups and columns `k = range::INTEGER`,
+`payload = range % 1000`. The query joined `k` with
+`SELECT range * 300001 AS k FROM range(3)` and returned `sum(payload) = 3`.
+Both configurations used the same installed
+binary, one native thread, four partitions and bounded in-process channels
+(64 KiB windows, 16 KiB frames, 512 rows, four slots). The control disabled
+`join_filter_pushdown`; the other configuration enabled it. Native profiles
+counted rows leaving the Parquet scans separately from the timed runs.
+
+After one warmup per configuration, seven samples alternated execution order.
+The measured total includes task preparation, full result collection and close;
+SQL compilation, input generation, profiling and cleanup are excluded.
+The host was shared and OS caches were retained. No build or test from this
+validation was running during the comparison.
+
+| Metric | Filters disabled | Filters enabled |
+| --- | ---: | ---: |
+| Parquet scan output rows | 8,388,608 | 18,371 |
+| Median native task execution (ms) | 158.9 | 32.6 |
+| Median task preparation (ms) | 5.0 | 5.0 |
+| Median prepare/execute/close total (ms) | 163.9 | 37.7 |
+| Intermediate channel accepted rows | 7 | 7 |
+
+The total median improves by 4.34x in this in-process synthetic workload. The
+native IN filter prunes row groups, so surviving scan rows need not equal the
+three matching join keys. This measurement covers local scan/probe work;
+cross-fragment filtering, FTE snapshot reuse and a new SF10 timing sweep remain
+separate increments.
+
+`build/review-validation/` retains the benchmark script, implementation patch,
+source identity, configurations, profiles, all samples, result hashes and test
+logs. `filter-benchmark.json` contains the measurements and
+`cleanup-manifest.json` records removed generated inputs, including the initial
+attempt that failed the database-setting compatibility check before timing.
+The 42,238,471-byte benchmark input was removed after validation.
+
+## Materialized input short-circuit completion
+
+The Python 3.11 CI run for correlated partitions failed with
+`materialized reader lost its consumers` in the Parquet FTE case. Native task
+cleanup closes its inputs when execution finishes, including when an empty
+join build makes further probe input unnecessary. A materialized reader could
+still be waiting for channel credit and incorrectly abort the successful task
+when every consumer closed.
+
+The reader now treats that loss of demand as completion and publishes FINISH
+at its last accepted sequence. It still verifies the complete object's checksum
+before delivery and retains explicit cancellation and prior channel errors.
+Borrowed batches keep their leases until their final release.
+
+Two controlled regressions reproduced the CI error before the fix: closing
+before the first frame, and closing while the reader is blocked behind a
+borrowed frame. After an incremental non-editable Release build, both passed,
+as did closed-consumer checksum/abort controls. The affected Python suites
+passed 741 cases; ten public Ray cases covered correlated queries, shared CTEs,
+broadcast joins and scalar-cardinality failures. The existing native engine
+suites passed 358 cases / 259,600 assertions. Validation used Linux and
+Python 3.12; the original failure occurred on Python 3.11.
+
+Reproduction, build and validation logs are retained in
+`build/pr-stack-acceptance-20261014/`.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:

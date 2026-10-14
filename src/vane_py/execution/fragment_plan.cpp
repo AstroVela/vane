@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "fragment_plan.hpp"
+#include "correlated_partition.hpp"
 #include "file_snapshot.hpp"
 #include "exchange_types.hpp"
 #include "parquet_split.hpp"
@@ -856,7 +857,9 @@ private:
 
 	DistributedSubtree Scoped(PhysicalOperator &root) {
 		DistributedSubtree result;
-		result.fragment.partition_count = 1;
+		CorrelatedPartition partitioning;
+		const bool partitioned = partitions > 1 && PlanCorrelatedPartition(root, partitioning);
+		result.fragment.partition_count = partitioned ? partitions : 1;
 		auto &node = result.fragment.root;
 		node.types = root.types;
 		node.scoped = true;
@@ -870,9 +873,21 @@ private:
 			// Keep delimiter caches and CTE consumers with their owner. Every
 			// independent input still goes through the distributed planner and
 			// explicit source assignments; no hidden scan is serialized here.
-			if (&op != &root && !HasScopedState(op) &&
-			    (op.type == PhysicalOperatorType::TABLE_SCAN || !op.children.empty())) {
-				auto input = Exchange(Build(op), "gather", 1);
+			auto partition_input = partitioning.inputs.find(&op);
+			const bool external_input =
+			    partitioned
+			        ? partition_input != partitioning.inputs.end()
+			        : !HasScopedState(op) && (op.type == PhysicalOperatorType::TABLE_SCAN || !op.children.empty());
+			if (&op != &root && external_input) {
+				vector<idx_t> keys;
+				string distribution = "gather";
+				if (partitioned) {
+					distribution = partition_input->second.IsValid() ? "hash" : "broadcast";
+					if (partition_input->second.IsValid()) {
+						keys.push_back(partition_input->second.GetIndex());
+					}
+				}
+				auto input = Exchange(Build(op), distribution, result.fragment.partition_count, keys);
 				bindings.names.emplace(&op, input.fragment.root.input_port);
 				node.children.push_back(std::move(input.fragment.root));
 				for (auto &edge : input.incoming) {

@@ -2,6 +2,22 @@
 
 本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
 
+## 已完成增量：关联子查询分区
+
+针对 Q17 的相关聚合和 Q21 的 EXISTS/NOT EXISTS，证明关联键局部性后让多个任务分别持有完整 delimiter 状态。
+
+- [x] 独立 locality 分析，整数关联键、完整分组、等值输入 HASH、其他独立输入 BROADCAST。
+- [x] 保留嵌套 delimiter/CTE 所有权，无法证明局部性的原生状态仍使用单分区。
+- [x] 补齐重复键、NULL、空输入、左右 delimiter、压缩键及两种 Ray 模式的回归用例。
+- [x] 连续两轮静态审查后统一构建，只运行相关测试。
+- [x] 同样的 36 CPU/可用内存策略复测 SF10 Q17/Q21，核对完整结果、交换量、耗时及资源清理。
+
+2026-10-13：相关非 Ray 933 项、真实 Ray 60 项通过，18 项因缺少可选依赖 fsspec 跳过。构建后仅修正测试别名、函数及优化器配置；native 未再修改。未运行全量 fast/release。
+
+SF10 的 Q17/Q21 在两种 Ray 模式各完成三次并核对完整结果，查询及 Runtime 资源清理通过。pipelined 中位数为 31.076 s / 31.789 s，FTE 为 51.079 s / 47.785 s。Q21 的大表关联输入已按订单键分配到两个分区。基线、样本数量、内存预算及测量限制见[关联子查询验收](EXECUTION_ACCEPTANCE.md#tpch-sf10-correlated-partitions)。
+
+随后叠加 #999 的 IE_JOIN 序列化及多线程外连接 NULL 存储修复，各批次均先完成两轮静态审查，再增量构建。最终相关非 Ray 965 项、真实 Ray 64 项通过，18 项可选依赖跳过。Ray 复测因机器 NVML 异常显式使用 CPU-only 集群；未修改 GPU 驱动或运行全量套件。
+
 ## 已完成增量：广播 join 与校验吞吐
 
 基于 TPC-H SQL 覆盖，先减少已有计划中的不必要交换与校验 CPU 开销：

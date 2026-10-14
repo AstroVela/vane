@@ -178,6 +178,116 @@ DETERMINISTIC_TIMEZONES = [
 ]
 
 
+def correlation_source(count=31):
+    # Repeated and NULL keys exercise ownership separately from row splitting.
+    return f"(select case when range % 11=0 then null else range % 7 end k, range % 5 s, range v from range({count}))"
+
+
+def correlated_partition_cases(source, inner=None):
+    inner = inner or source
+    return [
+        f"select a.v, a.k, (select avg(b.v) from {inner} b where b.k=a.k) av from {source} a",
+        f"select a.v, a.k, (select count(*) from {inner} b where b.k=a.k) n from {source} a",
+        f"select a.v, a.k, (select sum(b.v) from {inner} b where b.k is not distinct from a.k) n from {source} a",
+        f"select a.v, (select count(distinct b.s) from {inner} b where b.k=a.k) n from {source} a",
+        f"select a.v, (select sum(b.v) filter(where b.s>2) from {inner} b where b.k=a.k) n from {source} a",
+        f"select a.v, (select sum(b.v order by b.v) from {inner} b where b.k=a.k) n from {source} a",
+        # The expression joins complete inputs, but is not an injective
+        # correlation key. The inner input must remain complete on each task.
+        f"select a.v, (select sum(b.v) from {inner} b where b.k=a.k+a.s) n from {source} a",
+        f"select a.k,a.s,a.v from {source} a where exists (select 1 from {inner} b where b.k=a.k and b.s<>a.s)",
+        f"select a.k,a.s,a.v from {source} a where not exists (select 1 from {inner} b where b.k=a.k and b.s<>a.s)",
+        # Q21: the key equality permits partitioning, the supplier inequality
+        # must not be used as a hash key. The two delimiter owners are separate.
+        f"select a.k,a.s,a.v from {source} a where exists "
+        f"(select 1 from {inner} b where b.k=a.k and b.s<>a.s) and not exists "
+        f"(select 1 from {inner} c where c.k=a.k and c.s<>a.s and c.v%3=0)",
+    ]
+
+
+@pytest.mark.parametrize("partitions", [2, 5])
+@pytest.mark.parametrize("optimizers", ["", "build_side_probe_side", "compressed_materialization"])
+@pytest.mark.parametrize("outer_count,inner_count", [(31, 31), (31, 0), (0, 31)])
+def test_correlated_partition_semantics(partitions, optimizers, outer_count, inner_count):
+    with vane.connect(config={"threads": 1}) as connection:
+        connection.execute("set disabled_optimizers=?", [optimizers])
+        for sql in correlated_partition_cases(correlation_source(outer_count), correlation_source(inner_count)):
+            expected = connection.execute(sql).fetchall()
+            graph = compile_sql(connection, sql, partitions=partitions)
+            assert Counter(execute_graph(connection, graph)) == Counter(expected), sql
+
+
+@pytest.mark.parametrize("left_delimiter", [False, True])
+def test_correlated_equality_scopes_partition_without_broadcast(tmp_path, left_delimiter):
+    from vane.execution.plan import Distribution
+
+    with vane.connect(config={"threads": 1}) as connection:
+        # Retain both delimiter owners so this tests their routing, independent
+        # of whether the optimizer can eliminate a subquery on small tables.
+        disabled = "deliminator,build_side_probe_side" if left_delimiter else "deliminator"
+        connection.execute("set disabled_optimizers=?", [disabled])
+        source = correlated_parquet_source(connection, tmp_path)
+        for sql, scopes in [
+            (correlated_partition_cases(source)[0], 1),
+            (correlated_partition_cases(source)[-1], 2),
+        ]:
+            plan = connection.execute("explain (format json) " + sql).fetchone()[1]
+            assert plan.count("DELIM_JOIN") == scopes
+            graph = compile_sql(connection, sql, partitions=3)
+            # Each scope has two complete inputs and owns its own native state.
+            consumers = [f for f in graph.fragments if len(f.inputs) == 2]
+            assert len(consumers) == scopes
+            assert all(f.partition_count == 3 for f in consumers)
+            assert all(
+                edge.distribution is Distribution.HASH
+                for edge in graph.exchanges
+                if edge.consumer_fragment_id != graph.result.fragment_id
+            )
+            assert Counter(execute_graph(connection, graph)) == Counter(connection.execute(sql).fetchall())
+
+
+@pytest.mark.parametrize("partitions", [2, 5])
+def test_correlated_scopes_preserve_foreign_references_and_global_state(partitions):
+    source = correlation_source()
+    cases = [
+        # The inner delimiter refers to both enclosing levels. Moving it into
+        # a separate fragment would leave the outer cached scan without an owner.
+        f"select a.v from {source} a where exists (select 1 from {source} b where b.k=a.k "
+        f"and exists (select 1 from {source} c where c.k=b.k and c.s<>a.s))",
+        f"with x as materialized (select * from {source}) select a.v, "
+        "(select count(*) from x b where b.k=a.k) n from x a",
+        f"select a.v, a.s in (select b.s from {source} b where b.k=a.k) matches from {source} a",
+        f"select a.v, a.s not in (select case when b.s=1 then null else b.s end from {source} b where b.k=a.k) "
+        f"misses from {source} a",
+        f"select a.v,(select count(*) from {source} b where b.k<a.k) n from {source} a",
+        f"select a.v,(select count(*) from {source} b where b.k::varchar=a.k::varchar collate nocase) n "
+        f"from {source} a",
+    ]
+    with vane.connect(config={"threads": 1}) as connection:
+        for sql in cases:
+            expected = connection.execute(sql).fetchall()
+            assert Counter(execute_graph(connection, compile_sql(connection, sql, partitions))) == Counter(expected)
+
+
+def correlated_parquet_source(connection, tmp_path):
+    path = tmp_path / "correlations.parquet"
+    connection.execute(f"copy (select * from {correlation_source(103)}) to '{path}' (format parquet)")
+    return f"read_parquet('{path}')"
+
+
+def test_parquet_correlation_survives_native_key_compression(tmp_path):
+    with vane.connect(config={"threads": 1}) as connection:
+        connection.execute("set disabled_optimizers='deliminator'")
+        source = correlated_parquet_source(connection, tmp_path)
+        cases = correlated_partition_cases(source)
+        for index, sql in enumerate(cases):
+            expected = connection.execute(sql).fetchall()
+            graph = compile_sql(connection, sql, partitions=3)
+            if index in (0, len(cases) - 1):
+                assert any(f.partition_count == 3 and len(f.inputs) == 2 for f in graph.fragments)
+            assert Counter(execute_graph(connection, graph)) == Counter(expected)
+
+
 @pytest.mark.parametrize("partitions", [1, 2, 5])
 @pytest.mark.parametrize("sql", SQL_CASES + RANGE_JOIN_CASES + IE_JOIN_CASES)
 def test_fragment_subqueries_and_shared_state(sql, partitions):

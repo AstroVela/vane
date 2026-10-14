@@ -205,6 +205,62 @@ def test_cancel_reader_while_borrowed_window_is_full(tmp_path):
         reader.close()
 
 
+@pytest.mark.parametrize("consume_first", [False, True])
+def test_materialized_reader_finishes_when_consumers_close(tmp_path, consume_first):
+    schema = schema_for()
+    path = tmp_path / "short-circuit.mat"
+    metadata = write_object(path, schema, [(i,) for i in range(20)])
+    target = channel(schema)
+    if not consume_first:
+        target.close_consumer("consumer")
+    reader = native.MaterializedIO.read(
+        str(path), target, "producer", 1 << 20, native.MaterializedIO.staging_bytes(128), metadata
+    )
+    batch = None
+    try:
+        if consume_first:
+            _, batch = wait(lambda: target.poll("consumer"), lambda result: result[0] == "data")
+            wait(lambda: target.snapshot()["write_blocks"])
+            target.close_consumer("consumer")
+        status = wait(reader.status, lambda value: value["done"])
+        assert status["error"] == ""
+        assert target.snapshot()["error"] == ""
+        if batch is not None:
+            assert batch.to_rows() == [(0,), (1,), (2,)]
+            assert target.snapshot()["bytes"] > 0
+            batch.close()
+        assert target.snapshot()["bytes"] == 0
+        assert target.snapshot()["finished_producers"] == 1
+    finally:
+        if batch is not None:
+            batch.close()
+        reader.close()
+
+
+@pytest.mark.parametrize("failure", ["checksum", "abort"])
+def test_closed_consumer_preserves_materialized_input_failures(tmp_path, failure):
+    schema = schema_for()
+    path = tmp_path / "failed-input.mat"
+    metadata = write_object(path, schema, [(i,) for i in range(20)])
+    target = channel(schema)
+    target.close_consumer("consumer")
+    if failure == "checksum":
+        content = path.read_bytes()
+        path.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+    else:
+        target.abort("original input failure")
+    reader = native.MaterializedIO.read(
+        str(path), target, "producer", 1 << 20, native.MaterializedIO.staging_bytes(128), metadata
+    )
+    try:
+        status = wait(reader.status, lambda value: value["done"])
+        assert ("checksum" if failure == "checksum" else "original input failure") in status["error"]
+        assert target.snapshot()["error"] == status["error"]
+        assert target.snapshot()["bytes"] == 0
+    finally:
+        reader.close()
+
+
 def test_storage_limit_and_exclusive_create(tmp_path):
     schema = schema_for()
     path = tmp_path / "quota.mat"
