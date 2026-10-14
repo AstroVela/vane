@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
+import json
 import math
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -35,9 +34,9 @@ from vane.ai._video_pipeline_types import (
     VideoMediaInfo,
     VideoSource,
     _VideoRequest,
+    object_fields,
 )
 from vane.ai._video_source import VaneVideoSource
-from vane.ai.provider import _ProviderResultError, _safe_provider_execution_error
 
 __all__ = [
     "ClipWindow",
@@ -57,8 +56,8 @@ __all__ = [
 class VideoEmbeddingProfile:
     """A named, reproducible configuration of an existing Vane descriptor.
 
-    Providers run in the local worker for ``create()`` or distributed UDF workers
-    for ``build_ingestion()``. The profile name should version model options
+    Providers run in distributed UDF workers for every entry point.
+    The profile name should version model options
     (including revisions) so indexed vectors retain their encoding identity.
     """
 
@@ -345,8 +344,8 @@ class VideoEmbeddingPipeline:
 
     ``create(request)`` returns a task when ``async`` is true and a response
     otherwise. The default synchronous budget is 60 seconds of wall time and
-    60 seconds of video. Cancellation is checked between stages; an in-flight
-    decoder/model call must return before its resources can be released.
+    60 seconds of video. All entry points compile the same Ray ingestion plan.
+    Cancellation interrupts the query and waits for runner cleanup.
     """
 
     def __init__(
@@ -407,9 +406,20 @@ class VideoEmbeddingPipeline:
             if "weights" in request.fusion and not fusion.supports_weights:
                 raise ValueError("Fusion model does not support weights")
 
-    def create(self, request: Mapping[str, Any]) -> VideoEmbeddingTask | dict[str, Any]:
+    def create(
+        self,
+        request: Mapping[str, Any],
+        *,
+        resources: Mapping[str, Any] | None = None,
+        max_batch_bytes: int = 256 * 1024**2,
+    ) -> VideoEmbeddingTask | dict[str, Any]:
+        """Submit one asset through the ingestion plan and return its vector response."""
         parsed = _VideoRequest.parse(copy.deepcopy(request))
         self._validate(parsed)
+        from vane.ai._video_ingestion import validate_execution
+
+        resources = copy.deepcopy(dict(resources or {}))
+        validate_execution(self._source, resources, max_batch_bytes)
         task_id, cancelled = uuid.uuid4().hex, threading.Event()
         deadline = None if parsed.asynchronous else time.monotonic() + parsed.timeout_seconds
         with self._lock:
@@ -417,7 +427,9 @@ class VideoEmbeddingPipeline:
                 raise RuntimeError("Video embedding pipeline is closed")
             if len(self._tasks) >= self._max_tasks:
                 raise RuntimeError("Video task capacity reached; forget completed tasks before submitting more")
-            future = self._executor.submit(self._execute, task_id, parsed, cancelled, deadline)
+            future = self._executor.submit(
+                self._execute, task_id, parsed, cancelled, deadline, resources, max_batch_bytes
+            )
             task = VideoEmbeddingTask(task_id, future, cancelled)
             self._tasks[task_id] = task
         if parsed.asynchronous:
@@ -447,7 +459,16 @@ class VideoEmbeddingPipeline:
         with self._lock:
             return self._tasks[task_id]
 
-    def build_ingestion(
+    def ingest(self, asset: Mapping[str, Any], *, connection: Any, **options: Any) -> Any:
+        """Build a single-asset ingestion relation using ``batch_ingest``.
+
+        ``asset`` contains explicit asset_id, source_version and uri strings.
+        All other options are the same as for ``batch_ingest``. Neither method
+        executes the plan until a result consumer or sink is called.
+        """
+        return self.batch_ingest(_asset_relation(connection, asset), **options)
+
+    def batch_ingest(
         self,
         assets: Any,
         *,
@@ -473,7 +494,12 @@ class VideoEmbeddingPipeline:
                 raise RuntimeError("Video embedding pipeline is closed")
         request = _VideoRequest.parse(
             {
-                "input": {"type": "video", "uri": "relation://assets"},
+                "input": {
+                    "type": "video",
+                    "uri": "relation://assets",
+                    "asset_id": "relation",
+                    "source_version": "relation",
+                },
                 "modalities": list(modalities),
                 "selection": dict(selection or {}),
                 "segmentation": {"clip_seconds": clip_seconds},
@@ -505,8 +531,17 @@ class VideoEmbeddingPipeline:
         self.close()
 
     def _execute(
-        self, task_id: str, request: _VideoRequest, cancelled: threading.Event, deadline: float | None
+        self,
+        task_id: str,
+        request: _VideoRequest,
+        cancelled: threading.Event,
+        deadline: float | None,
+        resources: Mapping[str, Any],
+        max_batch_bytes: int,
     ) -> dict[str, Any]:
+        import vane
+        from vane.ai._video_ingestion import build_video_ingestion
+
         def checkpoint() -> None:
             if cancelled.is_set():
                 raise CancelledError()
@@ -515,136 +550,88 @@ class VideoEmbeddingPipeline:
                 raise VideoEmbeddingTimeout(task_id)
 
         checkpoint()
-        media = self._source.probe(request.uri)
-        checkpoint()
-        if not isinstance(media, VideoMediaInfo):
-            raise TypeError("Video source probe must return VideoMediaInfo")
-        if not request.asynchronous and media.duration > request.max_video_seconds:
-            raise ValueError("Video exceeds sync_budget.max_video_seconds; submit with async=true")
-        if media.duration > request.clip_seconds * self._max_clips:
-            raise ValueError("Video segmentation exceeds the pipeline max_clips budget")
-        count = math.ceil(media.duration / request.clip_seconds)
-        response: dict[str, Any] = {"id": task_id, "status": "ready", "data": [], "clips": []}
-        fusion = self._fusion
-        loop = asyncio.new_event_loop()
-        runtimes: dict[str, _ProfileRuntime] = {}
-        try:
-            with ExitStack() as cleanup:
-                for index in range(count):
-                    checkpoint()
-                    clip = ClipWindow(
-                        index * request.clip_seconds, min((index + 1) * request.clip_seconds, media.duration)
-                    )
-                    selected: dict[str, tuple[TimedContent, ...]] = {}
-                    decisions: dict[str, dict[str, Any]] = {}
-                    for selection in request.selections:
-                        winner = None
-                        for channel in selection.modalities:
-                            checkpoint()
-                            if winner is not None:
-                                decisions[channel] = {
-                                    "status": "skipped",
-                                    "reason": "lower_priority",
-                                    "selected_modality": winner,
-                                }
-                                continue
-                            if channel not in media.available:
-                                decisions[channel] = {"status": "skipped", "reason": "no_stream"}
-                                continue
-                            values = _content_in_clip(
-                                self._source.extract(request.uri, channel, clip, media), channel, clip
-                            )
-                            checkpoint()
-                            if not values:
-                                decisions[channel] = {"status": "skipped", "reason": "no_content"}
-                                continue
-                            selected[channel] = values
-                            decisions[channel] = {
-                                "status": "selected",
-                                "reason": "first_available" if selection.policy == "first_available" else "all",
-                            }
-                            if selection.policy == "first_available":
-                                winner = channel
-                    audit: dict[str, Any] = {
-                        "start_sec": clip.start,
-                        "end_sec": clip.end,
-                        "channels": {c: decisions[c] for c in request.modalities},
+        # Each task owns its connection. Interrupting it cannot cancel another
+        # caller's query. Keep signalling until the query unwinds, including a
+        # cancellation racing with plan binding or result-consumer startup.
+        with vane.connect() as connection:
+            finished = threading.Event()
+
+            def interrupt() -> None:
+                while not finished.wait(0.05):
+                    if cancelled.is_set():
+                        connection.interrupt()
+
+            watcher = threading.Thread(target=interrupt, name="vane-video-interrupt", daemon=True)
+            watcher.start()
+            try:
+                assets = _asset_relation(
+                    connection,
+                    {"asset_id": request.asset_id, "source_version": request.source_version, "uri": request.uri},
+                )
+                relation = build_video_ingestion(self, assets, request, resources, max_batch_bytes)
+                checkpoint()
+                rows = relation.to_arrow_table().to_pylist()
+                checkpoint()
+                response = _response(task_id, rows, request)
+                checkpoint()
+                return response
+            except VideoEmbeddingTimeout:
+                raise
+            except Exception:
+                if cancelled.is_set():
+                    raise CancelledError() from None
+                raise
+            finally:
+                finished.set()
+                watcher.join()
+
+
+def _asset_relation(connection: Any, asset: Mapping[str, Any]) -> Any:
+    fields = ("asset_id", "source_version", "uri")
+    values = object_fields(asset, set(fields), "asset")
+    if any(not isinstance(values.get(name), str) or not values[name].strip() for name in fields):
+        raise ValueError("asset_id, source_version and uri must be nonempty strings")
+    # Bound values preserve arbitrary URI/identity text without SQL interpolation.
+    return connection.sql(
+        "SELECT ?::VARCHAR AS asset_id, ?::VARCHAR AS source_version, ?::VARCHAR AS uri",
+        params=[values[name] for name in fields],
+    )
+
+
+def _response(task_id: str, rows: list[dict[str, Any]], request: _VideoRequest) -> dict[str, Any]:
+    """Format plan output; selection, embedding and fusion live only in the plan."""
+    response: dict[str, Any] = {"id": task_id, "status": "ready", "data": [], "clips": []}
+    for row in sorted(rows, key=lambda row: row["start_sec"]):
+        identity = {
+            name: row[name] for name in ("clip_id", "asset_id", "source_version", "uri", "start_sec", "end_sec")
+        }
+        metadata = {channel: json.loads(row[f"{channel}_metadata"]) for channel in request.modalities}
+        audit = {
+            **identity,
+            "channels": {
+                channel: {key: value for key, value in meta.items() if key in {"status", "reason", "selected_modality"}}
+                for channel, meta in metadata.items()
+            },
+        }
+        if request.return_timeline:
+            audit["timeline"] = [
+                {"modality": channel, **item} for channel, meta in metadata.items() for item in meta["timeline"]
+            ]
+        response["clips"].append(audit)
+        channels = list(request.modalities) if request.output in {"separate", "both"} else []
+        if request.output in {"fused", "both"}:
+            channels.append("fused")
+            metadata["fused"] = json.loads(row["fused_metadata"])
+        for channel in channels:
+            vector, meta = row[f"{channel}_vector"], metadata[channel]
+            if vector is not None:
+                response["data"].append(
+                    {
+                        **identity,
+                        "embedding": vector,
+                        "modality": channel,
+                        "modalities": meta["modalities"] if channel == "fused" else [channel],
+                        **{name: meta[name] for name in ("profile", "provider", "model")},
                     }
-                    if request.return_timeline:
-                        audit["timeline"] = [
-                            {
-                                "modality": channel,
-                                "start_sec": item.start,
-                                "end_sec": item.end,
-                                **({"text": item.value} if channel in TEXT_MODALITIES else {}),
-                            }
-                            for channel in request.modalities
-                            for item in selected.get(channel, ())
-                        ]
-                    response["clips"].append(audit)
-                    if selected and request.output in {"fused", "both"}:
-                        assert fusion is not None
-                        if frozenset(selected) not in fusion.combinations:
-                            raise ValueError("Fusion model does not support the modalities available in this clip")
-                    if request.output in {"separate", "both"}:
-                        for channel in request.modalities:
-                            if channel not in selected:
-                                continue
-                            checkpoint()
-                            profile = self._profiles[channel]
-                            if channel not in runtimes:
-                                runtimes[channel] = _ProfileRuntime(profile, channel, loop)
-                                cleanup.callback(runtimes[channel].close)
-                            vector = runtimes[channel].embed(selected[channel])
-                            checkpoint()
-                            response["data"].append(
-                                {
-                                    "embedding": vector,
-                                    "modality": channel,
-                                    "modalities": [channel],
-                                    "start_sec": clip.start,
-                                    "end_sec": clip.end,
-                                    "profile": profile.name,
-                                    "provider": profile.descriptor.get_provider(),
-                                    "model": profile.descriptor.get_model(),
-                                }
-                            )
-                    if selected and request.output in {"fused", "both"}:
-                        checkpoint()
-                        assert fusion is not None
-                        options = copy.deepcopy(request.fusion)
-                        options.setdefault("method", fusion.method)
-                        if "weights" in options:
-                            options["weights"] = {c: w for c, w in options["weights"].items() if c in selected}
-                        try:
-                            vector = fusion.embed(clip, selected, options)
-                            if inspect.isawaitable(vector):
-                                vector = loop.run_until_complete(vector)
-                        except Exception as error:
-                            raise _safe_provider_execution_error(
-                                fusion.provider, fusion.model, "video fusion", error
-                            ) from None
-                        try:
-                            with np.errstate(over="ignore", invalid="ignore"):
-                                vector = np.asarray(vector, dtype=np.float32)
-                        except (TypeError, ValueError, OverflowError):
-                            raise _ProviderResultError("Fusion model returned a non-numeric embedding") from None
-                        if vector.shape != (fusion.dimensions,) or not np.isfinite(vector).all():
-                            raise _ProviderResultError("Fusion model returned an invalid embedding")
-                        checkpoint()
-                        response["data"].append(
-                            {
-                                "embedding": vector.tolist(),
-                                "modality": "fused",
-                                "modalities": [c for c in request.modalities if c in selected],
-                                "start_sec": clip.start,
-                                "end_sec": clip.end,
-                                "profile": fusion.name,
-                                "provider": fusion.provider,
-                                "model": fusion.model,
-                            }
-                        )
-        finally:
-            loop.close()
-        checkpoint()
-        return response
+                )
+    return response

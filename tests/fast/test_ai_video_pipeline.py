@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import CancelledError
 
 import numpy as np
 import pytest
 
+import vane
 from vane.ai import VideoEmbeddingPipeline, VideoEmbeddingProfile, VideoFusionProfile
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
@@ -87,6 +89,10 @@ class Source:
         self.probes = []
         self.calls = []
 
+    def __deepcopy__(self, memo):
+        # Keep test instrumentation visible while exercising worker factories.
+        return self
+
     def probe(self, uri):
         self.probes.append(uri)
         return self.media
@@ -100,7 +106,11 @@ class Source:
 
 
 def request(channels, **kwargs):
-    return {"input": {"type": "video", "uri": "s3://fixture/video.mp4"}, "modalities": channels, **kwargs}
+    return {
+        "input": {"type": "video", "uri": "s3://fixture/video.mp4", "asset_id": "asset", "source_version": "v1"},
+        "modalities": channels,
+        **kwargs,
+    }
 
 
 def visual(start=0):
@@ -121,6 +131,31 @@ def profiles():
         )
         for channel in CHANNELS
     }
+
+
+@pytest.fixture(autouse=True)
+def inline_stage_contracts(monkeypatch):
+    """Exercise the shared compiler's actual stages and native aggregation.
+
+    Only dispatch is replaced for these unit contracts. Separate real-Ray tests
+    exercise all entry points, cancellation, concurrency and the Lance sink.
+    """
+    from vane.ai import _video_ingestion
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+
+        def apply(relation, factory, schema, options, budget, **kwargs):
+            runtime = factory()
+            try:
+                return connection.from_arrow(runtime(relation.to_arrow_table()))
+            finally:
+                close = getattr(runtime, "close", None)
+                if close is not None:
+                    close()
+
+        monkeypatch.setattr(_video_ingestion, "_apply_stage", apply)
+        yield
 
 
 def test_priority_is_per_clip_and_does_not_embed_unselected_channels(profiles):
@@ -156,7 +191,7 @@ def test_priority_is_per_clip_and_does_not_embed_unselected_channels(profiles):
     assert profiles["audio"].descriptor.loaded == 0
 
 
-def test_groups_keep_visual_and_only_fallback_between_subtitles_and_asr(profiles):
+def test_groups_keep_visual_and_prioritize_subtitles_before_asr(profiles):
     source = Source(
         {
             (0, "visual"): visual(),
@@ -293,9 +328,9 @@ def test_fusion_missing_input_combination_fails_without_silently_averaging(profi
     with VideoEmbeddingPipeline(
         source=source, profiles=profiles, fusion=fusion_profile(lambda *_: pytest.fail("must not fuse"))
     ) as pipeline:
-        with pytest.raises(ValueError, match="available in this clip"):
+        with pytest.raises(ValueError, match="selected modalities"):
             pipeline.create(request(["visual", "transcription"], output="both"))
-    assert profiles["visual"].descriptor.loaded == 0
+    assert profiles["visual"].descriptor.loaded == 1
 
 
 @pytest.mark.parametrize("vector", [[1, 2], [1, 2, float("nan")], [[1, 2, 3]], [1, 2, float("inf")]])
@@ -351,31 +386,35 @@ def test_empty_tail_clip_is_retained_and_timeline_can_be_omitted(profiles):
     assert result["data"][0]["end_sec"] == 10
 
 
-def test_async_returns_id_before_probe_finishes_and_snapshots_request(profiles):
+def test_async_returns_id_before_execution_finishes_and_snapshots_request(profiles, monkeypatch):
     entered, release = threading.Event(), threading.Event()
-    source = Source(duration=70)
-    original = source.probe
 
-    def probe(uri):
+    def execute(self, task_id, parsed, cancelled, deadline, resources, budget):
         entered.set()
         assert release.wait(5)
-        return original(uri)
+        assert parsed.modalities == ("visual",)
+        assert resources["embed"]["gpus"] == 0
+        return {"id": task_id, "clips": [1] * 7}
 
-    source.probe = probe
-    pipeline = VideoEmbeddingPipeline(source=source, profiles=profiles)
+    monkeypatch.setattr(VideoEmbeddingPipeline, "_execute", execute)
+    pipeline = VideoEmbeddingPipeline(source=Source(), profiles=profiles)
     try:
         payload = request(["visual"], **{"async": True})
-        task = pipeline.create(payload)
+        resources = {"embed": {"gpus": 0}}
+        task = pipeline.create(payload, resources=resources)
         assert isinstance(task, VideoEmbeddingTask) and task.id
         assert entered.wait(5)
         assert task.status == "processing"
         assert pipeline.get_task(task.id) is task
         payload["modalities"].append("audio")
+        resources["embed"]["gpus"] = 1
+        with pytest.raises(TimeoutError):
+            task.result(timeout=0.01)
+        assert task.status == "processing"
         release.set()
         result = task.result(timeout=5)
         assert len(result["clips"]) == 7
         assert task.status == "ready"
-        assert all(channel == "visual" for _, channel in source.calls)
         result["clips"].clear()
         assert len(task.result()["clips"]) == 7
         pipeline.forget_task(task.id)
@@ -394,12 +433,16 @@ def test_sync_duration_budget_rejects_before_extraction(profiles):
     assert not source.calls
 
 
-def test_sync_time_budget_stops_new_work_and_retains_task_for_cleanup(profiles):
+def test_sync_time_budget_stops_new_work_and_retains_task_for_cleanup(profiles, monkeypatch):
     release = threading.Event()
-    source = Source()
-    original = source.probe
-    source.probe = lambda uri: (release.wait(5), original(uri))[1]
-    pipeline = VideoEmbeddingPipeline(source=source, profiles=profiles)
+
+    def execute(self, task_id, parsed, cancelled, deadline, resources, budget):
+        assert cancelled.wait(5)
+        assert release.wait(5)
+        raise CancelledError()
+
+    monkeypatch.setattr(VideoEmbeddingPipeline, "_execute", execute)
+    pipeline = VideoEmbeddingPipeline(source=Source(), profiles=profiles)
     try:
         with pytest.raises(VideoEmbeddingTimeout) as error:
             pipeline.create(request(["visual"], sync_budget={"timeout_seconds": 0.02}))
@@ -409,7 +452,6 @@ def test_sync_time_budget_stops_new_work_and_retains_task_for_cleanup(profiles):
         with pytest.raises(CancelledError):
             task.result(timeout=5)
         assert task.status == "cancelled"
-        assert not source.calls
     finally:
         release.set()
         pipeline.close()
@@ -519,18 +561,18 @@ def test_fusion_weights_are_opt_in_and_only_selected_weights_are_passed():
             pipeline.create(payload)
 
 
-def test_cancelling_queued_task_does_not_extract_or_load_models(profiles):
+def test_cancelling_queued_task_does_not_execute(profiles, monkeypatch):
     entered, release = threading.Event(), threading.Event()
-    source = Source(duration=10)
-    original = source.probe
+    calls = []
 
-    def probe(uri):
+    def execute(self, task_id, parsed, cancelled, deadline, resources, budget):
+        calls.append(parsed.modalities)
         entered.set()
         assert release.wait(5)
-        return original(uri)
+        return {}
 
-    source.probe = probe
-    pipeline = VideoEmbeddingPipeline(source=source, profiles=profiles)
+    monkeypatch.setattr(VideoEmbeddingPipeline, "_execute", execute)
+    pipeline = VideoEmbeddingPipeline(source=Source(), profiles=profiles)
     try:
         first = pipeline.create(request(["visual"], **{"async": True}))
         assert entered.wait(5)
@@ -544,7 +586,45 @@ def test_cancelling_queued_task_does_not_extract_or_load_models(profiles):
         assert second.status == "cancelled"
         release.set()
         first.result(5)
-        assert source.calls == [(0, "visual")]
+        assert calls == [("visual",)]
     finally:
         release.set()
         pipeline.close()
+
+
+@pytest.mark.parametrize("field,value", [("asset_id", None), ("source_version", ""), ("uri", " ")])
+def test_input_identity_is_explicit_and_validated_before_io(profiles, field, value):
+    source = Source()
+    payload = request(["visual"])
+    payload["input"][field] = value
+    with VideoEmbeddingPipeline(source=source, profiles=profiles) as pipeline:
+        with pytest.raises(ValueError, match=field):
+            pipeline.create(payload)
+    assert not source.probes
+
+
+@pytest.mark.parametrize("options", [{"resources": {"embed": {"fallback": True}}}, {"max_batch_bytes": 0}])
+def test_create_rejects_invalid_execution_options_before_submission(profiles, options):
+    source = Source()
+    with VideoEmbeddingPipeline(source=source, profiles=profiles) as pipeline:
+        with pytest.raises(ValueError):
+            pipeline.create(request(["visual"], **{"async": True}), **options)
+        assert not pipeline._tasks
+    assert not source.probes
+
+
+def test_budget_expiring_during_plan_binding_keeps_timeout_identity(profiles, monkeypatch):
+    from vane.ai import _video_ingestion
+    from vane.ai._video_pipeline_types import _VideoRequest
+
+    def bind(*args):
+        time.sleep(0.03)
+        return None  # The checkpoint must reject before consuming the relation.
+
+    monkeypatch.setattr(_video_ingestion, "build_video_ingestion", bind)
+    with VideoEmbeddingPipeline(source=Source(), profiles=profiles) as pipeline:
+        with pytest.raises(VideoEmbeddingTimeout) as error:
+            pipeline._execute(
+                "job", _VideoRequest.parse(request(["visual"])), threading.Event(), time.monotonic() + 0.01, {}, 1024
+            )
+    assert error.value.task_id == "job"

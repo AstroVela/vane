@@ -114,17 +114,21 @@ def _table(rows: list[dict[str, Any]], schema: Mapping[str, str], budget: int) -
     return table
 
 
+def validate_execution(source: Any, resources: Mapping[str, Any], max_batch_bytes: int) -> dict[str, dict[str, Any]]:
+    if type(max_batch_bytes) is not int or max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be a positive integer")
+    if getattr(source, "connection", None) is not None:
+        raise ValueError("distributed video sources cannot capture a live connection")
+    return _stage_options(resources)
+
+
 def build_video_ingestion(
     pipeline: Any, assets: Any, request: Any, resources: Mapping[str, Any], max_batch_bytes: int
 ) -> Any:
     from vane.ai.video import _content_in_clip, _ProfileRuntime
 
-    if type(max_batch_bytes) is not int or max_batch_bytes <= 0:
-        raise ValueError("max_batch_bytes must be a positive integer")
-    options = _stage_options(resources)
     source = pipeline._source
-    if getattr(source, "connection", None) is not None:
-        raise ValueError("distributed video sources cannot capture a live connection")
+    options = validate_execution(source, resources, max_batch_bytes)
     profiles, fusion, max_clips = dict(pipeline._profiles), pipeline._fusion, pipeline._max_clips
     required = {"asset_id", "source_version", "uri"}
     input_schema = dict(zip(assets.columns, assets.types, strict=True))
@@ -150,6 +154,8 @@ def build_video_ingestion(
                 media = self.source.probe(asset["uri"])
                 if not isinstance(media, VideoMediaInfo):
                     raise TypeError("video source probe must return VideoMediaInfo")
+                if not request.asynchronous and media.duration > request.max_video_seconds:
+                    raise ValueError("Video exceeds sync_budget.max_video_seconds; submit with async=true")
                 if media.duration > request.clip_seconds * max_clips:
                     raise ValueError("video segmentation exceeds max_clips")
                 for index in range(math.ceil(media.duration / request.clip_seconds)):

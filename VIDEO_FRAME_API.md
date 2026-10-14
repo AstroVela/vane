@@ -438,6 +438,7 @@ fixed clips. Channel selection and vector output are independent:
 
 | Field | Values and meaning |
 | --- | --- |
+| `input` | `type="video"`, `uri`, explicit `asset_id` and immutable `source_version` |
 | `modalities` | Nonempty, unique list of `visual`, `audio`, `subtitles`, `transcription`, `ocr` |
 | `selection.policy` | `all` (default), or `first_available` within each clip |
 | `selection.priority` | Only with `first_available`; an exact permutation of the modalities. Defaults to their supplied order. |
@@ -470,14 +471,17 @@ visual = VideoEmbeddingProfile.from_provider(
 )
 with VideoEmbeddingPipeline(profiles={"visual": visual}) as pipeline:
     task = pipeline.create({
-        "input": {"type": "video", "uri": "s3://bucket/video.mp4"},
+        "input": {
+            "type": "video", "uri": "s3://bucket/video.mp4",
+            "asset_id": "video-123", "source_version": "object-version-1",
+        },
         "modalities": ["visual"],
         "selection": {"policy": "all", "unit": "clip"},
         "segmentation": {"clip_seconds": 10},
         "output": "separate",
         "return_timeline": True,
         "async": True,
-    })
+    }, resources={"embed": {"gpus": 1}})
     print(task.id)  # Available before container probing or model loading finishes.
     result = pipeline.get_task(task.id).result()
 ```
@@ -486,16 +490,19 @@ The complete runnable visual example is
 [`examples/video_embedding_pipeline.py`](examples/video_embedding_pipeline.py).
 Install `vane-ai[video]` plus the chosen model's extras, such as `cosmos` or
 `clap`. Profiles reuse existing Vane descriptors and typed embedding validation.
-They load models lazily, once per channel per task, on the local pipeline worker.
-`create()` runs on the local pipeline worker; `build_ingestion()` below compiles
-a lazy relation for distributed execution. Model revisions,
+`create()`, `ingest()` and `batch_ingest()` compile the same Ray execution plan.
+The first returns a vector response (or an asynchronous task); the ingestion
+methods return a lazy relation for one final sink. There is one implementation
+of selection, preprocessing, encoding, assembly and fusion. `create()` accepts
+the same `resources` and `max_batch_bytes` keyword options as ingestion. Models
+load lazily in UDF workers and actors retain them across batches. Model revisions,
 preprocessing options and normalization belong in a versioned profile name.
 
 `VaneVideoSource` (from `vane.ai.video`) uses Vane FILE access for local and remote
 URIs and PyAV for extraction. It probes the container once for both selection
 policies, then uses the first non-attached video stream, first audio stream and
 first subtitle stream. Video sampling defaults to eight distinct frames per
-clip; audio is windowed to 48 kHz mono PCM. Cosmos requires a local CUDA GPU.
+clip; audio is windowed to 48 kHz mono PCM. Cosmos requires a CUDA GPU on its Ray worker.
 Configure `frames_per_clip` and
 `sample_rate` for the selected profiles. Decoder and model limits remain errors;
 a short clip that cannot satisfy a model's frame count is not padded implicitly.
@@ -519,13 +526,17 @@ Return `[]` for normal absence. Whitespace-only text and content outside the
 current clip are empty for selection. Missing tracks and empty ASR may advance
 `first_available`; invalid timestamps, decoding errors, timeouts, invalid vectors
 and model failures propagate. There is no error-to-absence conversion or automatic
-retry in this orchestration layer.
+retry in this orchestration layer. The no-retry contract also fences replay of
+outer native execution fragments, so a failed UDF cannot be rerun indirectly.
 
 For clip search, keep visual independent and add a dialogue priority group:
 
 ```python
 request = {
-    "input": {"type": "video", "uri": "s3://bucket/video.mp4"},
+    "input": {
+        "type": "video", "uri": "s3://bucket/video.mp4",
+        "asset_id": "video-123", "source_version": "object-version-1",
+    },
     "modalities": ["visual", "subtitles", "transcription", "ocr", "audio"],
     "selection": {
         "policy": "all",
@@ -562,7 +573,8 @@ model support, must cover requested channels, and passes only selected weights
 to the callback. A future shared-space fusion adapter must separately establish
 compatibility of the exact encoding profiles.
 
-Responses contain `data` vectors with `start_sec`, `end_sec`, actual `modality`,
+Responses contain `data` vectors with `clip_id`, `asset_id`, `source_version`,
+`uri`, `start_sec`, `end_sec`, actual `modality`,
 contributing `modalities`, `provider`, `model` and `profile`. The `clips` array
 retains every clip, even when empty, with a decision for every requested channel:
 `all`/`first_available` for selection, or `no_stream`, `no_content`,
@@ -575,23 +587,35 @@ Task states are `pending`, `processing`, `ready`, `failed`, `cancelling` and
 `cancelled`. `task.result(timeout=...)` raises the execution error or a caller wait
 timeout; that wait timeout alone does not cancel the task. `task.cancel()` requests
 cooperative cancellation. A synchronous request exceeding its wall-clock budget
-raises `VideoEmbeddingTimeout` with `task_id` and requests cancellation. No new
-stage starts afterward, but an in-flight model/decoder call must return before
-cleanup completes. Source I/O also has its own timeout. `close()` and context exit
-wait for workers and model-client cleanup.
+raises `VideoEmbeddingTimeout` with `task_id` and interrupts the owned Vane query.
+The runner cancels outstanding work and tears down its resources; cancellation
+may race with work already admitted. Source I/O also has its own timeout.
+`close()` and context exit wait for submitted jobs and query cleanup. The query
+connection belongs to that task, so cancellation does not interrupt another
+caller's connection. The video-duration budget is checked in the common probe
+stage before any extraction. The wall-clock budget includes queueing, plan
+construction and Ray startup.
 
 Task IDs are process-local and are not a durable queue or HTTP service. The
-pipeline runs one task at a time, retains at most `max_tasks=128` tasks, and bounds
+pipeline submits one `create()` job at a time, with stages running in parallel
+within the query, retains at most `max_tasks=128` tasks, and bounds
 segmentation with `max_clips=10000`. Use `forget_task(id)` after consuming a
 completed task to release its result; running tasks cannot be forgotten.
 
-### Batch ingestion and one Lance table
+### Single and batch ingestion into one Lance table
 
-`VideoEmbeddingPipeline.build_ingestion()` builds one lazy Vane relation. The
-input contains `VARCHAR asset_id`, `source_version` and `uri`; identities must be
+`VideoEmbeddingPipeline.ingest(asset, connection=con, **options)` converts a
+single asset dictionary into one input row and calls `batch_ingest()`.
+`batch_ingest(assets, **options)` accepts a relation of any number of assets.
+Both return the same lazy relation and use the same output schema and final
+sink. `create()` also runs this plan over one asset and only formats its output
+into `data`/`clips`; it does not run a separate local media loop.
+
+The batch input contains `VARCHAR asset_id`, `source_version` and `uri`; identities must be
 unique and nonempty. A source version identifies immutable media. Stable
 `clip_id` values include the asset identity, version, segmentation size and clip
-boundaries. Executing the same input again does not provide upsert semantics.
+boundaries. All three entry points require these explicit identities; a URI is
+not treated as an immutable media version. Executing the same input again does not provide upsert semantics.
 
 ```python
 with vane.connect() as con, VideoEmbeddingPipeline(
@@ -602,7 +626,7 @@ with vane.connect() as con, VideoEmbeddingPipeline(
     },
     source=source_with_asr,
 ) as pipeline:
-    result = pipeline.build_ingestion(
+    result = pipeline.batch_ingest(
         con.read_parquet("assets.parquet"),
         modalities=["visual", "subtitles", "transcription"],
         selection={
@@ -628,12 +652,28 @@ with vane.connect() as con, VideoEmbeddingPipeline(
     # Attach the installed Lance provider and create a table matching
     # result.columns/result.types before submitting the ingestion query.
     result.insert_into("lance_ns.main.video_clips")
+
+    # The single-asset path has the same options, schema and sink.
+    single = pipeline.ingest(
+        {"asset_id": "next-video", "source_version": "v1", "uri": "s3://bucket/next.mp4"},
+        connection=con,
+        modalities=["visual", "subtitles", "transcription"],
+        selection={
+            "policy": "all",
+            "groups": [{
+                "modalities": ["subtitles", "transcription"],
+                "policy": "first_available",
+            }],
+        },
+        resources={"embed": {"gpus": 1}},
+    )
+    single.insert_into("lance_ns.main.video_clips")
 ```
 
 Profiles and the source use the contracts described above. This example requests
 GPUs for a GPU visual encoder. CPU models and remote API clients can use
 `gpus=0`, including in actors. Configure model devices consistently with the
-stage resources. A source passed to distributed ingestion must be serializable
+stage resources. A source passed to any entry point must be serializable
 and must not capture a live Vane connection. FILE access and credentials use the
 normal Vane worker session configuration.
 
@@ -669,6 +709,10 @@ defaults to one CPU actor, batch size one. Task and actor selection is independe
 of GPU allocation. Tasks construct and close their source/model runtime per
 invocation. Actors lazily cache channel encoders across batches; a single actor
 may retain several models, whose combined memory must fit its resources.
+Pools start incrementally and use the runner's normal prefetch policy; queued
+work on the first ready actor may initially execute serially. For workloads
+requiring concurrent starts across actors, configure the existing
+`VANE_RAY_ACTOR_PREFETCH_DEPTH=1` before creating the Ray runner.
 Separate resource pools per channel are outside this interface.
 
 `max_clips` bounds segmentation per asset. `max_batch_bytes` bounds each returned
@@ -705,6 +749,8 @@ A failed INSERT follows the provider's abort/commit contract. Other sinks such a
 The focused integration tests in
 [`tests/fast/test_ai_video_ingestion.py`](tests/fast/test_ai_video_ingestion.py)
 cover independent preprocessing, task/actor stage choices, priority selection,
-NULL vectors, distinct vector dimensions and a single final sink. The Lance
+NULL vectors, distinct vector dimensions, identical results through all three
+entry points, synchronous budgets, active-query cancellation, and single/batch
+inserts into the same Lance table with one commit per query. The Lance
 case requires a matching installed provider; Parquet verification alone does
 not establish the Lance commit behavior.

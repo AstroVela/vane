@@ -136,6 +136,8 @@ def _selection(value: Any, channels: tuple[str, ...], *, group: bool = False) ->
 @dataclass(frozen=True)
 class _VideoRequest:
     uri: str
+    asset_id: str
+    source_version: str
     modalities: tuple[str, ...]
     selections: tuple[_Selection, ...]
     clip_seconds: float
@@ -163,12 +165,15 @@ class _VideoRequest:
             },
             "video request",
         )
-        source = object_fields(value.get("input"), {"type", "uri"}, "input")
+        source = object_fields(value.get("input"), {"type", "uri", "asset_id", "source_version"}, "input")
         if source.get("type") != "video":
             raise ValueError("input.type must be video")
         uri = source.get("uri")
         if not isinstance(uri, str) or not uri.strip():
             raise ValueError("input.uri must be a nonempty string")
+        for name in ("asset_id", "source_version"):
+            if not isinstance(source.get(name), str) or not source[name].strip():
+                raise ValueError(f"input.{name} must be a nonempty string")
         channels = modalities(value.get("modalities"), "modalities")
         selection = value.get("selection", {})
         outer = _selection(selection, channels)
@@ -213,6 +218,8 @@ class _VideoRequest:
                 raise TypeError(f"{field} must be a bool")
         return cls(
             uri,
+            source["asset_id"],
+            source["source_version"],
             channels,
             tuple(selections),
             positive_number(segmentation.get("clip_seconds", 10), "clip_seconds"),

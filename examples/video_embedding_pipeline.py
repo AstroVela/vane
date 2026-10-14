@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Create visual clip embeddings with a local Cosmos profile and a task ID.
+"""Create visual clip embeddings with a Ray Cosmos profile and a task ID.
 
 Install vane-ai[video,cosmos]. Supply a reviewed model commit with --revision.
 Model weights are loaded only after task submission and successful probing.
@@ -16,6 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--asset-id", required=True)
+    parser.add_argument("--source-version", required=True)
     parser.add_argument("--device", choices=["cuda", "cuda:0"], default="cuda")
     args = parser.parse_args()
     profile = VideoEmbeddingProfile.from_provider(
@@ -31,14 +33,20 @@ def main():
     with VideoEmbeddingPipeline(profiles={"visual": profile}) as pipeline:
         task = pipeline.create(
             {
-                "input": {"type": "video", "uri": args.video},
+                "input": {
+                    "type": "video",
+                    "uri": args.video,
+                    "asset_id": args.asset_id,
+                    "source_version": args.source_version,
+                },
                 "modalities": ["visual"],
                 "selection": {"policy": "all", "unit": "clip"},
                 "segmentation": {"clip_seconds": 10},
                 "output": "separate",
                 "return_timeline": True,
                 "async": True,
-            }
+            },
+            resources={"embed": {"gpus": 1}},
         )
         print(f"Task ID: {task.id}", flush=True)
         for vector in task.result()["data"]:

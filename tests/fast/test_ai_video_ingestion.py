@@ -88,7 +88,7 @@ def test_video_ingestion_rejects_missing_input_identity(monkeypatch):
         VideoEmbeddingPipeline(profiles={"visual": VideoEmbeddingProfile("video-v1", VisualProfile())}) as pipeline,
     ):
         with pytest.raises(ValueError, match="VARCHAR asset_id"):
-            pipeline.build_ingestion(connection.sql("SELECT 'video' AS uri"), modalities=["visual"])
+            pipeline.batch_ingest(connection.sql("SELECT 'video' AS uri"), modalities=["visual"])
 
 
 @pytest.mark.real_ray
@@ -142,7 +142,7 @@ def test_video_ingestion_preserves_priority_and_independent_visual(ray_local, mo
         vane.connect() as connection,
         VideoEmbeddingPipeline(profiles=profiles, source=Source(), fusion=fusion) as pipeline,
     ):
-        relation = pipeline.build_ingestion(
+        relation = pipeline.batch_ingest(
             connection.read_parquet(str(source)),
             modalities=["visual", "subtitles", "transcription", "ocr"],
             selection={
@@ -274,18 +274,22 @@ def test_parallel_preprocessing_single_plan_and_single_sink(ray_local, monkeypat
     }
     preprocess = {"execution_backend": backend, "batch_size": 1, "cpus": 0.25}
     if backend == "ray_actor":
+        # A cold pool starts after its first actor is ready. Prevent prefetch
+        # from queuing both sides of the test barrier on that first actor.
+        monkeypatch.setenv("VANE_RAY_ACTOR_PREFETCH_DEPTH", "1")
         preprocess["actor_number"] = 2
     with (
         vane.connect() as connection,
         VideoEmbeddingPipeline(profiles=profiles, source=ParallelSource(str(tmp_path))) as pipeline,
     ):
-        relation = pipeline.build_ingestion(
+        relation = pipeline.batch_ingest(
             connection.read_parquet(str(source)),
             modalities=["subtitles", "ocr"],
             resources={"preprocess": preprocess, "embed": {"cpus": 0.25}},
         )
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None).to_physical_plan(connection)
         assert len(plan.collect_udf_nodes()) == 3
+        assert not Path(tmp_path, "probe").exists(), "plan inspection must not execute media probing"
         if destination == "parquet":
             relation.write_parquet(str(tmp_path / "result.parquet"))
             result = connection.read_parquet(str(tmp_path / "result.parquet")).to_arrow_table().to_pylist()
@@ -331,7 +335,7 @@ def test_decoder_error_fails_ingestion(ray_local, monkeypatch, tmp_path, destina
         vane.connect() as connection,
         VideoEmbeddingPipeline(profiles=profiles, source=ParallelSource(str(tmp_path), fail=True)) as pipeline,
     ):
-        relation = pipeline.build_ingestion(
+        relation = pipeline.batch_ingest(
             connection.read_parquet(str(source)),
             modalities=["subtitles", "ocr"],
             resources={"preprocess": {"cpus": 0.25}, "embed": {"cpus": 0.25}},
@@ -377,7 +381,7 @@ def test_duplicate_asset_identity_fails_assembly(ray_local, monkeypatch, tmp_pat
             profiles={"subtitles": VideoEmbeddingProfile("text-v1", TextProfile())}, source=EmptySource()
         ) as pipeline,
     ):
-        relation = pipeline.build_ingestion(connection.read_parquet(str(source)), modalities=["subtitles"])
+        relation = pipeline.batch_ingest(connection.read_parquet(str(source)), modalities=["subtitles"])
         with pytest.raises(Exception, match="duplicate asset identity"):
             relation.fetchall()
 
@@ -416,3 +420,263 @@ def test_stage_output_byte_budget_is_enforced():
 
     with pytest.raises(MemoryError, match="max_batch_bytes"):
         _table([{"content": b"x" * 1024}], {"content": "BLOB"}, 512)
+
+
+class TimelineSource:
+    supported_modalities = frozenset({"subtitles", "transcription", "ocr"})
+
+    def probe(self, uri):
+        return VideoMediaInfo(20, self.supported_modalities)
+
+    def extract(self, uri, channel, clip, media):
+        if channel == "subtitles" and clip.start == 0:
+            return [TimedContent(1, 2, "captions")]
+        if channel == "transcription":
+            if clip.start == 0:
+                raise AssertionError("selected subtitles must skip ASR")
+            return [TimedContent(11, 12, "speech")]
+        return []
+
+
+def timeline_pipeline():
+    return VideoEmbeddingPipeline(
+        source=TimelineSource(),
+        profiles={
+            channel: VideoEmbeddingProfile(channel + "-v1", TextProfile())
+            for channel in TimelineSource.supported_modalities
+        },
+        fusion=VideoFusionProfile(
+            "joint-v1",
+            "test",
+            "joint",
+            2,
+            (frozenset({"subtitles"}), frozenset({"transcription"})),
+            lambda clip, selected, options: [clip.start, len(selected)],
+        ),
+    )
+
+
+def timeline_options(output="separate"):
+    return {
+        "modalities": ["subtitles", "transcription", "ocr"],
+        "selection": {
+            "policy": "all",
+            "groups": [{"modalities": ["subtitles", "transcription"], "policy": "first_available"}],
+        },
+        "output": output,
+        "resources": {
+            name: {"execution_backend": "ray_task", "cpus": 0.25} for name in ("probe", "preprocess", "embed", "fusion")
+        },
+    }
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("output", ["separate", "fused", "both"])
+def test_ingest_batch_and_create_have_identical_clip_results(ray_local, monkeypatch, output):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    # Quotes must survive bound parameters and arbitrary source identity text.
+    asset = {"asset_id": "a'1", "source_version": "immutable-v1", "uri": "memory://video'1"}
+    options = timeline_options(output)
+    with vane.connect() as connection, timeline_pipeline() as pipeline:
+        single = pipeline.ingest(asset, connection=connection, **options)
+        assert len(
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(single, None)
+            .to_physical_plan(connection)
+            .collect_udf_nodes()
+        ) == (3 if output == "separate" else 4)
+        single_rows = single.to_arrow_table().to_pylist()
+        assets = connection.sql(
+            "SELECT ?::VARCHAR asset_id, ?::VARCHAR source_version, ?::VARCHAR uri UNION ALL SELECT 'b', 'v2', 'memory://b'",
+            params=list(asset.values()),
+        )
+        batch_rows = pipeline.batch_ingest(assets, **options).to_arrow_table().to_pylist()
+        assert len(batch_rows) == 4
+        assert sorted(single_rows, key=lambda r: r["clip_id"]) == sorted(
+            [r for r in batch_rows if r["asset_id"] == asset["asset_id"]], key=lambda r: r["clip_id"]
+        )
+        response = pipeline.create(
+            {"input": {"type": "video", **asset}, **{k: v for k, v in options.items() if k != "resources"}},
+            resources=options["resources"],
+        )
+    assert [clip["start_sec"] for clip in response["clips"]] == [0, 10]
+    rows_by_id = {row["clip_id"]: row for row in single_rows}
+    assert {clip["clip_id"] for clip in response["clips"]} == set(rows_by_id)
+    for vector in response["data"]:
+        row = rows_by_id[vector["clip_id"]]
+        channel = vector["modality"]
+        assert vector["embedding"] == row[f"{channel}_vector"]
+        metadata = json.loads(row[f"{channel}_metadata"])
+        assert all(vector[key] == metadata[key] for key in ("model", "profile", "provider", "start_sec", "end_sec"))
+    assert len(response["data"]) == (4 if output == "both" else 2)
+    assert response["clips"][0]["channels"]["transcription"]["reason"] == "lower_priority"
+    assert response["clips"][1]["channels"]["subtitles"]["reason"] == "no_content"
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_create_uses_ray_and_enforces_sync_duration_budget(ray_local, monkeypatch, tmp_path, asynchronous):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    directory = str(tmp_path)
+
+    class Source(TimelineSource):
+        def probe(self, uri):
+            Path(directory, "worker_pid").write_text(str(os.getpid()))
+            return VideoMediaInfo(61, self.supported_modalities)
+
+        def extract(self, *args):
+            Path(directory, "extracted").touch()
+            return []
+
+    with VideoEmbeddingPipeline(
+        source=Source(), profiles={"subtitles": VideoEmbeddingProfile("v1", TextProfile())}
+    ) as pipeline:
+        request = {
+            "input": {"type": "video", "uri": "memory://video", "asset_id": "a", "source_version": "v1"},
+            "modalities": ["subtitles"],
+            "async": asynchronous,
+        }
+        if asynchronous:
+            task = pipeline.create(request)
+            assert task.id and pipeline.get_task(task.id) is task
+            assert len(task.result(timeout=60)["clips"]) == 7
+            assert task.status == "ready"
+            assert (tmp_path / "extracted").exists()
+        else:
+            with pytest.raises(Exception, match="sync_budget.max_video_seconds"):
+                pipeline.create(request)
+            assert not (tmp_path / "extracted").exists()
+    assert int((tmp_path / "worker_pid").read_text()) != os.getpid()
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("cancellation", ["explicit", "sync_budget"])
+def test_create_cancels_active_ray_query(ray_local, monkeypatch, tmp_path, cancellation):
+    from concurrent.futures import CancelledError
+
+    from vane.ai.video import VideoEmbeddingTimeout
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    directory = str(tmp_path)
+
+    class Source(TimelineSource):
+        def probe(self, uri):
+            Path(directory, "entered").touch()
+            deadline = time.monotonic() + 45
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("test source was not released")
+                time.sleep(0.05)
+            return VideoMediaInfo(10, self.supported_modalities)
+
+        def extract(self, *args):
+            Path(directory, "extracted").touch()
+            return []
+
+    pipeline = VideoEmbeddingPipeline(
+        source=Source(), profiles={"subtitles": VideoEmbeddingProfile("v1", TextProfile())}
+    )
+    request = {
+        "input": {"type": "video", "uri": "memory://video", "asset_id": "a", "source_version": "v1"},
+        "modalities": ["subtitles"],
+    }
+    try:
+        if cancellation == "explicit":
+            task = pipeline.create({**request, "async": True})
+            deadline = time.monotonic() + 30
+            while not (tmp_path / "entered").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            task.cancel()
+        else:
+            with pytest.raises(VideoEmbeddingTimeout) as error:
+                pipeline.create({**request, "sync_budget": {"timeout_seconds": 8}})
+            task = pipeline.get_task(error.value.task_id)
+        with pytest.raises(CancelledError):
+            task.result(timeout=20)
+        assert task.status == "cancelled"
+        assert not (tmp_path / "extracted").exists()
+    finally:
+        (tmp_path / "release").touch()
+        pipeline.close()
+
+
+@pytest.mark.real_ray
+def test_ingest_and_batch_ingest_commit_to_same_lance_table(ray_local, monkeypatch, tmp_path):
+    try:
+        importlib.metadata.distribution("vane-extension-lance")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("matching Lance provider required")
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    with vane.connect() as connection, timeline_pipeline() as pipeline:
+        options = timeline_options("both")
+        relation = pipeline.ingest(
+            {"asset_id": "a", "source_version": "v1", "uri": "memory://a"}, connection=connection, **options
+        )
+        vane.load_installed_extension("lance", connection=connection)
+        namespace = str(tmp_path / "lance").replace("'", "''")
+        connection.execute(f"ATTACH '{namespace}' AS lance_ns (TYPE LANCE, READ_ONLY false)")
+        schema = ", ".join(f'"{name}" {dtype}' for name, dtype in zip(relation.columns, relation.types, strict=True))
+        connection.execute(f"CREATE TABLE lance_ns.main.clips ({schema})")
+        before = set((tmp_path / "lance").glob("**/_versions/*.manifest"))
+        relation.insert_into("lance_ns.main.clips")
+        after_single = set((tmp_path / "lance").glob("**/_versions/*.manifest"))
+        assert len(after_single - before) == 1
+        assets = connection.sql(
+            "SELECT asset_id, 'v1' AS source_version, 'memory://' || asset_id AS uri FROM (VALUES ('b'), ('c')) t(asset_id)"
+        )
+        batch = pipeline.batch_ingest(assets, **options)
+        assert batch.columns == relation.columns and batch.types == relation.types
+        batch.insert_into("lance_ns.main.clips")
+        after_batch = set((tmp_path / "lance").glob("**/_versions/*.manifest"))
+        assert len(after_batch - after_single) == 1
+        rows = connection.table("lance_ns.main.clips").to_arrow_table().to_pylist()
+    assert len(rows) == len({row["clip_id"] for row in rows}) == 6
+    assert {row["asset_id"] for row in rows} == {"a", "b", "c"}
+    for row in rows:
+        assert row["ocr_vector"] is None
+        assert row["fused_vector"] == [row["start_sec"], 1]
+        assert (row["subtitles_vector"] is None) == (row["start_sec"] == 10)
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("backend", ["ray_task", "ray_actor"])
+@pytest.mark.parametrize("consumer", ["read", "parquet"])
+def test_preprocess_error_is_not_retried_when_a_second_call_would_succeed(
+    ray_local, monkeypatch, tmp_path, backend, consumer
+):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    directory = str(tmp_path)
+
+    class Source(TimelineSource):
+        def probe(self, uri):
+            with Path(directory, "probe").open("a") as log:
+                log.write("probe\n")
+            return VideoMediaInfo(10, self.supported_modalities)
+
+        def extract(self, *args):
+            marker = Path(directory, "called")
+            if not marker.exists():
+                marker.touch()
+                raise RuntimeError("first extraction failed")
+            Path(directory, "retried").touch()
+            return []
+
+    with (
+        vane.connect() as connection,
+        VideoEmbeddingPipeline(
+            source=Source(), profiles={"subtitles": VideoEmbeddingProfile("v1", TextProfile())}
+        ) as pipeline,
+    ):
+        relation = pipeline.ingest(
+            {"asset_id": "a", "source_version": "v1", "uri": "memory://video"},
+            connection=connection,
+            modalities=["subtitles"],
+            resources={"preprocess": {"execution_backend": backend, "cpus": 0.25}},
+        )
+        with pytest.raises(Exception, match="first extraction failed"):
+            if consumer == "read":
+                relation.to_arrow_table()
+            else:
+                relation.write_parquet(str(tmp_path / "failed.parquet"))
+    assert not (tmp_path / "retried").exists()
+    assert (tmp_path / "probe").read_text() == "probe\n"
