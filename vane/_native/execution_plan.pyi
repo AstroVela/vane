@@ -6,6 +6,10 @@ from typing import Any
 
 from . import DuckDBPyConnection
 
+class SourceSnapshotCache:
+    def __init__(self, directory: str, capacity_bytes: int) -> None: ...
+    def snapshot(self) -> dict[str, int]: ...
+
 def engine_identity() -> str: ...
 def compile(
     connection: DuckDBPyConnection,
@@ -32,6 +36,7 @@ def stage_submission(
     hash_columns: Sequence[int],
     directory: str,
     source_budget: int,
+    source_cache: SourceSnapshotCache | None = None,
 ) -> dict[str, Any]: ...
 def inspect_submitted_fragment(
     connection: DuckDBPyConnection,

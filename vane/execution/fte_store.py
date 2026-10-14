@@ -451,7 +451,8 @@ class QueryStoreLease:
         # renewal atomically changes expiry only, not the reserved byte count.
         with self._close_lock:
             if self.closed or self.closing:
-                return
+                # Another thread may close while this one waits for the lock.
+                return  # type: ignore[unreachable]
             record = self.pool.allocations / f"{self.value['namespace']}.json"
             current = _read(record)
             if current["lease_id"] != self.value["lease_id"] or current["expires"] <= time.time():
