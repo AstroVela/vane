@@ -981,3 +981,105 @@ Owned processes stop before temporary/spill cleanup. The shared oracle cache
 is removed after recording its hashes; configurations retain input identities,
 result row counts/hashes and cleanup manifests. Original SF10 inputs remain
 unchanged.
+
+## Filtering compressed join keys and batching aggregate merges (2026-10-15)
+
+Q12 still exchanged all 15 million orders, although its filtered lineitem build
+contained 310,803 rows. Native integer compression inserts computed projections
+before the join. Scan filter pushdown cannot cross those projections, leaving
+`build_side_has_filter` unset even though the build is filtered. The distributed
+planner now also recognizes a FILTER or filtered scan beneath build-root
+projections while native join-filter optimization remains enabled. It applies
+the necessary SEMI filter after the computed probe projection, using the actual
+join-key type, and does not move it through that projection.
+
+Exact key-only domains now allow a 16 MiB estimate and require fewer than one
+quarter of the estimated probe rows. Added full-build and key-replica traffic
+must still be below the probe exchange estimate. Complete-build broadcasts keep
+their previous limits. Filtered aggregates with key estimates above 8 MiB retain
+the existing bounded 65,536-value hash-domain path. Estimates are planning
+limits; actual execution continues to enforce operator and channel budgets.
+
+Separately, merging exported aggregate states previously constructed temporary
+vectors and called combine for each row. The merge now builds aligned private
+state copies and target pointers for the current batch and calls the original
+native combine once. NULL states are skipped, repeated targets retain input
+order, malformed state lengths still fail, and destructive combine cannot
+modify the input blobs. State serialization and finalization remain unchanged.
+
+The fresh comparison freezes `8f2fc9c9f5`'s installed `0.3.0.dev100` runtime and
+compares it with `0.3.0.dev101`. Both use `/data/tpch10`, two 18-CPU workers,
+two partitions, 16 GiB operator memory per worker, a 1 MiB exchange window,
+64 KiB frames, 2048 rows and 16 slots. Timing includes submission, collection
+and successful close; startup and comparisons are excluded. Host load and OS
+caches are shared. No task-owned builds or tests run during measured comparisons.
+
+| Measurement, seconds | Frozen baseline | Final candidate | Local, final pass |
+|---|---:|---:|---:|
+| All 22 queries, one full pass | 29.887 | **27.393** | 9.085 |
+| Q12, full pass | 2.512 | **0.576** | 0.284 |
+| Q12, median of three focused repetitions | 2.299 | **0.538** | 0.279 |
+
+The full pass improves **8.3%**, remaining **3.02 times local**. Q12's focused
+median improves **76.6%**, reaching **1.93 times local**. All other 21 complete
+serialized graphs are identical after normalizing only engine identity; Q12
+adds one key-domain fragment. Q10's focused median is 2.594 to 2.571 seconds.
+Q18 varies from 2.926 to 2.644 in the focused comparison but only 2.713 to 2.679
+in the full pass; a separate batch-merge-only control measured 2.906. These
+measurements do not establish a substantial end-to-end Q18 improvement.
+
+Completed in-process native diagnostics, separate from Ray timing, show Q12
+orders exchange falling from **15,000,000 to 291,909 rows**. Including the
+extra full-build and key-domain branches, total accepted channel rows fall from
+**15,310,811 to 1,224,326**. Shared broadcast channels count once; these are work
+counts, not network bytes. Both results match local exactly and have the same
+output hash; all tasks finish, channel bytes and leases return to zero, and
+window bounds hold.
+
+An isolated final-aggregate diagnostic merges 1,048,576 decimal-sum states into
+4096 groups using one native thread. Median aggregate CPU time over three runs
+falls from **213.3 ms to 32.8 ms (84.6%)**. All results match. This measurement
+excludes Ray and source scans; Python row conversion is outside the reported
+operator CPU time. It does not imply an equivalent query latency reduction.
+
+The final baseline/candidate qualification contains **136 matching timing
+samples**: two complete 44-sample passes and two focused 24-sample passes.
+Another 48 samples from intermediate merge-only and budget-only candidates are
+retained separately. The budget-only candidate did not change Q12's graph;
+the additional build-filter recognition is necessary. Every run records input
+identities, output counts/hashes, successful cleanup and an untriggered disk guard.
+
+Native SHA-256 identities, in baseline/final order:
+
+```text
+758aaff0642304993ba57c9378a22f77214a79af5565bccbc2034465da3a2f46
+2b7c71426f703a274d58c4a279a1781b21ff1f4ee00049924134cba23c5ccf31
+```
+
+Evidence is retained under `build/pipelined-exchange-followup-20261015/`, including
+all six timing runs, `comparison.json`, normalized graph comparisons, final
+aggregate profiles, completed Q12 work counts, source identities and test logs.
+The frozen acceptance driver SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+
+Validation passes **716 affected native/compiler/SQL/performance cases** and
+**42 targeted real-Ray cases**, including both public modes, repeated aggregate
+targets, NULL and malformed states, numerical bounds, compressed-key filtering,
+small windows, cancellation and shared-build consumer loss with committed input
+reuse and a new fence. Two new volume regressions complete exact results on the
+frozen baseline and then fail the exchange-row bound.
+
+The Ray run first passed 40 cases; its two new aggregate assertions compared
+incompatible interval result representations. The final fixture casts the
+interval result to VARCHAR, as existing interval tests do, and both public
+cases plus 14 focused native cases pass. No production change was needed.
+The first compressed-key fixture was below the native compression threshold;
+its corrected cardinality exercises the intended projection boundary. Logs
+retain these fixture corrections. The full release suite and large-query FTE
+timings were not rerun. Formatting, applicable pinned pre-commit hooks, copyleft
+inventory and `git diff --check` pass.
+
+Owned benchmark processes stop before temporary/spill cleanup. The shared
+oracle cache is removed after recording its 22 output-file hashes. Completed
+test fixtures are also removed, with paths and sizes retained in cleanup
+manifests; active test files and original SF10 inputs are preserved.

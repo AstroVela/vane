@@ -942,11 +942,32 @@ private:
 		return false;
 	}
 
+	bool HasFilteredBuildRoot(const PhysicalOperator &root) {
+		auto op = &root;
+		while (op->type == PhysicalOperatorType::PROJECTION) {
+			op = &op->children[0].get();
+		}
+		if (op->type == PhysicalOperatorType::FILTER) {
+			return true;
+		}
+		if (op->type == PhysicalOperatorType::TABLE_SCAN) {
+			auto &scan = op->Cast<PhysicalTableScan>();
+			return scan.table_filters && !scan.table_filters->filters.empty();
+		}
+		return false;
+	}
+
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
 		EarlyProbeFilter result;
 		auto &build = join.children[1].get();
 		if (partitions == 1 || (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
-		    !join.filter_pushdown || !join.filter_pushdown->build_side_has_filter || !build.estimated_cardinality) {
+		    !join.filter_pushdown || !build.estimated_cardinality) {
+			return result;
+		}
+		// Native scan pushdown cannot cross an integer compression projection.
+		// A filter at the exchange boundary still sees the exact join-key type;
+		// recognize a filtered build even when no native scan target was found.
+		if (!join.filter_pushdown->build_side_has_filter && !HasFilteredBuildRoot(build)) {
 			return result;
 		}
 		const bool broadcast = BroadcastJoin(join, partitions);
@@ -1020,18 +1041,23 @@ private:
 			auto key_bytes =
 			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
 			target.keys_only = !broadcast;
-			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024;
+			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
 			if (target.hashed) {
 				// HAVING estimates can hide a tiny build. A distinct hash domain
 				// has at most 65536 entries even when that estimate is wrong.
 				// Collisions only retain extra probes; the original join is exact.
-				if (!HasFilteredAggregate(build) || target.input->estimated_cardinality <= 8 * 65536) {
+				if (target.input->estimated_cardinality <= 8 * 65536) {
 					continue;
 				}
 				key_bytes = 65536 * 9;
-			} else if (double(build.estimated_cardinality) * 8 >= double(target.input->estimated_cardinality)) {
+			} else if ((!broadcast && key_bytes > 16 * 1024 * 1024) ||
+			           double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
+			               double(target.input->estimated_cardinality)) {
 				continue;
 			}
+			// Key-only replicas carry no payload. Allow a larger estimate and
+			// fourfold selectivity, while still charging every extra build/key
+			// edge below. Complete-build broadcasts keep their smaller limits.
 			auto traffic = broadcast ? EstimatedExchangeBytes(build) * partitions
 			                         : EstimatedExchangeBytes(build) + key_bytes * partitions;
 			if (traffic < EstimatedExchangeBytes(*target.input)) {

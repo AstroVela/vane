@@ -31,7 +31,7 @@ from tests.fast.test_analytical_fragment_compiler import (
     scaled_wide_value,
     wide_aggregate_queries,
 )
-from tests.fast.test_execution_performance import interval_average_queries
+from tests.fast.test_execution_performance import batched_aggregate_query, interval_average_queries
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -69,6 +69,21 @@ def test_interval_average_preserves_wide_partition_states(tmp_path, mode):
             expected = local.execute(sql).fetchall()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 assert [tuple(row.values()) for row in result.collect().to_pylist()] == expected, sql
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_batched_aggregate_states(tmp_path, mode):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        for groups in (7, 4099):
+            sql = batched_aggregate_query(groups)
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
             assert_idle(connection)
 
 

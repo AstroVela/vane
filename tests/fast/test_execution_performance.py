@@ -125,6 +125,88 @@ def test_partial_aggregates_exchange_native_states(expressions):
         assert execute_graph(connection, graph) == expected
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("nulls", ["none", "mixed", "all"])
+def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(grouped, nulls):
+    sql = (
+        "select range k, sum(range) s, count(range) n from range(8) group by k"
+        if grouped
+        else "select sum(range) s, count(range) n from range(8)"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        partials = native._execute_fragment_for_test(
+            connection,
+            producer.native_plan,
+            {},
+            {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
+        )
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        # Exceed a native vector and revisit each target many times in a batch.
+        # NULL state blobs must be skipped independently for each aggregate.
+        rows = []
+        sums, counts = Counter(), Counter()
+        for index in range(4099):
+            partial = partials[index % len(partials)]
+            key = partial[0] if grouped else 0
+            sum_state, count_state = partial[-2:]
+            if nulls == "all" or (nulls == "mixed" and index % 3 == 0):
+                sum_state = None
+            if nulls == "all" or (nulls == "mixed" and index % 5 == 0):
+                count_state = None
+            rows.append((*partial[:-2], sum_state, count_state))
+            if sum_state is not None:
+                sums[key] += key if grouped else 28
+            if count_state is not None:
+                counts[key] += 1 if grouped else 8
+        expected = [
+            (*((key,) if grouped else ()), sums.get(key), counts[key]) for key in (range(8) if grouped else [0])
+        ]
+        for _ in range(2):
+            assert Counter(
+                native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            ) == Counter(expected)
+        malformed = [list(row) for row in rows]
+        malformed[-1][-1] = partials[0][-1] + b"invalid"
+        with pytest.raises(vane.IOException, match="Aggregate state size mismatch"):
+            native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: malformed}, {})
+        assert connection.execute("select 42").fetchall() == [(42,)]
+
+
+def batched_aggregate_query(groups):
+    return (
+        "select k, sum(v), count(v), avg(v), min(v), max(v), "
+        "sum(v::decimal(15,2)), avg(v::decimal(15,2)), "
+        "sum(v::hugeint), avg(v::hugeint), avg(interval '1 microsecond' * v)::varchar, "
+        "sum(v) filter(where i % 3=0), count(*) filter(where false) "
+        f"from (select range i, range % {groups} k, "
+        "case when k % 17=0 or range % 11=0 then null else range % 257-128 end v "
+        "from range(65539)) group by k order by k"
+    )
+
+
+@pytest.mark.parametrize("groups", [7, 4099])
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_merge_aggregate_batches_across_bounded_channels(groups, threads, partitions):
+    sql = batched_aggregate_query(groups)
+    limits = DirectExchangeLimits(65536, 16384, 127, 4)
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        with InProcessTaskService(
+            connection, submission(connection, sql, partitions=partitions), limits=limits
+        ) as service:
+            service.start()
+            assert collect(service) == expected
+            assert all(
+                item.snapshot()["bytes"] == item.snapshot()["leased_bytes"] == 0
+                and item.snapshot()["peak_bytes"] <= limits.window_bytes
+                for item in service.channels.values()
+            )
+
+
 @pytest.mark.parametrize("duplicate", [False, True])
 def test_one_parquet_file_uses_all_partitions_with_hive_and_row_numbers(tmp_path, duplicate):
     directory = tmp_path / "part=42"
@@ -498,17 +580,24 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
 
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
-@pytest.mark.parametrize("domain", ["exact", "hashed"])
+@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed"])
 def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, partitions, domain):
     with vane.connect(backend="local", config={"threads": threads}) as connection:
-        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain)
+        path = tmp_path / "fact.parquet"
+        sql = large_join_key_query(connection, path, domain)
         expected = connection.execute(sql).fetchall()
         spec = submission(connection, sql, partitions=partitions)
         sources = {
-            f.fragment_id for f in spec.graph.fragments if any(s.function_name == "read_parquet" for s in f.sources)
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(path).encode() in split.payload for s in f.sources for split in s.splits)
         }
         fact_edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
-        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        limits = (
+            DirectExchangeLimits(65536, 16384, 256, 2)
+            if domain in ("estimated", "compressed")
+            else DirectExchangeLimits(4096, 1024, 64, 1)
+        )
         with InProcessTaskService(connection, spec, limits) as service:
             service.start()
             assert collect(service) == expected
@@ -521,7 +610,9 @@ def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, 
             assert fact_edges and fact_rows < 65536
             assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
         assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
-        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == (
+            0 if domain == "compressed" else 1
+        )
 
 
 @pytest.mark.parametrize("domain", ["dense", "empty"])

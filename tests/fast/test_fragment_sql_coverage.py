@@ -179,19 +179,41 @@ DETERMINISTIC_TIMEZONES = [
 
 
 def large_join_key_query(connection, path, domain="exact", kind="inner", comparison="="):
+    if domain == "compressed":
+        build_path = path.with_stem("build")
+        connection.execute(
+            "copy (select range%4096 i, range%65536 k, 'fact-'||(range%4096)::varchar payload "
+            f"from range(5242880)) to '{path}' (row_group_size 2048)"
+        )
+        connection.execute(
+            "copy (select range%65536 k, 'build-'||(range%4096)::varchar v, 'other-'||(range%4096)::varchar w, "
+            f"'third-'||(range%4096)::varchar z from range(1048576)) to '{build_path}' (row_group_size 2048)"
+        )
+        # Both key columns have statistics: native compression creates a
+        # computed projection through which scan filter pushdown cannot pass.
+        output = ", b.v, b.w, b.z" if kind in ("inner", "left") else ""
+        return (
+            f"select p.i, p.k, p.payload{output} from read_parquet('{path}') p "
+            f"{kind} join (select * from read_parquet('{build_path}') where k%16384=0) b "
+            f"on p.k {comparison} b.k order by all"
+        )
+    count = 8388608 if domain == "estimated" else 1048576
+    value = "range%4096" if domain == "estimated" else "range"
     connection.execute(
-        "copy (select range i, case when range%8192=0 then null else range%65536 end k, "
-        f"'fact-'||range::varchar payload from range(1048576)) to '{path}' (row_group_size 2048)"
+        f"copy (select {value} i, case when range%8192=0 then null else range%65536 end k, "
+        f"'fact-'||({value})::varchar payload from range({count})) to '{path}' (row_group_size 2048)"
     )
     key = "case when range%8192=0 then null else range%65536 end"
     if domain == "dense":
         # More distinct input keys than the filter's fixed domain bound.
         key = key.replace("range%65536", "range%262144")
-    if domain == "exact":
-        build = (
-            f"select {key} k, 'build-'||range::varchar v, 'other-'||range::varchar w "
-            "from range(327680) where range%1024=0"
+    if domain in ("exact", "estimated"):
+        # The estimated variant has 1.5M build rows: its BIGINT key domain
+        # is 12.9 MiB, and the probe/build row ratio is between 4 and 8.
+        source = (
+            "range(7500000) where range%65536=1024" if domain == "estimated" else "range(327680) where range%1024=0"
         )
+        build = f"select {key} k, 'build-'||range::varchar v, 'other-'||range::varchar w from {source}"
         output = ", b.v, b.w" if kind in ("inner", "left") else ""
     else:
         total = "sum(range*1024)" if domain == "dense" else "sum(range)"

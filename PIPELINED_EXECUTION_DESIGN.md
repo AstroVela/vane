@@ -315,6 +315,8 @@ DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `o
 
 聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。状态合并复用引擎的 combine/finalize 包装器，FragmentGraph 独立构图。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。
 
+合并 partial 聚合状态时，按当前输入批次收集有效状态与目标地址，一次调用原生 combine。每条状态仍检查长度并复制到独立、对齐的临时空间，避免修改共享或未对齐的字符串存储；NULL 状态跳过，重复目标地址按输入顺序合并。临时空间随当前批次大小增长，不保留跨批次状态，也不改变 partial 状态的编码与最终数值范围检查。
+
 ### 大文件与交换吞吐
 
 Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row groups 划为最多 `partition_count` 个连续范围，通过原生 `row_group_ids` 扫描。单个大文件因此能分配给多个 worker；重复扫描引用、Hive 路径以及原文件内的 `file_row_number` 都保留。优化前收集的数据源依赖仍按完整文件验证，不随行组或过滤裁剪丢失。
@@ -335,7 +337,9 @@ DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipelin
 
 提前过滤通过原生 NULL 安全 SEMI join 保留 probe 重复行，最终 join 仍负责实际匹配和输出重复次数。原 join 与提前过滤分支共用同一 build fragment 的完整输出，不复制扫描或重算 join；两个分支都先消费 build 再读取 probe，额外通道仍计入原来的窗口预留。FTE 两个下游绑定同一已提交 producer 的各自输出，失败消费者沿用输入身份并更换 fence。该路径不放宽广播大小，也不根据运行后的实际小结果忽略原来的基数估计。
 
-若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。键域估计仍限制在 8 MiB，行数少于目标输入八分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
+若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。精确键域估计限制在 16 MiB，行数少于目标输入四分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。这些是规划估计，实际执行仍受 operator memory 和通道预算约束。完整 build 广播与其提前过滤继续使用原来的较小门槛。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
+
+原生 join-filter 优化启用时，除了已有的 build 过滤标记，规划器还检查 build 根部 projection 之下的 FILTER 或带表过滤的 scan。整数压缩投影可能阻止原生过滤下推至 scan，却不妨碍在该投影输出上按原 join 的键类型做 SEMI 过滤。该路径停在计算投影之后，不把压缩后的键直接用于原始扫描列；仍不穿过 LIMIT、聚合、外连接与共享状态边界。
 
 对于含 HAVING 的聚合子树，键数可能严重高估。键域估计超过 8 MiB 时，可将键转为 `hash(key) & 65535`，先在各分区去重，再聚合为完整集合，最后广播。每个 probe 分区最多接收 65,536 个 UBIGINT 哈希值；即使 HAVING 实际保留大量行，过滤集合也不会随原始基数无限增长。哈希碰撞只会多保留 probe 行，原 join 继续检查精确键、NULL 与其他条件。这一路径要求原生 build 过滤信息、目标输入估计大于 524,288 行，且新增 build 与过滤副本流量小于原输入交换；密集键域可能没有过滤收益。聚合与 SEMI build 都先消费共享 build，保留背压、取消和 FTE 已提交输入重放契约。
 
