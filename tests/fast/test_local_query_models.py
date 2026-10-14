@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -104,7 +105,13 @@ def _assert_idle(runtime):
     assert state["request_admission"]["active_requests"] == 0
     assert state["request_admission"]["queued_requests"] == 0
     if state.get("data") is not None:
-        assert state["data"]["usage_bytes"] == 0
+        # The completed future's callback can still hold its output while
+        # unwinding after the native query has returned and retired its request.
+        deadline = time.monotonic() + 5
+        while state["data"]["usage_bytes"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+            state = runtime.resource_snapshot()
+        assert state["data"]["usage_bytes"] == 0, state["data"]
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -458,6 +465,48 @@ def test_model_initialization_uses_captured_session_environment(monkeypatch):
         for _ in range(2):
             assert connection.execute("SELECT environment(1)").fetchall() == [("captured",)]
             _assert_idle(runtime)
+
+
+def test_model_idle_check_waits_for_completion_callback_refs(tmp_path, monkeypatch):
+    from vane.execution.udf_subprocess import UDFExecutor
+
+    entered, observed, proceed = threading.Event(), threading.Event(), threading.Event()
+    notify = UDFExecutor._notify_wakeup
+
+    def notify_before_callback_returns(executor):
+        notify(executor)
+        if not entered.is_set() and executor._pending_batches == 0 and not executor._task_futures:
+            entered.set()
+            assert proceed.wait(10)
+
+    monkeypatch.setattr(UDFExecutor, "_notify_wakeup", notify_before_callback_returns)
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        model = _register(runtime, _class_model(tmp_path))
+        vane.attach_function(model, connection=connection)
+        snapshot = runtime.resource_snapshot
+
+        def observe_callback_refs():
+            state = snapshot()
+            if entered.is_set() and state["data"]["usage_bytes"]:
+                observed.set()
+            return state
+
+        monkeypatch.setattr(runtime, "resource_snapshot", observe_callback_refs)
+
+        def query():
+            assert int(connection.execute("SELECT model_encode(1)").fetchall()[0][0].split(":")[1]) == 11
+            _assert_idle(runtime)
+
+        with ThreadPoolExecutor(1) as clients:
+            pending = clients.submit(query)
+            try:
+                assert entered.wait(5), "completion callback did not reach its final wakeup"
+                assert observed.wait(5), "idle check did not observe the callback's retained output"
+            finally:
+                proceed.set()
+            pending.result(timeout=10)
+        _assert_idle(runtime)
 
 
 @pytest.mark.parametrize("captured", [None, "1000000"])
