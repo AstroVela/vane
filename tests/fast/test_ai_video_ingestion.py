@@ -81,14 +81,62 @@ class WideTextProfile(TextProfile):
         return WideEncoder()
 
 
-def test_video_ingestion_rejects_missing_input_identity(monkeypatch):
+def test_video_ingestion_rejects_missing_uri(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local")
     with (
         vane.connect() as connection,
         VideoEmbeddingPipeline(profiles={"visual": VideoEmbeddingProfile("video-v1", VisualProfile())}) as pipeline,
     ):
-        with pytest.raises(ValueError, match="VARCHAR asset_id"):
-            pipeline.batch_ingest(connection.sql("SELECT 'video' AS uri"), modalities=["visual"])
+        with pytest.raises(ValueError, match="VARCHAR uri"):
+            pipeline.batch_ingest(connection.sql("SELECT 'video' AS asset_id"), modalities=["visual"])
+
+
+@pytest.mark.real_ray
+def test_durable_create_and_automatic_ids_use_ray_plan(ray_local, monkeypatch, tmp_path):
+    from vane.ai import VideoJobStore
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    driver_pid = os.getpid()
+
+    class Source:
+        supported_modalities = frozenset({"visual"})
+
+        def source_version(self, uri):
+            assert os.getpid() != driver_pid
+            return "immutable-fixture-v1"
+
+        def probe(self, uri):
+            assert os.getpid() != driver_pid
+            return VideoMediaInfo(2, self.supported_modalities)
+
+        def extract(self, uri, modality, clip, media):
+            return [
+                TimedContent(
+                    clip.start, clip.end, VideoClip((np.zeros((2, 2, 3), np.uint8),), (clip.start + 0.1,), (0,))
+                )
+            ]
+
+    store = VideoJobStore(tmp_path / "jobs.sqlite")
+    with VideoEmbeddingPipeline(
+        source=Source(),
+        profiles={"visual": VideoEmbeddingProfile("v1", VisualProfile())},
+        job_store=store,
+        pipeline_version="v1",
+    ) as pipeline:
+        task = pipeline.create(
+            {"input": {"type": "video", "uri": "memory://video"}, "modalities": ["visual"], "async": True}
+        )
+        result = task.result(timeout=120)
+        with vane.connect() as con:
+            rows = (
+                pipeline.batch_ingest(con.sql("SELECT 'memory://video' AS uri"), modalities=["visual"])
+                .to_arrow_table()
+                .to_pylist()
+            )
+    reopened = VideoJobStore(store.path)
+    assert reopened.get_task(task.id, pipeline_version="v1").result() == result
+    assert result["data"][0]["source_version"] == "immutable-fixture-v1"
+    assert rows[0]["clip_id"] == result["data"][0]["clip_id"]
 
 
 @pytest.mark.real_ray

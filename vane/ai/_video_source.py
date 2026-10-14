@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -32,6 +33,8 @@ class VaneVideoSource:
         self,
         *,
         extractors: Mapping[str, Callable[[str, ClipWindow, VideoMediaInfo], Sequence[TimedContent]]] | None = None,
+        asr: Any = None,
+        ocr: Any = None,
         connection: Any = None,
         frames_per_clip: int = 8,
         sample_rate: int = 48000,
@@ -54,9 +57,18 @@ class VaneVideoSource:
         if frames_per_clip > 256:
             raise ValueError("frames_per_clip cannot exceed 256")
         self._extractors = dict(extractors or {})
+        self._models = {name: model for name, model in (("transcription", asr), ("ocr", ocr)) if model is not None}
+        if self._models.keys() & self._extractors.keys():
+            raise ValueError("Configure each text channel with either a model or an extractor")
+        if any(
+            not callable(model) or not callable(getattr(model, "identity", None)) for model in self._models.values()
+        ):
+            raise TypeError("ASR and OCR adapters must be callable and expose identity()")
         if any(key not in MODALITIES or not callable(fn) for key, fn in self._extractors.items()):
             raise ValueError("extractors must map known modalities to callables")
-        self.supported_modalities = frozenset({"visual", "audio", "subtitles"} | self._extractors.keys())
+        self.supported_modalities = frozenset(
+            {"visual", "audio", "subtitles"} | self._extractors.keys() | self._models.keys()
+        )
         self.connection = connection
         self.frames_per_clip = frames_per_clip
         self.sample_rate = sample_rate
@@ -65,6 +77,35 @@ class VaneVideoSource:
         self.max_clip_bytes = max_clip_bytes
         self.max_pixels = max_pixels
         self.timeout_seconds = positive_number(timeout_seconds, "timeout_seconds")
+
+    def source_version(self, uri: str) -> str:
+        """Hash bounded source bytes without materializing the video in memory."""
+        import vane
+
+        digest = hashlib.sha256()
+        with vane.File(uri).open(connection=self.connection) as reader:
+            size = reader.size()
+            if size > self.max_input_bytes:
+                raise ValueError("Video source exceeds max_input_bytes")
+            total = 0
+            while block := reader.read(1024 * 1024):
+                total += len(block)
+                if total > self.max_input_bytes:
+                    raise ValueError("Video source exceeds max_input_bytes")
+                digest.update(block)
+            if total != size:
+                raise ValueError("Video source changed while computing its version")
+        return "sha256:" + digest.hexdigest()
+
+    def extraction_identity(self, modality: str) -> Any:
+        model = self._models.get(modality)
+        return model.identity() if model is not None else None
+
+    def close(self) -> None:
+        for model in self._models.values():
+            close = getattr(model, "close", None)
+            if close is not None:
+                close()
 
     @contextmanager
     def _open(self, uri: str) -> Iterator[tuple[Any, Any]]:
@@ -155,6 +196,9 @@ class VaneVideoSource:
     def extract(self, uri: str, modality: str, clip: ClipWindow, media: VideoMediaInfo) -> Sequence[TimedContent]:
         if modality in self._extractors:
             return self._extractors[modality](uri, clip, media)
+        if modality in self._models:
+            channel = "audio" if modality == "transcription" else "visual"
+            return self._models[modality](clip, self.extract(uri, channel, clip, media))
         if modality not in {"visual", "audio", "subtitles"}:
             raise ValueError(f"Configure an extractor for {modality}")
         with self._open(uri) as (container, av):

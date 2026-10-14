@@ -438,7 +438,7 @@ fixed clips. Channel selection and vector output are independent:
 
 | Field | Values and meaning |
 | --- | --- |
-| `input` | `type="video"`, `uri`, explicit `asset_id` and immutable `source_version` |
+| `input` | `type="video"`, `uri`; optional `asset_id` and immutable `source_version` |
 | `modalities` | Nonempty, unique list of `visual`, `audio`, `subtitles`, `transcription`, `ocr` |
 | `selection.policy` | `all` (default), or `first_available` within each clip |
 | `selection.priority` | Only with `first_available`; an exact permutation of the modalities. Defaults to their supplied order. |
@@ -446,7 +446,7 @@ fixed clips. Channel selection and vector output are independent:
 | `segmentation.clip_seconds` | Finite positive seconds; default 10 |
 | `output` | `separate` (default), `fused`, or `both` |
 | `return_timeline` | Include selected content intervals and text; default `true` |
-| `async` | Return an in-process `VideoEmbeddingTask`; default `false` |
+| `async` | Return a task handle immediately; durable when configured with `VideoJobStore`; default `false` |
 | `sync_budget` | `timeout_seconds` and `max_video_seconds`, each defaulting to 60 |
 
 These controls do not implement search AND/OR. Independent vectors can be used
@@ -512,7 +512,7 @@ to both clips; point events belong only to the half-open interval containing the
 Inputs must report a finite positive duration; live or unknown-length sources are
 rejected before segmentation.
 
-Speech recognition and OCR require explicit application extractors. Pass
+Speech recognition and OCR support built-in adapters or application extractors. Pass
 `VaneVideoSource(extractors={"transcription": asr, "ocr": ocr})` as `source=`.
 Each callable takes `(uri, ClipWindow, VideoMediaInfo)` and returns a sequence of
 `TimedContent(start, end, value)` objects. Timestamps are absolute asset seconds,
@@ -563,8 +563,8 @@ does skip visual for that clip.
 profile name, dimensions and supported modality combinations. Its `embed` callback
 receives `(clip, selected_timed_content, fusion_options)` and may return a vector
 or an awaitable vector. It must use a model capable of joint inputs and interpret
-the supplied common timeline. Current built-in independent encoders are not
-declared joint encoders. Vane never adds vectors merely because their dimensions
+the supplied common timeline. The built-in Qwen3-VL and Cohere adapters below
+encode joint inputs. Vane never adds vectors merely because their dimensions
 agree. Unsupported combinations after selection fail, including a missing input
 or a single selected modality unless that combination is explicitly supported.
 An entirely empty clip produces no vector and retains its audit record.
@@ -596,11 +596,126 @@ caller's connection. The video-duration budget is checked in the common probe
 stage before any extraction. The wall-clock budget includes queueing, plan
 construction and Ray startup.
 
-Task IDs are process-local and are not a durable queue or HTTP service. The
+Without a job store, task IDs are process-local. The
 pipeline submits one `create()` job at a time, with stages running in parallel
 within the query, retains at most `max_tasks=128` tasks, and bounds
 segmentation with `max_clips=10000`. Use `forget_task(id)` after consuming a
 completed task to release its result; running tasks cannot be forgotten.
+
+### Built-in local and cloud video models
+
+Model adapters load only inside executing workers. `VaneVideoSource(asr=..., ocr=...)`
+decodes bounded audio/frames and passes them to the selected adapters. No application
+callback is required. Every entry point uses the same adapters. For example:
+
+```python
+from vane.ai.video import VaneVideoSource
+from vane.ai.video_models import (
+    FasterWhisperASR, RapidOCRExtractor, Qwen3VLFusion,
+    DeepgramASR, GoogleVisionOCR, CohereFusion,
+)
+
+local_source = VaneVideoSource(
+    asr=FasterWhisperASR("/models/whisper", profile="whisper-checkpoint-v1", language="zh"),
+    ocr=RapidOCRExtractor(
+        "/models/ocr/det.onnx", "/models/ocr/rec.onnx", "/models/ocr/keys.txt",
+        profile="ocr-checkpoint-v1",
+    ),
+)
+local_fusion = Qwen3VLFusion("/models/qwen", frame_size=224).profile("qwen-joint-224-v1")
+
+cloud_source = VaneVideoSource(
+    asr=DeepgramASR(profile="deepgram-v1", model="nova-3", language="en"),
+    ocr=GoogleVisionOCR(profile="vision-ocr-v1"),
+)
+cloud_fusion = CohereFusion(dimensions=1024).profile("cohere-joint-v1")
+
+pipeline = VideoEmbeddingPipeline(
+    profiles=embedding_profiles, source=cloud_source, fusion=cloud_fusion,
+)
+```
+
+Install `vane-ai[video,video_asr,video_ocr]` for local ASR/OCR and `qwen3_vl` for
+local fusion. Checkpoints, ONNX files and the OCR character dictionary must already
+exist on every worker; adapters do not download models. RapidOCR uses CPU ONNX
+without an angle classifier. Whisper explicitly selects CPU/int8 or CUDA/precision
+and uses one decoding temperature. Configure stage resources to match the models;
+actors retain loaded models between batches and tasks release them per invocation.
+
+Qwen fusion reuses the existing BF16 CUDA checkpoint contract, encodes the frames
+and timestamped text in one forward pass, and resizes RGB frames to the declared
+square `frame_size` with bicubic interpolation. It preserves frame times/counts;
+the existing even-frame and token/byte limits still apply. Include this preprocessing
+in the profile version. Cohere sends one Embed v4 input containing PNG frames,
+their absolute times, and timed text, with truncation disabled. Both adapters support
+visual and the three text channels, including their nonempty subsets. Neither accepts
+raw audio or fusion weights; unsupported selected combinations fail without dropping inputs.
+Use independent audio embeddings for audio-inclusive indexing. These capabilities
+do not establish retrieval quality on a particular corpus.
+
+Cloud adapters read `DEEPGRAM_API_KEY`, `GOOGLE_VISION_API_KEY` and `COHERE_API_KEY`
+from the worker environment (variable names are configurable). They send only the
+selected decoded clips/frames to their respective providers. Credentials are not
+captured in descriptors or job records. Requests have finite timeouts and bounded
+bodies, disable redirects and retries, and propagate errors. Empty successful ASR/OCR
+results remain normal absence. ASR offsets are rebased to absolute asset seconds;
+OCR observations use their sampled frame times. Channel metadata includes the
+extraction provider/model/profile in addition to the embedding identity.
+
+Protocol references: [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+[RapidOCR](https://rapidai.github.io/RapidOCRDocs/main/en/install_usage/rapidocr/usage/),
+[Deepgram pre-recorded audio](https://developers.deepgram.com/reference/speech-to-text/listen-pre-recorded),
+[Google Vision OCR](https://docs.cloud.google.com/vision/docs/ocr),
+[Cohere joint inputs](https://docs.cohere.com/v2/reference/embed), and
+[Qwen mixed inputs](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B).
+The optional faster-whisper runtime uses MIT, RapidOCR uses Apache-2.0, and ONNX
+Runtime uses MIT. No upstream code, model weights or datasets are bundled here;
+model licenses remain properties of the separately provisioned checkpoints.
+
+### Persistent asynchronous tasks
+
+```python
+from vane.ai import VideoJobStore
+
+store = VideoJobStore("state/video-jobs.sqlite")
+with VideoEmbeddingPipeline(
+    profiles=embedding_profiles, source=cloud_source, fusion=cloud_fusion,
+    job_store=store, pipeline_version="video-search-v1",
+) as pipeline:
+    task = pipeline.create(request)  # request["async"] = True
+    print(task.id)
+    result = task.result()
+
+# After restarting, recreate the pipeline with the same version/configuration:
+# task = pipeline.get_task(saved_id)
+# if task.status == "interrupted":
+#     task = pipeline.resume_task(saved_id)
+# Results can also be read without constructing models or a pipeline:
+# store.get_task(saved_id, pipeline_version="video-search-v1").result()
+# store.list_tasks("video-search-v1")
+```
+
+The SQLite store persists JSON requests, execution options, status, sanitized errors
+and results (64 MiB maximum per result by default). It never persists executable
+Python plans, callbacks, model objects or credentials. Keep the database on a local
+filesystem with SQLite locking support. It may contain source URIs and extracted
+text; newly created database files have owner-only permissions. This is an embedded
+Python task store, without an HTTP server or external job scheduler.
+
+`pipeline_version` is an application-controlled immutable identity for the entire
+configuration: sources, extraction/embedding/fusion profiles, model revisions and
+preprocessing. Supply that same configuration when resuming; change the version when
+changing any of it. Reopening does not automatically submit jobs. Pending unclaimed
+and interrupted asynchronous jobs can be resumed explicitly with the same task ID.
+Each worker heartbeats an ownership lease (30 seconds by default); an expired job
+becomes `interrupted`, and stale workers cannot publish results after a new claim.
+Resume reexecutes the read-only embedding plan from its input, not a per-clip checkpoint.
+Failed, cancelled and completed jobs cannot be resumed. A caller wait timeout does
+not cancel; an explicit cancellation is persisted and observed by the executing worker.
+
+The store manages `create()` requests. Lazy `ingest()`/`batch_ingest()` relations and
+their final Lance writes still execute in the caller's connection. No automatic
+replay of a Lance append is introduced, including after an uncertain commit outcome.
 
 ### Single and batch ingestion into one Lance table
 
@@ -611,11 +726,21 @@ Both return the same lazy relation and use the same output schema and final
 sink. `create()` also runs this plan over one asset and only formats its output
 into `data`/`clips`; it does not run a separate local media loop.
 
-The batch input contains `VARCHAR asset_id`, `source_version` and `uri`; identities must be
-unique and nonempty. A source version identifies immutable media. Stable
+The batch input requires `VARCHAR uri`; optional `VARCHAR asset_id` and
+`source_version` columns may be omitted or NULL. Supplied identities must be nonempty.
+Missing asset IDs become `uri-sha256:<SHA256 of exact URI UTF-8 bytes>`. Missing
+versions are computed by streaming the source bytes as `sha256:<content digest>`
+inside the shared probe stage, bounded by `max_input_bytes`. This adds one complete
+source read without retaining the video in memory. Custom sources must implement
+`source_version(uri)` or receive an explicit version. Use stable URIs, and keep
+source bytes immutable for the entire execution/resumption. A version hash cannot
+pin a mutable remote object by itself. Explicit IDs/versions avoid the extra read.
+
+Stable
 `clip_id` values include the asset identity, version, segmentation size and clip
-boundaries. All three entry points require these explicit identities; a URI is
-not treated as an immutable media version. Executing the same input again does not provide upsert semantics.
+boundaries. All three entry points resolve identities through the same stage;
+a URI is not treated as an immutable media version. Duplicate identities in one
+input are rejected. Executing the same input again does not provide upsert semantics.
 
 ```python
 with vane.connect() as con, VideoEmbeddingPipeline(

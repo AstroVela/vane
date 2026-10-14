@@ -603,6 +603,127 @@ def test_input_identity_is_explicit_and_validated_before_io(profiles, field, val
     assert not source.probes
 
 
+def test_automatic_identities_share_single_batch_and_create_plan(profiles):
+    import hashlib
+
+    class IdentifiedSource(Source):
+        def source_version(self, uri):
+            return "content-sha256-v1"
+
+    source = IdentifiedSource({(0, "visual"): visual()}, duration=10)
+    with VideoEmbeddingPipeline(source=source, profiles=profiles) as pipeline, vane.connect() as con:
+        options = {"modalities": ["visual"]}
+        single = pipeline.ingest({"uri": "memory://asset"}, connection=con, **options).to_arrow_table().to_pylist()
+        batch = pipeline.batch_ingest(con.sql("SELECT 'memory://asset' AS uri"), **options).to_arrow_table().to_pylist()
+        response = pipeline.create({"input": {"type": "video", "uri": "memory://asset"}, **options})
+    assert single == batch
+    assert single[0]["asset_id"] == "uri-sha256:" + hashlib.sha256(b"memory://asset").hexdigest()
+    assert single[0]["source_version"] == "content-sha256-v1"
+    assert response["data"][0]["clip_id"] == single[0]["clip_id"]
+
+
+def test_durable_pipeline_result_is_available_after_reopen(profiles, tmp_path):
+    from vane.ai import VideoJobStore
+
+    source = Source({(0, "visual"): visual()}, duration=10)
+    path = tmp_path / "jobs.sqlite"
+    with VideoEmbeddingPipeline(
+        source=source, profiles=profiles, job_store=VideoJobStore(path), pipeline_version="v1"
+    ) as pipeline:
+        task = pipeline.create(request(["visual"], **{"async": True}))
+        result = task.result(timeout=10)
+    with VideoEmbeddingPipeline(
+        source=source, profiles=profiles, job_store=VideoJobStore(path), pipeline_version="v1"
+    ) as reopened:
+        restored = reopened.get_task(task.id)
+        assert restored.status == "ready" and restored.result() == result
+        with pytest.raises(ValueError, match="Only"):
+            reopened.resume_task(task.id)
+        reopened.forget_task(task.id)
+
+
+def test_durable_interrupted_request_resumes_same_id(profiles, tmp_path):
+    import sqlite3
+
+    from vane.ai import VideoJobStore
+
+    store = VideoJobStore(tmp_path / "jobs.sqlite")
+    payload = request(["visual"], **{"async": True})
+    store.submit("original", "v1", payload, {}, 256 * 1024**2, 10)
+    store.claim("original", "v1", "dead-worker")
+    with sqlite3.connect(store.path) as database:
+        database.execute("UPDATE video_jobs SET lease_until=0")
+    source = Source({(0, "visual"): visual()}, duration=10)
+    with VideoEmbeddingPipeline(source=source, profiles=profiles, job_store=store, pipeline_version="v1") as pipeline:
+        assert pipeline.get_task("original").status == "interrupted"
+        assert pipeline.resume_task("original").result(timeout=10)["id"] == "original"
+    assert len(source.probes) == 1
+
+
+def test_durable_model_error_stays_failed_without_reexecution(profiles, tmp_path):
+    from vane.ai import VideoJobStore, VideoTaskError
+
+    source = Source({(0, "visual"): RuntimeError("secret-provider-message")}, duration=10)
+    with VideoEmbeddingPipeline(
+        source=source, profiles=profiles, job_store=VideoJobStore(tmp_path / "jobs.sqlite"), pipeline_version="v1"
+    ) as pipeline:
+        task = pipeline.create(request(["visual"], **{"async": True}))
+        with pytest.raises(VideoTaskError) as caught:
+            task.result(timeout=10)
+        assert "secret-provider-message" not in str(caught.value)
+        with pytest.raises(ValueError):
+            pipeline.resume_task(task.id)
+    assert len(source.calls) == 1
+
+
+def test_durable_remote_cancellation_interrupts_query(profiles, tmp_path, monkeypatch):
+    from vane.ai import VideoJobStore
+    from vane.ai._video_jobs import PersistedVideoTask
+
+    entered = threading.Event()
+
+    def execute(self, task_id, request, cancelled, deadline, resources, budget):
+        entered.set()
+        assert cancelled.wait(5)
+        raise CancelledError()
+
+    monkeypatch.setattr(VideoEmbeddingPipeline, "_execute", execute)
+    path = tmp_path / "jobs.sqlite"
+    with VideoEmbeddingPipeline(
+        source=Source(), profiles=profiles, job_store=VideoJobStore(path), pipeline_version="v1"
+    ) as pipeline:
+        task = pipeline.create(request(["visual"], **{"async": True}))
+        assert entered.wait(5)
+        PersistedVideoTask(task.id, VideoJobStore(path), "v1").cancel()
+        with pytest.raises(CancelledError):
+            task.result(timeout=5)
+
+
+def test_durable_heartbeat_failure_is_failed_not_user_cancellation(profiles, tmp_path, monkeypatch):
+    from vane.ai import VideoJobStore, VideoTaskError
+
+    store = VideoJobStore(tmp_path / "jobs.sqlite")
+    renew = store.renew
+
+    def fail_heartbeat(task_id, owner, *, processing=False):
+        if not processing:
+            raise OSError("private-storage-details")
+        return renew(task_id, owner, processing=True)
+
+    def execute(self, task_id, request, cancelled, deadline, resources, budget):
+        assert cancelled.wait(5)
+        raise CancelledError()
+
+    monkeypatch.setattr(store, "renew", fail_heartbeat)
+    monkeypatch.setattr(VideoEmbeddingPipeline, "_execute", execute)
+    with VideoEmbeddingPipeline(source=Source(), profiles=profiles, job_store=store, pipeline_version="v1") as pipeline:
+        task = pipeline.create(request(["visual"], **{"async": True}))
+        with pytest.raises(VideoTaskError, match="OSError") as caught:
+            task.result(timeout=5)
+        assert "private-storage-details" not in str(caught.value)
+        assert task.status == "failed"
+
+
 @pytest.mark.parametrize("options", [{"resources": {"embed": {"fallback": True}}}, {"max_batch_bytes": 0}])
 def test_create_rejects_invalid_execution_options_before_submission(profiles, options):
     source = Source()

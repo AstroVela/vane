@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+
 """Real container timestamps and normal missing tracks, without model weights."""
 
 from fractions import Fraction
@@ -118,3 +119,40 @@ def test_decode_limits_are_errors(tmp_path):
     for modality in ("visual", "audio"):
         with pytest.raises(ValueError, match="max_clip_bytes"):
             source.extract(uri, modality, ClipWindow(0, 1), media)
+
+
+def test_source_version_hashes_content_and_enforces_byte_budget(tmp_path):
+    import hashlib
+
+    path = tmp_path / "content.bin"
+    path.write_bytes(b"version one")
+    source = VaneVideoSource()
+    assert source.source_version(str(path)) == "sha256:" + hashlib.sha256(b"version one").hexdigest()
+    path.write_bytes(b"version two")
+    assert source.source_version(str(path)) == "sha256:" + hashlib.sha256(b"version two").hexdigest()
+    with pytest.raises(ValueError, match="max_input_bytes"):
+        VaneVideoSource(max_input_bytes=2).source_version(str(path))
+
+
+def test_model_extraction_uses_decoded_channel_and_releases_worker(tmp_path):
+    uri = make_media(tmp_path / "model.mkv")
+    calls = []
+
+    class ASR:
+        def __call__(self, clip, content):
+            calls.append(content)
+            return [TimedContent(clip.start, clip.end, "speech")]
+
+        def identity(self):
+            return {"provider": "fixture", "profile": "asr-v1", "model": "test"}
+
+        def close(self):
+            calls.append("closed")
+
+    source = VaneVideoSource(asr=ASR())
+    clip = ClipWindow(0, 1)
+    assert source.extract(uri, "transcription", clip, source.probe(uri)) == [TimedContent(0, 1, "speech")]
+    assert calls[0][0].value.sample_rate == 48000
+    assert source.extraction_identity("transcription")["profile"] == "asr-v1"
+    source.close()
+    assert calls[-1] == "closed"

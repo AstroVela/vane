@@ -130,10 +130,15 @@ def build_video_ingestion(
     source = pipeline._source
     options = validate_execution(source, resources, max_batch_bytes)
     profiles, fusion, max_clips = dict(pipeline._profiles), pipeline._fusion, pipeline._max_clips
-    required = {"asset_id", "source_version", "uri"}
+    required = {"uri"}
     input_schema = dict(zip(assets.columns, assets.types, strict=True))
-    if not required <= input_schema.keys() or any(str(input_schema[c]) != "VARCHAR" for c in required):
-        raise ValueError("video ingestion input requires VARCHAR asset_id, source_version and uri")
+    if "uri" not in input_schema or any(
+        str(input_schema[c]) != "VARCHAR" for c in ("uri", "asset_id", "source_version") if c in input_schema
+    ):
+        raise ValueError("video ingestion requires VARCHAR uri and optional VARCHAR asset_id, source_version")
+    projection = ", ".join(
+        name if name in input_schema else f"NULL::VARCHAR AS {name}" for name in ("asset_id", "source_version", "uri")
+    )
     groups = [
         group
         for selection in request.selections
@@ -151,6 +156,12 @@ def build_video_ingestion(
             for asset in table.to_pylist():
                 if any(not isinstance(asset[name], str) or not asset[name].strip() for name in required):
                     raise ValueError("asset_id, source_version and uri must be nonempty strings")
+                for name in ("asset_id", "source_version"):
+                    value = asset[name]
+                    if value is not None and (not isinstance(value, str) or not value.strip()):
+                        raise ValueError(f"{name} must be a nonempty string when supplied")
+                if asset["asset_id"] is None:
+                    asset["asset_id"] = "uri-sha256:" + hashlib.sha256(asset["uri"].encode()).hexdigest()
                 media = self.source.probe(asset["uri"])
                 if not isinstance(media, VideoMediaInfo):
                     raise TypeError("video source probe must return VideoMediaInfo")
@@ -158,6 +169,15 @@ def build_video_ingestion(
                     raise ValueError("Video exceeds sync_budget.max_video_seconds; submit with async=true")
                 if media.duration > request.clip_seconds * max_clips:
                     raise ValueError("video segmentation exceeds max_clips")
+                if asset["source_version"] is None:
+                    identify = getattr(self.source, "source_version", None)
+                    if identify is None:
+                        raise ValueError(
+                            "Custom sources must implement source_version or receive explicit source_version"
+                        )
+                    asset["source_version"] = identify(asset["uri"])
+                    if not isinstance(asset["source_version"], str) or not asset["source_version"].strip():
+                        raise ValueError("source_version must return a nonempty string")
                 for index in range(math.ceil(media.duration / request.clip_seconds)):
                     start, end = index * request.clip_seconds, min((index + 1) * request.clip_seconds, media.duration)
                     identity = [
@@ -186,10 +206,15 @@ def build_video_ingestion(
                         )
             return _table(rows, _JOB_SCHEMA, max_batch_bytes)
 
+        def close(self) -> None:
+            close = getattr(self.source, "close", None)
+            if close is not None:
+                close()
+
     # Compute batch size alone does not split upstream blocks into Ray tasks.
     # Emit work-sized blocks and preserve those boundaries at preprocessing.
     jobs = _apply_stage(
-        assets.project("asset_id, source_version, uri"),
+        assets.project(projection),
         ProbeAndExpand,
         _JOB_SCHEMA,
         options["probe"],
@@ -233,6 +258,9 @@ def build_video_ingestion(
                         if content and group.policy == "first_available":
                             winner = channel
                     audit.update(modality=channel, start_sec=clip.start, end_sec=clip.end)
+                    identity = getattr(self.source, "extraction_identity", None)
+                    if identity is not None and (extraction := identity(channel)) is not None:
+                        audit["extraction"] = extraction
                     if request.return_timeline:
                         audit["timeline"] = [
                             {
@@ -246,6 +274,11 @@ def build_video_ingestion(
                     result[f"{channel}_metadata"] = json.dumps(audit, allow_nan=False)
                 rows.append(result)
             return _table(rows, content_schema, max_batch_bytes)
+
+        def close(self) -> None:
+            close = getattr(self.source, "close", None)
+            if close is not None:
+                close()
 
     class Encode:
         def __init__(self) -> None:
@@ -322,6 +355,7 @@ def build_video_ingestion(
     class Fuse:
         def __init__(self) -> None:
             self.loop = asyncio.new_event_loop()
+            self.embed = copy.deepcopy(fusion.embed)
 
         def __call__(self, table: pa.Table) -> pa.Table:
             rows = []
@@ -341,7 +375,7 @@ def build_video_ingestion(
                     if "weights" in settings:
                         settings["weights"] = {c: w for c, w in settings["weights"].items() if c in selected}
                     try:
-                        vector = fusion.embed(clip, selected, settings)
+                        vector = self.embed(clip, selected, settings)
                         if inspect.isawaitable(vector):
                             vector = self.loop.run_until_complete(vector)
                     except Exception as error:
@@ -376,6 +410,11 @@ def build_video_ingestion(
             return _table(rows, final_schema, max_batch_bytes)
 
         def close(self) -> None:
-            self.loop.close()
+            try:
+                close = getattr(self.embed, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                self.loop.close()
 
     return _apply_stage(merged, Fuse, final_schema, options["fusion"], max_batch_bytes)
