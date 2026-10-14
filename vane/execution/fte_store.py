@@ -99,6 +99,10 @@ def replace_metadata(path: Path, value: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+class _StoreLockTimeout(TimeoutError):
+    """Metadata lock contention, distinct from storage publication failures."""
+
+
 @contextmanager
 def store_lock(path: Path, *, timeout: float = 5) -> Iterator[Any]:
     from vane._native import execution_runtime as native
@@ -109,7 +113,7 @@ def store_lock(path: Path, *, timeout: float = 5) -> Iterator[Any]:
         if guard is not None:
             break
         if time.monotonic() >= end:
-            raise TimeoutError("shared storage control lock timed out")
+            raise _StoreLockTimeout("shared storage control lock timed out")
         time.sleep(0.005)
     try:
         yield guard
@@ -221,8 +225,8 @@ class StorePool:
         if self.allocations.resolve() != self.allocations:
             raise ValueError("allocation root contains a symlink")
 
-    def _candidates(self) -> list[Path]:
-        with store_lock(self.root / "allocation.lock"):
+    def _candidates(self, *, timeout: float = 5) -> list[Path]:
+        with store_lock(self.root / "allocation.lock", timeout=timeout):
             self._check()
             return [record for record, value in self._records() if value["expires"] <= time.time()]
 
@@ -292,7 +296,12 @@ class StorePool:
                 raise error
             if self._collection_thread is not None and self._collection_thread.is_alive():
                 return
-            candidates = self._candidates()
+            try:
+                candidates = self._candidates(timeout=0)
+            except _StoreLockTimeout:
+                # Maintenance is opportunistic. Admission still takes the
+                # same lock and counts every allocation until it is retired.
+                return
             if not candidates:
                 return
 
@@ -435,7 +444,12 @@ class QueryStoreLease:
             self._source_pins.append(ActiveStoreLease(wire))
 
     def renew(self) -> None:
-        with store_lock(self.pool.root / "allocation.lock"):
+        if self.closed or self.closing:
+            return
+        # This owner's shared lease lock excludes orphan retirement. Serialize
+        # with its own close, but never hold the global quota lock across sync:
+        # renewal atomically changes expiry only, not the reserved byte count.
+        with self._close_lock:
             if self.closed or self.closing:
                 return
             record = self.pool.allocations / f"{self.value['namespace']}.json"
