@@ -24,6 +24,7 @@ def store():
     yield result
     result.remove_client("capacity-test")
     assert result.snapshot()["live_allocations"] == 0
+    assert result._waiting_writes == {}
 
 
 @pytest.mark.parametrize("cancel", [False, True])
@@ -37,7 +38,7 @@ def test_physical_wait_wakes_on_release_or_cancellation(store, cancel):
         return nullcontext()
 
     with ThreadPoolExecutor(max_workers=1) as threads:
-        future = threads.submit(store.wait_for_capacity, 1024, (), scope, wait_context)
+        future = threads.submit(store.wait_for_capacity, 1024, (), scope, wait_context, frozenset())
         try:
             assert waiting.wait(timeout=5)
             with pytest.raises(FutureTimeoutError):
@@ -60,7 +61,9 @@ def test_output_larger_than_space_left_by_its_input_fails_promptly(store):
     held = store.allocate(3072)
     try:
         with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
-            store.wait_for_capacity(2048, (held.allocation,), ExecutionCancellationScope("too-large", 1), nullcontext)
+            store.wait_for_capacity(
+                2048, (held.allocation,), ExecutionCancellationScope("too-large", 1), nullcontext, frozenset()
+            )
     finally:
         held.release()
 
@@ -87,15 +90,15 @@ def test_idle_worker_input_report_distinguishes_retained_views_from_pending_rele
             peer.release_read(token)
         peer.retain_inputs({token})
         if release_before_report:
-            store.wait_for_capacity(2048, (), scope, nullcontext)
+            store.wait_for_capacity(2048, (), scope, nullcontext, frozenset())
         else:
             with pytest.raises(LocalShmStoreCapacityError, match="retained_input_bytes=3072"):
-                store.wait_for_capacity(2048, (), scope, nullcontext)
+                store.wait_for_capacity(2048, (), scope, nullcontext, frozenset())
             # Once another call starts, this reader can release independently
             # of the waiting writer. Clearing the idle observation permits a wait.
             peer.retain_inputs(set())
             with ThreadPoolExecutor(max_workers=1) as threads:
-                pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext)
+                pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext, frozenset())
                 try:
                     with pytest.raises(FutureTimeoutError):
                         pending.result(timeout=0.05)
@@ -124,7 +127,7 @@ def test_idle_worker_report_wakes_an_already_waiting_writer(store, monkeypatch):
     scope = ExecutionCancellationScope("later-retained-report", 1)
     try:
         with ThreadPoolExecutor(max_workers=1) as threads:
-            pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext)
+            pending = threads.submit(store.wait_for_capacity, 2048, (), scope, nullcontext, frozenset())
             try:
                 with store._capacity_condition:
                     assert store._capacity_condition.wait_for(lambda: bool(store._waiting_writes), timeout=5)
@@ -138,13 +141,20 @@ def test_idle_worker_report_wakes_an_already_waiting_writer(store, monkeypatch):
     assert store._retained_inputs == {}
 
 
-def test_mutually_blocked_writers_report_capacity_and_unblock_peer_on_cleanup(store):
-    inputs = [store.allocate(2048), store.allocate(2048)]
+@pytest.mark.parametrize("queued", [False, True])
+def test_mutually_blocked_writers_report_capacity_and_unblock_peer_on_cleanup(store, queued):
+    inputs = [store.allocate(2048, producer_id=str(index)) for index in range(2)]
     scopes = [ExecutionCancellationScope("cycle", index + 1) for index in range(2)]
 
     def write(index):
         try:
-            store.wait_for_capacity(2048, (inputs[index].allocation,), scopes[index], nullcontext)
+            store.wait_for_capacity(
+                2048,
+                () if queued else (inputs[index].allocation,),
+                scopes[index],
+                nullcontext,
+                frozenset({str(index)}),
+            )
             return "ready"
         except LocalShmStoreCapacityError:
             return "capacity"
@@ -168,7 +178,8 @@ def test_mutually_blocked_writers_report_capacity_and_unblock_peer_on_cleanup(st
     "producer,reader_active,reader_finished",
     [("upstream", False, False), ("upstream", True, False), ("unrelated", False, False), ("upstream", True, True)],
 )
-def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_active, reader_finished):
+@pytest.mark.parametrize("current_view", [False, True])
+def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_active, reader_finished, current_view):
     store = LocalShmStore(8192)
     store.add_client("queued-inputs")
     current = store.allocate(3072, producer_id="upstream")
@@ -176,12 +187,22 @@ def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_
     store.start_input(current.allocation, ("consumer", 1))
     scope = ExecutionCancellationScope("consumer", 1)
     try:
+        if not current_view:
+            store.finish_input(current.allocation, ("consumer", 1))
+            current.release()
         if reader_active:
             store.start_input(queued.allocation, ("independent", 1))
         if reader_finished:
             store.finish_input(queued.allocation, ("independent", 1))
         with ThreadPoolExecutor(max_workers=1) as threads:
-            pending = threads.submit(store.wait_for_capacity, 4096, (current.allocation,), scope, nullcontext)
+            pending = threads.submit(
+                store.wait_for_capacity,
+                4096,
+                (current.allocation,) if current_view else (),
+                scope,
+                nullcontext,
+                frozenset({"upstream"}),
+            )
             try:
                 if producer == "unrelated" or (reader_active and not reader_finished):
                     with pytest.raises(FutureTimeoutError):
@@ -241,13 +262,15 @@ try:
     # A live parent reference can still belong to a queued batch. Having
     # a fork owner as well does not make that batch independently releasable.
     with pytest.raises(LocalShmStoreCapacityError, match='queued_input_bytes=3072'):
-        store.wait_for_capacity(2048, (current.allocation,), scope, nullcontext)
+        store.wait_for_capacity(2048, (current.allocation,), scope, nullcontext, frozenset({'upstream'}))
     previous.release()
     with store._lock:
         entry = store._live[slot.generation]
         assert entry.refs == 0 and entry.forks and not entry.input_readers
     with ThreadPoolExecutor(max_workers=1) as threads:
-        pending = threads.submit(store.wait_for_capacity, 2048, (current.allocation,), scope, nullcontext)
+        pending = threads.submit(
+            store.wait_for_capacity, 2048, (current.allocation,), scope, nullcontext, frozenset({'upstream'})
+        )
         try:
             with store._capacity_condition:
                 waiting = store._capacity_condition.wait_for(lambda: bool(store._waiting_writes), timeout=2)
@@ -312,7 +335,9 @@ def test_waiting_worker_pins_only_reported_views_from_earlier_calls(store, monke
             peer.release_read(old_token)
         scope = ExecutionCancellationScope("history", 2)
         with ThreadPoolExecutor(max_workers=1) as threads:
-            pending = threads.submit(store.wait_for_capacity, 2048, peer.input_allocations(tokens), scope, nullcontext)
+            pending = threads.submit(
+                store.wait_for_capacity, 2048, peer.input_allocations(tokens), scope, nullcontext, frozenset()
+            )
             try:
                 if previous_view == "retained":
                     with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
@@ -358,7 +383,7 @@ def test_mutually_blocked_writers_ignore_unrelated_retained_views(unrelated_byte
 
     def write(index):
         try:
-            store.wait_for_capacity(4096, (inputs[index].allocation,), scopes[index], nullcontext)
+            store.wait_for_capacity(4096, (inputs[index].allocation,), scopes[index], nullcontext, frozenset())
             return "ready"
         except LocalShmStoreCapacityError:
             return "capacity"
@@ -398,7 +423,7 @@ def test_unrelated_allocation_can_still_release_space_for_waiting_writers():
 
     def write(index):
         try:
-            store.wait_for_capacity(3072, (inputs[index].allocation,), scopes[index], nullcontext)
+            store.wait_for_capacity(3072, (inputs[index].allocation,), scopes[index], nullcontext, frozenset())
         finally:
             inputs[index].release()
 

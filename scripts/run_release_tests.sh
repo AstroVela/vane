@@ -66,6 +66,7 @@ local_runtime_tests=(
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_actor_retaining_previous_input_can_receive_the_next_batch[generator-subprocess_task-16MiB-False-False-2]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-2-192KiB-False]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-4-320KiB-True]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_tracks_queued_stream_when_current_input_has_no_views[auto-128KiB]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_waits_for_independent_historical_input_release[fork]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_waits_for_independent_historical_input_release[notification]"
   "$project_root/tests/fast/test_local_query_runtime.py"

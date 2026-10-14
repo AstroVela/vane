@@ -2171,7 +2171,11 @@ views to disappear first. Explicit task byte envelopes remain strict.
 
 Each output request reports the worker's live input views, including views from
 earlier calls. Physical-capacity waits use this snapshot, idle retained views,
-and queued outputs of the input streams used by waiting consumers. Physical
+and queued outputs of the input streams used by waiting consumers. The current
+call's upstream producer identities are recorded independently of live views
+and persist until the call completes or is cancelled. An all-NULL input can
+retain no physical views while its next batch still needs the occupied actor
+slot; releasing input storage must not erase that stream dependency. Physical
 leases held only by fork descendants or pending release notifications can be
 released independently and are excluded from the worker's blocking views.
 Queued-input inference requires a live parent lease: a region with zero parent

@@ -1199,6 +1199,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                             self._shm_peer.input_allocations(event["input_tokens"]),
                             scope,
                             lambda: self._capacity_wait_context("shared_memory_output"),
+                            local_shm_budget_manager().consuming_input_producers(input_lease_id),
                         )
             except BaseException as exc:
                 if grant_id > 0:

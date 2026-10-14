@@ -424,6 +424,99 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("arena", ["128KiB", "256KiB"])
+@pytest.mark.parametrize("budget", ["32KiB", "auto"])
+def test_output_capacity_tracks_queued_stream_when_current_input_has_no_views(tmp_path, arena, budget):
+    queued = tmp_path / "queued-input"
+    script = textwrap.dedent(f"""
+        import gc
+        import threading
+        import time
+        from pathlib import Path
+        import pyarrow as pa
+        import vane
+        from vane.execution import udf_shm_store as storage
+        from vane.execution.ref_bundle import local_shm_ref_budget_snapshot
+
+        queued = Path({str(queued)!r})
+        waits = []
+        wait_for_capacity = storage.LocalShmStore.wait_for_capacity
+
+        def observe_wait(store, size, inputs, *args, **kwargs):
+            assert not inputs, 'NULL-only input must not retain a physical view'
+            waits.append(size)
+            return wait_for_capacity(store, size, inputs, *args, **kwargs)
+
+        storage.LocalShmStore.wait_for_capacity = observe_wait
+
+        def expand(batch):
+            yield pa.table({{'payload': [None]}})
+            yield pa.table({{'payload': [b'x' * 65536]}})
+            queued.touch()
+
+        class Consume:
+            def __call__(self, batch):
+                if batch['payload'][0].as_py() is None:
+                    deadline = time.monotonic() + 10
+                    while not queued.exists():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('upstream did not publish its queued input')
+                        time.sleep(0.01)
+                    return pa.table({{'payload': [b'y' * 65536]}})
+                return pa.table({{'payload': [b'done']}})
+
+        try:
+            with vane.connect(config={{'threads': 4}}) as con:
+                watchdog = threading.Timer(15, con.interrupt)
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    rel = con.sql('select 1::BIGINT as id').map_batches(
+                        expand, schema={{'payload': 'BLOB'}}, execution_backend='subprocess_task',
+                        batch_size=1, min_task_batch_size=1, task_input_max_bytes=8,
+                        output_batch_size=1, output_target_max_bytes=1024,
+                    ).map_batches(
+                        Consume, schema={{'payload': 'BLOB'}}, execution_backend='subprocess_actor',
+                        actor_number=1, batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
+                        output_batch_size=1, output_target_max_bytes=1024,
+                    )
+                    if {arena!r} == '128KiB':
+                        try:
+                            rel.to_arrow_table()
+                        except Exception as error:
+                            assert 'shared-memory output cannot make progress' in str(error), str(error)
+                            assert 'pinned_input_bytes=0' in str(error), str(error)
+                        else:
+                            raise AssertionError('queued input leaves no room for the output')
+                        assert waits, 'query must exercise an empty-view capacity check'
+                    else:
+                        result = rel.to_arrow_table()
+                        assert result['payload'].to_pylist() == [b'y' * 65536, b'done']
+                        del result
+                finally:
+                    watchdog.cancel()
+        finally:
+            vane.teardown_runner()
+            gc.collect()
+            assert storage.local_shm_store_snapshot()['live_bytes'] == 0
+            assert local_shm_ref_budget_snapshot()['usage_bytes'] == 0
+    """)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_LOCAL_SHM_STORE_BYTES": arena,
+            "VANE_LOCAL_SHM_REF_BUDGET_BYTES": budget,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     "blocks,arena,history", [(2, "192KiB", False), (1, "192KiB", False), (2, "256KiB", False), (4, "320KiB", True)]
 )

@@ -630,11 +630,14 @@ class LocalShmBudgetManager:
             self._consuming_inputs.pop(int(lease_id), None)
             self._consuming_outputs.pop(int(lease_id), None)
 
-    def consuming_inputs(self, lease_id: int | None) -> tuple[ShmAllocation, ...]:
+    def consuming_input_producers(self, lease_id: int | None) -> frozenset[str]:
+        """Keep upstream dependencies until the call ends, even after its views release."""
         if lease_id is None:
-            return ()
+            return frozenset()
         with self._cond:
-            return tuple(entry.allocation for entry in self._consuming_inputs.get(lease_id, ()) if entry.retained)
+            return frozenset(
+                entry.producer_id for entry in self._consuming_inputs.get(lease_id, ()) if entry.producer_id is not None
+            )
 
     def output_grant_input(self, grant_id: int | None) -> int | None:
         if grant_id is None:

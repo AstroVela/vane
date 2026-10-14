@@ -358,7 +358,7 @@ class LocalShmStore:
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._capacity_condition = threading.Condition(self._lock)
-        self._waiting_writes: dict[tuple[str, int], tuple[int, set[int]]] = {}
+        self._waiting_writes: dict[tuple[str, int], tuple[int, set[int], frozenset[str]]] = {}
         self._retained_inputs: dict[str, set[int]] = {}
         self._shm: Any = None
         self._free = [(0, capacity)]
@@ -442,12 +442,14 @@ class LocalShmStore:
         inputs: tuple[ShmAllocation, ...],
         scope: ExecutionCancellationScope,
         wait_context: Callable[[], AbstractContextManager[None]],
+        input_producers: frozenset[str],
     ) -> None:
         """Wait for a physical release without owning a grant or a worker CPU.
 
         A wait cannot resolve when no writer could fit even after every
         unrelated allocation is released. Report that capacity boundary instead
-        of letting the writers wait on each other's inputs indefinitely.
+        of letting the writers wait on each other's inputs indefinitely. Input
+        streams remain dependencies even when a call retains no physical views.
         """
         self._require_owner()
         required = self.check_write_size(size)
@@ -463,7 +465,7 @@ class LocalShmStore:
             # outside the store lock, including CPU reacquisition on exit.
             with wait_context():
                 with self._capacity_condition:
-                    self._waiting_writes[scope.identity] = (required, generations)
+                    self._waiting_writes[scope.identity] = (required, generations, input_producers)
                     self._capacity_condition.notify_all()
                     try:
                         while True:
@@ -474,7 +476,8 @@ class LocalShmStore:
                             if largest >= required:
                                 return
                             pinned = sum(self._live[g].capacity for g in generations if g in self._live)
-                            blocked_inputs = set().union(*(g for _, g in self._waiting_writes.values()))
+                            blocked_inputs = set().union(*(g for _, g, _ in self._waiting_writes.values()))
+                            blocked_producers = frozenset().union(*(p for _, _, p in self._waiting_writes.values()))
                             # Unstarted outputs of these input streams are not
                             # independent releases: their next consumer may be
                             # the invocation currently waiting for this write.
@@ -483,14 +486,11 @@ class LocalShmStore:
                             # With no parent leases, an allocation remains live
                             # only for fork descendants, whose exit is independent
                             # of the queued consumer.
-                            input_producers = {self._live[g].producer_id for g in blocked_inputs if g in self._live} - {
-                                None
-                            }
                             queued_inputs = {
                                 g
                                 for g, entry in self._live.items()
                                 if g not in blocked_inputs
-                                and entry.producer_id in input_producers
+                                and entry.producer_id in blocked_producers
                                 and entry.refs > 0
                                 and not entry.input_readers
                             }
@@ -512,7 +512,7 @@ class LocalShmStore:
                                 end = entry.allocation.offset + entry.capacity
                             largest_possible = max(largest_possible, self.capacity - end)
                             all_blocked = all(
-                                requested > largest_possible for requested, _ in self._waiting_writes.values()
+                                requested > largest_possible for requested, _, _ in self._waiting_writes.values()
                             )
                             if pinned + required > self.capacity or all_blocked:
                                 retained = sum(self._live[g].capacity for g in retained_inputs if g in self._live)

@@ -43,6 +43,39 @@ def test_repeated_input_slices_do_not_multiply_reserved_bytes():
     assert manager.snapshot()["usage_bytes"] == 0
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_consumed_input_streams_remain_dependencies_after_physical_release(cancel):
+    from vane.execution.ref_bundle import LocalShmBlockRef
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    store = LocalShmStore(4096)
+    store.add_client("stream-dependencies")
+    inputs = []
+    for producer in ("left", "right", "left", None):
+        physical = store.allocate(256, producer_id=producer)
+        inputs.append(LocalShmBlockRef(physical.allocation.identity, 256, allocation_lease=physical))
+    lease = manager.create_input_lease(inputs, 1024)
+    try:
+        manager.consume_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        assert store.snapshot()["live_bytes"] == 0
+        assert manager.consuming_input_producers(lease) == frozenset({"left", "right"})
+        assert manager.consuming_input_producers(None) == frozenset()
+        if cancel:
+            manager.cancel_input_lease(lease)
+        else:
+            manager.finish_consuming(lease)
+        assert manager.consuming_input_producers(lease) == frozenset()
+    finally:
+        manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        store.remove_client("stream-dependencies")
+    assert store.snapshot()["live_allocations"] == 0
+
+
 def test_consumer_escape_admits_one_complete_block_then_waits_for_release():
     manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
     manager.acquire_allocation(900)
