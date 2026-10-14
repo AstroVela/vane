@@ -192,7 +192,7 @@ def test_replicas_bind_admission_to_devices_and_run_in_parallel(harness, tmp_pat
         assert execution["pid"] == worker["pid"]
     (tmp_path / "release-1").touch()
     _wait(lambda: _demand(pool) == 1)
-    assert _devices(pool)[0]["retained_slots"] == 1
+    assert _devices(pool)[0]["retained_slots"] == 0
     assert _result(first).to_pydict()["device"] == [DEVICES[0]]
     (tmp_path / "release-2").touch()
     assert _result(second).to_pydict()["device"] == [DEVICES[1]]
@@ -213,19 +213,20 @@ def test_shared_device_keeps_older_query_ahead_of_newer_work(harness, tmp_path, 
     _wait(lambda: (tmp_path / "entered-1").exists())
     assert older.request_task_admission(0)
     assert newer.request_task_admission(0)
-    assert pool.gpu_execution_snapshot()["admission"]["queued_tasks"] == 2
-    (tmp_path / "release-1").touch()
-    assert _result(first).to_pydict()["x"] == [1]
+    assert pool.gpu_execution_snapshot()["admission"]["queued_tasks"] == 1
     assert older.task_admission_state()["available"]
     assert not newer.task_admission_state()["available"]
     older.submit(pa.table({"x": [3]}))
+    (tmp_path / "release-1").touch()
+    assert _result(first).to_pydict()["x"] == [1]
     assert _result(older).to_pydict()["x"] == [3]
     assert newer.task_admission_state()["available"]
     newer.submit(pa.table({"x": [4]}))
     assert _result(newer).to_pydict()["x"] == [4]
 
 
-def test_busy_device_does_not_park_task_allowance_needed_by_another_device(harness, tmp_path):
+def test_busy_device_without_prefetch_does_not_park_another_devices_task_allowance(harness, tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_UDF_ACTOR_PREFETCH_DEPTH", "1")
     h = harness(running=2)
     first_model = h.model(_gated(h, tmp_path))
     second_model = h.model(lambda table: table, DEVICES[1:])
@@ -527,15 +528,16 @@ def test_cancelling_a_submitted_future_before_it_runs_retires_device_demand(harn
     model = h.model(call)
     pool, _ = model
     executor = h.executor(model)
-    entered, release = threading.Event(), threading.Event()
+    entered = [threading.Event() for _ in range(pool._executor._max_workers)]
+    release = threading.Event()
 
-    def occupy_thread():
-        entered.set()
+    def occupy_thread(index):
+        entered[index].set()
         assert release.wait(15), "GPU executor thread was not released"
 
-    blocker = pool._executor.submit(occupy_thread)
+    blockers = [pool._executor.submit(occupy_thread, index) for index in range(len(entered))]
     try:
-        assert entered.wait(10)
+        assert all(event.wait(10) for event in entered)
         _admit(executor)
         executor.submit(pa.table({"x": [7]}))
         assert _states(pool) == ["submitted"]
@@ -545,7 +547,8 @@ def test_cancelling_a_submitted_future_before_it_runs_retires_device_demand(harn
         assert not Path(marker).exists()
     finally:
         release.set()
-        blocker.result(timeout=10)
+        for blocker in blockers:
+            blocker.result(timeout=10)
 
 
 def test_idle_worker_loss_does_not_retain_a_completed_invocations_execution(harness, monkeypatch):
@@ -574,3 +577,29 @@ def test_idle_worker_loss_does_not_retain_a_completed_invocations_execution(harn
     assert _result(executor).column(0)[0].as_py() != old_pid
     assert pool.device_snapshot()[0]["generation"] == 1
     assert _demand(pool) == 0
+
+
+def test_cancel_prefetched_call_does_not_claim_the_active_calls_worker(harness, tmp_path):
+    h = harness()
+    model = h.model(_gated(h, tmp_path))
+    pool, _ = model
+    first, cancelled, third = [h.executor(model) for _ in range(3)]
+    _admit(first)
+    first.submit(pa.table({"x": [1]}))
+    _wait(lambda: (tmp_path / "entered-1").exists())
+    pid = pool.worker_pids()[0]
+    _admit(cancelled)
+    cancelled.submit(pa.table({"x": [2]}))
+    assert not (tmp_path / "entered-2").exists()
+    cancelled.close(kill=True)
+    _wait(lambda: not cancelled.cleanup_pending())
+    assert pool.worker_pids() == [pid]
+    assert _states(pool) == ["running"]
+    assert pool.admission_slots.active_lease_count == 1
+    _admit(third)
+    third.submit(pa.table({"x": [3]}))
+    (tmp_path / "release-1").touch()
+    assert _result(first).column("x").to_pylist() == [1]
+    assert _result(third).column("x").to_pylist() == [3]
+    assert pool.worker_pids() == [pid]
+    assert not (tmp_path / "entered-2").exists()

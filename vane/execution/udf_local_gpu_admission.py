@@ -13,7 +13,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.resources import ResourceVector
-from vane.execution.udf_admission import AdmissionLease, LocalExecutionSlotPool, LocalSlotAdmissionAuthority
+from vane.execution.udf_admission import AdmissionLease
+from vane.execution.udf_local_actor_admission import LocalActorAdmissionAuthority, LocalActorExecutionSlotPool
 from vane.execution.udf_resource_usage import UnitResourceActivity
 
 if TYPE_CHECKING:
@@ -49,39 +50,45 @@ class LocalGpuExecution:
             self.backend_done = True
             self.cleanup_owners = cleanup_owners
             self.activity.transition("cleanup_pending" if cleanup_owners else "completing")
-            self._retire_locked()
+            retired = self._retire_locked()
+        if retired:
+            self.pool._release(self.lease_id)
 
     def complete(self) -> None:
         with self.pool._lock:
             self.completion_requested = True
-            self._retire_locked()
+            retired = self._retire_locked()
+        if retired:
+            self.pool._release(self.lease_id)
 
-    def _retire_locked(self) -> None:
+    def _retire_locked(self) -> bool:
         if not self.completion_requested or (self.submitted and not self.backend_done):
-            return
+            return False
         if any(owner._cleanup_finished is not True for owner in self.cleanup_owners):
             self.activity.transition("cleanup_pending")
-            return
+            return False
         self.pool._executions.pop(self.lease_id, None)
         self.cleanup_owners = ()
         self.activity.finish()
+        return True
 
 
-class LocalGpuAdmissionAuthority(LocalSlotAdmissionAuthority):
+class LocalGpuAdmissionAuthority(LocalActorAdmissionAuthority):
     def _lease_locked(self, slot: int, request_id: str, retained: int) -> AdmissionLease:
         lease = super()._lease_locked(slot, request_id, retained)
         pool = self._pool
         assert isinstance(pool, LocalGpuExecutionSlotPool)
-        execution = LocalGpuExecution(pool, lease.lease["lease_id"], slot)
+        execution = LocalGpuExecution(pool, lease.lease["lease_id"], slot % pool.actor_count)
         pool._executions[execution.lease_id] = execution
         lease.lease["local_gpu_execution"] = execution
         lease._execution_finished_callback = execution.complete
+        lease._release_callback = execution.complete
         return lease
 
 
-class LocalGpuExecutionSlotPool(LocalExecutionSlotPool):
+class LocalGpuExecutionSlotPool(LocalActorExecutionSlotPool):
     def __init__(self, devices: tuple[str, ...], *, execution_slot_prefix: str) -> None:
-        super().__init__(max_slots=len(devices), execution_slot_prefix=execution_slot_prefix)
+        super().__init__(len(devices), execution_slot_prefix=execution_slot_prefix)
         self.devices = devices
         self._executions: dict[str, LocalGpuExecution] = {}
         self.admission_activity = UnitResourceActivity({"pool": execution_slot_prefix})
@@ -112,8 +119,9 @@ class LocalGpuExecutionSlotPool(LocalExecutionSlotPool):
         # Physical cleanup belongs to the actor pool. Only retire records whose
         # owners have confirmed completion; snapshots never perform this work.
         with self._lock:
-            for execution in tuple(self._executions.values()):
-                execution._retire_locked()
+            retired = [e.lease_id for e in tuple(self._executions.values()) if e._retire_locked()]
+        for lease_id in retired:
+            self._release(lease_id)
 
     def cleanup_pending(self) -> bool:
         with self._lock:
@@ -123,16 +131,20 @@ class LocalGpuExecutionSlotPool(LocalExecutionSlotPool):
         try:
             super().close()
         finally:
+            retired = []
             with self._lock:
                 for execution in tuple(self._executions.values()):
                     if not execution.submitted:
                         execution.completion_requested = True
-                        execution._retire_locked()
+                        if execution._retire_locked():
+                            retired.append(execution.lease_id)
+            for lease_id in retired:
+                self._release(lease_id)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            ready = {a._ready_slot for a in self._authorities if a._ready_slot is not None}
-            held = {slot for slot, _ in self._active_slots.values()}
+            ready = [a._ready_slot % self.actor_count for a in self._authorities if a._ready_slot is not None]
+            held = [slot % self.actor_count for slot, _ in self._active_slots.values()]
             records = [
                 {
                     "lease_id": e.lease_id,
@@ -152,7 +164,8 @@ class LocalGpuExecutionSlotPool(LocalExecutionSlotPool):
                         "device": device,
                         "replica": replica,
                         "capacity": 1,
-                        "ready_slots": int(replica in ready),
+                        "prefetch_depth": self.prefetch_depth,
+                        "ready_slots": ready.count(replica),
                         "retained_slots": int(replica in held and not executions),
                         "execution_resources": ResourceVector(gpu=int(replica in ready or bool(executions))).to_dict(),
                         "executions": executions,

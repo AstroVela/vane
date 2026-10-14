@@ -340,6 +340,7 @@ include = [
     "/tests/fast/test_udf_local_request_cancellation.py",
     "/tests/fast/test_udf_local_request_native.py",
     "/tests/fast/test_udf_process.py",
+    "/tests/fast/test_udf_runtime_admission.py",
     "/tests/fast/test_udf_task_admission.py",
     "/tests/fast/test_ray_cpp_bindings.py",
     "/tests/fast/test_ray_diagnostics.py",

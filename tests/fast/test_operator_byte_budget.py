@@ -9,6 +9,7 @@ from vane.execution.byte_budget import (
     allocate_resource_reservations,
     build_byte_budget_state,
     byte_budget_block_reason,
+    resource_budget_remaining,
 )
 
 
@@ -39,6 +40,26 @@ def test_zero_capacity_is_exact_unless_the_adapter_explicitly_requests_tolerance
     baseline, maximum = {"task": 1e-13}, {"task": 1}
     assert allocate_resource_reservations(baseline, maximum, **options) == {"task": 0}
     assert allocate_resource_reservations(baseline, maximum, **options, arithmetic_tolerance=1e-9) == {"task": 1e-13}
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"producer": 0, "consumer": 0}, (8, 8)),
+        ({"producer": 7, "consumer": 0}, (1, 3)),
+        ({"producer": 9, "consumer": 0}, (0, 2)),
+        ({"producer": 9, "consumer": 3}, (0, 0)),
+    ],
+)
+def test_process_budget_shares_surplus_and_preserves_other_units_protection(usage, expected):
+    reserved = {"producer": 2, "consumer": 2}
+    assert (
+        tuple(
+            resource_budget_remaining(unit, usage=usage, reserved=reserved, limit=10)
+            for unit in ("producer", "consumer")
+        )
+        == expected
+    )
 
 
 def test_retired_output_remains_charged_while_active_units_share_remaining_bytes():

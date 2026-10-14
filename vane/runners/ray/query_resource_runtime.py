@@ -7,11 +7,11 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from vane.runners.ray.query_resource_graph import QueryAllocation, QueryResourceGraph
-from vane.runners.ray.query_resource_manager import RayQueryResourceManager
+from vane.execution.query_resource_policy import QueryResourceManager
+from vane.execution.query_resource_spec import QueryAllocation, QueryResourceGraph
 
 _LOCK = threading.RLock()
-_MANAGERS: dict[str, RayQueryResourceManager] = {}
+_MANAGERS: dict[str, QueryResourceManager] = {}
 
 
 def register_query_resource_graph(
@@ -22,10 +22,10 @@ def register_query_resource_graph(
     reservation_ratio: float = 0.5,
     on_change: Callable[[], None] | None = None,
     on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
-) -> RayQueryResourceManager:
+) -> QueryResourceManager:
     """Atomically publish the driver-local resource manager for a query."""
 
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         allocation,
         admission_open=admission_open,
@@ -41,7 +41,7 @@ def register_query_resource_graph(
     return manager
 
 
-def get_query_resource_manager(query_id: str) -> RayQueryResourceManager:
+def get_query_resource_manager(query_id: str) -> QueryResourceManager:
     query_key = str(query_id or "").strip()
     if not query_key:
         raise ValueError("query_id must be non-empty")

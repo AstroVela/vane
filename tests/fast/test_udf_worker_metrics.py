@@ -385,8 +385,7 @@ def test_native_unregistered_udfs_report_runtime_failures(backend, failure, fiel
             query(failure).fetchall()
         snapshot = runtime.resource_snapshot()
         failures = {key: count for key, count in snapshot["worker_failures"].items() if count}
-        # A query-owned actor pool can finish replacing the failed worker before
-        # request cleanup closes the replacement; that is an ordinary shutdown.
+        # Ordinary teardown of idle workers is not a query execution failure.
         failures.pop("shutdown_workers", None)
         assert failures == {field: 1}
         assert snapshot["request_admission"]["active_requests"] == 0

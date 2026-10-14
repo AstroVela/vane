@@ -3,14 +3,14 @@
 
 import pytest
 
-from vane.execution.udf_local_model import LocalModelRuntime
-from vane.runners.ray.cluster_resource_coordinator import (
+from vane.execution.cluster_resource_policy import (
     ClusterQueryResourceCoordinator,
     NodeCapacity,
 )
-from vane.runners.ray.query_resource_graph import ResourceVector
+from vane.execution.query_resource_demand import build_query_demand
+from vane.execution.query_resource_spec import ResourceVector
+from vane.execution.udf_local_model import LocalModelRuntime
 from vane.runners.ray.query_resource_graph_builder import (
-    build_query_demand,
     build_query_resource_graph,
     native_fragment_unit_id_for_fragment,
     native_fragment_unit_id_for_node,
@@ -137,14 +137,14 @@ def test_builder_delegates_native_process_resources_and_counts_each_ray_process(
 def test_builder_configures_actor_prefetch_uniformly():
     configured = build_query_resource_graph(
         _metadata(),
-        env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "3"},
+        env={"VANE_UDF_ACTOR_PREFETCH_DEPTH": "3"},
     )
     assert configured.unit_by_id(udf_unit_id_for_node("query-7", "3")).actor_prefetch_depth == 3
 
-    with pytest.raises(ValueError, match="VANE_RAY_ACTOR_PREFETCH_DEPTH"):
+    with pytest.raises(ValueError, match="VANE_UDF_ACTOR_PREFETCH_DEPTH"):
         build_query_resource_graph(
             _metadata(),
-            env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "0"},
+            env={"VANE_UDF_ACTOR_PREFETCH_DEPTH": "0"},
         )
 
 

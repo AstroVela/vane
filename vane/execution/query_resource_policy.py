@@ -13,16 +13,18 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
+from vane.execution.admission_ledger import BoundedSet
 from vane.execution.byte_budget import (
+    DEFAULT_RESOURCE_RESERVATION_RATIO,
     ByteBudgetUsage,
     allocate_resource_reservations,
     build_byte_budget_state,
     byte_budget_block_reason,
+    resource_budget_remaining,
 )
+from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
-from vane.runners.ray.admission_ledger import BoundedSet
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.query_resource_spec import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -219,7 +221,7 @@ class _NativeFragmentState:
     completed: bool = False
 
 
-class RayQueryResourceManager:
+class QueryResourceManager:
     """Own Ray execution and streaming-output resources for one query DAG.
 
     DuckDB owns native-fragment CPU, heap, scheduling, and spill. Native units
@@ -233,7 +235,7 @@ class RayQueryResourceManager:
         allocation: QueryAllocation,
         *,
         admission_open: bool = True,
-        reservation_ratio: float = 0.5,
+        reservation_ratio: float = DEFAULT_RESOURCE_RESERVATION_RATIO,
         on_change: Callable[[], None] | None = None,
         on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
     ) -> None:
@@ -253,7 +255,7 @@ class RayQueryResourceManager:
         self._units = {
             unit.resource_unit_id: _ResourceUnitState(
                 spec=unit,
-                actor_ready=unit.backend != "ray_actor",
+                actor_ready=unit.execution_kind != "actor",
             )
             for unit in graph.units
         }
@@ -281,6 +283,7 @@ class RayQueryResourceManager:
         self._submitted_actor_slots: set[tuple[str, int]] = set()
         self._retiring_actor_unit_ids: set[str] = set()
         self._actor_node_by_slot: dict[tuple[str, int], str] = {}
+        self._backend_actor_loads: dict[str, dict[int, int]] = {}
         self._active_actor_slots: dict[tuple[str, int], str] = {}
         self._queued_actor_slot_leases: dict[tuple[str, int], deque[str]] = {}
         self._terminal_attempts = BoundedSet[tuple[str, str]](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
@@ -398,7 +401,7 @@ class RayQueryResourceManager:
             raise ValueError("native fragment membership requires execution query and fragment IDs")
         with self._lock:
             unit = self._units[unit_key]
-            if unit.spec.backend != "ray_worker":
+            if unit.spec.execution_kind != "native":
                 raise ValueError("native fragment membership requires a ray_worker resource unit")
             if self._native_production_sealed:
                 raise RuntimeError("native task production is sealed")
@@ -475,7 +478,7 @@ class RayQueryResourceManager:
             changed = False
             memberless_units: list[str] = []
             for unit_key, unit in self._units.items():
-                if unit.spec.backend != "ray_worker":
+                if unit.spec.execution_kind != "native":
                     continue
                 if unit_key not in self._native_fragments:
                     memberless_units.append(unit_key)
@@ -558,7 +561,7 @@ class RayQueryResourceManager:
             eligible = set(self._eligible_resource_unit_ids_locked())
             return any(
                 lease.resource_unit_id not in eligible
-                and self._units[lease.resource_unit_id].spec.backend == "ray_actor"
+                and self._units[lease.resource_unit_id].spec.execution_kind == "actor"
                 for lease in self._task_leases.values()
             )
 
@@ -815,7 +818,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             for raw_actor_index in actor_indices:
                 if isinstance(raw_actor_index, bool):
@@ -856,6 +859,23 @@ class RayQueryResourceManager:
             )
             self._publish_change_locked()
 
+    def set_actor_slot_loads(self, resource_unit_id: str, loads: dict[int, int]) -> None:
+        """Observe shared backend occupancy when choosing an actor replica.
+
+        These counts affect placement preference only. Query leases still own
+        soft admission and the backend owns its physical prefetch capacity.
+        A query-private Ray pool needs no additional occupancy observation.
+        """
+        with self._lock:
+            spec = self._units[resource_unit_id].spec
+            if spec.execution_kind != "actor" or set(loads) != set(range(spec.actor_pool_size)):
+                raise ValueError("actor loads must describe every replica of an actor unit")
+            if any(type(count) is not int or count < 0 for count in loads.values()):
+                raise ValueError("actor loads must be nonnegative integers")
+            if self._backend_actor_loads.get(resource_unit_id) != loads:
+                self._backend_actor_loads[resource_unit_id] = dict(loads)
+                self._publish_change_locked()
+
     def set_ready_actor_slots(
         self,
         resource_unit_id: str,
@@ -869,7 +889,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             for raw_actor_index, raw_node_id in actor_node_ids.items():
                 if isinstance(raw_actor_index, bool):
@@ -944,7 +964,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if slot_index < 0 or slot_index >= unit.spec.actor_pool_size:
                 raise ValueError(f"actor index is outside pool {unit_key}: {slot_index}")
@@ -992,7 +1012,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if unit_key in self._eligible_resource_unit_ids_locked():
                 return False
@@ -1024,7 +1044,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if unit_key not in self._retiring_actor_unit_ids:
                 return False
@@ -1326,7 +1346,7 @@ class RayQueryResourceManager:
         if unit is None:
             return "unit_not_registered", True, empty_plan
         if request.output_kind not in {"data", "copy_metadata"} or (
-            request.output_kind == "copy_metadata" and unit.spec.backend != "ray_worker"
+            request.output_kind == "copy_metadata" and unit.spec.execution_kind != "native"
         ):
             return "invalid_task_output_kind", True, empty_plan
         if unit.completed:
@@ -1337,7 +1357,7 @@ class RayQueryResourceManager:
             return "materialization_barrier_pending", False, empty_plan
         if not unit.runnable:
             return "unit_not_runnable", False, empty_plan
-        if unit.spec.backend == "ray_actor" and not unit.actor_ready:
+        if unit.spec.execution_kind == "actor" and not unit.actor_ready:
             return "actor_not_ready", False, empty_plan
 
         task_key = str(request.task_id).strip()
@@ -1358,17 +1378,22 @@ class RayQueryResourceManager:
 
         node_id: str | None = None
         actor_index: int | None = None
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             node_id = "" if request.node_id is None else str(request.node_id).strip()
             if not node_id:
                 return "ray_worker_node_required", True, empty_plan
-        elif unit.spec.backend == "ray_task":
+        elif unit.spec.execution_kind == "task":
             if request.node_id is not None and str(request.node_id).strip():
                 return "ray_task_node_must_be_unset", True, empty_plan
-        elif unit.spec.backend == "ray_actor":
+        elif unit.spec.execution_kind == "actor":
             requested_node_id = "" if request.node_id is None else str(request.node_id).strip()
+            backend_loads = self._backend_actor_loads.get(unit.spec.resource_unit_id, {})
             candidates = [
-                (self._actor_slot_lease_count_locked(slot), slot[1], ready_node_id)
+                (
+                    max(self._actor_slot_lease_count_locked(slot), backend_loads.get(slot[1], 0)),
+                    slot[1],
+                    ready_node_id,
+                )
                 for slot, ready_node_id in self._actor_node_by_slot.items()
                 if slot[0] == unit.spec.resource_unit_id
                 and (not requested_node_id or ready_node_id == requested_node_id)
@@ -1454,7 +1479,7 @@ class RayQueryResourceManager:
 
         if spec.target_output_block_bytes <= 0:
             return 0
-        if spec.backend == "ray_worker":
+        if spec.execution_kind == "native":
             return int(spec.output_window_bytes)
         state = self._units[spec.resource_unit_id]
         if state.num_task_outputs_generated <= 0:
@@ -1480,7 +1505,7 @@ class RayQueryResourceManager:
         *,
         actor_index: int | None,
     ) -> int:
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             if actor_index is None:
                 raise RuntimeError("Ray actor admission requires a selected actor slot")
             if self._actor_slot_lease_count_locked((spec.resource_unit_id, actor_index)) > 0:
@@ -1491,9 +1516,9 @@ class RayQueryResourceManager:
 
     def _pending_output_estimate_for_lease_locked(self, lease: TaskLease) -> int:
         spec = self._units[lease.resource_unit_id].spec
-        if spec.backend == "ray_worker":
+        if spec.execution_kind == "native":
             return lease.output_window_bytes
-        if spec.backend == "ray_actor" and lease.lease_id not in self._active_actor_slots.values():
+        if spec.execution_kind == "actor" and lease.lease_id not in self._active_actor_slots.values():
             # Prefetched actor calls retain their inputs, but only the active
             # call can currently populate that actor's generator buffer.
             return 0
@@ -1564,24 +1589,17 @@ class RayQueryResourceManager:
             if amount <= 0:
                 continue
             assert usage_by_unit is not None
-            dimension_unit_ids, reserved_by_unit, limit = self._dimension_reservations_locked(
+            _, reserved_by_unit, limit = self._dimension_reservations_locked(
                 field_name,
                 requested_unit_id=resource_unit_id,
             )
-            reserved = reserved_by_unit[resource_unit_id]
-            current_amount = getattr(usage_by_unit[resource_unit_id], field_name)
-            if current_amount + amount <= reserved + _EPSILON:
-                continue
-            shared_pool = max(0.0, limit - sum(reserved_by_unit.values()))
-            shared_used = sum(
-                max(
-                    0.0,
-                    getattr(usage_by_unit[key], field_name) - reserved_by_unit[key],
-                )
-                for key in dimension_unit_ids
+            remaining = resource_budget_remaining(
+                resource_unit_id,
+                usage={key: getattr(usage_by_unit[key], field_name) for key in reserved_by_unit},
+                reserved=reserved_by_unit,
+                limit=limit,
             )
-            shared_need = amount - max(0.0, reserved - current_amount)
-            if shared_used + shared_need > shared_pool + _EPSILON:
+            if amount > remaining + _EPSILON:
                 return f"unit_soft_{field_name}"
 
         if not ignore_object_store and request.object_store_bytes > 0:
@@ -1756,7 +1774,7 @@ class RayQueryResourceManager:
     def _unit_uses_dimension(spec: ResourceUnitSpec, field_name: str) -> bool:
         if field_name == "object_store_bytes":
             return bool(spec.per_task.object_store_bytes or spec.target_output_block_bytes)
-        resources = spec.resident_per_actor if spec.backend == "ray_actor" else spec.per_task
+        resources = spec.resident_per_actor if spec.execution_kind == "actor" else spec.per_task
         return _resource_dimension(resources, field_name) > 0
 
     def _unit_dimension_commitment(self, spec: ResourceUnitSpec, field_name: str) -> int | float:
@@ -1766,7 +1784,7 @@ class RayQueryResourceManager:
             # charged to runtime usage; the default per-unit reservation below
             # supplies the protected progress share.
             return 0
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             return _resource_dimension(spec.resident_per_actor, field_name) * spec.actor_pool_size
         return _resource_dimension(spec.per_task, field_name)
 
@@ -1781,10 +1799,10 @@ class RayQueryResourceManager:
             # operator maximum and let the query-level soft budget, output
             # backpressure, spill, and liveness escape control the dimension.
             return self.allocation.resources.object_store_bytes
-        if spec.backend == "ray_actor" and field_name != "object_store_bytes":
+        if spec.execution_kind == "actor" and field_name != "object_store_bytes":
             return _resource_dimension(spec.resident_per_actor, field_name) * spec.actor_pool_size
         concurrency = self._unit_concurrency_cap(spec)
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             concurrency = spec.actor_pool_size
         coexistence_bound = math.inf if concurrency is None else int(concurrency)
         commitment = self._task_commitment(spec)
@@ -2005,7 +2023,7 @@ class RayQueryResourceManager:
         recovery_liveness: bool = False,
     ) -> TaskGrant:
         unit = self._units[str(request.resource_unit_id)].spec
-        if unit.backend == "ray_task":
+        if unit.execution_kind == "task":
             if plan.node_id is not None:
                 raise RuntimeError("Ray task leases must leave placement to Ray Core")
         elif not str(plan.node_id or "").strip():
@@ -2019,13 +2037,13 @@ class RayQueryResourceManager:
 
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
-        if unit.backend == "ray_actor":
+        if unit.execution_kind == "actor":
             if actor_index is None:
                 raise RuntimeError("Ray actor task admission requires a concrete actor slot")
             actor_slot = (unit.resource_unit_id, int(actor_index))
             if self._actor_slot_lease_count_locked(actor_slot) >= unit.actor_prefetch_depth:
                 raise RuntimeError("Ray actor prefetch slot changed during atomic task admission")
-            execution_slot_id = f"ray_actor:{unit.resource_unit_id}:{int(actor_index)}"
+            execution_slot_id = f"{unit.backend}:{unit.resource_unit_id}:{int(actor_index)}"
         else:
             actor_slot = None
             execution_slot_id = f"{unit.backend}:{unit.resource_unit_id}:{lease_id}"
@@ -2047,7 +2065,7 @@ class RayQueryResourceManager:
         usage = self._units[resource_unit_id].usage
         usage.task_count += 1
         usage.task_input_bytes += lease.resources.object_store_bytes
-        if unit.backend == "ray_worker":
+        if unit.execution_kind == "native":
             usage.native_output_window_bytes += lease.output_window_bytes
         self._active_attempt_leases[(lease.task_id, lease.attempt_id)] = lease.lease_id
         if actor_slot is not None:
@@ -2069,7 +2087,7 @@ class RayQueryResourceManager:
         usage = unit.usage
         usage.task_count -= 1
         usage.task_input_bytes -= lease.resources.object_store_bytes
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             usage.native_output_window_bytes -= lease.output_window_bytes
         if lease.actor_index is None:
             return
@@ -2120,7 +2138,7 @@ class RayQueryResourceManager:
             if task.attempt_id != attempt_key:
                 raise RuntimeError(f"FTE task lease attempt mismatch: lease={task.attempt_id} result={attempt_key}")
             unit = self._units[task.resource_unit_id]
-            if unit.spec.backend != "ray_worker":
+            if unit.spec.execution_kind != "native":
                 raise RuntimeError(
                     f"atomic FTE completion requires a native fragment lease: "
                     f"{task.resource_unit_id} uses {unit.spec.backend}"
@@ -2557,7 +2575,7 @@ class RayQueryResourceManager:
             self._active_liveness_task_lease_ids_by_unit.clear()
             self._active_liveness_output_lease_ids_by_unit.clear()
             for unit in self._units.values():
-                if unit.spec.backend == "ray_actor":
+                if unit.spec.execution_kind == "actor":
                     unit.actor_ready = False
             self._allocation_admission_open = False
             self._cancelled = True
@@ -2602,10 +2620,10 @@ class RayQueryResourceManager:
     ) -> ResourceVector:
         unit = self._units[resource_unit_id]
         usage = unit.usage
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             pending_bytes = usage.native_output_window_bytes
         else:
-            generators = usage.active_actor_count if unit.spec.backend == "ray_actor" else usage.task_count
+            generators = usage.active_actor_count if unit.spec.execution_kind == "actor" else usage.task_count
             pending_bytes = generators * self._pending_output_estimate_per_task_locked(unit.spec)
         # Every managed output remains charged exactly once, even after its
         # producer task has finished. Its queue/consumer state affects progress
@@ -2687,7 +2705,7 @@ class RayQueryResourceManager:
             resource_unit_id,
             excluded_waiting_block_id=excluded_waiting_block_id,
         )
-        if self._units[resource_unit_id].spec.backend == "ray_actor":
+        if self._units[resource_unit_id].spec.execution_kind == "actor":
             total = total + self._actor_resident_usage_locked(
                 resource_unit_id=resource_unit_id,
             )
@@ -2748,7 +2766,7 @@ class RayQueryResourceManager:
                 "query_id": self.graph.query_id,
                 "graph": self.graph.to_dict(),
                 "allocation": self.allocation.to_dict(),
-                "ray_core_owns_placement": True,
+                "backend_owns_placement": True,
                 "usage": usage.to_dict(),
                 "soft_allocation_usage": soft_allocation_usage.to_dict(),
                 "actor_process_usage": self._actor_resident_usage_locked().to_dict(),
@@ -2873,7 +2891,7 @@ class RayQueryResourceManager:
                             # output contracts. Report the largest active
                             # estimate, with the exact total alongside it.
                             max(pending_estimates_by_unit[resource_unit_id])
-                            if unit.spec.backend == "ray_worker" and pending_estimates_by_unit[resource_unit_id]
+                            if unit.spec.execution_kind == "native" and pending_estimates_by_unit[resource_unit_id]
                             else self._pending_output_estimate_per_task_locked(unit.spec)
                         ),
                         "pending_output_estimate_bytes": sum(pending_estimates_by_unit[resource_unit_id]),
@@ -2934,7 +2952,7 @@ __all__ = [
     "OutputBlockLease",
     "OutputBlockLeaseOwner",
     "OutputBlockRequest",
-    "RayQueryResourceManager",
+    "QueryResourceManager",
     "TaskGrant",
     "TaskLease",
     "TaskRequest",

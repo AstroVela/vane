@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import vane
+from tests.local_admission_helpers import linear_metadata
 from vane import pickle as vane_pickle
 from vane.ai import DiagnosticError, summarize_error
 from vane.execution import ref_bundle
@@ -69,6 +70,9 @@ class _Plan:
 
     def collect_udf_nodes(self, conn=None):
         return self.nodes
+
+    def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+        return linear_metadata(self.nodes)
 
     def set_udf_actor_handles(self, options, conn=None):
         self.options = options["one"]
@@ -778,6 +782,17 @@ def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited, mo
         result = _wait_result(first)
         assert not isinstance(result, BaseException)
         refs.extend(result[1])
+        # Execution completion wakes the query admission pump asynchronously.
+        # Wait for its callback to record the refusal without consuming it.
+        authority = second._admission_authority
+        deadline = time.monotonic() + 5
+        while True:
+            with authority._lock:
+                recorded = authority._wakeup_refusal is not None
+            if recorded:
+                break
+            assert time.monotonic() < deadline, "queued admission did not record its byte refusal"
+            time.sleep(0.01)
         # A transport notification can arrive after the pool callback has
         # recorded a byte refusal but before the dispatcher reads it.
         strict_transport.wake_waiters()

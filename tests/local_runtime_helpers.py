@@ -19,6 +19,7 @@ def _slot_snapshot(pool):
         return {
             "closed": pool._closed,
             "available_slots": len(pool._available_slots),
+            "prefetch_depth": getattr(pool, "prefetch_depth", 1),
             "active_leases": len(pool._active_slots),
             "ordinary_waiters": len(pool._waiters),
             "policy_sources": len(pool._sources) - int(0 in pool._sources),

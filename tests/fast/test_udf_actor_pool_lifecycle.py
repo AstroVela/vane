@@ -10,6 +10,7 @@ import types
 
 import pytest
 
+from tests.local_admission_helpers import linear_metadata
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
     actor_pool_cleanup_pending,
@@ -129,7 +130,9 @@ def _prepare_actor_pools(monkeypatch, backend, pool_factory, *, set_handles=None
         from vane.execution import udf_subprocess
 
         monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", pool_factory)
-        return udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(nodes, set_handles=set_handles)
+        return udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(
+            nodes, resource_graph=linear_metadata(nodes), set_handles=set_handles
+        )
 
     from vane.execution import udf_ray_actor_pool
 
@@ -285,7 +288,9 @@ def test_local_preparation_failure_leaves_borrowed_model_pool_with_its_owner(mon
         {"node_id": "owned", "payload": payload},
     ]
     with pytest.raises(RuntimeError) as exc_info:
-        udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(nodes, set_handles=fail_injection)
+        udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(
+            nodes, resource_graph=linear_metadata(nodes), set_handles=fail_injection
+        )
 
     assert exc_info.value is failure
     assert shutdowns == [True]

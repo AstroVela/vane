@@ -32,6 +32,12 @@ import vane.runners.ray.fragment_worker_transitions as worker_transitions_mod
 import vane.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import vane.runners.ray.worker as worker_mod
 import vane.runners.ray.worker_handle as worker_handle_mod
+from vane.execution.query_resource_spec import (
+    QueryAllocation,
+    QueryResourceGraph,
+    ResourceUnitSpec,
+    ResourceVector,
+)
 from vane.runners.common import QueryDeadlineExceeded
 from vane.runners.fte import (
     AssignmentResult,
@@ -55,12 +61,6 @@ from vane.runners.fte.fte_events import (
     WorkerReservationCompleted,
 )
 from vane.runners.ray.fragment_worker_context import fragment_id_for_task
-from vane.runners.ray.query_resource_graph import (
-    QueryAllocation,
-    QueryResourceGraph,
-    ResourceUnitSpec,
-    ResourceVector,
-)
 from vane.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
 from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
@@ -8463,7 +8463,7 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
 
 
 def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch):
-    from vane.runners.ray.query_resource_manager import TaskGrant
+    from vane.execution.query_resource_policy import TaskGrant
 
     query_id = "query-aggregate-soft-denial"
     fragment_id = _install_manual_test_fragment(query_id, "8")

@@ -11,12 +11,24 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from vane.runners.ray.query_resource_graph import QueryAllocation, ResourceVector
-from vane.runners.ray.worker_memory import build_ray_node_memory_layout
+from vane.execution.query_resource_spec import QueryAllocation, ResourceVector
 
 _EPSILON = 1e-9
 _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _INTEGER_RESOURCE_FIELDS = {"heap_bytes", "object_store_bytes"}
+
+
+def query_coordinator_timing(env: Mapping[str, str]) -> tuple[float, float]:
+    heartbeat_timeout = float(env.get("VANE_QUERY_HEARTBEAT_TIMEOUT_S", "30"))
+    if not math.isfinite(heartbeat_timeout) or heartbeat_timeout <= 0:
+        raise ValueError("VANE_QUERY_HEARTBEAT_TIMEOUT_S must be finite and positive")
+    default_interval = min(5.0, heartbeat_timeout / 3.0)
+    interval = float(env.get("VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S", str(default_interval)))
+    if not math.isfinite(interval) or interval <= 0 or interval >= heartbeat_timeout:
+        raise ValueError(
+            "VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S must be positive and less than VANE_QUERY_HEARTBEAT_TIMEOUT_S"
+        )
+    return heartbeat_timeout, interval
 
 
 def _sum_resources(resources: Sequence[ResourceVector]) -> ResourceVector:
@@ -37,7 +49,7 @@ def _positive_difference(left: ResourceVector, right: ResourceVector) -> Resourc
 
 @dataclass(frozen=True)
 class NodeCapacity:
-    """One live Ray node used only to derive the cluster-wide soft budget."""
+    """One live execution node used only to derive the cluster-wide soft budget."""
 
     node_id: str
     resources: ResourceVector
@@ -100,58 +112,6 @@ class _QueryState:
     expires_at: float = 0.0
 
 
-def read_ray_node_capacities(
-    ray_module: Any,
-    *,
-    object_store_fraction: float = 0.5,
-    heap_reserve_bytes_per_node: int = 0,
-) -> tuple[NodeCapacity, ...]:
-    """Read live Ray capacity without inventing host-resource fallbacks."""
-
-    fraction = float(object_store_fraction)
-    if not math.isfinite(fraction) or fraction <= 0 or fraction > 1:
-        raise ValueError("object_store_fraction must be in (0, 1]")
-    heap_reserve = int(heap_reserve_bytes_per_node)
-    if heap_reserve < 0:
-        raise ValueError("heap_reserve_bytes_per_node must be >= 0")
-
-    try:
-        raw_nodes = ray_module.nodes()
-    except Exception as exc:
-        raise RuntimeError(f"failed to read Ray node capacity: {exc}") from exc
-
-    capacities: list[NodeCapacity] = []
-    for raw_node in raw_nodes:
-        if not bool(raw_node.get("Alive", True)):
-            continue
-        resources = dict(raw_node.get("Resources") or {})
-        cpu = max(0.0, float(resources.get("CPU", 0) or 0))
-        gpu = max(0.0, float(resources.get("GPU", 0) or 0))
-        if cpu <= 0 and gpu <= 0:
-            continue
-        node_id = str(raw_node.get("NodeID") or raw_node.get("NodeManagerAddress") or "").strip()
-        if not node_id:
-            raise ValueError("alive Ray node with schedulable resources is missing NodeID")
-        ray_heap = max(0, int(float(resources.get("memory", 0) or 0)))
-        ray_store = max(0, int(float(resources.get("object_store_memory", 0) or 0)))
-        memory_layout = build_ray_node_memory_layout(ray_heap)
-        labels = [str(key) for key, value in resources.items() if str(key).startswith("node:") and float(value) > 0]
-        labels.extend(f"{key}={value}" for key, value in sorted(dict(raw_node.get("Labels") or {}).items()))
-        capacities.append(
-            NodeCapacity(
-                node_id=node_id,
-                resources=ResourceVector(
-                    cpu=cpu,
-                    gpu=gpu,
-                    heap_bytes=max(0, memory_layout.task_heap_capacity_bytes - heap_reserve),
-                    object_store_bytes=math.floor(ray_store * fraction),
-                ),
-                labels=tuple(labels),
-            )
-        )
-    return tuple(sorted(capacities, key=lambda item: item.node_id))
-
-
 class ClusterQueryResourceCoordinator:
     """Divide cluster capacity into query-level soft budgets.
 
@@ -181,7 +141,7 @@ class ClusterQueryResourceCoordinator:
         nodes: dict[str, NodeCapacity] = {}
         for node in node_capacities:
             if node.node_id in nodes:
-                raise ValueError(f"duplicate Ray node capacity: {node.node_id}")
+                raise ValueError(f"duplicate node capacity: {node.node_id}")
             nodes[node.node_id] = node
         return dict(sorted(nodes.items()))
 
@@ -482,5 +442,4 @@ __all__ = [
     "ClusterQueryResourceCoordinator",
     "NodeCapacity",
     "QueryDemand",
-    "read_ray_node_capacities",
 ]

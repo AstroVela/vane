@@ -30,8 +30,7 @@ block = refs.prepare_local_shm_block(pa.table({'x': [11, 22, 33]}))
 lease = store.allocate(block.ipc_size_bytes)
 allocation = lease.allocation
 region = store.buffer(allocation)
-region[:8] = len(block.ipc).to_bytes(8, 'little')
-region[8:] = memoryview(block.ipc).cast('B')
+block.write_to(region)
 region.release()
 ref = refs.LocalShmBlockRef(f'{allocation.identity}:0', allocation.size,
                           budget_bytes=0, allocation_lease=lease)
