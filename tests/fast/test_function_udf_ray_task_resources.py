@@ -837,3 +837,31 @@ def test_runtime_resource_options_cannot_override_graph_resources():
     assert options["num_cpus"] == 1.0
     assert options["num_gpus"] == 0.0
     assert options["memory"] == 2 * _GIB
+
+
+@pytest.mark.parametrize("payload_retries,override,expected", [(None, None, 4), (0, None, 0), (2, None, 2), (0, 1, 1)])
+def test_ray_task_honors_payload_retry_policy(monkeypatch, payload_retries, override, expected):
+    import ray
+
+    import vane.execution.udf_ray as fur
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    calls = []
+
+    def build_remote(cpus, gpus, memory, retries, *args):
+        calls.append(retries)
+        return object()
+
+    monkeypatch.setattr(fur, "_build_bundle_stream_remote", build_remote)
+    monkeypatch.setattr(fur, "_build_ref_bundle_stream_remote", build_remote)
+    monkeypatch.setattr(fur, "RayTaskUDFExecutor", lambda *args, **kwargs: object())
+    fur._build_ray_task_executor(
+        _distributed_payload(max_task_retries=payload_retries),
+        {
+            "query_driver_handle": object(),
+            "query_generation_capability": "generation",
+            "session_config": {},
+            "max_task_retries": override,
+        },
+    )
+    assert calls == [expected, expected]

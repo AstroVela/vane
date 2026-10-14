@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     )
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
+    from vane.ai.video import VideoEmbeddingPipeline, VideoEmbeddingProfile, VideoEmbeddingTask, VideoFusionProfile
 
 __all__ = [
     "AudioClip",
@@ -59,6 +60,10 @@ __all__ = [
     "UDFOptions",
     "VideoClip",
     "VideoInputSpec",
+    "VideoEmbeddingPipeline",
+    "VideoEmbeddingProfile",
+    "VideoEmbeddingTask",
+    "VideoFusionProfile",
     "embed",
     "embed_image",
     "embed_video",
@@ -69,6 +74,10 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "VideoEmbeddingPipeline": ("vane.ai.video", "VideoEmbeddingPipeline"),
+    "VideoEmbeddingProfile": ("vane.ai.video", "VideoEmbeddingProfile"),
+    "VideoEmbeddingTask": ("vane.ai.video", "VideoEmbeddingTask"),
+    "VideoFusionProfile": ("vane.ai.video", "VideoFusionProfile"),
     "DiagnosticError": ("vane.ai._errors", "DiagnosticError"),
     "summarize_error": ("vane.ai._errors", "summarize_error"),
     "AudioClip": ("vane.ai._audio_embedding", "AudioClip"),
