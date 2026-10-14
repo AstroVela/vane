@@ -689,3 +689,92 @@ SHA-256 remains
 Configurations retain code/package/input identities and output counts/hashes.
 Owned Ray processes stop before temporary/spill cleanup; source files remain
 unchanged and the shared local result cache is removed after comparison.
+
+## Reusing correlated owner keys before exchange (2026-10-15)
+
+Q21 cannot derive a sufficiently small independent scan for either correlation:
+its orders scan exceeds the existing estimate limit, and its outer owner is a
+nested delimiter. The planner now falls back to the existing owner fragment's
+output. A second hash edge feeds a key projection and broadcast into the native
+SEMI filter; the owner's source and joins execute once. The original delimiter
+still owns matching, NULL and aggregation semantics. Both delimiter variants
+consume their owner before DELIM_SCAN pipelines, and the filter branch drains
+that same owner into its build side before probing. This preserves progress
+with shared producers and bounded output windows.
+
+The fallback requires a nonzero owner estimate, fewer than one eighth of the
+input rows, at most 8 MiB of estimated key data, and lower estimated traffic for
+the additional complete owner edge plus key replicas than the input exchange.
+The earlier small independent scan path remains preferred for Q17. FTE uses
+the same graph and replays committed owner outputs for failed consumers.
+
+A fresh comparison freezes `35ca1d5bf0`'s installed `0.3.0.dev97` runtime and
+compares it with `0.3.0.dev98`, using the same SF10 inputs, two 18-CPU workers,
+two partitions, resource limits and timing boundaries as above. This task ran
+no concurrent builds or tests during timing. The host is shared, and unrelated
+worktree tests were active; these runs do not claim exclusive host isolation.
+
+| Measurement, seconds | Fresh frozen baseline | Owner reuse | Local, candidate pass |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 59.127 | **52.144** | 9.149 |
+| Q21, median of three | 9.632 | **4.295** | 1.263 |
+| Q17, median of three | 0.602 | 0.565 | 0.395 |
+
+Q21 falls **55.4%** and takes **3.40 times local**. The complete pass falls
+11.8% but remains **5.70 times local**; the baseline local total is 9.022
+seconds. The two full runs each have 52 matching samples. A separate nine-sample
+pipelined control gives Q6/Q17/Q21 medians of 0.397/0.592/4.322 seconds. Q17's
+small variation is not attributed to this fallback. Q18 (7.979 seconds), Q8
+(6.945) and Q5 (6.599) remain the largest candidate first-pass contributors.
+Ordered comparisons retain the existing numeric tolerance, and all samples
+return query, result and worker reservations to zero.
+
+Separate completed native diagnostics establish the work reduction:
+
+| Q21 accepted rows | Frozen baseline | Owner reuse |
+|---|---:|---:|
+| First correlated fact input | 59,986,052 | **3,458,628** |
+| Second correlated fact input | 37,929,348 | **2,401,716** |
+| All channels, including added owner/key branches | 144,608,322 | **55,437,498** |
+
+These are in-process native channel counts, with shared broadcast channels
+counted once, not Ray network bytes or timing samples. Both results match local
+exactly and have the same output hash; channel credit returns to zero within
+the configured byte windows. The outer lineitem input to the ordinary hash join
+still exchanges **37,929,348 rows**, identifying a remaining boundary for
+filter pushdown. The completed diagnostics use the public 1 MiB/16-slot
+exchange windows and a diagnostic-only 600-second deadline. An earlier frozen
+baseline attempt with a 64 KiB window reached its 180-second execution limit;
+its error and cleanup manifest are retained separately.
+
+The 32 new default-optimizer cases compare exact local results, reduced
+exchange volume and one execution of the owner source across one/four threads,
+two/three partitions, ordinary/NULL-safe equality, duplicate keys, multiple
+correlation fields, EXISTS, NOT EXISTS, nested and scalar queries. They fail
+the work-volume assertion on the frozen former runtime. Single-slot progress
+and cancellation are covered; cancellation runs in a subprocess with an
+independent deadline. Related native/compiler/SQL/FTE-source/exchange/graph
+modules pass **1367 distinct cases** across the main run and a corrected
+cancellation-fixture rerun. The initial fixture assumed a fixed number of pump
+steps before backpressure; it now waits for the observed blocked state.
+
+**Nine targeted Ray cases pass**, including both public execution modes and
+worker loss after a shared owner stage commits. The failed consumer reuses its
+input identity with a new fence, and reservations return to zero. The full
+release suite and large-query FTE timing qualification are not rerun.
+
+Native SHA-256 identities, in frozen baseline/candidate order:
+
+```text
+671df83774f6ba8c5bbcf5b5103873d8cdbecd19715f0463abaf1fbe2c8b2422
+9093f928fb2f3806b1b96ced415ed0320644cbd164b9d1def51b460a769b4ace
+```
+
+Evidence is retained under `build/pipelined-owner-keys-20261015/`:
+`baseline-full/`, `candidate-full/`, `candidate-focus/`, `comparison.json`,
+`comparison.csv`, native work reports, source patch and test logs. The frozen
+driver SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Configurations retain package/input identities and output counts/hashes.
+Owned processes stop before temporary/spill cleanup, and the shared oracle
+cache is removed after comparison. Original SF10 inputs remain unchanged.

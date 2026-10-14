@@ -21,6 +21,7 @@ from tests.fast.test_fragment_sql_coverage import (
     UNSTABLE_AGES,
     UNSTABLE_LAMBDAS,
     UNSTABLE_TIMEZONES,
+    correlated_owner_queries,
     correlated_parquet_source,
     correlated_partition_cases,
     correlation_source,
@@ -120,6 +121,66 @@ def test_public_correlated_key_filter_repeats_bound_parquet_scan(tmp_path, mode)
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 assert result.collect().to_pylist() == expected
             assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_correlated_owner_keys_and_shared_branches(tmp_path, mode):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config={"threads": 4}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        for index, comparison in enumerate(("=", "is not distinct from")):
+            queries = correlated_owner_queries(local, tmp_path / f"fact-{index}.parquet", comparison)
+            for sql in queries.values():
+                expected = local.execute(sql).to_arrow_table().to_pylist()
+                with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                    assert result.collect().to_pylist() == expected
+                assert_idle(connection)
+
+
+def test_fte_correlated_owner_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    dispatch, lost = RecoveryScheduler._dispatch, []
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        # Kill a consumer after an owner shared by several stages has committed.
+        producers = {
+            e.producer_fragment_id for e in scheduler.spec.graph.exchanges if e.producer_fragment_id in upstream
+        }
+        shared = any(
+            len({e.consumer_fragment_id for e in scheduler.spec.graph.exchanges if e.producer_fragment_id == p}) > 1
+            for p in producers
+        )
+        if admitted and shared and not lost:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = correlated_owner_queries(local, tmp_path / "fact.parquet", "is not distinct from")["nested"]
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90)) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert len(lost) == 1
+            attempts = [t for t in scheduler.history if t.task_id == lost[0].task_id]
+            assert len(attempts) == 2
+            assert attempts[0].input_id == attempts[1].input_id
+            assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

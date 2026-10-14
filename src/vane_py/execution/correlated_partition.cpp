@@ -194,12 +194,12 @@ public:
 		result.inputs.emplace(&owner, optional_idx(owner_column));
 		auto output = Visit(root.join);
 		if (output.valid && output.partitioned) {
-			CorrelatedKeySource keys;
-			FindKeySource(owner, owner_column, key_type, keys);
-			if (keys.source) {
-				for (auto input : filterable_inputs) {
-					result.filters.emplace(input, keys);
-				}
+			CorrelatedKeyFilter filter;
+			FindKeySource(owner, owner_column, key_type, filter.scan);
+			filter.owner.source = &owner;
+			filter.owner.column = owner_column;
+			for (auto input : filterable_inputs) {
+				result.filters.emplace(input, filter);
 			}
 		}
 		return output.valid && output.partitioned;

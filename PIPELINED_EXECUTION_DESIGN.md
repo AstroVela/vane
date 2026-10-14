@@ -912,6 +912,10 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 被重复规划的扫描保留协调端原始文件和 split 绑定，只有序列化的工作端副本去掉文件列表。额外扫描仍有显式 source assignment，遵守相同的文件版本检查和 FTE 冻结路径；不复制可能返回不同结果的任意表函数。
 
+找不到足够小的独立扫描时，可以复用已规划的 owner fragment 输出：保留原 HASH 边，另建 HASH 边将同一输出送到键列 projection，再广播给上述 SEMI join。owner 的 join、聚合和源只执行一次。只有 owner 估计行数已知且少于待过滤输入八分之一、键列估计不超过 8 MiB、额外完整 owner 交换加键列广播的估计字节数低于待过滤输入交换时才启用；原来的小扫描路径仍优先。这个回退也适用于 owner 是嵌套 delimiter 的 Q21。
+
+两种原生 delimiter 都先消费完整 owner，再运行 DELIM_SCAN 管线；键列分支也先消费 owner，供 SEMI join 构建过滤表。因此共享 producer 的两个分支都先排空 owner，不依赖待过滤输入才能释放其 credit。每条额外边沿用既有有界交换及取消清理规则。FTE 从已提交的 owner 输出绑定两个下游，失败消费者重放相同输入版本，不重新执行 owner。
+
 每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
 
 这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。

@@ -4,6 +4,9 @@
 """Execution work scales with groups and frames rather than input batches."""
 
 import json
+import subprocess
+import sys
+import textwrap
 import time
 from collections import Counter
 
@@ -11,6 +14,7 @@ import pytest
 
 import vane
 from tests.fast.test_direct_exchange import channel, collect, next_batch, prepare_root_task, submission
+from tests.fast.test_fragment_sql_coverage import correlated_owner_queries
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
@@ -466,3 +470,53 @@ def test_correlated_key_filter_preserves_nulls_duplicates_and_outer_rows(tmp_pat
         with InProcessTaskService(connection, submission(connection, sql, partitions=partitions), limits) as service:
             service.start()
             assert collect(service) == expected
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("kind", ["semi", "anti", "nested", "scalar"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partitions, kind, comparison):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql = correlated_owner_queries(connection, tmp_path / "fact.parquet", comparison)[kind]
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        spec = submission(connection, sql, partitions=partitions)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [channel.snapshot() for channel in service.channels.values()]
+            assert sum(state["accepted_rows"] for state in states) < 32768
+            assert all(state["peak_bytes"] <= limits.window_bytes for state in states)
+        # Sharing the owner must not execute its source a second time.
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_correlated_owner_fanout_releases_blocked_branches_on_close(tmp_path, threads):
+    # A native teardown deadlock must fail under an independent process deadline.
+    script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from pathlib import Path
+        import vane
+        from tests.fast.test_direct_exchange import submission
+        from tests.fast.test_fragment_sql_coverage import correlated_owner_queries
+        from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
+
+        with vane.connect(backend="local", config={"threads": int(sys.argv[2])}) as connection:
+            sql = correlated_owner_queries(connection, Path(sys.argv[1]) / "fact.parquet")["nested"]
+            limits = DirectExchangeLimits(4096, 1024, 64, 1)
+            spec = submission(connection, sql, partitions=3)
+            with InProcessTaskService(connection, spec, limits) as service:
+                service.start()
+                deadline = time.monotonic() + 10
+                while not any(c.snapshot()["write_blocks"] for c in service.channels.values()):
+                    assert time.monotonic() < deadline, service.snapshot()
+                    service.pump(1)
+                service.cancel("cancel shared owner branches")
+            assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
+        """
+    )
+    subprocess.run([sys.executable, "-c", script, str(tmp_path), str(threads)], check=True, timeout=30, cwd=tmp_path)

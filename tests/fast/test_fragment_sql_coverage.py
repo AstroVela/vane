@@ -178,6 +178,28 @@ DETERMINISTIC_TIMEZONES = [
 ]
 
 
+def correlated_owner_queries(connection, path, comparison="="):
+    connection.execute(
+        "copy (select case when range%65536=0 then null else range%4096 end k, range%97 v "
+        f"from range(131072)) to '{path}' (row_group_size 2048)"
+    )
+    # No independent Parquet scan contains the owner's key domain. Its output
+    # has duplicates and exceeds one-slot exchange windows on both branches.
+    owner = (
+        "(select range i, case when range%4=0 then null else (range%4)*257 end k, range%3 t "
+        "from range(65536) where range%31=0) a"
+    )
+    match = f"select 1 from read_parquet('{path}') b where b.k {comparison} a.k and b.v<>a.t"
+    exclude = f"select 1 from read_parquet('{path}') c where c.k {comparison} a.k and c.v>a.t+95"
+    return {
+        "semi": f"select a.i, a.k from {owner} where exists ({match}) order by a.i",
+        "anti": f"select a.i, a.k from {owner} where not exists ({exclude}) order by a.i",
+        "nested": f"select a.i, a.k from {owner} where exists ({match}) and not exists ({exclude}) order by a.i",
+        "scalar": f"select a.i, a.k, (select avg(b.v) from read_parquet('{path}') b "
+        f"where b.k {comparison} a.k and b.v<>a.t) v from {owner} order by a.i",
+    }
+
+
 def correlation_source(count=31):
     # Repeated and NULL keys exercise ownership separately from row splitting.
     return f"(select case when range % 11=0 then null else range % 7 end k, range % 5 s, range v from range({count}))"

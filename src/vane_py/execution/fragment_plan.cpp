@@ -760,15 +760,21 @@ public:
 
 	DistributedSubtree Exchange(DistributedSubtree child, const string &distribution, idx_t count,
 	                            const vector<idx_t> &keys = {}) {
+		auto types = child.fragment.root.types;
+		auto producer = Finish(std::move(child));
+		return ExchangeFrom(producer, std::move(types), distribution, count, keys);
+	}
+
+	DistributedSubtree ExchangeFrom(const string &producer, vector<LogicalType> types, const string &distribution,
+	                                idx_t count, const vector<idx_t> &keys = {}) {
 		ExchangeSpec edge;
 		edge.exchange_id = "exchange" + std::to_string(next_exchange++);
 		edge.consumer_port = edge.exchange_id;
 		edge.distribution = distribution;
-		auto types = child.fragment.root.types;
 		if (distribution == "hash") {
 			edge.partitioning = HashExpression(types, keys);
 		}
-		edge.producer = Finish(std::move(child));
+		edge.producer = producer;
 		DistributedSubtree result;
 		result.fragment.partition_count = count;
 		result.fragment.root.input_port = edge.consumer_port;
@@ -899,25 +905,42 @@ private:
 	}
 
 	DistributedSubtree FilterCorrelatedInput(PhysicalOperator &op, DistributedSubtree input, idx_t key,
-	                                         const CorrelatedKeySource &filter) {
-		// Duplicate only a small scan whose key domain is much smaller than the
-		// input. The native SEMI join preserves duplicates on the probe and uses
-		// null-safe equality so this necessary condition cannot discard NULL keys.
-		auto &source = *filter.source;
-		if (EstimatedExchangeBytes(source) > 8 * 1024 * 1024 ||
-		    double(source.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
-		    double(source.estimated_cardinality) * input.fragment.partition_count >= double(op.estimated_cardinality)) {
-			return input;
-		}
-		auto domain = Build(source);
-		vector<unique_ptr<Expression>> expressions;
-		expressions.push_back(make_uniq<BoundReferenceExpression>(op.types[key], filter.column));
-		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {op.types[key]}, std::move(expressions),
-		                                                 source.estimated_cardinality);
-		projection.children.push_back(source);
-		Wrap(projection, domain);
+	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
+		auto keys = filter.scan;
+		const bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
+		                    double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
+		                    double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
+		DistributedSubtree domain;
+		if (rescan) {
+			// Prefer duplicating a small independent scan to introducing another
+			// consumer of the delimiter owner.
+			domain = Build(*keys.source);
+		} else {
+			keys = filter.owner;
+			auto &owner = *keys.source;
+			auto key_bytes =
+			    double(owner.estimated_cardinality) * (1 + GetTypeIdSize(owner.types[keys.column].InternalType()));
+			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > 8 * 1024 * 1024 ||
+			    double(owner.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
+			    EstimatedExchangeBytes(owner) + key_bytes * count >= EstimatedExchangeBytes(op)) {
+				return input;
+			}
+			// Both delimiter variants consume their complete owner before any
+			// DELIM_SCAN pipeline. The other branch projects/broadcasts keys into
+			// the SEMI build, so both branches drain the shared producer first.
+			// Reuse its output; never duplicate the owner's joins or aggregates.
+			domain = ExchangeFrom(owner_producer, owner.types, "hash", partitions, {keys.column});
+		}
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(make_uniq<BoundReferenceExpression>(op.types[key], keys.column));
+		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {op.types[key]}, std::move(expressions),
+		                                                 keys.source->estimated_cardinality);
+		projection.children.push_back(*keys.source);
+		Wrap(projection, domain);
 		domain = Exchange(std::move(domain), count == 1 ? "gather" : "broadcast", count);
+		// NULL-safe equality is only a necessary condition; the original
+		// delimiter join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
 		condition.left = make_uniq<BoundReferenceExpression>(op.types[key], key);
@@ -947,6 +970,7 @@ private:
 		node.types = root.types;
 		node.scoped = true;
 		PhysicalPlanInputBindings bindings;
+		string owner_producer;
 		std::set<const PhysicalOperator *> visited;
 		std::function<void(PhysicalOperator &)> visit = [&](PhysicalOperator &op) {
 			if (!visited.insert(&op).second) {
@@ -973,10 +997,13 @@ private:
 				auto child = Build(op);
 				auto filter = partitioning.filters.find(&op);
 				if (partitioned && filter != partitioning.filters.end()) {
-					child =
-					    FilterCorrelatedInput(op, std::move(child), partition_input->second.GetIndex(), filter->second);
+					child = FilterCorrelatedInput(op, std::move(child), partition_input->second.GetIndex(),
+					                              filter->second, owner_producer);
 				}
 				auto input = Exchange(std::move(child), distribution, result.fragment.partition_count, keys);
+				if (partitioned && &op == &root.children[0].get()) {
+					owner_producer = input.incoming[0].producer;
+				}
 				bindings.names.emplace(&op, input.fragment.root.input_port);
 				node.children.push_back(std::move(input.fragment.root));
 				for (auto &edge : input.incoming) {
