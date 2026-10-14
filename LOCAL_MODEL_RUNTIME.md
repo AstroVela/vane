@@ -2161,6 +2161,27 @@ Execution completion returns the task/actor slot immediately; managed output
 bytes remain charged through queued results, zero-copy Arrow/NumPy views,
 remote readers, and inherited views protected by the shared-memory store.
 
+Shared-memory progress credits and physical bytes have separate lifetimes.
+The per-producer soft-budget window counts pending and unconsumed outputs.
+A downstream input ACK returns that output's progress credit, even when an
+actor retains a zero-copy view across calls. Its physical allocation and byte
+charge remain live until the last view or fork owner releases them. Consequently,
+multiple actors can receive replacement inputs without requiring their old
+views to disappear first. Explicit task byte envelopes remain strict.
+
+Physical-capacity waits include all current worker reads (including views from
+earlier calls), idle retained views, and queued
+outputs of the input streams used by waiting consumers. Queued input is not
+assumed reclaimable merely because it belongs to another allocation: its next
+invocation may require the very actor slot occupied by the waiting writer.
+A current read owner in another worker, or an unrelated stream, still permits
+an independent release. This is a conservative admission boundary: an input
+whose consumer has not started is not evidence that a capacity wait can finish.
+When these dependencies leave no contiguous region large enough for any waiting
+output, execution reports a capacity error with pinned, retained, and queued
+input bytes. Reducing input/output blocks or increasing the arena addresses this
+hard capacity boundary; increasing the soft reference budget does not.
+
 Explicit local `DataAdmissionLimits` remain an additional application limit.
 Their byte-accounting tests verify these differences from default soft admission:
 Local preserves a complete task envelope even at a zero reservation ratio;

@@ -164,6 +164,73 @@ def test_mutually_blocked_writers_report_capacity_and_unblock_peer_on_cleanup(st
                 lease.release()
 
 
+@pytest.mark.parametrize(
+    "producer,reader_active,reader_finished",
+    [("upstream", False, False), ("upstream", True, False), ("unrelated", False, False), ("upstream", True, True)],
+)
+def test_capacity_wait_tracks_queued_input_stream_dependencies(producer, reader_active, reader_finished):
+    store = LocalShmStore(8192)
+    store.add_client("queued-inputs")
+    current = store.allocate(3072, producer_id="upstream")
+    queued = store.allocate(3072, producer_id=producer)
+    store.start_input(current.allocation, ("consumer", 1))
+    scope = ExecutionCancellationScope("consumer", 1)
+    try:
+        if reader_active:
+            store.start_input(queued.allocation, ("independent", 1))
+        if reader_finished:
+            store.finish_input(queued.allocation, ("independent", 1))
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(store.wait_for_capacity, 4096, (current.allocation,), scope, nullcontext)
+            try:
+                if producer == "unrelated" or (reader_active and not reader_finished):
+                    with pytest.raises(FutureTimeoutError):
+                        pending.result(timeout=0.05)
+                    queued.release()
+                    pending.result(timeout=5)
+                else:
+                    with pytest.raises(LocalShmStoreCapacityError, match="queued_input_bytes=3072"):
+                        pending.result(timeout=5)
+            finally:
+                scope.cancel()
+    finally:
+        current.release()
+        queued.release()
+        store.remove_client("queued-inputs")
+    assert store.snapshot()["live_allocations"] == 0
+
+
+def test_waiting_worker_pins_views_from_earlier_calls(store, monkeypatch):
+    from vane.execution import udf_shm_store as storage
+
+    def current_store(client_id):
+        store.add_client(client_id)
+        return store
+
+    monkeypatch.setattr(storage, "current_store", current_store)
+    peer = storage.ParentShmPeer()
+    previous, current = store.allocate(2048), store.allocate(1024)
+    try:
+        old_token = peer.borrow_inputs({"block_refs": [{"allocation": previous.allocation.descriptor()}]})[0]
+        peer.retain_inputs({old_token})
+        peer.retain_inputs(set())  # The next call starts but still holds the old view.
+        peer.borrow_inputs({"block_refs": [{"allocation": current.allocation.descriptor()}]})
+        previous.release()
+        current.release()
+        with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
+            store.wait_for_capacity(
+                2048,
+                peer.input_allocations(),
+                ExecutionCancellationScope("history", 2),
+                nullcontext,
+            )
+    finally:
+        previous.release()
+        current.release()
+        peer.close_after_exit()
+    assert peer.input_allocations() == ()
+
+
 def test_fallible_budget_notification_does_not_repeat_physical_release(store):
     lease = store.allocate(1024)
     calls = []

@@ -177,21 +177,25 @@ def test_expanding_pipeline_releases_real_storage_under_small_budget(backend):
 
 
 @pytest.mark.parametrize(
-    "source_kind,source_backend,arena,copy_input,intermediate",
+    "source_kind,source_backend,arena,copy_input,intermediate,actors",
     [
-        ("generator", "subprocess_task", "16MiB", False, False),
-        ("table", "subprocess_task", "16MiB", False, False),
-        ("table", "subprocess_actor", "16MiB", False, False),
-        ("generator", "subprocess_task", "96KiB", False, False),
-        ("table", "subprocess_actor", "96KiB", False, False),
-        ("generator", "subprocess_task", "96KiB", True, False),
-        ("table", "subprocess_actor", "96KiB", True, False),
-        ("table", "subprocess_actor", "16MiB", False, True),
-        ("table", "subprocess_actor", "16MiB", True, True),
+        ("generator", "subprocess_task", "16MiB", False, False, 1),
+        ("table", "subprocess_task", "16MiB", False, False, 1),
+        ("table", "subprocess_actor", "16MiB", False, False, 1),
+        ("generator", "subprocess_task", "96KiB", False, False, 1),
+        ("table", "subprocess_actor", "96KiB", False, False, 1),
+        ("generator", "subprocess_task", "96KiB", True, False, 1),
+        ("table", "subprocess_actor", "96KiB", True, False, 1),
+        ("table", "subprocess_actor", "16MiB", False, True, 1),
+        ("table", "subprocess_actor", "16MiB", True, True, 1),
+        ("generator", "subprocess_task", "16MiB", False, False, 2),
+        ("generator", "subprocess_task", "16MiB", False, False, 4),
+        ("table", "subprocess_actor", "16MiB", False, False, 2),
+        ("table", "subprocess_actor", "16MiB", False, True, 2),
     ],
 )
 def test_actor_retaining_previous_input_can_receive_the_next_batch(
-    source_kind, source_backend, arena, copy_input, intermediate
+    source_kind, source_backend, arena, copy_input, intermediate, actors
 ):
     script = textwrap.dedent(f"""
         import gc
@@ -226,6 +230,7 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(
 
             def __call__(self, batch):
                 self.last = batch.to_pydict() if {copy_input!r} else batch
+                time.sleep(0.05)
                 return batch.select(['id'])
 
         try:
@@ -254,7 +259,7 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(
                         )
                     rel = rel.map_batches(
                         RetainingConsumer, schema={{'id': 'BIGINT'}},
-                        execution_backend='subprocess_actor', actor_number=1,
+                        execution_backend='subprocess_actor', actor_number={actors},
                         batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
                     )
                     if {arena!r} == '96KiB' and not {copy_input!r}:
@@ -287,6 +292,91 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(
             "VANE_PROGRESS": "0",
             "VANE_LOCAL_SHM_STORE_BYTES": arena,
             "VANE_LOCAL_SHM_REF_BUDGET_BYTES": "32KiB",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "blocks,arena,history", [(2, "192KiB", False), (1, "192KiB", False), (2, "256KiB", False), (4, "320KiB", True)]
+)
+@pytest.mark.parametrize("budget", ["32KiB", "16MiB", "auto"])
+def test_output_capacity_includes_inputs_queued_behind_the_current_call(blocks, arena, history, budget):
+    script = textwrap.dedent(f"""
+        import gc
+        import threading
+        import time
+        import pyarrow as pa
+        import vane
+        from vane.execution.ref_bundle import local_shm_ref_budget_snapshot
+        from vane.execution.udf_shm_store import local_shm_store_snapshot
+
+        def expand(batch):
+            for value in range({blocks}):
+                yield pa.table({{'id': [value], 'payload': [b'x' * 65536]}})
+
+        class Copy:
+            def __init__(self):
+                self.history = []
+
+            def __call__(self, batch):
+                if {history!r}:
+                    self.history.append(batch)
+                # Let the upstream publish the next input while this actor
+                # holds its sole execution slot. The history case also
+                # keeps previous-call views through the next allocation.
+                time.sleep(0.4)
+                return pa.table(batch.to_pydict())
+
+        try:
+            with vane.connect(config={{'threads': 4}}) as con:
+                watchdog = threading.Timer(15, con.interrupt)
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    rel = con.sql('select 1::BIGINT as id').map_batches(
+                        expand, schema={{'id': 'BIGINT', 'payload': 'BLOB'}},
+                        execution_backend='subprocess_task', batch_size=1, min_task_batch_size=1,
+                        task_input_max_bytes=8, output_batch_size=1, output_target_max_bytes=1024,
+                    ).map_batches(
+                        Copy, schema={{'id': 'BIGINT', 'payload': 'BLOB'}},
+                        execution_backend='subprocess_actor', actor_number=1,
+                        batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
+                        output_batch_size=1, output_target_max_bytes=1024,
+                    )
+                    if {history!r} or ({blocks} == 2 and {arena!r} == '192KiB'):
+                        try:
+                            rel.to_arrow_table()
+                        except Exception as error:
+                            assert 'shared-memory output cannot make progress' in str(error), str(error)
+                            if not {history!r}:
+                                assert 'queued_input_bytes=69632' in str(error), str(error)
+                        else:
+                            raise AssertionError('input working set leaves no room for the output')
+                    else:
+                        result = rel.to_arrow_table()
+                        assert sorted(result['id'].to_pylist()) == list(range({blocks}))
+                        assert result['payload'].to_pylist() == [b'x' * 65536] * {blocks}
+                        del result
+                finally:
+                    watchdog.cancel()
+        finally:
+            vane.teardown_runner()
+        gc.collect()
+        assert local_shm_ref_budget_snapshot()['usage_bytes'] == 0
+        assert local_shm_store_snapshot()['live_bytes'] == 0
+    """)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_LOCAL_SHM_STORE_BYTES": arena,
+            "VANE_LOCAL_SHM_REF_BUDGET_BYTES": budget,
         },
     )
     assert result.returncode == 0, result.stderr

@@ -312,6 +312,8 @@ class _LiveAllocation:
     forks: list[_ForkHold] = dataclass_field(default_factory=list)
     budget_releases: list[Callable[[], None]] = dataclass_field(default_factory=list)
     retained: bool = True
+    producer_id: str | None = None
+    input_readers: set[tuple[str, int]] = dataclass_field(default_factory=set)
 
 
 class StoreLease:
@@ -395,7 +397,7 @@ class LocalShmStore:
             if not self._clients:
                 self._drain_locked()
 
-    def allocate(self, size: int) -> StoreLease:
+    def allocate(self, size: int, *, producer_id: str | None = None) -> StoreLease:
         self._require_owner()
         required = self.check_write_size(size)
         with self._mutation():
@@ -419,7 +421,7 @@ class LocalShmStore:
             if length > required:
                 self._free.insert(index, (offset + required, length - required))
             allocation = ShmAllocation(self.store_id, self._shm.name, offset, size, next(self._generations))
-            self._live[allocation.generation] = _LiveAllocation(allocation, required)
+            self._live[allocation.generation] = _LiveAllocation(allocation, required, producer_id=producer_id)
             self._allocations += 1
             if offset < self._high_water:
                 self._reused_allocations += 1
@@ -473,6 +475,22 @@ class LocalShmStore:
                                 return
                             pinned = sum(self._live[g].capacity for g in generations if g in self._live)
                             blocked_inputs = set().union(*(g for _, g in self._waiting_writes.values()))
+                            # Unstarted outputs of these input streams are not
+                            # independent releases: their next consumer may be
+                            # the invocation currently waiting for this write.
+                            # A batch already borrowed by another worker has an
+                            # independent execution owner and can still progress.
+                            input_producers = {self._live[g].producer_id for g in blocked_inputs if g in self._live} - {
+                                None
+                            }
+                            queued_inputs = {
+                                g
+                                for g, entry in self._live.items()
+                                if g not in blocked_inputs
+                                and entry.producer_id in input_producers
+                                and not entry.input_readers
+                            }
+                            blocked_inputs.update(queued_inputs)
                             # An idle worker's retained input may require its
                             # next call to release it. Include that working set
                             # rather than waiting for an impossible next output.
@@ -498,6 +516,7 @@ class LocalShmStore:
                                     f"shared-memory output cannot make progress: requested={size}, "
                                     f"pinned_input_bytes={pinned}, capacity={self.capacity}, "
                                     f"retained_input_bytes={retained}, "
+                                    f"queued_input_bytes={sum(self._live[g].capacity for g in queued_inputs)}, "
                                     f"largest_free={largest}, largest_possible_free={largest_possible}; "
                                     "reduce task input or output block size"
                                 )
@@ -513,6 +532,22 @@ class LocalShmStore:
         if entry is None or entry.allocation != allocation:
             raise ValueError("stale or foreign shared-memory allocation")
         return entry
+
+    def start_input(self, allocation: ShmAllocation, reader: tuple[str, int]) -> None:
+        """A running worker, rather than a future invocation, now owns the input."""
+        self._require_owner()
+        with self._capacity_condition:
+            self._require_locked(allocation).input_readers.add(reader)
+            self._capacity_condition.notify_all()
+
+    def finish_input(self, allocation: ShmAllocation, reader: tuple[str, int]) -> None:
+        self._require_owner()
+        with self._capacity_condition:
+            # The read lease may have been the allocation's last physical owner.
+            entry = self._live.get(allocation.generation)
+            if entry is not None:
+                entry.input_readers.discard(reader)
+            self._capacity_condition.notify_all()
 
     def acquire(self, allocation: ShmAllocation) -> StoreLease:
         self._require_owner()
@@ -843,13 +878,19 @@ class ParentShmPeer:
                     lease = acquire_allocation(allocation)
                     token = next(self._ids)
                     self._reads[token] = lease
-                    descriptor["borrow_id"] = token
                     tokens.append(token)
+                    lease.store.start_input(lease.allocation, (self.client_id, token))
+                    descriptor["borrow_id"] = token
         except BaseException:
             for token in tokens:
                 self.release_read(token)
             raise
         return tokens
+
+    def input_allocations(self) -> tuple[ShmAllocation, ...]:
+        """All reads this worker can release, including views from earlier calls."""
+        with self._lock:
+            return tuple(lease.allocation for lease in self._reads.values() if not lease._released)
 
     def retain_inputs(self, tokens: set[int]) -> None:
         """Record post-call views, without taking additional physical leases."""
@@ -872,17 +913,21 @@ class ParentShmPeer:
         with self._lock:
             lease = self._reads.get(token)
             if lease is not None:
-                lease.release()
+                try:
+                    lease.release()
+                finally:
+                    if lease._released:
+                        lease.store.finish_input(lease.allocation, (self.client_id, token))
                 del self._reads[token]
                 if token in self._retained_tokens:
                     self.retain_inputs(self._retained_tokens - {token})
 
-    def reserve_write(self, grant_id: int, size: int) -> dict[str, Any]:
+    def reserve_write(self, grant_id: int, size: int, *, producer_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             self.check()
             if grant_id in self._writes:
                 raise ValueError("duplicate shared-memory write grant")
-            lease = self.store.allocate(size)
+            lease = self.store.allocate(size, producer_id=producer_id)
             self._writes[grant_id] = lease
             return lease.allocation.descriptor()
 
@@ -930,10 +975,10 @@ class ParentShmPeer:
             elif not self._lifetime.watching:
                 with _fork_lock:
                     self._lifetime.close_reader()
-            for leases in (self._reads, self._writes):
-                for token, lease in list(leases.items()):
-                    lease.release()
-                    del leases[token]
+            for token in list(self._reads):
+                self.release_read(token)
+            for token in list(self._writes):
+                self.finish_write(token)
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:

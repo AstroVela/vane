@@ -1179,7 +1179,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     self._track_output_grant(grant_id, scope)
                     scope.raise_if_cancelled("UDF subprocess output grant")
                     try:
-                        allocation = self._shm_peer.reserve_write(grant_id, size)
+                        allocation = self._shm_peer.reserve_write(grant_id, size, producer_id=scope.owner_id)
                         break
                     except LocalShmStoreCapacityError:
                         if reservation is not None:
@@ -1190,7 +1190,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         grant_id = 0
                         self._shm_peer.store.wait_for_capacity(
                             size,
-                            local_shm_budget_manager().consuming_inputs(input_lease_id),
+                            local_shm_budget_manager().consuming_inputs(input_lease_id)
+                            + self._shm_peer.input_allocations(),
                             scope,
                             lambda: self._capacity_wait_context("shared_memory_output"),
                         )
