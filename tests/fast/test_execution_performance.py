@@ -3,6 +3,7 @@
 
 """Execution work scales with groups and frames rather than input batches."""
 
+import json
 import time
 from collections import Counter
 
@@ -15,7 +16,76 @@ from vane._native import execution_plan as native
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 from vane.execution.pipelined_plan import placement
 from vane.execution.pipelined_worker import _Query
+from vane.execution.plan import Distribution
 from vane.execution.worker_resources import pipelined_demand
+
+
+def profile_fragment_scans(connection, monkeypatch):
+    scans = []
+    execute = native._execute_fragment_for_test
+
+    def visit(node):
+        if node.get("operator_type") == "TABLE_SCAN" and node["extra_info"].get("Function") == "READ_PARQUET":
+            scans.append(node)
+        for child in node.get("children", []):
+            visit(child)
+
+    def profiled(*args):
+        rows = execute(*args)
+        visit(json.loads(connection.get_profiling_information("json")))
+        return rows
+
+    monkeypatch.setattr(native, "_execute_fragment_for_test", profiled)
+    connection.execute("PRAGMA enable_profiling='no_output'")
+    return scans
+
+
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("column_type", ["INTEGER", "BIGINT"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_broadcast_join_filters_local_parquet_scan(tmp_path, monkeypatch, partitions, column_type, enabled):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select range::{column_type} k from range(131072)) to '{path}' (row_group_size 2048)")
+        if not enabled:
+            connection.execute("set disabled_optimizers='join_filter_pushdown'")
+        sql = f"select p.k from read_parquet('{path}') p join (select range * 30001 k from range(3)) b using(k)"
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, partitions)
+        scans = profile_fragment_scans(connection, monkeypatch)
+        # Each load must own fresh filters, including when the same payload is
+        # reused for different source partitions or a second execution.
+        for _ in range(2):
+            scans.clear()
+            assert Counter(execute_graph(connection, graph)) == expected
+            assert scans
+            # Count rows leaving the scan, not wall time or rows after the join.
+            scanned = sum(scan["operator_cardinality"] for scan in scans)
+            if enabled:
+                # The native IN filter prunes row groups; it need not evaluate
+                # the IN list on every row inside a surviving group.
+                assert 3 <= scanned <= 3 * 2048
+            else:
+                assert scanned == 131072
+
+
+def test_broadcast_filters_keep_independent_probe_scans_separate(tmp_path, monkeypatch):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select range k from range(131072)) to '{path}' (row_group_size 2048)")
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side'")
+        sql = (
+            f"select p.k, q.k from (select a.k from read_parquet('{path}') a "
+            "join (select range * 30001 k from range(3)) b using(k)) p "
+            f"join (select c.k from read_parquet('{path}') c "
+            "join (select range * 20001 k from range(5)) d using(k)) q using(k)"
+        )
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, 3)
+        scans = profile_fragment_scans(connection, monkeypatch)
+        assert Counter(execute_graph(connection, graph)) == expected
+        assert scans
+        assert sum(scan["operator_cardinality"] for scan in scans) <= 8 * 2048
 
 
 @pytest.mark.parametrize(
@@ -206,3 +276,53 @@ def test_same_worker_edges_share_channels_and_reserve_no_flight_staging(monkeypa
             time.sleep(0.001)
     finally:
         owner.close()
+
+
+@pytest.mark.parametrize("kind", ["inner", "left", "semi", "anti"])
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_broadcast_join_keeps_probe_partitions(kind, partitions, comparison):
+    left = "(select range i, case when range%7=0 then null else range%11 end k from range(43))"
+    right = "(select case when range=0 then null else range%3 end k from range(7))"
+    sql = f"select a.i, a.k from {left} a {kind} join {right} b on a.k {comparison} b.k"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, partitions)
+        assert Counter(execute_graph(connection, graph)) == expected
+    assert not any(e.distribution is Distribution.HASH for e in graph.exchanges)
+    probe = next(f for f in graph.fragments if f.sources and f.inputs)
+    assert probe.partition_count == partitions
+    assert len(probe.sources) == len(probe.inputs) == 1
+    edge = next(e for e in graph.exchanges if e.consumer_fragment_id == probe.fragment_id)
+    assert edge.distribution is (Distribution.GATHER if partitions == 1 else Distribution.BROADCAST)
+
+
+def test_broadcast_join_does_not_replicate_a_single_probe_partition():
+    sql = "select a.k, b.range from (select sum(range)::bigint k from range(4)) a left join range(7) b on a.k=b.range"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        graph = compile_sql(connection, sql, 5)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall() == [(6, 6)]
+    assert all(e.distribution is Distribution.GATHER for e in graph.exchanges)
+    assert graph.fragments[-1].partition_count == 1
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_broadcast_chain_filters_and_aggregates_before_exchange(threads):
+    sql = (
+        "select count(*) from range(100000) a join range(3) b on a.range%11=b.range "
+        "join range(2) c on a.range%11=c.range"
+    )
+    limits = DirectExchangeLimits(32768, 8192, 128, 2)
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=2)
+        with InProcessTaskService(connection, spec, limits=limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [channel.snapshot() for channel in service.channels.values()]
+            # Only small build rows and partial aggregates cross channels. The
+            # large probe stays in its scan partitions until after filtering.
+            assert sum(s["accepted_rows"] for s in states) < 64
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)

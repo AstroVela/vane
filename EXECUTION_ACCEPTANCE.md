@@ -158,6 +158,65 @@ Related regressions passed 1,094 non-Ray and 94 real-Ray cases; 23 optional
 subquery and CTE regression modules are included in the release launcher and
 source-package manifest.
 
+## TPCH SF10 broadcast and checksum throughput
+
+On 2026-10-13, a fresh baseline at `5dbc8f68b9` and the throughput increment
+both ran Q6/Q8/Q17/Q21 in that order. Both environments used PyArrow 26.0.0,
+NumPy 2.5.3 and Ray 2.59.0. The increment preserves broadcast probe fragments,
+avoids value traversal when measuring fixed-width frames, and uses OpenSSL EVP
+SHA-256 for frozen files and materialized objects.
+
+CPU and memory sizing follow the preceding acceptance: 36 local threads,
+two Ray workers with 18 CPU slots each, and all Ray-advertised memory after
+the required reservations. Both runs use the same 160 GiB store/query ceiling,
+4 GiB source allowance and 2 GiB object ceiling. Per-worker operator memory was
+27,507,070,976 / 28,095,027,200 bytes for baseline pipelined / FTE, and
+25,845,207,040 / 26,659,778,560 bytes for the increment. Available memory varies
+at startup. This is a single sample on a shared host with OS caches retained;
+elapsed time includes submission, complete collection and successful close.
+Q6 also includes the first query's actor startup within each Ray mode.
+
+| Query | Local after (s) | Pipelined before → after (s) | FTE before → after (s) |
+| --- | ---: | ---: | ---: |
+| Q06 | 0.252 | 1.432 → 1.351 | 22.415 → 13.112 |
+| Q08 | 0.602 | 15.561 → 13.853 | 93.481 → 56.513 |
+| Q17 | 0.416 | 44.307 → 40.764 | 100.796 → 59.926 |
+| Q21 | 1.322 | 58.582 → 47.770 | 93.822 → 58.702 |
+
+The increment continued through all 22 queries in each mode: local elapsed
+9.814 seconds, pipelined 238.258 seconds and FTE 616.156 seconds. All 44 Ray
+results matched local values, schemas and returned row sequences under the
+previously documented floating tolerance and HUGEINT Arrow profile. Per-query
+ownership and worker/store reservations retired; both closed Runtime snapshots
+had no remaining sessions or results. Source sizes and nanosecond modification
+times were unchanged. Only the four queries above have a same-day before/after
+baseline; the complete sweep supplies additional correctness coverage.
+
+The four-query elapsed sum changed from 119.882 to 103.739 seconds for pipelined,
+and from 310.514 to 188.253 seconds for FTE. FTE Q6 submission changed from
+21.732 to 12.406 seconds. Snapshot ownership, SHA-256 identities and full
+materialized-object verification remain in place.
+
+Nine TPC-H plans have fewer fragments. Q8 changes from 17 fragments / 16
+exchanges to 14 / 13; Q21 changes from 10 / 9 to 9 / 8. Q17 retains its
+five-fragment plan. A separate bounded-channel regression joins a 100,000-row
+probe with two small builds and aggregates before exchange: its channels record
+seven accepted rows in total. These counters are from that synthetic query,
+not from the SF10 timings. Correlated shared-state scopes still run in a single
+partition; their distribution and distributed runtime filters remain future work.
+
+Related regressions passed 1,295 non-Ray and 94 real-Ray cases, with 23 optional
+`fsspec` skips. Two static review rounds preceded one non-editable native build.
+Test SQL aliases and two fixtures depending on the old broadcast graph were
+corrected and rerun; production code did not change after that build. The
+complete fast/release suites were not run.
+
+Baseline artifacts are in `build/tpch-throughput-baseline-20261013/`; increment
+artifacts are in `build/tpch-throughput-after-20261013/`. They retain SQL, complete
+Arrow results, dependency/resource metadata, timings and ownership snapshots.
+The increment's installed native SHA-256 is
+`037b0a352a805ac5a84f21e7ced41b5d40ee51e80b4a945490b9210595421e47`.
+
 ## Repeated lifecycle checks
 
 The same connection and worker pool are reused across each sequence:

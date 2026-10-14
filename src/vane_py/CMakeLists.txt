@@ -74,12 +74,11 @@ set_target_properties(python_direct_flight PROPERTIES CXX_STANDARD 17)
 target_link_libraries(
   python_direct_flight
   PRIVATE
-    vane_python_dependencies
+    vane_python_dependencies OpenSSL::Crypto
     $<TARGET_PROPERTY:duckdb_execution_distributed_exchange,LINK_LIBRARIES>)
 target_include_directories(
   python_direct_flight
   PRIVATE
-    "${DUCKDB_SOURCE_PATH}/third_party/mbedtls/include"
     $<TARGET_PROPERTY:duckdb_execution_distributed_exchange,INCLUDE_DIRECTORIES>
 )
 
@@ -96,7 +95,8 @@ foreach(
   execution/arrow_frame.hpp
   execution/arrow_frame.cpp
   execution/file_snapshot.hpp
-  execution/file_snapshot.cpp)
+  execution/file_snapshot.cpp
+  execution/sha256.hpp)
   set_property(
     DIRECTORY
     APPEND

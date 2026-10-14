@@ -12,6 +12,7 @@
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/physical_plan_inputs.hpp"
+#include "duckdb/execution/dynamic_filter_serialization.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -603,7 +604,8 @@ OpenFileInfo DecodeFile(const string &payload) {
 	return file;
 }
 
-PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &fragment, idx_t partitions) {
+PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &fragment, idx_t partitions,
+                    DynamicTableFilterSerializationState &filters) {
 	CheckOperator(op, op.children.size());
 	PlanNode node;
 	node.types = op.types;
@@ -650,11 +652,14 @@ PlanNode EncodeNode(ClientContext &context, PhysicalOperator &op, FragmentSpec &
 		fragment.sources.push_back(std::move(source));
 	}
 	for (auto &child : op.children) {
-		node.children.push_back(EncodeNode(context, child.get(), fragment, partitions));
+		node.children.push_back(EncodeNode(context, child.get(), fragment, partitions, filters));
 	}
 	// Serialize each native node separately so an input is a real port in the
 	// fragment codec, never a fake empty scan hidden in executable plan bytes.
-	node.native_operator = Encode([&](Serializer &serializer) { op.SerializeNode(serializer); });
+	node.native_operator = Encode([&](Serializer &serializer) {
+		serializer.GetSerializationData().SetCustom(filters);
+		op.SerializeNode(serializer);
+	});
 	return node;
 }
 
@@ -682,6 +687,7 @@ namespace {
 struct DistributedSubtree {
 	FragmentSpec fragment;
 	vector<ExchangeSpec> incoming;
+	std::set<const DynamicTableFilterSet *> local_filters;
 };
 
 class AnalyticalPlanner {
@@ -744,8 +750,14 @@ public:
 		}
 		if (op.children.empty()) {
 			DistributedSubtree result;
-			result.fragment.root = EncodeNode(context, op, result.fragment, partitions);
+			result.fragment.root = EncodeNode(context, op, result.fragment, partitions, filter_serialization);
 			result.fragment.partition_count = result.fragment.sources.empty() ? 1 : partitions;
+			if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+				auto &scan = op.Cast<PhysicalTableScan>();
+				if (scan.dynamic_filters) {
+					result.local_filters.insert(scan.dynamic_filters.get());
+				}
+			}
 			return result;
 		}
 		if (op.type == PhysicalOperatorType::HASH_JOIN) {
@@ -825,6 +837,9 @@ private:
 	FragmentGraph &graph;
 	idx_t partitions;
 	idx_t next_exchange = 0;
+	// Nodes have independent payloads, but join and scan references must share
+	// an ID namespace. Each loaded fragment gets a fresh set of filter objects.
+	DynamicTableFilterSerializationState filter_serialization;
 
 	bool HasScopedState(const PhysicalOperator &op) {
 		if (op.type == PhysicalOperatorType::DELIM_SCAN || op.type == PhysicalOperatorType::CTE_SCAN ||
@@ -895,6 +910,7 @@ private:
 		visit(root);
 		node.native_operator = Encode([&](Serializer &serializer) {
 			serializer.GetSerializationData().SetCustom(bindings);
+			serializer.GetSerializationData().SetCustom(filter_serialization);
 			root.Serialize(serializer);
 		});
 		return result;
@@ -903,7 +919,10 @@ private:
 	PlanNode Node(PhysicalOperator &op) {
 		PlanNode node;
 		node.types = op.types;
-		node.native_operator = Encode([&](Serializer &serializer) { op.SerializeNode(serializer); });
+		node.native_operator = Encode([&](Serializer &serializer) {
+			serializer.GetSerializationData().SetCustom(filter_serialization);
+			op.SerializeNode(serializer);
+		});
 		return node;
 	}
 	void Wrap(PhysicalOperator &op, DistributedSubtree &child) {
@@ -1085,17 +1104,32 @@ private:
 		const bool broadcast = join.children[1].get().estimated_cardinality <= 32 &&
 		                       (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
 		                        join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI);
-		auto lk = ProjectKeys(left, left_keys);
-		left = Exchange(std::move(left), "hash", partitions, lk);
 		if (broadcast) {
-			right = Exchange(std::move(right), "broadcast", partitions);
+			// Every probe partition sees the complete build input. Preserve its
+			// existing distribution and fuse the probe subtree with the join;
+			// shuffling it by the join key adds no correctness guarantee here.
+			auto count = left.fragment.partition_count;
+			right = Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count);
 		} else {
+			auto lk = ProjectKeys(left, left_keys);
+			left = Exchange(std::move(left), "hash", partitions, lk);
 			auto rk = ProjectKeys(right, right_keys);
 			right = Exchange(std::move(right), "hash", partitions, rk);
 		}
-		// Runtime filters contain coordinator operator references. Each worker
-		// builds its own hash table and uses native build/probe event dependencies.
-		join.filter_pushdown.reset();
+		// Broadcast supplies the complete build input before the local probe
+		// scan starts. An exchange clears local_filters: filters must not cross
+		// a fragment boundary or use only one hash partition's build values.
+		if (join.filter_pushdown) {
+			auto &probes = join.filter_pushdown->probe_info;
+			probes.erase(std::remove_if(probes.begin(), probes.end(),
+			                            [&](const JoinFilterPushdownFilter &probe) {
+				                            return !left.local_filters.count(probe.dynamic_filters.get());
+			                            }),
+			             probes.end());
+			if (probes.empty()) {
+				join.filter_pushdown.reset();
+			}
+		}
 		join.join_stats.clear();
 		auto node = Node(join);
 		node.children.push_back(std::move(left.fragment.root));
@@ -1308,7 +1342,7 @@ namespace {
 PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const PlanNode &node, const InputFactory &inputs,
                            const unordered_map<string, const SourceSpec *> &sources,
                            const SourceAssignments &assignments, std::set<string> &used_sources,
-                           std::set<string> &used_inputs) {
+                           std::set<string> &used_inputs, DynamicTableFilterSerializationState &filters) {
 	if (!node.input_port.empty()) {
 		if (!inputs || !used_inputs.insert(node.input_port).second) {
 			throw InvalidInputException("fragment input %s must be bound exactly once", node.input_port);
@@ -1347,6 +1381,7 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		deserializer.Set<ClientContext &>(context);
 		deserializer.Set<DatabaseInstance &>(DatabaseInstance::GetDatabase(context));
 		deserializer.Set<bound_parameter_map_t &>(parameters);
+		deserializer.GetSerializationData().SetCustom(filters);
 		if (node.scoped) {
 			deserializer.GetSerializationData().SetCustom(bindings);
 		}
@@ -1437,7 +1472,8 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		throw SerializationException("non-scan fragment node has a source id");
 	}
 	for (auto &child : node.children) {
-		op->children.push_back(LoadNode(context, plan, child, inputs, sources, assignments, used_sources, used_inputs));
+		op->children.push_back(
+		    LoadNode(context, plan, child, inputs, sources, assignments, used_sources, used_inputs, filters));
 	}
 	auto &result = *op;
 	plan.TakeOwnership(std::move(op));
@@ -1459,9 +1495,11 @@ unique_ptr<PhysicalPlan> Load(ClientContext &context, const FragmentSpec &fragme
 	}
 	std::set<string> used_sources;
 	std::set<string> used_inputs;
+	DynamicTableFilterSerializationState filters;
 	auto plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
 	context.RunFunctionInTransaction([&]() {
-		plan->SetRoot(LoadNode(context, *plan, fragment.root, inputs, sources, assignments, used_sources, used_inputs));
+		plan->SetRoot(
+		    LoadNode(context, *plan, fragment.root, inputs, sources, assignments, used_sources, used_inputs, filters));
 	});
 	if (used_sources.size() != sources.size()) {
 		throw SerializationException("fragment contains unused source descriptions");

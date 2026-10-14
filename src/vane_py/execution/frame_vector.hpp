@@ -53,6 +53,14 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &r
 	if (size > limit) {
 		return false;
 	}
+	auto physical = type.InternalType();
+	// A fixed-width vector's frame size depends only on row count, including
+	// its validity bitmap. Sizing must not flatten or revisit every value on
+	// each retry; copying below still resolves selections and NULL validity.
+	if (!buffer && physical != PhysicalType::STRUCT && physical != PhysicalType::LIST &&
+	    physical != PhysicalType::ARRAY && physical != PhysicalType::VARCHAR) {
+		return true;
+	}
 	UnifiedVectorFormat data;
 	column.ToUnifiedFormat(source_count, data);
 	auto index_at = [&](idx_t row) {
@@ -66,7 +74,6 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &r
 			}
 		}
 	}
-	auto physical = type.InternalType();
 	if (physical == PhysicalType::STRUCT) {
 		auto &children = StructVector::GetEntries(column);
 		layout.children.resize(children.size());
@@ -156,6 +163,7 @@ idx_t Measure(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t c
 		throw InvalidInputException("invalid direct frame row selection");
 	}
 	vector<idx_t> selected;
+	selected.reserve(count);
 	for (idx_t i = offset; i < offset + count; i++) {
 		if (rows[i] >= input.size()) {
 			throw InvalidInputException("direct frame row selection is out of bounds");

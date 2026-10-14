@@ -292,7 +292,7 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 | COUNT、SUM、AVG、具有可导出固定状态的单参数 MIN/MAX | source 分区执行 native partial，交换带类型的 AGGREGATE_STATE；final 调用原函数 combine/finalize，GROUP BY 使用 HASH，无分组使用 GATHER；FILTER 只在 partial 应用 |
 | DISTINCT、带排序的聚合、双参数 MIN/MAX(x,n)、具有动态状态的 MIN/MAX、Binder 内部聚合改写 | 原始行按 group key 分区后执行完整 native aggregate，保留去重、排序和动态状态的所有权 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
-| BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入；其他 join 两侧按等值键 HASH；外连接不能广播产生重复未匹配 build 行 |
+| BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入，probe 子树保留原分区并与 join 合并；probe 只有一个分区时改为 GATHER build；其他 join 两侧按等值键 HASH；不能广播会产生重复未匹配 build 行的 join |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
 | TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
@@ -317,9 +317,15 @@ Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row grou
 
 同 worker 的 pipelined 边共用一个 DirectChannel，只有一份 credit 和窗口预留，不创建 Flight relay 或预留该边的网络 staging。跨 worker 和根结果链路继续使用 Flight。执行循环在 pump 有进展时立即继续，只有无进展时才短暂等待。
 
+广播 join 的每个 probe 分区都能看到完整 build，因此不再额外 HASH 分发 probe。保留 probe 的扫描、已有输入端口及分区数，后续过滤与可拆分聚合可以先在同一 fragment 执行。下游需要按键分组或 join 时仍显式建立自己的 HASH 边。单分区 probe 不会因为请求更高并行度而复制；MARK/SINGLE 与共享 delimiter/CTE 状态继续遵守独立的原生作用域规则。
+
+DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量阶段不逐值转换向量。实际复制仍解析 dictionary/constant selection 与 NULL；字符串和嵌套列仍遍历选中的有效内容，检查子数组边界及 frame_bytes，不改变 credit 计费。
+
 DirectCollector 为本地扫描的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。依赖上游 exchange 的任务立即转发可用结果，避免等待下一批输入时扣住已有结果。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。
 
 FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
+
+冻结文件、物化对象及帧校验使用已有 OpenSSL 依赖的 EVP SHA-256 实现，内容身份仍为标准 SHA-256。每个流独立持有摘要状态并检查 EVP 返回值。文件复制、取消检查、封存及物化读取前的整对象验证继续执行；每次查询仍创建自己的冻结副本，不共享跨查询快照。
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
 

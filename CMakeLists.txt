@@ -115,6 +115,7 @@ endif()
 
 # PyBind11
 find_package(pybind11 REQUIRED CONFIG)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 # DuckDB
 include(cmake/duckdb_loader.cmake)
@@ -189,7 +190,7 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_relation>
   $<TARGET_OBJECTS:python_type>)
 # Add Vane's Python and engine dependencies.
-target_link_libraries(_native PRIVATE vane_python_dependencies)
+target_link_libraries(_native PRIVATE vane_python_dependencies OpenSSL::Crypto)
 if(WIN32)
   target_link_libraries(_native PRIVATE advapi32)
 endif()

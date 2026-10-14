@@ -385,7 +385,9 @@ def test_build_barrier_precedes_probe_reads(threads):
     from vane._native import execution_plan as plan
 
     with vane.connect(backend="local", config={"threads": threads}) as connection:
-        spec = submission(connection, "select a.range from range(20) a join range(3) b using(range)", partitions=2)
+        # Keep both inputs above the broadcast threshold so the probe is an
+        # exchange channel whose unread frames can be observed at the barrier.
+        spec = submission(connection, "select a.range from range(50) a join range(40) b using(range)", partitions=2)
         fragment = next(f for f in spec.graph.fragments if len(f.inputs) == 2)
         incoming = [e for e in spec.graph.exchanges if e.consumer_fragment_id == fragment.fragment_id]
         channels, rows = {}, {}
@@ -434,7 +436,7 @@ def test_build_barrier_precedes_probe_reads(threads):
                 return output.poll("client")
 
             state, batch = eventually(poll, lambda value: value[0] == "data")
-            assert sorted(batch.to_rows()) == [(0,), (1,), (2,)]
+            assert sorted(batch.to_rows()) == [(i,) for i in range(40)]
             batch.close()
             eventually(poll, lambda value: value[0] == "end")
             assert service.diagnostics()[0]["builds_ready"] == 1
