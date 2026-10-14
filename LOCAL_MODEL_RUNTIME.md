@@ -1003,6 +1003,10 @@ The CUDA driver's [visibility and ordering rules](https://docs.nvidia.com/cuda/c
 resolve `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`; the assigned full UUID is
 set before each worker imports its UDF. MIG devices are rejected. CUDA and NVML
 driver libraries must be available. Discovery errors are reported directly.
+Discovery participates in the query's startup cancellation scope. Interrupts
+and execution deadlines kill and reap the owned probe before releasing the
+request slot. The same cleanup runs when discovery exceeds its internal
+30-second timeout. A cancelled probe does not reserve GPU devices.
 
 Query-owned and explicitly registered GPU pools share device exclusions within
 the driver process. A pool reserves all its replicas before starting workers;

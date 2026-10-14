@@ -2696,7 +2696,9 @@ class LocalSubprocessActorPool:
 
                 if payload.get("gpus") != 1 or type(payload.get("gpus")) not in (int, float):
                     raise ValueError("local GPU actors require exactly one GPU per replica")
-                self._gpu_reservation = reserve_gpu_devices(self.pool_size, self._gpu_devices or None)
+                self._gpu_reservation = reserve_gpu_devices(
+                    self.pool_size, self._gpu_devices or None, cancellation=startup_cancellation
+                )
                 self._gpu_devices = self._gpu_reservation.devices
                 self.admission_slots = LocalGpuExecutionSlotPool(
                     self._gpu_devices, execution_slot_prefix=f"subprocess_actor:{pool_identity}"

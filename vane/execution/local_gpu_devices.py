@@ -12,20 +12,43 @@ import sys
 import threading
 from pathlib import Path
 
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_local_gpu import _device_ids
 from vane.execution.udf_local_resources import LocalProcessCapacityError
 
 
-def discover_gpu_devices() -> tuple[str, ...]:
+def discover_gpu_devices(*, cancellation: ExecutionCancellationScope | None = None) -> tuple[str, ...]:
     helper = Path(__file__).with_name("local_cuda_inventory.py")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled("local CUDA device discovery")
     try:
-        result = subprocess.run(
-            [sys.executable, "-I", str(helper)], capture_output=True, text=True, timeout=30, check=True
-        )
+        with subprocess.Popen(
+            [sys.executable, "-I", str(helper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        ) as process:
+            # Register after spawn: registration immediately invokes the callback
+            # if cancellation raced with Popen. The caller owns reaping and pipe
+            # cleanup, so cancellation never leaves a detached discovery child.
+            unregister = cancellation.register_cancel_wakeup(process.kill) if cancellation is not None else None
+            try:
+                try:
+                    stdout, stderr = process.communicate(timeout=30)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("local CUDA device discovery")
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, process.args, stdout, stderr)
+            finally:
+                if unregister is not None:
+                    unregister()
     except (OSError, subprocess.SubprocessError) as error:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("local CUDA device discovery")
         detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
         raise RuntimeError(f"local CUDA device discovery failed: {detail}") from error
-    devices = json.loads(result.stdout)
+    devices = json.loads(stdout)
     return _device_ids(devices) if devices else ()
 
 
@@ -52,11 +75,15 @@ class _DeviceOwners:
         self.lock = threading.RLock()
         self.occupied = set() if occupied is None else set(occupied)
 
-    def reserve(self, count: int, devices: tuple[str, ...] | None) -> GpuDeviceLease:
-        candidates = discover_gpu_devices() if devices is None else _device_ids(devices)
+    def reserve(
+        self, count: int, devices: tuple[str, ...] | None, cancellation: ExecutionCancellationScope | None
+    ) -> GpuDeviceLease:
+        candidates = discover_gpu_devices(cancellation=cancellation) if devices is None else _device_ids(devices)
         if len(candidates) < count or (devices is not None and len(candidates) != count):
             raise ValueError(f"local GPU actor pool needs {count} devices; visible inventory has {len(candidates)}")
         with self.lock:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("local GPU device reservation")
             free = tuple(device for device in candidates if device not in self.occupied)
             if len(free) < count:
                 raise LocalProcessCapacityError(
@@ -70,7 +97,9 @@ class _DeviceOwners:
 _owners = _DeviceOwners()
 
 
-def reserve_gpu_devices(count: int, devices: tuple[str, ...] | None = None) -> GpuDeviceLease:
+def reserve_gpu_devices(
+    count: int, devices: tuple[str, ...] | None = None, *, cancellation: ExecutionCancellationScope | None = None
+) -> GpuDeviceLease:
     if type(count) is not int or count <= 0:
         raise ValueError("local GPU replica count must be a positive integer")
     global _owners
@@ -78,4 +107,4 @@ def reserve_gpu_devices(count: int, devices: tuple[str, ...] | None = None) -> G
         # Preserve inherited exclusions, but never touch an inherited lock.
         # The fork child cannot reclaim devices still owned by parent workers.
         _owners = _DeviceOwners(_owners.occupied)
-    return _owners.reserve(count, devices)
+    return _owners.reserve(count, devices, cancellation)
