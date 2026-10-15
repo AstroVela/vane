@@ -1271,3 +1271,92 @@ manifests. The frozen driver SHA-256 remains
 Owned processes stop before temporary/spill cleanup. The shared oracle is
 removed after preserving its 22 hashes; test fixtures are removed outside
 measured windows. Original SF10 inputs are preserved.
+
+## Independent native sink waiters (2026-10-15)
+
+This follow-up freezes `88e29cb910a597378248e11107dfd36f95b7aefc` as
+its baseline. A native collector previously used one waiter lock for all
+output channels, serializing frame copies to independent targets and waking
+tasks waiting for other targets. Waiter groups now belong to individual
+channels. Sequence allocation, publication and blocked-task registration stay
+atomic within each channel; metadata remains bounded by the fixed target set.
+
+The frame-size experiment also exposed a lost wakeup in byte-limited windows:
+a task blocked on a larger frame shared its producer with a smaller task that
+could still publish. That success erased the shared callback without returning
+credit. Both Q10 and Q18 stalled with 128 KiB frames; a short-deadline Q18
+reproduction retained unfinished producers after all output credit had returned.
+Successful publication now preserves the callback until credit, closure or
+cancellation triggers it. Three deterministic tests fail on the original
+runtime and pass with the fix, including a borrowed view and late release.
+The default 64 KiB frame, 1 MiB window, 2048 rows and 16 slots are unchanged.
+
+The same frozen SF10 driver and Parquet inputs are used, with two 18-CPU
+workers, two partitions, 16 GiB operator memory per worker, 128 MiB exchange
+and 256 MiB staging capacity. Local uses 36 threads and 32 GiB. Timings include
+submission through collection and successful close, with shared-host OS caches
+retained and no concurrent task-owned builds or tests. The original driver's
+SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+
+| Measurement, seconds | Frozen baseline | Candidate | Candidate local |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 24.935 | 24.617 | 9.118 |
+| Q10, median of three | 1.090 | 1.022 | 0.473 |
+| Q12, median of three | 0.550 | 0.550 | 0.284 |
+| Q18, median of three | 2.693 | 2.372 | 0.708 |
+
+Q18 improves 11.9%, remaining 3.35 times local. Fixing only the lost callback
+measures 2.689 seconds for Q18, separating the throughput improvement from that
+correctness fix. The single full pass improves 1.3% and remains 2.70 times local;
+its small aggregate difference is not evidence of a general speedup. The
+15-million-group first Q18 exchange remains; this change addresses publication
+concurrency rather than reducing the query's data volume.
+
+The full-pass Q16 sample rose from 1.729 to 2.132 seconds. A three-repetition
+check of all larger full-pass outliers runs the candidate first and the frozen
+baseline second, using the same oracle and default exchange limits:
+
+| Query | Baseline median, seconds | Candidate median, seconds | Change |
+|---|---:|---:|---:|
+| Q2 | 0.411 | 0.410 | -0.3% |
+| Q7 | 0.870 | 0.817 | -6.1% |
+| Q9 | 2.423 | 2.490 | +2.8% |
+| Q15 | 0.532 | 0.534 | +0.3% |
+| Q16 | 1.697 | 1.762 | +3.9% |
+| Q19 | 1.009 | 0.980 | -2.9% |
+
+The large Q16 outlier does not reproduce consistently: candidate samples range
+from 1.743 to 2.149 seconds and baseline samples from 1.688 to 2.044. The remaining
+Q9/Q16 median costs of 2.8%/3.9% are retained rather than described as zero
+regression. These short shared-host runs establish the Q18 improvement more
+strongly than an all-query improvement. All nine successful acceptance/control
+runs have matching input and driver identities (212 samples, including 96 on
+the final native build); diagnostic/failed runs and microbenchmarks are separate.
+
+A separate 128 KiB stress run completes eight repetitions each of Q10 and Q18
+without hanging, matches local, and releases every query/worker reservation.
+That setting needs 4.25 MiB of reserved Flight staging per link versus 2.25 MiB
+at 64 KiB, so it is not made the default. Reusing a previously measured frame
+size was also tried and discarded: a four-thread in-process aggregate-state
+microbenchmark measured 228.2 versus 229.4 ms (eight samples after warmup), with
+no established benefit. That single-process microbenchmark does not demonstrate
+the Ray improvement from independent target locks.
+
+The final non-editable Release build passes 262 related native, Flight,
+materialized-exchange and fanout/cancellation tests plus 14 real-Ray tests.
+The full release suite and large-query FTE performance were not rerun.
+Native SHA-256 identities, in frozen baseline / callback-only / final order:
+
+- `4c3ad4751652f3f64f5318c3a5b7f3653b354df117b72e4071d8702adda0dae0`
+- `3fa391447df0eb2c59599b33ade3a7e50beba25a139b3093d376a790b99755f4`
+- `da70e1e138e6da24939ae40070c4d4a03917d6672c5d00609b2e46e13cec4b05`
+
+Evidence is retained under `build/pipelined-q18-frames-20261015/`: frozen
+runtimes, driver/configuration/input identities, raw timings, result counts and
+hashes, failed-candidate diagnostics, source patches and cleanup manifests.
+Diagnostic runs are separate from acceptance; completed worker-channel counters
+are unavailable after cleanup, so partial live observations are not reported
+as completed exchange work. Owned processes stop before temporary/spill cleanup;
+the shared oracle is removed after recording its hashes. The source dataset is
+preserved and every disk guard remains untriggered.

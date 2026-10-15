@@ -261,7 +261,9 @@ DirectWrite DirectChannel::TryWrite(const string &id, idx_t sequence, DataChunk 
 				return DirectWrite::BLOCKED;
 			}
 		}
-		writers.erase(id);
+		// Another native task sharing this producer may still be waiting for a
+		// larger frame. A smaller publication does not return credit or wake
+		// that task; retain its callback until release, closure or cancellation.
 		if (!live) {
 			return DirectWrite::CLOSED;
 		}

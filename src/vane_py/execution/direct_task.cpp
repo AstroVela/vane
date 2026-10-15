@@ -174,10 +174,15 @@ public:
 
 class DirectSinkGlobal : public GlobalSinkState {
 public:
-	explicit DirectSinkGlobal(ClientContext &context_p) : context(context_p) {
+	DirectSinkGlobal(ClientContext &context_p, const vector<DirectOutput> &outputs) : context(context_p) {
+		for (auto &output : outputs) {
+			for (auto &channel : output.channels) {
+				waiters.emplace(channel.get(), make_shared_ptr<StateWithBlockableTasks>());
+			}
+		}
 	}
 	ClientContext &context;
-	shared_ptr<StateWithBlockableTasks> waiters = make_shared_ptr<StateWithBlockableTasks>();
+	std::map<const DirectChannel *, shared_ptr<StateWithBlockableTasks>> waiters;
 };
 
 class DirectCollector : public PhysicalResultCollector {
@@ -196,7 +201,7 @@ public:
 		return PhysicalPlanGenerator::OrderPreservationRecursive(plan) != OrderPreservationType::FIXED_ORDER;
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
-		return make_uniq<DirectSinkGlobal>(context);
+		return make_uniq<DirectSinkGlobal>(context, outputs);
 	}
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &) const override {
 		auto state = make_uniq<DirectSinkLocal>();
@@ -208,13 +213,17 @@ public:
 	}
 	DirectWrite Write(DirectSinkGlobal &state, const DirectOutput &output, DirectChannel &channel, DataChunk &chunk,
 	                  const vector<idx_t> &rows, idx_t offset, idx_t count, const InterruptState &interrupt) const {
-		auto guard = state.waiters->Lock();
+		// Sequence allocation and waiter registration are shared by tasks that
+		// publish to this channel. Other targets can copy and publish in parallel,
+		// and returning their credit does not reschedule this channel's tasks.
+		auto &waiters = state.waiters.at(&channel);
+		auto guard = waiters->Lock();
 		// Sequence allocation and publication are atomic across native sink
 		// tasks. Each blocked task retains its own input until credit returns.
 		auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk, rows, offset,
-		                               count, Wakeup(state.waiters));
+		                               count, Wakeup(waiters));
 		if (result == DirectWrite::BLOCKED) {
-			state.waiters->BlockTask(guard, interrupt);
+			waiters->BlockTask(guard, interrupt);
 			progress->output_blocked.store(true);
 		}
 		return result;

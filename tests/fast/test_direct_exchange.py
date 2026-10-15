@@ -187,6 +187,50 @@ def test_broadcast_one_allocation_independent_leases(connection):
     assert exchange.snapshot()["leased_bytes"] == 0
 
 
+@pytest.mark.parametrize("event", ["credit", "close", "abort"])
+def test_smaller_publication_preserves_blocked_writer_wakeup(connection, event):
+    exchange = channel(connection, sql="select 'text'::varchar", window=128, frame=128, slots=4)
+    exchange.add_producer("a")
+    exchange.seal_producers()
+    signal = native._TestSignal()
+    assert exchange._write_rows("a", 1, [("a" * 60,)]) == "accepted"
+    assert exchange._write_rows("a", 2, [("b" * 50,)], signal) == "blocked"
+    # Parallel sink tasks share a producer and allocate their sequence when
+    # publishing. A smaller task can fit without returning any credit, so its
+    # success must preserve the shared waiter callback.
+    assert exchange._write_rows("a", 2, [("c",)]) == "accepted"
+    _, batch = exchange.poll("client")
+    retained = batch.slice(0, 1)
+    batch.close()
+    assert signal.count == 0
+    try:
+        if event == "credit":
+            retained.close()
+            assert signal.count == 1
+            assert exchange._write_rows("a", 3, [("b" * 50,)]) == "accepted"
+            exchange.finish("a", 3)
+            for sequence, value in ((2, "c"), (3, "b" * 50)):
+                _, batch = exchange.poll("client")
+                assert batch.sequence == sequence and batch.to_rows() == [(value,)]
+                batch.close()
+            assert exchange.poll("client")[0] == "end"
+        else:
+            if event == "close":
+                exchange.close_consumer("client")
+                assert exchange._write_rows("a", 3, [("b" * 50,)]) == "closed"
+                exchange.finish("a", 2)
+            else:
+                exchange.abort("blocked writer failure")
+                with pytest.raises(vane.InvalidInputException, match="blocked writer failure"):
+                    exchange._write_rows("a", 3, [("b" * 50,)])
+            assert signal.count == 1
+            assert retained.to_rows() == [("a" * 60,)]
+    finally:
+        retained.close()
+        exchange.close_consumer("client")
+    assert exchange.snapshot()["bytes"] == exchange.snapshot()["leased_bytes"] == 0
+
+
 def test_error_is_sticky_and_wakes_readers_and_writers(connection):
     exchange = channel(connection, consumers=("one", "two"))
     exchange.add_producer("a")
