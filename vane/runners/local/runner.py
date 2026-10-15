@@ -723,6 +723,8 @@ class LocalRunner(Runner):
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
             try:
+                # Fragment extraction replays actor options by stable resource ID.
+                physical_plan.collect_query_resource_graph_metadata(conn=conn)
                 udf_actor_pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical_plan, conn=conn)
             except BaseException as actor_preparation_error:
                 _retain_owned_udf_actor_pools(actor_preparation_error, udf_actor_pools)
@@ -979,6 +981,8 @@ class LocalRunner(Runner):
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
             try:
+                # Describe resources before actor payloads and handles are bound.
+                physical_plan.collect_query_resource_graph_metadata(conn=conn)
                 udf_actor_pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical_plan, conn=conn)
             except BaseException as actor_preparation_error:
                 _retain_owned_udf_actor_pools(actor_preparation_error, udf_actor_pools)
