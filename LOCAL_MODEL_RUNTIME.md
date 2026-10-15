@@ -1252,6 +1252,17 @@ Shared-memory flow remains governed by its separate transport and data budgets.
 On Linux with cgroup v2, available process memory also respects containing
 cgroup limits.
 
+Subprocess actors use the same default library thread policy as Ray's native
+actors. When unset, `OMP_NUM_THREADS` defaults to the assigned CPU count rounded
+down, with a minimum of one (also one when `cpus` is omitted). Vane does not add
+Rayon, BLAS-specific or PyTorch inter-op limits for actors; libraries interpret
+OMP and their own defaults. Explicit inherited environment settings are preserved.
+Local actors also honor `VANE_TORCH_NUM_THREADS` and
+`VANE_TORCH_INTEROP_THREADS` individually when PyTorch is loaded during actor
+initialization; setting either leaves the other pool unchanged. With neither
+override, constructor-selected PyTorch settings are preserved. Subprocess task
+workers retain their managed library thread limits and inter-op default of one.
+
 Tasks without `memory_bytes` have zero declared heap commitment, matching
 Ray. Worker RSS, including mapped shared memory and past high-water marks,
 does not create a separate local concurrency cap or calibration phase. Declare

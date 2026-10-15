@@ -7719,22 +7719,155 @@ def test_subprocess_task_worker_env_preserves_explicit_omp_num_threads(monkeypat
     assert env["VANE_TORCH_NUM_THREADS"] == "8"
 
 
-def test_subprocess_actor_worker_env_defaults_omp_num_threads(monkeypatch):
+@pytest.mark.parametrize("cpus, expected", [(None, "1"), (0.0, "1"), (0.25, "1"), (2.75, "2"), (3.0, "3")])
+def test_subprocess_actor_worker_env_only_defaults_omp_num_threads(monkeypatch, cpus, expected):
     from vane.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_threading import _THREAD_ENV_VARS
 
-    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    for name in (*_THREAD_ENV_VARS, "VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS"):
         monkeypatch.delenv(name, raising=False)
 
     env = _worker_env_for_pool_index(
-        {"execution_backend": "subprocess_actor", "cpus": 3.0},
+        {"execution_backend": "subprocess_actor", "cpus": cpus},
         0,
         4,
     )
 
-    assert env["OMP_NUM_THREADS"] == "3"
-    assert env["OPENBLAS_NUM_THREADS"] == "3"
-    assert env["MKL_NUM_THREADS"] == "3"
-    assert env["NUMEXPR_NUM_THREADS"] == "3"
+    assert env == {
+        "OMP_NUM_THREADS": expected,
+        "VANE_SUBPROCESS_WORKER_INDEX": "0",
+        "VANE_SUBPROCESS_POOL_SIZE": "4",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_torch",
+    [
+        ({}, (8, 18)),
+        ({"VANE_TORCH_NUM_THREADS": "3"}, (3, 18)),
+        ({"VANE_TORCH_INTEROP_THREADS": "2"}, (8, 2)),
+        (
+            {
+                "OMP_NUM_THREADS": "4",
+                "OPENBLAS_NUM_THREADS": "5",
+                "MKL_NUM_THREADS": "6",
+                "NUMEXPR_NUM_THREADS": "7",
+                "VECLIB_MAXIMUM_THREADS": "8",
+                "RAYON_NUM_THREADS": "9",
+                "VANE_TORCH_NUM_THREADS": "3",
+                "VANE_TORCH_INTEROP_THREADS": "2",
+            },
+            (3, 2),
+        ),
+    ],
+)
+def test_subprocess_actor_preserves_native_and_explicit_threads(monkeypatch, overrides, expected_torch):
+    import json
+
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_threading import _THREAD_ENV_VARS
+
+    names = (*_THREAD_ENV_VARS, "VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS")
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+
+    class InspectThreads:
+        def __init__(self):
+            # Model a library loaded and configured by the constructor without
+            # requiring PyTorch in CPU-only CI. Startup must not reset it.
+            class TorchThreads:
+                num_threads = 8
+                interop_threads = 18
+
+                def get_num_threads(self):
+                    return self.num_threads
+
+                def get_num_interop_threads(self):
+                    return self.interop_threads
+
+                def set_num_threads(self, value):
+                    self.num_threads = value
+
+                def set_num_interop_threads(self, value):
+                    self.interop_threads = value
+
+            self.torch = TorchThreads()
+            sys.modules["torch"] = self.torch
+            self.constructor_env = {name: os.environ.get(name) for name in names}
+
+        def warm_up(self):
+            self.warmup_threads = (self.torch.get_num_threads(), self.torch.get_num_interop_threads())
+
+        def __call__(self, table):
+            return pa.table(
+                {
+                    "env": [json.dumps(self.constructor_env)],
+                    "warmup_threads": [list(self.warmup_threads)],
+                    "call_threads": [[self.torch.get_num_threads(), self.torch.get_num_interop_threads()]],
+                }
+            )
+
+    _set_task_resource_limit(monkeypatch, 1)
+    payload = _subprocess_map_payload(InspectThreads, execution_backend="subprocess_actor", actor_number=1)
+    executor, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    try:
+        _submit_with_admission(executor, pa.table({"x": [1]}))
+        result = _wait_for_results(executor, 1, timeout_s=10.0)[0].to_pydict()
+        expected_env = dict.fromkeys(names)
+        expected_env.update({"OMP_NUM_THREADS": "1", **overrides})
+        assert json.loads(result["env"][0]) == expected_env
+        assert result["warmup_threads"] == [list(expected_torch)]
+        assert result["call_threads"] == [list(expected_torch)]
+    finally:
+        try:
+            executor.close()
+        finally:
+            pool.shutdown(kill=True)
+
+
+@pytest.mark.parametrize("name", ["VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS"])
+@pytest.mark.parametrize("value", ["", "0", "-1", "invalid"])
+def test_native_actor_rejects_invalid_explicit_torch_threads_before_mutation(monkeypatch, name, value):
+    from vane.execution import udf_threading
+
+    def unexpected_access():
+        raise AssertionError("invalid overrides must be rejected before accessing either pool")
+
+    monkeypatch.setattr(udf_threading, "_TORCH_THREADS_CONFIGURED", False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(get_num_threads=unexpected_access, get_num_interop_threads=unexpected_access),
+    )
+    monkeypatch.setenv("VANE_TORCH_NUM_THREADS", "3")
+    monkeypatch.setenv("VANE_TORCH_INTEROP_THREADS", "2")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        udf_threading.configure_loaded_torch_threads(explicit_only=True)
+    assert udf_threading._TORCH_THREADS_CONFIGURED is False
+
+
+def test_native_actor_torch_thread_overrides_wait_for_library_import(monkeypatch):
+    from vane.execution import udf_threading
+
+    monkeypatch.setattr(udf_threading, "_TORCH_THREADS_CONFIGURED", False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setenv("VANE_TORCH_NUM_THREADS", "3")
+    monkeypatch.delenv("VANE_TORCH_INTEROP_THREADS", raising=False)
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is False
+    assert udf_threading._TORCH_THREADS_CONFIGURED is False
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(get_num_threads=lambda: 8, set_num_threads=calls.append),
+    )
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is True
+    assert calls == [3]
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is False
 
 
 def test_udf_threading_configures_loaded_torch_once(monkeypatch):

@@ -638,13 +638,13 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
     try:
         payload_bytes = _read_ipc_from_shm(payload_shm, payload_size)
         payload = vane_pickle.loads(payload_bytes)
-        configure_loaded_torch_threads()
         produce_ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
         subprocess_mode = _payload_subprocess_mode(payload)
+        configure_loaded_torch_threads(explicit_only=subprocess_mode == "actor")
         _worker_thread_log("worker_started", payload, mode=subprocess_mode)
         if subprocess_mode == "actor":
             executor = RuntimeUDFExecutor(_streaming_payload(payload))
-            configure_loaded_torch_threads()
+            configure_loaded_torch_threads(explicit_only=True)
             executor.warm_up()
             _worker_thread_log("actor_executor_ready", payload, mode=subprocess_mode)
         _send_message(sock, _MSG_READY)
