@@ -1642,7 +1642,13 @@ def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypa
     import vane.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor()
-    monkeypatch.setattr(vllm_executor, "build_executor", lambda model, options: executor)
+
+    def build_executor(model, options):
+        assert model == "round-trip-vllm"
+        assert vllm_executor.normalize_options(options)["use_ray"] is False
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
     source = vane.connect()
     relation = source.sql("""
         SELECT ai_prompt(
@@ -1655,7 +1661,13 @@ def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypa
     """)
 
     target, physical, serialized = _round_trip_ai_plan(relation)
-    table = _execute_ai_physical_plan(target, physical)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        with target.cursor() as cursor:
+            result = runner.execute_native(cursor, physical, None, None)
+            table = pa.concat_tables(list(result.partition_payloads))
+    finally:
+        runner.shutdown()
 
     assert physical.collect_udf_nodes() == []
     assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]
