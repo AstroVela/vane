@@ -165,6 +165,7 @@ class OutputBlockLease:
     state: str
     liveness: bool
     allocation_generation: int
+    liveness_group_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,7 @@ class QueryResourceManager:
         self._terminal_output_blocks = BoundedSet[str](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
         self._active_liveness_task_lease_ids_by_unit: dict[str, str] = {}
         self._active_liveness_output_lease_ids_by_unit: dict[str, str] = {}
+        self._liveness_output_members: dict[str, set[str]] = {}
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
         self._completed_materialization_barrier_ids: set[str] = set()
@@ -2475,8 +2477,9 @@ class QueryResourceManager:
         if liveness and not self._output_liveness_chain_available_locked(producer_unit_id):
             raise RuntimeError("cannot grant more than one liveness output per downstream chain unit")
         self._record_output_observation_locked(request)
+        lease_id = uuid.uuid4().hex
         lease = OutputBlockLease(
-            lease_id=uuid.uuid4().hex,
+            lease_id=lease_id,
             query_id=self.graph.query_id,
             producer_unit_id=producer_unit_id,
             task_lease_id=str(request.task_lease_id),
@@ -2487,6 +2490,7 @@ class QueryResourceManager:
             state=str(initial_state),
             liveness=liveness,
             allocation_generation=self.allocation.generation,
+            liveness_group_id=lease_id if liveness else None,
         )
         self._output_leases[lease.lease_id] = lease
         self._output_lease_by_block[lease.block_id] = lease.lease_id
@@ -2495,9 +2499,59 @@ class QueryResourceManager:
         self._recompute_unit_queued_output_locked(lease.producer_unit_id)
         if liveness:
             self._active_liveness_output_lease_ids_by_unit[lease.producer_unit_id] = lease.lease_id
+            self._liveness_output_members[lease.lease_id] = {lease.lease_id}
             self._output_liveness_grants_total += 1
         self._publish_change_locked()
         return OutputBlockGrant(True, lease=lease, liveness=liveness)
+
+    def partition_output_block(self, lease_id: str, sizes: tuple[int, ...]) -> tuple[OutputBlockLease, ...]:
+        """Divide an admitted publication into independently owned physical blocks.
+
+        Admission and the generator observation cover the complete publication.
+        Partitioning changes neither its byte charge nor its progress grant;
+        all parts must be handed off or freed before that grant is returned.
+        """
+        with self._lock:
+            lease = self._output_leases.get(str(lease_id))
+            if lease is None:
+                raise RuntimeError("cannot partition a released output lease")
+            if lease.state not in {"generator_pending", "unit_queue"}:
+                raise ValueError("cannot partition an output after consumer handoff")
+            if not sizes or any(size <= 0 for size in sizes) or sum(sizes) != lease.size_bytes:
+                raise ValueError("output partition sizes must be positive and preserve admitted bytes")
+            if len(sizes) == 1:
+                return (lease,)
+            parts = tuple(
+                replace(lease, lease_id=uuid.uuid4().hex, block_id=uuid.uuid4().hex, size_bytes=size) for size in sizes
+            )
+            self._output_leases.pop(lease.lease_id)
+            self._output_lease_by_block.pop(lease.block_id)
+            self._terminal_output_blocks.add(lease.block_id)
+            self._update_output_usage_locked(lease, added=False)
+            for part in parts:
+                self._output_leases[part.lease_id] = part
+                self._output_lease_by_block[part.block_id] = part.lease_id
+                self._update_output_usage_locked(part, added=True)
+            if lease.liveness_group_id is not None:
+                members = self._liveness_output_members[lease.liveness_group_id]
+                members.remove(lease.lease_id)
+                members.update(part.lease_id for part in parts)
+            self._recompute_unit_queued_output_locked(lease.producer_unit_id)
+            self._publish_change_locked()
+            return parts
+
+    def _return_output_progress_locked(self, lease: OutputBlockLease) -> None:
+        group_id = lease.liveness_group_id
+        if group_id is None:
+            return
+        members = self._liveness_output_members.get(group_id)
+        if members is None:
+            return
+        members.discard(lease.lease_id)
+        if not members:
+            del self._liveness_output_members[group_id]
+            if self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == group_id:
+                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
 
     def transition_output_block(self, lease_id: str, state: str) -> bool:
         lease_key = str(lease_id)
@@ -2513,16 +2567,10 @@ class QueryResourceManager:
             if target_index != current_index + 1:
                 raise ValueError(f"invalid output lease transition: {lease.state} -> {target}")
             self._output_leases[lease_key] = OutputBlockLease(**{**asdict(lease), "state": target})
-            if (
-                target == "downstream_input"
-                and self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == lease_key
-            ):
-                # A liveness escape limits each producer to one full block at
-                # a time. The handed-off object stays charged, while returning
-                # this unit's token lets a partial downstream batch request its
-                # next block.
-                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
             if target == "downstream_input":
+                # Retained bytes stay charged after the complete publication
+                # hands off its progress token to a downstream consumer.
+                self._return_output_progress_locked(lease)
                 self._units[lease.producer_unit_id].usage.producer_output_bytes -= lease.size_bytes
                 self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._recompute_unit_queued_output_locked(lease.producer_unit_id)
@@ -2538,8 +2586,7 @@ class QueryResourceManager:
             self._update_output_usage_locked(lease, added=False)
             self._output_lease_by_block.pop(lease.block_id, None)
             self._terminal_output_blocks.add(lease.block_id)
-            if self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == lease_key:
-                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
+            self._return_output_progress_locked(lease)
             self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._recompute_unit_queued_output_locked(lease.producer_unit_id)
             self._publish_change_locked()
@@ -2574,6 +2621,7 @@ class QueryResourceManager:
                 self._recompute_unit_queued_output_locked(resource_unit_id)
             self._active_liveness_task_lease_ids_by_unit.clear()
             self._active_liveness_output_lease_ids_by_unit.clear()
+            self._liveness_output_members.clear()
             for unit in self._units.values():
                 if unit.spec.execution_kind == "actor":
                     unit.actor_ready = False

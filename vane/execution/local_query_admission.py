@@ -394,6 +394,32 @@ class LocalQueryAdmission:
                 if waiter.lease is not None:
                     self.manager.release_output_block(waiter.lease.lease_id)
 
+    def own_output_bundle(
+        self,
+        task: TaskLease,
+        sizes: tuple[int, ...],
+        scope: ExecutionCancellationScope,
+        admission: AdmissionLease,
+    ) -> tuple[OutputBlockLeaseOwner, ...]:
+        """Admit one indivisible publication, then assign its per-block owners."""
+        if not sizes:
+            return ()
+        if any(size <= 0 for size in sizes):
+            raise ValueError("output bundle sizes must be positive")
+        owner = self.own_output(task, sum(sizes), scope, admission)
+        if len(sizes) == 1:
+            return (owner,)
+        try:
+            parts = self.manager.partition_output_block(owner.lease_id, sizes)
+            try:
+                return tuple(OutputBlockLeaseOwner(self.manager, part) for part in parts)
+            except BaseException:
+                for part in parts:
+                    self.manager.release_output_block(part.lease_id)
+                raise
+        finally:
+            owner.release()
+
     def finish_task(self, lease: TaskLease) -> None:
         with self._lock:
             if lease.lease_id not in self._live_tasks:

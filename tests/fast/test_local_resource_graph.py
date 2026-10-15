@@ -34,6 +34,50 @@ def _collect(provider: ResourceGraphMetadataProvider, conn):
     return provider.collect_resource_graph_metadata(conn=conn)
 
 
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize("statement", ["create_table_as", "insert", "insert_returning"])
+def test_native_writes_collect_udf_inputs_and_sink_boundary(monkeypatch, threads, statement):
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    graphs = []
+    prepare = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes
+
+    def capture(nodes, **kwargs):
+        graphs.append(kwargs["resource_graph"])
+        return prepare(nodes, **kwargs)
+
+    monkeypatch.setattr(udf_subprocess, "ensure_local_subprocess_actor_pools_for_nodes", capture)
+
+    @vane.func(return_dtype="BIGINT")
+    def identity(value):
+        return value
+
+    with vane.connect(config={"threads": threads}) as conn:
+        vane.attach_function(identity, alias="write_identity", parameters=["BIGINT"], connection=conn)
+        select = "SELECT write_identity(i) AS x FROM range(3) t(i)"
+        if statement == "create_table_as":
+            conn.execute(f"CREATE TABLE result AS {select}")
+        else:
+            conn.execute("CREATE TABLE result(x BIGINT)")
+            returning = " RETURNING x" if statement == "insert_returning" else ""
+            result = conn.execute(f"INSERT INTO result {select}{returning}")
+            if returning:
+                assert sorted(result.fetchall()) == [(0,), (1,), (2,)]
+        assert conn.execute("SELECT x FROM result ORDER BY x").fetchall() == [(0,), (1,), (2,)]
+
+    assert len(graphs) == 1
+    graph = graphs[0]
+    assert len(graph["udf_node_ids"]) == 1
+    nodes = {node["node_id"]: node for node in graph["nodes"]}
+    sink = nodes[graph["terminal_node_ids"][0]]
+    assert sink["node_name"] in {"CREATE_TABLE_AS", "BATCH_CREATE_TABLE_AS", "INSERT", "BATCH_INSERT"}
+    assert sink["is_materialization_barrier"]
+    assert sink["materialized_input_node_ids"] == sink["input_node_ids"]
+    assert sink["input_node_ids"]
+    build_local_resource_graph(graph, query_id="write")
+
+
 @pytest.mark.parametrize(
     "backend,adapter",
     [
