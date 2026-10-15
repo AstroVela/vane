@@ -332,7 +332,6 @@ struct MaterializedIO::Impl {
 			if (!batch || idx_t(batch->num_rows()) != count) {
 				throw IOException("materialized Arrow row count mismatch");
 			}
-			Check(batch->ValidateFull());
 			Check(reader->ReadNext(&extra));
 			if (extra) {
 				throw IOException("materialized frame has trailing batches");

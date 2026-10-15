@@ -572,6 +572,7 @@ def test_global_only_settings_must_match_without_mutating_worker_database(connec
         ({"engine_identity": "another-engine"}, "engine identity"),
         ({"protocol_version": 2}, "protocol"),
         ({"type_profile": "unknown-types"}, "type or connection"),
+        ({"type_profile": "vane.analytical-types:4"}, "type or connection"),
         ({"connection_profile": "unknown-session"}, "type or connection"),
         ({"distributions": (Distribution.GATHER,)}, "distribution"),
         ({"scans": ()}, "source capability or split codec"),

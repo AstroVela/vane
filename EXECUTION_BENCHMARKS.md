@@ -2032,3 +2032,104 @@ cleanup. Shared oracle hashes are retained before deletion, source inputs
 are preserved and disk guards remain untriggered. Only related tests and
 Q9/Q18 timings are run; the full release/all-query suites and large-query
 FTE timings are not repeated.
+
+
+## Compact decimal exchange and one full decode validation (2026-10-15)
+
+The frozen baseline is `5791895980`. Internal precision 1–9 DECIMAL columns
+now use Arrow decimal32 and precision 10–18 use decimal64, preserving scale
+and nulls recursively through containers. Precision 19–38 keeps decimal256
+with precision 39 for full signed-128-bit aggregate intermediates. Public
+DECIMAL results remain decimal128 at their declared SQL precision, including
+empty and nested results. The native v1.5 exporter provides the compact
+coefficients; its binary views are normalized to the existing binary layout
+for BLOB and aggregate states. The common decoder performs full Arrow
+validation once; Flight and materialized reads omit their duplicate pass.
+Sequence, byte/row limits, checksums and materialized seals remain checked.
+
+This changes the exchange type profile from `vane.analytical-types:4` to `:5`.
+Workers with the previous profile are rejected before execution, and the
+codec participates in fragment build identity. Frame, window, slot and
+staging limits are unchanged in this round.
+
+A separate completed Q9 diagnostic on the baseline measured **0.706 CPU
+seconds** in encoding and **0.565 CPU seconds** in common decoding across
+worker processes. The redundant outer Flight validation used **0.117 CPU
+seconds**, in addition to **0.102 CPU seconds** for full validation inside
+decode. These scoped thread-CPU measurements include a small warmup; nested
+probes overlap and cannot be summed into whole-query CPU or latency. Probes
+were removed before acceptance. There is no measured candidate CPU delta.
+
+The final comparison uses baseline/candidate followed by candidate/baseline,
+three samples per query/mode/runtime in each round. Only Q9/Q18 are timed.
+The frozen driver, SF10 input hashes and declared resources match: local
+36 threads/32 GiB; two pipelined 18-CPU workers, two partitions and 16 GiB
+operator memory per worker; 64 KiB/2048-row frames, 1 MiB/16-slot windows,
+eight Flight frames, 128 MiB exchange and 256 MiB staging per worker.
+Installed Python differs only in the type-profile version. Timing includes
+submission, collection and successful close, excluding startup/comparison.
+OS caches remain warm on a shared host; no task-owned build, test or
+diagnostic overlaps a timing window.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.871 | 1.620 | 0.855 | 1.589 | -1.9% | 1.86 |
+| Q18 | 0.699 | 1.082 | 0.691 | 1.069 | -1.2% | 1.55 |
+
+Q9 improves 2.5% and 2.3% in the two rounds, but its local control also
+improves about 1.8% across all six samples. These small changes do **not**
+establish a meaningful narrowing of the pipelined/local gap. Q18's result
+is similarly modest. All **48 comparison samples**, including **24 on the
+candidate**, match local schema, rows and values (relative/absolute float
+tolerances 1e-9/1e-6). There is no new all-query total or FTE latency claim.
+
+Completed native Q9 diagnostics retain **22,276,643 accepted channel rows**,
+identical per-channel counts and public schemas, and the same 175-row output
+hash. Observed Flight wire types and actual completed channel counts show:
+
+| Input | Accepted rows | Decimal columns narrowed | Removed value-buffer bytes |
+|---|---:|---:|---:|
+| Filtered lineitem | 3,261,613 | Three decimal128 → decimal64 | 78,278,712 |
+| Joined fact rows | 3,261,613 | Three decimal128 → decimal64 | 78,278,712 |
+| Filtered partsupp | 435,128 | One decimal128 → decimal64 | 3,481,024 |
+
+The corresponding exchange decimal value buffers shrink by **160,038,448
+bytes (152.6 MiB)**. This calculation includes logical channel rows, including
+local channels that do not encode Arrow, and excludes validity buffers and
+IPC framing. It is not measured network traffic. The 15,000,000-row orders
+HASH exchange and overall row work remain.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev112`) passes
+**359 related native tests** and **13 real-Ray tests**. New cases check compact
+wire widths, boundary coefficients, NULLs, empty/nested/selected values,
+embedded BLOBs, unchanged public schemas and rejection of corrupt decimal
+coefficients/UTF-8 before publishing rows. Existing full-width intermediates,
+temporal/analytical types, bounded exchanges, Flight failures and materialized
+integrity checks pass. Ray covers analytical/partial aggregate states,
+pipelined/FTE execution and failed-consumer retry, remote public schemas,
+slow-client backpressure/early close and interruption/delivery timeout.
+Two new wire-width cases fail on the frozen baseline as expected.
+
+Native SHA-256 identities, baseline and accepted candidate:
+
+- `9c2c8cf4b228d8dec52f11e04d100698027e019e372f7f67e862725d98b8542d`
+- `c37910d5a5c53e28f04c49dec7f6fee72c91c3c90a6b6257e537ce38d80c3662`
+
+Evidence is retained under `build/pipelined-arrow-codec-20261015/`: frozen
+runtime, source/build/configuration/input identities, raw samples, CPU
+diagnostic patch/logs, completed native work and actual wire schemas,
+`comparison.json`, `local-vs-pipelined.csv`, test logs and cleanup manifests.
+All measured query/worker/result reservations return to zero. Owned
+processes stop before temporary/spill cleanup; oracle hashes are retained
+before deletion, source inputs are preserved and disk guards remain
+untriggered. Only related tests and Q9/Q18 timings are run; the full release,
+all-query suites and large-query FTE timings are not repeated.
+
+A separate ACK-notification experiment consumes a pending notification even
+when receipt advances during a control RPC. Three controlled traces remove
+an immediate redundant status request, and 52 Flight tests pass. Its one
+three-sample Q9 comparison is 1.597 seconds versus 1.582 without the change,
+with local controls 0.847/0.840 seconds. This does not establish a latency
+benefit, so the ACK change is not retained. Its 12 matching samples, patch,
+identities and cleanup are retained separately and excluded from the
+accepted candidate medians.

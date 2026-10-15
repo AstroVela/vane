@@ -964,13 +964,13 @@ owner 只执行一次，原有 GATHER 保留；每个提前过滤分支广播同
 
 这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。
 
-P4 使用 `vane.analytical-types:4`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
+P4 使用 `vane.analytical-types:5`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 
-DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow codec，由用途决定 schema。使用 128 位存储的 DECIMAL 在内部交换中使用 `decimal256(39,scale)`，保留原生系数的完整 signed 128-bit 范围；例如内层 SUM 的 39 位结果可供外层 SUM 抵消，不能因声明精度只有 38 位而在中途拒绝。使用更小原生存储的 DECIMAL 仍按 `decimal128(width,scale)` 交换。公开结果中的所有 DECIMAL 保留 SQL 声明的 `decimal128(width,scale)`，包括嵌套字段和空结果。HUGEINT 在交换及公开结果中均使用 `decimal256(39,0)`。宽化通过符号扩展完成，解码先检查 signed 128-bit 边界，保留 scale、NULL 及 LIST/STRUCT/MAP/ARRAY 内的子值；额外缓冲计入既有 staging 预留。
+DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow codec，由用途决定 schema。使用 128 位存储的 DECIMAL 在内部交换中使用 `decimal256(39,scale)`，保留原生系数的完整 signed 128-bit 范围；例如内层 SUM 的 39 位结果可供外层 SUM 抵消，不能因声明精度只有 38 位而在中途拒绝。小数精度 1–9 的内部交换采用 `decimal32(width,scale)`，精度 10–18 采用 `decimal64(width,scale)`，避免先扩成 128 位、传输后再收窄；精度、scale 与 NULL 语义保持相同。公开结果中的所有 DECIMAL 保留 SQL 声明的 `decimal128(width,scale)`，包括嵌套字段和空结果。HUGEINT 在交换及公开结果中均使用 `decimal256(39,0)`。宽化通过符号扩展完成，解码先检查 signed 128-bit 边界，保留 scale、NULL 及 LIST/STRUCT/MAP/ARRAY 内的子值；额外缓冲计入既有 staging 预留。
 
 TIME 使用 `int64` 微秒，允许闭区间 `[0, 86400000000]`，因此保留合法的 `24:00:00`。INTERVAL 使用 `struct<months:int32, days:int32, micros:int64>`，在 native Arrow exporter 之前转换，避免微秒乘 1000 溢出；非 NULL interval 的三个分量均不得为 NULL。两种存储表示同样用于公开 Ray Arrow 结果和嵌套子值，调用方可在 SQL 中转为 VARCHAR 获得时间文本。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant。
 
-旧 profile 不再接受，Arrow codec 源码纳入 fragment build identity。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
+旧 profile（包括 `vane.analytical-types:4`）不再接受，Arrow codec 源码纳入 fragment build identity。内部使用原生 Arrow v1.5 导出窄 DECIMAL；该导出器产生的 BLOB/聚合状态 binary view 在适配层还原为既有 binary 布局，包括嵌套字段。公开结果继续使用原有导出设置。公共解码入口统一执行 schema 匹配和一次完整 Arrow 校验，再构造 native 值；Flight 和物化读取端保留帧大小、序号、校验和及封存检查，省去进入解码前的重复完整校验。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
 
 算子检查依据实际物理函数、scan 和 owned subplan，不能只看 SELECT 关键字。阻塞聚合、sort 和 join 可以合法等待完整输入；pipelined 只承诺允许的执行重叠，不承诺每条 SQL 都早产出。
 
