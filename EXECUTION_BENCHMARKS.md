@@ -1468,3 +1468,121 @@ result counts/hashes, completed native work counts and per-run cleanup
 manifests. Source Parquet files are preserved. Temporary/spill outputs are
 removed after owned processes stop, and shared oracle hashes are retained
 before deleting the generated oracle.
+
+## Budgeted correlated scan keys (2026-10-15)
+
+A fresh SF10 comparison at `8c7ea975f2` measures Q4 at 1.999 seconds versus
+0.268 locally. Its filtered orders owner estimates 3 million rows, while the
+lineitem input estimates about 12 million. The existing one-eighth owner/input
+threshold rejects an early key filter, although the direct delimiter join
+estimates only about 2.17 million matches. In completed native execution,
+37,929,348 lineitem rows cross the hash exchange before that join.
+
+When an independent Parquet scan is the complete delimiter owner, the planner
+can now budget its projected integral keys against the declared per-worker,
+per-query operator allowance. The existing larger broadcast limit must exceed
+8 MiB, and the key estimate must fit `min(64 MiB, budget / 16)`. A direct
+single-condition INNER join with the owner's delimiter scan must estimate
+less than one-quarter of input rows, and all key replicas must cost less than
+the estimated eliminated exchange. Multiple/residual conditions, unavailable
+estimates, unknown nested widths and a scan that only supplies a wider owner
+superset do not qualify through this cost path. The original small-scan and
+shared-owner policies retain their existing thresholds.
+
+The independent scan projects keys before broadcasting them. The existing
+NULL-safe SEMI filter removes impossible fact rows before hash exchange; the
+original delimiter still enforces matching, duplicate, EXISTS/NOT EXISTS and
+aggregation semantics. Explicit source assignments and version checks apply
+to the additional scan. It does not introduce a shared owner dependency or
+change runtime memory, credit, frame, window or slot limits.
+
+The frozen acceptance driver and SF10 input identities match the previous
+round. Local uses 36 threads and 32 GiB; pipelined uses two 18-CPU workers,
+two partitions, 16 GiB operator memory per worker, 64 KiB/2048-row frames,
+1 MiB windows and 16 slots. Timings include submission through collection and
+successful close, excluding startup and oracle comparison. The shared host
+retains OS caches, and no task-owned build or test overlaps measured runs.
+
+| Measurement, seconds | Frozen baseline | Candidate | Candidate local |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 22.645 | 21.462 | 9.133 |
+| Q4, median of three | 1.999 | 0.682 | 0.276 |
+| Q11, median of three | 1.646 | 1.675 | 0.095 |
+| Q16, median of three | 0.737 | 0.744 | 0.154 |
+| Q18, median of three | 2.415 | 2.421 | 0.697 |
+
+Q4 improves **65.9%**, remaining **2.47 times local**. The full pass improves
+5.2%, remaining 2.35 times local; it is weaker evidence than Q4's repeated
+comparison. The Q11/Q16/Q18 control medians increase 1.8%/0.9%/0.3%. Full-pass
+Q10 and Q11 increase 6.2% and 4.6%; these single observations do not establish
+their repeatability, and this round does not claim every query improved.
+All 136 timing samples, including 68 on the candidate, pass schema, row-count
+and value checks with relative/absolute floating tolerances of 1e-9/1e-6.
+
+The per-query table below uses only the candidate's single complete pass,
+without mixing in the focused medians.
+
+| Query | Local, seconds | Pipelined, seconds | Pipelined / local |
+|---|---:|---:|---:|
+| Q1 | 0.518 | 0.704 | 1.36 |
+| Q2 | 0.139 | 0.378 | 2.71 |
+| Q3 | 0.370 | 0.763 | 2.06 |
+| Q4 | 0.274 | 0.658 | 2.40 |
+| Q5 | 0.407 | 0.705 | 1.73 |
+| Q6 | 0.215 | 0.346 | 1.61 |
+| Q7 | 0.411 | 0.797 | 1.94 |
+| Q8 | 0.511 | 0.881 | 1.72 |
+| Q9 | 0.884 | 2.415 | 2.73 |
+| Q10 | 0.476 | 1.035 | 2.17 |
+| Q11 | 0.093 | 1.794 | 19.35 |
+| Q12 | 0.293 | 0.612 | 2.09 |
+| Q13 | 0.524 | 1.235 | 2.36 |
+| Q14 | 0.296 | 0.703 | 2.37 |
+| Q15 | 0.317 | 0.500 | 1.58 |
+| Q16 | 0.147 | 0.656 | 4.48 |
+| Q17 | 0.396 | 0.533 | 1.35 |
+| Q18 | 0.727 | 2.396 | 3.30 |
+| Q19 | 0.423 | 0.926 | 2.19 |
+| Q20 | 0.348 | 0.919 | 2.64 |
+| Q21 | 1.220 | 2.087 | 1.71 |
+| Q22 | 0.144 | 0.418 | 2.90 |
+| Total | **9.133** | **21.462** | **2.35** |
+
+Separate completed native diagnostics count **38,503,039 → 2,597,933**
+accepted channel rows for Q4, a **93.3%** reduction. The additional scan
+broadcasts 573,671 owner keys; only 1,450,571 lineitem rows then cross their
+hash exchange. Both runs return the same five rows and content hash, remain
+within the configured windows and release all channel/lease bytes. These
+counts include each shared broadcast channel once and are not network bytes
+or Ray timings. Worker counters are unavailable after Ray cleanup; completed
+native work is measured separately rather than inferred from empty snapshots.
+
+Q11 remains unchanged by this optimization. Its shared CTE keeps two
+8-million-row partsupp inputs in one native scope, despite the supplier/nation
+build producing only 4,049 keys. Its completed native diagnostic counts
+16,004,050 channel rows. Moving filtering before those exchanges is the next
+candidate, but the CTE's shared consumers must preserve build/probe ordering
+and bounded-channel progress.
+
+The final non-editable Release build (`vane-ai 0.3.0.dev106`) passes **108
+related native planner/execution tests** and **9 real-Ray tests**. Coverage
+includes equality and NULL-safe EXISTS/NOT EXISTS, duplicate/NULL owner keys,
+single/multiple threads, tiny channel budgets, per-query budget division,
+replica-traffic and residual-condition fallback, existing correlated scopes,
+source-version validation, cancellation/backpressure and FTE consumer retry
+with the same input identity and a new fence. Initial new regressions produce
+nine failures on the frozen runtime, with three fallback controls passing.
+The full release suite and large-query FTE performance are not rerun.
+
+Native SHA-256 identities, baseline and candidate:
+
+- `81dfaaf965f0984f5254bcb47cc9e5aa8598da3396897a648cb394d4073a705f`
+- `c26c6363d27e0995b35e49a42b29a96d71647a34039064803ab1dc24e4b42b29`
+
+Evidence is retained under `build/pipelined-q4-q11-20261015/`, including frozen
+runtime/configuration/input identities, raw samples, result hashes/counts,
+native work diagnostics, `comparison.json` and `local-vs-pipelined.csv`.
+All query/worker/result reservations return to zero. Owned processes stop
+before temporary/spill cleanup; shared oracle hashes are retained before
+deletion. Source Parquet files are preserved, and all disk guards remain
+untriggered.

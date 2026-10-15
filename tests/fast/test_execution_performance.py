@@ -697,6 +697,81 @@ def test_parallel_exchange_preserves_ordered_result_batches(tail):
             assert collect(service) == expected
 
 
+def budgeted_correlated_scan_query(connection, path, comparison="=", kind="semi"):
+    owner = path.with_stem("owner")
+    connection.execute(
+        "copy (select case when range%8192=0 then null when range%2048=1024 then range-1024 else range end k, "
+        "'priority-'||(range%5)::varchar prio, range%5 t, range%1024=0 is_kept "
+        f"from range(262144)) to '{owner}' (row_group_size 2048)"
+    )
+    connection.execute(
+        "copy (select case when range%8192=0 then null else range%262144 end k, range%7 v, 3::bigint w "
+        f"from range(1048576)) to '{path}' (row_group_size 2048)"
+    )
+    negate = "not " if kind == "anti" else ""
+    return (
+        f"select o.prio,count(*) from read_parquet('{owner}') o where o.is_kept and {negate}exists "
+        f"(select 1 from read_parquet('{path}') f where f.k {comparison} o.k and f.v<f.w) "
+        "group by o.prio order by o.prio"
+    )
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("kind", ["semi", "anti"])
+def test_budgeted_correlated_scan_filters_before_exchange(tmp_path, threads, comparison, kind):
+    with vane.connect(backend="local", config={"threads": threads, "memory_limit": "256MiB"}) as connection:
+        path = tmp_path / "fact.parquet"
+        sql = budgeted_correlated_scan_query(connection, path, comparison, kind)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="budgeted-correlated-filter",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(2, worker_operator_bytes=256 << 20),
+        )
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits=limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [c.snapshot() for c in service.channels.values()]
+            assert sum(s["accepted_rows"] for s in states) < 4096
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+        assert sum(s.function_name == "read_parquet" for f in spec.graph.fragments for s in f.sources) == 3
+
+
+@pytest.mark.parametrize(
+    "budget,partitions,filtered", [(0, 2, False), (128 << 20, 2, False), (256 << 20, 2, True), (256 << 20, 5, False)]
+)
+def test_correlated_scan_filter_respects_budget_and_replica_traffic(tmp_path, budget, partitions, filtered):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        sql = budgeted_correlated_scan_query(connection, tmp_path / "fact.parquet")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="correlated-filter-budget",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is filtered
+
+
+def test_correlated_scan_filter_does_not_cost_residual_selectivity_as_one_key(tmp_path):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        sql = budgeted_correlated_scan_query(connection, tmp_path / "fact.parquet")
+        sql = sql.replace("f.v<f.w", "f.v<f.w and f.v<>o.t")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="correlated-filter-residual",
+            options=FragmentCompileOptions(2, worker_operator_bytes=256 << 20),
+        )
+        assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("join_key", ["p.k", "p.j"])
 def test_correlated_average_filters_fact_rows_before_exchange(tmp_path, threads, join_key):

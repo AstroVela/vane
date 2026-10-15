@@ -16,6 +16,8 @@ struct CorrelatedKeySource {
 struct CorrelatedKeyFilter {
 	CorrelatedKeySource scan;
 	CorrelatedKeySource owner;
+	// Cost estimate from the inner join with this owner's delimiter keys.
+	idx_t estimated_matching_rows = 0;
 };
 
 // Every entry is a complete, independently executable subtree. A valid column

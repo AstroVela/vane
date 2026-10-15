@@ -198,8 +198,9 @@ public:
 			FindKeySource(owner, owner_column, key_type, filter.scan);
 			filter.owner.source = &owner;
 			filter.owner.column = owner_column;
-			for (auto input : filterable_inputs) {
-				result.filters.emplace(input, filter);
+			for (auto &input : filterable_inputs) {
+				filter.estimated_matching_rows = input.second;
+				result.filters.emplace(input.first, filter);
 			}
 		}
 		return output.valid && output.partitioned;
@@ -210,7 +211,7 @@ private:
 	idx_t group;
 	idx_t owner_column;
 	const LogicalType &key_type;
-	std::set<const PhysicalOperator *> filterable_inputs;
+	unordered_map<const PhysicalOperator *, idx_t> filterable_inputs;
 
 	Flow Seed(idx_t columns, idx_t column) {
 		Flow result(columns);
@@ -225,7 +226,7 @@ private:
 	// Only hash an independent input when equality identifies the original key,
 	// in the same native type. Other complete inputs can safely be broadcast.
 	void MatchInput(Flow &input, const Expression &input_key, const Flow &other, const Expression &other_key,
-	                bool filterable) {
+	                bool filterable, idx_t estimated_matching_rows) {
 		if (!input.boundary || input.partitioned || !other.partitioned ||
 		    input_key.GetExpressionClass() != ExpressionClass::BOUND_REF || input_key.return_type != key_type) {
 			return;
@@ -243,7 +244,7 @@ private:
 		input.partitioned = true;
 		input.keys[index] = std::move(key);
 		if (filterable) {
-			filterable_inputs.insert(input.boundary);
+			filterable_inputs.emplace(input.boundary, estimated_matching_rows);
 		}
 	}
 
@@ -270,15 +271,18 @@ private:
 			return output;
 		}
 		bool colocated = false;
+		// A residual or second key can reduce the join without making this
+		// one-key filter selective. Keep those estimates out of its costing.
+		const auto estimated_matching_rows = join.conditions.size() == 1 ? join.estimated_cardinality : 0;
 		for (auto &condition : join.conditions) {
 			if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
 			    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 				continue;
 			}
 			MatchInput(left, *condition.left, right, *condition.right,
-			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[1]));
+			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[1]), estimated_matching_rows);
 			MatchInput(right, *condition.right, left, *condition.left,
-			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[0]));
+			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[0]), estimated_matching_rows);
 			auto lk = CopyKey(*condition.left, left.keys);
 			auto rk = CopyKey(*condition.right, right.keys);
 			colocated = colocated || (lk && rk && lk->Equals(*rk));

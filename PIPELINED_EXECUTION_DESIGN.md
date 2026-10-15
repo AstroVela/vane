@@ -934,6 +934,10 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 被重复规划的扫描保留协调端原始文件和 split 绑定，只有序列化的工作端副本去掉文件列表。额外扫描仍有显式 source assignment，遵守相同的文件版本检查和 FTE 冻结路径；不复制可能返回不同结果的任意表函数。
 
+若该 Parquet 扫描本身就是完整 delimiter owner，还可使用已声明的单 worker、单查询内存份额预算其投影键。此路径要求预算允许大于 8 MiB 的广播，键列估计不超过 `min(64 MiB, worker_operator_bytes / 16)`；与 owner 的 delimiter scan 直接相连的单键 INNER join 必须估计保留不到输入四分之一的行，全部键副本流量也必须低于预计省下的输入交换量。多个连接条件、残余条件、缺失基数估计或无法估算的嵌套输入宽度均不使用这一成本判断。较宽的 owner 键超集不能借用完整 owner 的选择性；原有小扫描及共享 owner 输出路径保持原来的门槛。
+
+投影键在额外的独立 Parquet 扫描后、交换前生成，不复制完整 owner payload，也不建立依赖 delimiter 消费者的共享分支。原生 NULL 安全 SEMI 过滤只删除不可能属于 owner 键域的输入行，最终 delimiter 仍负责全部连接条件、重复行、EXISTS/NOT EXISTS 及聚合语义。内存与流量都是规划估计，执行仍遵守原有 operator memory、通道 credit 和取消清理规则。
+
 找不到足够小的独立扫描时，可以复用已规划的 owner fragment 输出：保留原 HASH 边，另建 HASH 边将同一输出送到键列 projection，再广播给上述 SEMI join。owner 的 join、聚合和源只执行一次。只有 owner 估计行数已知且少于待过滤输入八分之一、键列估计不超过 8 MiB、额外完整 owner 交换加键列广播的估计字节数低于待过滤输入交换时才启用；原来的小扫描路径仍优先。这个回退也适用于 owner 是嵌套 delimiter 的 Q21。
 
 两种原生 delimiter 都先消费完整 owner，再运行 DELIM_SCAN 管线；键列分支也先消费 owner，供 SEMI join 构建过滤表。因此共享 producer 的两个分支都先排空 owner，不依赖待过滤输入才能释放其 credit。每条额外边沿用既有有界交换及取消清理规则。FTE 从已提交的 owner 输出绑定两个下游，失败消费者重放相同输入版本，不重新执行 owner。

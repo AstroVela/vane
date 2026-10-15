@@ -1162,13 +1162,25 @@ private:
 	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
 		auto keys = filter.scan;
-		const bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
-		                    double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
-		                    double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
+		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
+		              double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
+		              double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
+		if (!rescan && keys.source && keys.source == filter.owner.source && broadcast_limit > 8 * 1024 * 1024) {
+			// A filtered Parquet owner can be badly overestimated. Its direct
+			// delimiter join estimates the surviving fact rows; use that estimate
+			// only when this scan is the complete owner, not a wider superset.
+			auto key_bytes =
+			    double(keys.source->estimated_cardinality) * (1 + GetTypeIdSize(op.types[key].InternalType()));
+			auto probe_bytes = EstimatedExchangeBytes(op);
+			auto matches = double(filter.estimated_matching_rows);
+			rescan = key_bytes <= broadcast_limit && matches > 0 && matches * 4 < double(op.estimated_cardinality) &&
+			         probe_bytes != NumericLimits<double>::Maximum() &&
+			         key_bytes * count < probe_bytes * (1 - matches / double(op.estimated_cardinality));
+		}
 		DistributedSubtree domain;
 		if (rescan) {
-			// Prefer duplicating a small independent scan to introducing another
-			// consumer of the delimiter owner.
+			// Project bounded keys before their exchange. A repeated independent
+			// Parquet scan cannot introduce a dependency on the delimiter consumer.
 			domain = Build(*keys.source);
 		} else {
 			keys = filter.owner;
