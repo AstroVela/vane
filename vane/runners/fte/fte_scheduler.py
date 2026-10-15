@@ -721,6 +721,13 @@ class FteQueryScheduler:
         with self._lock:
             return self._draining
 
+    def completion_generation(self) -> int | None:
+        """Return an idle event generation for validating a completion snapshot."""
+        with self._lock:
+            if self._state != "RUNNING" or self._draining or self._events or self._task_sources:
+                return None
+            return self._next_causal_generation
+
     def record_worker_failure(
         self,
         worker_id: str,
