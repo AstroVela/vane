@@ -587,6 +587,31 @@ def test_native_frame_basic_type_profile(connection, type_name, values):
     assert exchange.snapshot()["bytes"] == 0
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("frame_rows", [63, 64, 65])
+@pytest.mark.parametrize("shape", ["flat", "filtered", "nullable", "constant"])
+def test_fixed_width_frames_preserve_offsets_validity_and_owned_values(threads, frame_rows, shape):
+    value = "42" if shape == "constant" else "range"
+    if shape == "nullable":
+        value = "case when range%11=0 then null else range end"
+    predicate = "where range%3!=0" if shape == "filtered" else ""
+    sql = (
+        "select range k, v%2=0, (v%255-127)::tinyint, (v-1000)::smallint, v::integer, "
+        "v*10000000000, v::hugeint*1000000000000000000000000000000::hugeint, "
+        "v::decimal(38,5), v::float/2, v::double/2, date '2026-01-01'+v::integer "
+        f"from (select range, {value} v from range(8197) {predicate})"
+    )
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        limits = DirectExchangeLimits(8192, 8192, frame_rows, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert sorted(collect(service)) == sorted(expected)
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 def test_consumer_starts_before_producers_and_wakes_on_first_frame(connection):
     spec = submission(connection)
     with InProcessTaskService(connection, spec, TINY) as service:

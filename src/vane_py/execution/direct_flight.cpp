@@ -27,7 +27,7 @@ namespace duckdb {
 namespace vane_execution {
 namespace {
 
-constexpr idx_t MAX_INFLIGHT_FRAMES = 4;
+constexpr idx_t MAX_INFLIGHT_FRAMES = 8;
 
 void Check(const arrow::Status &status, const string &operation = "") {
 	if (!status.ok()) {
@@ -463,7 +463,7 @@ idx_t DirectFlight::StagingPerLink(idx_t frame_bytes) {
 	if (!frame_bytes || frame_bytes > (1ULL << 28)) {
 		throw InvalidInputException("direct Flight frame_bytes must be between 1 and 256 MiB");
 	}
-	// Four in-flight wire frames plus native/Arrow conversion and IPC buffers.
+	// Bounded in-flight wire frames plus native/Arrow conversion and IPC buffers.
 	// Fixed allowance covers schema/metadata and per-column aligned padding.
 	return (4 * MAX_INFLIGHT_FRAMES + 16) * frame_bytes + (1 << 18);
 }

@@ -303,6 +303,8 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 
 HASH join 和完整分组聚合的分区键若直接引用已有输入列，复用该列在交换 payload 中的位置，避免额外投影、复制和传输相同值。计算键仍追加计算结果；同一列在键序列中重复出现时，后续出现仍追加独立位置，保持原生多键散列的顺序和次数，例如 `a.k=b.k AND a.k=b.j` 不能只保留一个散列键。原始输入列的位置保持稳定，join 条件、聚合表达式和输出映射继续引用原列；所有键均可复用时省去新增的 projection。分区哈希和 NULL 语义仍由原生引擎执行，pipelined 与 FTE 使用同一图。
 
+任务准备时校验每个 HASH 输出的协议、引擎身份、schema、列引用及分区数，并保存该输出自己的列索引序列。后续批次直接使用原生 Hash/CombineHash 按相同顺序计算，避免重复解码表达式和创建执行器。每个 native sink task 独立持有哈希临时向量，可顺序复用于不同输出；缓存不引用输入向量、数据帧或连接状态，因此不延长输入 credit 的持有时间。FTE 重试在新任务中重新准备这些索引。
+
 分组聚合可以利用 Parquet split 的键范围证明组已完整：输入必须只有一个 Parquet source 且没有交换输入，至少一个整数分组键经原样 projection/filter 直接来自文件列。规划器检查已生成的实际 split 及其 row group，要求该列类型与绑定类型一致、统计信息包含非空的 min/max 且明确无 NULL，各 split 的闭区间严格不相交；边界相等也视为可能跨 split。这样每个组都在一个 split 内，分区可以直接执行完整 native aggregate，并在后续 HAVING 后再输出，省去 partial/final 聚合交换。其他分组键仍可含 NULL；有序、DISTINCT、宽累加器等语义继续由原生聚合负责。
 
 范围证明不穿过 join、aggregate、cast 或计算表达式，不借用行数估计。缺失统计、可能含 NULL 的证明键、范围重叠、文件列类型转换、union-by-name/hive/schema 映射和生成列都保留原交换路径。原 split、worker assignment、源版本检查和 FTE 冻结及重试规则保持有效；这不减少 Parquet 扫描行数，也不增加动态 split pruning。
@@ -334,6 +336,8 @@ Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row grou
 非关联等值 MARK join 也可采用完整 build 广播，让 IN/NOT IN 的 probe 扫描和后续过滤保留分区。每个原生 join 都看到全部 build 行，包括 NULL、重复键与空集合，因此沿用原生三值逻辑。仅使用基础广播规则：估计至多 32 行，或估计至多 8 MiB 且额外副本流量不超过省下的 probe 交换；不使用 worker 预算允许的更大广播。这样后续规划即使为提前过滤收紧广播门槛，也不会将 MARK 改成缺失全局 NULL/空集合信息的 HASH 分发。不满足规则或带 delimiter 元数据的 MARK 继续使用原生作用域。
 
 DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量阶段不逐值转换向量。实际复制仍解析 dictionary/constant selection 与 NULL；字符串和嵌套列仍遍历选中的有效内容，检查子数组边界及 frame_bytes，不改变 credit 计费。
+
+构造帧时，若已校验的行选择连续，且定长列为 flat vector、整个输入范围无 NULL，则一次复制该连续值区并设置对应 validity 位。含 NULL、dictionary/constant、非连续选择及嵌套列继续逐值处理。选择边界检查、帧布局和大小计算保持相同；复制结果仍属于帧自己的内存，借用与释放规则不变。
 
 DirectCollector 为本地扫描和上游 exchange 输入的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。执行器每 10 ms 检查尾批，并在等待上游输入前强制尝试发送，避免把已有结果扣在空闲生产者之后。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。默认 frame_rows 为原生向量容量 2048，frame_bytes 仍为 64 KiB，窗口仍为 1 MiB/16 帧；宽行继续按字节上限拆分。
 
@@ -719,9 +723,9 @@ P1.2 的预算保证限定为通道拥有的实际值缓冲；operator 输入/�
 
 [direct_flight.cpp](src/vane_py/execution/direct_flight.cpp) 实现独立的 native Flight 服务，与旧 shuffle server 没有 ticket 或执行路径适配。传输对象先获得有限的 link 数量和 staging 预留，publish/subscribe 消耗这些额度。每条路由绑定完整的 query、attempt、双方 worker epoch、exchange、分区、schema 指纹、routing version 和随机 capability；服务按已注册 ticket 的完整字节匹配，日志与错误不回显凭据。
 
-DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流最多允许四个未确认帧，同时受 native channel 的字节和帧数额度约束；服务端为每帧保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，由控制线程异步累计 ACK 上游，读取线程继续接收额度内的后续帧。关闭会释放全部发送 lease，随后到达的 ACK 只返回已关闭状态。
+DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流最多允许八个未确认帧，同时受 native channel 的字节和帧数额度约束；服务端为每帧保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，由控制线程异步累计 ACK 上游，读取线程继续接收额度内的后续帧。关闭会释放全部发送 lease，随后到达的 ACK 只返回已关闭状态。
 
-每个 link 的 staging 上界预留为 `32 * frame_bytes + 256 KiB`，覆盖四个在途帧、Arrow/native 编解码和 IPC payload；单条 gRPC 接收消息限制仍为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅复用有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。Flight 与物化 I/O 的单等待者信号会保留通知，避免在检查状态和进入等待之间错过唤醒；读取和控制线程各有独立信号。
+每个 link 的 staging 上界预留为 `48 * frame_bytes + 256 KiB`，覆盖八个在途帧、Arrow/native 编解码和 IPC payload；单条 gRPC 接收消息限制仍为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅复用有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。Flight 与物化 I/O 的单等待者信号会保留通知，避免在检查状态和进入等待之间错过唤醒；读取和控制线程各有独立信号。 默认 64 KiB 帧下，每个远程 link 的 staging 预留由 2.25 MiB 增至 3.25 MiB；worker 的已配置总容量不变，整图准入继续按新需求核算，容量不足时在启动前拒绝。同 worker 的通道不计 Flight staging。
 
 接收端在最后一个 ACK 成功后才向 native channel 发布 FINISH，ACK 失败不能晚于成功的 EOF。数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 

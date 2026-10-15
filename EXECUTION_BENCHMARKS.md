@@ -1938,3 +1938,97 @@ cleanup; oracle hashes are retained before deletion, source inputs are
 preserved and disk guards remain untriggered. Only related tests and Q9/Q18
 timings are run; full release/all-query and large-query FTE timings are not
 repeated.
+
+## Prepared hash routing, bulk frame copies and Flight window (2026-10-15)
+
+The frozen baseline is `ca93b80d5c`. Task preparation now validates each HASH
+output once and retains its ordered column indices. Batches use native
+Hash/CombineHash with scratch owned by each sink task, without re-decoding
+expressions or retaining input leases. Fixed-width, flat, fully valid columns
+with a validated contiguous row selection copy into the owned frame in one
+span. Nullable, selected, constant and nested vectors retain the existing
+value-wise path; frame layout, byte limits and ownership stay unchanged.
+
+Separate completed native Q9 diagnostics measured cumulative thread CPU
+inside identical temporary probes, one run per build. Hash routing fell from **1.742 to 0.679
+CPU seconds** and frame allocation/copy from **1.544 to 0.706 CPU seconds**.
+These are scoped in-process CPU measurements, not Ray query latency or total
+worker CPU. Probes were removed before acceptance. CPU-only Q9 timings
+changed from 1.980 to 1.953 seconds across six samples per runtime, with
+opposite signs in forward/reverse rounds: they do not establish a latency
+speedup. The hash-only exploration is retained separately.
+
+A separate Ray Q9 timeline found orders finished at 1.203 seconds while
+filtered-fact and joined-fact remote channels still held 16 outstanding
+frames, including 12 queued frames. Their four unacknowledged Flight frames
+limited progress. Raising that bound to **eight frames** lets the reader
+continue further while cumulative ACKs travel on the control connection.
+The ninth frame still waits, and native byte/slot credit continues to bound
+all outstanding data. Sequence checks, cancellation and FINISH are unchanged.
+
+This increases each link's staging reservation from
+`32 * frame_bytes + 256 KiB` to `48 * frame_bytes + 256 KiB`: **2.25 to
+3.25 MiB** at 64 KiB frames. Configured worker capacity is unchanged and
+admission charges the larger requirement before execution. A graph that
+previously fit a smaller staging capacity can now be rejected. Q9 has 20/19
+remote links per worker; reservations increase from 45/42.75 to 65/61.75 MiB,
+within the same declared 256 MiB per-worker capacity. Local channels have no
+Flight staging. This is an explicit throughput/memory tradeoff, not a
+reduction in total reserved memory.
+
+Only Q9/Q18 are timed. The final comparison uses a baseline/candidate round
+followed by candidate/baseline, three samples per query/mode/runtime in each
+round. Driver, installed Python, SF10 input hashes and declared resources
+match: local 36 threads/32 GiB; two pipelined 18-CPU workers, two partitions
+and 16 GiB operator memory per worker; 64 KiB/2048-row frames, 1 MiB windows
+and 16 slots. Submission through collection and successful close is timed;
+startup and comparison are excluded. OS caches remain warm on the shared
+host, and no task-owned build/test/diagnostic overlaps the timing windows.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.857 | 1.930 | 0.861 | 1.601 | -17.1% | 1.86 |
+| Q18 | 0.693 | 1.092 | 0.716 | 1.062 | -2.8% | 1.48 |
+
+Q9 improves in both rounds: 1.928 to 1.620 seconds and 1.932 to 1.588
+seconds. Q18's smaller change remains modest relative to shared-host
+variation. All **48 final comparison samples**, including **24 on the final
+build**, match local schema, row counts and values (relative/absolute float
+tolerances 1e-9/1e-6). Earlier CPU/hash explorations bring retained timing
+samples to 96; they are not pooled into the final candidate median.
+Completed native Q9 work retains **22,276,643 accepted channel rows**,
+identical per-channel counts/schemas and the same 175-row output hash.
+The 15,000,000 orders rows still cross HASH. No new all-query total or
+local parity is inferred.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev111`) passes
+**270 related native tests**. New cases cover different simultaneous HASH
+outputs and private scratch at 1/4 threads and 3/5 partitions, malformed
+partitioning rejected before task start, fixed-width/nullable/constant/filtered
+values at 63/64/65-row frame boundaries, and Flight's eight-frame progress,
+ninth-frame blocking, duplicate ACKs, FINISH, close and staging admission.
+The frozen baseline times out in the new window test before reaching eight
+frames. Existing tiny-window, wakeup/cancellation, nullable Parquet, type,
+materialized-input and Flight failure regressions pass. **11 real-Ray tests**
+also pass: pipelined/FTE reused-key execution and failed-consumer retry,
+analytical types, source contracts, slow-client backpressure/early close,
+interruption/delivery timeout, and admission rollback for insufficient I/O
+or staging capacity. Retry keeps input identity and changes the fence.
+Formatting, applicable pinned pre-commit hooks, copyleft inventory and
+`git diff --check` pass.
+
+Native SHA-256 identities, baseline and final candidate:
+
+- `18a1cb5ce5859c1eff53101177e088614bbc9ceac7c741956f8fcbbfb91d213b`
+- `9c2c8cf4b228d8dec52f11e04d100698027e019e372f7f67e862725d98b8542d`
+
+Evidence is retained under `build/pipelined-exchange-cpu-20261015/`: frozen
+runtime, source/build/configuration/input identities, samples, CPU diagnostic
+patches and logs, native work/schema reports, `comparison.json`,
+`local-vs-pipelined.csv`, test logs and cleanup manifests. Temporary probes
+are absent from production sources. All measured query/worker/result
+reservations return to zero; owned processes stop before temporary/spill
+cleanup. Shared oracle hashes are retained before deletion, source inputs
+are preserved and disk guards remain untriggered. Only related tests and
+Q9/Q18 timings are run; the full release/all-query suites and large-query
+FTE timings are not repeated.

@@ -160,6 +160,8 @@ public:
 		}
 	};
 	vector<vector<Buffer>> buffers;
+	// Scratch belongs to this native sink task and never retains input leases.
+	unique_ptr<Vector> hashes;
 	bool initialized = false;
 	idx_t output = 0;
 	idx_t channel = 0;
@@ -208,6 +210,9 @@ public:
 		state->buffers.resize(outputs.size());
 		for (idx_t i = 0; i < outputs.size(); i++) {
 			state->buffers[i].resize(outputs[i].channels.size());
+			if (!outputs[i].hash_columns.empty() && !state->hashes) {
+				state->hashes = make_uniq<Vector>(LogicalType::HASH);
+			}
 		}
 		return std::move(state);
 	}
@@ -301,8 +306,8 @@ public:
 				auto &output = outputs[out];
 				auto &selection = state.selections[out];
 				selection.resize(output.channels.size());
-				if (!output.partitioning.empty()) {
-					auto ids = HashPartitions(context.client, output.partitioning, chunk, output.channels.size());
+				if (!output.hash_columns.empty()) {
+					auto ids = HashPartitions(output.hash_columns, chunk, output.channels.size(), *state.hashes);
 					for (idx_t row = 0; row < ids.size(); row++) {
 						selection[ids[row]].push_back(row);
 					}
@@ -511,7 +516,7 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 	if (used.size() != inputs.size() || outputs.empty()) {
 		throw InvalidInputException("unexpected direct input port or missing output");
 	}
-	for (auto &output : outputs) {
+	for (auto &output : task->outputs) {
 		if (output.channels.empty() || output.producer.empty()) {
 			throw InvalidInputException("missing direct output channel or producer");
 		}
@@ -522,10 +527,10 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 			}
 			channel->LastSequence(output.producer); // Registration must precede preparation.
 		}
+		output.hash_columns.clear();
 		if (!output.partitioning.empty()) {
-			DataChunk empty;
-			empty.Initialize(Allocator::Get(context), task->fragment.root.types);
-			HashPartitions(context, output.partitioning, empty, output.channels.size());
+			output.hash_columns =
+			    BindHashColumns(context, output.partitioning, task->fragment.root.types, output.channels.size());
 		}
 	}
 	task->prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);

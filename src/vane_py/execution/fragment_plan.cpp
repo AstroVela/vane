@@ -41,7 +41,7 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/helper/physical_set.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
@@ -2222,7 +2222,8 @@ unique_ptr<PhysicalPlan> Load(ClientContext &context, const FragmentSpec &fragme
 	return plan;
 }
 
-vector<idx_t> HashPartitions(ClientContext &context, const string &partitioning, DataChunk &chunk, idx_t partitions) {
+vector<idx_t> BindHashColumns(ClientContext &context, const string &partitioning,
+                              const vector<LogicalType> &input_types, idx_t partitions) {
 	CheckPartitions(partitions);
 	vector<unique_ptr<Expression>> expressions;
 	vector<LogicalType> types;
@@ -2233,10 +2234,10 @@ vector<idx_t> HashPartitions(ClientContext &context, const string &partitioning,
 		types = deserializer.ReadProperty<vector<LogicalType>>(10, "input_types");
 		expressions = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(11, "expressions");
 	});
-	if (types != chunk.GetTypes() || expressions.empty()) {
+	if (types != input_types || expressions.empty()) {
 		throw InvalidInputException("HASH partitioning requires matching input schema and non-empty keys");
 	}
-	vector<LogicalType> key_types;
+	vector<idx_t> columns;
 	for (auto &expression : expressions) {
 		if (expression->GetExpressionClass() != ExpressionClass::BOUND_REF) {
 			throw SerializationException("unsupported native HASH expression");
@@ -2245,22 +2246,34 @@ vector<idx_t> HashPartitions(ClientContext &context, const string &partitioning,
 		if (ref.index >= types.size() || ref.return_type != types[ref.index]) {
 			throw SerializationException("native HASH reference does not match input schema");
 		}
-		key_types.push_back(ref.return_type);
+		columns.push_back(ref.index);
 	}
-	ExpressionExecutor executor(context, expressions);
-	DataChunk keys;
-	keys.Initialize(Allocator::Get(context), key_types);
-	executor.Execute(chunk, keys);
-	Vector hashes(LogicalType::HASH);
-	keys.Hash(hashes);
+	return columns;
+}
+
+vector<idx_t> HashPartitions(const vector<idx_t> &columns, DataChunk &chunk, idx_t partitions, Vector &hashes) {
+	// Preparation has checked the schema and bound references. Hash the same
+	// vectors in the same order without rebuilding an executor for each batch.
+	D_ASSERT(!columns.empty() && partitions > 0);
+	VectorOperations::Hash(chunk.data[columns[0]], hashes, chunk.size());
+	for (idx_t i = 1; i < columns.size(); i++) {
+		VectorOperations::CombineHash(hashes, chunk.data[columns[i]], chunk.size());
+	}
 	UnifiedVectorFormat data;
 	hashes.ToUnifiedFormat(chunk.size(), data);
 	auto values = UnifiedVectorFormat::GetData<hash_t>(data);
 	vector<idx_t> result;
+	result.reserve(chunk.size());
 	for (idx_t i = 0; i < chunk.size(); i++) {
 		result.push_back(values[data.sel->get_index(i)] % partitions);
 	}
 	return result;
+}
+
+vector<idx_t> HashPartitions(ClientContext &context, const string &partitioning, DataChunk &chunk, idx_t partitions) {
+	auto columns = BindHashColumns(context, partitioning, chunk.GetTypes(), partitions);
+	Vector hashes(LogicalType::HASH);
+	return HashPartitions(columns, chunk, partitions, hashes);
 }
 
 namespace {

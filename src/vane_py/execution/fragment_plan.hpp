@@ -94,6 +94,11 @@ using SourceAssignments = unordered_map<string, vector<string>>;
 // separate from execution and never creates an executor or initializes a scan.
 unique_ptr<PhysicalPlan> Load(ClientContext &context, const FragmentSpec &fragment, const InputFactory &inputs,
                               const SourceAssignments &assignments);
+// Validate once against the output schema. Evaluators keep only column indices;
+// each native sink task supplies its own scratch vector, without input leases.
+vector<idx_t> BindHashColumns(ClientContext &context, const string &partitioning, const vector<LogicalType> &types,
+                              idx_t partitions);
+vector<idx_t> HashPartitions(const vector<idx_t> &columns, DataChunk &chunk, idx_t partitions, Vector &hashes);
 vector<idx_t> HashPartitions(ClientContext &context, const string &partitioning, DataChunk &chunk, idx_t partitions);
 
 } // namespace vane_execution
