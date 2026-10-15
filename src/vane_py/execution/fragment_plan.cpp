@@ -720,7 +720,7 @@ double EstimatedExchangeBytes(const PhysicalOperator &op) {
 
 bool BroadcastJoin(const PhysicalHashJoin &join, idx_t probe_partitions, idx_t broadcast_limit) {
 	if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT && join.join_type != JoinType::SEMI &&
-	    join.join_type != JoinType::ANTI) {
+	    join.join_type != JoinType::ANTI && join.join_type != JoinType::MARK) {
 		return false;
 	}
 	auto &build = join.children[1].get();
@@ -838,11 +838,14 @@ public:
 		}
 		if (op.type == PhysicalOperatorType::HASH_JOIN) {
 			auto &join = op.Cast<PhysicalHashJoin>();
-			// MARK requires global NULL/empty-build knowledge. SINGLE must see
-			// all matching rows before checking scalar-subquery cardinality.
+			// A complete broadcast gives each MARK probe partition the global
+			// NULL/empty-build knowledge. Require the base broadcast budget so
+			// preserving an early probe filter cannot later select a hash join.
+			// SINGLE must see all matches before checking scalar cardinality.
 			// Delimiter elimination can leave correlated metadata on an ordinary
 			// join, including when its outer input is empty. Keep its native scope.
-			if (join.join_type == JoinType::MARK || join.join_type == JoinType::SINGLE || !join.delim_types.empty()) {
+			if (join.join_type == JoinType::SINGLE || !join.delim_types.empty() ||
+			    (join.join_type == JoinType::MARK && !BroadcastJoin(join, partitions, 8 * 1024 * 1024))) {
 				return Scoped(op);
 			}
 			return Join(join);

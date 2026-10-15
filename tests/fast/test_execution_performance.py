@@ -404,6 +404,69 @@ def test_broadcast_join_does_not_replicate_a_single_probe_partition():
     assert graph.fragments[-1].partition_count == 1
 
 
+@pytest.mark.parametrize("partitions", [1, 2, 5])
+@pytest.mark.parametrize("predicate", ["in", "not in"])
+@pytest.mark.parametrize("build", ["range%11", "case when range=0 then null else range%11 end", "null::bigint"])
+def test_broadcast_mark_join_preserves_complete_build_semantics(partitions, predicate, build):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        for count in (0, 70):
+            sql = (
+                f"select i, k, k {predicate} (select {build} from range({count})) is_match "
+                "from (select range i, case when range%7=0 then null else range%17 end k from range(430)) "
+                "order by i"
+            )
+            expected = connection.execute(sql).fetchall()
+            graph = compile_sql(connection, sql, partitions)
+            assert execute_graph(connection, graph) == expected
+            probe = next(f for f in graph.fragments if f.sources and f.inputs)
+            assert probe.partition_count == partitions
+            assert not any(e.distribution is Distribution.HASH for e in graph.exchanges)
+            assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) == (partitions > 1)
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_broadcast_mark_filters_and_aggregates_before_exchange(tmp_path, threads):
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        connection.execute(
+            f"copy (select range i, case when range%7=0 then null else range%101 end k "
+            f"from range(32768)) to '{path}' (row_group_size 2048)"
+        )
+        sql = (
+            f"select count(*), sum(i)::bigint from read_parquet('{path}') "
+            "where k in (1,3,5,7,9,11,13,15) and k not in (select range*3 from range(17))"
+        )
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        limits = DirectExchangeLimits(4096, 1024, 32, 2)
+        with InProcessTaskService(connection, spec, limits=limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [channel.snapshot() for channel in service.channels.values()]
+            # Only complete small builds and partial aggregates cross channels.
+            # The Parquet probe, including its literal IN list, stays distributed.
+            assert sum(s["accepted_rows"] for s in states) < 100
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+            assert all(s["bytes"] == s["leased_bytes"] == 0 for s in states)
+
+
+@pytest.mark.parametrize("probe_rows,build_rows,partitions", [(10000, 1000, 16), (10000000, 1000000, 2)])
+def test_mark_join_gathers_when_build_exceeds_broadcast_budget(probe_rows, build_rows, partitions):
+    sql = f"select range, range in (select range from range({build_rows})) from range({probe_rows})"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        for budget in (0, 16 << 30):
+            graph = compile_fragment_graph(
+                connection,
+                sql,
+                query_id="mark-broadcast-budget",
+                options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+            )
+            assert all(e.distribution is Distribution.GATHER for e in graph.exchanges)
+            assert next(f for f in graph.fragments if f.inputs).partition_count == 1
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 def test_broadcast_chain_filters_and_aggregates_before_exchange(threads):
     sql = (

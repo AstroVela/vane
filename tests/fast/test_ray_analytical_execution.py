@@ -200,6 +200,65 @@ def test_broadcast_probe_scans_and_small_builds_share_a_fragment(tmp_path, mode)
             assert_idle(connection)
 
 
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_public_broadcast_mark_join(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as local:
+        local.execute(
+            f"copy (select range i, case when range%7=0 then null else range%101 end k "
+            f"from range(16384)) to '{path}' (row_group_size 2048)"
+        )
+        build = "select case when range=0 then null else range%11 end from range(70)"
+        queries = [
+            f"select i, k in ({build}) is_match, k not in ({build}) is_unmatched "
+            f"from read_parquet('{path}') order by i limit 31",
+            f"select count(*), sum(i)::bigint from read_parquet('{path}') "
+            "where k in (1,3,5,7,9,11,13,15) and k not in (select range*3 from range(17))",
+            f"select count(*) from read_parquet('{path}') where k not in (select range from range(0))",
+            f"select k, k in ({build}) is_match from (select sum(range)::bigint k from range(4))",
+        ]
+        expected = [local.execute(sql).to_arrow_table().to_pylist() for sql in queries]
+    limits = resources(tmp_path, task_contexts_per_worker=64, io_concurrency=256)
+    with vane.Runtime(limits) as application, application.connect() as connection:
+        for index, (sql, rows) in enumerate(zip(queries, expected, strict=True)):
+            with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+                scheduler = result.context._reader
+                assert result.collect().to_pylist() == rows
+                if index == 0:
+                    assert any(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges)
+                    if mode == "fte_retry":
+                        assert len(lost) == 1
+                        attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                        assert len(attempts) == 2
+                        assert attempts[0].input_id == attempts[1].input_id
+                        assert attempts[0].fence != attempts[1].fence
+            assert_idle(connection)
+
+
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_public_analytical_sql_and_repeated_execution(tmp_path, mode):
     with (

@@ -1360,3 +1360,111 @@ are unavailable after cleanup, so partial live observations are not reported
 as completed exchange work. Owned processes stop before temporary/spill cleanup;
 the shared oracle is removed after recording its hashes. The source dataset is
 preserved and every disk guard remains untriggered.
+
+## Broadcasting complete small MARK builds (2026-10-15)
+
+SF10 Q16 took 1.850 seconds versus 0.146 locally in a fresh three-repetition
+control at `6d187d2d86`. Its `NOT IN` became a MARK join, which unconditionally
+kept a single native scope. A nested literal IN-list scan also kept the part
+join inside that scope: 8,000,000 partsupp rows, 1,855,696 part rows and only
+56 filtered supplier keys were gathered before the final joins and aggregation.
+
+An uncorrelated equality MARK join now uses the existing complete-build
+broadcast path when its build qualifies for the base policy: at most 32
+estimated rows, or at most 8 MiB with extra replica traffic no larger than the
+probe exchange saved. Each probe partition receives the entire build, so the
+native MARK implementation retains NULL, empty-build and duplicate-key
+semantics. Probe scans, nested literal IN filters and subsequent joins can
+remain distributed. MARK does not use the larger worker-budget broadcast
+allowance: retaining an early probe filter must not subsequently change it
+into a hash-partitioned build. Larger builds, correlated delimiter metadata,
+SINGLE and shared owner scopes retain their existing treatment.
+
+The same frozen acceptance driver compares the old installed runtime with the
+non-editable Release candidate on `/data/tpch10`, using two 18-CPU workers,
+two partitions, 16 GiB operator memory per worker and unchanged default
+64 KiB/2048-row frames, 1 MiB windows and 16 slots. Local uses 36 threads and
+32 GiB. Timings include submission through collection and successful close;
+input/oracle validation and startup are outside the measured query window.
+The host is shared, OS caches remain warm, and no task-owned builds or tests
+overlap the comparison runs.
+
+| Measurement, seconds | Frozen baseline | Candidate | Candidate local |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 23.591 | 23.003 | 9.046 |
+| Q4, median of three | 2.122 | 2.099 | 0.304 |
+| Q9, median of three | 2.368 | 2.376 | 0.860 |
+| Q11, median of three | 1.699 | 1.708 | 0.093 |
+| Q16, median of three | 1.850 | 0.729 | 0.143 |
+
+Q16 improves **60.6%**, remaining **5.08 times local**. The full pass improves
+2.5%, remaining 2.54 times local; that single pass is weaker evidence than the
+repeated Q16 comparison. All 22 queries match the local oracle. The focused
+Q9 median differs by only +0.3%, while the full-pass Q9 and Q17 samples rise
+6.2% and 12.5%. A separate three-repetition check runs the candidate first and
+baseline second: Q9 medians are 2.417 versus 2.427 seconds, Q17 0.576 versus
+0.613, and Q16 0.650 versus 2.031. The Q9/Q17 single-pass regressions do not
+reproduce in this control. Of all 22 compiled graphs, only Q16 changes its
+fragment/edge topology; serialized hashes also contain runtime identity and
+are not treated as a cross-build operator-equivalence proof.
+
+The following per-query numbers use the candidate's single complete pass;
+they are not mixed with the focused medians above. All results pass schema,
+row-count and value comparison, with the driver's recorded floating tolerance.
+
+| Query | Local, seconds | Pipelined, seconds | Pipelined / local |
+|---|---:|---:|---:|
+| Q1 | 0.484 | 0.711 | 1.47 |
+| Q2 | 0.133 | 0.385 | 2.88 |
+| Q3 | 0.367 | 0.762 | 2.08 |
+| Q4 | 0.266 | 2.035 | 7.66 |
+| Q5 | 0.407 | 0.755 | 1.85 |
+| Q6 | 0.212 | 0.392 | 1.85 |
+| Q7 | 0.414 | 0.827 | 2.00 |
+| Q8 | 0.511 | 0.890 | 1.74 |
+| Q9 | 0.836 | 2.419 | 2.90 |
+| Q10 | 0.475 | 1.052 | 2.22 |
+| Q11 | 0.093 | 1.787 | 19.25 |
+| Q12 | 0.298 | 0.610 | 2.05 |
+| Q13 | 0.550 | 1.223 | 2.22 |
+| Q14 | 0.297 | 0.692 | 2.33 |
+| Q15 | 0.306 | 0.501 | 1.64 |
+| Q16 | 0.159 | 0.626 | 3.94 |
+| Q17 | 0.403 | 0.700 | 1.74 |
+| Q18 | 0.712 | 2.345 | 3.29 |
+| Q19 | 0.417 | 0.891 | 2.14 |
+| Q20 | 0.342 | 0.903 | 2.64 |
+| Q21 | 1.225 | 2.067 | 1.69 |
+| Q22 | 0.139 | 0.431 | 3.09 |
+| Total | **9.046** | **23.003** | **2.54** |
+
+Separate completed in-process diagnostics count **9,883,592 → 1,539,170**
+accepted native channel rows for Q16, a reduction of **84.4%**. The 8-million-row
+partsupp probe now stays in its source fragment, the filtered part build sends
+296,824 rows, and 1,186,602 surviving rows still cross the DISTINCT aggregation
+hash exchange. Both diagnostics return the same 27,840 result rows, release
+all channel/lease bytes and stay within the original credit windows. Shared
+broadcast channels count once; these work counts are not network bytes or
+Ray timings. Q4 still exchanges approximately 38.5 million rows and is not
+optimized by this change.
+
+The final build passes **217 related native planner/execution tests** and
+**7 real-Ray tests**, including complete MARK builds with NULLs, empty inputs,
+duplicates, 1/2/5 partitions, literal IN lists, bounded backpressure, broadcast
+budget fallback, scalar-subquery errors, shared/correlated scopes, early close,
+interrupt and FTE consumer retry with the same input identity and a new fence.
+The corrected new performance regressions fail on the frozen runtime (20
+failures, with two fallback controls passing). The full release suite and
+large-query FTE performance are not rerun.
+
+Native SHA-256 identities, baseline and candidate:
+
+- `da70e1e138e6da24939ae40070c4d4a03917d6672c5d00609b2e46e13cec4b05`
+- `81dfaaf965f0984f5254bcb47cc9e5aa8598da3396897a648cb394d4073a705f`
+
+Evidence is retained under `build/pipelined-mark-join-20261015/`, including the
+frozen baseline runtime, unchanged driver, code/input identities, raw timings,
+result counts/hashes, completed native work counts and per-run cleanup
+manifests. Source Parquet files are preserved. Temporary/spill outputs are
+removed after owned processes stop, and shared oracle hashes are retained
+before deleting the generated oracle.

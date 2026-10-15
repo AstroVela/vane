@@ -323,7 +323,9 @@ Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row grou
 
 同 worker 的 pipelined 边共用一个 DirectChannel，只有一份 credit 和窗口预留，不创建 Flight relay 或预留该边的网络 staging。跨 worker 和根结果链路继续使用 Flight。执行循环在 pump 有进展时立即继续，只有无进展时才短暂等待。
 
-广播 join 的每个 probe 分区都能看到完整 build，因此不再额外 HASH 分发 probe。保留 probe 的扫描、已有输入端口及分区数，后续过滤与可拆分聚合可以先在同一 fragment 执行。下游需要按键分组或 join 时仍显式建立自己的 HASH 边。单分区 probe 不会因为请求更高并行度而复制；MARK/SINGLE 与共享 delimiter/CTE 状态继续遵守独立的原生作用域规则。
+广播 join 的每个 probe 分区都能看到完整 build，因此不再额外 HASH 分发 probe。保留 probe 的扫描、已有输入端口及分区数，后续过滤与可拆分聚合可以先在同一 fragment 执行。下游需要按键分组或 join 时仍显式建立自己的 HASH 边。单分区 probe 不会因为请求更高并行度而复制；SINGLE 与共享 delimiter/CTE 状态继续遵守独立的原生作用域规则。
+
+非关联等值 MARK join 也可采用完整 build 广播，让 IN/NOT IN 的 probe 扫描和后续过滤保留分区。每个原生 join 都看到全部 build 行，包括 NULL、重复键与空集合，因此沿用原生三值逻辑。仅使用基础广播规则：估计至多 32 行，或估计至多 8 MiB 且额外副本流量不超过省下的 probe 交换；不使用 worker 预算允许的更大广播。这样后续规划即使为提前过滤收紧广播门槛，也不会将 MARK 改成缺失全局 NULL/空集合信息的 HASH 分发。不满足规则或带 delimiter 元数据的 MARK 继续使用原生作用域。
 
 DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量阶段不逐值转换向量。实际复制仍解析 dictionary/constant selection 与 NULL；字符串和嵌套列仍遍历选中的有效内容，检查子数组边界及 frame_bytes，不改变 credit 计费。
 
@@ -924,7 +926,7 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 编译器先遍历完整 SQL，包括表达式中的子查询、表子查询及 CTE 定义，再进入绑定。确定性内置 scalar function 按 catalog 来源和稳定性检查，不再维护函数名白名单。用户宏、UDF、带副作用及仅查询内稳定的函数继续拒绝；Binder 生成的标量子查询多行检查保留原生异常。所有文件引用在任何快照复制前完成展开，优化前的数据源依赖仍参与 worker 快照校验。
 
-普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter 及 MARK/SINGLE 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter、SINGLE 及未采用完整 build 广播的 MARK 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
 
 关联 delimiter 的分区由独立的 locality 分析决定，分析先于计划修改。只选择原生整数关联键；owner 输入按该键 HASH，同一关联键的外层行、去重缓存和内部完整聚合组属于同一分区。分析沿 projection、filter、hash join 与分组键追踪关联键，只认可直接引用和优化器证明无损的整数压缩/解压。等值条件能证明独立输入具有同类型关联键时，该输入也 HASH；其他完整独立输入可以 BROADCAST。外连接不能保留广播侧的未匹配行，分组的每个 grouping set 必须包含关联键，省略的分组列不能继续传播键身份。多个候选键按可避免广播的估计行数选择，例如 Q21 使用订单键而非供应商不等式。
 
@@ -936,7 +938,7 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 两种原生 delimiter 都先消费完整 owner，再运行 DELIM_SCAN 管线；键列分支也先消费 owner，供 SEMI join 构建过滤表。因此共享 producer 的两个分支都先排空 owner，不依赖待过滤输入才能释放其 credit。每条额外边沿用既有有界交换及取消清理规则。FTE 从已提交的 owner 输出绑定两个下游，失败消费者重放相同输入版本，不重新执行 owner。
 
-每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
+每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、未采用完整 build 广播的 MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
 
 这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。
 
