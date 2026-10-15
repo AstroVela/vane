@@ -915,7 +915,7 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | LIMIT | P4 全局 LIMIT/OFFSET，支持提前关闭 | 分布式 LIMIT pushdown 优化 |
 | ORDER BY、TopN | P4 单根全局排序及 partial/final TopN | 排序性能和 spill 基准 |
 | 标量子查询、EXISTS、IN/NOT IN、ANY/ALL | 原生 MARK/SINGLE 与 delimiter 执行语义 | 优化带全局摘要的分布式 MARK |
-| 非递归物化 CTE | 工作表和全部消费者保留在同一原生执行单元 | 独立的跨 worker 共享物化设计 |
+| 非递归物化 CTE | 工作表和全部消费者保留在同一原生执行单元；小 owner 可过滤独立输入 | 独立的跨 worker 共享物化设计 |
 | CROSS_PRODUCT、nested-loop join | 收集输入后执行完整连接 | 按代价与连接语义扩展分布式规则 |
 | window、ASOF 等复杂算子 | 明确拒绝 | 按语义和分布式计划逐项扩展 |
 | 递归 CTE 与迭代反馈 | 明确拒绝 | 需要独立的反馈执行设计 |
@@ -927,6 +927,10 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 编译器先遍历完整 SQL，包括表达式中的子查询、表子查询及 CTE 定义，再进入绑定。确定性内置 scalar function 按 catalog 来源和稳定性检查，不再维护函数名白名单。用户宏、UDF、带副作用及仅查询内稳定的函数继续拒绝；Binder 生成的标量子查询多行检查保留原生异常。所有文件引用在任何快照复制前完成展开，优化前的数据源依赖仍参与 worker 快照校验。
 
 普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter、SINGLE 及未采用完整 build 广播的 MARK 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+
+非递归 CTE 的 owner 是独立子树、估计行数已知且完整输出不超过 8 MiB 时，可复用已规划的 owner producer，在独立 probe 输入的 GATHER 之前增加原生 NULL 安全 SEMI 过滤。只接受直接连接当前 owner 的 CTE_SCAN、同类型原生整数键、单一等值条件的 INNER/SEMI join；owner 估计行数须少于 probe 八分之一，全部新增副本流量须小于该输入的估计交换量。缺少宽度统计、计算键、多个或残余条件、保留 probe 行的 join，以及含嵌套 CTE/delimiter 或重复物理节点的消费子树，继续使用原有作用域计划。CTE_SCAN 输出类型及列位置必须对应完整 owner。
+
+owner 只执行一次，原有 GATHER 保留；每个提前过滤分支广播同一完整输出，最终 CTE join 仍决定匹配、重复次数和 NULL 语义。原生 CTE 在消费工作表前先物化 owner，提前过滤分支也先排空 owner 再读取 probe，因此共享 producer 的推进不依赖尚未过滤的事实行。各分支沿用有界通道及取消清理，FTE 复用已提交输入、失败重试更换 fence。这里的运行时键过滤减少交换行数；它本身不建立扫描动态过滤或协调端的 split 裁剪，不能将交换量下降等同于磁盘读取量下降。
 
 关联 delimiter 的分区由独立的 locality 分析决定，分析先于计划修改。只选择原生整数关联键；owner 输入按该键 HASH，同一关联键的外层行、去重缓存和内部完整聚合组属于同一分区。分析沿 projection、filter、hash join 与分组键追踪关联键，只认可直接引用和优化器证明无损的整数压缩/解压。等值条件能证明独立输入具有同类型关联键时，该输入也 HASH；其他完整独立输入可以 BROADCAST。外连接不能保留广播侧的未匹配行，分组的每个 grouping set 必须包含关联键，省略的分组列不能继续传播键身份。多个候选键按可避免广播的估计行数选择，例如 Q21 使用订单键而非供应商不等式。
 

@@ -1586,3 +1586,120 @@ All query/worker/result reservations return to zero. Owned processes stop
 before temporary/spill cleanup; shared oracle hashes are retained before
 deletion. Source Parquet files are preserved, and all disk guards remain
 untriggered.
+
+## Filtering independent CTE inputs before gather (2026-10-15)
+
+The fresh baseline at `700c01626e` takes 1.552 seconds for SF10 Q11 versus
+0.096 locally. The optimizer shares a supplier/nation build through a native
+CTE. Although that build produces only 4,049 rows, both 8-million-row partsupp
+inputs are gathered into the CTE's single native scope before their joins.
+Completed native diagnostics count 16,004,050 accepted channel rows.
+
+The planner now reuses an independent CTE owner's producer to filter its
+independent fact inputs before GATHER. It requires a known owner estimate of
+at most 8 MiB, fewer than one-eighth of probe rows, and all additional replica
+traffic below the estimated probe exchange. The original join must be
+INNER/SEMI with one equality or NULL-safe equality condition over unchanged
+integral references, directly against this owner's CTE_SCAN with matching
+output types and column positions. Unknown widths, computed/multiple/residual
+keys, preserved probe rows, nested CTE/delimiter ownership and repeated
+physical nodes retain the original path.
+
+Each added branch receives the complete owner output and uses a native
+NULL-safe SEMI filter. The original CTE materialization and final joins remain
+responsible for NULLs, duplicate matches, aggregation and shared state. The
+owner runs once: both its native materialization and the added filter builds
+drain it before probing, so bounded fanout does not depend on fact input
+progress. Source assignments, operator budgets, channel credits and FTE input
+identity/fence rules are unchanged. This reduces exchange rows; it does not
+add Parquet row-group or coordinator split pruning.
+
+The immutable driver uses the same SF10 input identities and resources as the
+previous round: local has 36 threads/32 GiB; pipelined has two 18-CPU workers,
+two partitions and 16 GiB operator memory per worker. Default 64 KiB/2048-row
+frames, 1 MiB windows and 16 slots remain unchanged. The timer covers query
+submission through collection and successful close, excluding startup and
+oracle comparison. The host is shared, OS caches remain warm, and no task-owned
+build or test overlaps the measured runs.
+
+| Measurement, seconds | Frozen baseline | Candidate | Candidate local |
+|---|---:|---:|---:|
+| All 22 queries, one complete pass | 21.660 | 20.317 | 9.260 |
+| Q4, median of three | 0.653 | 0.636 | 0.305 |
+| Q9, median of three | 2.346 | 2.377 | 0.842 |
+| Q11, median of three | 1.552 | 0.276 | 0.094 |
+| Q18, median of three | 2.511 | 2.389 | 0.697 |
+
+Q11 improves **82.2%**, remaining **2.93 times local**. The single full pass
+improves **6.2%**, remaining **2.19 times local**. Other full-pass samples vary:
+Q17/Q1/Q14/Q8 increase 8.9%/8.1%/7.3%/7.0%, and Q18 increases 6.5%, while its
+focused median decreases 4.9%. Q9's focused median increases 1.3%. These are
+shared-host observations, not evidence that every query improves or that
+single-pass differences are repeatable. The repeated Q11 comparison and
+completed work counts are the direct evidence for this change.
+
+All 136 timing samples, including 68 on the candidate, pass schema, row-count
+and value comparison with relative/absolute floating tolerances of 1e-9/1e-6.
+The repository's fixed Q11 threshold returns zero rows on this SF10 input in
+both runtimes; nonempty regression fixtures independently verify aggregates,
+duplicate matches and NULL semantics. The following table uses only the
+candidate's single complete pass, without mixing in focused medians.
+
+| Query | Local, seconds | Pipelined, seconds | Pipelined / local |
+|---|---:|---:|---:|
+| Q1 | 0.530 | 0.769 | 1.45 |
+| Q2 | 0.136 | 0.385 | 2.83 |
+| Q3 | 0.373 | 0.771 | 2.07 |
+| Q4 | 0.285 | 0.615 | 2.16 |
+| Q5 | 0.418 | 0.723 | 1.73 |
+| Q6 | 0.214 | 0.385 | 1.80 |
+| Q7 | 0.409 | 0.814 | 1.99 |
+| Q8 | 0.512 | 0.920 | 1.80 |
+| Q9 | 0.847 | 2.466 | 2.91 |
+| Q10 | 0.480 | 1.049 | 2.18 |
+| Q11 | 0.098 | 0.269 | 2.74 |
+| Q12 | 0.295 | 0.556 | 1.88 |
+| Q13 | 0.564 | 1.210 | 2.15 |
+| Q14 | 0.305 | 0.719 | 2.36 |
+| Q15 | 0.299 | 0.528 | 1.76 |
+| Q16 | 0.151 | 0.645 | 4.27 |
+| Q17 | 0.427 | 0.592 | 1.39 |
+| Q18 | 0.754 | 2.517 | 3.34 |
+| Q19 | 0.430 | 0.938 | 2.18 |
+| Q20 | 0.356 | 0.945 | 2.66 |
+| Q21 | 1.230 | 2.090 | 1.70 |
+| Q22 | 0.146 | 0.410 | 2.80 |
+| Total | **9.260** | **20.317** | **2.19** |
+
+Separate completed native diagnostics count **16,004,050 → 659,988** accepted
+channel rows, a **95.9%** reduction. Each fact input now sends 323,920 rows;
+the original owner GATHER and each of two added broadcasts carry 4,049 rows.
+Both runs match the local oracle and content hash, remain within the original
+credit windows, and release all channel/lease bytes. Shared broadcast channels
+count once; these counts are not network bytes or Ray timings. They do not
+infer completed work from worker counters that are unavailable after cleanup.
+
+The final non-editable Release build (`vane-ai 0.3.0.dev107`) passes **185
+related native tests** (27 focused cases plus 158 existing regressions) and
+**7 real-Ray tests**. These cover INNER/SEMI filtering, equality/NULL-safe
+equality, duplicates, empty/NULL builds, 1/4 threads, 2/5 partitions, tiny
+windows and cancellation; fallback for cost, preserved rows, computed/residual
+keys and nested ownership; existing shared/correlated/scalar semantics and
+changed-source rejection; and public pipelined/FTE execution, backpressure,
+interrupt and failed-consumer retry with the same input identity and a new
+fence. The initial regressions fail on the frozen runtime in all 12 work-count
+cases, while eight semantic/fallback cases pass. The full release suite and
+large-query FTE performance are not rerun.
+
+Native SHA-256 identities, baseline and candidate:
+
+- `c26c6363d27e0995b35e49a42b29a96d71647a34039064803ab1dc24e4b42b29`
+- `b6e88f973bca4ebc7195950168157a95e5fcc82a013a9fee1051d24fb18b3bf9`
+
+Evidence is retained under `build/pipelined-cte-filter-20261015/`, including
+frozen runtime/configuration/input identities, raw samples, result hashes and
+counts, completed native work, `comparison.json` and `local-vs-pipelined.csv`.
+All query/worker/result reservations return to zero. Owned processes stop
+before temporary/spill cleanup, shared oracle hashes are recorded before
+deletion, source Parquet files are preserved, and all disk guards remain
+untriggered. Q18 and Q9 now have the largest absolute gaps in the focused set.

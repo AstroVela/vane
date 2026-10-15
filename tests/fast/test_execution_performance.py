@@ -697,6 +697,96 @@ def test_parallel_exchange_preserves_ordered_result_batches(tail):
             assert collect(service) == expected
 
 
+def shared_cte_filter_query(connection, path, comparison="=", kind="inner", owner="normal"):
+    connection.execute(
+        "copy (select case when range%4096=0 then null else range%65536 end k, range%5 g, range%7 v "
+        f"from range(131072)) to '{path}' (row_group_size 2048)"
+    )
+    key = "null::bigint" if owner == "null" else "case when range%17=0 then null else (range%64)*1021 end"
+    domain = f"select {key} k, range%3 v from range({0 if owner == 'empty' else 512})"
+    predicate = f"f.k {comparison} d.k"
+    if kind == "residual":
+        kind = "inner"
+        predicate += " and f.v>d.v"
+    elif kind == "computed":
+        kind = "inner"
+        predicate = "f.k+f.v=d.k"
+    source = f"read_parquet('{path}') f {kind} join d on {predicate}"
+    return (
+        f"with d as materialized ({domain}) select f.g,sum(f.v) v,count(*) n from {source} group by f.g "
+        f"having sum(f.v)>=(select coalesce(sum(f.v),0)*0.001 from {source}) order by f.g"
+    )
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 2), (4, 5)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("kind", ["inner", "semi"])
+def test_shared_cte_filters_fact_inputs_before_gather(tmp_path, threads, partitions, comparison, kind):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql = shared_cte_filter_query(connection, tmp_path / "fact.parquet", comparison, kind)
+        expected = connection.execute(sql).fetchall()
+        assert expected
+        spec = submission(connection, sql, partitions=partitions)
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [c.snapshot() for c in service.channels.values()]
+            assert sum(s["accepted_rows"] for s in states) < 8192
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+        # The materialized CTE producer runs once for its original consumer
+        # and both complete-build filters, including its duplicate/NULL keys.
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+
+
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("owner", ["empty", "null"])
+def test_shared_cte_filter_preserves_empty_and_null_builds(tmp_path, comparison, owner):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = shared_cte_filter_query(connection, tmp_path / "fact.parquet", comparison, owner=owner)
+        expected = connection.execute(sql).fetchall()
+        with InProcessTaskService(
+            connection, submission(connection, sql), DirectExchangeLimits(4096, 1024, 32, 1)
+        ) as service:
+            service.start()
+            assert collect(service) == expected
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("kind", ["left", "anti", "residual", "computed"])
+def test_shared_cte_filter_keeps_preserved_rows_and_unsupported_keys(tmp_path, kind):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = shared_cte_filter_query(connection, tmp_path / "fact.parquet", kind=kind)
+        graph = compile_sql(connection, sql, 2)
+        assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+
+
+@pytest.mark.parametrize(
+    "owner_rows,probe_rows,partitions", [(512, 8192, 1), (2048, 8192, 2), (512, 8192, 16), (262144, 8388608, 2)]
+)
+def test_shared_cte_filter_respects_size_selectivity_and_replica_cost(owner_rows, probe_rows, partitions):
+    sql = (
+        f"with d as materialized (select range k,repeat('v',64) payload from range({owner_rows})) "
+        f"select sum(f.range),max(d.payload) from range({probe_rows}) f join d on f.range=d.k "
+        "having sum(f.range)>=(select count(*) from d)"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        graph = compile_sql(connection, sql, partitions)
+        assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+
+
+def test_shared_cte_filter_preserves_nested_owner_dependencies(tmp_path):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = shared_cte_filter_query(connection, tmp_path / "fact.parquet", "is not distinct from")
+        sql = sql.replace("with d as materialized", "with parent as materialized")
+        sql = sql.replace(") select f.g", "), d as materialized (select * from parent where v<2) select f.g", 1)
+        graph = compile_sql(connection, sql, 2)
+        assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+
+
 def budgeted_correlated_scan_query(connection, path, comparison="=", kind="semi"):
     owner = path.with_stem("owner")
     connection.execute(
@@ -966,7 +1056,7 @@ def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, thre
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate"])
+@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate", "cte"])
 def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
@@ -979,6 +1069,7 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
         from tests.fast.test_fragment_sql_coverage import (
             correlated_owner_queries, early_join_filter_query, large_join_key_query,
         )
+        from tests.fast.test_execution_performance import shared_cte_filter_query
         from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 
         config = {"threads": int(sys.argv[2])}
@@ -986,7 +1077,9 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
             config["disabled_optimizers"] = "join_order,build_side_probe_side"
         with vane.connect(backend="local", config=config) as connection:
             path = Path(sys.argv[1]) / "fact.parquet"
-            if sys.argv[3] in ("exact", "hashed", "join_estimate"):
+            if sys.argv[3] == "cte":
+                sql = shared_cte_filter_query(connection, path)
+            elif sys.argv[3] in ("exact", "hashed", "join_estimate"):
                 sql = large_join_key_query(connection, path, sys.argv[3])
             else:
                 sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"

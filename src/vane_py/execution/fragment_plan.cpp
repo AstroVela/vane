@@ -16,6 +16,7 @@
 #include "duckdb/execution/dynamic_filter_serialization.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
@@ -1233,9 +1234,69 @@ private:
 		return input;
 	}
 
+	unordered_map<const PhysicalOperator *, EarlyProbeFilter> PlanCTEFilters(PhysicalOperator &root) {
+		unordered_map<const PhysicalOperator *, EarlyProbeFilter> filters;
+		if (partitions == 1 || root.type != PhysicalOperatorType::CTE) {
+			return filters;
+		}
+		auto &cte = root.Cast<PhysicalCTE>();
+		auto &owner = root.children[0].get();
+		auto bytes = EstimatedExchangeBytes(owner);
+		if (HasScopedState(owner) || !owner.estimated_cardinality || bytes > 8 * 1024 * 1024) {
+			return filters;
+		}
+		bool independent = true;
+		std::set<const PhysicalOperator *> visited;
+		std::function<void(PhysicalOperator &)> visit = [&](PhysicalOperator &op) {
+			// Do not transfer a filter across nested ownership or a shared DAG
+			// input that another consumer may need without this restriction.
+			if (!visited.insert(&op).second || op.type == PhysicalOperatorType::CTE ||
+			    op.type == PhysicalOperatorType::LEFT_DELIM_JOIN || op.type == PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+				independent = false;
+				return;
+			}
+			if (op.type == PhysicalOperatorType::HASH_JOIN) {
+				auto &join = op.Cast<PhysicalHashJoin>();
+				auto &probe = join.children[0].get();
+				auto &build = join.children[1].get();
+				auto probe_bytes = EstimatedExchangeBytes(probe);
+				if ((join.join_type == JoinType::INNER || join.join_type == JoinType::SEMI) &&
+				    join.delim_types.empty() && join.conditions.size() == 1 &&
+				    build.type == PhysicalOperatorType::CTE_SCAN &&
+				    build.Cast<PhysicalColumnDataScan>().cte_index == cte.table_index && build.types == owner.types &&
+				    !HasScopedState(probe) &&
+				    double(owner.estimated_cardinality) * 8 < double(probe.estimated_cardinality) &&
+				    probe_bytes != NumericLimits<double>::Maximum() && bytes * partitions < probe_bytes) {
+					auto &condition = join.conditions[0];
+					if ((condition.comparison == ExpressionType::COMPARE_EQUAL ||
+					     condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+					    condition.left->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+					    condition.right->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+					    condition.left->return_type.IsIntegral() &&
+					    condition.left->return_type == condition.right->return_type) {
+						EarlyProbeFilter filter;
+						filter.column = condition.left->Cast<BoundReferenceExpression>().index;
+						filter.build = &owner;
+						filter.build_column = condition.right->Cast<BoundReferenceExpression>().index;
+						filters.emplace(&probe, filter);
+					}
+				}
+			}
+			for (auto &child : op.GetChildren()) {
+				visit(const_cast<PhysicalOperator &>(child.get()));
+			}
+		};
+		visit(root.children[1]);
+		if (!independent) {
+			filters.clear();
+		}
+		return filters;
+	}
+
 	DistributedSubtree Scoped(PhysicalOperator &root) {
 		DistributedSubtree result;
 		CorrelatedPartition partitioning;
+		auto cte_filters = PlanCTEFilters(root);
 		const bool partitioned = partitions > 1 && PlanCorrelatedPartition(root, partitioning);
 		result.fragment.partition_count = partitioned ? partitions : 1;
 		auto &node = result.fragment.root;
@@ -1272,8 +1333,20 @@ private:
 					child = FilterCorrelatedInput(op, std::move(child), partition_input->second.GetIndex(),
 					                              filter->second, owner_producer);
 				}
+				auto cte_filter = cte_filters.find(&op);
+				if (cte_filter != cte_filters.end() && !owner_producer.empty()) {
+					// The native CTE materializes its owner before its consumers.
+					// Each extra branch also drains that owner into a SEMI build
+					// before probing, so bounded fanout cannot depend on fact rows.
+					auto &key_filter = cte_filter->second;
+					auto count = child.fragment.partition_count;
+					auto domain = ExchangeFrom(owner_producer, key_filter.build->types,
+					                           count == 1 ? "gather" : "broadcast", count);
+					child = SemiFilter(op, std::move(child), key_filter.column, *key_filter.build, std::move(domain),
+					                   key_filter.build_column);
+				}
 				auto input = Exchange(std::move(child), distribution, result.fragment.partition_count, keys);
-				if (partitioned && &op == &root.children[0].get()) {
+				if ((partitioned || root.type == PhysicalOperatorType::CTE) && &op == &root.children[0].get()) {
 					owner_producer = input.incoming[0].producer;
 				}
 				bindings.names.emplace(&op, input.fragment.root.input_port);
