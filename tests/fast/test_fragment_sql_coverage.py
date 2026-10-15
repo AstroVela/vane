@@ -179,6 +179,26 @@ DETERMINISTIC_TIMEZONES = [
 
 
 def large_join_key_query(connection, path, domain="exact", kind="inner", comparison="="):
+    if domain == "join_estimate":
+        build_path = path.with_stem("build")
+        connection.execute(
+            "copy (select range%4096 i, case when range%1048576=0 then null else range%1048576 end k, "
+            "range%2 flag, 'fact-'||(range%4096)::varchar payload, 'other-'||(range%4096)::varchar extra "
+            f"from range(2097152)) to '{path}' (row_group_size 2048)"
+        )
+        connection.execute(
+            "copy (select case when range<2 then null else range//2 end k, (range//2)%4096 active, "
+            f"'build-'||(range%4096)::varchar v from range(1048576)) to '{build_path}' (row_group_size 2048)"
+        )
+        # Scan filters estimate a 2:1 probe/build ratio, but the single-key
+        # join estimates fewer than one quarter of the probes will survive.
+        # Duplicate and NULL build keys must still reach the original join.
+        output = ", b.v" if kind in ("inner", "left") else ""
+        return (
+            f"select p.i, p.k, p.payload, p.extra{output} from read_parquet('{path}') p "
+            f"{kind} join (select * from read_parquet('{build_path}') where active=0) b "
+            f"on p.k {comparison} b.k where p.flag=0 order by all"
+        )
     if domain == "compressed":
         build_path = path.with_stem("build")
         connection.execute(

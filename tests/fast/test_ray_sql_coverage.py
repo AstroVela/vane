@@ -164,10 +164,10 @@ def test_public_join_filter_before_exchange(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
-@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed"])
+@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])
 def test_public_key_domain_before_hash_exchange(tmp_path, mode, domain):
     limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
-    if domain in ("estimated", "compressed"):
+    if domain in ("estimated", "compressed", "join_estimate"):
         limits = replace(
             limits, exchange_stores=tuple(replace(store, source_bytes=128 << 20) for store in limits.exchange_stores)
         )
@@ -183,7 +183,9 @@ def test_public_key_domain_before_hash_exchange(tmp_path, mode, domain):
         assert_idle(connection)
 
 
-@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "estimated", "compressed"])
+@pytest.mark.parametrize(
+    "query_kind", ["correlated", "join", "exact", "hashed", "estimated", "compressed", "join_estimate"]
+)
 def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch, query_kind):
     import ray
 
@@ -209,7 +211,7 @@ def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, mo
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
     limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
-    if query_kind in ("estimated", "compressed"):
+    if query_kind in ("estimated", "compressed", "join_estimate"):
         limits = replace(
             limits, exchange_stores=tuple(replace(store, source_bytes=128 << 20) for store in limits.exchange_stores)
         )
@@ -219,7 +221,7 @@ def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, mo
         application.connect() as connection,
     ):
         path = tmp_path / "fact.parquet"
-        if query_kind in ("exact", "hashed", "estimated", "compressed"):
+        if query_kind in ("exact", "hashed", "estimated", "compressed", "join_estimate"):
             sql = large_join_key_query(local, path, query_kind)
         else:
             sql = (

@@ -580,7 +580,7 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
 
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
-@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed"])
+@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])
 def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, partitions, domain):
     with vane.connect(backend="local", config={"threads": threads}) as connection:
         path = tmp_path / "fact.parquet"
@@ -595,7 +595,7 @@ def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, 
         fact_edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
         limits = (
             DirectExchangeLimits(65536, 16384, 256, 2)
-            if domain in ("estimated", "compressed")
+            if domain in ("estimated", "compressed", "join_estimate")
             else DirectExchangeLimits(4096, 1024, 64, 1)
         )
         with InProcessTaskService(connection, spec, limits) as service:
@@ -611,8 +611,21 @@ def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, 
             assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
         assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
         assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == (
-            0 if domain == "compressed" else 1
+            0 if domain in ("compressed", "join_estimate") else 1
         )
+
+
+@pytest.mark.parametrize("shape", ["single", "multiple", "narrow"])
+def test_join_output_filter_estimate_requires_single_key_and_traffic_savings(tmp_path, shape):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = large_join_key_query(connection, tmp_path / "fact.parquet", "join_estimate")
+        if shape == "multiple":
+            sql = sql.replace("on p.k = b.k", "on p.k = b.k and p.i=b.active")
+        elif shape == "narrow":
+            sql = sql.replace("p.payload, p.extra, ", "")
+        graph = compile_sql(connection, sql, partitions=2)
+        assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) == (shape == "single")
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
 
 
 @pytest.mark.parametrize("domain", ["dense", "empty"])
@@ -650,7 +663,7 @@ def test_key_domain_keeps_original_join_conditions(tmp_path, condition):
             assert collect(service) == expected
 
 
-@pytest.mark.parametrize("domain", ["exact", "hashed"])
+@pytest.mark.parametrize("domain", ["exact", "hashed", "join_estimate"])
 @pytest.mark.parametrize("kind", ["inner", "left", "anti"])
 def test_key_domain_preserves_null_safe_and_outer_matches(tmp_path, domain, kind):
     with vane.connect(backend="local", config={"threads": 4}) as connection:
@@ -685,7 +698,7 @@ def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, thre
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed"])
+@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate"])
 def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
@@ -705,7 +718,7 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
             config["disabled_optimizers"] = "join_order,build_side_probe_side"
         with vane.connect(backend="local", config=config) as connection:
             path = Path(sys.argv[1]) / "fact.parquet"
-            if sys.argv[3] in ("exact", "hashed"):
+            if sys.argv[3] in ("exact", "hashed", "join_estimate"):
                 sql = large_join_key_query(connection, path, sys.argv[3])
             else:
                 sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"

@@ -1040,6 +1040,7 @@ private:
 			}
 			auto key_bytes =
 			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
+			auto probe_bytes = EstimatedExchangeBytes(*target.input);
 			target.keys_only = !broadcast;
 			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
 			if (target.hashed) {
@@ -1050,17 +1051,31 @@ private:
 					continue;
 				}
 				key_bytes = 65536 * 9;
-			} else if ((!broadcast && key_bytes > 16 * 1024 * 1024) ||
-			           double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
-			               double(target.input->estimated_cardinality)) {
-				continue;
+			} else {
+				if (!broadcast && key_bytes > 16 * 1024 * 1024) {
+					continue;
+				}
+				if (double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
+				    double(target.input->estimated_cardinality)) {
+					// A single-key join's output also estimates the probes retained
+					// by its key domain. This does not hold for just one condition of
+					// a multi-key/residual join or a filter moved across another join.
+					if (broadcast || join.conditions.size() != 1 || target.input != &join.children[0].get() ||
+					    !join.estimated_cardinality ||
+					    double(join.estimated_cardinality) * 4 >= double(target.input->estimated_cardinality)) {
+						continue;
+					}
+					// Charge the extra build/key edges only against traffic estimated
+					// to disappear, rather than the entire unfiltered probe exchange.
+					probe_bytes *= 1 - double(join.estimated_cardinality) / double(target.input->estimated_cardinality);
+				}
 			}
 			// Key-only replicas carry no payload. Allow a larger estimate and
 			// fourfold selectivity, while still charging every extra build/key
 			// edge below. Complete-build broadcasts keep their smaller limits.
 			auto traffic = broadcast ? EstimatedExchangeBytes(build) * partitions
 			                         : EstimatedExchangeBytes(build) + key_bytes * partitions;
-			if (traffic < EstimatedExchangeBytes(*target.input)) {
+			if (traffic < probe_bytes) {
 				target.build = &build;
 				target.build_column = condition.right->Cast<BoundReferenceExpression>().index;
 				return target;

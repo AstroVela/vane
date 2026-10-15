@@ -1083,3 +1083,84 @@ Owned benchmark processes stop before temporary/spill cleanup. The shared
 oracle cache is removed after recording its 22 output-file hashes. Completed
 test fixtures are also removed, with paths and sizes retained in cleanup
 manifests; active test files and original SF10 inputs are preserved.
+
+## Selecting exact key filters from join output estimates (2026-10-15)
+
+Q10 still exchanged 14,808,183 filtered lineitem rows before its orders join.
+The build estimate was 3,000,000 rows against 11,997,210 estimated probes, so
+it failed the fourfold probe/build row test. However, the single-key join
+estimated only 2,399,442 output rows, and its UINT32 key domain fit the existing
+16 MiB estimate limit.
+
+The planner now has an additional eligibility route for an exact key domain:
+when the build/probe row test fails, a single-condition INNER/SEMI hash join
+can use a nonzero join-output estimate below one quarter of its direct probe
+rows. Added full-build and replicated-key traffic must fit within the probe
+traffic estimated to disappear. This estimate is not used for one condition
+of a multi-key/residual join or a filter moved across another join. The key
+size cap, complete-build broadcast limits, hashed-domain path and original
+exact join remain unchanged. Cardinalities remain estimates; actual execution
+continues to enforce operator and channel budgets.
+
+The comparison freezes `30e82b4fc4`'s installed `0.3.0.dev101` runtime and
+compares it with `0.3.0.dev102`. Both use SF10, two 18-CPU workers, two
+partitions, 16 GiB operator memory per worker, a 1 MiB exchange window,
+64 KiB frames, 2048 rows and 16 slots. Timing includes submission, full
+collection and successful close. Startup and validation are excluded; the
+host and OS caches are shared. No task-owned builds or tests overlap timing.
+
+| Measurement, seconds | Frozen baseline | Candidate | Local, candidate pass |
+|---|---:|---:|---:|
+| All 22 queries, one full pass | 28.091 | **25.821** | 9.126 |
+| Q2, median of three focused repetitions | 1.361 | **0.380** | 0.140 |
+| Q10, median of three focused repetitions | 2.597 | **1.600** | 0.465 |
+| Q12 control, median of three focused repetitions | 0.542 | 0.574 | 0.285 |
+| Q18 control, median of three focused repetitions | 2.728 | 2.686 | 0.707 |
+
+The full pass improves **8.1%** and remains **2.83 times local**. Q2 and Q10
+focused medians improve **72.1%** and **38.4%**, respectively. Q10 remains
+**3.44 times local**. Q12/Q18 controls vary in opposite directions; no benefit
+is claimed for them. Only Q2 and Q10 serialized graphs change; the other 20
+are identical after normalizing engine identity. These fresh controls are a
+separate measurement round from the preceding Q12/aggregate-merge comparison.
+
+Completed native diagnostics, separate from Ray timing, show Q10 lineitem
+exchange falling from **14,808,183 to 1,147,084 rows**. Including extra build
+and key branches, total accepted rows fall from **18,409,613 to 5,894,828**
+(**68.0%**). Q2 total accepted rows fall from **1,688,593 to 108,012**
+(**93.6%**). Shared broadcast channels count once; these are channel work
+counts, not network bytes. Both queries match local exactly and retain their
+output hashes, all tasks finish, credits return to zero and byte bounds hold.
+Q10 still exchanges 1,499,999 wide customer rows and 381,105 partial groups;
+this change does not remove that remaining work.
+
+All **136 timing samples** match local: 24 baseline focused samples split
+across two runs, 24 candidate focused samples, and two complete 44-sample
+passes. Input identities match across all runs; disk guards do not trigger,
+queries and runtimes return to idle, and owned processes stop before cleanup.
+
+Validation passes **165 related native/compiler tests** and **19 real-Ray
+tests**, covering both public modes, duplicate/NULL keys, preserved outer
+rows, narrow-probe traffic rejection, multiple-key rejection, small exchange
+windows, cancellation, and FTE consumer loss after a shared build commits.
+The new volume regression completes correct results on the frozen baseline
+and then fails at 524,286 fact rows; the candidate satisfies the bounded
+exchange-row assertion. The full release suite and large-query FTE timing
+were not rerun. Formatting, applicable pinned pre-commit hooks, copyleft
+inventory and `git diff --check` pass.
+
+Native SHA-256 identities, in baseline/candidate order:
+
+```text
+2b7c71426f703a274d58c4a279a1781b21ff1f4ee00049924134cba23c5ccf31
+e3d64f828f0203ca896e8113c0a9559c9e65c3d728e5065427e2edeb10c67646
+```
+
+Evidence is retained under `build/pipelined-q10-20261015/`: frozen baseline,
+source/native identities, all five timing runs, normalized graph comparisons,
+completed Q2/Q10 native work counts, test logs, `comparison.json/csv` and
+cleanup manifests. The acceptance driver SHA-256 is
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Shared oracle files are removed after retaining their hashes. Test fixtures
+and owned temporary/spill data are removed outside measured windows; original
+SF10 inputs are preserved.
