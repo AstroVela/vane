@@ -347,6 +347,10 @@ DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipelin
 
 提前过滤通过原生 NULL 安全 SEMI join 保留 probe 重复行，最终 join 仍负责实际匹配和输出重复次数。原 join 与提前过滤分支共用同一 build fragment 的完整输出，不复制扫描或重算 join；两个分支都先消费 build 再读取 probe，额外通道仍计入原来的窗口预留。FTE 两个下游绑定同一已提交 producer 的各自输出，失败消费者沿用输入身份并更换 fence。该路径不放宽广播大小，也不根据运行后的实际小结果忽略原来的基数估计。
 
+若 INNER HASH join 的 probe 键来自更早的 INNER join，还可复用那个 join 的小 build，过滤当前 join 的另一个输入。例如 Q9 已由带条件的 part 限定商品键，partsupp 在 HASH 之前也可以用相同键域过滤。键必须为同类型原生整数，沿直接 projection、filter 和 INNER join 输出追踪；输出来自 build 时使用完整 build 对应列，输出保留 probe 键时只通过原生等值或 NULL 安全等值关系证明它属于 build 键域。计算键、LIMIT、聚合、外连接和共享作用域不传播该证明。
+
+这个小 build 必须含显式过滤、无共享作用域、估计行数已知且完整输出不超过 8 MiB，并已符合原来的小 build 广播条件。其估计行数须少于待过滤输入八分之一，新增副本流量须低于该输入交换量。小 build 只规划一次，原 join 与新增 NULL 安全 SEMI join 共享其 producer；原来的多键及残余条件继续决定最终结果。优先保留既有 probe 提前过滤，不为同一 join 同时添加相互依赖的两侧过滤；当前 join 即使在 probe 汇集为单分区后可广播融合，也不使用该路径，保证两个消费者位于独立 HASH 输入中。该优化减少交换行数，本身不增加扫描或 split 裁剪。
+
 若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。精确键域估计限制在 16 MiB，行数少于目标输入四分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。这些是规划估计，实际执行仍受 operator memory 和通道预算约束。完整 build 广播的额外提前过滤仍仅用于估计不超过 8 MiB 的 build。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
 
 若 build/probe 行数比例未达到上述门槛，单一等值条件的 HASH join 还可用预计连接输出衡量键域过滤的选择性：输出估计须已知且少于 probe 四分之一，新增 build/键副本流量须低于预计被消除的 probe 流量。此判断仅用于该 join 的直接 probe 输入，不把多键、残余条件或跨越其他 join 后的输出估计归给一个提前过滤键。16 MiB 键域上限、完整 build 广播门槛及最终精确匹配仍按原规则执行。

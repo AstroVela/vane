@@ -1782,3 +1782,82 @@ samples, output hashes/counts, completed native work, `comparison.json`,
 to zero. Owned processes stop before temporary/spill cleanup; oracle hashes
 are retained before deletion, source datasets are preserved, and disk guards
 remain untriggered.
+
+## Share selective join builds across hash inputs (2026-10-15)
+
+The fresh frozen baseline at `054070296b` still sends all 8,000,000 SF10
+partsupp rows across Q9's final HASH join, although its other input has
+already been restricted to 108,782 part keys by the green-name predicate.
+The planner now reuses that complete small build to filter the opposite
+input before HASH. It traces unchanged integral keys through projections,
+filters and INNER joins, including an equality-equivalent probe key when
+the optimizer omits the build's copy. An output build payload can supply its
+own complete domain as well. The original multi-key/residual join still
+decides matches; the added NULL-safe SEMI join preserves duplicates.
+
+The shared build must have an explicit filter, a known estimate at most
+8 MiB, no shared scope, and qualify for the existing small-build broadcast.
+It must estimate fewer than one-eighth of target rows and less replica
+traffic than the target exchange. Computed keys, LIMIT, aggregates, outer
+joins, unknown nested widths and uneconomic replication retain the original
+path. Existing probe-side filters take priority. A parent that can fuse its
+build by broadcast, even after its probe gathers to one partition, cannot
+use this extra opposite-input filter, keeping both
+consumers in independent HASH inputs. The seed is planned once, with source
+assignments, channel limits and FTE committed-input ownership preserved.
+
+Only Q9 and the Q18 control are timed, three times per mode and runtime.
+The frozen driver, installed Python code, resource settings and all SF10
+input hashes match. Local uses 36 threads/32 GiB; pipelined uses two 18-CPU
+workers, two partitions and 16 GiB operator memory per worker. Frames remain
+64 KiB/2048 rows, windows 1 MiB with 16 slots. Timing includes submission,
+collection and successful close, excluding startup and result comparison.
+The shared host retains warm OS caches; no task-owned build or test overlaps
+measurement.
+
+| Query, median of three | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.875 | 2.394 | 0.856 | 2.095 | -12.5% | 2.45 |
+| Q18 | 0.705 | 1.119 | 0.697 | 1.102 | -1.5% | 1.58 |
+
+Q9 improves **12.5%**, while the Q18 control remains effectively unchanged.
+The candidate Q9 samples are 2.195, 2.095 and 2.044 seconds. All **24 timing
+samples** match local schema, row count and values, with floating tolerances
+of 1e-9 relative and 1e-6 absolute. These focused results do not establish a
+new all-22-query total or local/pipelined parity.
+
+Completed native Q9 diagnostics reduce accepted channel rows from
+**29,732,733 to 22,276,643 (25.1%)**. The partsupp input falls from 8,000,000
+to **435,128 rows (94.6%)**, at the cost of one additional 108,782-row shared
+build channel. Output remains 175 rows with the same content hash. Shared
+broadcast channels count once; these are separate from network bytes, scan
+rows and disk I/O. The 15,000,000-row orders input still crosses HASH and is
+the largest remaining exchange in this diagnostic.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev109`) passes
+**82 related native tests** and **7 real-Ray tests**. Coverage includes
+1/4 threads, 2/3 partitions, tiny windows, cancellation, direct/equivalent
+keys and build payloads, multi-key/residual conditions, duplicates, NULL-safe
+equality, empty/all-NULL domains, preserved rows, unsupported lineage and
+cost fallbacks. Two further regressions check that sorting a descendant
+probe into one partition cannot fuse the shared consumers; the earlier
+candidate fails both plan checks. Existing probe/key-domain/large-broadcast
+behavior and source contracts remain covered. Public pipelined/FTE execution and a failed shared
+consumer pass with the same input identity and a new retry fence. The Ray
+fixture uses default optimizers and the original 4 MiB materialized-object
+bound. Two new work-count checks fail as intended on the frozen baseline,
+which sends all 262,144 target rows.
+
+Native SHA-256 identities, baseline and candidate:
+
+- `35e4e517f4f2e769143c013f0723f06d406a0fdd5c8f1550502029c30c5ec8c3`
+- `8166bf69b4160c17ac6118ce9233c24e3a34b73a42cafd2a6d4a02158e4f22b0`
+
+Evidence is retained under `build/pipelined-q9-20261015/`: frozen runtime,
+code/configuration/input identities, raw timing samples, completed native
+work, result counts/hashes, `comparison.json`, `local-vs-pipelined.csv`,
+`test-validation.json` and test logs. All query/worker/result reservations
+return to zero. Owned processes stop before temporary/spill cleanup; shared
+oracle hashes are retained before deletion and source datasets are preserved.
+Disk guards remain untriggered. The full release suite, all-22-query pass and
+large-query FTE timings are not rerun, following the related-test scope.

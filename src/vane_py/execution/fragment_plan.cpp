@@ -933,6 +933,7 @@ private:
 		bool hashed = false;
 	};
 	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
+	unordered_map<const PhysicalOperator *, string> shared_join_builds;
 
 	bool HasFilteredAggregate(const PhysicalOperator &op) {
 		if (op.type == PhysicalOperatorType::FILTER) {
@@ -970,6 +971,106 @@ private:
 			return scan.table_filters && !scan.table_filters->filters.empty();
 		}
 		return false;
+	}
+
+	EarlyProbeFilter PlanBuildFilter(PhysicalHashJoin &join) {
+		EarlyProbeFilter result;
+		auto &target = join.children[1].get();
+		auto target_bytes = EstimatedExchangeBytes(target);
+		// Keep the two consumers in independent hash-join inputs. A fused
+		// broadcast parent could make its probe-side seed wait for this build.
+		// The probe can gather below an earlier join, so exclude fusion even
+		// with one probe partition rather than costing only the requested count.
+		if (partitions == 1 || join.join_type != JoinType::INNER || !join.delim_types.empty() ||
+		    BroadcastJoin(join, 1, broadcast_limit) || probe_filters.count(&target) ||
+		    target_bytes == NumericLimits<double>::Maximum()) {
+			return result;
+		}
+		for (auto &condition : join.conditions) {
+			if ((condition.comparison != ExpressionType::COMPARE_EQUAL &&
+			     condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
+			    condition.left->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+			    condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+			    !condition.left->return_type.IsIntegral() ||
+			    condition.left->return_type != condition.right->return_type) {
+				continue;
+			}
+			auto try_build = [&](PhysicalHashJoin &probe, idx_t column) {
+				auto &build = probe.children[1].get();
+				if (column >= build.types.size() || build.types[column] != condition.left->return_type ||
+				    !HasFilteredBuildRoot(build) || HasScopedState(build) || !build.estimated_cardinality ||
+				    EstimatedExchangeBytes(build) > 8 * 1024 * 1024 ||
+				    !BroadcastJoin(probe, partitions, 8 * 1024 * 1024) ||
+				    double(build.estimated_cardinality) * 8 >= double(target.estimated_cardinality) ||
+				    EstimatedExchangeBytes(build) * partitions >= target_bytes) {
+					return false;
+				}
+				result.input = &target;
+				result.column = condition.right->Cast<BoundReferenceExpression>().index;
+				result.build = &build;
+				result.build_column = column;
+				return true;
+			};
+			auto column = condition.left->Cast<BoundReferenceExpression>().index;
+			auto op = &join.children[0].get();
+			while (column < op->types.size() && op->types[column] == condition.left->return_type) {
+				if (op->type == PhysicalOperatorType::PROJECTION) {
+					auto &expression = *op->Cast<PhysicalProjection>().select_list[column];
+					if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+						break;
+					}
+					column = expression.Cast<BoundReferenceExpression>().index;
+					op = &op->children[0].get();
+				} else if (op->type == PhysicalOperatorType::FILTER) {
+					op = &op->children[0].get();
+				} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+					auto &probe = op->Cast<PhysicalHashJoin>();
+					if (probe.join_type != JoinType::INNER || !probe.delim_types.empty()) {
+						break;
+					}
+					if (column < probe.lhs_output_columns.col_idxs.size()) {
+						column = probe.lhs_output_columns.col_idxs[column];
+						// The optimizer can retain either copy of an equality key.
+						// INNER matches prove that the surviving probe key belongs
+						// to the complete build domain even when that copy is omitted.
+						for (auto &key : probe.conditions) {
+							if ((key.comparison == ExpressionType::COMPARE_EQUAL ||
+							     key.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+							    key.left->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+							    key.right->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+							    key.left->return_type == condition.left->return_type &&
+							    key.right->return_type == condition.left->return_type &&
+							    key.left->Cast<BoundReferenceExpression>().index == column &&
+							    try_build(probe, key.right->Cast<BoundReferenceExpression>().index)) {
+								return result;
+							}
+						}
+						op = &probe.children[0].get();
+						continue;
+					}
+					auto index = probe.rhs_output_columns.col_idxs[column - probe.lhs_output_columns.col_idxs.size()];
+					if (index < probe.conditions.size()) {
+						auto &key = *probe.conditions[index].right;
+						if (key.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+							break;
+						}
+						column = key.Cast<BoundReferenceExpression>().index;
+					} else {
+						column = probe.payload_columns.col_idxs[index - probe.conditions.size()];
+					}
+					// These output values are a subset of this complete small build.
+					// Reuse it as a necessary-condition filter for the other input;
+					// the original multi-key/residual join still decides matches.
+					if (try_build(probe, column)) {
+						return result;
+					}
+					op = &probe.children[1].get();
+				} else {
+					break;
+				}
+			}
+		}
+		return result;
 	}
 
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
@@ -1612,6 +1713,24 @@ private:
 	}
 	DistributedSubtree Join(PhysicalHashJoin &join) {
 		auto filter = PlanProbeFilter(join);
+		// Keep existing probe filters first, and never make both join inputs
+		// depend on a new filter supplied by the opposite input.
+		auto build_filter = filter.input ? EarlyProbeFilter() : PlanBuildFilter(join);
+		if (build_filter.input) {
+			auto found = shared_join_builds.find(build_filter.build);
+			if (found == shared_join_builds.end()) {
+				auto producer = Finish(Build(*build_filter.build));
+				found = shared_join_builds.emplace(build_filter.build, std::move(producer)).first;
+			}
+			build_filter.domain = build_filter.build;
+			build_filter.domain_producer = found->second;
+			probe_filters[build_filter.input].push_back(build_filter);
+		}
+		string build_producer;
+		auto shared_build = shared_join_builds.find(&join.children[1].get());
+		if (shared_build != shared_join_builds.end()) {
+			build_producer = shared_build->second;
+		}
 		// Do not trade away a filter moved before another join, or cost a larger
 		// broadcast against probes already reduced by an ancestor's early filter.
 		const bool preserve_filter =
@@ -1626,7 +1745,10 @@ private:
 		if (filter.input) {
 			// Both the original join and the early SEMI build drain this shared
 			// producer before probing. Never rescan or recompute the build side.
-			filter.producer = Finish(Build(join.children[1]));
+			if (build_producer.empty()) {
+				build_producer = Finish(Build(join.children[1]));
+			}
+			filter.producer = build_producer;
 			filter.domain = filter.build;
 			filter.domain_producer = filter.producer;
 			if (filter.keys_only) {
@@ -1641,7 +1763,16 @@ private:
 			}
 		} else {
 			left = Build(join.children[0]);
-			right = Build(join.children[1]);
+			if (build_producer.empty()) {
+				right = Build(join.children[1]);
+			}
+		}
+		if (build_filter.input) {
+			auto &filters = probe_filters.at(build_filter.input);
+			filters.pop_back();
+			if (filters.empty()) {
+				probe_filters.erase(build_filter.input);
+			}
 		}
 		vector<unique_ptr<Expression>> left_keys, right_keys;
 		for (auto &condition : join.conditions) {
@@ -1663,18 +1794,18 @@ private:
 			// existing distribution and fuse the probe subtree with the join;
 			// shuffling it by the join key adds no correctness guarantee here.
 			auto count = left.fragment.partition_count;
-			right = filter.input
-			            ? ExchangeFrom(filter.producer, filter.build->types, count == 1 ? "gather" : "broadcast", count)
-			            : Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count);
+			right = build_producer.empty() ? Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count)
+			                               : ExchangeFrom(build_producer, join.children[1].get().types,
+			                                              count == 1 ? "gather" : "broadcast", count);
 		} else {
 			auto lk = ProjectKeys(left, left_keys);
 			left = Exchange(std::move(left), "hash", partitions, lk);
-			if (filter.input) {
+			if (!build_producer.empty()) {
 				vector<idx_t> rk;
 				for (auto &key : right_keys) {
 					rk.push_back(key->Cast<BoundReferenceExpression>().index);
 				}
-				right = ExchangeFrom(filter.producer, filter.build->types, "hash", partitions, rk);
+				right = ExchangeFrom(build_producer, join.children[1].get().types, "hash", partitions, rk);
 			} else {
 				auto rk = ProjectKeys(right, right_keys);
 				right = Exchange(std::move(right), "hash", partitions, rk);

@@ -1056,7 +1056,7 @@ def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, thre
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate", "cte"])
+@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate", "cte", "build"])
 def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
@@ -1070,6 +1070,7 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
             correlated_owner_queries, early_join_filter_query, large_join_key_query,
         )
         from tests.fast.test_execution_performance import shared_cte_filter_query
+        from tests.fast.test_join_build_filter import shared_join_build_query
         from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 
         config = {"threads": int(sys.argv[2])}
@@ -1077,7 +1078,9 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
             config["disabled_optimizers"] = "join_order,build_side_probe_side"
         with vane.connect(backend="local", config=config) as connection:
             path = Path(sys.argv[1]) / "fact.parquet"
-            if sys.argv[3] == "cte":
+            if sys.argv[3] == "build":
+                sql, _, _ = shared_join_build_query(connection, path.parent)
+            elif sys.argv[3] == "cte":
                 sql = shared_cte_filter_query(connection, path)
             elif sys.argv[3] in ("exact", "hashed", "join_estimate"):
                 sql = large_join_key_query(connection, path, sys.argv[3])
