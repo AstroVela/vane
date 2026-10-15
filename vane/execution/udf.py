@@ -128,9 +128,14 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
             from vane.execution.udf_local_model import RegisteredLocalModel
 
             model = options.get("local_model_pool")
-            if backend != "subprocess_actor" or not isinstance(model, RegisteredLocalModel):
-                raise ValueError("GPU resources require a Ray UDF backend or an explicitly registered local model")
-            model.validate_gpu_pool(payload, options.get("local_actor_pool"), options.get("session_config"))
+            if backend != "subprocess_actor":
+                raise ValueError("GPU resources require a Ray UDF backend or a local actor pool")
+            if isinstance(model, RegisteredLocalModel):
+                model.validate_gpu_pool(payload, options.get("local_actor_pool"), options.get("session_config"))
+            else:
+                from vane.execution.udf_local_gpu import validate_query_gpu_pool
+
+                validate_query_gpu_pool(payload, options.get("local_actor_pool"), options.get("session_config"))
         from vane.execution.udf_subprocess import UDFExecutor
 
         return UDFExecutor(payload, options=options)

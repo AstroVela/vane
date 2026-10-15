@@ -510,6 +510,10 @@ unstarted tickets must be cancelled or shut down; the request context manager
 does this on exit. `shutdown()` remains a cleanup operation after running
 `execute()` returns; use `cancel()` to interrupt execution from another thread.
 
+Native cancellation and stream cleanup callbacks retain their original query
+context. Releasing their last context owner, including during Python traceback
+collection, happens outside the GIL so native worker thread cleanup can finish.
+
 Successful execution, UDF failure, and worker exit all run query cleanup.
 The request slot stays charged through uncertain or concurrent cleanup; retry
 `request.shutdown()` after failure. The runtime retains pending cleanup owners
@@ -979,12 +983,48 @@ The runtime does not discover arbitrary CUDA streams or synchronize background
 GPU work that outlives a UDF invocation. It introduces no PyTorch dependency;
 the application supplies its CUDA framework.
 
-Unregistered local GPU UDFs, GPU task UDFs, fractional GPU declarations and
-multiple GPUs per replica remain unsupported. An empty inventory is invalid;
+Query-owned GPU table UDFs can run without a configured runtime, as described
+below. GPU task UDFs, fractional GPU declarations and multiple GPUs per replica
+remain unsupported. An empty explicit inventory is invalid;
 omit `gpu_devices` for a CPU-only runtime. CPU and GPU registered models share
 one registry, task budget, byte budget and request lifecycle. CPU registrations
 must omit the device assignment. A resident GPU limit of zero rejects GPU
 registration even if the inventory contains devices.
+
+### Query-owned GPU table UDFs
+
+With `VANE_RUNNER=local-fast`, `relation.map_batches(Model, schema=...,
+actor_number=1, gpus=1)` and `flat_map` assign one visible physical CUDA GPU
+per fixed actor replica. Workers, GPU residency, and query admission belong to
+that query and close on completion or failure. They use the same subprocess
+streaming, CPU/heap admission, and shared query budget as CPU actors. An ordinary
+connection can therefore use the original audio benchmark's table UDF and native
+`write_parquet` sink; no expression adapter or Arrow collection is needed.
+
+Device discovery runs in a separate interpreter using the CUDA driver and NVML,
+without loading a model framework or initializing CUDA in the calling process.
+The CUDA driver's [visibility and ordering rules](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html)
+resolve `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`; the assigned full UUID is
+set before each worker imports its UDF. MIG devices are rejected. CUDA and NVML
+driver libraries must be available. Discovery errors are reported directly.
+Discovery participates in the query's startup cancellation scope, including
+ordinary connections without `configure_local_runtime()`. Connection interrupts
+kill and reap the owned probe before `fetchall()` or `write_parquet()` returns.
+Configured runtimes also apply execution deadlines and retain the request slot
+until this cleanup completes. The same cleanup runs when discovery exceeds its
+internal 30-second timeout. A cancelled probe does not reserve GPU devices.
+
+Query-owned and explicitly registered GPU pools share device exclusions within
+the driver process. A pool reserves all its replicas before starting workers;
+insufficient free GPUs fail promptly and can be retried after the occupying pool
+closes. Failed worker cleanup retains the device reservation until a successful
+retry. Forked children cannot release inherited reservations or reuse devices
+owned by inherited parent pools. Separate driver processes and external GPU
+applications are not arbitrated. This does not add VRAM enforcement.
+
+The configured model runtime retains its read-only query contract and explicit
+inventory/registration API for models reused across queries. Unregistered GPU
+column expressions still require Ray; this increment enables table UDFs.
 
 ### Device residency
 

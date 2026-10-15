@@ -11,6 +11,7 @@ VRAM enforcement or cross-process arbitration is performed here.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,25 @@ def _device_ids(values: Sequence[str]) -> tuple[str, ...]:
     if len(set(devices)) != len(devices):
         raise ValueError("GPU devices must be unique")
     return devices
+
+
+def validate_query_gpu_pool(payload: Mapping[str, Any], pool: Any, session_config: Any) -> None:
+    from vane.execution.udf_local_model import _model_fingerprint
+    from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+    if (
+        not isinstance(pool, LocalSubprocessActorPool)
+        or pool._owner_pid != os.getpid()
+        or not pool._query_owned_gpu
+        or pool._closed
+        or pool._gpu_reservation is None
+        or pool._gpu_reservation.released
+        or pool._gpu_reservation.devices != pool._gpu_devices
+        or pool.pool_size != payload.get("actor_number")
+        or pool.session_config != session_config
+        or _model_fingerprint(pool.payload) != _model_fingerprint(payload)
+    ):
+        raise ValueError("GPU resources require a prepared local actor pool owning the declared devices and payload")
 
 
 @dataclass(frozen=True)

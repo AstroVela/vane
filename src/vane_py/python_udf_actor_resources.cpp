@@ -275,6 +275,8 @@ public:
 		if (scope_depth == 0) {
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
+			preparation_cancelled = false;
+			preparation_generation++;
 			runtime_query = WrapPyObjectForUDFActorHandles(local_query);
 		} else if (runtime_query || !local_query.is_none()) {
 			throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
@@ -287,9 +289,25 @@ public:
 			scope_depth--;
 		}
 		if (scope_depth == 0) {
+			startup_cancellation.reset();
 			runtime_query.reset();
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
+		}
+	}
+
+	void CancelPreparation() {
+		D_ASSERT(PyGILState_Check());
+		if (!Enabled() || runtime_query) {
+			return;
+		}
+		// The native query can reset ClientContext::interrupted while starting.
+		// Remember an interrupt even before the first UDF creates its scope.
+		preparation_cancelled = true;
+		auto cancellation = startup_cancellation;
+		if (cancellation) {
+			auto &scope = *static_cast<pybind11::object *>(cancellation.get());
+			scope.attr("cancel")("query interrupted during UDF preparation");
 		}
 	}
 
@@ -495,10 +513,21 @@ private:
 
 		try {
 			if (pybind11::len(subprocess_nodes) > 0) {
+				if (!startup_cancellation) {
+					auto scope =
+					    pybind11::module_::import("vane.execution.udf_lifecycle")
+					        .attr("ExecutionCancellationScope")(DirectPlanIdentity(prepared), preparation_generation);
+					startup_cancellation = WrapPyObjectForUDFActorHandles(scope);
+				}
+				auto &scope = *static_cast<pybind11::object *>(startup_cancellation.get());
+				if (preparation_cancelled) {
+					scope.attr("cancel")("query interrupted during UDF preparation");
+				}
 				auto subprocess_module = pybind11::module_::import("vane.execution.udf_subprocess");
 				auto result = pybind11::reinterpret_borrow<pybind11::tuple>(
 				    subprocess_module.attr("ensure_local_subprocess_actor_pools_for_nodes")(
 				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared),
+				        pybind11::arg("startup_cancellation") = scope,
 				        pybind11::arg("resource_graph") = CollectNativeLocalResourceGraph(context, prepared)));
 				auto created = result[0];
 				auto handles_map = result[1];
@@ -579,6 +608,9 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	idx_t preparation_generation = 0;
+	bool preparation_cancelled = false;
+	shared_ptr<void> startup_cancellation;
 	bool local_runtime_input_policy = false;
 	shared_ptr<void> runtime_query;
 	bool capture_cleanup_warnings = false;
@@ -603,6 +635,14 @@ bool HasLocalRuntimeInputPolicy(const ClientContext &context) {
 	D_ASSERT(PyGILState_Check());
 	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
 	return state && state->HasLocalRuntimeInputPolicy();
+}
+
+void CancelPythonUDFActorResourcePreparation(ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
+	if (state) {
+		state->CancelPreparation();
+	}
 }
 
 ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparation() {

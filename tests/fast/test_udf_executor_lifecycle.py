@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import os
 import socket
 import struct
 import sys
@@ -4735,6 +4736,8 @@ def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_w
             events.append("admission-close")
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.name = "pool"
     pool._closed = False
@@ -4802,6 +4805,8 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     failed_worker = FakeWorker("failed")
     replacement = FakeWorker("replacement")
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -4924,6 +4929,8 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     failed_worker = FailedWorker()
     provisional_worker = ProvisionalWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -4997,6 +5004,8 @@ def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(mon
             pass
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -5060,6 +5069,8 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
@@ -5119,6 +5130,8 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_scope_cancel_failu
 
     scope = FailingScope()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -5174,6 +5187,8 @@ def test_local_subprocess_actor_pool_reports_graceful_quiescence_timeout(monkeyp
             return None
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -5210,6 +5225,8 @@ def test_local_subprocess_actor_pool_bounds_replacement_cleanup_errors():
     import vane.execution.udf_subprocess as subprocess_exec
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool._closed = True
     pool._lock = threading.RLock()
@@ -5247,6 +5264,8 @@ def test_local_subprocess_actor_pool_closes_idle_workers_concurrently():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
@@ -5297,6 +5316,8 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     from vane.execution.udf_admission import LocalExecutionCapacity
 
     capacity = LocalExecutionCapacity(max_slots=None, resource_limit=ResourceVector(cpu=1, heap_bytes=100))
@@ -5369,6 +5390,8 @@ def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_unti
     provisional_worker = FakeWorker("provisional")
     admission_slots = FakeAdmissionSlots()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -5430,6 +5453,8 @@ def test_local_subprocess_actor_pool_retries_retained_executor_cleanup():
 
     executor = FakeExecutor()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
@@ -5483,6 +5508,8 @@ def test_local_subprocess_actor_pool_aborts_active_workers_concurrently():
             close_barrier.wait(timeout=1.0)
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
@@ -5519,6 +5546,8 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     lost_worker = FakeWorker("lost", reusable=True)
     replacement = FakeWorker("replacement", reusable=True)
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {"udf_name": "reconstructible_local_actor"}
     pool.pool_size = 1
@@ -7010,6 +7039,8 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
     pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
