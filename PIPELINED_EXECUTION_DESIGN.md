@@ -301,6 +301,10 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 | TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
 
+分组聚合可以利用 Parquet split 的键范围证明组已完整：输入必须只有一个 Parquet source 且没有交换输入，至少一个整数分组键经原样 projection/filter 直接来自文件列。规划器检查已生成的实际 split 及其 row group，要求该列类型与绑定类型一致、统计信息包含非空的 min/max 且明确无 NULL，各 split 的闭区间严格不相交；边界相等也视为可能跨 split。这样每个组都在一个 split 内，分区可以直接执行完整 native aggregate，并在后续 HAVING 后再输出，省去 partial/final 聚合交换。其他分组键仍可含 NULL；有序、DISTINCT、宽累加器等语义继续由原生聚合负责。
+
+范围证明不穿过 join、aggregate、cast 或计算表达式，不借用行数估计。缺失统计、可能含 NULL 的证明键、范围重叠、文件列类型转换、union-by-name/hive/schema 映射和生成列都保留原交换路径。原 split、worker assignment、源版本检查和 FTE 冻结及重试规则保持有效；这不减少 Parquet 扫描行数，也不增加动态 split pruning。
+
 整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。partial 导出原生 sum/count 状态，final 合并后只做一次原生终结，保留 DECIMAL scale 和时间类型的舍入。
 
 DECIMAL SUM 的部分状态可以超过声明的 `DECIMAL(38,s)`，因此交换私有状态字节，不把分区小计提前终结为 SQL DECIMAL。具有 128 位输入的 SUM/AVG 使用下述宽状态，避免分区内先溢出。AGGREGATE_STATE 在内部 Arrow 中编码为 binary；函数、输入/返回类型、引擎代码和平台身份共同限定 codec，加载时检查实际状态长度。公开 DECIMAL 的 Arrow schema 继续使用声明精度与 scale。

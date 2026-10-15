@@ -38,6 +38,7 @@ from tests.fast.test_execution_performance import (
     large_broadcast_query,
     shared_cte_filter_query,
 )
+from tests.fast.test_parquet_aggregate_partitioning import disjoint_aggregate_query
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -50,6 +51,45 @@ def resources(tmp_path, **changes):
     # Analytical plans retain more partition objects across stage barriers.
     # These small test inputs need a 4 MiB bound per object, including retries.
     return replace(base, exchange_stores=tuple(replace(store, object_bytes=4 << 20) for store in base.exchange_stores))
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and not lost:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    sql = disjoint_aggregate_query(tmp_path)
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert all(e.distribution.value == "gather" for e in scheduler.spec.graph.exchanges)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])

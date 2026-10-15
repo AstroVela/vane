@@ -1483,6 +1483,56 @@ private:
 		}
 		return plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 0);
 	}
+	bool CompleteParquetGroups(PhysicalOperator &input, const DistributedSubtree &child,
+	                           const vector<unique_ptr<Expression>> &groups) {
+		if (!child.incoming.empty() || child.fragment.sources.size() != 1) {
+			return false;
+		}
+		for (auto &group : groups) {
+			if (group->GetExpressionType() != ExpressionType::BOUND_REF || !group->return_type.IsIntegral()) {
+				continue;
+			}
+			auto column = group->Cast<BoundReferenceExpression>().index;
+			auto op = &input;
+			// Only unchanged references and row filters preserve the file key.
+			// Stop at joins, exchanges, casts and computed/compressed expressions.
+			while (op->children.size() == 1) {
+				if (op->type == PhysicalOperatorType::PROJECTION) {
+					auto &expressions = op->Cast<PhysicalProjection>().select_list;
+					if (column >= expressions.size() ||
+					    expressions[column]->GetExpressionType() != ExpressionType::BOUND_REF) {
+						break;
+					}
+					column = expressions[column]->Cast<BoundReferenceExpression>().index;
+				} else if (op->type != PhysicalOperatorType::FILTER) {
+					break;
+				}
+				op = &op->children[0].get();
+			}
+			if (op->type != PhysicalOperatorType::TABLE_SCAN || column >= op->types.size() ||
+			    op->types[column] != group->return_type) {
+				continue;
+			}
+			auto &scan = op->Cast<PhysicalTableScan>();
+			if (!IsParquetScan(scan.function.name)) {
+				continue;
+			}
+			auto position = scan.projection_ids.empty() ? column : scan.projection_ids[column];
+			auto &index = scan.column_ids[position];
+			if (index.HasChildren()) {
+				continue;
+			}
+			vector<OpenFileInfo> splits;
+			for (auto &split : child.fragment.sources[0].splits) {
+				splits.push_back(DecodeFile(split.payload));
+			}
+			if (ParquetSplitRangesDisjoint(context, ParquetBind(scan.bind_data.get()), splits,
+			                               index.GetPrimaryIndex())) {
+				return true;
+			}
+		}
+		return false;
+	}
 	DistributedSubtree Aggregate(PhysicalOperator &op, DistributedSubtree child,
 	                             const vector<unique_ptr<Expression>> &groups,
 	                             const vector<unique_ptr<Expression>> &aggregates) {
@@ -1515,7 +1565,7 @@ private:
 			// order. Finalization, rather than a partial subtotal, checks range.
 			wide_aggregate = WidenAggregate(aggregate) || wide_aggregate;
 		}
-		if (child.fragment.partition_count == 1) {
+		if (child.fragment.partition_count == 1 || CompleteParquetGroups(op.children[0], child, groups)) {
 			if (wide_aggregate) {
 				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
 				Wrap(aggregate, child);

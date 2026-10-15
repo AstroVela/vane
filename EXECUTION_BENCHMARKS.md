@@ -1703,3 +1703,82 @@ All query/worker/result reservations return to zero. Owned processes stop
 before temporary/spill cleanup, shared oracle hashes are recorded before
 deletion, source Parquet files are preserved, and all disk guards remain
 untriggered. Q18 and Q9 now have the largest absolute gaps in the focused set.
+
+## Complete Parquet groups before exchange (2026-10-15)
+
+The fresh frozen baseline at `b460ece483` spends a median 2.439 seconds on
+SF10 Q18, versus 0.700 locally. Its HAVING condition retains 624 order keys,
+but 15,000,000 partial groups still cross HASH before that condition can run.
+The exact two Parquet splits already have nonoverlapping order-key ranges:
+the first ends at 29,982,980 and the second starts at 29,982,981. The groups
+are complete within their source splits; a second aggregation is unnecessary.
+
+The planner now proves this property from the actual encoded splits. A
+direct integral grouping key must trace through only unchanged projections
+and filters to one Parquet source with no incoming exchanges. All selected
+row groups must have known min/max, no possible NULL key, and the file column
+must match the bound type. Split ranges must be strictly disjoint, including
+their endpoints. The complete native aggregate then runs in the source
+fragment, allowing HAVING to remove groups before exchange. This applies to
+grouping generally, without matching Q18's SQL or relying on cardinality
+estimates. It also preserves ordered/DISTINCT aggregates and wide accumulator
+semantics.
+
+Overlapping ranges, duplicate file ranges, missing/nullable statistics,
+computed or cast keys, generated columns, schema mappings and boundaries
+through other aggregates or joins retain the original distribution. Source
+assignments and version checks, FTE snapshots/retries, operator memory and
+exchange credits are unchanged. This optimization removes aggregate traffic;
+it does not reduce input scan rows or add dynamic split pruning.
+
+Only Q18 and the Q9 control are timed in this round. The frozen driver and
+all SF10 input identities match. Local uses 36 threads/32 GiB; pipelined uses
+two 18-CPU workers, two partitions and 16 GiB operator memory per worker.
+Frames remain 64 KiB/2048 rows, windows 1 MiB with 16 slots. Timings cover
+submission through collection and successful close, excluding startup and
+oracle comparison. OS caches remain warm on a shared host, with no task-owned
+build or test overlapping the measurements.
+
+| Query, median of three | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q18 | 0.700 | 2.439 | 0.707 | 1.144 | -53.1% | 1.62 |
+| Q9 | 0.853 | 2.411 | 0.853 | 2.416 | +0.2% | 2.83 |
+
+The completed native Q18 diagnostic reduces accepted channel rows from
+**17,222,552 to 2,222,552 (87.1%)**. Exactly 15,000,000 partial-group rows
+disappear; the remaining hash inputs include 1,499,999 customers, 142,848
+orders and 573,177 outer lineitems. The output remains 100 rows with the same
+content hash. Shared broadcast channels count once, and channel row counts
+are separate from network-byte or disk-I/O measurements.
+
+All **24 timing samples** pass schema, row-count and value comparison with
+relative/absolute floating tolerances of 1e-9/1e-6, including 12 on the
+candidate. Q9 is effectively unchanged in this sample and remains the larger
+absolute local/pipelined gap. No new all-22-query total is inferred from these
+focused runs. Validation stays within the requested related-test scope;
+the all-22-query pass, full release suite and large-query FTE timings were
+not rerun.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev108`) passes
+**93 related native tests** (26 new cases and 67 existing regressions) and
+**7 real-Ray tests**. Coverage includes 1/4 threads, 2/3/5 partitions,
+bounded channels, unsigned/negative keys, multiple/empty/repeated files,
+overlap at a boundary, NULLs, missing statistics, cast/computed/virtual keys,
+file schema mappings, ordered/DISTINCT/wide aggregates, changed-source
+rejection, cancellation/backpressure and FTE worker retry with identical
+input identity and a new fence. The initial performance regression fails on
+the frozen runtime: 8 result groups require 4,112 accepted rows rather than
+the candidate's 16 rows (8 qualifying groups plus 8 final results).
+
+Native SHA-256 identities, baseline and candidate:
+
+- `b6e88f973bca4ebc7195950168157a95e5fcc82a013a9fee1051d24fb18b3bf9`
+- `35e4e517f4f2e769143c013f0723f06d406a0fdd5c8f1550502029c30c5ec8c3`
+
+Evidence is retained under `build/pipelined-disjoint-aggregate-20261015/`,
+including the frozen runtime, code/configuration/input identities, raw
+samples, output hashes/counts, completed native work, `comparison.json`,
+`local-vs-pipelined.csv` and test logs. Query/worker/result reservations return
+to zero. Owned processes stop before temporary/spill cleanup; oracle hashes
+are retained before deletion, source datasets are preserved, and disk guards
+remain untriggered.
