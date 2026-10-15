@@ -473,8 +473,12 @@ for a second round of temporal sampling. Paired image queries share this space.
 `GoogleJointEmbedder` in `vane.ai.media_models` exposes asynchronous
 `embed_joint(video, text, audio=timed_audio)` and `embed_query(text)` methods.
 `timed_audio` is a sequence of `TimedContent` holding `AudioClip` values with
-nonoverlapping sample-aligned timestamps. One Content contains frames, text and
-explicit WAV parts and produces one vector. Audio from a video is extracted
+nonoverlapping sample-aligned timestamps and a common sample rate. One Content
+contains frames, text and at most one WAV and produces one vector. Audio segments
+are placed on their sample timeline in that WAV; gaps become silence and count
+toward the 180-second limit. This satisfies Vertex's
+[one-audio-file-per-prompt limit](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/embedding-2).
+Audio from a video is extracted
 explicitly; the provider never assumes a video payload also encodes its soundtrack.
 `await model.aclose()` releases its worker-local client. Independent audio/video
 rows use separate Content objects/RPCs with bounded concurrency, including on

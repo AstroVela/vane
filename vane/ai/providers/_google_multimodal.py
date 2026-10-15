@@ -14,6 +14,7 @@ import io
 import math
 import wave
 from collections.abc import Callable, Sequence
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -88,9 +89,7 @@ def _image_part(frame: Image) -> types.Part:
     return types.Part.from_bytes(data=output.getvalue(), mime_type="image/png")
 
 
-def _audio_part(clip: AudioClip) -> types.Part:
-    from google.genai import types
-
+def _audio_samples(clip: AudioClip) -> np.ndarray[Any, Any]:
     if not isinstance(clip, AudioClip) or type(clip.sample_rate) is not int or not 1 <= clip.sample_rate <= 192000:
         raise ValueError("Google audio embedding requires PCM with a valid sample rate")
     samples = np.asarray(clip.samples)
@@ -104,14 +103,49 @@ def _audio_part(clip: AudioClip) -> types.Part:
         or np.any(np.abs(samples) > 1)
     ):
         raise ValueError("Google audio embedding requires bounded finite PCM in [-1, 1], at most 180 seconds")
-    pcm = np.clip(np.rint(samples.mean(axis=1) * 32768), -32768, 32767).astype("<i2")
+    return np.clip(np.rint(samples.mean(axis=1) * 32768), -32768, 32767).astype("<i2")
+
+
+def _audio_parts(audio: Sequence[TimedContent]) -> list[types.Part]:
+    """One WAV per Content, preserving source time gaps as silence."""
+    from google.genai import types
+
+    if not audio:
+        return []
+    placements: list[tuple[int, np.ndarray[Any, Any]]] = []
+    origin, rate, end, input_bytes = 0.0, 0, 0, 0
+    for item in audio:
+        if not isinstance(item, TimedContent) or not isinstance(item.value, AudioClip):
+            raise TypeError("Joint audio requires timestamped AudioClip inputs")
+        clip = item.value
+        samples = _audio_samples(clip)
+        if not placements:
+            origin, rate = item.start, clip.sample_rate
+        if clip.sample_rate != rate:
+            raise ValueError("Joint audio segments must have the same sample rate")
+        if abs(item.end - item.start - len(samples) / rate) > 1 / rate:
+            raise ValueError("Joint audio requires sample-aligned timestamps")
+        offset = round((Fraction(str(item.start)) - Fraction(str(origin))) * rate)
+        if offset < end:
+            raise ValueError("Joint audio must have ordered, nonoverlapping sample-aligned timestamps")
+        end = offset + len(samples)
+        input_bytes += np.asarray(clip.samples).nbytes
+        if end > 180 * rate or input_bytes > 64 * 1024**2 or end * 2 > MAX_REQUEST_BYTES:
+            raise ValueError("Joint audio timeline exceeds the 180-second or byte budget, including gaps")
+        placements.append((offset, samples))
+    pcm: np.ndarray[Any, Any] = np.zeros(end, dtype="<i2")
+    for offset, samples in placements:
+        pcm[offset : offset + len(samples)] = samples
     output = io.BytesIO()
     with wave.open(output, "wb") as writer:
         writer.setnchannels(1)
         writer.setsampwidth(2)
-        writer.setframerate(clip.sample_rate)
+        writer.setframerate(rate)
         writer.writeframes(pcm.tobytes())
-    return types.Part.from_bytes(data=output.getvalue(), mime_type="audio/wav")
+    return [
+        types.Part.from_text(text=f"audio_start_sec={origin:.17g}; audio_end_sec={origin + end / rate:.17g}"),
+        types.Part.from_bytes(data=output.getvalue(), mime_type="audio/wav"),
+    ]
 
 
 def media_content(
@@ -123,7 +157,6 @@ def media_content(
     if not isinstance(text, str):
         raise TypeError("Google joint text must be a string")
     parts = [types.Part.from_text(text=text)] if text.strip() else []
-    seconds = 0.0
     if video is not None:
         VIDEO_SPEC.validate_count(len(video.frames))
         if len(video.frames) != len(video.frame_indices) or len(video.frames) != len(video.frame_times):
@@ -140,24 +173,9 @@ def media_content(
             raise ValueError("Google video exceeds the decoded input budget")
         for timestamp, frame in zip(video.frame_times, video.frames, strict=True):
             parts.extend([types.Part.from_text(text=f"frame_time_sec={timestamp:.17g}"), _image_part(frame)])
-    previous_end = None
-    for item in audio:
-        if not isinstance(item, TimedContent) or not isinstance(item.value, AudioClip):
-            raise TypeError("Joint audio requires timestamped AudioClip inputs")
-        clip = item.value
-        part = _audio_part(clip)
-        duration = len(clip.samples) / clip.sample_rate
-        if abs(item.end - item.start - duration) > 1 / clip.sample_rate or (
-            previous_end is not None and item.start < previous_end - 1 / clip.sample_rate
-        ):
-            raise ValueError("Joint audio must have ordered, nonoverlapping sample-aligned timestamps")
-        previous_end = item.end
-        seconds += duration
-        parts.extend(
-            [types.Part.from_text(text=f"audio_start_sec={item.start:.17g}; audio_end_sec={item.end:.17g}"), part]
-        )
-    if not parts or seconds > 180:
-        raise ValueError("Google joint input requires content and at most 180 seconds of audio")
+    parts.extend(_audio_parts(audio))
+    if not parts:
+        raise ValueError("Google joint input requires content")
     # Bound text locally by bytes; the endpoint owns the combined multimodal
     # token count. Do not approximate image/audio tokens or truncate to fit.
     text_bytes = sum(len(part.text.encode("utf-8")) for part in parts if part.text)

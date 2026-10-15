@@ -169,7 +169,38 @@ def test_server_truncation_aborts_joint_encoding(sdk):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("bad", ["frames", "empty", "nonfinite", "timeline", "overlap", "text"])
+@pytest.mark.parametrize("rate", [16000, 48000])
+@pytest.mark.parametrize("gap", [0, 0.25])
+def test_joint_audio_is_one_wav_with_sample_positions_and_silent_gaps(sdk, rate, gap):
+    calls, _, _ = sdk
+    first, second = sound(10.1, rate), sound(10.6 + gap, rate)
+    second.value.samples[:] = -0.5
+
+    async def run():
+        adapter = GoogleJointEmbedder(dimensions=128)
+        try:
+            await adapter.embed_joint(None, "words", audio=(first, second))
+        finally:
+            await adapter.aclose()
+
+    asyncio.run(run())
+    parts = calls[0]["contents"][0].parts
+    files = [part.inline_data for part in parts if part.inline_data]
+    assert len(files) == 1 and files[0].mime_type == "audio/wav"
+    assert parts[-2].text == f"audio_start_sec={first.start:.17g}; audio_end_sec={second.end:.17g}"
+    with wave.open(io.BytesIO(files[0].data)) as wav:
+        assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (rate, 1, 2)
+        assert wav.getnframes() == round((1 + gap) * rate)
+        samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+    np.testing.assert_array_equal(samples[: rate // 2], 8192)
+    np.testing.assert_array_equal(samples[rate // 2 : round((0.5 + gap) * rate)], 0)
+    np.testing.assert_array_equal(samples[round((0.5 + gap) * rate) :], -16384)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["frames", "empty", "nonfinite", "timeline", "overlap", "text", "mixed_rate", "gap_budget", "one_sample_overlap"],
+)
 def test_invalid_joint_input_fails_before_rpc(sdk, pillow, bad):
     calls, _, _ = sdk
     video, text, audio = clip(), "words", (sound(),)
@@ -183,6 +214,12 @@ def test_invalid_joint_input_fails_before_rpc(sdk, pillow, bad):
         audio = (TimedContent(10, 11, sound().value),)
     elif bad == "overlap":
         audio = (sound(), sound(10.25))
+    elif bad == "one_sample_overlap":
+        audio = (sound(), sound(10.5 - 1 / 16000))
+    elif bad == "mixed_rate":
+        audio = (sound(), sound(10.5, 48000))
+    elif bad == "gap_budget":
+        audio = (sound(), sound(190))
     else:
         text = "x" * 8192
 
@@ -229,6 +266,10 @@ def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow
         entries = body.get("requests", [body])
         assert len(entries) == 1
         assert entries[0]["content"]["parts"]
+        from google.genai import types
+
+        parts = types.Content.model_validate(entries[0]["content"]).parts
+        assert sum(bool(part.inline_data and part.inline_data.mime_type == "audio/wav") for part in parts) <= 1
         vector = {"values": [float(len(bodies))] * 128}
         if vertex:
             assert body["embedContentConfig"]["autoTruncate"] is False
@@ -265,7 +306,7 @@ def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow
                 await encoder.aclose()
         joint = GoogleJointEmbedder(dimensions=128)
         try:
-            assert len(await joint.embed_joint(clip(), "words", audio=(sound(),))) == 128
+            assert len(await joint.embed_joint(clip(), "words", audio=(sound(), sound(10.75)))) == 128
         finally:
             await joint.aclose()
 
@@ -280,3 +321,9 @@ def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow
         "image/png",
         "audio/wav",
     ]
+    with wave.open(io.BytesIO(parts[-1].inline_data.data)) as wav:
+        assert wav.getnframes() == 20000 and wav.getframerate() == 16000
+        samples = np.frombuffer(wav.readframes(20000), dtype="<i2")
+    np.testing.assert_array_equal(samples[:8000], 8192)
+    np.testing.assert_array_equal(samples[8000:12000], 0)
+    np.testing.assert_array_equal(samples[12000:], 8192)
