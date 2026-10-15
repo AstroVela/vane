@@ -167,6 +167,7 @@ class EmbedAudioOptions(TypedDict, total=False):
     normalize: bool
     batch_size: int
     actor_number: int
+    max_concurrency_per_actor: int
     execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
     max_retries: int
     cache_folder: str | None
@@ -451,6 +452,8 @@ def validate_embed_image_options(
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset(
             {
@@ -483,6 +486,8 @@ def validate_embed_audio_options(
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
     if relation:
@@ -499,6 +504,8 @@ def validate_embed_video_options(
 ) -> dict[str, Any]:
     """Video providers cannot inherit text chunking or image loading policies."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset(
             {

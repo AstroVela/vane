@@ -461,6 +461,36 @@ timestamps and text; vectors from independent models are never added. At least
 one input must be present. These models accept video and text, not decoded audio.
 Use each model's paired text encoding for retrieval.
 
+Google `gemini-embedding-2` supports `GoogleProvider.get_video_embedder`,
+`get_audio_embedder` and `get_image_embedder`. These descriptors are serializable,
+declare zero GPUs and use the same captured Google Gemini/Vertex client settings
+as text embedding. Install the `google`, `video` and `audio` extras as needed.
+Audio descriptors request 16 kHz PCM; extraction/resampling precedes embedding.
+VideoClip inputs contain at most six sampled RGB frames. The adapter encodes them
+as PNG parts with their absolute timestamps; it does not submit a video container
+for a second round of temporal sampling. Paired image queries share this space.
+
+`GoogleJointEmbedder` in `vane.ai.media_models` exposes asynchronous
+`embed_joint(video, text, audio=timed_audio)` and `embed_query(text)` methods.
+`timed_audio` is a sequence of `TimedContent` holding `AudioClip` values with
+nonoverlapping sample-aligned timestamps. One Content contains frames, text and
+explicit WAV parts and produces one vector. Audio from a video is extracted
+explicitly; the provider never assumes a video payload also encodes its soundtrack.
+`await model.aclose()` releases its worker-local client. Independent audio/video
+rows use separate Content objects/RPCs with bounded concurrency, including on
+Vertex, and preserve row count and order. `both` requires independent encodings
+in addition to the joint encoding; fused vectors cannot be decomposed.
+
+The adapter rejects unsupported models/options, invalid PCM/timelines, over-six
+frame clips, over-180-second audio, oversized decoded/encoded payloads and text
+over a local 8192-byte budget. The endpoint enforces the combined 8192-token limit;
+Vertex input truncation is disabled, and reported truncation is an error. The
+adapter never reduces frame counts, truncates text or substitutes transcription
+for audio. Output dimensions are
+128–3072; use the same model/dimensions and its paired query encoder for retrieval.
+The joint query encoder supplies Gemini's documented search-query instruction.
+See the [Google embedding guide](https://ai.google.dev/gemini-api/docs/embeddings).
+
 Use a callable function with `execution_backend="ray_task"` for task execution,
 or a callable class with `execution_backend="ray_actor"` to retain models across
 batches. CPU actors use `gpus=0`; CUDA models need explicit GPU resources. The

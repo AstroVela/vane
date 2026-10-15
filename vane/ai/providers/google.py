@@ -3,7 +3,7 @@
 
 """Google Generative AI (Gemini) provider for Vane AI.
 
-Supports text embedding via ``embed_content`` and basic multimodal Prompt
+Supports text and multimodal embedding via ``embed_content`` and multimodal Prompt
 calls via ``generate_content``.
 
 Prompt calls must name a model, either per call (``model=...``) or through
@@ -60,7 +60,13 @@ def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from vane.ai.protocols import Prompter, TextEmbedder
+    from vane.ai.protocols import (
+        AudioEmbedderDescriptor,
+        ImageEmbedderDescriptor,
+        Prompter,
+        TextEmbedder,
+        VideoEmbedderDescriptor,
+    )
     from vane.ai.typing import Embedding, Options
 
 
@@ -351,6 +357,47 @@ class GoogleProvider(Provider):
             client_options=self._client_options,
         )
 
+    def _media_embedder(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        from vane.ai.providers._google_multimodal import (
+            GoogleAudioEmbedderDescriptor,
+            GoogleImageEmbedderDescriptor,
+            GoogleVideoEmbedderDescriptor,
+        )
+
+        text = cast(
+            GoogleTextEmbedderDescriptor, self.get_text_embedder(model=model, dimensions=dimensions, options=options)
+        )
+        descriptor = {
+            "audio": GoogleAudioEmbedderDescriptor,
+            "image": GoogleImageEmbedderDescriptor,
+            "video": GoogleVideoEmbedderDescriptor,
+        }[kind]
+        return descriptor(
+            model_name=text.model_name,
+            provider_name=text.provider_name,
+            dimensions=text.get_dimensions(),
+            request_dimensions=text.request_dimensions,
+            options=text.options,
+            client_options=text.client_options,
+        )
+
+    def get_audio_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> AudioEmbedderDescriptor:
+        return cast("AudioEmbedderDescriptor", self._media_embedder("audio", model, dimensions, options))
+
+    def get_video_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> VideoEmbedderDescriptor:
+        return cast("VideoEmbedderDescriptor", self._media_embedder("video", model, dimensions, options))
+
+    def get_image_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> ImageEmbedderDescriptor:
+        return cast("ImageEmbedderDescriptor", self._media_embedder("image", model, dimensions, options))
+
     def get_prompter(
         self,
         model: str | None = None,
@@ -519,13 +566,19 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         with _translate_missing_provider_dependency("google", "google.genai"):
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+        return await self._embed_contents([types.Content(parts=[types.Part.from_text(text=t)]) for t in text])
+
+    async def _embed_contents(self, contents: list[Any], *, reject_truncation: bool = False) -> list[Embedding]:
+        """One Content is one vector, including when it has multiple media parts."""
         config = dict(self._options)
         if self._dimensions is not None:
             config["output_dimensionality"] = self._dimensions
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in text],
+            "contents": contents,
         }
+        if reject_truncation and self._client.vertexai:
+            config["auto_truncate"] = False
         if config:
             kwargs["config"] = config
         retry_error = None
@@ -565,11 +618,15 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         if batch_error is not None:
             raise batch_error from None
         chunk_embeddings = result.embeddings or []
-        if len(chunk_embeddings) != len(text):
+        if len(chunk_embeddings) != len(contents):
             raise _EmbeddingBatchError(
-                f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(text)} inputs; "
+                f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(contents)} inputs; "
                 "embedding calls must preserve row count and order"
             )
+        if reject_truncation and any(
+            getattr(getattr(item, "statistics", None), "truncated", False) for item in chunk_embeddings
+        ):
+            raise _EmbeddingBatchError("Google truncated the embedding input; use smaller clips/text")
         return self._decode_response_vectors(chunk_embeddings, lambda item: np.array(item.values, dtype=np.float32))
 
 

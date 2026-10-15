@@ -27,6 +27,7 @@ import numpy as np
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._video_embedding import VideoClip
 from vane.ai.media import MediaWindow, TimedContent
+from vane.ai.providers._google_multimodal import GoogleJointEmbedder as GoogleJointEmbedder
 
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
@@ -378,9 +379,13 @@ class Qwen3VLJointEmbedder:
     dimensions = 2048
     input_modalities = frozenset({"video", "text"})
 
-    def embed_joint(self, video: VideoClip | None, text: str) -> np.ndarray[Any, Any]:
+    def embed_joint(
+        self, video: VideoClip | None, text: str, *, audio: Sequence[TimedContent] = ()
+    ) -> np.ndarray[Any, Any]:
         from vane.ai.providers.qwen3_vl import Qwen3VLEmbedder
 
+        if audio:
+            raise ValueError("Qwen3-VL joint embedding does not support raw audio")
         if video is None and not text.strip():
             raise ValueError("Joint embedding requires video or text")
         if self._runtime is None:
@@ -433,7 +438,9 @@ class CohereJointEmbedder:
     def embed_query(self, text: str) -> list[float]:
         return self._embed(None, text, "search_query")
 
-    def embed_joint(self, video: VideoClip | None, text: str) -> list[float]:
+    def embed_joint(self, video: VideoClip | None, text: str, *, audio: Sequence[TimedContent] = ()) -> list[float]:
+        if audio:
+            raise ValueError("Cohere joint embedding does not support raw audio")
         return self._embed(video, text, "search_document")
 
     def _embed(self, video: VideoClip | None, text: str, input_type: str) -> list[float]:
