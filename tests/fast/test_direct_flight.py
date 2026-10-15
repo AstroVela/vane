@@ -122,23 +122,23 @@ def test_flight_window_retains_credit_until_cumulative_ack(terminal):
 
 
 @pytest.mark.parametrize("terminal", ["finish", "close"])
-def test_eight_flight_frames_progress_before_ack_and_ninth_waits(terminal):
+def test_sixteen_flight_frames_progress_before_ack_and_seventeenth_waits(terminal):
     import pyarrow.flight as flight
 
     with vane.connect(backend="local") as connection:
-        graph = compile_fragment_graph(connection, "select 1::bigint", query_id="flight-eight")
+        graph = compile_fragment_graph(connection, "select 1::bigint", query_id="flight-sixteen")
         root = next(f for f in graph.fragments if f.fragment_id == graph.result.fragment_id)
-        source = native.DirectChannel(root.outputs[0].schema, native.DirectLimits(512, 128, 3, 16), 1, ["consumer"])
+        source = native.DirectChannel(root.outputs[0].schema, native.DirectLimits(512, 128, 3, 32), 1, ["consumer"])
         source.add_producer("producer")
         source.seal_producers()
     sender, pool = service(), ThreadPoolExecutor(max_workers=1)
     client = reader = None
     try:
-        sender.publish("eight", source, "consumer")
-        for sequence in range(1, 13):
+        sender.publish("sixteen", source, "consumer")
+        for sequence in range(1, 25):
             assert source._write_rows("producer", sequence, [(sequence,)]) == "accepted"
         client = flight.FlightClient(sender.location)
-        reader = client.do_get(flight.Ticket("eight"), flight.FlightCallOptions(timeout=10))
+        reader = client.do_get(flight.Ticket("sixteen"), flight.FlightCallOptions(timeout=10))
 
         def read(sequence):
             batch = reader.read_chunk()
@@ -146,30 +146,30 @@ def test_eight_flight_frames_progress_before_ack_and_ninth_waits(terminal):
             assert batch.data.column(0).to_pylist() == [sequence]
 
         def ack(sequence):
-            return list(client.do_action(flight.Action("vane.direct.ack", f"{sequence}\neight".encode())))
+            return list(client.do_action(flight.Action("vane.direct.ack", f"{sequence}\nsixteen".encode())))
 
-        for sequence in range(1, 9):
+        for sequence in range(1, 17):
             read(sequence)
-        assert source.snapshot()["outstanding_frames"] == 12
-        assert source.snapshot()["queued_frames"] == 4
-        pending = pool.submit(read, 9)
+        assert source.snapshot()["outstanding_frames"] == 24
+        assert source.snapshot()["queued_frames"] == 8
+        pending = pool.submit(read, 17)
         with pytest.raises(TimeoutError):
             pending.result(timeout=0.1)
-        ack(4)
-        ack(4)  # Repeated ACKs must not release the new window.
+        ack(8)
+        ack(8)  # Repeated ACKs must not release the new window.
         pending.result(timeout=5)
-        for sequence in range(10, 13):
+        for sequence in range(18, 25):
             read(sequence)
-        assert source.snapshot()["outstanding_frames"] == 8
+        assert source.snapshot()["outstanding_frames"] == 16
         if terminal == "finish":
-            ack(12)
-            source.finish("producer", 12)
-            assert reader.read_chunk().app_metadata.to_pybytes() == b"F:12"
+            ack(24)
+            source.finish("producer", 24)
+            assert reader.read_chunk().app_metadata.to_pybytes() == b"F:24"
             with pytest.raises(StopIteration):
                 reader.read_chunk()
         else:
-            list(client.do_action(flight.Action("vane.direct.close", b"\neight")))
-            assert ack(12)[0].body.to_pybytes() == b"closed"
+            list(client.do_action(flight.Action("vane.direct.close", b"\nsixteen")))
+            assert ack(24)[0].body.to_pybytes() == b"closed"
         assert source.snapshot()["bytes"] == source.snapshot()["leased_bytes"] == 0
         assert source.snapshot()["peak_bytes"] <= 512
     finally:
@@ -189,6 +189,14 @@ def test_flight_staging_is_reserved_for_every_inflight_window(frame_bytes, links
         native.DirectFlight("127.0.0.1", "127.0.0.1", links, required - 1, frame_bytes)
     sender = native.DirectFlight("127.0.0.1", "127.0.0.1", links, required, frame_bytes)
     sender.close()
+
+
+def test_previous_eight_frame_staging_cannot_admit_sixteen_frame_window():
+    # Two links previously fit in 6.5 MiB at 64 KiB frames. The additional
+    # wire frames must be charged before either endpoint can start.
+    with pytest.raises(vane.InvalidInputException, match="staging"):
+        sender = native.DirectFlight("127.0.0.1", "127.0.0.1", 2, (6 << 20) + (1 << 19), 65536)
+        sender.close()
 
 
 @pytest.mark.parametrize("reject_ack", [False, True])

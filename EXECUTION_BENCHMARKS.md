@@ -2133,3 +2133,80 @@ with local controls 0.847/0.840 seconds. This does not establish a latency
 benefit, so the ACK change is not retained. Its 12 matching samples, patch,
 identities and cleanup are retained separately and excluded from the
 accepted candidate medians.
+
+
+## Sixteen-frame Flight window (2026-10-15)
+
+The frozen baseline is `f907c138f4`. A separate Q9 timeline shows the orders
+exchange completing around 0.8 seconds, followed by roughly 0.6 seconds of
+filtered/joined fact transfer. Remote fact outputs repeatedly hold eight
+unacknowledged frames and another eight queued frames while their receivers
+usually have little queued data. Temporary per-stream probes measure
+0.272/0.280 seconds waiting for the Flight window on the two joined-fact
+senders. With sixteen frames, those waits fall to 0.031/0.036 seconds in a
+separate completed diagnostic run. Corresponding stream spans change from
+0.629/0.629 to 0.589/0.596 seconds. These per-stream wall times overlap
+upstream computation and control traffic; they are not additive query
+latency or an isolated estimate of ACK cost. Row counts and wire schemas
+match. Diagnostic probes are removed before the final build is restored.
+
+Flight now permits **sixteen unacknowledged frames**; the seventeenth waits.
+Existing native byte/slot credit, cumulative ACKs, FINISH and cancellation
+still govern ownership and completion. Staging is charged as
+`80 * frame_bytes + 256 KiB` per remote link: **5.25 MiB** at 64 KiB frames,
+up from 3.25 MiB. Q9's 20/19 remote links require **105/99.75 MiB** per
+worker instead of 65/61.75 MiB, within the same configured 256 MiB capacity.
+Previously sufficient smaller capacities can now be rejected before
+execution. This is a throughput/memory tradeoff; the configured worker
+capacity and native channel limits are unchanged.
+
+Only Q9/Q18 are timed, in baseline/candidate then candidate/baseline order,
+with three samples per query/mode/runtime in each round. Driver, installed
+Python, SF10 input hashes and declared resources match: local 36 threads/
+32 GiB; two pipelined 18-CPU workers, two partitions and 16 GiB operator
+memory per worker; 64 KiB/2048-row frames, 1 MiB/16-slot channels, 128 MiB
+exchange and 256 MiB staging per worker, and a 1 GiB Ray object store.
+Ray's automatically reported available host memory varies by about
+0.3 GiB; operator limits remain fixed. Timings include submission,
+collection and successful close, excluding startup/comparison. The shared
+host has warm OS caches; no task-owned build/test/diagnostic overlaps a
+measured comparison window.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.857 | 1.609 | 0.859 | 1.495 | -7.1% | 1.74 |
+| Q18 | 0.696 | 1.076 | 0.715 | 1.069 | -0.7% | 1.49 |
+
+Q9 improves in both rounds, from 1.583 to 1.495 seconds and from 1.627 to
+1.496 seconds; its combined local control is essentially unchanged. Q18's
+small difference and opposite signs across rounds do not establish a
+latency benefit. All **48 comparison samples**, including **24 on the
+accepted candidate**, match local schema, row counts and values with
+relative/absolute floating tolerances 1e-9/1e-6. No new all-query total,
+large-query FTE result or local parity is inferred.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev113`) passes
+**53 related native Flight tests** and **13 real-Ray tests**. They cover the
+sixteen-frame window, seventeenth-frame blocking, duplicate cumulative ACKs,
+FINISH/close, insufficient staging, malformed data/control replies, process
+loss and lease retirement. Ray checks public/empty results, tiny-window
+backpressure/early close, worker/result-process loss, admission rollback,
+interrupt/delivery timeout, HASH/Parquet routing, pipelined/FTE shared-input
+retry and retained remote client views. Two tests fail on the frozen
+baseline as expected: receiving sixteen frames without ACK times out, and
+the old 6.5 MiB two-link staging budget is still admitted.
+
+Native SHA-256 identities, baseline and final candidate:
+
+- `c37910d5a5c53e28f04c49dec7f6fee72c91c3c90a6b6257e537ce38d80c3662`
+- `0972960bda0376fc02b514419cfa834e79120260cbbeb84b6236617adb3ef365`
+
+Evidence is retained under `build/pipelined-flight-tail-20261015/`: frozen
+runtime, source/configuration/input identities, raw samples, timeline and
+per-stream diagnostic patches/metrics, `comparison.json`,
+`local-vs-pipelined.csv`, test logs and cleanup manifests. All measured
+query/worker/result reservations return to zero. Owned processes stop
+before temporary/spill cleanup; oracle hashes are retained before deletion,
+source inputs are preserved and disk guards remain untriggered. Formatting,
+applicable pre-commit hooks, copyleft and diff checks pass. The full release,
+fast and all-query suites are not rerun, following the related-test scope.

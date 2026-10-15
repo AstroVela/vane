@@ -27,7 +27,7 @@ namespace duckdb {
 namespace vane_execution {
 namespace {
 
-constexpr idx_t MAX_INFLIGHT_FRAMES = 8;
+constexpr idx_t MAX_INFLIGHT_FRAMES = 16;
 
 void Check(const arrow::Status &status, const string &operation = "") {
 	if (!status.ok()) {
