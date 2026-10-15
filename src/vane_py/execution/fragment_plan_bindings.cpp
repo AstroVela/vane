@@ -106,13 +106,14 @@ py::dict DescribeGraph(const FragmentGraph &graph) {
 }
 
 py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
-                      const vector<idx_t> &hash_columns) {
+                      const vector<idx_t> &hash_columns, idx_t worker_operator_bytes) {
 	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
 	{
 		py::gil_scoped_release release;
-		graph = Compile(context, sql, query_id, partitions, hash_columns);
+		graph =
+		    Compile(context, sql, query_id, partitions, hash_columns, "", 0, nullptr, nullptr, worker_operator_bytes);
 	}
 	return DescribeGraph(graph);
 }
@@ -120,7 +121,7 @@ py::dict CompileGraph(DuckDBPyConnection &connection, const string &sql, const s
 py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
                            const vector<idx_t> &hash_columns, bool require_replay,
                            const string &snapshot_directory = "", idx_t source_budget = 0,
-                           SourceSnapshotCache *source_cache = nullptr) {
+                           SourceSnapshotCache *source_cache = nullptr, idx_t worker_operator_bytes = 0) {
 	auto lock = DuckDBPyConnection::LockConnection(connection.py_connection_lock);
 	auto &context = *connection.con.GetConnection().context;
 	FragmentGraph graph;
@@ -131,7 +132,7 @@ py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, co
 		py::gil_scoped_release release;
 		snapshot = CaptureConnection(context);
 		graph = Compile(context, sql, query_id, partitions, hash_columns, snapshot_directory, source_budget,
-		                &source_bytes, source_cache);
+		                &source_bytes, source_cache, worker_operator_bytes);
 		for (auto &fragment : graph.fragments) {
 			sources.push_back(CaptureSources(context, fragment, require_replay));
 		}
@@ -336,27 +337,30 @@ void RegisterExecutionPlanBindings(py::module_ &module) {
 	    .def("snapshot", &SourceSnapshotCache::Snapshot, py::call_guard<py::gil_scoped_release>());
 	execution.def("engine_identity", &vane_execution::EngineIdentity);
 	execution.def("compile", &CompileGraph, py::arg("connection"), py::arg("sql"), py::arg("query_id"),
-	              py::arg("partition_count"), py::arg("hash_columns"));
+	              py::arg("partition_count"), py::arg("hash_columns"), py::arg("worker_operator_bytes") = 0);
 	execution.def(
 	    "compile_submission",
 	    [](DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
-	       const vector<idx_t> &hash_columns,
-	       bool replay) { return CompileSubmission(connection, sql, query_id, partitions, hash_columns, replay); },
+	       const vector<idx_t> &hash_columns, bool replay, idx_t worker_operator_bytes) {
+		    return CompileSubmission(connection, sql, query_id, partitions, hash_columns, replay, "", 0, nullptr,
+		                             worker_operator_bytes);
+	    },
 	    py::arg("connection"), py::arg("sql"), py::arg("query_id"), py::arg("partition_count"), py::arg("hash_columns"),
-	    py::arg("require_replay"));
+	    py::arg("require_replay"), py::arg("worker_operator_bytes") = 0);
 	execution.def(
 	    "stage_submission",
 	    [](DuckDBPyConnection &connection, const string &sql, const string &query_id, idx_t partitions,
 	       const vector<idx_t> &hash_columns, const string &directory, idx_t source_budget,
-	       const std::shared_ptr<SourceSnapshotCache> &source_cache) {
+	       const std::shared_ptr<SourceSnapshotCache> &source_cache, idx_t worker_operator_bytes) {
 		    if (directory.empty() || !source_budget || source_budget > (1ULL << 40)) {
 			    throw InvalidInputException("FTE staging requires a directory and finite source storage budget");
 		    }
 		    return CompileSubmission(connection, sql, query_id, partitions, hash_columns, true, directory,
-		                             source_budget, source_cache.get());
+		                             source_budget, source_cache.get(), worker_operator_bytes);
 	    },
 	    py::arg("connection"), py::arg("sql"), py::arg("query_id"), py::arg("partition_count"), py::arg("hash_columns"),
-	    py::arg("directory"), py::arg("source_budget"), py::arg("source_cache") = nullptr);
+	    py::arg("directory"), py::arg("source_budget"), py::arg("source_cache") = nullptr,
+	    py::arg("worker_operator_bytes") = 0);
 	execution.def("compiler_capabilities", &CompilerCapabilities, py::arg("connection"));
 	execution.def("inspect_submitted_fragment", &InspectSubmittedFragment, py::arg("connection"), py::arg("payload"),
 	              py::arg("connection_snapshot"), py::arg("source_snapshot"), py::arg("require_replay"));

@@ -624,7 +624,15 @@ def test_ended_input_error_prevents_native_finish(threads, borrowed):
                 assert time.monotonic() < deadline
                 service.pump(1)
             if borrowed:
-                status, batch = output.poll("client")
+                # A parallel source can block on the right before the left
+                # pipeline publishes its buffered row. Wait for the lease we
+                # intend to hold across the late input error.
+                while True:
+                    status, batch = output.poll("client")
+                    if status != "blocked":
+                        break
+                    assert time.monotonic() < deadline
+                    service.pump(1)
                 assert status == "data" and batch.to_rows() == [(42,)]
             assert service.status()[0]["state"] == "RUNNING"
             left.abort("input failed after EOF")

@@ -9,11 +9,14 @@ import sys
 import textwrap
 import time
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
 import vane
 from tests.fast.test_direct_exchange import channel, collect, next_batch, prepare_root_task, submission
+from tests.fast.test_execution_submission import options as query_options
+from tests.fast.test_execution_submission import resources as query_resources
 from tests.fast.test_fragment_sql_coverage import (
     correlated_owner_queries,
     early_join_filter_query,
@@ -21,10 +24,12 @@ from tests.fast.test_fragment_sql_coverage import (
 )
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane._native import execution_plan as native
+from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 from vane.execution.pipelined_plan import placement
 from vane.execution.pipelined_worker import _Query
 from vane.execution.plan import Distribution
+from vane.execution.submission import prepare_ray_query
 from vane.execution.worker_resources import pipelined_demand
 
 
@@ -441,6 +446,131 @@ def test_broadcast_join_does_not_assume_narrow_build_rows(nested):
         graph = compile_sql(connection, sql, 2)
     assert any(e.distribution is Distribution.HASH for e in graph.exchanges)
     assert not any(e.distribution is Distribution.BROADCAST for e in graph.exchanges)
+
+
+@pytest.mark.parametrize(
+    "budget,build_rows,partitions,nested,broadcast",
+    [
+        (0, 1000000, 2, False, False),
+        (128 << 20, 1000000, 2, False, False),
+        (256 << 20, 1000000, 2, False, True),
+        (256 << 20, 2000000, 2, False, False),
+        (1 << 30, 2000000, 2, False, True),
+        (16 << 30, 8000000, 2, False, False),
+        (1 << 30, 1000000, 64, False, False),
+        (1 << 30, 1000000, 2, True, False),
+    ],
+)
+def test_large_broadcast_requires_worker_budget_and_traffic_margin(budget, build_rows, partitions, nested, broadcast):
+    payload = "[range]" if nested else "repeat(range::varchar, 20)"
+    sql = (
+        f"select a.range, a.payload from (select range, {payload} payload from range(10000000)) a "
+        f"join range({build_rows}) b on a.range=b.range"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("pragma disable_optimizer")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="broadcast-budget",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is broadcast
+
+
+def large_broadcast_query(connection, path, kind="inner", comparison="="):
+    connection.execute(
+        "copy (select range%4096 i, case when range%1048576=0 then null else range%1048576 end k, "
+        "'fact-'||(range%4096)::varchar payload, 'other-'||(range%4096)::varchar extra "
+        f"from range(2097152)) to '{path}' (row_group_size 2048)"
+    )
+    return (
+        "select p.i%31 g, count(*), sum(length(p.payload)+length(p.extra)) "
+        f"from read_parquet('{path}') p {kind} join "
+        "(select case when range<2 then null else range//2 end k from range(1048576)) b "
+        f"on p.k {comparison} b.k group by g order by g"
+    )
+
+
+def early_broadcast_filter_query(connection, path, build_kind):
+    connection.execute(
+        "copy (select range i, range%65536 k, 'fact-'||(range%4096)::varchar payload, "
+        "'extra-'||(range%4096)::varchar extra, 'third-'||(range%4096)::varchar third "
+        f"from range(2097152)) to '{path}' (row_group_size 2048)"
+    )
+    if build_kind == "small":
+        orders = "select range i from range(1048576)"
+        keys = "select range k from range(8192) where range%512=0"
+        payload = "length(f.payload)"
+    else:
+        orders = "select range i, 'order-'||range::varchar payload from range(1048576)"
+        keys = (
+            "select range%65536 k, 'build-'||range::varchar v, 'other-'||range::varchar w "
+            "from range(327680) where range%1024=0"
+        )
+        payload = "length(f.payload)+length(f.extra)+length(f.third)+length(o.payload)+length(b.v)+length(b.w)"
+    return (
+        f"select f.i%31 g, count(*), sum({payload}) from read_parquet('{path}') f "
+        f"join ({orders}) o using(i) join ({keys}) b on f.k=b.k group by g order by g"
+    )
+
+
+@pytest.mark.parametrize("build_kind", ["small", "large"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_large_broadcast_preserves_filters_before_earlier_joins(tmp_path, build_kind, partitions):
+    config = {"threads": 4, "disabled_optimizers": "join_order,build_side_probe_side", "memory_limit": "1GiB"}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = early_broadcast_filter_query(connection, tmp_path / "fact.parquet", build_kind)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="preserve-early-filter",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=1 << 30)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=1 << 30),
+        )
+        # Keep the selective build shared with an early filter. Broadcasting a
+        # larger join must not make that filter disappear from an earlier join.
+        assert any(
+            len({e.consumer_fragment_id for e in spec.graph.exchanges if e.producer_fragment_id == f.fragment_id}) > 1
+            for f in spec.graph.fragments
+        )
+        limits = DirectExchangeLimits(65536, 16384, 512, 4)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [c.snapshot() for c in service.channels.values()]
+            assert sum(s["accepted_rows"] for s in states) < 1100000
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("kind", ["inner", "left", "semi", "anti"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_large_broadcast_keeps_wide_probe_before_aggregation(tmp_path, kind, comparison, partitions):
+    with vane.connect(backend="local", config={"threads": 4, "memory_limit": "256MiB"}) as connection:
+        sql = large_broadcast_query(connection, tmp_path / "fact.parquet", kind, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="large-broadcast",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=256 << 20),
+        )
+        limits = DirectExchangeLimits(65536, 16384, 512, 4)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            states = [c.snapshot() for c in service.channels.values()]
+            # One complete build plus small partial/final groups; wide probes
+            # must not cross a hash edge before their local join/aggregation.
+            assert sum(s["accepted_rows"] for s in states) < 1048576 + 1024
+            assert all(s["peak_bytes"] <= limits.window_bytes for s in states)
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
 
 
 @pytest.mark.parametrize("threads", [1, 4])

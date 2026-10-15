@@ -31,7 +31,11 @@ from tests.fast.test_analytical_fragment_compiler import (
     scaled_wide_value,
     wide_aggregate_queries,
 )
-from tests.fast.test_execution_performance import batched_aggregate_query, interval_average_queries
+from tests.fast.test_execution_performance import (
+    batched_aggregate_query,
+    interval_average_queries,
+    large_broadcast_query,
+)
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -44,6 +48,63 @@ def resources(tmp_path, **changes):
     # Analytical plans retain more partition objects across stage barriers.
     # These small test inputs need a 4 MiB bound per object, including retries.
     return replace(base, exchange_stores=tuple(replace(store, object_bytes=4 << 20) for store in base.exchange_stores))
+
+
+@pytest.mark.parametrize("mode,slots", [("pipelined", 1), ("pipelined", 2), ("fte", 1), ("fte", 2), ("fte_retry", 1)])
+def test_large_broadcast_uses_per_query_worker_budget(tmp_path, monkeypatch, mode, slots):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(tmp_path, max_active_queries=slots, task_contexts_per_worker=64, io_concurrency=256)
+    limits = replace(
+        limits,
+        exchange=DirectExchangeLimits(),
+        exchange_stores=tuple(
+            # The low-memory control shuffles wide rows and reserves larger
+            # materialized outputs than the broadcast variant.
+            replace(store, query_bytes=512 << 20, source_bytes=128 << 20, object_bytes=32 << 20)
+            for store in limits.exchange_stores
+        ),
+    )
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = large_broadcast_query(local, tmp_path / "fact.parquet")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert any(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges) == (slots == 1)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
 
 
 QUERIES = [

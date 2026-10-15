@@ -211,6 +211,10 @@ def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, mo
 
     monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
     limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    if query_kind == "exact":
+        # Keep the key-domain fanout instead of broadcasting the entire build.
+        # Full-build broadcast recovery is covered in analytical execution tests.
+        limits = replace(limits, operator_memory_bytes=128 << 20)
     if query_kind in ("estimated", "compressed", "join_estimate"):
         limits = replace(
             limits, exchange_stores=tuple(replace(store, source_bytes=128 << 20) for store in limits.exchange_stores)

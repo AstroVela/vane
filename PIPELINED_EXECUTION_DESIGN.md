@@ -333,11 +333,15 @@ DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipelin
 
 普通等值 INNER/LEFT/SEMI/ANTI join 的 build 估计不超过 32 行时保留小表广播策略。更大的 build 仅在估计交换大小不超过 8 MiB，且额外副本的流量不超过省下的 probe 重分区流量时广播；分区数为 N 时比较 `(N-1) × build_bytes <= probe_bytes`。估算包含定长类型宽度、有效性开销及每个变长标量 64 字节，缺少长度统计的嵌套类型继续使用原来的小行数策略。该阈值用于计划选择，实际执行仍受 operator memory 与通道窗口约束。广播保留 probe 分区和同一 fragment 内的扫描动态过滤。
 
+公共 Runtime 提供明确的 worker 内存份额时，还可广播超过 8 MiB 的 build，以避免传输宽 probe 行。这一路径将单份 build 估计限制为 `min(64 MiB, worker_operator_bytes / 16)`，并要求 `4 × (N-1) × build_bytes < probe_bytes`；无法估计嵌套 probe 宽度时不启用。内部编译参数 `worker_operator_bytes` 使用单 worker 的 operator memory 除以 `max_active_queries`，pipelined 和 FTE 都使用同一份额；不使用 coordinator 内存或所有 worker 的合计预算。未提供份额的独立编译继续采用基础策略。这些是计划估计，不代替原有内存预留、硬限制和 spill 机制。
+
+规划先按基础广播策略发现提前键过滤。若过滤跨越了更早的 join，或当前 join 的 probe 已被上层 join 的提前过滤缩小，则保留基础广播门槛，避免按未过滤的 probe 估计放大副本。仅过滤当前 join 直接 HASH 输入的键域，可以由较大的完整 build 广播替代，因为广播会消除这条交换边。较大广播不取消跨 join 的提前过滤，也不放宽这些过滤自身的大小和选择性门槛。
+
 若 INNER/SEMI 广播 join 的原生过滤信息表明 build 含选择条件，还可把必要的整数键过滤提前到 probe 子树中更早的 HASH 交换之前。只沿原样 projection、filter 与 INNER/SEMI join 的 probe 输出追踪直接引用；遇到计算键、LIMIT、聚合、外连接或共享作用域时停止下移。build 估计必须已知、不超过 8 MiB、行数少于目标输入八分之一，额外广播流量也必须小于该输入的估计交换量。没有跨越 HASH 边时继续使用原有同 fragment 动态过滤。
 
 提前过滤通过原生 NULL 安全 SEMI join 保留 probe 重复行，最终 join 仍负责实际匹配和输出重复次数。原 join 与提前过滤分支共用同一 build fragment 的完整输出，不复制扫描或重算 join；两个分支都先消费 build 再读取 probe，额外通道仍计入原来的窗口预留。FTE 两个下游绑定同一已提交 producer 的各自输出，失败消费者沿用输入身份并更换 fence。该路径不放宽广播大小，也不根据运行后的实际小结果忽略原来的基数估计。
 
-若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。精确键域估计限制在 16 MiB，行数少于目标输入四分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。这些是规划估计，实际执行仍受 operator memory 和通道预算约束。完整 build 广播与其提前过滤继续使用原来的较小门槛。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
+若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。精确键域估计限制在 16 MiB，行数少于目标输入四分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。这些是规划估计，实际执行仍受 operator memory 和通道预算约束。完整 build 广播的额外提前过滤仍仅用于估计不超过 8 MiB 的 build。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
 
 若 build/probe 行数比例未达到上述门槛，单一等值条件的 HASH join 还可用预计连接输出衡量键域过滤的选择性：输出估计须已知且少于 probe 四分之一，新增 build/键副本流量须低于预计被消除的 probe 流量。此判断仅用于该 join 的直接 probe 输入，不把多键、残余条件或跨越其他 join 后的输出估计归给一个提前过滤键。16 MiB 键域上限、完整 build 广播门槛及最终精确匹配仍按原规则执行。
 

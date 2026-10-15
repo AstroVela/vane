@@ -1164,3 +1164,110 @@ cleanup manifests. The acceptance driver SHA-256 is
 Shared oracle files are removed after retaining their hashes. Test fixtures
 and owned temporary/spill data are removed outside measured windows; original
 SF10 inputs are preserved.
+
+## Broadcasting wider builds within worker memory (2026-10-15)
+
+The fixed 8 MiB build estimate still forced Q10 to shuffle 1,499,999 wide
+customer rows. The planner now accepts larger complete builds when their
+estimated size is at most `min(64 MiB, worker_operator_bytes / 16)` and
+`4 * (partitions - 1) * build_bytes < probe_bytes`. Unknown nested probe
+widths cannot justify this path. The runtime supplies each worker's operator
+memory divided by active-query capacity, in both pipelined and FTE modes.
+Standalone compilation without a budget retains the previous policy, as do
+builds of at most 32 rows and the original 8 MiB path. These are planning
+estimates; admission, actual memory limits and spill remain enforced.
+
+Early filters take precedence over larger broadcasts. The planner first finds
+filters under the original policy. A filter moved through an earlier join,
+or an ancestor's filter already reducing the current probe, retains the
+original broadcast limit. A direct key filter can be replaced by a larger
+broadcast that eliminates the same join's hash input. Extra early filters
+keep their existing size and selectivity limits.
+
+This guard is required by measured regressions. An initial candidate removed
+Q7's early customer-key filter, increasing orders exchange from 1,205,808 to
+15,000,000 rows. It also removed Q21's early supplier filter while broadcasting
+7,309,184 orders. Their focused medians regressed from 0.816 to 1.651 and from
+2.084 to 2.631 seconds. Four regression cases fail on that candidate and pass
+with the guard, covering small/large selective builds and two/three partitions.
+Final Q7/Q8/Q21 serialized graphs equal the frozen baseline; only Q2/Q3/Q5/Q10
+change, with the other 18 graphs identical after normalizing engine identity.
+
+The comparison freezes `51e38be681`'s installed `0.3.0.dev102` runtime against
+the final `0.3.0.dev103` build. Both use SF10, two 18-CPU workers, two partitions,
+16 GiB operator memory per worker, a 1 MiB exchange window, 64 KiB frames,
+2048 rows and 16 slots. Timing includes submission, complete collection and
+successful close, excluding startup and validation. Host load and OS caches
+are shared; no task-owned builds or tests overlap measured comparisons.
+
+| Measurement, seconds | Frozen baseline | Final candidate | Local, final pass |
+|---|---:|---:|---:|
+| All 22 queries, one full pass | 26.606 | **25.538** | 9.100 |
+| Q2, median of three repetitions | 0.397 | 0.396 | 0.146 |
+| Q3, median of three repetitions | 0.793 | 0.800 | 0.369 |
+| Q5, median of three repetitions | 0.890 | 0.754 | 0.412 |
+| Q7, median of three repetitions | 0.816 | 0.811 | 0.409 |
+| Q8, median of three repetitions | 0.898 | 0.862 | 0.543 |
+| Q10, median of three repetitions | 1.692 | 1.068 | 0.464 |
+| Q12, median of three repetitions | 0.568 | 0.564 | 0.294 |
+| Q18, median of three repetitions | 2.689 | 2.639 | 0.718 |
+| Q21, median of three repetitions | 2.084 | 2.102 | 1.209 |
+
+The full pass improves **4.0%**, remaining **2.81 times local**.
+Q10's focused median improves **36.9%**, reaching **2.30 times local**;
+Q5 improves **15.2%**. Q2/Q3 do not establish a material latency benefit.
+Q7/Q21 return to baseline performance. The unchanged Q8/Q12/Q18 controls vary
+slightly; no optimization benefit is claimed for them. One full-pass total is
+not a repeated whole-suite estimate.
+
+Completed final native diagnostics, separate from Ray timing, reduce Q10 total
+accepted channel rows from **5,894,828 to 2,101,431 (64.4%)**. Wide customer rows
+remain local through joining and partial aggregation; 381,105 partial groups
+still cross the aggregation exchange. Both outputs match local exactly and
+retain the same hash. All tasks finish, byte bounds hold, and bytes/leases
+return to zero. Shared broadcasts count once; these are work counts, not
+network bytes. A synthetic complete-build regression also reduces accepted
+rows from 3,145,852 to 1,048,700 while preserving exact output.
+
+Final qualification contains **196 matching timing samples** across five runs:
+54 focused samples and 44 full-pass samples per runtime. An additional
+98 samples from the initial candidate are retained separately, giving 294
+matching samples across seven runs. Inputs and the frozen driver match in all
+runs; disk guards remain untriggered, and queries/runtimes return to idle.
+
+Validation passes **585 affected native/compiler/submission/performance tests**
+and **26 targeted real-Ray cases**, including per-query memory shares, both
+public modes, duplicate/NULL and outer-join semantics, small windows, early
+filter retention, cancellation, and committed-input reuse after consumer loss.
+The previous Python 3.11 CI failure was a test synchronization assumption:
+blocking on the right input did not ensure a parallel left pipeline had
+published its buffered row. The test now waits within its existing deadline
+for the actual output lease before injecting the late error. Its EOF/error
+assertions remain, and 100 additional repetitions pass.
+
+Forced-optimizer guard fixtures run in process. Four attempted public versions
+were rejected before execution because worker preparation deliberately rejects
+mismatched database-global optimizer settings; those inapplicable fixtures were
+removed. Public guard qualification uses Q7/Q21 with default optimizers. Logs
+also retain the earlier reader-lifetime/storage-limit fixture corrections and
+the exact-domain fanout fixture's explicit 128 MiB budget. The latter preserves
+its intended shared-build recovery path; complete-broadcast recovery has a
+separate passing case. The full release suite and large-query FTE timings were
+not rerun. Formatting, applicable pinned pre-commit hooks, copyleft inventory
+and `git diff --check` pass.
+
+Native SHA-256 identities, in baseline/final order:
+
+```text
+e3d64f828f0203ca896e8113c0a9559c9e65c3d728e5065427e2edeb10c67646
+4c3ad4751652f3f64f5318c3a5b7f3653b354df117b72e4071d8702adda0dae0
+```
+
+Evidence is retained under `build/pipelined-wide-probe-20261015/`: all seven
+timing runs, source/native identities, normalized plans, native work counts,
+regression controls, test and CI logs, `comparison.json/csv`, and cleanup
+manifests. The frozen driver SHA-256 remains
+`7df12dcea6a469482b85f84e6bfa015d1eca299ba06d55707a1b2bad0f3b9c60`.
+Owned processes stop before temporary/spill cleanup. The shared oracle is
+removed after preserving its 22 hashes; test fixtures are removed outside
+measured windows. Original SF10 inputs are preserved.

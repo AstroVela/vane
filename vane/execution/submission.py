@@ -237,6 +237,7 @@ def prepare_ray_query(
         compile_options.partition_count,
         compile_options.hash_columns,
         options.target.mode is DistributedMode.FTE,
+        compile_options.worker_operator_bytes,
     )
     return _submission(value, options, resources)
 
@@ -279,6 +280,7 @@ def stage_ray_query(
         source_directory,
         source_budget,
         source_cache,
+        compile_options.worker_operator_bytes,
     )
     return _submission(value, options, resources), value["source_bytes"]
 

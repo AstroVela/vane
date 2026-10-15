@@ -718,7 +718,7 @@ double EstimatedExchangeBytes(const PhysicalOperator &op) {
 	return double(op.estimated_cardinality) * width;
 }
 
-bool BroadcastJoin(const PhysicalHashJoin &join, idx_t probe_partitions) {
+bool BroadcastJoin(const PhysicalHashJoin &join, idx_t probe_partitions, idx_t broadcast_limit) {
 	if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT && join.join_type != JoinType::SEMI &&
 	    join.join_type != JoinType::ANTI) {
 		return false;
@@ -731,14 +731,24 @@ bool BroadcastJoin(const PhysicalHashJoin &join, idx_t probe_partitions) {
 	// Broadcasting sends N copies of the build instead of shuffling both
 	// sides once. Bound each replica and require its extra traffic to fit in
 	// the probe traffic saved. Fusing the probe also preserves scan filters.
-	return build_bytes <= 8 * 1024 * 1024 &&
-	       build_bytes * double(probe_partitions - 1) <= EstimatedExchangeBytes(join.children[0]);
+	const auto probe_bytes = EstimatedExchangeBytes(join.children[0]);
+	const auto extra_bytes = build_bytes * double(probe_partitions - 1);
+	if (build_bytes <= 8 * 1024 * 1024) {
+		return extra_bytes <= probe_bytes;
+	}
+	// Larger replicas need declared worker memory and a wider traffic margin.
+	// Unknown nested widths cannot justify this additional replication.
+	return build_bytes <= broadcast_limit && probe_bytes != NumericLimits<double>::Maximum() &&
+	       extra_bytes * 4 < probe_bytes;
 }
 
 class AnalyticalPlanner {
 public:
-	AnalyticalPlanner(ClientContext &context, PhysicalPlan &plan, FragmentGraph &graph, idx_t partitions)
-	    : context(context), plan(plan), graph(graph), partitions(partitions) {
+	AnalyticalPlanner(ClientContext &context, PhysicalPlan &plan, FragmentGraph &graph, idx_t partitions,
+	                  idx_t worker_operator_bytes)
+	    : context(context), plan(plan), graph(graph), partitions(partitions),
+	      broadcast_limit(
+	          MaxValue<idx_t>(8 * 1024 * 1024, MinValue<idx_t>(64 * 1024 * 1024, worker_operator_bytes / 16))) {
 	}
 
 	string Finish(DistributedSubtree subtree, const vector<string> &names = {}) {
@@ -902,6 +912,7 @@ private:
 	PhysicalPlan &plan;
 	FragmentGraph &graph;
 	idx_t partitions;
+	idx_t broadcast_limit;
 	idx_t next_exchange = 0;
 	// Nodes have independent payloads, but join and scan references must share
 	// an ID namespace. Each loaded fragment gets a fresh set of filter objects.
@@ -970,7 +981,9 @@ private:
 		if (!join.filter_pushdown->build_side_has_filter && !HasFilteredBuildRoot(build)) {
 			return result;
 		}
-		const bool broadcast = BroadcastJoin(join, partitions);
+		// Find existing early filters before considering larger broadcasts. Their
+		// savings can invalidate an ancestor or descendant join's traffic estimate.
+		const bool broadcast = BroadcastJoin(join, partitions, 8 * 1024 * 1024);
 		if (broadcast && EstimatedExchangeBytes(build) > 8 * 1024 * 1024) {
 			return result;
 		}
@@ -1026,7 +1039,7 @@ private:
 					}
 					column = probe.lhs_output_columns.col_idxs[column];
 					op = &probe.children[0].get();
-					if (!BroadcastJoin(probe, partitions) && column < op->types.size() &&
+					if (!BroadcastJoin(probe, partitions, 8 * 1024 * 1024) && column < op->types.size() &&
 					    op->types[column] == condition.left->return_type) {
 						target.input = op;
 						target.column = column;
@@ -1461,6 +1474,16 @@ private:
 	}
 	DistributedSubtree Join(PhysicalHashJoin &join) {
 		auto filter = PlanProbeFilter(join);
+		// Do not trade away a filter moved before another join, or cost a larger
+		// broadcast against probes already reduced by an ancestor's early filter.
+		const bool preserve_filter =
+		    (filter.input && filter.input != &join.children[0].get()) || probe_filters.count(&join.children[0].get());
+		const auto join_broadcast_limit = preserve_filter ? idx_t(8 * 1024 * 1024) : broadcast_limit;
+		if (filter.keys_only && BroadcastJoin(join, partitions, join_broadcast_limit)) {
+			// A direct key filter only reduces this join's own hash input. Fusing
+			// the probe with a full-build broadcast removes that exchange entirely.
+			filter = EarlyProbeFilter();
+		}
 		DistributedSubtree left, right;
 		if (filter.input) {
 			// Both the original join and the early SEMI build drain this shared
@@ -1496,7 +1519,7 @@ private:
 		if (left_keys.empty() || !join.delim_types.empty()) {
 			throw NotImplementedException("distributed hash join requires uncorrelated equality keys");
 		}
-		const bool broadcast = BroadcastJoin(join, left.fragment.partition_count);
+		const bool broadcast = BroadcastJoin(join, left.fragment.partition_count, join_broadcast_limit);
 		if (broadcast) {
 			// Every probe partition sees the complete build input. Preserve its
 			// existing distribution and fuse the probe subtree with the join;
@@ -1669,8 +1692,11 @@ void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, 
 
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns, const string &snapshot_directory, idx_t source_budget,
-                      idx_t *source_bytes, SourceSnapshotCache *source_cache) {
+                      idx_t *source_bytes, SourceSnapshotCache *source_cache, idx_t worker_operator_bytes) {
 	CheckPartitions(partitions);
+	if (worker_operator_bytes > idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("worker operator planning budget exceeds the supported range");
+	}
 	auto trimmed_id = query_id;
 	StringUtil::Trim(trimmed_id);
 	if (trimmed_id.empty()) {
@@ -1720,7 +1746,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		}
 		PhysicalPlanGenerator physical_planner(context);
 		auto physical = physical_planner.Plan(std::move(planner.plan));
-		AnalyticalPlanner distributed(context, *physical, graph, partitions);
+		AnalyticalPlanner distributed(context, *physical, graph, partitions, worker_operator_bytes);
 		auto root = distributed.Build(physical->Root());
 		if (!hash_columns.empty()) {
 			root = distributed.Exchange(std::move(root), "hash", partitions, hash_columns);

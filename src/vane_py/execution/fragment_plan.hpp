@@ -83,7 +83,8 @@ vector<std::pair<string, string>> ScanCapabilities(ClientContext &context);
 // as result-column positions. Native code binds and serializes the expressions.
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns, const string &snapshot_directory = "", idx_t source_budget = 0,
-                      idx_t *source_bytes = nullptr, SourceSnapshotCache *source_cache = nullptr);
+                      idx_t *source_bytes = nullptr, SourceSnapshotCache *source_cache = nullptr,
+                      idx_t worker_operator_bytes = 0);
 
 using InputFactory =
     std::function<unique_ptr<PhysicalOperator>(PhysicalPlan &, const string &, const vector<LogicalType> &)>;

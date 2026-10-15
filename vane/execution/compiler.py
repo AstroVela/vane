@@ -27,10 +27,14 @@ from vane.execution.plan import (
 class FragmentCompileOptions:
     partition_count: int = 1
     hash_columns: tuple[int, ...] = ()
+    # Per-worker, per-query operator reservation; zero keeps conservative planning.
+    worker_operator_bytes: int = 0
 
     def __post_init__(self) -> None:
         if type(self.partition_count) is not int or not 1 <= self.partition_count <= 2**31 - 1:
             raise ValueError("partition_count must be an integer between 1 and 2147483647")
+        if type(self.worker_operator_bytes) is not int or not 0 <= self.worker_operator_bytes <= 2**63 - 1:
+            raise ValueError("worker_operator_bytes must be an integer between 0 and 9223372036854775807")
         if not isinstance(self.hash_columns, (tuple, list)):
             raise ValueError("hash_columns must be a sequence of result-column positions")
         columns = tuple(self.hash_columns)
@@ -85,7 +89,9 @@ def compile_fragment_graph(
         raise ValueError("query_id must be a non-empty string")
     if not isinstance(options, FragmentCompileOptions):
         raise ValueError("options must be FragmentCompileOptions")
-    value = execution_plan.compile(connection, sql, query_id, options.partition_count, options.hash_columns)
+    value = execution_plan.compile(
+        connection, sql, query_id, options.partition_count, options.hash_columns, options.worker_operator_bytes
+    )
     return _native_graph(value)
 
 

@@ -729,12 +729,16 @@ class RayQueryRuntime(QueryRuntime):
                 ),
                 resources.worker_count * resources.io_concurrency,
             )
+            compile_options = FragmentCompileOptions(
+                resources.partitions,
+                worker_operator_bytes=resources.operator_memory_bytes // resources.max_active_queries,
+            )
             if mode is DistributedMode.FTE:
                 assert isinstance(options.target, RayExecution) and options.target.fte_options is not None
                 store = self.exchange_store(options.target.fte_options.exchange_store)
                 scheduler = RecoveryScheduler(self.pool, store, context, rows_per_batch, consumer)
                 context.started(scheduler.cancel)
-                scheduler.prepare(connection, sql, options, demand, FragmentCompileOptions(resources.partitions))
+                scheduler.prepare(connection, sql, options, demand, compile_options)
                 spec = scheduler.spec
             else:
                 spec = prepare_ray_query(
@@ -743,7 +747,7 @@ class RayQueryRuntime(QueryRuntime):
                     query_id=context.query_id,
                     options=options,
                     resources=demand,
-                    compile_options=FragmentCompileOptions(resources.partitions),
+                    compile_options=compile_options,
                 )
                 scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch, consumer)
                 context.started(scheduler.cancel)
