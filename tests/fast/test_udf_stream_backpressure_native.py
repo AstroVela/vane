@@ -384,9 +384,11 @@ def test_actor_retaining_previous_input_can_receive_the_next_batch(
                             batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
                             output_batch_size=1, output_target_max_bytes=1024,
                         )
+                    # Four sleeping consumers plus the producer must fit within
+                    # the 4-CPU CI runner while retaining every actor replica.
                     rel = rel.map_batches(
                         RetainingConsumer, schema={{'id': 'BIGINT'}},
-                        execution_backend='subprocess_actor', actor_number={actors},
+                        execution_backend='subprocess_actor', actor_number={actors}, cpus=0.5,
                         batch_size=1, min_task_batch_size=1, task_input_max_bytes=1024,
                     )
                     if {arena!r} == '96KiB' and not {copy_input!r}:

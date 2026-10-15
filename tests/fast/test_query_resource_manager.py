@@ -3817,6 +3817,82 @@ def test_task_and_output_liveness_tokens_have_independent_lifetimes():
     assert manager.snapshot()["usage"]["object_store_bytes"] == 0
 
 
+def test_partitioned_output_keeps_one_progress_grant_until_all_parts_leave_producer():
+    unit = _unit("resource:f:bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    request = OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    grant = manager.try_acquire_output_block(request)
+    assert grant.granted and grant.liveness
+    before = manager.snapshot()["usage"]
+    parts = manager.partition_output_block(grant.lease.lease_id, (2, 3, 7))
+    assert manager.snapshot()["usage"] == before
+    assert [part.size_bytes for part in parts] == [2, 3, 7]
+    assert manager.snapshot()["liveness"]["output_grants_total"] == 1
+    next_request = OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "next", 4)
+
+    def handoff(part):
+        manager.transition_output_block(part.lease_id, "unit_queue")
+        manager.transition_output_block(part.lease_id, "downstream_input")
+
+    handoff(parts[0])
+    manager.release_output_block(parts[1].lease_id)
+    assert manager.try_acquire_output_block(next_request).blocked_reason == "liveness_output_active"
+    handoff(parts[2])
+    # All parts have left the producer. Retained consumer bytes do not prevent
+    # the next publication from acquiring its single bounded progress grant.
+    next_grant = manager.try_acquire_output_block(next_request)
+    assert next_grant.granted and next_grant.liveness
+    manager.release_task_lease(task.lease_id, attempt_id=task.attempt_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 2 + 7 + 4
+    manager.release_output_block(parts[0].lease_id)
+    manager.release_output_block(parts[2].lease_id)
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 4
+    assert snapshot["liveness"]["active_output_lease_ids_by_unit"] == {unit.resource_unit_id: next_grant.lease.lease_id}
+    manager.release_output_block(next_grant.lease.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+    assert manager._liveness_output_members == {}
+
+
+@pytest.mark.parametrize("sizes", [(), (0, 12), (-1, 13), (4, 4), (6, 7)])
+def test_invalid_output_partition_preserves_original_lease(sizes):
+    unit = _unit("resource:f:invalid-bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    )
+    before = manager.snapshot()
+    with pytest.raises(ValueError, match="preserve admitted bytes"):
+        manager.partition_output_block(grant.lease.lease_id, sizes)
+    after = manager.snapshot()
+    # The existing soft-budget debt keeps aging while validation rejects the
+    # partition; the lease ledger, usage, and progress grant must stay intact.
+    assert after.pop("soft_allocation_debt_duration_s") >= before.pop("soft_allocation_debt_duration_s")
+    assert after == before
+    manager.cancel("test cleanup")
+    assert manager._liveness_output_members == {}
+
+
+def test_cancel_partitioned_output_removes_group_and_makes_late_release_idempotent():
+    unit = _unit("resource:f:cancel-bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    )
+    parts = manager.partition_output_block(grant.lease.lease_id, (5, 7))
+    manager.cancel("cancel bundle")
+    for part in parts:
+        assert not manager.release_output_block(part.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+    assert manager._liveness_output_members == {}
+
+
 def test_oversized_output_block_uses_one_bounded_liveness_grant():
     unit = _unit("resource:f:decode", target=50, blocks=2)
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=100))

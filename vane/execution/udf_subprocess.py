@@ -4162,21 +4162,27 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         if query is None or not isinstance(result, tuple) or len(result) != 4 or result[0] != REF_BUNDLE_RESULT_MARKER:
             return
         assert admission is not None
+        owners = ()
+        attached = 0
         try:
-            for ref in result[1]:
-                owner = query.own_output(admission.lease["query_policy_task"], ref.size, scope, admission)
-                try:
-                    ref.attach_query_output_lease(owner)
-                except BaseException as error:
-                    try:
-                        owner.release()
-                    except BaseException as cleanup_error:
-                        raise error from cleanup_error
-                    raise
+            owners = query.own_output_bundle(
+                admission.lease["query_policy_task"], tuple(ref.size for ref in result[1]), scope, admission
+            )
+            for ref, owner in zip(result[1], owners, strict=True):
+                ref.attach_query_output_lease(owner)
+                attached += 1
         except BaseException as error:
+            cleanup_error = None
+            for owner in owners[attached:]:
+                try:
+                    owner.release()
+                except BaseException as exc:
+                    cleanup_error = exc
             try:
                 _release_local_ref_bundle_result(result)
-            except BaseException as cleanup_error:
+            except BaseException as exc:
+                cleanup_error = exc
+            if cleanup_error is not None:
                 raise error from cleanup_error
             raise
 

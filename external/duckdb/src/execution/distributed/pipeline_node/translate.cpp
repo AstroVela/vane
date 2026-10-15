@@ -666,6 +666,19 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 		node_impl = TranslateNestedLoopJoin(nlj, children);
 		break;
 	}
+	case PhysicalOperatorType::CREATE_TABLE_AS:
+	case PhysicalOperatorType::BATCH_CREATE_TABLE_AS:
+	case PhysicalOperatorType::INSERT:
+	case PhysicalOperatorType::BATCH_INSERT: {
+		if (!plan_config_.native_scan_metadata) {
+			throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());
+		}
+		// DuckDB owns the write and its transaction. Expose the input UDFs and
+		// the sink boundary without creating a distributed write task.
+		node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
+		                                             MakeSchemaRef(op.GetTypes()), std::move(children), true));
+		return;
+	}
 	case PhysicalOperatorType::RECURSIVE_CTE:
 	case PhysicalOperatorType::RECURSIVE_KEY_CTE:
 	case PhysicalOperatorType::EXECUTE:
