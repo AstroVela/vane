@@ -16,8 +16,8 @@ from vane.ai.options import (
     _require_prompt_number,
     normalize_prompt_options,
 )
-from vane.ai.protocols import NativeInferencePlan
-from vane.ai.provider import Provider
+from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
+from vane.ai.providers._native_inference import NativeEmbeddingProviderMixin
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
@@ -106,7 +106,7 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
     """Serializable configuration for native SGLang query planning."""
 
     provider_name: str = "sglang"
-    model_name: str = "Qwen/Qwen3-1.7B"
+    model_name: str = ""
     system_message: str | None = None
     on_error: str = "raise"
     return_format: dict[str, Any] | None = None
@@ -201,10 +201,10 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
         return options
 
 
-class SGLangProvider(Provider):
-    """Provider backed by a local or remote SGLang engine."""
+class SGLangProvider(NativeEmbeddingProviderMixin):
+    """Provider backed by a native Python SGLang engine."""
 
-    DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
+    _native_family = "sglang"
 
     def __init__(self, name: str | None = None):
         self._name = name or "sglang"
@@ -221,12 +221,14 @@ class SGLangProvider(Provider):
         return_raw_response: bool = False,
         *,
         options: Mapping[str, Any] | None = None,
-    ) -> NativeSGLangPromptPlan:
+    ) -> NativeSGLangPromptPlan | PrompterDescriptor:
+        if "media_mime_types" in (options or {}):
+            return self._media_prompter(model, system_message, return_format, return_raw_response, options)
         if return_raw_response:
             raise ValueError("Provider 'sglang' does not support return_raw_response")
         prepared = normalize_prompt_options("sglang", options or {}, relation=False)
         prepared = _validate_sglang_prompt_options(prepared)
-        model_name = model or self.DEFAULT_MODEL
+        model_name = model
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("SGLang prompt model must be a non-empty string")
         return NativeSGLangPromptPlan(

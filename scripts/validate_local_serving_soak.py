@@ -125,7 +125,7 @@ def require_idle_owners(resources):
         admission = pool["admission"]
         if pool["active_workers"] or admission["active_leases"] or admission["ordinary_waiters"]:
             raise AssertionError("idle model pool retained work")
-        if admission["available_slots"] != pool["pool_size"]:
+        if admission["available_slots"] != pool["pool_size"] * admission.get("prefetch_depth", 1):
             raise AssertionError("idle model pool did not return every slot")
     tasks = resources.get("task_workers")
     if tasks is not None and tasks["reserved_execution_slots"]:

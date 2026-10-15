@@ -51,6 +51,101 @@ def callback_relation(connection, batches):
 """
 
 
+@pytest.mark.parametrize("callback", ["interrupt", "stream_cleanup"])
+def test_native_callback_gc_releases_context_without_holding_gil(monkeypatch, callback):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import gc
+        import sys
+        import threading
+
+        import pyarrow as pa
+        import vane
+        import builtins
+        from vane.datasource import DataSource, DataSourceTask
+        from vane.execution import local_query, local_result_delivery
+        from vane.execution.request_admission import RequestAdmissionLimits
+        from vane.execution.result_delivery import ResultDeliveryLimits
+
+        faulthandler.dump_traceback_later(15, exit=True)
+        # Choose exactly when the last callback cycle is collected.
+        gc.disable()
+        kind = sys.argv[1]
+        callbacks = []
+        if kind == 'interrupt':
+            started = local_query._NativeQuery.started
+            def capture(self, interrupt):
+                callbacks.append(interrupt)
+                return started(self, interrupt)
+            local_query._NativeQuery.started = capture
+        else:
+            prepare = local_result_delivery.prepare_native_query_stream
+            def capture(*args, **kwargs):
+                callbacks.append(args[4])
+                return prepare(*args, **kwargs)
+            local_result_delivery.prepare_native_query_stream = capture
+
+        rows = 65536
+        builtins._vane_callback_gc_batch = pa.record_batch({'x': pa.array(range(rows), type=pa.int64())})
+        builtins._vane_callback_gc_threads = set()
+        owner = threading.get_ident()
+        class Task(DataSourceTask):
+            def execute(self):
+                import builtins, threading
+                builtins._vane_callback_gc_threads.add(threading.get_ident())
+                yield builtins._vane_callback_gc_batch
+        class Source(DataSource):
+            @property
+            def schema(self):
+                return {'x': 'BIGINT'}
+            def get_tasks(self):
+                for _ in range(8):
+                    yield Task()
+
+        with vane.connect(config={'threads': 2}) as connection:
+            runtime = connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1),
+                result_limit=ResultDeliveryLimits(1, 65536),
+            )
+            relation = connection.from_datasource(Source()).aggregate("sum(x)::BIGINT AS total")
+            expected = 8 * rows * (rows - 1) // 2
+            if kind == 'interrupt':
+                assert relation.fetchall() == [(expected,)]
+            else:
+                result = relation.execute_result(stream=True)
+                assert result.take().to_pylist() == [{'total': expected}]
+                try:
+                    result.take()
+                except StopIteration:
+                    pass
+                else:
+                    raise AssertionError('stream did not finish')
+                result.close()
+                del result
+            assert builtins._vane_callback_gc_threads - {owner}, builtins._vane_callback_gc_threads
+            assert len(callbacks) == 1, callbacks
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+        # The retained callback becomes the final native context owner.
+        del relation, runtime, connection
+        gc.collect()
+        callbacks.append(callbacks)
+        del callbacks
+        gc.collect()
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, callback],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.fixture
 def native_environment(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -1012,8 +1107,10 @@ def test_datasource_input_reentry_is_rejected_before_connection_locks(native_env
                 yield pa.record_batch({"x": [1]})
 
             relation = callback_relation(connection, batches)
+            # Exercise the deadline-managed path without letting setup expire
+            # before the callback whose reentry guard this test must observe.
             runtime = connection.configure_local_runtime(
-                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1 if timed else None
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=5.0 if timed else None
             )
             try:
                 assert relation.fetchall() == [(1,)]
@@ -1066,8 +1163,10 @@ def test_datasource_input_file_operations_check_reentry(native_environment, tmp_
         faulthandler.dump_traceback_later(8, exit=True)
         path, entry, target = sys.argv[1:]
         with vane.connect(config={"threads": 2}) as parent:
+            # Keep deadline handling enabled while allowing input setup to
+            # reach the callback whose FILE reentry guard is under test.
             runtime = parent.configure_local_runtime(
-                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=5.0
             )
             with parent.cursor() as cursor, parent.cursor() as sibling:
                 executing = parent if target == "connection" else cursor

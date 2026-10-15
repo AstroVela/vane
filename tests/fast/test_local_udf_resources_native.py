@@ -51,7 +51,7 @@ def transport(monkeypatch):
 def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(monkeypatch, tracking, limited_tasks):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     observed = []
-    outputs = []
+    output_observed = []
     complete = udf_subprocess.UDFExecutor._complete_task_submit
     publish = udf_subprocess.UDFExecutor._publish_stream_result
 
@@ -60,9 +60,9 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
         return complete(executor, *args, **kwargs)
 
     def observe_output(executor, *args, **kwargs):
-        # A consumer may release streamed output before the producer finishes.
-        # Inspect byte ownership while the block is still awaiting publication.
-        outputs.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
+        # The producer owns this block until publication. Downstream can
+        # consume and release it before the terminal completion callback.
+        output_observed.append((executor.resource_identity(), runtime.resource_snapshot()["udf_units"]))
         return publish(executor, *args, **kwargs)
 
     monkeypatch.setattr(udf_subprocess.UDFExecutor, "_complete_task_submit", observe)
@@ -115,17 +115,20 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
                         resource.shutdown()
                 gc.collect()
                 _wait(lambda: not runtime.resource_snapshot()["udf_units"])
+                if tracking != "graph_only":
+                    data = runtime.resource_snapshot()["data"]
+                    assert data["leases"] == data["retained_bytes"] == 0
             assert len(query_ids) == 2 and worker_pids[0] == worker_pids[1]
-        for observations in (observed, outputs):
-            assert len(observations) == 4
-            assert {identity["query_id"] for identity, _ in observations} == query_ids
-            assert {identity["backend"] for identity, _ in observations} == {"subprocess_task", "subprocess_actor"}
+        expected = {
+            (query_id, backend) for query_id in query_ids for backend in ("subprocess_task", "subprocess_actor")
+        }
+        for snapshots in (observed, output_observed):
+            assert {(identity["query_id"], identity["backend"]) for identity, _ in snapshots} == expected
         for identity, units in observed:
             own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
             assert own["completing_tasks"] >= 1
-        for identity, units in outputs:
+        for identity, units in output_observed:
             own = next(unit for unit in units if unit["resource_unit_id"] == identity["resource_unit_id"])
-            assert own["running_tasks"] >= 1
             if tracking == "graph_only":
                 assert own["data"] is None
             else:

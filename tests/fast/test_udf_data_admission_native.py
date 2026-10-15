@@ -13,6 +13,7 @@ import pytest
 import vane
 from tests.local_admission_helpers import linear_metadata
 from vane import pickle as vane_pickle
+from vane.ai import DiagnosticError, summarize_error
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataAdmissionWaitLimits
@@ -549,7 +550,8 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
             _release_local_ref_bundle_result(block)
             result = executor.take_ready_result()
             error = result if submit_id is None else result[2]
-            assert isinstance(error, OSError)
+            assert isinstance(error, DiagnosticError)
+            assert summarize_error(error) == "OSError"
             assert "reservation completion failure" in str(error)
             executor.stats()
             assert strict_transport.snapshot()["usage_bytes"] == 0
@@ -780,6 +782,17 @@ def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited, mo
         result = _wait_result(first)
         assert not isinstance(result, BaseException)
         refs.extend(result[1])
+        # Execution completion wakes the query admission pump asynchronously.
+        # Wait for its callback to record the refusal without consuming it.
+        authority = second._admission_authority
+        deadline = time.monotonic() + 5
+        while True:
+            with authority._lock:
+                recorded = authority._wakeup_refusal is not None
+            if recorded:
+                break
+            assert time.monotonic() < deadline, "queued admission did not record its byte refusal"
+            time.sleep(0.01)
         # A transport notification can arrive after the pool callback has
         # recorded a byte refusal but before the dispatcher reads it.
         strict_transport.wake_waiters()

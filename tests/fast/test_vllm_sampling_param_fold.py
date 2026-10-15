@@ -31,7 +31,7 @@ def _plan_from_prompt_options(options: dict) -> NativeVLLMPromptPlan:
 
     descriptor, _, _, _ = _prepare_prompt_call(
         "vllm",
-        None,
+        "test-model",
         None,
         None,
         False,
@@ -78,7 +78,7 @@ class TestFoldReachesNativeOptions:
         assert native["generate_args"]["lora_request"] == "adapter"
 
     def test_direct_plan_construction_folds(self):
-        plan = NativeVLLMPromptPlan(vllm_options={"max_tokens": 512})
+        plan = NativeVLLMPromptPlan(model_name="test-model", vllm_options={"max_tokens": 512})
         assert _native_sampling_params(plan)["max_tokens"] == 512
 
     def test_on_error_stays_top_level(self):
@@ -106,13 +106,15 @@ class TestExplicitSamplingParamsPrecedence:
 
     def test_json_string_sampling_params_entry_wins(self):
         plan = NativeVLLMPromptPlan(
-            vllm_options={"max_tokens": 512, "generate_args": {"sampling_params": '{"max_tokens": 64}'}}
+            model_name="test-model",
+            vllm_options={"max_tokens": 512, "generate_args": {"sampling_params": '{"max_tokens": 64}'}},
         )
         assert _native_sampling_params(plan)["max_tokens"] == 64
 
     def test_convenience_field_folds_into_json_string_sampling_params(self):
         plan = NativeVLLMPromptPlan(
-            vllm_options={"max_tokens": 512, "generate_args": {"sampling_params": '{"top_p": 0.9}'}}
+            model_name="test-model",
+            vllm_options={"max_tokens": 512, "generate_args": {"sampling_params": '{"top_p": 0.9}'}},
         )
         assert _native_sampling_params(plan) == {"top_p": 0.9, "max_tokens": 512}
 
@@ -129,12 +131,12 @@ class TestNoInputMutation:
     def test_plan_input_dict_is_not_mutated(self):
         vllm_options = {"max_tokens": 512, "generate_args": {"sampling_params": {"seed": 7}}}
         snapshot = copy.deepcopy(vllm_options)
-        plan = NativeVLLMPromptPlan(vllm_options=vllm_options)
+        plan = NativeVLLMPromptPlan(model_name="test-model", vllm_options=vllm_options)
         plan.build_physical_vllm_options()
         assert vllm_options == snapshot
 
     def test_build_is_repeatable(self):
-        plan = NativeVLLMPromptPlan(vllm_options={"max_tokens": 512})
+        plan = NativeVLLMPromptPlan(model_name="test-model", vllm_options={"max_tokens": 512})
         assert plan.build_physical_vllm_options() == plan.build_physical_vllm_options()
 
 
@@ -165,7 +167,7 @@ def test_public_vllm_rejects_guided_decoding_alias_mapping():
 @pytest.mark.parametrize(
     "factory",
     [
-        pytest.param(_plan_from_prompt_options, id="prompt-entry-point-default-model"),
+        pytest.param(_plan_from_prompt_options, id="prompt-entry-point"),
         pytest.param(
             lambda options: VLLMProvider().get_prompter(model="selected-model", options=options),
             id="provider-factory-explicit-model",
@@ -182,7 +184,9 @@ def test_public_vllm_rejects_model_in_engine_args_during_planning(factory):
     "factory",
     [
         pytest.param(_plan_from_prompt_options, id="prompt-entry-point"),
-        pytest.param(lambda options: VLLMProvider().get_prompter(options=options), id="provider-factory"),
+        pytest.param(
+            lambda options: VLLMProvider().get_prompter(model="test-model", options=options), id="provider-factory"
+        ),
     ],
 )
 def test_public_vllm_rejects_negative_nested_temperature_during_planning(sampling_params, factory):
@@ -228,7 +232,9 @@ def test_public_vllm_rejects_negative_nested_temperature_during_planning(samplin
     "factory",
     [
         pytest.param(_plan_from_prompt_options, id="prompt-entry-point"),
-        pytest.param(lambda options: VLLMProvider().get_prompter(options=options), id="provider-factory"),
+        pytest.param(
+            lambda options: VLLMProvider().get_prompter(model="test-model", options=options), id="provider-factory"
+        ),
     ],
 )
 def test_public_vllm_remote_code_requires_an_immutable_code_revision(engine_args, factory):
@@ -284,7 +290,8 @@ class TestNonMappingContainers:
 
     def test_invalid_sampling_params_json_raises(self):
         plan = NativeVLLMPromptPlan(
-            vllm_options={"max_tokens": 5, "generate_args": {"sampling_params": '{"max_tokens":'}}
+            model_name="test-model",
+            vllm_options={"max_tokens": 5, "generate_args": {"sampling_params": '{"max_tokens":'}},
         )
         with pytest.raises(ValueError, match="sampling_params"):
             plan.build_physical_vllm_options()
@@ -292,14 +299,16 @@ class TestNonMappingContainers:
 
 class TestNoOpCases:
     def test_none_convenience_values_are_dropped_without_fold(self):
-        plan = NativeVLLMPromptPlan(vllm_options={"max_tokens": None, "temperature": None})
+        plan = NativeVLLMPromptPlan(model_name="test-model", vllm_options={"max_tokens": None, "temperature": None})
         native = plan.build_physical_vllm_options()
         assert "max_tokens" not in native
         assert "temperature" not in native
         assert "generate_args" not in native
 
     def test_options_without_convenience_fields_pass_through(self):
-        plan = NativeVLLMPromptPlan(vllm_options={"generate_args": {"lora_request": "adapter"}})
+        plan = NativeVLLMPromptPlan(
+            model_name="test-model", vllm_options={"generate_args": {"lora_request": "adapter"}}
+        )
         native = plan.build_physical_vllm_options()
         assert native["generate_args"] == {"lora_request": "adapter"}
 

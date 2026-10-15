@@ -2914,6 +2914,7 @@ void DuckDBPyConnection::Interrupt() {
 			request.attr("cancel")();
 		} else {
 			context->Interrupt();
+			CancelPythonUDFActorResourcePreparation(*context);
 		}
 	} catch (...) {
 		interrupt_generation.fetch_add(1);

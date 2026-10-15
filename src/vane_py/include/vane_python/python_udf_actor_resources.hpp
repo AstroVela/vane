@@ -23,6 +23,10 @@ pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedS
 void EnableLocalRuntimeInputPolicy(ClientContext &context);
 bool HasLocalRuntimeInputPolicy(const ClientContext &context);
 
+//! Cancel ordinary native UDF startup without waiting for the context lock.
+//! Requires the GIL; the active preparation scope owns the cancellation state.
+void CancelPythonUDFActorResourcePreparation(ClientContext &context);
+
 class ScopedPythonUDFActorResourcePreparation {
 public:
 	explicit ScopedPythonUDFActorResourcePreparation(ClientContext &context,

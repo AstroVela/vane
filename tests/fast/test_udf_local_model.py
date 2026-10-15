@@ -15,6 +15,7 @@ import pytest
 import vane
 from tests.local_admission_helpers import PreparedOwners, linear_metadata
 from vane import pickle as vane_pickle
+from vane.ai import DiagnosticError, summarize_error
 from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
@@ -256,8 +257,9 @@ def test_data_accounting_completion_failure_still_returns_task_worker_capacity(m
             _submit(failed, pa.table({"x": [1]}))
             _wait_until(lambda: bool(failed._queue), "completion callback did not publish its result")
         error = failed.take_ready_result()
-        assert isinstance(error, RuntimeError)
-        assert str(error) == "planned accounting callback failure"
+        assert isinstance(error, DiagnosticError)
+        assert summarize_error(error) == "RuntimeError"
+        assert "planned accounting callback failure" in str(error)
         failed.stats()  # Cleanup is a task result, not a persistent wakeup error.
         assert not failed._task_futures
         assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
@@ -1385,6 +1387,7 @@ def test_transport_waiters_yield_node_cpu_to_another_pool_before_resuming_or_can
     monkeypatch.setattr(local.os, "cpu_count", lambda: workers)
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    competing_task = budget.reserve_task_bytes(1, 1)
     large, small = pa.table({"x": list(range(8192))}), pa.table({"x": [1]})
     held = ref_bundle.make_local_shm_ref_bundle_result(large)
 
@@ -1436,8 +1439,10 @@ def test_transport_waiters_yield_node_cpu_to_another_pool_before_resuming_or_can
         _wait_until(lambda: global_runtime.execution_capacity.reserved_slots == 0, "global capacity leaked")
         snapshot = runtime.resource_snapshot()["task_admission"]
         assert snapshot["running_tasks"] == snapshot["waiting_tasks"] == snapshot["resuming_tasks"] == 0
+        competing_task.release()
         assert budget.snapshot()["usage_bytes"] == 0
     finally:
+        competing_task.release()
         for ref in held[1]:
             ref.release()
         for executor in executors:

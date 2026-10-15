@@ -33,6 +33,7 @@ from typing import Any, Callable
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
+from vane.ai._errors import DiagnosticError
 from vane.ai.functions import _log_substituted_failure
 from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
 
@@ -387,7 +388,9 @@ class LocalEngineExecutor(LLMExecutor):
             if not self._ray_actor_mode and not self.engine_ready.is_set():
                 await self._wait_for_engine_ready_async()
             if self.engine_error_message is not None:
-                raise _SafeProviderError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
+                raise DiagnosticError(
+                    f"{self._engine_name} engine init failed", _SafeProviderError(self.engine_error_message)
+                )
             if self.llm is None:
                 raise _SafeProviderError(f"{self._engine_name} engine not initialized")
             with self.counter_lock:
@@ -471,7 +474,9 @@ class LocalEngineExecutor(LLMExecutor):
                 raise RuntimeError(f"{self._engine_name} executor is shutting down")
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
-                    raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
+                    raise DiagnosticError(
+                        f"{self._engine_name} engine init failed", _SafeProviderError(self.engine_error_message)
+                    )
                 self._append_error_rows(rows)
                 return
             with self.task_count_lock:
@@ -516,7 +521,9 @@ class LocalEngineExecutor(LLMExecutor):
 
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
-                    raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
+                    raise DiagnosticError(
+                        f"{self._engine_name} engine init failed", _SafeProviderError(self.engine_error_message)
+                    )
                 self._append_error_rows(rows, executor_id, reservation_id)
                 return
 
@@ -555,7 +562,7 @@ class LocalEngineExecutor(LLMExecutor):
             return
         error_message = self._per_executor_errors.get(executor_id) if executor_id else self.error_message
         if error_message is not None:
-            raise RuntimeError(f"{self._engine_name} task failed: {error_message}")
+            raise DiagnosticError(f"{self._engine_name} task failed", _SafeProviderError(error_message))
 
     def take_ready_result(self, executor_id: str | None = None) -> tuple[Any, ...] | None:
         self._raise_if_task_failed(executor_id)
@@ -740,6 +747,9 @@ class LocalEngineExecutor(LLMExecutor):
 
     def all_tasks_finished(self) -> bool:
         with self.task_count_lock:
+            # Generation records failures before decrementing the task count.
+            # Check under the same lock so an error cannot become successful completion.
+            self._raise_if_task_failed()
             return self._finished_submitting and self.running_task_count == 0 and len(self.completed_tasks) == 0
 
     def _wakeup_ready(self) -> bool:

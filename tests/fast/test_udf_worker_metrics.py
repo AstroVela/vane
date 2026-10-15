@@ -516,7 +516,7 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     )
     release_grant = subprocess_exec.release_local_shm_output_grant
     before = subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"]
-    event = vane_pickle.dumps({"request_id": 1, "size_bytes": 296})
+    event = vane_pickle.dumps({"request_id": 1, "size_bytes": 296, "input_tokens": []})
 
     def fail_response(*_args):
         assert worker._proc.poll() is None
@@ -551,11 +551,25 @@ def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, f
     assert nonzero(metrics) == {field: 1}
 
 
+@pytest.mark.parametrize("tokens", [None, {}, [0], [-1], [True], ["1"]])
+def test_output_grant_rejects_malformed_input_view_snapshot(monkeypatch, tokens):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    worker = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    failures = []
+    monkeypatch.setattr(worker, "_record_worker_protocol_failure", failures.append)
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 296, "input_tokens": tokens})
+    with pytest.raises(ValueError, match="invalid output grant shared-memory input tokens") as error:
+        worker._decode_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
+    assert failures == [error.value]
+
+
 @pytest.mark.parametrize(
     "message,field",
     [
         ("_MSG_INPUT_CONSUMED", "input_lease_id"),
         ("_MSG_INPUT_CONSUME_FAILED", "input_lease_id"),
+        ("_MSG_INPUT_RETAINED", "tokens"),
         ("_MSG_OUTPUT_GRANT_REQUEST", "size_bytes"),
         ("_MSG_OUTPUT_GRANT_RELEASE", "grant_id"),
     ],
@@ -783,6 +797,88 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
     finally:
         # Corrupting a response can hide names from the parent. The probe owns
         # the original descriptor so its injected protocol damage leaks no shm.
+        _release_corrupted_descriptors(descriptors)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("failure", ["invalid_ipc", "truncated_ipc_body"])
+@pytest.mark.timeout(60)
+def test_failed_stream_receiver_does_not_retain_transferred_output(monkeypatch, backend, failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    receive = local._recv_message
+    decode_handler = local._SingleSubprocessExecutor._result_decode_error_handler
+    track_future = local.UDFExecutor._track_task_future
+    decode_started = threading.Event()
+    receiver_failed = threading.Event()
+    descriptors, sockets, futures = [], [], []
+
+    def receive_until_decode_failure(sock):
+        if sockets and sock is sockets[0] and not receiver_failed.is_set():
+            # The consumer retires the producer before the terminal frame.
+            # Retain the resulting Future/error so GC cannot mask a stale
+            # reference to the already-published block in the receiver frame.
+            assert decode_started.wait(10), "consumer did not decode the corrupted block"
+            receiver_failed.set()
+            raise EOFError("injected receiver EOF after deferred decoding failure")
+        message, payload = receive(sock)
+        if message == local._MSG_REF_BUNDLE_CHUNK and not descriptors:
+            descriptor = vane_pickle.loads(payload)
+            descriptors.append(descriptor)
+            sockets.append(sock)
+            _corrupt_shm_result(descriptor, failure, monkeypatch=monkeypatch)
+        return message, payload
+
+    def observe_decode_failure(worker):
+        handler = decode_handler(worker)
+        assert handler is not None
+
+        def failed(error):
+            decode_started.set()
+            handler(error)
+
+        return failed
+
+    def retain_future(executor, future, *args, **kwargs):
+        futures.append(future)
+        return track_future(executor, future, *args, **kwargs)
+
+    monkeypatch.setattr(local, "_recv_message", receive_until_decode_failure)
+    monkeypatch.setattr(local._SingleSubprocessExecutor, "_result_decode_error_handler", observe_decode_failure)
+    monkeypatch.setattr(local.UDFExecutor, "_track_task_future", retain_future)
+    try:
+        with vane.connect(config={"threads": 2}) as connection:
+            runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 4))
+
+            def query():
+                return connection.sql("SELECT 1::BIGINT AS x").map_batches(
+                    _Actor if backend == "subprocess_actor" else _task,
+                    schema={"pid": "BIGINT"},
+                    execution_backend=backend,
+                    **({"actor_number": 1} if backend == "subprocess_actor" else {}),
+                )
+
+            with pytest.raises(Exception):
+                query().fetchall()
+            assert decode_started.is_set() and receiver_failed.is_set()
+            assert len(descriptors) == len(futures) == 1
+            assert futures[0].done()
+            error = futures[0].exception()
+            assert error is not None
+            assert error.__traceback__ is not None
+            snapshot = runtime.resource_snapshot()
+            outcomes = {key: value for key, value in snapshot["worker_failures"].items() if value}
+            outcomes.pop("shutdown_workers", None)
+            assert outcomes == {"worker_losses": 1}
+            assert snapshot["request_admission"]["active_requests"] == 0
+            assert snapshot["request_admission"]["failed_executions"] == 1
+            # Neither the retained Future nor its error may own consumed data.
+            with pytest.raises(ValueError):
+                ref_bundle.acquire_allocation(descriptors[0]["block_refs"][0]["allocation"])
+            assert query().fetchall()[0][0] > 0
+            assert runtime.resource_snapshot()["worker_failures"]["worker_losses"] == 1
+    finally:
         _release_corrupted_descriptors(descriptors)
 
 
@@ -1341,6 +1437,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
     )
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    before_owners = set(ref_bundle.local_shm_budget_manager()._owned_output_grants)
+    before_input_owners = dict(ref_bundle.local_shm_budget_manager()._owned_input_allocations)
     receive, acquire = local._recv_message, ref_bundle.acquire_allocation
     release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
     release_descriptor = local.release_local_shm_ref_bundle_descriptor
@@ -1366,8 +1464,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         injected.append(cleanup_failure)
         raise RuntimeError("injected adoption cleanup failure")
 
-    def fail_budget_callback(size, *, name=""):
-        release_budget(size, name=name)
+    def fail_budget_callback(size, *, name="", output_owner=None, input_owner_id=None):
+        release_budget(size, name=name, output_owner=output_owner, input_owner_id=input_owner_id)
         # Model a failing post-release notification, without leaking a test
         # allocation. The failed region acquisition remains the primary error.
         if descriptors and not injected:
@@ -1401,6 +1499,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     assert worker._cleanup_finished
     assert nonzero(metrics) == {field: 1}
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+    assert set(ref_bundle.local_shm_budget_manager()._owned_output_grants) == before_owners
+    assert ref_bundle.local_shm_budget_manager()._owned_input_allocations == before_input_owners
 
 
 @pytest.mark.parametrize("path", ["recv_header", "recv_payload", "send_submit", "send_grant", "send_finished"])

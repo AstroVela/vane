@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +20,7 @@ import vane
 from vane import pickle as vane_pickle
 from vane.execution import local_gpu_devices, udf_subprocess
 from vane.execution.udf import build_executor
+from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
 from vane.execution.udf_local_gpu import LocalGpuModelAdapter
 from vane.execution.udf_local_resources import LocalProcessCapacityError
 from vane.execution.udf_model_pool import ModelPoolRegistry
@@ -50,35 +52,256 @@ def payload(actor=DeviceActor, replicas=1):
 @pytest.fixture
 def inventory(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", lambda: DEVICES)
+    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", lambda **kwargs: DEVICES)
     yield
     assert not local_gpu_devices._owners.occupied
 
 
 def test_discovery_uses_a_fresh_interpreter_with_inherited_visibility(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,0")
+    popen = subprocess.Popen
 
-    def run(command, **kwargs):
+    def spawn(command, **kwargs):
         assert command[1] == "-I"
         assert command[-1].endswith("local_cuda_inventory.py")
         assert "env" not in kwargs
         assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,0"
-        assert kwargs["timeout"] == 30 and kwargs["check"]
-        return subprocess.CompletedProcess(command, 0, f'["{DEVICES[1]}", "{DEVICES[0]}"]')
+        code = (
+            "import json, os; assert os.environ['CUDA_VISIBLE_DEVICES'] == '1,0'; "
+            f"print(json.dumps({list(DEVICES[::-1])!r}))"
+        )
+        return popen([command[0], command[1], "-c", code], **kwargs)
 
-    monkeypatch.setattr(local_gpu_devices.subprocess, "run", run)
-    assert local_gpu_devices.discover_gpu_devices() == DEVICES[::-1]
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    scope = ExecutionCancellationScope("successful-discovery", 1)
+    assert local_gpu_devices.discover_gpu_devices(cancellation=scope) == DEVICES[::-1]
+    assert scope._cancel_wakeups == {}
 
 
-@pytest.mark.parametrize("error", [OSError("no driver"), subprocess.TimeoutExpired("probe", 30)])
-def test_discovery_reports_failures_without_claiming_devices(monkeypatch, error):
+def test_discovery_reports_child_error_and_closes_pipes(monkeypatch):
+    popen = subprocess.Popen
+    children = []
+
+    def spawn(command, **kwargs):
+        child = popen(
+            [sys.executable, "-I", "-c", "import sys; print('NVML unavailable', file=sys.stderr); sys.exit(3)"],
+            **kwargs,
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeError, match="discovery failed: NVML unavailable"):
+        local_gpu_devices.reserve_gpu_devices(1)
+    assert children[0].returncode == 3
+    assert children[0].stdout.closed and children[0].stderr.closed
+    assert not local_gpu_devices._owners.occupied
+
+
+def test_discovery_reports_spawn_failure_without_claiming_devices(monkeypatch):
     def fail(*args, **kwargs):
-        raise error
+        raise OSError("no driver")
 
-    monkeypatch.setattr(local_gpu_devices.subprocess, "run", fail)
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", fail)
     with pytest.raises(RuntimeError, match="discovery failed"):
         local_gpu_devices.reserve_gpu_devices(1)
     assert not local_gpu_devices._owners.occupied
+
+
+def test_discovery_timeout_kills_and_reaps_child(monkeypatch):
+    popen = subprocess.Popen
+    children = []
+
+    def spawn(command, **kwargs):
+        child = popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"], **kwargs)
+        children.append(child)
+        communicate = child.communicate
+
+        def short_timeout(*args, **options):
+            assert options["timeout"] == 30
+            return communicate(*args, timeout=0.1)
+
+        monkeypatch.setattr(child, "communicate", short_timeout)
+        return child
+
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        local_gpu_devices.reserve_gpu_devices(1)
+    assert children[0].returncode is not None
+    assert children[0].stdout.closed and children[0].stderr.closed
+    assert not local_gpu_devices._owners.occupied
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_cancelled_discovery_starts_no_child_and_claims_no_devices(monkeypatch, explicit):
+    scope = ExecutionCancellationScope("cancelled-discovery", 1)
+    scope.cancel("before discovery")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("cancelled discovery spawned a child")
+
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", unexpected)
+    with pytest.raises(ExecutionCancelledError):
+        local_gpu_devices.reserve_gpu_devices(1, DEVICES[:1] if explicit else None, cancellation=scope)
+    assert not local_gpu_devices._owners.occupied
+
+
+def test_cancellation_during_spawn_is_delivered_after_child_is_owned(monkeypatch):
+    scope = ExecutionCancellationScope("spawn-race", 1)
+    popen = subprocess.Popen
+    children = []
+
+    def spawn(command, **kwargs):
+        child = popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"], **kwargs)
+        children.append(child)
+        scope.cancel("during spawn")
+        return child
+
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    with pytest.raises(ExecutionCancelledError):
+        local_gpu_devices.reserve_gpu_devices(1, cancellation=scope)
+    assert children[0].returncode is not None
+    assert children[0].stdout.closed and children[0].stderr.closed
+    assert not local_gpu_devices._owners.occupied
+
+
+@pytest.mark.parametrize(
+    "configured,terminal,action",
+    [
+        (True, "fetchall", "interrupt"),
+        (True, "fetchall", "deadline"),
+        (False, "fetchall", "interrupt"),
+        (False, "write_parquet", "interrupt"),
+    ],
+)
+def test_query_cancellation_reaps_discovery(monkeypatch, tmp_path, configured, terminal, action):
+    from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestExecutionTimeout
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+    helper = tmp_path / "local_cuda_inventory.py"
+    helper.write_text(
+        "import os, time\nfrom pathlib import Path\n"
+        f"Path({str(entered)!r}).write_text(str(os.getpid()))\n"
+        "deadline = time.monotonic() + 20\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    if time.monotonic() > deadline: raise TimeoutError('test discovery was not released')\n"
+        "    time.sleep(0.01)\n"
+        f"print('[\"{DEVICES[0]}\"]')\n"
+    )
+    monkeypatch.setattr(local_gpu_devices, "__file__", str(tmp_path / "local_gpu_devices.py"))
+    popen = subprocess.Popen
+    children = []
+
+    def spawn(command, **kwargs):
+        child = popen(command, **kwargs)
+        if str(helper) in command:
+            children.append(child)
+        return child
+
+    monkeypatch.setattr(local_gpu_devices.subprocess, "Popen", spawn)
+    discover = local_gpu_devices.discover_gpu_devices
+    scopes = []
+
+    def discover_with_scope(*, cancellation=None):
+        scopes.append(cancellation)
+        return discover(cancellation=cancellation)
+
+    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", discover_with_scope)
+    with vane.connect(config={"threads": 2}) as connection:
+        runtime = (
+            connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1 if action == "deadline" else None
+            )
+            if configured
+            else None
+        )
+        relation = connection.sql("SELECT 7 AS x").map_batches(
+            DeviceActor, schema={"x": vane.sqltypes.INTEGER, "device": vane.sqltypes.VARCHAR}, actor_number=1, gpus=1
+        )
+        output = tmp_path / "output.parquet"
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            future = clients.submit(
+                relation.fetchall if terminal == "fetchall" else lambda: relation.write_parquet(str(output))
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not entered.exists():
+                    if future.done():
+                        future.result()
+                    assert time.monotonic() < deadline, "discovery did not start"
+                    time.sleep(0.01)
+                if action == "interrupt":
+                    connection.interrupt()
+                expected = (
+                    (RequestCancelled if action == "interrupt" else RequestExecutionTimeout)
+                    if configured
+                    else vane.Error
+                )
+                with pytest.raises(expected) as cancelled:
+                    future.result(timeout=3)
+                if not configured:
+                    assert "interrupt" in str(cancelled.value).lower() or "cancel" in str(cancelled.value).lower()
+                assert len(children) == 1 and children[0].returncode is not None
+                assert children[0].stdout.closed and children[0].stderr.closed
+                assert scopes[0] is not None and scopes[0].is_set()
+                assert not output.exists()
+                if runtime is not None:
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cancelling_requests"] == 0
+                assert not local_gpu_devices._owners.occupied
+                assert connection.execute("SELECT 9").fetchall() == [(9,)]
+                if action == "interrupt":
+                    release.touch()
+                    assert relation.fetchall() == [(7, DEVICES[0])]
+                    assert scopes[1] is not scopes[0] and not scopes[1].is_set()
+                    assert not local_gpu_devices._owners.occupied
+            finally:
+                release.touch()
+                try:
+                    future.result(timeout=5)
+                except (RequestCancelled, RequestExecutionTimeout, vane.Error):
+                    pass
+
+
+def test_ordinary_query_interrupt_during_startup_scope_creation(monkeypatch):
+    from vane.execution import udf_lifecycle
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    entered = threading.Event()
+    release = threading.Event()
+    discovery_calls = []
+
+    class DelayedScope(ExecutionCancellationScope):
+        def __init__(self, owner_id, generation):
+            entered.set()
+            assert release.wait(10)
+            super().__init__(owner_id, generation)
+
+    def unexpected_discovery(**kwargs):
+        discovery_calls.append(kwargs)
+        pytest.fail("unexpected GPU discovery")
+
+    monkeypatch.setattr(udf_lifecycle, "ExecutionCancellationScope", DelayedScope)
+    monkeypatch.setattr(local_gpu_devices, "discover_gpu_devices", unexpected_discovery)
+    with vane.connect(config={"threads": 2}) as connection:
+        relation = connection.sql("SELECT 7 AS x").map_batches(
+            DeviceActor, schema={"x": vane.sqltypes.INTEGER, "device": vane.sqltypes.VARCHAR}, actor_number=1, gpus=1
+        )
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            future = clients.submit(relation.fetchall)
+            try:
+                assert entered.wait(5)
+                connection.interrupt()
+                release.set()
+                with pytest.raises(vane.Error, match="(?i)interrupt|cancel"):
+                    future.result(timeout=3)
+                assert discovery_calls == []
+                assert not local_gpu_devices._owners.occupied
+                assert connection.execute("SELECT 9").fetchall() == [(9,)]
+            finally:
+                release.set()
 
 
 def test_replica_reservation_is_atomic_under_contention(inventory):

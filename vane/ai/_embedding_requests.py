@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, ordered request execution for built-in remote embedders.
+"""Request-owned embedding policies and remote text request planning.
 
 The owning UDF executor supplies the event loop. Each worker owns at most
 one request (including its retries); successful requests are never replayed
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from vane.ai.provider import ProviderCapabilityError, _ProviderResultError
+from vane.execution._async_dispatch import map_async_ordered
 
 logger = logging.getLogger(__name__)
 
@@ -108,13 +109,8 @@ class EmbeddingMetrics:
     queue_seconds: float = 0.0
 
 
-class ManagedTextEmbedder(ABC):
+class ManagedEmbedder:
     """Internal opt-in to request-level retry and row error handling."""
-
-    @abstractmethod
-    async def embed_text(self, text: list[str]) -> list[Any]:
-        """Embed using this adapter's request planner."""
-        ...
 
     def configure_execution(
         self,
@@ -126,6 +122,15 @@ class ManagedTextEmbedder(ABC):
         self._request_max_retries = max_retries
         self._request_on_error = on_error
         self._validate_vector = validate
+
+
+class ManagedTextEmbedder(ManagedEmbedder, ABC):
+    """Remote text embedding with request budgets and usage accounting."""
+
+    @abstractmethod
+    async def embed_text(self, text: list[str]) -> list[Any]:
+        """Embed using this adapter's request planner."""
+        ...
 
     @property
     def metrics(self) -> EmbeddingMetrics:
@@ -175,14 +180,11 @@ class ManagedTextEmbedder(ABC):
         retries = getattr(self, "_request_max_retries", 0)
         on_error = getattr(self, "_request_on_error", "raise")
         validate = getattr(self, "_validate_vector", lambda value: value)
-        iterator = iter(batches)
-        stopped = False
 
-        async def invoke(indices: list[int], texts: list[str]) -> None:
+        async def invoke(indices: list[int], texts: list[str], check_stopped: Callable[[], None]) -> None:
             failure: Exception | None = None
             for attempt in range(retries + 1):
-                if stopped:
-                    return
+                check_stopped()
                 wait = None
                 started = time.monotonic()
                 self.metrics.requests += 1
@@ -234,39 +236,22 @@ class ManagedTextEmbedder(ABC):
                 and not _is_request_wide_error(failure)
             ):
                 middle = len(texts) // 2
-                await invoke(indices[:middle], texts[:middle])
-                await invoke(indices[middle:], texts[middle:])
+                await invoke(indices[:middle], texts[:middle], check_stopped)
+                await invoke(indices[middle:], texts[middle:], check_stopped)
                 return
             self.metrics.failed_inputs += len(texts)
             _log_substituted_failure(failure, on_error="ignore")
 
-        async def worker() -> None:
-            nonlocal stopped
-            try:
-                while not stopped:
-                    batch = next(iterator, None)
-                    if batch is None:
-                        return
-                    # No await between the stop check, claiming a batch, and
-                    # entering invoke: dispatch is serialized on this loop.
-                    indices, texts = batch
-                    self.metrics.queue_seconds += time.monotonic() - queued_at
-                    await invoke(indices, texts)
-            except BaseException:
-                # Siblings can resume before gather observes this exception.
-                stopped = True
-                raise
+        async def dispatch(batch: tuple[list[int], list[str]], check_stopped: Callable[[], None]) -> None:
+            self.metrics.queue_seconds += time.monotonic() - queued_at
+            await invoke(*batch, check_stopped)
 
-        tasks = [
-            asyncio.create_task(worker()) for _ in range(min(getattr(self, "_request_concurrency", 1), len(results)))
-        ]
         try:
-            await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+            await map_async_ordered(
+                batches,
+                dispatch,
+                max_concurrency=getattr(self, "_request_concurrency", 1),
+            )
         finally:
             logger.debug("Embedding request metrics: %s", self.metrics)
         return results

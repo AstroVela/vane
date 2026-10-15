@@ -22,6 +22,7 @@ import pytest
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai.functions import _EmbedTextBatch
 from vane.ai.options import validate_embed_options
+from vane.ai.providers.google import GoogleTextEmbedder
 from vane.ai.providers.openai import OpenAITextEmbedder, OpenAITextEmbedderDescriptor
 
 
@@ -450,6 +451,94 @@ def test_worker_failure_stops_queued_dispatch_before_gather_cancels_siblings(fai
         assert active == 0
 
     asyncio.run(run())
+
+
+@pytest.fixture(params=[OpenAITextEmbedder, GoogleTextEmbedder], ids=["openai", "google"])
+def concurrent_embedder(request):
+    embedder = request.param.__new__(request.param)
+    embedder._provider_name = "fixture"
+    embedder._model = "fixture"
+    embedder._dimensions = 2
+    embedder._request_concurrency = 2
+    embedder._request_batch_size = 1
+    embedder._batch_token_limit = 100
+    embedder._input_text_token_limit = 100
+    embedder._estimate_tokens = len
+    embedder._overlength = None
+    embedder.aclose = AsyncMock()
+    return embedder
+
+
+def test_terminal_sibling_failure_stops_retry_attempts(concurrent_embedder):
+    from vane.ai.functions import RetryAfterError
+
+    calls = []
+    ready = asyncio.Event()
+
+    async def request(texts):
+        calls.append(texts)
+        if texts == ["fatal"]:
+            await ready.wait()
+            raise ValueError("terminal input failure")
+        ready.set()
+        raise RetryAfterError(0, status=503)
+
+    concurrent_embedder._embed_batch = request
+    with pytest.raises(RuntimeError, match="upstream error: ValueError"):
+        _drive(_wrapper(concurrent_embedder, max_retries=3), ["fatal", "retry", "queued"])
+    assert calls == [["fatal"], ["retry"]]
+    assert concurrent_embedder.metrics.requests == 2
+
+
+@pytest.mark.parametrize("ready_worker", [0, 1])
+def test_parent_cancellation_stops_ready_request_admission(concurrent_embedder, ready_worker):
+    async def run():
+        calls = []
+        gates = [asyncio.get_running_loop().create_future() for _ in range(2)]
+
+        async def request(texts):
+            index = int(texts[0])
+            calls.append(index)
+            if index < 2:
+                await gates[index]
+            return [[index, 1]]
+
+        concurrent_embedder._embed_batch = request
+        task = asyncio.create_task(concurrent_embedder.embed_text([str(i) for i in range(8)]))
+        while len(calls) < 2:
+            await asyncio.sleep(0)
+        gates[ready_worker].set_result(None)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls == [0, 1]
+        assert concurrent_embedder.metrics.requests == 2
+
+    asyncio.run(asyncio.wait_for(run(), 5))
+
+
+def test_parent_cancellation_stops_retry_after_backoff(concurrent_embedder):
+    from vane.ai.functions import RetryAfterError
+
+    async def run():
+        calls = []
+
+        async def request(texts):
+            calls.append(texts)
+            if texts == ["retry"]:
+                asyncio.get_running_loop().call_soon(task.cancel)
+                raise RetryAfterError(0, status=503)
+            await asyncio.Event().wait()
+
+        concurrent_embedder._embed_batch = request
+        concurrent_embedder.configure_execution(max_retries=3, on_error="raise", validate=lambda value: value)
+        task = asyncio.create_task(concurrent_embedder.embed_text(["retry", "slow", "queued"]))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls == [["retry"], ["slow"]]
+        assert concurrent_embedder.metrics.requests == 2
+
+    asyncio.run(asyncio.wait_for(run(), 5))
 
 
 def test_all_null_does_not_instantiate_provider():

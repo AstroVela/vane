@@ -15,6 +15,7 @@ import pytest
 
 from tests.local_admission_helpers import linear_metadata
 from vane import pickle as vane_pickle
+from vane.ai._errors import DiagnosticError, summarize_error
 from vane.execution import ref_bundle, udf_subprocess
 from vane.execution.resources import ResourceVector
 
@@ -284,16 +285,13 @@ def test_partial_buffer_failure_keeps_original_error_and_retry_owner(prepare, mo
     scope = executor._new_execution_scope()
     refs = [ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [value]}))[1][0] for value in (1, 2)]
     result = (ref_bundle.REF_BUNDLE_RESULT_MARKER, refs, None, ["x"])
-    buffer_output = query.buffer_output
+    buffer = udf_subprocess.LocalOutputRead.buffer
     remove_waiter = query.manager.remove_output_waiter
-    buffered, failed = [], []
+    failed = []
 
-    def buffer_once(*args, **kwargs):
-        if buffered:
-            raise ValueError("injected buffer failure")
-        output = buffer_output(*args, **kwargs)
-        buffered.append(output)
-        return output
+    def buffer_then_fail(self, *args, **kwargs):
+        buffer(self, *args, **kwargs)
+        raise ValueError("injected buffer failure")
 
     def remove_once(*args, **kwargs):
         if not failed:
@@ -301,7 +299,7 @@ def test_partial_buffer_failure_keeps_original_error_and_retry_owner(prepare, mo
             raise RuntimeError("injected output cleanup failure")
         return remove_waiter(*args, **kwargs)
 
-    monkeypatch.setattr(query, "buffer_output", buffer_once)
+    monkeypatch.setattr(udf_subprocess.LocalOutputRead, "buffer", buffer_then_fail)
     monkeypatch.setattr(query.manager, "remove_output_waiter", remove_once)
     future = Future()
     executor._pending_batches = 1
@@ -311,9 +309,12 @@ def test_partial_buffer_failure_keeps_original_error_and_retry_owner(prepare, mo
     assert not executor._task_futures
     assert executor._output_reads
     item = _next(executor, ZERO)
-    assert isinstance(item[2], ValueError)
-    assert str(item[2]) == "injected buffer failure"
-    assert "injected output cleanup failure" in str(item[2].__cause__)
+    assert isinstance(item[2], DiagnosticError)
+    assert "injected buffer failure" in str(item[2])
+    primary, cleanup = summarize_error(item[2]).split("; cleanup: ")
+    assert primary.split(" <- ")[0] == "ValueError"
+    assert "RuntimeError" in cleanup
+    assert "injected" not in summarize_error(item[2])
     executor.close(kill=True)
     assert not executor._output_reads
     assert not query._live_tasks
@@ -337,7 +338,9 @@ def test_completion_failure_discards_buffered_data_without_delaying_error(prepar
     executor._track_task_future(future, 1, 1, time.perf_counter(), admission, scope)
     future.set_result(result)
     item = _next(executor, ZERO)
-    assert str(item[2]) == "injected completion failure"
+    assert isinstance(item[2], DiagnosticError)
+    assert "injected completion failure" in str(item[2])
+    assert summarize_error(item[2]) == "RuntimeError"
     assert not executor._output_reads
     assert not query._buffered_outputs
     assert not query._live_tasks

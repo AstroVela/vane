@@ -47,7 +47,7 @@ from vane._expression_udf import _build_actor_map_batches_expression, _build_map
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
-from vane.ai._embedding_requests import ManagedTextEmbedder
+from vane.ai._embedding_requests import ManagedEmbedder
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
@@ -586,8 +586,10 @@ def _embedding_provider_family(provider: Any) -> str | None:
         return "google"
     if module == "vane.ai.providers.transformers":
         return "transformers"
+    if module in {"vane.ai.providers.vllm", "vane.ai.providers.sglang"}:
+        return module.rsplit(".", 1)[1]
     name = getattr(provider, "name", None)
-    if isinstance(name, str) and name.casefold() in {"openai", "google", "transformers"}:
+    if isinstance(name, str) and name.casefold() in {"openai", "google", "transformers", "vllm", "sglang"}:
         return name.casefold()
     return None
 
@@ -887,7 +889,7 @@ class _EmbeddingBatch:
         self._on_error: _OnError = on_error
         self._normalize = normalize
         self._arrow_type = pa.list_(pa.float32(), dimensions)
-        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | None = (
+        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | ManagedEmbedder | None = (
             None  # lazy: instantiate on first __call__
         )
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
@@ -895,6 +897,8 @@ class _EmbeddingBatch:
 
     def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
+        if self._embedder is not None and self._embedder_loop_bound and self._run_async != run_async:
+            raise RuntimeError("cannot rebind an async provider before its cleanup completes")
         self._run_async = run_async
 
     def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:
@@ -905,7 +909,7 @@ class _EmbeddingBatch:
     def _mark_loop_bound(self) -> None:
         self._embedder_loop_bound = True
 
-    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder:
+    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder | ManagedEmbedder:
         if self._embedder is None:
             run_async = self._require_run_async()
 
@@ -915,7 +919,7 @@ class _EmbeddingBatch:
                 return self._descriptor.instantiate()
 
             self._embedder = run_async(_instantiate())
-            if isinstance(self._embedder, ManagedTextEmbedder):
+            if isinstance(self._embedder, ManagedEmbedder):
                 self._embedder.configure_execution(
                     max_retries=self._max_retries,
                     on_error=self._on_error,
@@ -943,7 +947,6 @@ class _EmbeddingBatch:
             return
         if not self._embedder_loop_bound:
             return
-        self._embedder = None
         close_error: Exception | None = None
         try:
             aclose = getattr(embedder, "aclose", None)
@@ -959,6 +962,8 @@ class _EmbeddingBatch:
                 "Embed cleanup",
                 close_error,
             ) from None
+        # A failed close must leave the provider reachable for executor retry.
+        self._embedder = None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -1034,7 +1039,7 @@ class _EmbeddingBatch:
             raw = _retry_call(
                 getattr(embedder, self._method_name),
                 texts,
-                max_retries=0 if isinstance(embedder, ManagedTextEmbedder) else self._max_retries,
+                max_retries=0 if isinstance(embedder, ManagedEmbedder) else self._max_retries,
                 on_error="raise",
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
@@ -1062,7 +1067,7 @@ class _EmbeddingBatch:
                 "embedding calls must preserve row count and order"
             )
         return self._coerce_embedding_rows(
-            values, allow_nulls=isinstance(self._embedder, ManagedTextEmbedder) and self._on_error == "ignore"
+            values, allow_nulls=isinstance(self._embedder, ManagedEmbedder) and self._on_error == "ignore"
         )
 
     def _embed_inputs(self, texts: list[Any]) -> list[np.ndarray | None]:
@@ -1080,7 +1085,7 @@ class _EmbeddingBatch:
         except Exception as exc:
             if self._on_error == "raise":
                 raise
-            if isinstance(self._embedder, ManagedTextEmbedder):
+            if isinstance(self._embedder, ManagedEmbedder):
                 _log_substituted_failure(exc, on_error=self._on_error)
                 return [None] * len(texts)
 
@@ -1258,6 +1263,8 @@ class _PromptBatch:
 
     def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
+        if self._prompter is not None and self._prompter_loop_bound and self._run_async != run_async:
+            raise RuntimeError("cannot rebind an async provider before its cleanup completes")
         self._run_async = run_async
 
     def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:
@@ -1299,7 +1306,6 @@ class _PromptBatch:
             return
         if not self._prompter_loop_bound:
             return
-        self._prompter = None
         close_error: Exception | None = None
         try:
             aclose = getattr(prompter, "aclose", None)
@@ -1315,6 +1321,8 @@ class _PromptBatch:
                 "Prompt cleanup",
                 close_error,
             ) from None
+        # A failed close must leave the provider reachable for executor retry.
+        self._prompter = None
 
     def __getstate__(self) -> dict[str, Any]:
         # The cached client and the bound runtime capability are process-local.
@@ -1472,12 +1480,16 @@ class _PromptBatch:
         max_retries = self._max_retries
         on_error = self._on_error
 
-        async def invoke(index: int) -> str | None:
+        async def invoke(index: int, check_stopped: Callable[[], None]) -> str | None:
+            def request(messages: tuple[Any, ...]) -> Any:
+                check_stopped()
+                return prompter.prompt(messages)
+
             capability_error: ProviderCapabilityError | None = None
             provider_error: Exception | None = None
             try:
                 result = await _retry_call_async(
-                    prompter.prompt,
+                    request,
                     row_messages[index],
                     max_retries=max_retries,
                     on_error=on_error,
@@ -1507,33 +1519,20 @@ class _PromptBatch:
                 _log_substituted_failure(exc, on_error=on_error)
                 return None
 
-        async def run_all(indices: list[int]) -> list[str | None]:
-            if self._max_concurrency_per_actor is None:
-                calls = [invoke(index) for index in indices]
-            else:
-                semaphore = asyncio.Semaphore(self._max_concurrency_per_actor)
-
-                async def limited(index: int) -> str | None:
-                    async with semaphore:
-                        return await invoke(index)
-
-                calls = [limited(index) for index in indices]
-
-            tasks = [asyncio.create_task(call) for call in calls]
-            try:
-                return await asyncio.gather(*tasks)
-            except BaseException:
-                # ``gather`` propagates the first failure but leaves sibling
-                # requests running.  Drain their cancellation before this
-                # batch returns so a failed row cannot leak work into the
-                # next batch or outlive the executor-owned event loop.
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+        from vane.execution._async_dispatch import map_async_ordered
 
         indices = list(row_messages)
-        prompt_results = self._require_run_async()(run_all(indices))
+        prompt_results = self._require_run_async()(
+            map_async_ordered(
+                indices,
+                invoke,
+                max_concurrency=(
+                    self._max_concurrency_per_actor
+                    if self._max_concurrency_per_actor is not None
+                    else max(1, len(indices))
+                ),
+            )
+        )
         for index, result in zip(indices, prompt_results, strict=True):
             results[index] = result
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
@@ -2266,7 +2265,7 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family in {"vllm", "sglang"}:
+    if family in {"vllm", "sglang"} and "media_mime_types" not in prepared:
         if return_raw_response:
             raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1

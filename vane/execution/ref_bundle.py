@@ -38,6 +38,7 @@ from vane.execution.udf_shm_store import (
     acquire_allocation,
     worker_shm_client,
 )
+from vane.execution.udf_stream_backpressure import STREAM_BUFFER_BLOCKS
 
 REF_BUNDLE_RESULT_MARKER = "__vane_ref_bundle_result__"
 SUBMIT_RESULT_MARKER = "__vane_submit_result__"
@@ -85,6 +86,7 @@ class _InputLease:
     submit_id: int | None
     decode_error_handlers: tuple[Callable[[BaseException], None] | None, ...] = ()
     physical_inputs: tuple[_LiveAllocation, ...] = ()
+    output_owners: tuple[_OutputGrant, ...] = ()
     state: str = "active"
     pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
     releasing: bool = False
@@ -97,6 +99,9 @@ class _OutputGrant:
     name: str
     priority: str
     input_lease_id: int | None = None
+    owner_id: str | None = None
+    owner_bytes: int = 0
+    consumed: bool = False
     state: str = "active"
 
 
@@ -281,6 +286,10 @@ class LocalShmBudgetManager:
         self._consuming_inputs: dict[int, tuple[_LiveAllocation, ...]] = {}
         self._consuming_outputs: dict[int, tuple[_LiveAllocation, ...]] = {}
         self._output_grants: dict[int, _OutputGrant] = {}
+        # Physical byte ownership can outlive input ACKs. Only unconsumed
+        # grants occupy the progress window across invocation generations.
+        self._owned_output_grants: dict[str, dict[int, _OutputGrant]] = {}
+        self._owned_input_allocations: dict[str, int] = {}
         self._input_ref_holds: dict[tuple[str, Any], _InputRefHold] = {}
         self._lease_ids = count(1)
         self._grant_ids = count(1)
@@ -351,6 +360,7 @@ class LocalShmBudgetManager:
         block: bool = True,
         cancel_event: _CancellationFlag | None = None,
         wait_context: _CapacityWaitContext | None = None,
+        input_owner_id: str | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -364,13 +374,27 @@ class LocalShmBudgetManager:
             def _can_allocate_locked() -> bool:
                 _raise_if_cancelled_locked()
                 limit = self._limit_locked()
-                return limit <= 0 or self._usage_locked() == 0 or self._usage_locked() + requested <= limit
+                return (
+                    limit <= 0
+                    or self._usage_locked() == 0
+                    or self._usage_locked() + requested <= limit
+                    or (
+                        # A downstream actor may retain another operator's
+                        # output until its next call. Each source needs one
+                        # input allocation to reach that call, even when none
+                        # of its own outputs remain live.
+                        self._task_reservation_bytes == 0
+                        and input_owner_id is not None
+                        and not self._owned_input_allocations.get(input_owner_id)
+                        and self._unconsumed_outputs_locked(input_owner_id) < STREAM_BUFFER_BLOCKS
+                    )
+                )
 
             _raise_if_cancelled_locked()
             limit = self._limit_locked()
             if limit <= 0:
                 return 0
-            while block and limit > 0 and self._usage_locked() > 0 and self._usage_locked() + requested > limit:
+            while block and not _can_allocate_locked():
                 _shm_debug_log(
                     "budget_wait",
                     name=name or "-",
@@ -397,6 +421,10 @@ class LocalShmBudgetManager:
                     limit_bytes=limit,
                 )
             self._allocated_bytes += requested
+            if input_owner_id is not None:
+                self._owned_input_allocations[input_owner_id] = (
+                    self._owned_input_allocations.get(input_owner_id, 0) + requested
+                )
             _shm_debug_log(
                 "budget_acquire",
                 name=name or "-",
@@ -426,12 +454,24 @@ class LocalShmBudgetManager:
         # The caller rechecks and reserves under the lock: another task may
         # have used the available bytes while execution capacity was reacquired.
 
-    def release_allocation(self, size: int, *, name: str = "") -> None:
+    def _release_input_owner_locked(self, owner_id: str | None, size: int) -> None:
+        if owner_id is not None:
+            remaining = self._owned_input_allocations.get(owner_id, 0) - size
+            if remaining > 0:
+                self._owned_input_allocations[owner_id] = remaining
+            else:
+                self._owned_input_allocations.pop(owner_id, None)
+
+    def release_allocation(
+        self, size: int, *, name: str = "", output_owner: _OutputGrant | None = None, input_owner_id: str | None = None
+    ) -> None:
         released = max(0, int(size))
         if released <= 0:
             return
         with self._cond:
             self._allocated_bytes = max(0, self._allocated_bytes - released)
+            self._release_output_owner_locked(output_owner, released)
+            self._release_input_owner_locked(input_owner_id, released)
             _shm_debug_log(
                 "budget_release",
                 name=name or "-",
@@ -484,6 +524,11 @@ class LocalShmBudgetManager:
                 submit_id=submit_id,
                 decode_error_handlers=decode_error_handlers,
                 physical_inputs=tuple(physical_inputs.values()),
+                output_owners=tuple(
+                    ref._progress_owner
+                    for ref in lease_refs
+                    if isinstance(ref, LocalShmBlockRef) and ref._progress_owner is not None
+                ),
             )
             self._input_lease_bytes += lease_bytes
             _shm_debug_log(
@@ -534,6 +579,8 @@ class LocalShmBudgetManager:
                 holds = self._release_input_holds_locked(lease.holds, lease_id=lease_id, state=lease.state)
                 lease.pending_holds = {hold.key: hold for hold in holds}
                 if lease.state == "consumed":
+                    for owner in lease.output_owners:
+                        owner.consumed = True
                     if lease.physical_inputs:
                         self._consuming_inputs[lease_id] = lease.physical_inputs
                     self._input_consumed_count += 1
@@ -583,11 +630,14 @@ class LocalShmBudgetManager:
             self._consuming_inputs.pop(int(lease_id), None)
             self._consuming_outputs.pop(int(lease_id), None)
 
-    def consuming_inputs(self, lease_id: int | None) -> tuple[ShmAllocation, ...]:
+    def consuming_input_producers(self, lease_id: int | None) -> frozenset[str]:
+        """Keep upstream dependencies until the call ends, even after its views release."""
         if lease_id is None:
-            return ()
+            return frozenset()
         with self._cond:
-            return tuple(entry.allocation for entry in self._consuming_inputs.get(lease_id, ()) if entry.retained)
+            return frozenset(
+                entry.producer_id for entry in self._consuming_inputs.get(lease_id, ()) if entry.producer_id is not None
+            )
 
     def output_grant_input(self, grant_id: int | None) -> int | None:
         if grant_id is None:
@@ -595,6 +645,29 @@ class LocalShmBudgetManager:
         with self._cond:
             grant = self._output_grants.get(grant_id)
             return None if grant is None else grant.input_lease_id
+
+    def output_grant_owner(self, grant_id: int | None) -> _OutputGrant | None:
+        if grant_id is None:
+            return None
+        with self._cond:
+            grant = self._output_grants.get(grant_id)
+            return grant if grant is not None and grant.owner_id is not None else None
+
+    def _unconsumed_outputs_locked(self, owner_id: str | None) -> int:
+        if owner_id is None:
+            return 0
+        return sum(not grant.consumed for grant in self._owned_output_grants.get(owner_id, {}).values())
+
+    def _release_output_owner_locked(self, grant: _OutputGrant | None, size: int) -> None:
+        if grant is None or grant.owner_id is None:
+            return
+        grant.owner_bytes = max(0, grant.owner_bytes - max(0, int(size)))
+        if grant.owner_bytes == 0:
+            owned = self._owned_output_grants.get(grant.owner_id)
+            if owned is not None:
+                owned.pop(grant.grant_id, None)
+                if not owned:
+                    del self._owned_output_grants[grant.owner_id]
 
     def record_consuming_output(self, lease_id: int | None, refs: list[LocalShmBlockRef]) -> None:
         with self._cond:
@@ -787,6 +860,7 @@ class LocalShmBudgetManager:
         name: str = "",
         priority: str = "producer",
         input_lease_id: int | None = None,
+        owner_id: str | None = None,
         cancel_event: _CancellationFlag | None = None,
         wait_context: _CapacityWaitContext | None = None,
     ) -> int:
@@ -815,23 +889,36 @@ class LocalShmBudgetManager:
                         input_lease_id is not None
                         and any(entry.retained for entry in self._consuming_outputs.get(input_lease_id, ()))
                     )
+                    owned_outputs = self._unconsumed_outputs_locked(owner_id)
                     return (
                         priority == "consumer"
                         and self._task_reservation_bytes == 0
-                        and (usage <= limit or (consuming and not output_pending))
+                        and (
+                            usage <= limit
+                            or (consuming and not output_pending)
+                            # Pressure may belong to another operator in the
+                            # pipeline. Allow this source's initial block too;
+                            # pending and unread grants still bound its window.
+                            or (owner_id is not None and owned_outputs < STREAM_BUFFER_BLOCKS)
+                        )
                     )
 
                 while not can_grant():
                     self._wait_for_capacity_locked(can_grant, wait_context)
                 limit, usage = self._limit_locked(), self._usage_locked()
                 grant_id = next(self._grant_ids)
-                self._output_grants[grant_id] = _OutputGrant(
+                grant = _OutputGrant(
                     grant_id=grant_id,
                     bytes=requested,
                     name=name or f"output-grant-{grant_id}",
                     priority=priority,
                     input_lease_id=input_lease_id,
+                    owner_id=owner_id,
+                    owner_bytes=requested if owner_id is not None else 0,
                 )
+                self._output_grants[grant_id] = grant
+                if owner_id is not None:
+                    self._owned_output_grants.setdefault(owner_id, {})[grant_id] = grant
                 self._output_grant_bytes += requested
                 if limit > 0 and usage + requested > limit:
                     self._oversized_output_grants += 1
@@ -877,6 +964,7 @@ class LocalShmBudgetManager:
             if grant is None:
                 return 0
             self._output_grant_bytes = max(0, self._output_grant_bytes - grant.bytes)
+            self._release_output_owner_locked(grant, grant.owner_bytes)
             _shm_debug_log(
                 "output_grant_release",
                 name=name or grant.name or "-",
@@ -1033,6 +1121,7 @@ def request_local_shm_output_grant(
     name: str = "",
     priority: str = "producer",
     input_lease_id: int | None = None,
+    owner_id: str | None = None,
     cancel_event: _CancellationFlag | None = None,
     wait_context: _CapacityWaitContext | None = None,
 ) -> int:
@@ -1041,6 +1130,7 @@ def request_local_shm_output_grant(
         name=name,
         priority=priority,
         input_lease_id=input_lease_id,
+        owner_id=owner_id,
         cancel_event=cancel_event,
         wait_context=wait_context,
     )
@@ -1082,6 +1172,7 @@ def _acquire_local_shm_ref_budget(
     block: bool = True,
     cancel_event: _CancellationFlag | None = None,
     wait_context: _CapacityWaitContext | None = None,
+    input_owner_id: str | None = None,
 ) -> int:
     requested = max(0, int(size))
     if requested <= 0:
@@ -1092,6 +1183,7 @@ def _acquire_local_shm_ref_budget(
         block=block,
         cancel_event=cancel_event,
         wait_context=wait_context,
+        input_owner_id=input_owner_id,
     )
 
 
@@ -1118,11 +1210,15 @@ def release_local_shm_ref_output_budget(size: int, *, name: str = "") -> None:
     _LOCAL_SHM_BUDGET_MANAGER.release_pending_output(released, name=name)
 
 
-def _release_local_shm_ref_budget(size: int, *, name: str = "") -> None:
+def _release_local_shm_ref_budget(
+    size: int, *, name: str = "", output_owner: _OutputGrant | None = None, input_owner_id: str | None = None
+) -> None:
     released = max(0, int(size))
     if released <= 0:
         return
-    _LOCAL_SHM_BUDGET_MANAGER.release_allocation(released, name=name)
+    _LOCAL_SHM_BUDGET_MANAGER.release_allocation(
+        released, name=name, output_owner=output_owner, input_owner_id=input_owner_id
+    )
 
 
 def _arrow_table_to_ipc_bytes(table: pa.Table) -> bytes:
@@ -1406,10 +1502,14 @@ def _unlink_shm(shm: shared_memory.SharedMemory, *, track: bool) -> None:
 class _PooledBudgetCharge:
     """Transfer a byte charge to storage, with idempotent failure rollback."""
 
-    def __init__(self, size: int, name: str) -> None:
+    def __init__(
+        self, size: int, name: str, output_owner: _OutputGrant | None = None, input_owner_id: str | None = None
+    ) -> None:
         self.manager = local_shm_budget_manager()
         self.size = size
         self.name = name
+        self.output_owner = output_owner
+        self.input_owner_id = input_owner_id
         self.owner_pid = os.getpid()
         self.attached = False
         self.released = False
@@ -1425,6 +1525,8 @@ class _PooledBudgetCharge:
             if self.released:
                 return
             self.manager._allocated_bytes = max(0, self.manager._allocated_bytes - self.size)
+            self.manager._release_output_owner_locked(self.output_owner, self.size)
+            self.manager._release_input_owner_locked(self.input_owner_id, self.size)
             self.released = True
             self.manager._cond.notify_all()
         _notify_local_shm_budget_wakeup_callbacks()
@@ -1447,9 +1549,16 @@ class LocalShmBlockRef:
         allocation_lease: Any = None,
         allocation_offset: int = 0,
         pooled_budget: _PooledBudgetCharge | None = None,
+        output_owner: _OutputGrant | None = None,
+        input_owner_id: str | None = None,
     ) -> None:
         self.name = str(name)
         self._owner_pid = os.getpid()
+        self._output_owner = output_owner
+        # This observation returns progress credit on input ACK, independently
+        # of the byte charge attached to the allocation and its exported views.
+        self._progress_owner = output_owner
+        self._input_owner_id = input_owner_id
         self.size = int(size)
         self.owner = bool(owner)
         self._shm = shm
@@ -1467,12 +1576,15 @@ class LocalShmBlockRef:
             self._budget_bytes = 0
         elif budget_bytes is None:
             if cancel_event is None:
-                self._budget_bytes = _acquire_local_shm_ref_budget(self.size, name=self.name)
+                self._budget_bytes = _acquire_local_shm_ref_budget(
+                    self.size, name=self.name, input_owner_id=input_owner_id
+                )
             else:
                 self._budget_bytes = _acquire_local_shm_ref_budget(
                     self.size,
                     name=self.name,
                     cancel_event=cancel_event,
+                    input_owner_id=input_owner_id,
                 )
         else:
             self._budget_bytes = max(0, int(budget_bytes))
@@ -1480,13 +1592,15 @@ class LocalShmBlockRef:
             # An ACK or descriptor release does not release worker/Arrow views.
             # Transfer this charge to the physical allocation, including any
             # fork pins, before publishing the ref to native execution.
-            charge = pooled_budget or _PooledBudgetCharge(self._budget_bytes, self.name)
+            charge = pooled_budget or _PooledBudgetCharge(self._budget_bytes, self.name, output_owner, input_owner_id)
             allocation_lease.store.retain_budget(
                 allocation_lease.allocation,
                 charge.release,
             )
             charge.attached = True
             self._budget_bytes = 0
+            self._output_owner = None
+            self._input_owner_id = None
         self._finalizer = weakref.finalize(
             self,
             _cleanup_local_shm_ref,
@@ -1497,6 +1611,8 @@ class LocalShmBlockRef:
             self._track,
             allocation_lease,
             self._owner_pid,
+            self._output_owner,
+            self._input_owner_id,
         )
         if self.owner:
             global _local_shm_refs_created
@@ -1586,6 +1702,8 @@ class LocalShmBlockRef:
         if budget_bytes <= 0:
             return 0
         self._budget_bytes = 0
+        output_owner, self._output_owner = self._output_owner, None
+        input_owner_id, self._input_owner_id = self._input_owner_id, None
         finalizer = getattr(self, "_finalizer", None)
         if finalizer is not None and finalizer.alive:
             detached = finalizer.detach()
@@ -1602,7 +1720,9 @@ class LocalShmBlockRef:
                     self._owner_pid,
                 )
         _shm_debug_log("budget_detach", name=self.name, owner=self.owner, size=budget_bytes)
-        _release_local_shm_ref_budget(budget_bytes, name=self.name)
+        _release_local_shm_ref_budget(
+            budget_bytes, name=self.name, output_owner=output_owner, input_owner_id=input_owner_id
+        )
         return budget_bytes
 
     def release(self) -> None:
@@ -1640,6 +1760,8 @@ def _cleanup_local_shm_ref(
     track: bool = False,
     allocation_lease: Any = None,
     owner_pid: int | None = None,
+    output_owner: _OutputGrant | None = None,
+    input_owner_id: str | None = None,
 ) -> None:
     if owner_pid is not None and owner_pid != os.getpid():
         return
@@ -1671,7 +1793,7 @@ def _cleanup_local_shm_ref(
             global _local_shm_refs_released
             with _local_shm_budget_cond:
                 _local_shm_refs_released += 1
-        _release_local_shm_ref_budget(budget_bytes, name=name)
+        _release_local_shm_ref_budget(budget_bytes, name=name, output_owner=output_owner, input_owner_id=input_owner_id)
     if cleanup_error is not None:
         raise cleanup_error
 
@@ -1683,15 +1805,17 @@ def make_local_shm_ref_bundle_result(
     wait_context: _CapacityWaitContext | None = None,
     task_reservation: LocalShmTaskReservation | None = None,
     allocation_role: str = "input",
+    input_owner_id: str | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
     if task_reservation is not None:
+        input_owner_id = None
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("local_shm reserved allocation cancelled")
         budget_bytes = task_reservation.allocate(required, role=allocation_role)
-    elif cancel_event is None and wait_context is None:
+    elif cancel_event is None and wait_context is None and input_owner_id is None:
         budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
     else:
         budget_bytes = _acquire_local_shm_ref_budget(
@@ -1699,6 +1823,7 @@ def make_local_shm_ref_bundle_result(
             name="local-shm-result",
             cancel_event=cancel_event,
             wait_context=wait_context,
+            input_owner_id=input_owner_id,
         )
     shm = None
     try:
@@ -1711,6 +1836,7 @@ def make_local_shm_ref_bundle_result(
             shm=shm,
             budget_bytes=budget_bytes,
             track=False,
+            input_owner_id=input_owner_id,
         )
         budget_bytes = 0
         _shm_debug_log("create_result", name=shm.name, size=required, rows=table.num_rows, nbytes=table.nbytes)
@@ -1723,7 +1849,9 @@ def make_local_shm_ref_bundle_result(
                     _unlink_shm(shm, track=False)
                 except FileNotFoundError:
                     pass
-        _release_local_shm_ref_budget(budget_bytes, name="local-shm-result-create-failed")
+        _release_local_shm_ref_budget(
+            budget_bytes, name="local-shm-result-create-failed", input_owner_id=input_owner_id
+        )
         raise
 
     metadata = {
@@ -1982,6 +2110,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     metadata_in = descriptor["metadata"]
     grant_id = descriptor["grant_id"]
     consuming_input = local_shm_budget_manager().output_grant_input(grant_id)
+    output_owner = local_shm_budget_manager().output_grant_owner(grant_id)
     refs = []
     metadata = []
     grant_budget_remaining: int | None = None
@@ -2006,7 +2135,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                             cancel_event=cancel_event,
                         )
                     except Exception:
-                        _release_local_shm_ref_budget(budget_bytes, name=name)
+                        _release_local_shm_ref_budget(budget_bytes, name=name, output_owner=output_owner)
                         raise
             else:
                 budget_bytes = _acquire_local_shm_ref_budget(
@@ -2017,7 +2146,9 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                 )
             shm = None
             allocation_lease = None
-            pooled_budget = _PooledBudgetCharge(budget_bytes, name) if "allocation" in local_desc else None
+            pooled_budget = (
+                _PooledBudgetCharge(budget_bytes, name, output_owner) if "allocation" in local_desc else None
+            )
             try:
                 try:
                     if "allocation" in local_desc:
@@ -2059,6 +2190,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                         allocation_lease=allocation_lease,
                         allocation_offset=local_desc.get("allocation_offset", 0),
                         pooled_budget=pooled_budget,
+                        output_owner=output_owner,
                     )
                 )
             except Exception as adoption_error:
@@ -2066,7 +2198,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                     if pooled_budget is not None:
                         pooled_budget.release_unattached()
                     else:
-                        _release_local_shm_ref_budget(budget_bytes, name=name)
+                        _release_local_shm_ref_budget(budget_bytes, name=name, output_owner=output_owner)
                 except Exception as cleanup_error:
                     # The caller classifies invalid references separately from
                     # parent allocation failures. Preserve that primary error.
@@ -2097,13 +2229,17 @@ def make_local_shm_ref_bundle_result_from_descriptor(
             for ref in refs:
                 ref.release()
             if grant_budget_remaining is not None and grant_budget_remaining > 0:
-                _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+                _release_local_shm_ref_budget(
+                    grant_budget_remaining, name="local-shm-descriptor-grant-unused", output_owner=output_owner
+                )
         except Exception as cleanup_error:
             raise adoption_error from cleanup_error
         raise
 
     if grant_budget_remaining is not None and grant_budget_remaining > 0:
-        _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+        _release_local_shm_ref_budget(
+            grant_budget_remaining, name="local-shm-descriptor-grant-unused", output_owner=output_owner
+        )
 
     return (
         REF_BUNDLE_RESULT_MARKER,

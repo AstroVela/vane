@@ -176,6 +176,24 @@ class LocalOutputAdmission:
             self._close_locked()
             return owner
 
+    def take_bundle(self, sizes: tuple[int, ...]) -> tuple[OutputBlockLeaseOwner, ...] | None:
+        """Partition one admitted publication without requesting more capacity."""
+        owner = self.take()
+        if owner is None:
+            return None
+        if len(sizes) == 1:
+            return (owner,)
+        try:
+            parts = self.query.manager.partition_output_block(owner.lease_id, sizes)
+            try:
+                return tuple(OutputBlockLeaseOwner(self.query.manager, part) for part in parts)
+            except BaseException:
+                for part in parts:
+                    self.query.manager.release_output_block(part.lease_id)
+                raise
+        finally:
+            owner.release()
+
     def _notify(self) -> None:
         if self.query.owner_pid != os.getpid():
             return
@@ -241,7 +259,6 @@ class LocalQueryAdmission:
         self._live_tasks: dict[str, str] = {}
         self._finished_tasks: dict[str, TaskLease] = {}
         self._producers: dict[str, list[LocalQueryAdmissionAuthority]] = {}
-        self._completed_units: set[str] = set()
         self._published_actors: set[str] = set()
         self._coordinator = coordinator
         self.manager = QueryResourceManager(
@@ -291,8 +308,7 @@ class LocalQueryAdmission:
     ) -> LocalQueryAdmissionAuthority:
         with self._lock:
             self._raise_error_locked()
-            if unit_id in self._completed_units:
-                raise RuntimeError("local UDF production already completed")
+            self.manager.update_unit_state(unit_id, runnable=True)
             authority = LocalQueryAdmissionAuthority(self, unit_id, base, physical)
             self._authorities.add(authority)
             self._producers.setdefault(unit_id, []).append(authority)
@@ -472,15 +488,18 @@ class LocalQueryAdmission:
         self.manager.release_task_lease(lease_id, attempt_id=self._finished_tasks[lease_id].attempt_id)
         self._live_tasks.pop(lease_id)
         self._finished_tasks.pop(lease_id)
-        self._finish_unit_locked(unit_id)
+        self._mark_idle_unit_locked(unit_id)
 
-    def _finish_unit_locked(self, unit_id: str) -> None:
-        if unit_id in self._completed_units or unit_id in self._live_tasks.values():
+    def _mark_idle_unit_locked(self, unit_id: str) -> None:
+        if unit_id in self._live_tasks.values():
             return
         producers = self._producers.get(unit_id, ())
         if producers and all(authority._finished_submitting for authority in producers):
-            self._completed_units.add(unit_id)
-            self.manager.update_unit_state(unit_id, runnable=False, completed=True)
+            # DuckDB may construct another local dispatcher for this UDF after
+            # the known dispatchers drain, including after an empty input.
+            # Their membership is not sealed, so this is temporary idleness,
+            # not the shared policy's irreversible production completion.
+            self.manager.update_unit_state(unit_id, runnable=False)
 
     def snapshot(self) -> dict[str, Any]:
         return self.manager.snapshot()
@@ -676,7 +695,7 @@ class LocalQueryAdmissionAuthority:
         self.close()
         with self.query._lock:
             self._finished_submitting = True
-            self.query._finish_unit_locked(self.unit_id)
+            self.query._mark_idle_unit_locked(self.unit_id)
 
     def close(self) -> None:
         if self.query.owner_pid != os.getpid():

@@ -1317,6 +1317,20 @@ static unique_ptr<QueryResult> MakeRunnerWriteResult(const RunnerBoundPlan &plan
 	}
 }
 
+static shared_ptr<ClientContext> RetainClientContextForPython(const shared_ptr<ClientContext> &context) {
+	auto *owner = new shared_ptr<ClientContext>(context);
+	return shared_ptr<ClientContext>(context.get(), [owner](ClientContext *) {
+		// Python callback/traceback collection can release the last context.
+		// Database teardown joins native threads whose TLS cleanup needs the GIL.
+		if (Py_IsInitialized() && PyGILState_Check()) {
+			py::gil_scoped_release release;
+			delete owner;
+		} else {
+			delete owner;
+		}
+	});
+}
+
 RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context, unique_ptr<SQLStatement> statement,
                                         const shared_ptr<Relation> &relation,
                                         case_insensitive_map_t<BoundParameterData> parameters,
@@ -1381,6 +1395,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (!check.is_none()) {
 			check();
 		}
+		auto callback_context = RetainClientContextForPython(context);
 		const auto interrupt_generation = source_connection->InterruptGeneration();
 		ScopedPythonReplacementScanFrame caller_frame(*context);
 		auto execute = py::cpp_function([&](py::object query) {
@@ -1400,7 +1415,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 					pending = statement ? context->PendingQuery(std::move(statement), native_parameters)
 					                    : context->PendingQuery(relation, native_parameters);
 				}
-				query.attr("started")(py::cpp_function([context]() { context->Interrupt(); }));
+				query.attr("started")(py::cpp_function([callback_context]() { callback_context->Interrupt(); }));
 				{
 					py::gil_scoped_release release;
 					execution.native_result = DuckDBPyConnection::CompletePendingQuery(*pending);
@@ -1448,7 +1463,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 					native->SetConnectionLock(source_connection->py_connection_lock, context);
 					auto lock = source_connection->py_connection_lock;
 					py::object request = query.attr("request");
-					auto close_native = py::cpp_function([context, lock, weak_source, request](bool retire) {
+					auto close_native = py::cpp_function([callback_context, lock, weak_source, request](bool retire) {
 						if (retire) {
 							// These fields are GIL-protected. A stale cleanup retry must
 							// not wait on a newer query's native execution lock.
@@ -1462,7 +1477,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 						} else {
 							auto guard = DuckDBPyConnection::LockConnection(lock);
 							py::gil_scoped_release release;
-							context->CancelTransaction();
+							callback_context->CancelTransaction();
 						}
 					});
 					// Publish a cleanup owner before Arrow export can fail.

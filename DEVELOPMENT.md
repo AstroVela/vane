@@ -385,6 +385,25 @@ join point.
 
 Set `DUCKDB_DISTRIBUTED_DEBUG=1`. Native debug output uses `DistributedDebugStream()` and appears in Ray worker error logs, normally below `/tmp/ray/session_latest/logs/worker-*.err`. Plain C `stdout` output is not reliably captured by Ray workers.
 
+Ray UDF pools return pending handles during executor construction; task admission
+waits for the first initialized actor without blocking native startup. The default
+initialization limit is 300 seconds, including time waiting for Ray capacity.
+After admission, both table and ref-bundle submission resolve the leased actor's
+initialization result even if its local delivery or readiness notification is
+delayed. This wait honors query interruption and query/ObjectRef deadlines; an
+empty local ready set alone must not reject an admitted task.
+Set `VANE_RAY_ACTOR_INIT_TIMEOUT_S` to a finite positive number on the client
+before opening its Ray runtime to change this limit. Shorter query/ObjectRef
+deadlines still apply. Resource maintenance reports the expired pool's requested
+CPU/GPU resources and terminates its actors; it never switches execution backends.
+
+A client that stops heartbeating is reclaimed after
+`VANE_RAY_CLIENT_LEASE_TIMEOUT_S` (60 seconds by default). Reclamation fences
+its queries and terminates their UDF actors before joining native operations,
+so an abandoned GPU actor cannot prevent session teardown. Failed termination
+retains ownership and is retried; connections and resource leases remain owned
+until normal teardown completes.
+
 ## Release artifacts
 
 Build and validate an sdist before opening a release pull request:
@@ -395,3 +414,44 @@ python scripts/check_release_artifacts.py dist/*.tar.gz
 ```
 
 See [RELEASE.md](RELEASE.md) for the complete process.
+
+AI error diagnostics use `vane.ai.summarize_error(error)` to produce a bounded,
+public-safe root-cause summary, including cleanup failures. Known engine option and
+GPU memory errors retain actionable details; arbitrary upstream text is
+not copied because it can contain credentials or input data. Numeric status and
+errno values remain available. Provider wrappers preserve these diagnostics over
+Ray/native transport, capturing cause/cleanup chains before detaching upstream
+exceptions. Flattened diagnostics keep each exception's own status, including
+HTTP status stored on an SDK response. A resolved actor initializer failure now fails its pool and
+releases owned actors immediately, even if other actors are pending for resources.
+Worker integrations should raise `vane.ai.DiagnosticError(operation, error)`
+outside the original exception handler. It captures a sanitized summary and
+retains its type through pickle and structured Ray error metadata. Raw SDK
+messages are never interpreted as diagnostic envelopes, even if they contain
+`upstream error:` or forged diagnostic headers. Actor activation preserves the
+typed cause chain before Ray serializes it, and executor creation captures it
+before the native dispatcher converts the exception to text. The Ray driver
+captures native diagnostics at result-stream, COPY and DataSink call boundaries.
+COPY outcome exceptions retain sanitized cause/cleanup snapshots in their pickle
+state while preserving the committed/unknown outcome type and retry restrictions.
+Terminal query cleanup failures are captured from their exception objects into
+the transport summary; arbitrary warning strings and exception notes are not parsed.
+A Ray wrapper never authorizes decoding a plain `RuntimeError` body. Native
+decoding is restricted to native exceptions and those native query producers;
+descriptions and model identifiers cannot replace the encoded summary. Known
+safe provider failures such as `vllm returned no outputs` retain their explanation
+through wrapping and transport using a closed vocabulary.
+Remote vLLM/SGLang executors retain typed actor diagnostics, including failed
+submission acknowledgements and cleanup, before returning errors to native SQL.
+Rewrapping merges worker and query cleanup into one bounded cleanup section,
+keeping errno attached to the correct failure. Length limits preserve complete
+diagnostic items in both sections so another transport can still parse cleanup;
+items exceeding a small caller budget omit details, and type names that cannot
+fit use `Exception`. Cleanup also reserves space in the parser's item limit.
+Remote wait deadlines, missing wait references and incomplete actor results
+retain their closed technical explanations; actor/result counts are validated
+as bounded integers.
+Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and
+isolated Ray regressions for initialization, fetching results and writing Parquet.
+The dependent Context HTTP regressions exercise actual `vane.cls.batch`
+constructor failures through a complete query and HTTP error response.

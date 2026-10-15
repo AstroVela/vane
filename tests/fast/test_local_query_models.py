@@ -173,6 +173,34 @@ def test_concurrent_cursors_borrow_one_registered_pool(tmp_path, batch):
         assert len(_initializations(tmp_path)) == 1
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("batch_format", ["numpy", "pandas"])
+def test_registered_model_feeds_formatted_batches_across_queries(tmp_path, batch, batch_format):
+    if batch_format == "pandas":
+        pytest.importorskip("pandas")
+
+    def identity(values):
+        return values
+
+    with vane.connect(config={"threads": 2}) as connection:
+        runtime = _runtime(connection)
+        model = _register(runtime, _class_model(tmp_path, batch=batch))
+        model.prewarm()
+        rows = []
+        for _ in range(3):
+            relation = connection.sql("SELECT i::BIGINT AS x FROM range(2) r(i)")
+            relation = relation.project(model(vane.col("x")).alias("encoded"))
+            rows.extend(
+                relation.map_batches(
+                    identity, schema={"encoded": vane.sqltypes.VARCHAR}, batch_format=batch_format
+                ).fetchall()
+            )
+            _assert_idle(runtime)
+        assert len(_initializations(tmp_path)) == 1
+        assert {value.split(":")[0] for (value,) in rows} == set(_initializations(tmp_path))
+        assert sorted(int(value.split(":")[1]) for (value,) in rows) == [10] * 3 + [11] * 3
+
+
 @pytest.mark.parametrize("configured", [False, True])
 @pytest.mark.parametrize("entry", ["sql", "relation"])
 def test_registration_cannot_be_borrowed_by_another_session(tmp_path, configured, entry):

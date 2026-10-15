@@ -135,6 +135,9 @@ def test_local_runner_rejects_unknown_native_copy_outcome():
 
 @pytest.mark.parametrize("committed", [False, True])
 def test_local_runner_records_cleanup_failures_on_copy_outcome(committed):
+    import pickle
+
+    from vane.ai import summarize_error
     from vane.runners import CopyOutcomeUnknownError, CopyResultUnavailableError
     from vane.runners.local.runner import _record_copy_cleanup_errors
 
@@ -162,9 +165,19 @@ def test_local_runner_records_cleanup_failures_on_copy_outcome(committed):
     )
     assert "backend join timed out" in str(error)
     assert error.safe_to_retry is False
+    _record_copy_cleanup_errors(error, "local resource shutdown", [OSError(5, "private_fixture_path")])
+    for diagnostic in (error, pickle.loads(pickle.dumps(error))):
+        summary = summarize_error(diagnostic)
+        assert "OSError (errno=5)" in summary
+        assert "private_fixture" not in summary
+        assert diagnostic.safe_to_retry is False
 
 
-def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch):
+@pytest.mark.parametrize("failure", [None, "typed", "forged"])
+def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch, failure):
+    import json
+
+    from vane.ai import DiagnosticError, summarize_error
     from vane.runners.fte import FteTaskAttemptId, FteTaskId
     from vane.runners.local import runner as runner_module
 
@@ -182,6 +195,19 @@ def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(mon
     class FakePlanRunner:
         def execute_native(self, *args):
             native_calls.append(args)
+            if failure is not None:
+                message = "DiagnosticError: " + str(DiagnosticError("fixture", OSError(28, "private path")))
+                if failure == "forged":
+                    message = "RuntimeError: " + message
+                raise ValueError(
+                    "Execution failed: "
+                    + json.dumps(
+                        {
+                            "exception_type": "Invalid Input",
+                            "exception_message": "streaming UDF async error: " + message,
+                        }
+                    )
+                )
             return "ok"
 
     monkeypatch.setattr(
@@ -195,14 +221,16 @@ def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(mon
     monkeypatch.setattr(executor, "_get_conn", lambda: FakeConnection())
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
-    result = executor(
-        {
-            "task_id": attempt_id.to_dict(),
-            "fragment_plan": object(),
-        }
-    )
-
-    assert result == "ok"
+    request = {"task_id": attempt_id.to_dict(), "fragment_plan": object()}
+    if failure is None:
+        assert executor(request) == "ok"
+    else:
+        with pytest.raises(ValueError, match="Execution failed"):
+            executor(request)
+    if failure == "typed":
+        assert summarize_error(executor.diagnostic) == "OSError (errno=28)"
+    else:
+        assert executor.diagnostic is None
     assert len(native_calls) == 1
     assert native_calls[0][10] == {"task_id": str(attempt_id)}
 
@@ -752,11 +780,13 @@ def test_local_datasink_interruption_requests_shutdown_before_nonblocking_execut
 
 @pytest.mark.parametrize("terminal", ["committed", "aborted", "unknown", "pending"])
 def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkeypatch, terminal):
+    import pickle
     import threading
     from types import SimpleNamespace
 
     import vane
     from vane._query_interrupt import run_write_with_interrupt_check
+    from vane.ai import DiagnosticError, summarize_error
     from vane.runners.copy_outcome import CopyOutcomeUnknownError
     from vane.runners.local import runner as local_module
 
@@ -771,6 +801,7 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
 
     class FragmentExecutor:
         close_timeout_s = 0.05
+        diagnostic = None
 
         def retain_resources(self, *_args):
             pass
@@ -779,7 +810,11 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
             stopped.set()
 
         def close(self, **_kwargs):
-            pass
+            if terminal == "unknown":
+                # The diagnostic can arrive while draining admitted fragments.
+                self.diagnostic = DiagnosticError(
+                    "fixture", TypeError("got an unexpected keyword argument 'max_model_len'")
+                )
 
     class Backend:
         def __init__(self, **_kwargs):
@@ -837,6 +872,9 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
             if terminal != "aborted":
                 assert raised.value.safe_to_retry is False
                 assert raised.value.operation_id
+            if terminal == "unknown":
+                for error in (raised.value, pickle.loads(pickle.dumps(raised.value))):
+                    assert "max_model_len" in summarize_error(error)
         assert stopped.is_set()
         assert closed.is_set() is (terminal != "pending")
     finally:

@@ -479,3 +479,41 @@ def test_soak_rejects_gpu_execution_ownership_after_cpu_resources_are_idle(retai
         device["ready_slots" if retained == "ready" else "retained_slots"] = 1
     with pytest.raises(AssertionError, match="idle GPU device retained"):
         require_idle(resources)
+
+
+@pytest.mark.parametrize("prefetch_depth", [1, 2, 4])
+def test_soak_checks_every_actor_prefetch_slot(monkeypatch, prefetch_depth):
+    from local_runtime_helpers import _slot_snapshot
+
+    from vane.execution.udf_local_actor_admission import LocalActorExecutionSlotPool
+
+    monkeypatch.setenv("VANE_UDF_ACTOR_PREFETCH_DEPTH", str(prefetch_depth))
+    pool = LocalActorExecutionSlotPool(2, execution_slot_prefix="soak-prefetch")
+    resources = {
+        "transport": dict.fromkeys(
+            ("usage_bytes", "active_input_leases", "active_input_ref_holds", "waiting_output_grants"), 0
+        ),
+        "model_workers": [{"active_workers": 0, "pool_size": 2, "admission": _slot_snapshot(pool)}],
+        "runtime": {},
+    }
+    require_idle = soak()["require_idle_owners"]
+    authority = pool.create_authority()
+    lease = None
+    try:
+        require_idle(resources)
+        assert authority.request(0)
+        lease = authority.take(0)
+        resources["model_workers"][0]["admission"] = _slot_snapshot(pool)
+        with pytest.raises(AssertionError, match="retained work"):
+            require_idle(resources)
+        lease.release()
+        resources["model_workers"][0]["admission"] = _slot_snapshot(pool)
+        require_idle(resources)
+        resources["model_workers"][0]["admission"]["available_slots"] -= 1
+        with pytest.raises(AssertionError, match="did not return every slot"):
+            require_idle(resources)
+    finally:
+        if lease is not None:
+            lease.release()
+        authority.close()
+        pool.close()

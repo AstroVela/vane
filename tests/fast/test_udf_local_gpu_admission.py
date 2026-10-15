@@ -324,35 +324,20 @@ def test_byte_wait_has_no_device_execution_reservation(harness, monkeypatch, lim
     assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consumer_progress(
-    harness, monkeypatch, tmp_path
-):
+def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consumer_progress(harness, monkeypatch):
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 4096)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     h = harness(running=1)
-    entered, release = str(tmp_path / "output-ready"), str(tmp_path / "allow-output")
-    h.releases.append(Path(release))
-
-    def produce(table):
-        Path(entered).touch()
-        while not Path(release).exists():
-            time.sleep(0.005)
-        return pa.table({"blob": [b"p" * 1000]})
-
-    producer_model = h.model(produce, refs=True)
+    producer_model = h.model(lambda table: pa.table({"blob": [b"p" * 1000]}), refs=True)
     consumer_model = h.model(lambda table: pa.table({"length": [len(table.column(0)[0].as_py())]}), DEVICES[1:])
     producer, consumer = h.executor(producer_model), h.executor(consumer_model)
     held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"blob": [b"c" * 3000]}))
+    # Exercise a real output wait despite ordinary soft-budget progress.
+    reservation = manager.reserve_task_bytes(1, 1)
     output = None
-    occupied = None
     try:
         _admit(producer)
         producer.submit(pa.table({"x": [1]}))
-        _wait(lambda: Path(entered).exists())
-        # Exhaust the bounded consumer escape after input decoding. Otherwise
-        # the first output is allowed through the soft limit without waiting.
-        occupied = manager.request_output_grant(1000, priority="consumer")
-        Path(release).touch()
         _wait(
             lambda: (
                 _states(producer_model[0]) == ["shared_memory_output"] and h.runtime.snapshot()["waiting_tasks"] == 1
@@ -370,8 +355,7 @@ def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consume
         assert _demand(producer_model[0]) == _demand(consumer_model[0]) == 0
         assert h.runtime.snapshot()["waiting_tasks"] == 0
     finally:
-        if occupied is not None:
-            manager.release_output_grant(occupied)
+        reservation.release()
         udf_subprocess._release_local_ref_bundle_result(output)
         udf_subprocess._release_local_ref_bundle_result(held)
     assert manager.snapshot()["usage_bytes"] == 0

@@ -22,7 +22,7 @@ class LocalOutputRead:
     """
 
     def __init__(self) -> None:
-        self._pending: list[tuple[LocalShmBlockRef, LocalOutputAdmission]] = []
+        self._pending: list[tuple[tuple[LocalShmBlockRef, ...], LocalOutputAdmission]] = []
 
     def buffer(self, result: Any, admission: AdmissionLease | None) -> None:
         """Register unread blocks after the executor has taken cleanup ownership."""
@@ -30,24 +30,36 @@ class LocalOutputRead:
         if query is None or not isinstance(result, tuple) or len(result) != 4 or result[0] != REF_BUNDLE_RESULT_MARKER:
             return
         assert admission is not None
-        for ref in result[1]:
-            self._pending.append((ref, query.buffer_output(admission.lease["query_policy_task"], ref.size)))
+        refs = tuple(result[1])
+        if refs:
+            self._pending.append(
+                (refs, query.buffer_output(admission.lease["query_policy_task"], sum(ref.size for ref in refs)))
+            )
 
     def poll(self, wakeup: Callable[[], None]) -> bool:
         """Start/read admission without waiting for an output grant."""
         while self._pending:
-            ref, request = self._pending[0]
+            refs, request = self._pending[0]
             request.request(wakeup)
-            owner = request.take()
-            if owner is None:
+            # The result is handed off as one group. A partial grant could
+            # hold the progress token needed by its unpublished siblings.
+            owners = request.take_bundle(tuple(ref.size for ref in refs))
+            if owners is None:
                 return False
+            attached = 0
             try:
-                ref.attach_query_output_lease(owner)
-                owner.transition_to("unit_queue")
+                for ref, owner in zip(refs, owners, strict=True):
+                    ref.attach_query_output_lease(owner)
+                    attached += 1
+                    owner.transition_to("unit_queue")
             except BaseException as error:
-                try:
-                    owner.release()
-                except BaseException as cleanup_error:
+                cleanup_error = None
+                for owner in owners[attached:]:
+                    try:
+                        owner.release()
+                    except BaseException as exc:
+                        cleanup_error = exc
+                if cleanup_error is not None:
                     raise error from cleanup_error
                 raise
             self._pending.pop(0)

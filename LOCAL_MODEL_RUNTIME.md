@@ -510,6 +510,10 @@ unstarted tickets must be cancelled or shut down; the request context manager
 does this on exit. `shutdown()` remains a cleanup operation after running
 `execute()` returns; use `cancel()` to interrupt execution from another thread.
 
+Native cancellation and stream cleanup callbacks retain their original query
+context. Releasing their last context owner, including during Python traceback
+collection, happens outside the GIL so native worker thread cleanup can finish.
+
 Successful execution, UDF failure, and worker exit all run query cleanup.
 The request slot stays charged through uncertain or concurrent cleanup; retry
 `request.shutdown()` after failure. The runtime retains pending cleanup owners
@@ -524,6 +528,13 @@ shutdown times out, the request stays `cancelling` and keeps its admission slot
 until callbacks release their outputs and execution slots and cleanup is retried
 through `request.shutdown()` or `runtime.close()`. This also applies without
 `task_limit`, `track_data`, or `data_limit`.
+
+Standalone local UDF executors follow the same completion boundary: a successful
+`close()` waits for their completion callbacks to release task admissions and
+finish scope and activity cleanup. A cleanup timeout retains the executor's
+futures and pool reference for an explicit close retry. The wait covers only
+that executor's invocations; other executors sharing the pool can keep running.
+
 Retries use each lease's shared-input ownership rules and each task's grant
 identities, so cleaning one request cannot release another request's data.
 Shared registered models remain resident. Shared-memory UDF outputs and their
@@ -996,6 +1007,12 @@ The CUDA driver's [visibility and ordering rules](https://docs.nvidia.com/cuda/c
 resolve `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`; the assigned full UUID is
 set before each worker imports its UDF. MIG devices are rejected. CUDA and NVML
 driver libraries must be available. Discovery errors are reported directly.
+Discovery participates in the query's startup cancellation scope, including
+ordinary connections without `configure_local_runtime()`. Connection interrupts
+kill and reap the owned probe before `fetchall()` or `write_parquet()` returns.
+Configured runtimes also apply execution deadlines and retain the request slot
+until this cleanup completes. The same cleanup runs when discovery exceeds its
+internal 30-second timeout. A cancelled probe does not reserve GPU devices.
 
 Query-owned and explicitly registered GPU pools share device exclusions within
 the driver process. A pool reserves all its replicas before starting workers;
@@ -1334,6 +1351,19 @@ Worker acquisition retries retained retirements before spawning or waiting for
 a free slot. A failed retry returns a task error and its execution resources;
 shared-pool peers do not wait indefinitely behind an unclosed retired worker.
 
+Each subprocess worker starts its own session. Its process group and observed
+engine descendants remain owned after the worker PID exits. Shutdown terminates
+remaining live descendants before confirming cleanup or returning process
+capacity. A failed termination retains that owner for a later close; inherited
+fork finalizers cannot signal the parent's workers. A zombie has already
+released execution resources and is left for its parent to reap.
+
+When a cached task callable fails to close, the executor and its original async
+loop remain owned outside the idle callable LRU. The same cache key must finish
+that cleanup before another task binds a new loop. Clearing the idle cache does
+not discard outstanding cleanup. Runtime close captures bounded exception types
+and numeric diagnostics before transporting the error, including cleanup errno.
+
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
 `TaskAdmissionQueueFull`; native execution surfaces this as a query error.
@@ -1356,12 +1386,12 @@ allowing already prepared queries to finish.
 The shared query admission gate closes before model draining starts, so
 task-only preparation cannot enter between the two drain operations.
 
-The runtime allowance is released when execution finishes, even if its result
-has not yet been consumed. The existing pool slot remains attached to that
-buffered result until consumption or cleanup. Shared-memory output references
-keep their existing byte accounting until downstream releases them. A slow
-consumer therefore still bounds buffering in its pool without monopolizing
-another model's runtime execution allowance.
+The runtime allowance and task pool slot are released when execution finishes,
+even if the result has not yet been consumed. Buffered results retain their
+output ownership, and shared-memory references keep their byte accounting until
+downstream releases them. Output flow control bounds buffering independently of
+execution slots. Releasing an older result cannot release a newer invocation
+that has reused its slot.
 
 `resource_snapshot()["task_admission"]` reports the limits, `running_tasks`,
 `ready_tasks`, `queued_tasks`, `waiting_tasks`, `resuming_tasks`, query owners,
@@ -1496,6 +1526,10 @@ asynchronously; it does not block the worker response loop or the native
 scheduler. Other invocations' terminal events can still advance, while each
 invocation's terminal event stays behind its own output blocks.
 
+A multi-block result requests admission once for its complete byte size.
+After that grant, its lease is partitioned into independent physical block
+owners before the group is handed to the consumer.
+
 Worker completion returns physical execution capacity independently of the
 reader. Unread blocks retain their producer's query task lease and pending
 output estimate until they are admitted or discarded. Admitted output leases
@@ -1504,14 +1538,30 @@ released, even after the producer and query have closed.
 
 Stream permits do not release storage or task resources. Pooled allocations
 remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
-fork pin retains them. The input ACK records the consuming dependency without
-creating output credit; overlapping slices cannot multiply reserved bytes.
+fork pin retains them. The input ACK records the consuming dependency and
+returns the acknowledged output's progress credit. Overlapping slices cannot
+multiply reserved bytes.
 Ordinary output admission allows a consumer holding live input to finish one
-complete block across the soft transport window. That consumer waits for its
-previous output to be released before expanding again above the window, so
-unrelated upstream inputs cannot prevent downstream progress. Explicit per-task byte envelopes
-keep their hard boundary. The physical arena always enforces its own capacity,
-including allocation rounding and fragmentation; it does not spill.
+complete block across the soft transport window. Each output source also has
+a bounded allowance to produce the next block, so an actor that releases its
+previous input only after receiving the next batch can advance. This includes
+sources with no live output of their own: in a longer pipeline, the retained
+block may belong to an intermediate operator.
+This additional allowance stops at two pending or unconsumed outputs per source
+across invocations. A downstream input ACK returns that output's progress credit,
+even while a worker view or fork pin retains its storage. The physical allocation
+and byte charge remain until the last lease is released. Each source may allocate
+one next-call input while it has room in this progress window; another input
+must wait for that input's byte charge to be released. This lets the next call
+reach output admission without opening an unbounded input queue. Explicit per-task byte
+envelopes keep their hard boundary. The physical arena always enforces its own
+capacity, including allocation rounding and fragmentation; it does not spill.
+If none of the waiting writers can fit an output even after every unrelated
+allocation is released, the arena reports a capacity error instead of waiting
+indefinitely on their pinned inputs. The pinned working set includes inputs
+reported as retained after a worker finishes its call and clears temporary
+references. These inputs may need another call before the actor can release
+them, so they cannot be assumed reclaimable while waiting for that next output.
 
 These bounds cover transport output, not arbitrary intermediate heap objects
 allocated inside user code before it returns or yields a table. A UDF that
@@ -1529,7 +1579,7 @@ small IPC metadata changes between batches do not strand a nearly usable slot.
 Physical capacity includes this rounding.
 
 Stream-window permits are independent of storage ownership. Input acknowledgments
-do not release pooled output bytes or reserve replacement output credit. Pooled
+return progress credits without reserving replacement output bytes. Pooled
 output bytes remain charged to the transport budget until the allocation's last
 physical lease, including worker views and fork pins, is released. Before sending
 an input, the parent registers a read lease for the receiving worker. Arrow and
@@ -1544,12 +1594,15 @@ When a UDF forks, the worker also pins all live remote input leases, including
 views retained by an earlier invocation. Last-buffer notifications wait for the
 inheriting child and its descendants to exit or exec. One lifetime pipe per
 worker, transferred at startup, lets the parent retain outstanding input regions
-even if the worker exits before those descendants. Worker shutdown transfers
-these leases to arena pins; they keep preventing reuse and page reclamation
-until the inherited writers close. Ordinary batches do not allocate additional
-descriptors. Worker-client cleanup and inherited input finalizers check the
-creator PID before touching locks, release queues, or sockets, so a fork child's
-normal exit cannot shut down its parent's release channel.
+even if the worker exits before those descendants. Retiring the storage peer
+after unexpected worker exit transfers these leases to arena pins; they keep
+preventing reuse and page reclamation until the inherited writers close.
+Explicit executor shutdown first terminates the worker's process group and
+observed descendants, including fork readers, before retiring its storage peer.
+Ordinary batches do not allocate additional descriptors. Worker-client cleanup
+and inherited input finalizers check the creator PID before touching locks,
+release queues, or sockets, so a fork child's normal exit cannot shut down its
+parent's release channel.
 
 `VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
 `auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
@@ -2131,6 +2184,11 @@ the same dynamically learned pending-generator window. An undeclared UDF heap
 commitment is zero; worker RSS high-water marks do not become an additional
 local concurrency limit. Native plan preparation installs this policy even
 when `track_data`, `track_graph`, and explicit runtime limits are omitted.
+Ordinary native `CREATE TABLE AS` and `INSERT` queries retain their DuckDB write
+semantics when they include subprocess UDFs. Their resource graph includes the
+UDF inputs and the native write sink as a materialization boundary. This does
+not extend the configured local request runtime's read-only SQL contract or
+enable distributed execution of these native writes.
 
 Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
 soft budgets, split those budgets between live queries, and preserve downstream
@@ -2144,6 +2202,12 @@ Ray capacity comes from its cluster. Their actual object storage and physical
 placement remain backend responsibilities. DuckDB schedules local native
 operators and supplies their materialization ordering; local UDF concurrency does not depend on pipeline
 width or the number of Parquet row groups.
+
+DuckDB can create local dispatchers for the same UDF at different times. When
+the currently registered dispatchers drain, the UDF becomes temporarily idle
+and can accept a later dispatcher. Retained outputs stay charged throughout
+this transition. Materialization phase changes still require native ordering
+evidence; draining the current dispatchers does not seal UDF production.
 
 `VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
 `VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S` configure the same reservation and
@@ -2159,6 +2223,44 @@ that replacement startup without waiting for the model to finish loading.
 Execution completion returns the task/actor slot immediately; managed output
 bytes remain charged through queued results, zero-copy Arrow/NumPy views,
 remote readers, and inherited views protected by the shared-memory store.
+
+A local result bundle is one publication, even when it contains several IPC
+blocks. Query output admission reserves its complete byte count atomically,
+then assigns each physical block an independent lease. A liveness grant covers
+the complete bundle and returns only after every part is handed off or released.
+Retained parts remain charged individually until their last physical owner
+releases them; releasing one part does not free another part's charge.
+
+Shared-memory progress credits and physical bytes have separate lifetimes.
+The per-producer soft-budget window counts pending and unconsumed outputs.
+A downstream input ACK returns that output's progress credit, even when an
+actor retains a zero-copy view across calls. Its physical allocation and byte
+charge remain live until the last view or fork owner releases them. Consequently,
+multiple actors can receive replacement inputs without requiring their old
+views to disappear first. Explicit task byte envelopes remain strict.
+
+Each output request reports the worker's live input views, including views from
+earlier calls. Physical-capacity waits use this snapshot, idle retained views,
+and queued outputs of the input streams used by waiting consumers. The current
+call's upstream producer identities are recorded independently of live views
+and persist until the call completes or is cancelled. An all-NULL input can
+retain no physical views while its next batch still needs the occupied actor
+slot; releasing input storage must not erase that stream dependency. Physical
+leases held only by fork descendants or pending release notifications can be
+released independently and are excluded from the worker's blocking views.
+Queued-input inference requires a live parent lease: a region with zero parent
+references, held only by fork descendants, can release independently and must
+not be classified as queued work merely because it has no input reader.
+Queued input is not assumed reclaimable merely because it belongs to another
+allocation: its next invocation may require the very actor slot occupied by the
+waiting writer.
+A current read owner in another worker, or an unrelated stream, still permits
+an independent release. This is a conservative admission boundary: an input
+whose consumer has not started is not evidence that a capacity wait can finish.
+When these dependencies leave no contiguous region large enough for any waiting
+output, execution reports a capacity error with pinned, retained, and queued
+input bytes. Reducing input/output blocks or increasing the arena addresses this
+hard capacity boundary; increasing the soft reference budget does not.
 
 Explicit local `DataAdmissionLimits` remain an additional application limit.
 Their byte-accounting tests verify these differences from default soft admission:

@@ -314,14 +314,15 @@ def test_shared_actor_pool_uses_idle_replica_across_query_policies():
         pool.close()
 
 
-def test_cancel_queued_output_is_nonblocking_and_preserves_other_query_owners():
+@pytest.mark.parametrize("sizes", [(100,), (25, 25, 25, 25)])
+def test_cancel_queued_output_is_nonblocking_and_preserves_other_query_owners(sizes):
     graph, bindings = _graph()
     query = LocalQueryAdmission(graph, _allocation(store=1))
     pool = LocalExecutionSlotPool(max_slots=2, execution_slot_prefix="task")
     authority = _authority(query, bindings["0"], pool)
     lease = _take(authority)
     first = _own_output(query, lease, 100)
-    second = query.buffer_output(lease.lease["query_policy_task"], 100)
+    second = query.buffer_output(lease.lease["query_policy_task"], sum(sizes))
     try:
         second.request(lambda: None)
         assert second.take() is None
@@ -362,6 +363,138 @@ def test_query_output_bytes_follow_zero_copy_view_after_task_and_query_close():
     del view
     gc.collect()
     assert query.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+@pytest.mark.parametrize("store", [1, 1_000_000])
+def test_output_bundle_admits_atomically_and_releases_each_physical_view(store):
+    from vane.execution.local_output_read import LocalOutputRead
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, make_local_shm_ref_bundle_result
+
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation(store=store))
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    authority = _authority(query, bindings["0"], pool)
+    lease = _take(authority)
+    refs = [make_local_shm_ref_bundle_result(pa.table({"x": list(range(2048))}))[1][0] for _ in range(4)]
+    output_read = LocalOutputRead()
+    views = []
+    try:
+        output_read.buffer((REF_BUNDLE_RESULT_MARKER, refs, {}, {}), lease)
+        assert output_read.poll(lambda: None)
+        snapshot = query.snapshot()
+        assert len(snapshot["output_leases"]) == 4
+        assert snapshot["liveness"]["output_grants_total"] == (1 if store == 1 else 0)
+        views = [ref.to_table() for ref in refs]
+        sizes = [ref.size for ref in refs]
+        for ref in refs:
+            ref.transition_data_lease("downstream_input")
+            ref.release()
+        lease.release()
+        assert query.snapshot()["usage"]["object_store_bytes"] == sum(sizes)
+        views.pop(0)
+        gc.collect()
+        assert query.snapshot()["usage"]["object_store_bytes"] == sum(sizes[1:])
+        assert views[-1]["x"][17].as_py() == 17
+        authority.close()
+        query.shutdown()
+        assert query.snapshot()["usage"]["object_store_bytes"] == sum(sizes[1:])
+        views.clear()
+        gc.collect()
+        assert query.snapshot()["usage"]["object_store_bytes"] == 0
+    finally:
+        output_read.close()
+        for ref in refs:
+            ref.release()
+        views.clear()
+        lease.release()
+        authority.close()
+        query.shutdown()
+        pool.close()
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 3])
+def test_output_bundle_attachment_failure_releases_all_blocks(monkeypatch, failure_index):
+    from vane.execution.local_output_read import LocalOutputRead
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, make_local_shm_ref_bundle_result
+
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation(store=1))
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    authority = _authority(query, bindings["0"], pool)
+    lease = _take(authority)
+    refs = [make_local_shm_ref_bundle_result(pa.table({"x": [i]}))[1][0] for i in range(4)]
+
+    def fail_attach(owner):
+        raise RuntimeError("injected attachment failure")
+
+    monkeypatch.setattr(refs[failure_index], "attach_query_output_lease", fail_attach)
+    output_read = LocalOutputRead()
+    try:
+        with pytest.raises(RuntimeError, match="injected attachment failure"):
+            output_read.buffer((REF_BUNDLE_RESULT_MARKER, refs, {}, {}), lease)
+            output_read.poll(lambda: None)
+        output_read.close()
+        for ref in refs:
+            ref.release()
+        lease.release()
+        snapshot = query.snapshot()
+        assert snapshot["output_leases"] == {}
+        assert snapshot["liveness"]["active_output_lease_ids_by_unit"] == {}
+        assert snapshot["usage"]["object_store_bytes"] == 0
+    finally:
+        output_read.close()
+        for ref in refs:
+            ref.release()
+        lease.release()
+        authority.close()
+        query.shutdown()
+        pool.close()
+
+
+def test_native_multiblock_result_completes_above_query_soft_budget(monkeypatch):
+    import vane
+    from vane.execution.request_admission import RequestAdmissionLimits
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64KiB")
+    monkeypatch.setenv("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5")
+    output_type = vane.type("STRUCT(document FILE, text VARCHAR)")
+    file_type = pa.struct(
+        [
+            ("url", pa.string()),
+            ("content_type", pa.string()),
+            ("position", pa.int64()),
+            ("size", pa.int64()),
+            ("checksum", pa.string()),
+        ]
+    )
+
+    @vane.func.batch(return_dtype=output_type, batch_size=1)
+    def produce(values):
+        i = values[0].as_py()
+        # Distinct Arrow layouts prevent transport coalescing: all four blocks
+        # must be published together, totaling about 53 KiB against 32 KiB.
+        text = pa.array([b"x" * 12000], type=pa.binary()) if i % 2 == 0 else pa.array(["x" * 12000])
+        document = pa.array(
+            [
+                {
+                    "url": f"memory://bundle/{i}",
+                    "content_type": "application/octet-stream",
+                    "position": 0,
+                    "size": 3,
+                    "checksum": "sha256:abc",
+                }
+            ],
+            type=file_type,
+        )
+        return pa.StructArray.from_arrays([document, text], names=["document", "text"])
+
+    with vane.connect(config={"threads": 2}) as conn:
+        conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 0), execution_timeout=10)
+        relation = conn.sql("SELECT i::BIGINT AS id FROM range(4) t(i)").select(
+            produce(vane.col("id")).alias("payload")
+        )
+        assert relation.project("length(payload.text)").fetchall() == [(12000,)] * 4
 
 
 def test_concurrent_local_queries_share_and_return_the_ray_query_allocation():
@@ -478,7 +611,47 @@ def test_native_local_query_uses_shared_policy_by_default(monkeypatch, configure
     assert all(query.snapshot()["usage"]["heap_bytes"] == 0 for query in captured)
 
 
-def test_production_completion_waits_for_active_execution_but_retains_output_bytes():
+@pytest.mark.parametrize("produced_output", [False, True])
+@pytest.mark.parametrize("coordinated", [False, True])
+def test_finished_dispatcher_allows_later_parallel_dispatcher(produced_output, coordinated):
+    graph, bindings = _graph()
+    query = LocalQueryAdmission(graph, _allocation(), coordinator=LocalQueryCoordinator() if coordinated else None)
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
+    first = _authority(query, bindings["0"], pool)
+    lease = _take(first) if produced_output else None
+    output = _own_output(query, lease, 50) if lease is not None else None
+    second = next_lease = None
+    try:
+        # DuckDB can finish an empty local dispatcher before constructing the
+        # next one for the same UDF. Retained output also outlives a dispatcher.
+        first.finished_submitting()
+        if lease is not None:
+            lease.complete_execution()
+        retained = 50 if output is not None else 0
+        assert query.snapshot()["usage"]["object_store_bytes"] == retained
+        second = _authority(query, bindings["0"], pool)
+        next_lease = _take(second)
+        assert query.snapshot()["usage"]["cpu"] == 1
+        # Active tasks also carry the policy's pending-output estimate.
+        assert query.snapshot()["usage"]["object_store_bytes"] >= retained + 16
+        next_lease.complete_execution()
+        assert query.snapshot()["usage"]["object_store_bytes"] == retained
+    finally:
+        if output is not None:
+            output.release()
+        if lease is not None:
+            lease.release()
+        if next_lease is not None:
+            next_lease.release()
+        first.close()
+        if second is not None:
+            second.close()
+        query.shutdown()
+        pool.close()
+    assert query.snapshot()["usage"]["cpu"] == query.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_dispatcher_drain_waits_for_active_execution_and_retains_output_bytes():
     graph, bindings = _graph()
     query = LocalQueryAdmission(graph, _allocation())
     pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="task")
@@ -487,9 +660,11 @@ def test_production_completion_waits_for_active_execution_but_retains_output_byt
     owner = _own_output(query, lease, 50)
     try:
         authority.finished_submitting()
-        assert bindings["0"] not in query._completed_units
+        assert query.snapshot()["units"][bindings["0"]]["runnable"]
         lease.complete_execution()
-        assert bindings["0"] in query._completed_units
+        unit = query.snapshot()["units"][bindings["0"]]
+        assert not unit["runnable"]
+        assert not unit["completed"]
         assert query.snapshot()["usage"]["object_store_bytes"] == 50
         owner.release()
         assert query.snapshot()["usage"]["object_store_bytes"] == 0
@@ -516,7 +691,8 @@ def test_unread_output_retains_policy_identity_after_execution_finishes(finish):
         state = query.snapshot()["units"][bindings["0"]]
         assert state["num_task_outputs_generated"] == state["pending_output_count"] == 0
         assert state["num_tasks_finished"] == 0
-        assert bindings["0"] not in query._completed_units
+        assert state["runnable"]
+        assert not state["completed"]
         if finish == "read":
             output.request(lambda: None)
             owner = output.take()
@@ -525,8 +701,10 @@ def test_unread_output_retains_policy_identity_after_execution_finishes(finish):
         else:
             output.close()
             assert query.snapshot()["usage"]["object_store_bytes"] == 0
-        assert bindings["0"] in query._completed_units
-        assert query.snapshot()["units"][bindings["0"]]["num_tasks_finished"] == 1
+        state = query.snapshot()["units"][bindings["0"]]
+        assert not state["runnable"]
+        assert not state["completed"]
+        assert state["num_tasks_finished"] == 1
     finally:
         output.close()
         if owner is not None:

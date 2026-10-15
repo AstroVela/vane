@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import pickle
 import threading
@@ -360,11 +361,13 @@ def _make_local_query_driver_actor():
     runner._leased_result_partition_refs = {}
     runner._result_partition_ref_counters = {}
     runner._query_resource_graphs = {}
+    runner._query_resource_lock = threading.RLock()
     runner._query_allocations = {}
     runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
+    runner._udf_actor_timeout_cleanup_pending = set()
     runner._active_udf_actor_by_unit = {}
     runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}
@@ -636,6 +639,7 @@ def test_maintenance_loops_continue_after_pre311_asyncio_timeout(
             runner._query_resource_maintenance_error = ""
             runner._query_resource_maintenance_failures = 0
             runner._maintain_query_resources_once = lambda: maintenance_calls.append(None)
+            runner._expire_pending_udf_actor_pools = lambda **_kwargs: None
             maintenance_loop = runner_cls._query_resource_maintenance_loop
 
         wait_calls = 0
@@ -1366,6 +1370,8 @@ def test_close_plan_cancels_queued_copy_before_connection_teardown(monkeypatch):
 
 
 def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
+    from vane.ai import DiagnosticError
+
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
     logical_plan = _FakeLogicalPlan(physical_plan)
@@ -1374,7 +1380,10 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             on_execution_started()
-            runner._query_terminal_errors["copy-query-terminal"] = "Ray actor UDF pool initialization failed"
+            runner._query_terminal_errors["copy-query-terminal"] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
             return _committed_copy_result(ok=True)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1402,6 +1411,7 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     assert outcome.write_state == "committed"
     assert outcome.cleanup_state == "complete"
     assert any("Ray actor UDF pool initialization failed" in warning for warning in outcome.cleanup_warnings)
+    assert any("max_model_len" in warning for warning in outcome.cleanup_warnings)
 
 
 def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatch):
@@ -1759,6 +1769,63 @@ def test_query_driver_marks_unknown_result_when_cancelled_during_teardown(monkey
     assert plan_id not in runner._plan_lifecycles
 
 
+@pytest.mark.parametrize("returned", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_datasink_keeps_late_initialization_cause_and_unknown_outcome(
+    monkeypatch, returned, cleanup_failure
+):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-late-initialization"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            runner._query_terminal_errors[plan_id] = DiagnosticError(
+                "Ray actor UDF pool initialization failed",
+                TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+            )
+            if returned:
+                return {
+                    "outcome_unknown": True,
+                    "outcome_aborted": False,
+                    "outcome_cancelled": False,
+                    "outcome_error": "FTE worker reservation failed: query_failed",
+                    "write_results": [],
+                    "data_sink_cleanup_warnings": [],
+                }
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+    def teardown(_self, actual_plan_id, expected_lifecycle):
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            cleanup = RayTaskError("close", "private traceback", OSError(5, "private path"))
+            raise driver._QueryCleanupDiagnostic("private cleanup", (cleanup,))
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", teardown)
+
+    try:
+        result = asyncio.run(_run_actor_datasink_plan(runner, logical_plan))
+    finally:
+        cls._shutdown_driver_executors(runner)
+    assert result["outcome_unknown"] is True
+    assert result["outcome_aborted"] is False
+    assert result["outcome_cancelled"] is False
+    summary = summarize_error(pickle.loads(pickle.dumps(result["outcome_diagnostic"])))
+    assert "max_model_len" in summary and "private" not in summary
+    if cleanup_failure:
+        assert "cleanup: OSError (errno=5)" in summary
+
+
 def test_query_driver_marks_failed_execution_when_cancelled_during_cleanup(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "datasink-failed-then-cancelled-during-cleanup"
@@ -2064,7 +2131,10 @@ def test_query_driver_owner_discard_releases_pending_copy_cleanup_terminal():
     assert cls._copy_operation_terminal_record(runner, operation_id) is None
 
 
-def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, late_init):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2075,6 +2145,11 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise ValueError("planned failure before commit")
 
     def _teardown(_self, actual_plan_id):
@@ -2093,7 +2168,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
         lambda: _run_actor_copy_plan(runner, logical_plan),
         lambda: _run_actor_copy_plan(runner, logical_plan),
     ):
-        with pytest.raises(ValueError, match="planned failure before commit"):
+        with pytest.raises(DiagnosticError if late_init else ValueError):
             asyncio.run(operation())
 
     recovered = asyncio.run(
@@ -2106,12 +2181,22 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     )
 
     assert recovered.outcome is None
-    assert isinstance(recovered.error, ValueError)
-    assert str(recovered.error) == "planned failure before commit"
+    if late_init:
+        assert isinstance(recovered.error, DiagnosticError)
+        assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(recovered.error)))
+    else:
+        assert isinstance(recovered.error, ValueError)
+        assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
 
 
-def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-native-outcome-unknown"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2132,6 +2217,11 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             return unknown_result
 
     def _teardown(_self, actual_plan_id):
@@ -2139,6 +2229,8 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2158,8 +2250,20 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
         assert error.value.manifest_path.endswith("/manifest.txt")
         assert error.value.committed_marker_path.endswith("/committed")
         assert error.value.safe_to_retry is False
-        assert error.value.cleanup_warnings == ()
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        elif not cleanup_failure:
+            assert error.value.cleanup_warnings == ()
         assert "readback was inconclusive" in str(error.value)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyOutcomeUnknownError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2176,7 +2280,13 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert plan_calls == 1
 
 
-def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch):
+@pytest.mark.parametrize("late_init", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(
+    monkeypatch, late_init, cleanup_failure
+):
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-result-unavailable"
     logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
@@ -2187,6 +2297,11 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
             nonlocal plan_calls
             plan_calls += 1
             on_execution_started()
+            if late_init:
+                runner._query_terminal_errors[plan_id] = DiagnosticError(
+                    "Ray actor UDF pool initialization failed",
+                    TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+                )
             raise driver.CopyResultUnavailableError(
                 plan_id,
                 "planned result marshalling failure",
@@ -2197,6 +2312,8 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
         _release_test_plan_session_state(cls, runner, actual_plan_id)
+        if cleanup_failure:
+            raise driver._QueryCleanupDiagnostic("private teardown text", (OSError(errno.EIO, "private path"),))
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -2214,6 +2331,18 @@ def test_query_driver_committed_result_failure_is_structured_and_never_reexecute
         assert error.value.write_state == "committed"
         assert error.value.safe_to_retry is False
         assert "planned result marshalling failure" in str(error.value)
+        if late_init:
+            assert any("max_model_len" in warning for warning in error.value.cleanup_warnings)
+        restored = pickle.loads(pickle.dumps(error.value))
+        assert type(restored) is driver.CopyResultUnavailableError and restored.safe_to_retry is False
+        assert restored.operation_id == plan_id and restored.write_state == "committed"
+        assert restored.__cause__ is None
+        summary = summarize_error(restored)
+        assert "private" not in summary
+        if late_init:
+            assert "max_model_len" in summary
+        if cleanup_failure:
+            assert "cleanup: OSError (errno=5)" in summary
 
     recovered = asyncio.run(
         cls.recover_copy_plan(
@@ -2396,6 +2525,17 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert restored.cleanup_warnings == error.cleanup_warnings
     assert restored.safe_to_retry is False
     assert str(restored) == str(error)
+
+
+def test_copy_recovery_unknown_error_retains_safe_cause_after_serialization():
+    from vane.ai import summarize_error
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as caught:
+        driver._raise_copy_outcome_unknown("copy-recovery", OSError(errno.EIO, "private recovery path"))
+    restored = pickle.loads(pickle.dumps(caught.value))
+    assert restored.operation_id == "copy-recovery" and restored.safe_to_retry is False
+    assert "OSError (errno=5)" in summarize_error(restored)
+    assert "private" not in summarize_error(restored)
 
 
 def test_copy_result_unavailable_error_preserves_terminal_state_across_serialization():
@@ -4130,7 +4270,8 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
         query_id=query_id,
         query_connection=query_connection,
     )
-    runner._query_terminal_errors[query_id] = "planned terminal marker"
+    terminal_error = RuntimeError("planned terminal marker")
+    runner._query_terminal_errors[query_id] = terminal_error
     fragment_drops = []
     monkeypatch.setattr(
         cls,
@@ -4147,7 +4288,7 @@ def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retr
     assert runner._plan_query_ids[plan_id] == query_id
     assert runner._plan_connections[plan_id] is query_connection
     assert plan_id in runner._sessions[_TEST_SESSION_ID].plan_ids
-    assert runner._query_terminal_errors[query_id] == "planned terminal marker"
+    assert runner._query_terminal_errors[query_id] is terminal_error
 
     cls._teardown_plan_resources(runner, plan_id)
 
@@ -7614,7 +7755,12 @@ def test_get_next_partition_rejects_non_metadata_aware_fragment():
         )
 
 
-def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery():
+@pytest.mark.parametrize("during_poll", [False, True])
+@pytest.mark.parametrize("failure", ["provider", "timeout"])
+def test_get_next_partition_surfaces_late_actor_initialization_failure_before_delivery(during_poll, failure):
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-placement-lost"
     query_id = "query-placement-lost"
@@ -7622,7 +7768,22 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     undelivered = object()
     runner.curr_streams[plan_id] = _DummyStream([undelivered])
     runner.curr_plans[plan_id] = object()
-    runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
+    if failure == "provider":
+        terminal_error = DiagnosticError(
+            "Ray actor UDF pool initialization failed",
+            TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+        )
+    else:
+        terminal_error = TimeoutError("Ray actor UDF pool initialization timed out: CPU=1, GPU=1 per actor")
+    if during_poll:
+
+        def failed_poll():
+            runner._query_terminal_errors[query_id] = terminal_error
+            raise RuntimeError("FTE worker reservation failed: query_failed")
+
+        runner.curr_streams[plan_id].next_nowait = failed_poll
+    else:
+        runner._query_terminal_errors[query_id] = terminal_error
     teardown_calls = []
 
     def _teardown(actual_plan_id):
@@ -7632,38 +7793,82 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     runner._teardown_plan_resources = _teardown
 
-    with pytest.raises(RuntimeError, match="Ray actor UDF pool initialization failed"):
-        asyncio.run(
-            cls.get_next_partition(
-                runner,
-                _TEST_RUNTIME_OWNER_ID,
-                _TEST_SESSION_ID,
-                plan_id,
+    try:
+        with pytest.raises(type(terminal_error), match="Ray actor UDF pool initialization") as caught:
+            asyncio.run(
+                cls.get_next_partition(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    plan_id,
+                )
             )
-        )
+    finally:
+        release_query_resource_manager(query_id, reason="test_complete")
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
-    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
-
-    release_query_resource_manager(query_id, reason="test_complete")
+    # asyncio bridges concurrent Future timeouts into a new TimeoutError.
+    assert type(caught.value) is type(terminal_error)
+    restored = pickle.loads(pickle.dumps(caught.value))
+    if failure == "provider":
+        assert "max_model_len" in summarize_error(restored)
+    else:
+        assert str(restored) == str(terminal_error)
 
 
 def test_terminal_query_failure_preserves_primary_when_teardown_also_fails():
+    from vane.ai import DiagnosticError, summarize_error
+
     cls, runner = _make_local_query_driver_actor()
     plan_id = "terminal-cleanup-plan"
     query_id = "terminal-cleanup-query"
-    runner._query_terminal_errors[query_id] = "fixed actor placement was lost"
+    terminal_error = DiagnosticError(
+        "Ray actor UDF pool initialization failed",
+        TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'"),
+    )
+    runner._query_terminal_errors[query_id] = terminal_error
     cleanup_error = RuntimeError("planned terminal teardown failure")
     runner._teardown_plan_resources = lambda *_args, **_kwargs: (_ for _ in ()).throw(cleanup_error)
 
     with pytest.raises(driver.QueryExecutionCleanupError) as error:
         cls._finish_terminal_query(runner, plan_id, query_id)
 
-    assert isinstance(error.value.primary_error, RuntimeError)
-    assert str(error.value.primary_error) == "fixed actor placement was lost"
+    assert error.value.primary_error is terminal_error
+    assert "max_model_len" in summarize_error(pickle.loads(pickle.dumps(error.value)))
     assert error.value.cleanup_errors == (cleanup_error,)
     assert error.value.__cause__ is error.value.primary_error
+
+
+@pytest.mark.parametrize("ray_wrapped", [False, True])
+def test_terminal_query_serializes_cleanup_diagnostics_after_ownership_is_released(ray_wrapped):
+    from ray.exceptions import RayTaskError
+
+    from vane.ai import DiagnosticError, summarize_error
+
+    cls, runner = _make_local_query_driver_actor()
+    query_id = "terminal-cleanup-diagnostic"
+    runner._query_terminal_errors[query_id] = DiagnosticError(
+        "actor initialization", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    cleanup_errors = (OSError(errno.EIO, "private cleanup path"), OSError(errno.ENOSPC, "private journal path"))
+    if ray_wrapped:
+        cleanup_errors = tuple(RayTaskError("cleanup", "private traceback", error) for error in cleanup_errors)
+
+    def teardown(plan_id):
+        runner._query_terminal_errors.pop(query_id)
+        raise driver._QueryCleanupDiagnostic("private cleanup message", cleanup_errors)
+
+    runner._teardown_plan_resources = teardown
+    with pytest.raises(DiagnosticError) as caught:
+        cls._finish_terminal_query(runner, "terminal-plan", query_id)
+    serialized = pickle.dumps(caught.value)
+    assert b"private" not in serialized
+    for error in (caught.value, pickle.loads(serialized)):
+        summary = summarize_error(error)
+        assert "max_model_len" in summary
+        assert "; cleanup: OSError (errno=5)" in summary and "OSError (errno=28)" in summary
+    assert query_id not in runner._query_terminal_errors
 
 
 def test_get_next_partition_waits_for_teardown_without_blocking_event_loop():
@@ -13055,3 +13260,76 @@ def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypat
         ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
         ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
     ]
+
+
+def test_expired_client_kills_udf_actor_before_joining_active_operation():
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-udf-startup"
+    _bind_test_plan_session(runner, plan_id)
+    actor_killed = threading.Event()
+    operation_started = threading.Event()
+    session = runner._sessions[_TEST_SESSION_ID]
+    events = []
+
+    class Pool:
+        actors = [object()]
+        _vane_retired = False
+
+        def shutdown(self, *, kill):
+            assert kill is True
+            assert session.connection.closed is False
+            events.append("kill")
+            self.actors = []
+            actor_killed.set()
+
+    pool = Pool()
+    runner._active_udf_actors = [pool]
+    runner._active_udf_actors_by_plan = {plan_id: [pool]}
+    runner._active_udf_actor_by_unit = {plan_id: {"actor": pool}}
+
+    def cleanup(actual_plan_id):
+        assert actual_plan_id == plan_id
+        assert session.active_operations == 0
+        events.append("teardown")
+        session.plan_ids.discard(plan_id)
+        runner._plan_session_ids.pop(plan_id)
+
+    runner._cleanup_finished_plan = cleanup
+
+    def native_operation():
+        operation_started.set()
+        assert actor_killed.wait(timeout=5)
+        assert session.connection.closed is False
+        events.append("operation-exit")
+
+    async def expire():
+        async def operation():
+            cls._begin_session_operation(session, _TEST_SESSION_ID)
+            try:
+                await driver._run_in_executor_with_owned_side_effects(
+                    runner._get_driver_native_executor(),
+                    native_operation,
+                )
+            finally:
+                cls._end_session_operation(session)
+
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(operation_started.wait, 2)
+        runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1
+        assert cls._mark_expired_client_leases(runner, now=1) == (_TEST_RUNTIME_OWNER_ID,)
+        assert (
+            await asyncio.wait_for(
+                cls._detach_client_owner(runner, _TEST_RUNTIME_OWNER_ID, expired=True),
+                timeout=5,
+            )
+            is False
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(expire())
+    assert events == ["kill", "operation-exit", "teardown"]
+    assert session.connection.closed is True
+    assert runner._active_udf_actors == []

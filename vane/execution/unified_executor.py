@@ -77,7 +77,15 @@ def build_unified_executor(
     """Build a UDF executor from the unified payload."""
     from vane.execution.udf import build_executor
 
-    return build_executor(payload, options)
+    try:
+        return build_executor(payload, options)
+    except Exception as error:
+        from vane.ai._errors import DiagnosticError
+
+        # The native dispatcher stringifies this exception. Capture its typed
+        # cause/cleanup chain here, before Python type identity is lost.
+        diagnostic = DiagnosticError("UDF executor initialization failed", error)
+    raise diagnostic from None
 
 
 __all__ = ["UDFExecutor", "build_unified_executor"]

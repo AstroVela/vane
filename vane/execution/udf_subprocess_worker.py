@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from vane import pickle as vane_pickle
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution._subprocess_error import error_payload
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
     PreparedLocalShmBlock,
@@ -37,7 +38,7 @@ from vane.execution.udf_row_preserving import (
     fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
-from vane.execution.udf_shm_store import initialize_worker_shm_client
+from vane.execution.udf_shm_store import initialize_worker_shm_client, worker_shm_client
 from vane.execution.udf_threading import configure_loaded_torch_threads
 
 _MSG_READY = 0x01
@@ -60,6 +61,7 @@ _MSG_REF_BUNDLE_CHUNK = 0x11
 _MSG_OUTPUT_GRANT_FAILED = 0x12
 _MSG_STREAM_NEXT = 0x13
 _MSG_STREAM_CONTINUE = 0x14
+_MSG_INPUT_RETAINED = 0x15
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -426,6 +428,7 @@ def _request_output_grant(
         "worker_pid": os.getpid(),
         "size_bytes": int(size),
         "priority": "consumer",
+        "input_tokens": worker_shm_client().retained_inputs(),
     }
     if input_lease_id is not None:
         payload["input_lease_id"] = int(input_lease_id)
@@ -625,44 +628,6 @@ def _execute_submit(
     return data_shm, _MSG_OK, struct.pack("<Q", result_size)
 
 
-def _execute_task_submit(
-    payload: dict[str, Any],
-    input_table: pa.Table,
-    data_shm: shared_memory.SharedMemory,
-    produce_ref_bundle_output: bool,
-    submit_count: int,
-    log_submit: bool,
-    sock: socket.socket,
-    input_lease_id: int | None = None,
-) -> tuple[shared_memory.SharedMemory, int, bytes]:
-    if input_table.num_rows == 0:
-        return data_shm, _MSG_OK, struct.pack("<Q", 0)
-    executor = RuntimeUDFExecutor(_streaming_payload(payload), cache_callable=_callable_cache_enabled(payload))
-    configure_loaded_torch_threads()
-    try:
-        if log_submit:
-            _worker_thread_log(
-                "task_executor_ready",
-                payload,
-                submit_count=submit_count,
-                rows=input_table.num_rows,
-            )
-        return _execute_submit(
-            executor,
-            input_table,
-            data_shm,
-            produce_ref_bundle_output,
-            sock=sock,
-            submit_count=submit_count,
-            input_lease_id=input_lease_id,
-            finish_before_drain=True,
-        )
-    finally:
-        # close() flushes via finished_submitting() and releases the callable
-        # under its own finally, so cleanup runs even if the flush raises.
-        executor.close()
-
-
 def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str, shm_fd: int) -> None:
     sock = socket.socket(fileno=sock_fd)
     shm_client = initialize_worker_shm_client(shm_fd)
@@ -699,7 +664,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     _send_message(
                         sock,
                         _MSG_ERROR,
-                        _format_exception(cleanup_error).encode("utf-8", errors="replace"),
+                        error_payload(cleanup_error, _format_exception(cleanup_error)),
                     )
                     # The parent may decide to force termination after this
                     # bounded attempt. Retain the executor until then so its
@@ -712,7 +677,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         executor.finished_submitting()
                     _send_message(sock, _MSG_ACK)
                 except Exception as exc:
-                    _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                    _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
                 continue
             if msg_type not in (_MSG_SUBMIT, _MSG_SUBMIT_REF_BUNDLE):
                 raise ValueError(f"unknown UDF subprocess message type: {msg_type:#x}")
@@ -720,6 +685,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 raise ValueError("submit message payload must contain the shared-memory byte size")
 
             try:
+                if subprocess_mode == "task" and executor is not None:
+                    raise RuntimeError("subprocess task worker still owns an executor awaiting cleanup")
                 input_lease_id = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
@@ -770,16 +737,38 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         msg_type=msg_type,
                     )
                 if subprocess_mode == "task":
-                    data_shm, result_msg_type, result_payload = _execute_task_submit(
-                        payload,
-                        input_table,
-                        data_shm,
-                        produce_ref_bundle_output,
-                        submit_count,
-                        log_submit,
-                        sock,
-                        input_lease_id=input_lease_id,
-                    )
+                    if input_table.num_rows == 0:
+                        result_msg_type, result_payload = _MSG_OK, struct.pack("<Q", 0)
+                    else:
+                        # Publish ownership before setup or execution can fail.
+                        # A failed close remains owned by this control loop for
+                        # _MSG_CLOSE and final teardown; it cannot be replaced
+                        # by the next task or acknowledged as already cleaned.
+                        executor = RuntimeUDFExecutor(
+                            _streaming_payload(payload), cache_callable=_callable_cache_enabled(payload)
+                        )
+                        try:
+                            configure_loaded_torch_threads()
+                            if log_submit:
+                                _worker_thread_log(
+                                    "task_executor_ready",
+                                    payload,
+                                    submit_count=submit_count,
+                                    rows=input_table.num_rows,
+                                )
+                            data_shm, result_msg_type, result_payload = _execute_submit(
+                                executor,
+                                input_table,
+                                data_shm,
+                                produce_ref_bundle_output,
+                                sock=sock,
+                                submit_count=submit_count,
+                                input_lease_id=input_lease_id,
+                                finish_before_drain=True,
+                            )
+                        finally:
+                            executor.close()
+                            executor = None
                 else:
                     if executor is None:
                         raise RuntimeError("subprocess actor worker executor is not initialized")
@@ -801,23 +790,27 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         rows=input_table.num_rows,
                         result_msg_type=result_msg_type,
                     )
+                input_table = None
+                _send_message(sock, _MSG_INPUT_RETAINED, vane_pickle.dumps(shm_client.retained_inputs()))
                 _send_message(sock, result_msg_type, result_payload)
             except _TaskCancelledError as exc:
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
-                _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
             finally:
                 input_table = None
     except Exception as exc:
         try:
-            _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+            _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
         except Exception:
             pass
     finally:
+        cleanup_error = None
         if executor is not None:
-            _close_executor_with_retry(executor)
-            executor = None
-            gc.collect()
+            cleanup_error = _close_executor_with_retry(executor)
+            if cleanup_error is None:
+                executor = None
+                gc.collect()
         shm_client.close()
         try:
             payload_shm.close()
@@ -831,6 +824,10 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             sock.close()
         except Exception:
             pass
+        if cleanup_error is not None:
+            # Failed engine cleanup is not a successful worker exit. The
+            # parent still owns this worker's process group and descendants.
+            raise cleanup_error
 
 
 def _main(argv: list[str]) -> int:

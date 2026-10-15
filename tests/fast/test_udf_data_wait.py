@@ -427,25 +427,29 @@ def test_older_byte_waiter_keeps_its_turn_among_newer_ordinary_work(harness, sam
 
 def test_busy_pool_does_not_park_bytes_needed_by_a_different_pool(harness):
     h = harness(budget=400, slots=2)
-    busy = h.authority()
-    ordinary = h.pools[0].create_authority()
-    second_ordinary = h.pools[0].create_authority()
+    # Keep one pool full while a different pool can use the remaining global
+    # slot. Completed calls no longer keep a task pool slot for their result.
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="busy", execution_capacity=h.capacity)
+    h.pools.append(pool)
+    busy = h.authority(pool=pool)
+    ordinary = pool.create_authority()
     try:
-        for caller in (ordinary, second_ordinary):
-            caller.request(8)
-            h.leases.append(caller.take(8))
+        ordinary.request(8)
+        held = h.take(ordinary)
         busy.request(8)
+        assert busy.state()["state"] == "requested"
         assert h.ledger.snapshot()["reserved_bytes"] == 0
-        assert h.capacity.reserved_slots == 2
-        # Return execution-only capacity, retaining both busy pool/result slots.
-        h.leases[-1].complete_execution()
+        assert h.capacity.reserved_slots == 1
         other = h.authority()
         other.request(8)
         h.take(other).release()
         assert busy.state()["state"] == "requested"
+        assert h.capacity.reserved_slots == 1
+        held.release()
+        h.take(busy).release()
+        assert h.ledger.snapshot()["reserved_bytes"] == 0
     finally:
         ordinary.close()
-        second_ordinary.close()
 
 
 def test_ready_grant_racing_request_snapshot_is_not_requeued(harness, monkeypatch):
