@@ -40,7 +40,37 @@ def native_error(error, envelope="native_json"):
         message = (
             "Invalid Input Error: Python exception occurred while executing the UDF: " + typed + "\nAt:\nprivate source"
         )
+    if envelope == "task_json":
+        message = json.dumps(
+            {
+                "exception_type": "INTERNAL",
+                "exception_message": "[PlanExecutionContext::spawn] task error: DuckDBError::InternalError: " + message,
+                "stack_trace_pointers": "private native stack",
+            }
+        )
     return InvalidInputException(message)
+
+
+@pytest.mark.parametrize("invalid", ["type", "prefix", "task_type", "message_type", "json", "forged"])
+def test_spawn_diagnostic_requires_complete_typed_native_envelopes(invalid):
+    from vane.ai._errors import _native_query_diagnostic
+
+    diagnostic = DiagnosticError("fixture", OSError(errno.ENOSPC, "private path"))
+    error = RuntimeError(str(diagnostic)) if invalid == "forged" else diagnostic
+    payload = json.loads(str(native_error(error, "task_json")))
+    if invalid == "type":
+        payload["exception_type"] = "Invalid Input"
+    elif invalid == "prefix":
+        payload["exception_message"] = "private text " + payload["exception_message"]
+    elif invalid == "task_type":
+        payload["exception_message"] = payload["exception_message"].replace(
+            "DuckDBError::InternalError:", "RuntimeError:", 1
+        )
+    elif invalid == "message_type":
+        payload["exception_message"] = {"private": "body"}
+    message = "DuckDBError::ExternalError: " + json.dumps(payload) + ("trailing text" if invalid == "json" else "")
+    assert _native_query_diagnostic(ValueError(message)) is None
+    assert "private" not in summarize_error(ValueError(message))
 
 
 @pytest.mark.parametrize(
@@ -59,7 +89,8 @@ def native_error(error, envelope="native_json"):
     ],
 )
 @pytest.mark.parametrize(
-    "envelope", ["plain", "native_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"]
+    "envelope",
+    ["plain", "native_json", "task_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"],
 )
 def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, expected, envelope):
     public = _safe_provider_execution_error("sglang", "private-model", "embedding initialization", error)
@@ -698,7 +729,7 @@ def test_actor_activation_captures_cause_and_cleanup_before_ray_serialization(mo
 
 
 @pytest.mark.parametrize("method", ["copy", "datasink"])
-@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+@pytest.mark.parametrize("envelope", ["native_json", "task_json", "init_json", "init_stream_json"])
 def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(method, envelope):
     from types import SimpleNamespace
 
@@ -732,7 +763,7 @@ def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(meth
     assert "OSError (errno=28)" in summary and "private" not in summary
 
 
-@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+@pytest.mark.parametrize("envelope", ["native_json", "task_json", "init_json", "init_stream_json"])
 @pytest.mark.parametrize("forged", [False, True])
 def test_datasink_returned_failure_captures_only_native_typed_diagnostics(envelope, forged):
     from types import SimpleNamespace

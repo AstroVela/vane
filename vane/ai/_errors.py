@@ -274,12 +274,12 @@ def _is_exception(error: BaseException, module_name: str, *names: str) -> bool:
     return any(isinstance(cls := namespace.get(name), type) and isinstance(error, cls) for name in names)
 
 
-def _native_invalid_input_message(message: str) -> str | None:
+def _native_exception_message(message: str, expected_type: str) -> str | None:
     try:
         payload = json.loads(message)
     except (ValueError, RecursionError):
         return None
-    if type(payload) is not dict or payload.get("exception_type") != "Invalid Input":
+    if type(payload) is not dict or payload.get("exception_type") != expected_type:
         return None
     nested_message = payload.get("exception_message")
     return nested_message if type(nested_message) is str else None
@@ -288,9 +288,20 @@ def _native_invalid_input_message(message: str) -> str | None:
 def _native_summary(message: str) -> str | None:
     """Decode complete native UDF/LLM envelopes, never search arbitrary text."""
     message = message.removeprefix("DuckDBError::ExternalError: ")
+    if message.startswith("{"):
+        # Terminal INSERT tasks can wrap the FTE failure in the native spawn
+        # boundary's INTERNAL envelope. Require that exact envelope; arbitrary
+        # internal-error bodies must not acquire diagnostic provenance.
+        nested = _native_exception_message(message, "INTERNAL")
+        prefix = "[PlanExecutionContext::spawn] task error: DuckDBError::InternalError: "
+        if nested is None or not nested.startswith(prefix):
+            return None
+        message = nested[len(prefix) :]
     for prefix in ("FTE query wait failed: FTE query failed: Execution failed: ", "Execution failed: "):
         if message.startswith(prefix):
-            nested = _native_invalid_input_message(message[len(prefix) :].partition("\n--- DIAGNOSTIC DUMP ---\n")[0])
+            nested = _native_exception_message(
+                message[len(prefix) :].partition("\n--- DIAGNOSTIC DUMP ---\n")[0], "Invalid Input"
+            )
             if nested is None:
                 return None
             message = nested
@@ -302,7 +313,7 @@ def _native_summary(message: str) -> str | None:
         # Initialization can reach either the slot error or the streaming
         # collector first. Both carry the native InvalidInputException JSON.
         if message.startswith("{"):
-            nested = _native_invalid_input_message(message)
+            nested = _native_exception_message(message, "Invalid Input")
             if nested is None or not nested.startswith("Failed to build udf executor: "):
                 return None
             message = nested.removeprefix("Failed to build udf executor: ")
