@@ -2780,6 +2780,9 @@ def ensure_local_subprocess_actor_pools_for_plan(
     conn: Any = None,
 ) -> tuple[list[LocalSubprocessActorPool], dict[str, Any]]:
     """Pre-create local subprocess actors and inject them into UDF nodes."""
+    # Binding and fragment replay both require the planner's stable resource IDs.
+    # Describe the plan before collecting the payloads used to create actors.
+    plan.collect_query_resource_graph_metadata(conn=conn)
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_local_subprocess_actor_pools_for_nodes(
         udf_nodes,

@@ -233,16 +233,9 @@ def _round_trip_ai_plan(relation):
 
 
 def _execute_ai_physical_plan(target, physical):
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from tests.local_plan_helpers import execute_local_physical_plan
 
-    pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
-    try:
-        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
-        payloads = list(result.partition_payloads)
-        return pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
-    finally:
-        for pool in pools:
-            pool.shutdown(kill=True)
+    return execute_local_physical_plan(target, physical)
 
 
 @pytest.mark.parametrize("function", ["ai_prompt", "ai_embed"])

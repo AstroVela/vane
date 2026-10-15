@@ -32,16 +32,9 @@ def _round_trip_to_fresh_physical_plan(relation):
 
 
 def _execute_fresh_physical_plan(target, physical):
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from tests.local_plan_helpers import execute_local_physical_plan
 
-    pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
-    try:
-        runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
-        result = runner.execute_native(target.cursor(), physical, None, None)
-        return _table_from_native_result(result)
-    finally:
-        for pool in pools:
-            pool.shutdown(kill=True)
+    return execute_local_physical_plan(target, physical)
 
 
 def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
