@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from vane.execution.cluster_resource_policy import (
@@ -19,7 +20,7 @@ from vane.execution.query_resource_demand import build_query_demand
 from vane.execution.resources import ResourceVector
 
 if TYPE_CHECKING:
-    from vane.execution.local_query_admission import LocalQueryAdmission, LocalQueryAdmissionAuthority
+    from vane.execution.local_query_admission import LocalQueryAdmission
 
 
 class LocalQueryCoordinator:
@@ -81,7 +82,7 @@ class LocalQueryCoordinator:
             ):
                 self._refresh()
 
-    def drive(self, query: LocalQueryAdmission) -> set[LocalQueryAdmissionAuthority]:
+    def drive(self, query: LocalQueryAdmission) -> set[Callable[[], None]]:
         # Like the Ray driver's serialized admission turn, keep shared actor
         # load observation, policy selection and backend reservation together.
         # Backend requests are nonblocking; execution never runs under this lock.

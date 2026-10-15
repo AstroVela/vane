@@ -40,6 +40,7 @@ from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._subprocess_error import capture_cleanup, decode_error, native_result_error
 from vane.execution._udf_runtime import _bounded_close_error
+from vane.execution.local_output_read import LocalOutputRead
 from vane.execution.local_resource_graph import LocalResourceUnitContext
 from vane.execution.local_stream_adapter import LocalStreamAdapter
 from vane.execution.ref_bundle import (
@@ -3985,6 +3986,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._queue: deque[Any] = deque()
         self._result_admissions: deque[AdmissionLease | None] = deque()
         self._result_streams: deque[LocalStreamAdapter | None] = deque()
+        self._result_reads: deque[LocalOutputRead | None] = deque()
+        self._output_reads: dict[int, LocalOutputRead] = {}
         self._queue_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
@@ -4152,48 +4155,35 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return (SUBMIT_RESULT_MARKER, int(submit_id), result)
         return result if result is not None else (None, True)
 
-    @staticmethod
-    def _own_query_output(
-        result: Any,
-        admission: AdmissionLease | None,
-        scope: ExecutionCancellationScope,
-    ) -> None:
-        query = admission.lease.get("query_policy") if admission is not None else None
-        if query is None or not isinstance(result, tuple) or len(result) != 4 or result[0] != REF_BUNDLE_RESULT_MARKER:
-            return
-        assert admission is not None
-        owners = ()
-        attached = 0
+    def _buffer_output_read_locked(self, result: Any, admission: AdmissionLease | None) -> LocalOutputRead:
+        output_read = LocalOutputRead()
+        self._output_reads[id(output_read)] = output_read
         try:
-            owners = query.own_output_bundle(
-                admission.lease["query_policy_task"], tuple(ref.size for ref in result[1]), scope, admission
-            )
-            for ref, owner in zip(result[1], owners, strict=True):
-                ref.attach_query_output_lease(owner)
-                attached += 1
+            output_read.buffer(result, admission)
         except BaseException as error:
-            cleanup_error = None
-            for owner in owners[attached:]:
-                try:
-                    owner.release()
-                except BaseException as exc:
-                    cleanup_error = exc
             try:
-                _release_local_ref_bundle_result(result)
-            except BaseException as exc:
-                cleanup_error = exc
-            if cleanup_error is not None:
-                raise error from cleanup_error
+                self._close_output_read_locked(output_read)
+            except BaseException as cleanup_error:
+                message = (
+                    f"{_bounded_close_error(error)}; UDF output cleanup failed: {_bounded_close_error(cleanup_error)}"
+                )
+                raise capture_cleanup(message, error, cleanup_error) from error
             raise
+        return output_read
+
+    def _close_output_read_locked(self, output_read: LocalOutputRead) -> None:
+        output_read.close()
+        self._output_reads.pop(id(output_read), None)
 
     def _publish_stream_result(self, submit_id: int | None, result: Any) -> None:
         transition_local_shm_output(result, "unit_queue")
         item = (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
         with self._queue_lock:
             if self._closed:
-                _release_local_ref_bundle_result(result)
                 raise ExecutionCancelledError("UDF output stream executor closed")
+            output_read = self._buffer_output_read_locked(result, _active_local_admission.get())
             self._queue.append(item)
+            self._result_reads.append(output_read)
             # A block transfers data ownership only. Backend completion
             # independently releases execution capacity.
             self._result_admissions.append(None)
@@ -4381,12 +4371,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         ) = None
         admission: AdmissionLease | None = None
         scope: ExecutionCancellationScope | None = None
+        output_read: LocalOutputRead | None = None
+        with self._task_futures_lock:
+            debug_meta = self._task_future_meta.get(future)
+        if debug_meta is not None:
+            debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
         try:
             result = future.result()
             if cleanup_error is not None:
                 raise cleanup_error
             transition_local_shm_output(result, "unit_queue")
-            item = self._submit_result_item(submit_id, result)
+            if result is not None:
+                with self._queue_lock:
+                    if not self._closed:
+                        output_read = self._buffer_output_read_locked(result, admission)
         except BaseException as exc:
             error = exc
             if cleanup_error is not None and cleanup_error is not exc:
@@ -4394,13 +4392,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     f"{_bounded_close_error(error)}; UDF input cleanup failed: {_bounded_close_error(cleanup_error)}"
                 )
                 error = capture_cleanup(message, error, cleanup_error)
-            _release_local_ref_bundle_result(result)
-            result = None
         finally:
-            with self._task_futures_lock:
-                debug_meta = self._task_future_meta.get(future)
             if debug_meta is not None:
-                debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
                 if isinstance(admission, AdmissionLease):
                     try:
                         # The future includes backend cleanup. Output leases
@@ -4411,8 +4404,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         # just like task_scope.finish(). Poisoning wakeups can
                         # skip result consumption and strand its pool slot.
                         if error is None:
-                            _release_local_ref_bundle_result(result)
-                            result = None
                             error = exc
                         else:
                             message = f"{_bounded_close_error(error)}; UDF execution cleanup failed: {_bounded_close_error(exc)}"
@@ -4426,28 +4417,37 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         )
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
-            if error is not None:
-                # Capture every completion failure after both cleanup stages,
-                # before native result consumption discards exception types.
-                item = self._submit_result_item(submit_id, native_result_error(error))
-            if item is not None:
-                with self._queue_lock:
-                    if self._closed:
-                        _release_local_ref_bundle_result(result)
-                        if admission is not None:
-                            try:
-                                admission.release()
-                            except BaseException as exc:
+            with self._queue_lock:
+                if error is not None or self._closed:
+                    if output_read is not None:
+                        try:
+                            self._close_output_read_locked(output_read)
+                        except BaseException as exc:
+                            # The executor retains this owner for close/retry.
+                            # Cleanup must not skip completion bookkeeping or
+                            # replace the producer's error.
+                            if error is not None:
+                                message = f"{_bounded_close_error(error)}; UDF output cleanup failed: {_bounded_close_error(exc)}"
+                                error = capture_cleanup(message, error, exc)
+                            else:
                                 self._record_wakeup_error(exc)
-                    else:
-                        self._queue.append(item)
-                        self._result_admissions.append(admission)
-                        self._result_streams.append(None)
-            elif admission is not None:
-                try:
-                    admission.release()
-                except BaseException as exc:
-                    self._record_wakeup_error(exc)
+                        output_read = None
+                    _release_local_ref_bundle_result(result)
+                    result = None
+                if self._closed:
+                    if admission is not None:
+                        try:
+                            admission.release()
+                        except BaseException as exc:
+                            self._record_wakeup_error(exc)
+                else:
+                    item = self._submit_result_item(
+                        submit_id, native_result_error(error) if error is not None else result
+                    )
+                    self._queue.append(item)
+                    self._result_reads.append(output_read)
+                    self._result_admissions.append(admission)
+                    self._result_streams.append(None)
             if scope is not None:
                 self._retire_execution_scope(scope)
 
@@ -4595,13 +4595,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 stream_token = _active_local_stream.set(stream)
 
                 def publish(result: Any) -> None:
-                    self._own_query_output(result, admission, scope)
                     self._publish_stream_result(submit_id, result)
 
                 token = _active_local_output.set(publish)
                 try:
                     result = output_fn(worker)
-                    self._own_query_output(result, admission, scope)
                     return result
                 finally:
                     _active_local_output.reset(token)
@@ -4821,30 +4819,56 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             "subprocess UDF ref-bundle submission requires submit_ref_bundle_with_id() and a pregranted admission lease"
         )
 
+    def _ready_result_index_locked(self, capacity: dict[str, Any] | None) -> int | None:
+        window = None if capacity is None else StreamReadWindow(StreamCapacity.parse(capacity))
+        blocked_submits = set()
+        data_blocked = False
+        for index, item in enumerate(self._queue):
+            submit_id = None
+            if isinstance(item, tuple) and item[0] == SUBMIT_RESULT_MARKER:
+                submit_id, output = item[1:3]
+            elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool):
+                output = item[0]
+            else:
+                output = item
+            if output is None or isinstance(output, BaseException):
+                # Another invocation's terminal event need not wait for DATA
+                # capacity, but it must never overtake its own output blocks.
+                if submit_id not in blocked_submits:
+                    return index
+                continue
+            if not data_blocked:
+                data_blocked = window is not None and not window.take(estimate_local_shm_ref_bundle_ipc_size(output))
+                if not data_blocked:
+                    output_read = self._result_reads[index] if self._result_reads else None
+                    data_blocked = output_read is not None and not output_read.poll(self._notify_wakeup)
+                if not data_blocked:
+                    return index
+            blocked_submits.add(submit_id)
+        return None
+
     def take_ready_result(self, capacity: dict[str, Any] | None = None) -> Any | None:
         self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._queue_lock:
-            if self._queue and capacity is not None:
-                item = self._queue[0]
-                if isinstance(item, tuple) and item[0] == SUBMIT_RESULT_MARKER:
-                    output = item[2]
-                elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool):
-                    output = item[0]
-                else:
-                    output = item
-                if output is not None and not isinstance(output, BaseException):
-                    window = StreamReadWindow(StreamCapacity.parse(capacity))
-                    if not window.take(estimate_local_shm_ref_bundle_ipc_size(output)):
-                        return None
-            try:
-                result = self._queue.popleft()
-            except IndexError:
+            index = self._ready_result_index_locked(capacity)
+            if index is None:
                 return None
+            result = self._queue[index]
+            del self._queue[index]
+            if self._result_reads:
+                output_read = self._result_reads[index]
+                del self._result_reads[index]
+                if output_read is not None:
+                    self._output_reads.pop(id(output_read), None)
             result_admissions = getattr(self, "_result_admissions", None)
-            admission = result_admissions.popleft() if result_admissions else None
-            stream = self._result_streams.popleft() if self._result_streams else None
+            admission = result_admissions[index] if result_admissions else None
+            if result_admissions:
+                del result_admissions[index]
+            stream = self._result_streams[index] if self._result_streams else None
+            if self._result_streams:
+                del self._result_streams[index]
         if stream is not None:
             stream.consumed()
         if admission is not None:
@@ -4953,7 +4977,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 if self._task_futures:
                     return True
             with self._active_input_leases_lock:
-                return bool(self._active_input_leases)
+                if self._active_input_leases:
+                    return True
+            with self._queue_lock:
+                return bool(self._output_reads)
 
     def close(self, kill: bool = False) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
@@ -4998,6 +5025,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     result_admissions.clear()
                 streams = list(self._result_streams)
                 self._result_streams.clear()
+                self._result_reads.clear()
+                for output_read in tuple(self._output_reads.values()):
+                    try:
+                        self._close_output_read_locked(output_read)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
         else:
             queued_results = []
             admissions = []
