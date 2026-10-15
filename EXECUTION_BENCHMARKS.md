@@ -1861,3 +1861,80 @@ return to zero. Owned processes stop before temporary/spill cleanup; shared
 oracle hashes are retained before deletion and source datasets are preserved.
 Disk guards remain untriggered. The full release suite, all-22-query pass and
 large-query FTE timings are not rerun, following the related-test scope.
+
+## Reuse existing hash-key payload columns (2026-10-15)
+
+The frozen baseline at `329e47c0f7` projects a second copy of every join or
+complete-aggregate hash key into its exchange payload, including direct
+references to columns already present. Q9's 15,000,000-row orders input
+therefore sends `(orderkey, orderdate, orderkey)`. `ProjectKeys` now reuses
+existing columns and omits the added projection when every key can be
+reused. Computed keys and repeated occurrences of a key retain separate
+projected positions, preserving multi-key hash order and multiplicity even
+when one join side repeats a column and the other uses distinct columns.
+Original column positions, join conditions and aggregate bindings stay valid.
+
+Only related Q9/Q18 queries are timed, three times per mode and runtime.
+The driver, installed Python code, SF10 inputs and resource settings match
+between the frozen and candidate runtimes. Local uses 36 threads/32 GiB;
+pipelined uses two 18-CPU workers, two partitions and 16 GiB operator memory
+per worker. Frames remain 64 KiB/2048 rows and windows 1 MiB/16 slots.
+Timing covers submission through collection and successful close, excluding
+startup and comparison. The shared host retains warm OS caches; no
+task-owned build, test or diagnostic overlaps timing.
+
+| Query, median of three | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.857 | 2.105 | 0.856 | 1.944 | -7.6% | 2.27 |
+| Q18 | 0.700 | 1.114 | 0.699 | 1.094 | -1.8% | 1.57 |
+
+Q9 improves **7.6%**; Q18's small change does not establish a meaningful
+speedup. Q9 candidate samples are 2.065, 1.904 and 1.944 seconds. All **24
+timing samples** match local schema, row counts and values, with floating
+tolerances of 1e-9 relative and 1e-6 absolute. There is no fresh all-query
+total, and Q9 remains 2.27 times local latency.
+
+Completed native Q9 diagnostics retain exactly **22,276,643 accepted channel
+rows**, including 15,000,000 orders rows, and the same 175-row output hash.
+The four affected HASH payloads shrink as follows:
+
+| Input | Accepted rows | Columns before → after | Removed key types | Removed value-buffer bytes |
+|---|---:|---:|---|---:|
+| Filtered lineitem | 3,261,613 | 7 → 6 | uint32 | 13,046,452 |
+| Orders | 15,000,000 | 3 → 2 | uint32 | 60,000,000 |
+| Joined fact rows | 3,261,613 | 8 → 6 | two int64 | 52,185,808 |
+| Filtered partsupp | 435,128 | 6 → 4 | two int64 | 6,962,048 |
+
+The sum is **132,194,308 bytes (126.1 MiB)**, calculated from actual accepted
+rows and removed fixed-width Arrow types. It excludes validity buffers and
+IPC framing and is not a measurement of total network bytes. Row counts,
+partitioning and scan work stay the same; the large orders HASH exchange
+still remains.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev110`) passes
+**199 related native tests** and **7 real-Ray tests**. The 32 new native
+cases cover typed and nullable keys, NULL-safe/full joins, repeated and
+computed keys, reordered multi-key conditions, complete aggregates and tiny
+bounded channels at 1/4 threads and 2/3 partitions. On the frozen runtime,
+30 cases fail the payload-width checks; two ordinary partial-aggregate
+controls pass. Existing joins, aggregate/ordered/collated expressions,
+key-domain filters and shared-build cancellation add 167 passing cases.
+Public pipelined/FTE execution and a failed consumer preserve results and
+retry input identity with a new fence, under the existing 4 MiB materialized
+object limit. Source-contract, backpressure, early-close and interruption
+checks also pass.
+
+Native SHA-256 identities, baseline and candidate:
+
+- `8166bf69b4160c17ac6118ce9233c24e3a34b73a42cafd2a6d4a02158e4f22b0`
+- `18a1cb5ce5859c1eff53101177e088614bbc9ceac7c741956f8fcbbfb91d213b`
+
+Evidence is retained under `build/pipelined-order-filter-20261015/`, including
+the frozen runtime, code/configuration/input identities, raw samples,
+completed native work and schemas, output counts/hashes, `comparison.json`,
+`local-vs-pipelined.csv`, `test-validation.json` and logs. Query/worker/result
+reservations return to zero. Owned processes stop before temporary/spill
+cleanup; oracle hashes are retained before deletion, source inputs are
+preserved and disk guards remain untriggered. Only related tests and Q9/Q18
+timings are run; full release/all-query and large-query FTE timings are not
+repeated.

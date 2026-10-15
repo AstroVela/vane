@@ -1534,16 +1534,30 @@ private:
 		auto types = child.fragment.root.types;
 		vector<unique_ptr<Expression>> expressions;
 		vector<idx_t> columns;
+		std::set<idx_t> referenced;
 		for (idx_t col = 0; col < types.size(); col++) {
 			expressions.push_back(make_uniq<BoundReferenceExpression>(types[col], col));
 		}
 		for (auto &key : keys) {
+			if (key->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+				auto column = key->Cast<BoundReferenceExpression>().index;
+				if (referenced.insert(column).second) {
+					// The key is already in the payload. Reuse its position instead
+					// of copying and transporting a second column of the same values.
+					columns.push_back(column);
+					continue;
+				}
+			}
+			// Repeated keys still occupy separate hash positions: the opposite
+			// join input can use different columns for those conditions.
 			columns.push_back(types.size());
 			types.push_back(key->return_type);
 			expressions.push_back(key->Copy());
 		}
-		auto &projection = plan.Make<PhysicalProjection>(types, std::move(expressions), 0);
-		Wrap(projection, child);
+		if (types.size() != child.fragment.root.types.size()) {
+			auto &projection = plan.Make<PhysicalProjection>(types, std::move(expressions), 0);
+			Wrap(projection, child);
+		}
 		return columns;
 	}
 	bool WidenAggregate(BoundAggregateExpression &aggregate) {
