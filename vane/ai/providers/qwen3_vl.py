@@ -332,8 +332,8 @@ class Qwen3VLEmbedder:
 
     def embed_joint(self, clip: VideoClip | None, text: str) -> np.ndarray[Any, Any]:
         """Encode aligned text and video in one forward pass, with no vector sum."""
-        if not isinstance(text, str) or not text.strip():
-            raise EmbeddingConfigurationError("Joint encoding requires nonempty timeline text")
+        if not isinstance(text, str) or (clip is None and not text.strip()):
+            raise EmbeddingConfigurationError("Joint encoding requires video or nonempty text")
         # OCR/transcription can contain literal special-token strings. Keep those
         # bytes as escaped text rather than extra image/video placeholders.
         content = [{"type": "text", "text": text.replace("<|", "\\u003c|")}]

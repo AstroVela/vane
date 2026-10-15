@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
-    from vane.ai._video_jobs import VideoJobStore, VideoTaskError
     from vane.ai.functions import embed, embed_audio, embed_image, embed_video, prompt
     from vane.ai.options import (
         EmbedAudioOptions,
@@ -38,7 +37,6 @@ if TYPE_CHECKING:
     )
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
-    from vane.ai.video import VideoEmbeddingPipeline, VideoEmbeddingProfile, VideoEmbeddingTask, VideoFusionProfile
 
 __all__ = [
     "AudioClip",
@@ -61,12 +59,6 @@ __all__ = [
     "UDFOptions",
     "VideoClip",
     "VideoInputSpec",
-    "VideoEmbeddingPipeline",
-    "VideoEmbeddingProfile",
-    "VideoEmbeddingTask",
-    "VideoFusionProfile",
-    "VideoJobStore",
-    "VideoTaskError",
     "embed",
     "embed_image",
     "embed_video",
@@ -77,12 +69,6 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "VideoJobStore": ("vane.ai._video_jobs", "VideoJobStore"),
-    "VideoTaskError": ("vane.ai._video_jobs", "VideoTaskError"),
-    "VideoEmbeddingPipeline": ("vane.ai.video", "VideoEmbeddingPipeline"),
-    "VideoEmbeddingProfile": ("vane.ai.video", "VideoEmbeddingProfile"),
-    "VideoEmbeddingTask": ("vane.ai.video", "VideoEmbeddingTask"),
-    "VideoFusionProfile": ("vane.ai.video", "VideoFusionProfile"),
     "DiagnosticError": ("vane.ai._errors", "DiagnosticError"),
     "summarize_error": ("vane.ai._errors", "summarize_error"),
     "AudioClip": ("vane.ai._audio_embedding", "AudioClip"),

@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import base64
 import io
-import itertools
 import json
 import math
 import os
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -26,7 +26,12 @@ import numpy as np
 
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._video_embedding import VideoClip
-from vane.ai._video_pipeline_types import TEXT_MODALITIES, ClipWindow, TimedContent, positive_number
+from vane.ai.media import MediaWindow, TimedContent
+
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
+
+    from vane.ai.providers.qwen3_vl import Qwen3VLEmbedder
 
 
 def _local_path(value: str) -> str:
@@ -51,9 +56,12 @@ def _segment(item: TimedContent, start: float, end: float, text: str) -> TimedCo
     return TimedContent(item.start + start, min(item.start + end, item.end), text) if text.strip() else None
 
 
-def _mono(item: TimedContent, sample_rate: int) -> np.ndarray:
-    import av
+def _validate_window(clip: MediaWindow, content: Sequence[TimedContent]) -> None:
+    if any(not clip.start <= item.start <= item.end <= clip.end for item in content):
+        raise ValueError("Model content must lie within its media window")
 
+
+def _mono(item: TimedContent, sample_rate: int) -> np.ndarray:
     audio = item.value
     if not isinstance(audio, AudioClip):
         raise TypeError("ASR requires decoded AudioClip content")
@@ -68,6 +76,8 @@ def _mono(item: TimedContent, sample_rate: int) -> np.ndarray:
     mono = samples.mean(axis=1)
     if audio.sample_rate == sample_rate:
         return mono
+    import av
+
     frame = av.AudioFrame.from_ndarray(mono.reshape(1, -1), format="fltp", layout="mono")
     frame.sample_rate = audio.sample_rate
     resampler = av.AudioResampler(format="fltp", layout="mono", rate=sample_rate)
@@ -75,7 +85,7 @@ def _mono(item: TimedContent, sample_rate: int) -> np.ndarray:
     return np.concatenate([f.to_ndarray().reshape(-1) for f in frames]) if frames else np.empty(0, np.float32)
 
 
-def _frames(content: Any):
+def _frames(content: Sequence[TimedContent]) -> Iterator[tuple[float, np.ndarray[Any, Any]]]:
     for item in content:
         if not isinstance(item.value, VideoClip):
             raise TypeError("OCR requires decoded VideoClip content")
@@ -98,19 +108,18 @@ def _png(frame: np.ndarray) -> bytes:
 class FasterWhisperASR:
     """Local faster-whisper, with segment times rebased to the asset timeline."""
 
-    def __init__(
-        self, model: str, *, profile: str, device: str = "cpu", compute_type: str = "int8", language: str | None = None
-    ):
-        self.model, self.profile = _local_path(model), _name(profile)
+    def __init__(self, model: str, *, device: str = "cpu", compute_type: str = "int8", language: str | None = None):
+        self.model = _local_path(model)
         if device not in {"cpu", "cuda"} or compute_type not in {"int8", "float16", "float32", "int8_float16"}:
             raise ValueError("Select an explicit CPU/CUDA device and compute_type")
         self.device, self.compute_type, self.language = device, compute_type, language
-        self._runtime = None
+        self._runtime: WhisperModel | None = None
 
-    def identity(self):
-        return {"provider": "faster_whisper", "model": self.model, "profile": self.profile}
+    def identity(self) -> dict[str, str]:
+        return {"provider": "faster_whisper", "model": self.model}
 
-    def __call__(self, clip: ClipWindow, content: Any):
+    def __call__(self, clip: MediaWindow, content: Sequence[TimedContent]) -> list[TimedContent]:
+        _validate_window(clip, content)
         if not content:
             return []
         if self._runtime is None:
@@ -136,7 +145,7 @@ class FasterWhisperASR:
                     result.append(text)
         return result
 
-    def close(self):
+    def close(self) -> None:
         self._runtime = None
 
 
@@ -164,7 +173,7 @@ class _RapidRuntime:
         self.recognizer = TextRecognizer(config.Rec)
         self.threshold = float(config.Global.text_score)
 
-    def __call__(self, pixels: np.ndarray):
+    def __call__(self, pixels: np.ndarray) -> tuple[str, ...]:
         from rapidocr.ch_ppocr_rec import TextRecInput
         from rapidocr.utils.process_img import get_rotate_crop_image
 
@@ -191,16 +200,17 @@ class _RapidRuntime:
 class RapidOCRExtractor:
     """CPU ONNX OCR with explicit detection/recognition models and dictionary."""
 
-    def __init__(self, detection_model: str, recognition_model: str, keys: str, *, profile: str):
+    def __init__(self, detection_model: str, recognition_model: str, keys: str):
         self.detection_model, self.recognition_model, self.keys = map(
             _local_path, (detection_model, recognition_model, keys)
         )
-        self.profile, self._runtime = _name(profile), None
+        self._runtime: _RapidRuntime | None = None
 
-    def identity(self):
-        return {"provider": "rapidocr", "model": self.recognition_model, "profile": self.profile}
+    def identity(self) -> dict[str, str]:
+        return {"provider": "rapidocr", "model": self.recognition_model}
 
-    def __call__(self, clip: ClipWindow, content: Any):
+    def __call__(self, clip: MediaWindow, content: Sequence[TimedContent]) -> list[TimedContent]:
+        _validate_window(clip, content)
         if not content:
             return []
         if self._runtime is None:
@@ -218,12 +228,12 @@ class RapidOCRExtractor:
                 result.append(TimedContent(timestamp, timestamp, text))
         return result
 
-    def close(self):
+    def close(self) -> None:
         self._runtime = None
 
 
 class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
         return None
 
 
@@ -264,20 +274,20 @@ class DeepgramASR:
     def __init__(
         self,
         *,
-        profile: str,
         model: str = "nova-3",
         api_key_env: str = "DEEPGRAM_API_KEY",
         language: str = "en",
         timeout_seconds: float = 30,
     ):
-        self.profile, self.model = _name(profile), _name(model)
+        self.model = _name(model)
         self.api_key_env, self.language = _name(api_key_env), _name(language)
-        self.timeout = positive_number(timeout_seconds, "timeout_seconds")
+        self.timeout = _timeout(timeout_seconds)
 
-    def identity(self):
-        return {"provider": "deepgram", "model": self.model, "profile": self.profile}
+    def identity(self) -> dict[str, str]:
+        return {"provider": "deepgram", "model": self.model}
 
-    def __call__(self, clip: ClipWindow, content: Any):
+    def __call__(self, clip: MediaWindow, content: Sequence[TimedContent]) -> list[TimedContent]:
+        _validate_window(clip, content)
         result = []
         for item in content:
             samples = _mono(item, 16000)
@@ -315,14 +325,15 @@ class DeepgramASR:
 
 
 class GoogleVisionOCR:
-    def __init__(self, *, profile: str, api_key_env: str = "GOOGLE_VISION_API_KEY", timeout_seconds: float = 30):
-        self.profile, self.api_key_env = _name(profile), _name(api_key_env)
-        self.timeout = positive_number(timeout_seconds, "timeout_seconds")
+    def __init__(self, *, api_key_env: str = "GOOGLE_VISION_API_KEY", timeout_seconds: float = 30):
+        self.api_key_env = _name(api_key_env)
+        self.timeout = _timeout(timeout_seconds)
 
-    def identity(self):
-        return {"provider": "google_vision", "model": "TEXT_DETECTION", "profile": self.profile}
+    def identity(self) -> dict[str, str]:
+        return {"provider": "google_vision", "model": "TEXT_DETECTION"}
 
-    def __call__(self, clip: ClipWindow, content: Any):
+    def __call__(self, clip: MediaWindow, content: Sequence[TimedContent]) -> list[TimedContent]:
+        _validate_window(clip, content)
         result = []
         for timestamp, frame in _frames(content):
             payload = {
@@ -354,77 +365,51 @@ class GoogleVisionOCR:
         return result
 
 
-def _fusion_profile(adapter: Any, name: str, provider: str, model: str, dimensions: int):
-    from vane.ai.video import VideoFusionProfile
-
-    channels = sorted({"visual", *TEXT_MODALITIES})
-    combinations = tuple(
-        frozenset(combo) for size in range(1, len(channels) + 1) for combo in itertools.combinations(channels, size)
-    )
-    return VideoFusionProfile(name, provider, model, dimensions, combinations, adapter)
-
-
-def _fusion_text(clip: ClipWindow, selected: Any) -> str:
-    return json.dumps(
-        {
-            "clip_start_sec": clip.start,
-            "clip_end_sec": clip.end,
-            "text": [
-                {"modality": channel, "start_sec": item.start, "end_sec": item.end, "text": item.value}
-                for channel in sorted(selected)
-                if channel in TEXT_MODALITIES
-                for item in selected[channel]
-            ],
-        },
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-
-
-class Qwen3VLFusion:
+class Qwen3VLJointEmbedder:
     """Joint video/text encoding using the existing explicit Qwen BF16 contract."""
 
     def __init__(self, model: str, *, frame_size: int = 224):
         if type(frame_size) is not int or frame_size <= 0 or frame_size % 32 or frame_size > 256:
             raise ValueError("Qwen fusion frame_size must be a positive multiple of 32 up to 256")
-        self.model, self._runtime = _local_path(model), None
+        self.model = _local_path(model)
+        self._runtime: Qwen3VLEmbedder | None = None
         self.frame_size = frame_size
 
-    def profile(self, name: str):
-        return _fusion_profile(self, name, "qwen3_vl", self.model, 2048)
+    dimensions = 2048
+    input_modalities = frozenset({"video", "text"})
 
-    def __call__(self, clip: ClipWindow, selected: Any, options: Any):
+    def embed_joint(self, video: VideoClip | None, text: str) -> np.ndarray[Any, Any]:
         from vane.ai.providers.qwen3_vl import Qwen3VLEmbedder
 
+        if video is None and not text.strip():
+            raise ValueError("Joint embedding requires video or text")
         if self._runtime is None:
             self._runtime = Qwen3VLEmbedder(self.model)
-        visuals = selected.get("visual", ())
-        if len(visuals) > 1:
-            raise ValueError("Qwen joint encoding requires one aligned video window")
-        video = None
-        if visuals:
+        if video is not None:
             from PIL import Image
 
-            source = visuals[0].value
             video = VideoClip(
                 tuple(
                     np.asarray(
                         Image.fromarray(frame).resize((self.frame_size, self.frame_size), Image.Resampling.BICUBIC)
                     )
-                    for frame in source.frames
+                    for frame in video.frames
                 ),
-                source.frame_times,
-                source.frame_indices,
+                video.frame_times,
+                video.frame_indices,
             )
-        return self._runtime.embed_joint(video, _fusion_text(clip, selected))
+        return self._runtime.embed_joint(video, text)
 
-    def close(self):
+    def embed_query(self, text: str) -> np.ndarray[Any, Any]:
+        return self.embed_joint(None, text)
+
+    def close(self) -> None:
         if self._runtime is not None:
             self._runtime.close()
             self._runtime = None
 
 
-class CohereFusion:
+class CohereJointEmbedder:
     """One joint Embed v4 input containing timestamped frames and text."""
 
     def __init__(
@@ -440,15 +425,23 @@ class CohereFusion:
         if type(max_request_bytes) is not int or not 0 < max_request_bytes <= 20 * 1024**2:
             raise ValueError("Cohere max_request_bytes must be within 20 MiB")
         self.dimensions, self.api_key_env = dimensions, _name(api_key_env)
-        self.timeout = positive_number(timeout_seconds, "timeout_seconds")
+        self.timeout = _timeout(timeout_seconds)
         self.max_request_bytes = max_request_bytes
 
-    def profile(self, name: str):
-        return _fusion_profile(self, name, "cohere", "embed-v4.0", self.dimensions)
+    input_modalities = frozenset({"video", "text"})
 
-    def __call__(self, clip: ClipWindow, selected: Any, options: Any):
-        content = [{"type": "text", "text": _fusion_text(clip, selected)}]
-        for timestamp, frame in _frames(selected.get("visual", ())):
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(None, text, "search_query")
+
+    def embed_joint(self, video: VideoClip | None, text: str) -> list[float]:
+        return self._embed(video, text, "search_document")
+
+    def _embed(self, video: VideoClip | None, text: str, input_type: str) -> list[float]:
+        if video is None and not text.strip():
+            raise ValueError("Joint embedding requires video or text")
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
+        frames = zip(video.frame_times, video.frames, strict=True) if video is not None else ()
+        for timestamp, frame in frames:
             content.extend(
                 [
                     {"type": "text", "text": f"frame_time_sec={timestamp}"},
@@ -461,7 +454,7 @@ class CohereFusion:
         payload = json.dumps(
             {
                 "model": "embed-v4.0",
-                "input_type": "search_document",
+                "input_type": input_type,
                 "inputs": [{"content": content}],
                 "embedding_types": ["float"],
                 "output_dimension": self.dimensions,
@@ -483,3 +476,9 @@ class CohereFusion:
             return vectors[0]
         except (KeyError, TypeError, ValueError):
             raise ValueError("Cohere returned invalid joint embedding output") from None
+
+
+def _timeout(value: float) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("timeout_seconds must be finite and positive")
+    return float(value)

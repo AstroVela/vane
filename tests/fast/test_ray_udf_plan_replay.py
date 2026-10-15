@@ -507,3 +507,39 @@ def test_map_batches_ray_task_rejects_direct_execution_without_query_resource_gr
         relation.arrow().read_all()
     del relation
     con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_mixed_task_actor_pipeline_keeps_executor_options_after_fragment_extraction():
+    import pyarrow as pa
+    import ray
+
+    def prepare(batch):
+        return pa.table({"x": [value + 1 for value in batch.column(0).to_pylist()]})
+
+    class Encode:
+        def __call__(self, batch):
+            assert ray.get_gpu_ids() == []
+            return pa.table({"x": [value * 2 for value in batch.column(0).to_pylist()]})
+
+    def publish(batch):
+        return pa.table({"total": batch.column(0)})
+
+    _runners.set_runner_ray(noop_if_initialized=True)
+    runner = _runners.get_or_create_runner()
+    with vane.connect() as con:
+        relation = con.sql("SELECT i::BIGINT AS x FROM range(6) t(i)").map_batches(
+            prepare, schema={"x": "BIGINT"}, execution_backend="ray_task", batch_size=2, gpus=0
+        )
+        relation = relation.map_batches(
+            Encode, schema={"x": "BIGINT"}, execution_backend="ray_actor", actor_number=1, batch_size=2, gpus=0
+        )
+        relation = relation.aggregate("sum(x)::BIGINT AS total").map_batches(
+            publish, schema={"total": "BIGINT"}, execution_backend="ray_task", gpus=0
+        )
+        try:
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+            result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+            assert result.column(0).to_pylist() == [42]
+        finally:
+            runner.close()

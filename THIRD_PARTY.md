@@ -52,6 +52,15 @@ pyelftools are installed separately by package managers and are not copied into
 the Vane source distribution. Optional provider clients are also installed
 separately. Their own distributions govern their licenses.
 
+The optional `video_asr` extra installs faster-whisper (MIT) and its dependencies;
+`video_ocr` installs RapidOCR (Apache-2.0) and ONNX Runtime (MIT). These packages
+and model weights are not bundled. Local adapters require explicitly provisioned
+model assets; deployments must review their licenses separately. Preserve the
+exact dependency wheels' notices, including CTranslate2 and bundled native
+libraries, when redistributing an environment. PyAV/FFmpeg obligations are covered
+in [COPYLEFT.md](COPYLEFT.md). Cloud adapters use the Python standard library and
+do not include provider SDKs or model assets.
+
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.

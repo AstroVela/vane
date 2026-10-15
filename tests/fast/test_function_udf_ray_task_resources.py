@@ -865,3 +865,19 @@ def test_ray_task_honors_payload_retry_policy(monkeypatch, payload_retries, over
         },
     )
     assert calls == [expected, expected]
+
+
+def test_public_no_retries_decorator_preserves_function_and_class():
+    from vane.udf import no_retries
+
+    def function(batch):
+        return batch
+
+    class Worker:
+        def __call__(self, batch):
+            return batch
+
+    assert no_retries(function) is function
+    assert no_retries(Worker) is Worker
+    assert function._vane_datasink_no_task_retries is True
+    assert Worker._vane_datasink_no_task_retries is True
