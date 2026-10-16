@@ -507,6 +507,11 @@ sequenceDiagram
     P-->>S: Prepared
     C-->>S: Prepared
     O-->>S: Prepared
+    par Per-worker input connections
+        S->>P: Connect inputs
+    and
+        S->>C: Connect inputs
+    end
     Note over S,O: All channels connected and ready
     par Per-worker start batches
         S->>C: Start consumer batch
@@ -518,6 +523,8 @@ sequenceDiagram
     O-->>C: Release credit
     C-->>P: Release credit
 ~~~
+
+所有 worker 完成准备并公布端点后，协调器先向各 worker 发出输入连接 RPC，再等待这些回执，允许不同 worker 同时连接。所有连接成功后才连接结果出口并检查就绪；任一连接失败或回执丢失，清理整个已准备组，并隔离仍在途的连接调用。
 
 所有 worker、输入通道和结果出口完成连接并报告就绪后，协调器向每个 worker 发出一次启动 RPC；批次内按逆拓扑顺序启动本 worker 的消费者及生产者。不同 worker 的启动可以重叠；native start 不等待输入，先到的数据受既有通道字节和帧数额度约束。任一批次启动失败或回执丢失，取消并清理整个已准备组，包括批次内尚未启动的 task。join 的 build 输入先推进，probe 输入根据 BuildReady 事件解除语义等待。单个 producer 暂时没有数据不会阻止读取其他就绪输入。
 

@@ -111,6 +111,61 @@ def test_group_capacity_failure_rolls_back_before_start(capacity):
         assert_idle(connection)
 
 
+@pytest.mark.parametrize("fail_reply", [False, True])
+def test_worker_connections_overlap_and_failed_reply_releases_group(monkeypatch, fail_reply):
+    import ray
+
+    from vane.execution import pipelined_runtime
+
+    with vane.Runtime(resources()) as application, application.connect() as connection:
+        connection.query("select 1").collect()
+        pool = connection.query_runtime.pool
+        calls, starts, dispatched = {}, [], []
+        get = pipelined_runtime._get
+
+        def connect(index, remote, epoch, query, locations):
+            reference = remote(epoch, query, locations)
+            dispatched.append(reference)
+            if fail_reply and index == 0:
+                # Remote connections can still be in flight when the first
+                # reply fails. Cleanup must also fence these late calls.
+                reference = ray.put(ray.exceptions.ActorUnavailableError("lost worker connect reply", None))
+            calls[index] = reference
+            return reference
+
+        def wait(reference, *args, **kwargs):
+            if reference in calls.values():
+                assert len(calls) == len(pool.workers), "dispatch every worker connection before waiting"
+            return get(reference, *args, **kwargs)
+
+        def start(remote, *args):
+            starts.append(args)
+            return remote(*args)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(pipelined_runtime, "_get", wait)
+            for index, worker in enumerate(pool.workers):
+                patch.setattr(worker, "connect", SimpleNamespace(remote=partial(connect, index, worker.connect.remote)))
+                patch.setattr(worker, "start", SimpleNamespace(remote=partial(start, worker.start.remote)))
+            if fail_reply:
+                with pytest.raises(ray.exceptions.ActorUnavailableError, match="lost worker connect reply"):
+                    connection.query("select range from range(100)")
+                assert starts == []
+            else:
+                with connection.query("select range from range(100)") as result:
+                    assert sorted(result.collect().column(0).to_pylist()) == list(range(100))
+                assert len(starts) == len(pool.workers)
+            assert_idle(connection)
+            for reference in dispatched:
+                try:
+                    ray.get(reference, timeout=5)
+                except ray.exceptions.RayTaskError:
+                    assert fail_reply  # The late connection may observe cancellation.
+            assert_idle(connection)
+        assert connection.query("select 42").collect().column(0).to_pylist() == [42]
+        assert_idle(connection)
+
+
 @pytest.mark.parametrize("failure", [None, "reply", "partial_batch"])
 def test_worker_start_batches_allow_delayed_peer_and_failed_reply(tmp_path, monkeypatch, failure):
     import ray

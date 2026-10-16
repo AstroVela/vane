@@ -2385,3 +2385,99 @@ to zero. Owned processes stop before temporary/spill cleanup; oracle row
 counts, schemas and hashes are retained before output deletion. Rejected
 binary copies are removed, source inputs are preserved, and disk guards
 remain untriggered, with about 74 GiB free after cleanup.
+
+## Concurrent pipelined worker connections (2026-10-16)
+
+The frozen baseline is `f9ec2c4daa`. After all workers finish preparation
+and publish their endpoints, the scheduler now dispatches every worker's
+input connection RPC before awaiting the replies. Previously it waited
+for each worker before dispatching the next. Result connections, readiness
+checks and batched starts still follow successful worker connections.
+A failed or ambiguous connection reply releases the whole prepared group,
+including workers whose connection calls remain in flight.
+
+Separate coordinator diagnostics, three samples per query/runtime, show
+median cumulative connection reply waits falling from **13.3 to 8.8 ms for
+Q9** and **14.5 to 10.3 ms for Q18**. There are still two RPCs per query.
+These diagnostics establish less serial connection waiting; the
+uninstrumented comparison does **not establish a consistent end-to-end
+or overall submission improvement**.
+
+The comparison runs baseline/candidate and then candidate/baseline, with
+three samples per query/mode/runtime in each round. SF10 input hashes,
+driver and declared resources match: local 36 threads/32 GiB; two pipelined
+18-CPU workers, two partitions and 16 GiB operator memory per worker;
+64 KiB/2048-row frames, 1 MiB/16-slot channels, 128 MiB exchange and 256 MiB
+staging per worker, and a 1 GiB Ray object store. The Flight window remains
+sixteen frames and staging remains 5.25 MiB per remote link. Ray's reported
+available host memory varies by about 0.36 GiB. Timings include submission,
+collection and successful close, excluding startup and validation, with
+warm OS caches on the shared host. No task-owned build, test or diagnostic
+overlaps the measured comparison.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.855 | 1.419 | 0.860 | 1.410 | -0.7% | 1.64 |
+| Q18 | 0.696 | 1.044 | 0.693 | 1.045 | +0.2% | 1.51 |
+
+Q9 changes from 1.424 to 1.389 seconds in the first round and 1.414 to
+1.418 seconds in the reverse round. Q18 changes from 1.034 to 1.047
+seconds and 1.054 to 1.038 seconds. Both queries' rounds disagree.
+Combined local controls change by +0.6%/-0.4% for Q9/Q18. Uninstrumented
+submission medians increase from **165.1 to 167.2 ms** and **188.8 to
+196.3 ms**, respectively. The isolated connection saving is small relative
+to preparation and run-to-run variation; it does not demonstrate a narrower
+gap to local. All **48 timing samples**, including **24 on the candidate**,
+match local schemas, row counts and values with relative/absolute floating
+tolerances 1e-9/1e-6. All-query and large-query FTE timings are not repeated.
+
+A separate baseline worker probe measures three repetitions per query on
+two workers, six worker observations per query. Median preparation wall
+times are:
+
+| Per-worker stage, milliseconds | Q9 | Q18 |
+|---|---:|---:|
+| Fresh database connection | 38.5 | 35.5 |
+| Whole-plan validation | 8.6 | 9.2 |
+| Flight service creation | 1.7 | 1.6 |
+| Channel setup | 0.7 | 0.7 |
+| Task preparation loop | 6.5 | 6.1 |
+| Total query preparation | 56.4 | 54.1 |
+
+Thread CPU time for database creation is close to its wall time, pointing
+to initialization work rather than waiting for thread startup. Native
+fragment inspection accounts for about 6.3/6.4 ms within whole-plan
+validation, and native task preparation for 6.1/5.7 ms within the task loop;
+these nested intervals must not be added to their parents. Worker intervals
+overlap across workers and are not additive query latency. The probes use
+temporary coordinator wrappers and a worker setup hook, without changing
+the installed source; all instrumented samples are excluded from the
+timing table. Database creation remains the main worker preparation cost.
+This change does not reuse databases or alter query isolation or memory
+ownership.
+
+The non-editable incremental Release install (`vane-ai 0.3.0.dev116`) and
+frozen baseline have identical native SHA-256
+`c876bd8ff35b0d994182586544b98725323693f525b7c3b31b90795a82ec5bf2`.
+Only installed `execution/pipelined_runtime.py` differs. DuckDB SourceID
+remains `ff00fa7d41e2817abdc7e24a48081472f2a351f8`.
+**23 related real-Ray tests pass**, including two new connection cases
+that check dispatch before waiting, a lost reply with other connections
+in flight, no premature starts, complete release and pool reuse. The
+dispatch regression fails against the baseline as expected. Existing
+coverage includes delayed/partial starts, backpressure, early close,
+process loss, admission rollback, cancellation/deadlines, HASH/Parquet,
+shared build/CTE inputs and budgeted broadcast. Only affected tests run;
+the full release and fast suites are not repeated. Formatting, applicable
+pre-commit hooks, copyleft and diff checks pass.
+
+Evidence is retained under `build/pipelined-prepare-20261016/`: frozen
+identities/configurations, raw samples, `comparison.json`,
+`local-vs-pipelined.csv`, separate `connect-comparison.json` and
+`prepare-breakdown.json`, probe sources, test logs and cleanup manifests.
+The accepted worker breakdown uses `baseline-diagnostic-complete`; two
+earlier harness setup/oracle errors are recorded and excluded. All measured
+query/worker/result reservations return to zero. Owned processes stop
+before temporary/spill cleanup. Oracle schemas, row counts and hashes
+are retained before output deletion, source inputs are preserved and
+disk guards remain untriggered, with about 74 GiB free after cleanup.

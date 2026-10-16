@@ -409,11 +409,13 @@ class PipelinedScheduler:
         locations = {
             index: _get(reference, self.context) for index, reference in zip(sorted(self.prepared), self.prepare_calls)
         }
-        for index in self.prepared:
-            _get(
-                self.pool.workers[index].connect.remote(self.pool.epochs[index], self.spec.query_id, locations),
-                self.context,
-            )
+        # Every endpoint is published; workers can connect their inputs in parallel.
+        connections = [
+            self.pool.workers[index].connect.remote(self.pool.epochs[index], self.spec.query_id, locations)
+            for index in sorted(self.prepared)
+        ]
+        for reference in connections:
+            _get(reference, self.context)
         root_route = next(route for route in routes if route["target_worker"] == -1)
         timeout = self.spec.options.execution_timeout + self.spec.options.delivery_timeout
         _get(
