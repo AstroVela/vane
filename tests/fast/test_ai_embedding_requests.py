@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import pickle
 import sys
@@ -62,12 +63,22 @@ def _drive(wrapper, texts):
 
 
 @pytest.mark.parametrize("phase", ["initialization", "batch", "isolation", "conversion"])
-def test_embedding_memory_errors_are_not_wrapped_or_ignored(phase):
+@pytest.mark.parametrize("kind", ["memory", "cause", "diagnostic"])
+def test_embedding_memory_errors_are_not_wrapped_or_ignored(phase, kind):
+    from vane.ai import DiagnosticError
+
     calls = []
+
+    def fail():
+        if kind == "cause":
+            raise RuntimeError("private allocation") from OSError(errno.ENOMEM, "private path")
+        if kind == "diagnostic":
+            raise pickle.loads(pickle.dumps(DiagnosticError("embedding", OSError(errno.ENOSPC, "private path"))))
+        raise MemoryError("allocation failed")
 
     class AllocatingVector:
         def __array__(self, *args, **kwargs):
-            raise MemoryError("allocation failed")
+            fail()
 
     async def request(texts):
         calls.append(texts)
@@ -75,13 +86,13 @@ def test_embedding_memory_errors_are_not_wrapped_or_ignored(phase):
             return [AllocatingVector() for _ in texts]
         if phase == "isolation" and len(texts) > 1:
             raise RuntimeError("isolate a row-level failure")
-        raise MemoryError("allocation failed")
+        fail()
 
     wrapper = _wrapper(SimpleNamespace(embed_text=request), on_error="ignore")
     if phase == "initialization":
 
         def instantiate():
-            raise MemoryError("allocation failed")
+            fail()
 
         wrapper._descriptor.instantiate = instantiate
     with pytest.raises(MemoryError):

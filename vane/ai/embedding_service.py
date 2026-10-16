@@ -15,7 +15,6 @@ import contextlib
 import json
 import math
 import os
-import re
 import signal
 import socket
 import stat
@@ -28,6 +27,7 @@ import numpy as np
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._errors import _is_resource_error
 
 
 class _Credits:
@@ -289,10 +289,10 @@ class EmbeddingService:
             await ipc.send(sock, {"request_id": request_id, "state": "released", **response})
         except (Exception, asyncio.CancelledError) as error:
             category = (
-                "configuration"
+                "resource"
+                if _is_resource_error(error)
+                else "configuration"
                 if isinstance(error, (EmbeddingConfigurationError, ValueError, TypeError))
-                else "resource"
-                if isinstance(error, (MemoryError, OSError)) and getattr(error, "errno", None) in (None, 12, 28)
                 else "execution"
             )
             # Opaque categories only; never send raw input/SDK exception text.
@@ -318,25 +318,7 @@ class EmbeddingService:
         except EmbeddingConfigurationError:
             return {"error": "configuration"}
         except Exception as error:
-            # Avoid importing torch in the service/client protocol. Actual model
-            # OOM classes retain their canonical type, as do Python MemoryError.
-            from vane.ai import summarize_error
-
-            # Only canonical safe diagnostic atoms, never raw SDK messages.
-            resource = (
-                isinstance(error, MemoryError)
-                or (isinstance(error, OSError) and error.errno in {12, 28})
-                or re.search(
-                    r"(?:^| <- |; cleanup: |; )(?:"
-                    r"(?:MemoryError|OutOfMemoryError|OutOfMemoryException)(?=: | \(|$)"
-                    r"|RuntimeError: CUDA memory allocation failed;"
-                    r"|RuntimeError: CPU memory allocation failed;"
-                    r"|ValueError: insufficient GPU KV-cache memory;)",
-                    summarize_error(error, max_chars=4096),
-                )
-                is not None
-            )
-            return {"error": "resource" if resource else "execution"}
+            return {"error": "resource" if _is_resource_error(error) else "execution"}
 
 
 async def _run(config: dict[str, Any]) -> None:

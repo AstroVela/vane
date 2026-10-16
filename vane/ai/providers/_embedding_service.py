@@ -24,6 +24,7 @@ from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
+from vane.ai._errors import _raise_if_resource_error
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.embedding import Modality
 from vane.ai.options import _SERVICE_EMBED_OPTIONS
@@ -195,6 +196,7 @@ class ServiceEmbedder(ManagedEmbedder):
             except (EmbeddingConfigurationError, MemoryError):
                 raise
             except Exception as error:
+                _raise_if_resource_error(error)
                 if getattr(self, "_request_on_error", "raise") == "raise":
                     raise
                 _log_substituted_failure(error, on_error="ignore")
@@ -208,10 +210,10 @@ class ServiceEmbedder(ManagedEmbedder):
         parts, arrays, size = plan
         request_id = uuid.uuid4().hex
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        self._sockets.add(sock)
         started = time.monotonic()
         try:
+            sock.setblocking(False)
+            self._sockets.add(sock)
             await asyncio.get_running_loop().sock_connect(sock, self.options["service_path"])
             ipc.check_peer(sock)
             await ipc.send(sock, self._reservation(parts, size, request_id))
@@ -221,12 +223,7 @@ class ServiceEmbedder(ManagedEmbedder):
                 raise EmbeddingConfigurationError("Embedding service did not reserve the request")
             self.metrics["queue_seconds"] += time.monotonic() - started
             copied = time.monotonic()
-            try:
-                fd = ipc.sealed_buffer(arrays, size)
-            except OSError as error:
-                if error.errno in {12, 28}:
-                    raise MemoryError("Embedding shared-memory allocation failed") from None
-                raise
+            fd = ipc.sealed_buffer(arrays, size)
             self.metrics["copy_seconds"] += time.monotonic() - copied
             try:
                 await ipc.send(sock, {"request_id": request_id, "state": "published"}, fd)

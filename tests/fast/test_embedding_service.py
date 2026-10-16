@@ -615,12 +615,13 @@ def check_public_resource_failure(process, family, backend):
                 .fetchall()
             )
 
-    (root / "memory_error").touch()
-    for joint in (False, True):
-        with pytest.raises(Exception, match="MemoryError|resources") as failure:
-            query(joint)
-        assert "private model" not in str(failure.value)
-    (root / "memory_error").unlink()
+    for flag in ("memory_error", "wrapped_enospc"):
+        (root / flag).touch()
+        for joint in (False, True):
+            with pytest.raises(Exception, match="MemoryError|resources") as failure:
+                query(joint)
+            assert "private model" not in str(failure.value)
+        (root / flag).unlink()
     (root / "execution_error").touch()
     assert query() == [(None,)]
     (root / "execution_error").unlink()
@@ -628,7 +629,7 @@ def check_public_resource_failure(process, family, backend):
     # Ray's existing fragment policy attempts a failed UDF four times. The
     # service client must not multiply those attempts by max_retries=3.
     failed_attempts = 4 if backend.startswith("ray_") else 1
-    expected_calls = 2 * failed_attempts + 2
+    expected_calls = 4 * failed_attempts + 2
     asyncio.run(until(lambda: state(root).get("calls") == expected_calls and state(root).get("inflight") == 0))
     assert state(root)["engines"] == 1
 

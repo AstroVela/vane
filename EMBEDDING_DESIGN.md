@@ -559,8 +559,19 @@ NULL. The public Embed wrappers preserve allocation failures from initialization
 inference and vector conversion; they do not isolate/replay rows or substitute
 NULL for these failures. The service client never retries an individual request
 after uncertain completion, even when Embed's `max_retries` is configured.
+Native request retries and NULL substitution also stop on allocation failures.
+The common classifier retains ENOMEM/ENOSPC and recognized model allocator
+errors through cause chains and sanitized diagnostics, including failures
+during socket setup, shared-memory publication and vector conversion.
 Ray's enclosing task/fragment retry policy is independent and may start a new
 request; exhausting those attempts still aborts the query on a resource error.
+
+Native image inputs retain Vane's UInt8, UInt16 and Float32 IMAGE modes and
+pixel values for the selected processor, including `do_rescale=False` for
+already scaled Float32 input. Native validation enforces image shape, finite
+pixels, declared modalities and the combined row byte budget. The shared-memory
+service's wire format separately requires uint8 RGB images and video frames;
+choosing the native runtime does not apply that transport restriction.
 
 ## 9. Errors, observability and cleanup
 

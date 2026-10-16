@@ -18,7 +18,7 @@ import math
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -29,6 +29,7 @@ from vane.ai._audio_embedding import AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
+from vane.ai._errors import _raise_if_resource_error
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.embedding import Modality
@@ -591,11 +592,37 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
             raise EmbeddingConfigurationError("Embedding input exceeds max_input_bytes")
         return await self._embed_content(EmbeddingContent((EmbeddingPart(EmbeddingPartSpec(kind), value),)))
 
-    async def _embed_content(self, content: EmbeddingContent) -> Any:
+    def _validate_content(self, content: EmbeddingContent) -> None:
+        from vane import InvalidInputException
+        from vane._image import _array_mode, _validate_pixels
         from vane.ai._embedding_ipc import describe, input_spec
 
+        spec = input_spec(self.options)
+        spec.validate_layout(tuple(part.spec for part in content.parts))
+        # Native processors accept Vane IMAGE modes without an IPC copy or
+        # conversion. The service wire format deliberately remains uint8 RGB.
+        images = [part.value for part in content.parts if part.spec.kind == "image"]
+        remaining = tuple(part for part in content.parts if part.spec.kind != "image")
+        size = 0
+        if remaining:
+            parts, _, size = describe(EmbeddingContent(remaining), spec)
+            size += sum(len(part["text"].encode("utf-8")) for part in parts if part["kind"] == "text")
+        for value in images:
+            if not isinstance(value, np.ndarray) or not value.size or value.ndim != 3:
+                raise EmbeddingConfigurationError("Native images require nonempty HWC arrays")
+            size += value.nbytes
+            if size > spec.max_input_bytes:
+                raise EmbeddingConfigurationError("Embedding row exceeds combined input byte budget")
+            try:
+                _validate_pixels(value, _array_mode(value))
+            except InvalidInputException:
+                raise EmbeddingConfigurationError(
+                    "Native images require finite pixels in a supported IMAGE mode"
+                ) from None
+
+    async def _embed_content(self, content: EmbeddingContent) -> Any:
         started = time.monotonic()
-        describe(content, input_spec(self.options))
+        self._validate_content(content)
         text = self._render(
             [
                 {
@@ -720,9 +747,13 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         from vane.ai.functions import _log_substituted_failure, _retry_call_async
 
         async def invoke(value: Any, check_stopped: Callable[[], None]) -> Any:
-            def request() -> Awaitable[Any]:
+            async def request() -> Any:
                 check_stopped()
-                return self._embed(kind, value)
+                try:
+                    return await self._embed(kind, value)
+                except Exception as exc:
+                    _raise_if_resource_error(exc)
+                    raise
 
             try:
                 result = await _retry_call_async(
@@ -734,6 +765,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
             except EmbeddingConfigurationError:
                 raise
             except Exception as exc:
+                _raise_if_resource_error(exc)
                 if getattr(self, "_request_on_error", "raise") == "raise":
                     raise
                 _log_substituted_failure(exc, on_error="ignore")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import json
 import re
 import sys
@@ -55,6 +56,7 @@ _CPU_MEMORY = re.compile(
     r"Error code [0-9]{1,10} \([^\r\n)]{1,128}\)"
 )
 _CPU_MEMORY_DETAIL = "CPU memory allocation failed; check model and worker CPU memory budgets"
+_CUDA_MEMORY_DETAIL = "CUDA memory allocation failed; check model and worker GPU memory budgets"
 _ONNX_MEMORY = re.compile(
     r"\[ONNXRuntimeError\] : (?:1 : FAIL|6 : RUNTIME_EXCEPTION) : "
     r"(?:Non-zero status code returned while running [A-Za-z_][A-Za-z_0-9]{0,127} node\. ?"
@@ -204,9 +206,9 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
         if (
             "CUDA out of memory" in message
             or message == "CUDA failed with error out of memory"
-            or canonical("CUDA memory allocation failed; check model and worker GPU memory budgets")
+            or canonical(_CUDA_MEMORY_DETAIL)
         ):
-            return "CUDA memory allocation failed; check model and worker GPU memory budgets"
+            return _CUDA_MEMORY_DETAIL
     return None
 
 
@@ -536,3 +538,41 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
         suffix += separator + " <- ".join(rendered)
         remaining_items -= len(rendered)
     return " <- ".join(_bounded_chain(summaries[:remaining_items], max_chars - len(suffix))) + suffix
+
+
+def _is_resource_error(error: BaseException) -> bool:
+    """Recognize allocation failures through typed chains and safe diagnostics.
+
+    Never search arbitrary exception text for errno or diagnostic markers.
+    Keep this independent of torch, Ray and inference SDK imports.
+    """
+    for cause in _exception_chain(error):
+        if isinstance(cause, MemoryError):
+            return True
+        if isinstance(cause, OSError):
+            number = OSError.__dict__["errno"].__get__(cause)
+            if type(number) is int and number in {errno.ENOMEM, errno.ENOSPC}:
+                return True
+    primary, cleanup = _summary_parts(summarize_error(error, max_chars=4096))
+    atoms = primary + [atom for chain in cleanup for atom in _summary_parts(chain)[0]]
+    for atom in atoms:
+        name = _TYPE.match(atom)
+        if name is None:
+            continue
+        if name[0] in {"MemoryError", "OutOfMemoryError", "OutOfMemoryException"}:
+            return True
+        status = _STATUS_GROUP.match(atom, name.end())
+        if status and any(
+            field in {f"errno={errno.ENOMEM}", f"errno={errno.ENOSPC}"} for field in status[0][2:-1].split(", ")
+        ):
+            return True
+        detail = atom[name.end() + 2 :] if atom.startswith(": ", name.end()) else ""
+        if detail in {_CPU_MEMORY_DETAIL, _CUDA_MEMORY_DETAIL, _ONNX_MEMORY_DETAIL} or _SAFE_MEMORY.fullmatch(detail):
+            return True
+    return False
+
+
+def _raise_if_resource_error(error: BaseException) -> None:
+    """Normalize fatal allocation errors before retry or nullable-row handling."""
+    if _is_resource_error(error):
+        raise MemoryError("Embedding exhausted model or host resources") from None

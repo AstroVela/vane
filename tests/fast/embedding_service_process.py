@@ -4,12 +4,14 @@
 """CPU SDK fixture in a separate service process; never loads model weights."""
 
 import asyncio
+import errno
 import json
 import signal
 import sys
 from pathlib import Path
 
 from tests.fast.test_native_multimodal import install_sdk
+from vane.ai import DiagnosticError
 from vane.ai.embedding_service import EmbeddingService
 
 
@@ -26,6 +28,8 @@ async def main():
                 await asyncio.sleep(0.01)
             if (root / "memory_error").exists():
                 raise MemoryError("private model allocation diagnostic")
+            if (root / "wrapped_enospc").exists():
+                raise DiagnosticError("embedding", OSError(errno.ENOSPC, "private model allocation path"))
             if (root / "execution_error").exists():
                 raise RuntimeError("private model execution diagnostic")
             return [3, 4]
