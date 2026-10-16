@@ -358,7 +358,9 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
     try:
         with monkeypatch.context() as fault:
             if failure == "ack":
-                fault.setattr(manager, "_release_input_ack_ref", fail)
+                # Materialized inputs own their pooled refs, so ACK releases
+                # the descriptor directly instead of only returning its budget.
+                fault.setattr(ref_bundle.LocalShmBlockRef, "release", fail)
             else:
                 fault.setattr(manager, "cancel_input_lease", fail_completion)
             assert executor.request_task_admission(8)
