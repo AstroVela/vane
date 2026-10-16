@@ -65,7 +65,7 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
 
 
 _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
-    {"anthropic", "cosmos", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
+    {"anthropic", "cosmos", "embedding_http", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 
@@ -197,17 +197,17 @@ def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
     return OpenAIProvider(name, **client_options)
 
 
-def _load_vllm(name: str | None = None) -> Provider:
+def _load_vllm(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.vllm import VLLMProvider
 
-    return VLLMProvider(name)
+    return VLLMProvider(name, **client_options)
 
 
-def _load_sglang(name: str | None = None) -> Provider:
+def _load_sglang(name: str | None = None, **client_options: Any) -> Provider:
     try:
         from vane.ai.providers.sglang import SGLangProvider
 
-        return SGLangProvider(name)
+        return SGLangProvider(name, **client_options)
     except ImportError as e:
         raise ProviderImportError("sglang") from e
 

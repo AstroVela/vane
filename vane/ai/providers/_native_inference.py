@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker-owned Python inference engines. No serving process or HTTP client.
+"""Worker-owned Python inference engines and explicit runtime descriptor selection.
 
 The regular AI actor owns the engine and its asynchronous runtime. Descriptors
 carry configuration only; importing this module does not import model SDKs.
@@ -35,7 +35,9 @@ from vane.ai.options import (
     normalize_prompt_options,
 )
 from vane.ai.protocols import (
+    AudioEmbedderDescriptor,
     ImageEmbedderDescriptor,
+    MultimodalEmbedderDescriptor,
     PrompterDescriptor,
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
@@ -756,41 +758,78 @@ class NativePrompter(_NativeRuntime):
         return result["text"]
 
 
-class NativeEmbeddingProviderMixin(Provider):
+class InferenceEmbeddingProviderMixin(Provider):
     _native_family: str
 
-    def get_text_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeTextEmbedderDescriptor:
-        return NativeTextEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
+    def _capture_http_client(self, api_key: str | None) -> None:
+        import os
+
+        from vane.ai._client_config import copy_client_options
+
+        # Snapshot on the application, but validate only when HTTP is selected.
+        # Native embedding and prompting do not consume HTTP credentials.
+        self._http_client_options = copy_client_options(
+            {"api_key": api_key if api_key is not None else os.environ.get(f"{self._native_family.upper()}_API_KEY")}
         )
+
+    def _embedding_descriptor(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        prepared = dict(options or {})
+        runtime = prepared.get("runtime", "native")
+        if runtime == "http":
+            from vane.ai.providers._embedding_http import (
+                HTTPImageEmbedderDescriptor,
+                HTTPMultimodalEmbedderDescriptor,
+                HTTPTextEmbedderDescriptor,
+            )
+
+            if kind in {"video", "audio"}:
+                raise EmbeddingConfigurationError(
+                    "HTTP embedding requires encoded video/audio BLOBs with explicit mime_type; "
+                    "decoded frame timelines and PCM are not re-encoded"
+                )
+            return {
+                "text": HTTPTextEmbedderDescriptor,
+                "image": HTTPImageEmbedderDescriptor,
+                "multimodal": HTTPMultimodalEmbedderDescriptor,
+            }[kind](model or "", dimensions, prepared, self.name, self._native_family, self._http_client_options)
+        if runtime != "native":
+            raise EmbeddingConfigurationError("Embed runtime must be 'native' or 'http'")
+        prepared.pop("runtime", None)
+        factory = {
+            "text": NativeTextEmbedderDescriptor,
+            "image": NativeImageEmbedderDescriptor,
+            "video": NativeVideoEmbedderDescriptor,
+        }.get(kind)
+        if factory is None:
+            raise NotImplementedError(f"Native {self._native_family} does not support {kind} embedding")
+        return factory(model or "", dimensions, prepared, self.name, self._native_family)
+
+    def get_text_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> TextEmbedderDescriptor:
+        return self._embedding_descriptor("text", model, dimensions, options)
 
     def get_image_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeImageEmbedderDescriptor:
-        return NativeImageEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
-        )
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> ImageEmbedderDescriptor:
+        return self._embedding_descriptor("image", model, dimensions, options)
 
     def get_video_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeVideoEmbedderDescriptor:
-        return NativeVideoEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
-        )
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> VideoEmbedderDescriptor:
+        return self._embedding_descriptor("video", model, dimensions, options)
+
+    def get_audio_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> AudioEmbedderDescriptor:
+        return self._embedding_descriptor("audio", model, dimensions, options)
+
+    def get_multimodal_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> MultimodalEmbedderDescriptor:
+        return self._embedding_descriptor("multimodal", model, dimensions, options)
 
     def _media_prompter(
         self,

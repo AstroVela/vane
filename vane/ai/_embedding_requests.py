@@ -35,7 +35,7 @@ class _EmbeddingBatchError(_ProviderResultError):
     """
 
 
-def _is_request_wide_error(error: Exception) -> bool:
+def _is_request_wide_error(error: object) -> bool:
     """Recognize structured account/auth errors even when HTTP status is 400.
 
     SDK error envelopes differ: Google stores ErrorInfo in details, while
@@ -102,6 +102,7 @@ def _is_request_wide_error(error: Exception) -> bool:
 @dataclass
 class EmbeddingMetrics:
     requests: int = 0
+    request_bytes: int = 0
     retries: int = 0
     failed_inputs: int = 0
     input_tokens: int = 0
