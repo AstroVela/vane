@@ -364,6 +364,7 @@ class LocalShmStore:
         self._capacity_condition = threading.Condition(self._lock)
         self._foreground_allocations = 0
         self._prefetch_reclaimers: set[Callable[[], None]] = set()
+        self._active_prefetch_reclaims = 0
         self._waiting_writes: dict[tuple[str, int], tuple[int, set[int], frozenset[str]]] = {}
         self._retained_inputs: dict[str, set[int]] = {}
         self._shm: Any = None
@@ -434,9 +435,30 @@ class LocalShmStore:
         self._require_owner()
         with self._lock:
             reclaimers = tuple(self._prefetch_reclaimers)
+            if not reclaimers:
+                return
             self._prefetch_reclaimers.clear()
-        for reclaim in reclaimers:
-            reclaim()
+            # Transfer the whole batch to an execution owner before releasing
+            # the lock. Concurrent writers must still see this reclaim work.
+            self._active_prefetch_reclaims += 1
+        error: BaseException | None = None
+        try:
+            for reclaim in reclaimers:
+                try:
+                    reclaim()
+                except BaseException as exc:
+                    # Every snapshotted callback needs an attempt, including
+                    # those belonging to other invocations after one fails.
+                    if error is None:
+                        error = exc
+        finally:
+            with self._capacity_condition:
+                self._active_prefetch_reclaims -= 1
+                # Claimed inputs and cleanup failures may free no bytes, but
+                # waiters must recheck their dependencies when the batch ends.
+                self._capacity_condition.notify_all()
+        if error is not None:
+            raise error
 
     def allocate(self, size: int, *, producer_id: str | None = None, speculative: bool = False) -> StoreLease:
         self._require_owner()
@@ -570,7 +592,13 @@ class LocalShmStore:
                             all_blocked = all(
                                 requested > largest_possible for requested, _, _ in self._waiting_writes.values()
                             )
-                            if pinned + required > self.capacity or all_blocked:
+                            # A queued input may still be reclaimed by another
+                            # writer's snapshotted callback. Wait interruptibly
+                            # for that work before declaring a dependency cycle.
+                            # The current call's live views remain non-reclaimable.
+                            if pinned + required > self.capacity or (
+                                all_blocked and not self._active_prefetch_reclaims
+                            ):
                                 retained = sum(self._live[g].capacity for g in retained_inputs if g in self._live)
                                 raise LocalShmStoreCapacityError(
                                     f"shared-memory output cannot make progress: requested={size}, "

@@ -16,6 +16,7 @@ import time
 import types
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import pytest
 
@@ -11221,6 +11222,124 @@ def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(m
         for pool in pools:
             pool.shutdown(kill=True)
         store.remove_client("reclaim-race-test")
+    assert store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("reclaim_first", [False, True])
+def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeypatch, tmp_path, reclaim_first):
+    import vane.execution.udf_subprocess as local
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("inflight-reclaim-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+
+    def wait_for(path):
+        deadline = time.monotonic() + 15
+        while not path.exists():
+            assert time.monotonic() < deadline, str(path)
+            time.sleep(0.01)
+
+    class Actor:
+        def __call__(self, table):
+            label = table["x"][0].as_py()[:1].decode()
+            (tmp_path / f"entered-{label}").touch()
+            if label in ("A", "B"):
+                wait_for(tmp_path / f"release-{label}")
+            size = {"A": 48 * 1024, "B": 64 * 1024, "Q": 1}[label]
+            return pa.table({"x": [label.encode() * size]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    prepared, reclaim_started, resume, waiting = (threading.Event() for _ in range(4))
+    materialize = local.make_local_shm_ref_bundle_result
+    register = store.register_prefetch
+    wait_for_capacity = store.wait_for_capacity
+
+    def observe(table, **kwargs):
+        result = materialize(table, **kwargs)
+        if table["x"][0].as_py().startswith(b"Q"):
+            prepared.set()
+        return result
+
+    def register_paused(reclaim):
+        def paused():
+            reclaim_started.set()
+            assert resume.wait(10), "reclaim was not resumed"
+            reclaim()
+
+        return register(paused)
+
+    def observe_wait(size, *args):
+        if size > 60 * 1024:
+            waiting.set()
+        return wait_for_capacity(size, *args)
+
+    def drain(executor, expected):
+        result = _wait_for_results(executor, 1)[0]
+        assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+        try:
+            assert [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()] == [expected]
+        finally:
+            local._release_local_ref_bundle_result(result)
+
+    executors, pools = [], []
+    try:
+        for label in ("B", "A"):
+            executor, pool = _make_subprocess_actor_executor(local, payload, name=f"reclaim-{label}")
+            executors.append(executor)
+            pools.append(pool)
+        queued = local.UDFExecutor(payload, options={"local_actor_pool": pools[0]})
+        executors.append(queued)
+        for executor, label, size in zip(executors, ("B", "A"), (8 * 1024, 4 * 1024)):
+            _submit_with_admission(executor, pa.table({"x": [label.encode() * size]}))
+            wait_for(tmp_path / f"entered-{label}")
+        assert manager.snapshot()["limit_bytes"] == 40 * 1024
+        monkeypatch.setattr(local, "make_local_shm_ref_bundle_result", observe)
+        monkeypatch.setattr(store, "register_prefetch", register_paused)
+        monkeypatch.setattr(store, "wait_for_capacity", observe_wait)
+        _submit_with_admission(queued, pa.table({"x": [b"Q" * (24 * 1024)]}))
+        assert prepared.wait(5)
+        (tmp_path / "release-A").touch()
+        assert reclaim_started.wait(5)
+        with ThreadPoolExecutor(max_workers=2) as consumers:
+            try:
+                output_a = consumers.submit(drain, executors[1], b"A" * (48 * 1024))
+                if reclaim_first:
+                    resume.set()
+                    output_a.result(timeout=10)
+                (tmp_path / "release-B").touch()
+                output_b = consumers.submit(drain, executors[0], b"B" * (64 * 1024))
+                if not reclaim_first:
+                    assert waiting.wait(5), "second actor did not wait for physical capacity"
+                    with pytest.raises(FutureTimeoutError):
+                        output_b.result(timeout=0.05)
+                    resume.set()
+                output_a.result(timeout=10)
+                output_b.result(timeout=10)
+                drain(queued, b"Q")
+            finally:
+                resume.set()
+    finally:
+        resume.set()
+        for label in ("A", "B"):
+            (tmp_path / f"release-{label}").touch()
+        for executor in reversed(executors):
+            executor.close(kill=True)
+        for pool in pools:
+            pool.shutdown(kill=True)
+        store.remove_client("inflight-reclaim-test")
     assert store.snapshot()["live_allocations"] == 0
     assert manager.snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0

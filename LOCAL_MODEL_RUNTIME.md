@@ -2233,8 +2233,13 @@ threads before waiting for their actor's execution turn, overlapping the previou
 call's computation. Preparation follows per-replica FIFO order and is speculative:
 it never waits for memory or spends an execution progress allowance. Executing
 calls take priority and can reclaim unclaimed prefetched blocks when they need
-space. The queued call retains its original Arrow input and prepares it again
-at execution handoff, without replaying user code. Explicit byte reservations
+space. The arena tracks reclamation until every snapshotted callback has been
+attempted, including when another output starts reclamation concurrently.
+Capacity waits remain cancellable and recheck queued-input dependencies after
+reclamation finishes, even when callbacks release no bytes or fail. Callbacks
+run outside the arena lock; claimed input views still enforce the physical
+capacity bound. The queued call retains its original Arrow input and prepares
+it again at execution handoff, without replaying user code. Explicit byte reservations
 are consumed only at that handoff. Cancelling a prepared call releases its
 blocks even when it never acquires a worker. Input ACK returns
 the materialized-input progress credit independently of retained physical bytes.
