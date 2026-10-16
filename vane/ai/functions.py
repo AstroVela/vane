@@ -901,6 +901,7 @@ class _EmbeddingBatch:
         )
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._embedder_loop_bound = False  # set once the embedder is known loop-bound
+        self._selection_columns: tuple[str, ...] | None = None
 
     def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
@@ -1116,9 +1117,22 @@ class _EmbeddingBatch:
         return self._embed_inputs(values)
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        texts = self._input_values(table)
+        row_indices = list(range(table.num_rows))
+        results: list[Any] = [None] * table.num_rows
+        if self._selection_columns is not None:
+            # Keep the predicate and all input fields inside one non-NULL
+            # struct. A NULL optional part/predicate must not cause native
+            # constant folding to bypass validation of selected rows.
+            unpacked = pa.Table.from_arrays(
+                table.column("selected_input").flatten(), names=["condition", *self._selection_columns]
+            )
+            condition = unpacked.column("condition")
+            if not (pa.types.is_boolean(condition.type) or pa.types.is_null(condition.type)):
+                raise TypeError("Embed where must produce BOOLEAN or NULL")
+            row_indices = [index for index, value in enumerate(condition.to_pylist()) if value is True]
+            table = unpacked.drop(["condition"]).take(pa.array(row_indices, type=pa.int64()))
+        texts = self._input_values(table) if row_indices else []
         active_indices = [index for index, text in enumerate(texts) if text is not None]
-        results: list[Any] = [None] * len(texts)
 
         if active_indices:
             active_texts = [texts[index] for index in active_indices]
@@ -1130,7 +1144,7 @@ class _EmbeddingBatch:
                 normalize=self._normalize,
             )
             for index, value in zip(active_indices, active_results, strict=True):
-                results[index] = value
+                results[row_indices[index]] = value
 
         embeddings = pa.array(
             [None if value is None else value.tolist() for value in results],
@@ -1654,9 +1668,12 @@ def _build_embed_expression(
     options: Mapping[str, Any],
     relation: bool,
     output_column: str = "embedding",
+    where: Expression | None = None,
 ) -> Expression:
     from vane.ai._embedding_content import EmbeddingPartSpec
 
+    if where is not None and not is_expression(where):
+        raise TypeError("vane.ai.embed where requires a BOOLEAN Expression")
     input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "text"
     if isinstance(input, (TextInput, ImageInput, VideoInput, AudioInput)):
         if getattr(input, "mime_type", None) is not None:
@@ -1716,6 +1733,13 @@ def _build_embed_expression(
         }[input_kind]
         wrapper = wrapper_class(descriptor, input_name, output_column, resolved_dimensions, **wrapper_options)
         inputs = {input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), input)}
+    if where is not None:
+        wrapper._selection_columns = tuple(inputs)
+        inputs = {
+            "selected_input": vane.FunctionExpression(
+                "struct_pack", where.alias("condition"), *(value.alias(name) for name, value in inputs.items())
+            )
+        }
     output_type = f"FLOAT[{resolved_dimensions}]"
     return _build_ai_batch_expression(
         wrapper,
@@ -1747,6 +1771,7 @@ def embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     **options: Unpack[EmbedOptions],
 ) -> Expression: ...
 
@@ -1759,6 +1784,7 @@ def embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     **options: Unpack[EmbedOptions],
 ) -> Expression: ...
 
@@ -1773,6 +1799,7 @@ def embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     output_column: str = "embedding",
     **options: Unpack[EmbedOptions],
 ) -> Relation: ...
@@ -1787,6 +1814,7 @@ def embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     output_column: str = "embedding",
     **options: Unpack[EmbedOptions],
 ) -> Relation: ...
@@ -1802,6 +1830,7 @@ def embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[EmbedOptions],
 ) -> Expression | Relation:
@@ -1810,6 +1839,9 @@ def embed(
     A bare Expression denotes text. Decoded media uses ImageInput, VideoInput
     or AudioInput. Supply mime_type to pass encoded bytes without decoding.
     MultimodalInput combines optional parts into one vector for each row.
+    With where=, only TRUE rows undergo input conversion and model execution;
+    FALSE/NULL rows return NULL while preserving row count and order. Expression
+    evaluation and provider/layout configuration still apply to the whole plan.
     """
 
     if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
@@ -1831,6 +1863,7 @@ def embed(
             on_error=on_error,
             output_column=resolved_output_column,
             options=options,
+            where=where,
         )
         return relation.select(
             _star_excluding_existing_output_column(relation, resolved_output_column),
@@ -1854,6 +1887,7 @@ def embed(
         on_error=on_error,
         options=options,
         relation=False,
+        where=where,
     )
 
 

@@ -498,3 +498,33 @@ and currently imported joint wrappers remain active until milestone 3 replaces
 their consumers. Dependency PRs must pin a Vane build containing the required
 contract and use matching native/extension identities. Documentation links should
 point to this design instead of duplicating it across repositories.
+
+## Conditional rows in a shared pipeline
+
+`embed(..., where=boolean_expression)` preserves every input row and returns
+NULL for FALSE/NULL predicates. Only TRUE rows pass through embedding input
+conversion, byte/frame validation and provider execution. Configuration and
+logical input types remain validated for the plan; arbitrary SQL expressions
+are still evaluated normally. A selected multimodal row with no content still
+fails, including with `on_error="ignore"`.
+
+This supports several profile columns in one pipeline without repeating upstream
+ASR/OCR work or sending missing inputs to a model. A non-NULL struct carries the
+predicate and typed fields through binding; the worker filters it before input
+conversion, then restores vector positions. An entirely unselected batch never
+instantiates its provider client. Existing task/actor lifecycle, cancellation,
+normalization, retries and credentials remain owned by Embed.
+
+```python
+rows = rows.embed(
+    MultimodalInput([VideoInput(vane.col("video"), "video/mp4"),
+                     TextInput(vane.col("transcript"))]),
+    provider=provider, model=model, dimensions=dimensions,
+    where=vane.col("profile") == vane.ConstantExpression("joint"),
+)
+```
+
+Context milestone 3 uses this row selection in a linear plan. The current
+Ray translator treats materialized CTE subtrees as native scan sources, so a
+CTE containing distributed UDFs fails resource registration. This change adds
+no CTE fallback or native planner bypass.
