@@ -6,6 +6,8 @@
 import gc
 import time
 from dataclasses import replace
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,6 +107,65 @@ def test_group_capacity_failure_rolls_back_before_start(capacity):
             connection.query("select range from range(20)")
         assert len(connection.query_runtime.pool.workers) == 2
         assert_idle(connection)
+        assert connection.query("select 42").collect().column(0).to_pylist() == [42]
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("failure", [None, "reply", "partial_batch"])
+def test_worker_start_batches_allow_delayed_peer_and_failed_reply(tmp_path, monkeypatch, failure):
+    import ray
+
+    source = tmp_path / "input.parquet"
+    sql = f"select k, sum(v) as total from read_parquet('{source}') group by k order by k"
+    with vane.connect(backend="local") as local:
+        local.execute(f"copy (select range % 97 as k, range as v from range(20000)) to '{source}'")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+    with vane.Runtime(resources()) as application, application.connect() as connection:
+        connection.query("select 1").collect()
+        pool = connection.query_runtime.pool
+        calls = {}
+
+        def start(index, remote, epoch, query, tasks):
+            assert index not in calls, "each worker must receive a single start batch"
+            assert len(tasks) > 1, "exercise multiple dependent fragments in each batch"
+            if not calls:
+                assert all(
+                    ray.get(worker.ready.remote(worker_epoch, query), timeout=5)
+                    for worker, worker_epoch in zip(pool.workers, pool.epochs)
+                )
+            else:
+                # The first worker must finish starting its entire graph while
+                # its peer has not started any task, even with tiny channels.
+                first, receipt = next(iter(calls.items()))
+                ray.get(receipt, timeout=5)
+                state = ray.get(pool.workers[first].status.remote(pool.epochs[first], query), timeout=5)
+                assert not state["production_done"]
+            if failure == "partial_batch" and len(calls) + 1 == len(pool.workers):
+                # Fail inside the batch after one native task has started and
+                # before the worker creates its pump thread.
+                tasks = [tasks[0], "unknown-task", *tasks[1:]]
+            reference = remote(epoch, query, tasks)
+            calls[index] = reference
+            if failure == "reply" and len(calls) == len(pool.workers):
+                ray.get(reference, timeout=5)
+                return ray.put(ray.exceptions.ActorUnavailableError("lost worker start reply", None))
+            return reference
+
+        with monkeypatch.context() as patch:
+            for index, worker in enumerate(pool.workers):
+                patch.setattr(worker, "start", SimpleNamespace(remote=partial(start, index, worker.start.remote)))
+            if failure == "reply":
+                with pytest.raises(ray.exceptions.ActorUnavailableError, match="lost worker start reply"):
+                    connection.query(sql)
+            elif failure == "partial_batch":
+                with pytest.raises(ray.exceptions.RayTaskError, match="task does not belong to this worker"):
+                    connection.query(sql)
+            else:
+                with connection.query(sql) as result:
+                    assert result.collect().to_pylist() == expected
+            assert len(calls) == len(pool.workers)
+            assert_idle(connection)
+        # Cleanup after an ambiguous reply must leave the pool reusable.
         assert connection.query("select 42").collect().column(0).to_pylist() == [42]
         assert_idle(connection)
 

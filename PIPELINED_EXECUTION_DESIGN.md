@@ -507,15 +507,19 @@ sequenceDiagram
     P-->>S: Prepared
     C-->>S: Prepared
     O-->>S: Prepared
-    S->>C: Start consumer
-    S->>P: Start producer and splits
+    Note over S,O: All channels connected and ready
+    par Per-worker start batches
+        S->>C: Start consumer batch
+    and
+        S->>P: Start producer batch and splits
+    end
     P-->>C: Bounded batches
     C-->>O: Incremental result
     O-->>C: Release credit
     C-->>P: Release credit
 ~~~
 
-消费者及结果出口先准备好，再启动生产者。join 的 build 输入先推进，probe 输入根据 BuildReady 事件解除语义等待。单个 producer 暂时没有数据不会阻止读取其他就绪输入。
+所有 worker、输入通道和结果出口完成连接并报告就绪后，协调器向每个 worker 发出一次启动 RPC；批次内按逆拓扑顺序启动本 worker 的消费者及生产者。不同 worker 的启动可以重叠；native start 不等待输入，先到的数据受既有通道字节和帧数额度约束。任一批次启动失败或回执丢失，取消并清理整个已准备组，包括批次内尚未启动的 task。join 的 build 输入先推进，probe 输入根据 BuildReady 事件解除语义等待。单个 producer 暂时没有数据不会阻止读取其他就绪输入。
 
 PIPELINED 不重试已启动的 task。worker 丢失、不可恢复的数据连接中断或算子失败使整个查询失败，唤醒读端并关闭相关通道。已经返回的部分结果不能以正常 EOF 收尾。
 

@@ -2299,3 +2299,89 @@ hashes are retained before deletion, source inputs are preserved and disk
 guards remain untriggered. Formatting, applicable pre-commit hooks,
 copyleft and diff checks pass. Only related tests and queries are run;
 the full release, fast and all-query suites are not repeated.
+
+## Batched pipelined worker starts (2026-10-16)
+
+The frozen baseline is `7f2f9f59aa`. After every worker and result endpoint
+is connected and ready, the coordinator previously waited for start RPCs
+at each fragment boundary. Q9/Q18 required 19/23 RPCs for their 10/13
+fragments on two workers. The scheduler now sends one batch per worker,
+preserving reverse topological order within each batch. Native start does
+not wait for exchange input; bounded channels can hold data until the peer
+starts. Preparation, source validation, admission, fixed attempts/splits,
+readiness checks, cancellation and resource ownership retain their contracts.
+A failed or ambiguous start still releases every prepared worker, including
+tasks whose batch has only partially started.
+
+Separate coordinator diagnostics, three samples per query/runtime, record
+start RPC counts of **19 to 2 for Q9** and **23 to 2 for Q18**. Median
+cumulative waits for their replies fall from **39.2 to 2.8 ms** and
+**19.2 to 3.2 ms**, respectively. These diagnostics are excluded from the
+latency comparison. In the uninstrumented comparison, median submission
+time falls from **180.4 to 153.0 ms** for Q9 and **228.9 to 201.2 ms** for
+Q18, with lower submission medians in both rounds.
+
+The comparison uses baseline/candidate then candidate/baseline order,
+with three samples per query/mode/runtime in each round. SF10 input hashes,
+driver and declared resources match: local 36 threads/32 GiB; two pipelined
+18-CPU workers, two partitions and 16 GiB operator memory per worker;
+64 KiB/2048-row frames, 1 MiB/16-slot channels, 128 MiB exchange and 256 MiB
+staging per worker, and a 1 GiB Ray object store. The Flight window remains
+sixteen frames and staging remains 5.25 MiB per remote link. Ray's reported
+available host memory varies by about 0.22 GiB; declared operator limits
+are fixed. Timings include submission, collection and successful close,
+excluding startup and validation, with warm OS caches on the shared host.
+No task-owned build, test or diagnostic overlaps a measured comparison.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.851 | 1.447 | 0.862 | 1.414 | -2.3% | 1.64 |
+| Q18 | 0.697 | 1.094 | 0.701 | 1.067 | -2.5% | 1.52 |
+
+Q18 improves in both rounds, 1.092 to 1.066 seconds and 1.096 to 1.068
+seconds. Q9 changes from 1.452 to 1.403 seconds in the first round but
+1.442 to 1.450 seconds in the reverse round: its combined median is lower,
+but a consistent end-to-end improvement is not established. Combined
+local controls change by +1.2%/+0.5% for Q9/Q18. All **48 timing samples**,
+including **24 on the candidate**, match local schema, row counts and
+values with relative/absolute floating tolerances 1e-9/1e-6. This is a
+startup improvement; local parity, an all-query total and large-query FTE
+performance are not established.
+
+The non-editable incremental Release install (`vane-ai 0.3.0.dev115`) and
+frozen baseline have the same native SHA-256:
+`c876bd8ff35b0d994182586544b98725323693f525b7c3b31b90795a82ec5bf2`.
+Only the installed `execution/pipelined_runtime.py` differs. The baseline
+was rebuilt from clean `7f2f9f59aa` sources before freezing; its build
+identity differs from the preceding round's binary. DuckDB SourceID is
+still `ff00fa7d41e2817abdc7e24a48081472f2a351f8`.
+
+**21 related real-Ray tests pass**, including three new cases for a
+delayed peer under tiny channel limits, a lost start reply after native
+startup and a failure partway through a batch before its pump thread
+exists. Each verifies result correctness or failure propagation, complete
+release and pool reuse. The batching regression fails on the baseline's
+single-fragment start as expected. Existing coverage includes backpressure,
+early close, process loss, admission rollback, cancellation/deadlines,
+HASH/Parquet, shared build/CTE inputs and budgeted broadcast. Formatting,
+applicable pre-commit hooks, copyleft and diff checks pass. Only related
+tests and Q9/Q18 are run; the full release, fast and all-query suites are
+not repeated.
+
+Two preceding receiver experiments are rejected and fully reverted:
+borrowing fixed-width Arrow values did not improve Q9 latency despite
+lower decode CPU, and reusing expected schemas/removing duplicate frame
+fitting left latency effectively unchanged. A 128 KiB frame screen showed
+no established gain sufficient to justify doubling per-link staging from
+5.25 to 10.25 MiB. Their patches, identities, tests, diagnostics and
+measurements remain under `build/pipelined-receive-20261016/`; none of those
+native changes or frame settings is included in this round.
+
+Accepted evidence is under `build/pipelined-start-20261016/`: baseline and
+candidate identities, frozen configurations, raw samples, `comparison.json`,
+`local-vs-pipelined.csv`, separate `control-comparison.json`, regression and
+check logs, and cleanup manifests. Query/worker/result reservations return
+to zero. Owned processes stop before temporary/spill cleanup; oracle row
+counts, schemas and hashes are retained before output deletion. Rejected
+binary copies are removed, source inputs are preserved, and disk guards
+remain untriggered, with about 74 GiB free after cleanup.

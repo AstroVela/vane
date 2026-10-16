@@ -438,20 +438,21 @@ class PipelinedScheduler:
                 break
             self.stop.wait(0.01)
         self.context.deadline_probe = self.production_status
-        # Every context, input and endpoint now exists. Start consumers before
-        # their producers, retaining the same fixed attempt and split assignment.
+        # Every context, input and endpoint is ready. Batch starts per worker,
+        # keeping consumers before producers within each batch. Across workers,
+        # bounded channels can hold data until the peer's batch has started.
         fragments = {f.fragment_id: f for f in self.spec.graph.fragments}
+        by_worker: dict[int, list[str]] = {}
         for identity in reversed(self.spec.graph.topological_fragment_ids()):
-            by_worker: dict[int, list[str]] = {}
             for part in range(fragments[identity].partition_count):
                 task = task_id(identity, part)
                 by_worker.setdefault(assignments[task], []).append(task)
-            calls = [
-                self.pool.workers[index].start.remote(self.pool.epochs[index], self.spec.query_id, tasks)
-                for index, tasks in by_worker.items()
-            ]
-            for reference in calls:
-                _get(reference, self.context)
+        calls = [
+            self.pool.workers[index].start.remote(self.pool.epochs[index], self.spec.query_id, tasks)
+            for index, tasks in by_worker.items()
+        ]
+        for reference in calls:
+            _get(reference, self.context)
         self.monitor = threading.Thread(target=self._monitor, name="vane-pipelined-query", daemon=True)
         self.monitor.start()
 
