@@ -264,8 +264,16 @@ dependency group. Run them when changing the corresponding integration:
 ```bash
 scripts/run_fast_tests.sh
 scripts/run_installed_pytest.sh tests/slow
-scripts/run_installed_pytest.sh tests/ai
+scripts/run_ai_tests.sh
 ```
+
+The AI launcher runs non-Ray core tests, non-Ray expression tests and Ray tests
+in three fresh processes. Run one group with `scripts/run_ai_tests.sh core`,
+`expressions` or `ray`. Together they cover the same CPU-only AI suite; external
+services and GPU tests require explicit opt-in through the installed pytest
+launcher. CI keeps a 600-second deadline per group, reports the first failure
+immediately, and uploads JUnit results instead of allowing one long non-Ray run
+to exhaust that deadline before printing its failures.
 
 The fast-test launcher runs non-Ray tests, shared-cluster Ray tests, and
 test-owned Ray clusters in separate pytest processes. This keeps the real Ray
