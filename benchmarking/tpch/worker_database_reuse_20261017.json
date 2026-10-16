@@ -1,0 +1,264 @@
+{
+  "date": "2026-10-17",
+  "integration_base": "0920b4472d80b1452fd12862d23fcb0e09c8ead8",
+  "performance_base": "c97e5bf31b475e722028196bcfdab79f61003510",
+  "production_patch_sha256": "2ab71f31ccacd6d07f8d7fee17dab7518b749d79283e531b0f30454291fb34dc",
+  "candidate_native_sha256": "13d7cd6bd97cf93774a5264765ff9c725c1752300f08fd9e086edaeec91dce22",
+  "baseline_native_sha256": "c876bd8ff35b0d994182586544b98725323693f525b7c3b31b90795a82ec5bf2",
+  "driver_sha256": "2f6a1b07c5d477ef27daa09cd97039ae6f2a6c6397702fa0c669d6ac5b9e3d9a",
+  "dataset": "TPC-H SF10 Parquet",
+  "inputs": {
+    "nation": {
+      "bytes": 2673,
+      "mtime_ns": 1770647586791057832,
+      "sha256": "f45a4aa92dee8fbadb28d0c5c75ed0af6a1c54a74fcaf8787a3e38ab1024a92d",
+      "rows": 25,
+      "row_groups": 1
+    },
+    "region": {
+      "bytes": 1301,
+      "mtime_ns": 1770647586792057873,
+      "sha256": "e2e43eea1a4ef40b35796f430a9eca390435a1b638744b2d9a0827f12a573021",
+      "rows": 5,
+      "row_groups": 1
+    },
+    "supplier": {
+      "bytes": 7964658,
+      "mtime_ns": 1770647586921063213,
+      "sha256": "79b6af2a17a6c07f7d0b72ed29c56d33a5f72847edb1ebd470f9471f67549a76",
+      "rows": 100000,
+      "row_groups": 1
+    },
+    "customer": {
+      "bytes": 125270383,
+      "mtime_ns": 1770647587234076176,
+      "sha256": "167c91b3592b7c786efe43c7150d81709741ddc353703b0a8566d367ae4c16ce",
+      "rows": 1500000,
+      "row_groups": 13
+    },
+    "part": {
+      "bytes": 68530019,
+      "mtime_ns": 1770647587559089640,
+      "sha256": "7970a4075783e614e885fe1064a5bc3041464091109195559a91d490925ee9c7",
+      "rows": 2000000,
+      "row_groups": 17
+    },
+    "partsupp": {
+      "bytes": 451842158,
+      "mtime_ns": 1770647588242117941,
+      "sha256": "44bb38bfbfad6e7f59f4c0b4c2af84c865a0defeb627ec7cb356fd8b35dcb2c2",
+      "rows": 8000000,
+      "row_groups": 66
+    },
+    "orders": {
+      "bytes": 658152289,
+      "mtime_ns": 1770647589413166502,
+      "sha256": "09ed16a1a81e88cf61b2d38bee999d267a12ea71ff70dc888e6204a204e138da",
+      "rows": 15000000,
+      "row_groups": 123
+    },
+    "lineitem": {
+      "bytes": 2639949045,
+      "mtime_ns": 1770647594259367930,
+      "sha256": "8fe8fe00b4a42ccb33d238ec942a5fff0db7d3f50081178453e527eb28096739",
+      "rows": 59986052,
+      "row_groups": 489
+    }
+  },
+  "resources": {
+    "max_active_queries": 1,
+    "max_queued_queries": 64,
+    "max_results": 1,
+    "result_buffer_bytes": 67108864,
+    "worker_count": 2,
+    "cpus_per_worker": 18,
+    "task_contexts_per_worker": 64,
+    "operator_memory_bytes": 17179869184,
+    "exchange_buffer_bytes": 134217728,
+    "staging_buffer_bytes": 268435456,
+    "io_concurrency": 256,
+    "partitions": 2,
+    "exchange": {
+      "window_bytes": 1048576,
+      "frame_bytes": 65536,
+      "frame_rows": 2048,
+      "frame_slots": 16
+    },
+    "exchange_stores": [
+      {
+        "name": "sf10",
+        "root": "<per-run temporary directory>/store",
+        "capacity_bytes": 171798691840,
+        "query_bytes": 171798691840,
+        "object_bytes": 2147483648,
+        "source_bytes": 4294967296,
+        "lease_seconds": 60.0,
+        "source_cache_bytes": 0
+      }
+    ]
+  },
+  "local_config": {
+    "threads": 36,
+    "memory_limit": "32GiB"
+  },
+  "object_store_bytes": 1073741824,
+  "run_order": [
+    "optimized-baseline-focus",
+    "optimized-candidate-focus",
+    "optimized-candidate-confirm",
+    "optimized-baseline-confirm"
+  ],
+  "samples_per_query_and_mode_per_variant": 6,
+  "timing": "query through complete collection and successful close; excludes comparison and diagnostics",
+  "warmup": "select 1 once per mode, with cleanup checked before timing",
+  "host_policy": "shared host, OS caches retained; this task runs no concurrent builds or tests",
+  "float_tolerance": {
+    "relative": 1e-09,
+    "absolute": 1e-06
+  },
+  "paths": "Ephemeral run paths normalized; raw configurations retained with local build artifacts.",
+  "runs": {
+    "optimized-baseline-focus": {
+      "started_at_utc": "2026-10-16T18:09:58Z",
+      "packages": {
+        "vane-ai": "0.3.0.dev116",
+        "ray": "2.59.0",
+        "pyarrow": "26.0.0",
+        "numpy": "2.5.4",
+        "psutil": "7.2.2"
+      },
+      "native_sha256": "c876bd8ff35b0d994182586544b98725323693f525b7c3b31b90795a82ec5bf2",
+      "memory_available_at_start": 59238494208,
+      "host_load_at_start": [
+        2.60546875,
+        3.35009765625,
+        4.38427734375
+      ]
+    },
+    "optimized-candidate-focus": {
+      "started_at_utc": "2026-10-16T18:10:31Z",
+      "packages": {
+        "vane-ai": "0.3.0.dev117",
+        "ray": "2.59.0",
+        "pyarrow": "26.0.0",
+        "numpy": "2.5.4",
+        "psutil": "7.2.2"
+      },
+      "native_sha256": "13d7cd6bd97cf93774a5264765ff9c725c1752300f08fd9e086edaeec91dce22",
+      "memory_available_at_start": 59373408256,
+      "host_load_at_start": [
+        6.61328125,
+        4.36962890625,
+        4.6962890625
+      ]
+    },
+    "optimized-candidate-confirm": {
+      "started_at_utc": "2026-10-16T18:11:02Z",
+      "packages": {
+        "vane-ai": "0.3.0.dev117",
+        "ray": "2.59.0",
+        "pyarrow": "26.0.0",
+        "numpy": "2.5.4",
+        "psutil": "7.2.2"
+      },
+      "native_sha256": "13d7cd6bd97cf93774a5264765ff9c725c1752300f08fd9e086edaeec91dce22",
+      "memory_available_at_start": 59323625472,
+      "host_load_at_start": [
+        7.279296875,
+        4.7998046875,
+        4.82763671875
+      ]
+    },
+    "optimized-baseline-confirm": {
+      "started_at_utc": "2026-10-16T18:11:34Z",
+      "packages": {
+        "vane-ai": "0.3.0.dev116",
+        "ray": "2.59.0",
+        "pyarrow": "26.0.0",
+        "numpy": "2.5.4",
+        "psutil": "7.2.2"
+      },
+      "native_sha256": "c876bd8ff35b0d994182586544b98725323693f525b7c3b31b90795a82ec5bf2",
+      "memory_available_at_start": 59345432576,
+      "host_load_at_start": [
+        9.11279296875,
+        5.60107421875,
+        5.10009765625
+      ]
+    }
+  },
+  "summary": {
+    "9": {
+      "baseline": {
+        "local": 0.845743288002268,
+        "pipelined": 1.397462811502919
+      },
+      "candidate": {
+        "local": 0.8417195320034807,
+        "pipelined": 1.2498521995003102
+      },
+      "pipelined_reduction_percent": 10.5627577913046,
+      "candidate_pipeline_to_local": 1.4848796445597294
+    },
+    "18": {
+      "baseline": {
+        "local": 0.6946013755041349,
+        "pipelined": 1.046547116999136
+      },
+      "candidate": {
+        "local": 0.6877252555023006,
+        "pipelined": 0.910212999497162
+      },
+      "pipelined_reduction_percent": 13.027040568693927,
+      "candidate_pipeline_to_local": 1.323512539658531
+    }
+  },
+  "validation": {
+    "timed_samples": 48,
+    "oracle_matches": 48,
+    "owned_processes_stopped": true,
+    "temporary_data_removed": true,
+    "independent_base_and_candidate_sf10_samples": 16,
+    "independent_regression_cases": 91,
+    "combined_regression_cases": 32
+  },
+  "limitations": [
+    "This comparison includes PR #1020 on both sides; the PR itself is independently based on integration.",
+    "Only Q9 and Q18 were measured; medians are not a bound for every query or host.",
+    "No claim of a hard process RSS limit; idle database instances retain bounded engine state."
+  ],
+  "separate_worker_profile": {
+    "probe_sha256": "4e3f68d80ff2d5ced2577d767396a351c6ff6d6486f77f30093a82e8cb747c1d",
+    "results": {
+      "optimized-baseline-profile": {
+        "9": {
+          "worker_observations": 6,
+          "database_connect_median_ms": 36.702748,
+          "query_prepare_median_ms": 52.9688625,
+          "worker_release_median_ms": 37.228136000000006
+        },
+        "18": {
+          "worker_observations": 6,
+          "database_connect_median_ms": 37.166103500000006,
+          "query_prepare_median_ms": 54.930321000000006,
+          "worker_release_median_ms": 28.483061499999998
+        }
+      },
+      "optimized-candidate-profile": {
+        "9": {
+          "worker_observations": 6,
+          "database_connect_median_ms": 0.493065,
+          "query_prepare_median_ms": 18.598954499999998,
+          "worker_release_median_ms": 5.441318
+        },
+        "18": {
+          "worker_observations": 6,
+          "database_connect_median_ms": 0.427053,
+          "query_prepare_median_ms": 17.1835505,
+          "worker_release_median_ms": 4.096157
+        }
+      }
+    },
+    "timing_note": "Worker-level medians from separate instrumented runs; not added to end-to-end medians."
+  }
+}

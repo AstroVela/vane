@@ -17,6 +17,7 @@ from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskSe
 from vane.execution.pipelined_plan import placement
 from vane.execution.pipelined_worker import _Query
 from vane.execution.plan import Distribution
+from vane.execution.worker_database import WorkerDatabasePool
 from vane.execution.worker_resources import pipelined_demand
 
 
@@ -256,9 +257,10 @@ def test_same_worker_edges_share_channels_and_reserve_no_flight_staging(monkeypa
     demand = pipelined_demand(resources, 0, list(tasks), routes)
     assert demand["io"] == 1  # Only the root result leaves this process.
     assert demand["exchange"] == len(routes) * resources.exchange.window_bytes
-    owner = _Query(spec, resources, 0, routes)
+    databases = WorkerDatabasePool(resources)
+    owner = _Query(spec, resources, 0, routes, databases.acquire(spec.query_id, reusable=True))
     try:
-        owner.prepare(list(tasks), demand["operator"])
+        owner.prepare(list(tasks))
         assert len(owner.channels) == len(routes)
         assert all(name.startswith("out/") for name in owner.channels)
         owner.connect({0: str(owner.flight.location)})
@@ -276,6 +278,8 @@ def test_same_worker_edges_share_channels_and_reserve_no_flight_staging(monkeypa
             time.sleep(0.001)
     finally:
         owner.close()
+        for anchor in databases.idle:
+            anchor.close()
 
 
 @pytest.mark.parametrize("kind", ["inner", "left", "semi", "anti"])
