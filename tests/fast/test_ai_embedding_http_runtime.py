@@ -163,6 +163,82 @@ def test_http_preserves_missing_or_valid_driver_key_across_serialization(monkeyp
 
 
 @pytest.mark.parametrize("family", PROVIDERS)
+@pytest.mark.parametrize("credential", ["explicit", "environment", "missing"])
+@pytest.mark.parametrize("kind", ["text", "multimodal"])
+def test_public_loader_authenticates_with_the_serialized_application_key(monkeypatch, family, credential, kind):
+    import sys
+
+    from vane.ai import load_provider
+
+    variable = f"{family.upper()}_API_KEY"
+    monkeypatch.delenv(variable, raising=False)
+    if credential != "missing":
+        monkeypatch.setenv(variable, "environment-key")
+    # Loading a remote provider must not require its native inference package.
+    monkeypatch.setitem(sys.modules, family, None)
+    provider = load_provider(
+        family, name="my-deployment", **({"api_key": "explicit-key"} if credential == "explicit" else {})
+    )
+    provider = pickle.loads(pickle.dumps(provider))
+    monkeypatch.setenv(variable, "different-worker-key")
+    descriptor = getattr(provider, f"get_{kind}_embedder")(
+        "served-model",
+        2,
+        options={"runtime": "http", "base_url": "http://embedding.invalid/v1", "http_input_format": "multimodal"},
+    )
+    assert provider.name == descriptor.get_provider() == "my-deployment"
+    assert all(key not in repr(descriptor) for key in ("explicit-key", "environment-key", "different-worker-key"))
+    assert "api_key" not in descriptor.get_options()
+    descriptor = pickle.loads(pickle.dumps(descriptor))
+    expected = {"explicit": "Bearer explicit-key", "environment": "Bearer environment-key", "missing": None}[credential]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.headers.get("authorization") == expected
+        return _response(_inputs(request)[2])
+
+    client_factory = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: client_factory(transport=httpx.MockTransport(handler), **kwargs)
+    )
+
+    async def run():
+        client = descriptor.instantiate()
+        try:
+            result = await client.embed_text(["1", "2"])
+            assert np.asarray(result).tolist() == [[1.0, 1.0], [2.0, 1.0]]
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
+def test_public_loader_preserves_native_credential_validation_boundary(family):
+    from vane.ai import load_provider
+    from vane.ai.protocols import NativeInferencePlan
+    from vane.ai.providers._native_inference import NativeTextEmbedderDescriptor
+
+    provider = load_provider(family, api_key="")
+    assert isinstance(provider.get_text_embedder("native-model", 2), NativeTextEmbedderDescriptor)
+    assert isinstance(provider.get_prompter("native-model"), NativeInferencePlan)
+    with pytest.raises(ValueError, match=f"{family.upper()}_API_KEY"):
+        provider.get_text_embedder(
+            "served-model", 2, options={"runtime": "http", "base_url": "http://embedding.invalid/v1"}
+        )
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
+def test_public_loader_rejects_unknown_client_settings(family):
+    from vane.ai import load_provider
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'unknown_setting'"):
+        load_provider(family, unknown_setting="invalid")
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
 @pytest.mark.parametrize(
     "options",
     [

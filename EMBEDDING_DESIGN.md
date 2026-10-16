@@ -342,7 +342,9 @@ Local validation never enters this error policy. Cancellation drains the local
 HTTP tasks before executor cleanup; it is not an acknowledgement that remote GPU
 work has stopped. No shared-memory lease is involved in this transport.
 
-Use `SGLangProvider(api_key=...)` / `VLLMProvider(api_key=...)`, or the respective
+Use `vane.ai.load_provider("sglang", api_key=...)` /
+`vane.ai.load_provider("vllm", api_key=...)`, the corresponding provider
+constructors, or the respective
 `SGLANG_API_KEY` / `VLLM_API_KEY` on the application, for optional bearer auth.
 Keys are captured and redacted like other provider descriptors. Workers do not
 read ambient OpenAI credentials or proxy settings; redirects are not followed.
