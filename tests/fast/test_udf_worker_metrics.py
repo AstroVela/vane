@@ -332,9 +332,12 @@ def test_graceful_cancel_retires_worker_with_late_stream_chunk(monkeypatch, back
             for ref in result[1]:
                 ref.release()
 
+    manager = ref_bundle.local_shm_budget_manager()
+    # The warm-up call also publishes pooled input. Capture the baseline before
+    # it can leave an input release pending on the independent ownership channel.
+    before = manager.snapshot()["allocated_bytes"]
     try:
         original_pid = pid()
-        before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
         monkeypatch.setattr(local._SingleSubprocessExecutor, "_decode_ref_bundle_result", pause_result)
         monkeypatch.setattr(first, "_wait_for_pending_futures", wait_after_cancel)
         table = pa.table({"x": [1]})
@@ -354,7 +357,12 @@ def test_graceful_cancel_retires_worker_with_late_stream_chunk(monkeypatch, back
             closing.result(timeout=10)
         assert pid() != original_pid
         assert nonzero(metrics) == {"cancelled_workers": 1}
-        assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+        # The replacement worker stays alive; its result can arrive before the
+        # input-release notification. Keep checking actual physical ownership.
+        with manager._cond:
+            assert manager._cond.wait_for(lambda: manager.snapshot()["allocated_bytes"] == before, timeout=10), (
+                manager.snapshot()
+            )
         if other_grant is not None:
             assert ref_bundle.local_shm_budget_manager().output_grant_pending(other_grant)
     finally:

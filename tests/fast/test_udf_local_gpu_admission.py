@@ -321,7 +321,10 @@ def test_byte_wait_has_no_device_execution_reservation(harness, monkeypatch, lim
         executor.close(kill=True)
         query.shutdown()
         ledger.close()
-    assert manager.snapshot()["usage_bytes"] == 0
+    # Closing this executor leaves the registered model alive. Its independent
+    # input-release channel may still be returning the last physical byte charge.
+    with manager._cond:
+        assert manager._cond.wait_for(lambda: manager.snapshot()["usage_bytes"] == 0, timeout=10), manager.snapshot()
 
 
 def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consumer_progress(harness, monkeypatch):
