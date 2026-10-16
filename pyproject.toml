@@ -69,6 +69,7 @@ doris = ["aiohttp>=3.14.3,<4"]
 milvus = ["pymilvus>=3.0.1,<4"]
 qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
+embedding_http = ["httpx>=0.27,<1", "pillow>=10.4"] # SGLang / vLLM HTTP clients, without local inference engines
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.73.0"] # floor preserves multimodal Content parts for Gemini Embedding 2
 typesafe = ["typesafe-sdk>=0.7.0,<0.8"] # validated AsyncTypeSafeClient System One API

@@ -104,6 +104,12 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
+    # SGLang / vLLM: choose a remote service explicitly instead of an engine.
+    runtime: Literal["native", "http"]
+    http_input_format: Literal["text", "multimodal"]
+    media_mime_types: list[str]
+    max_request_bytes: int
+
     # Remote embedding request batching (OpenAI and Google).
     request_batch_size: int
 
@@ -148,6 +154,27 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
+_HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
+    {
+        "runtime",
+        "base_url",
+        "timeout",
+        "http_input_format",
+        "media_mime_types",
+        "max_input_bytes",
+        "max_request_bytes",
+        "supports_overriding_dimensions",
+    }
+)
+
+
+def _inference_embed_options(options: Mapping[str, Any]) -> frozenset[str]:
+    runtime = options.get("runtime", "native")
+    if runtime not in ("native", "http"):
+        raise ValueError("Embed option 'runtime' must be 'native' or 'http'")
+    return _HTTP_EMBED_OPTIONS if runtime == "http" else _NATIVE_EMBED_OPTIONS | {"runtime"}
+
+
 _NATIVE_EMBED_OPTIONS = frozenset(
     {
         "max_concurrency_per_actor",
@@ -301,6 +328,8 @@ def validate_embed_options(
     _reject_sensitive_embed_options(copied)
     family = (provider_family or "").casefold()
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
+    if family in {"sglang", "vllm"}:
+        allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
     unknown = sorted(set(copied) - allowed)
@@ -329,6 +358,31 @@ def validate_embed_options(
 
     if "supports_overriding_dimensions" in copied and not isinstance(copied["supports_overriding_dimensions"], bool):
         raise ValueError("Embed option 'supports_overriding_dimensions' must be a bool")
+    if family in {"sglang", "vllm"} and copied.get("runtime") == "http":
+        _validate_base_url_option(copied, api="Embed")
+        if not copied.get("base_url") or urlsplit(copied["base_url"]).query:
+            raise ValueError("HTTP embedding requires an explicit base_url without query parameters")
+        if copied.get("http_input_format", "text") not in ("text", "multimodal"):
+            raise ValueError("http_input_format must be 'text' or 'multimodal'")
+        timeout = copied.get("timeout", 60.0)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("HTTP embedding timeout must be finite and positive")
+        for name in ("max_input_bytes", "max_request_bytes"):
+            _require_embed_int(copied, name, minimum=1)
+            if copied.get(name, 1) > 256 * 1024**2:
+                raise ValueError(f"HTTP embedding {name} must not exceed 256 MiB")
+        if copied.get("max_concurrency_per_actor", 4) > 1024:
+            raise ValueError("HTTP embedding max_concurrency_per_actor must not exceed 1024")
+        mime_types = copied.get("media_mime_types", [])
+        if not isinstance(mime_types, list) or any(not isinstance(value, str) for value in mime_types):
+            raise TypeError("media_mime_types must be a list of MIME type strings")
+        if mime_types and copied.get("http_input_format", "text") != "multimodal":
+            raise ValueError("media_mime_types requires http_input_format='multimodal'")
     if "input_type" in copied and copied["input_type"] not in ("query", "document"):
         raise ValueError("Embed option 'input_type' must be 'query' or 'document'")
     if "overlength" in copied and copied["overlength"] not in ("error", "truncate", "chunk_mean"):
@@ -423,7 +477,7 @@ def validate_embed_image_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _NATIVE_EMBED_OPTIONS
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -442,6 +496,8 @@ def validate_embed_audio_options(
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
+    if provider_family in {"vllm", "sglang"}:
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -475,7 +531,7 @@ def validate_embed_video_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _NATIVE_EMBED_OPTIONS
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)

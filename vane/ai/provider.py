@@ -65,7 +65,7 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
 
 
 _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
-    {"anthropic", "cosmos", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
+    {"anthropic", "cosmos", "embedding_http", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 

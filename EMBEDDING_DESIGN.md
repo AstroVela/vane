@@ -1,6 +1,8 @@
 # Unified embedding design and delivery roadmap
 
-Status: milestone 1 implemented; validation results are recorded in the PR. This document separates the target design
+Status: milestone 1 merged in #1024; milestone 2 implemented in #1026 against
+main. Validation results and runtime acceptance limits are recorded in each PR.
+This document separates the target design
 from capabilities delivered by each milestone. No compatibility aliases, model
 substitution, protocol guessing, or fallback transports are part of the design.
 
@@ -52,9 +54,10 @@ Context's development branch is not the mirror repository's default branch.
 | Context joint dispatch | `video_runtime.py`, `video_plan.py` | Migrate in milestone 3 |
 | SQL functions | `_sql.py`, `src/vane_py/ai_sql_functions.cpp` | Still active; consolidate in milestone 5 |
 
-The local SGLang batching/SHM experiments are evidence for later work, not an
-implemented standard provider. They depend on a specific runtime backport and
-must not be copied wholesale or described as stock-runtime support.
+The local SGLang batching/SHM experiments supplied transport evidence. Milestone
+2 now implements standard HTTP providers separately; SHM remains milestone 4.
+The experimental EmbeddingGemma 2 server uses a model backport, which must not
+be described as stock SGLang 0.5.17 model support.
 
 ## 3. Public input contract
 
@@ -235,6 +238,117 @@ audio support from the term OpenAI-compatible. See the
 [SGLang embedding API](https://docs.sglang.io/docs/basic_usage/openai_api_embeddings)
 and [vLLM embedding API](https://docs.vllm.ai/en/latest/models/pooling_models/embed/).
 
+### 6.1 Implemented SGLang / vLLM HTTP mode
+
+Install `vane-ai[embedding_http]` on clients and workers. HTTP execution reserves
+zero worker GPUs and imports neither inference runtime. Keep the inference
+service running independently. `runtime="native"` remains the default;
+`runtime="http"` requires an explicit `base_url`, served `model`, and output
+`dimensions`. The base URL includes the API prefix (usually `/v1`); the codec
+appends `/embeddings`. It does not discover endpoints or change formats on error.
+
+```python
+from vane.ai import MultimodalInput, TextInput, VideoInput, embed
+from vane.ai.providers.sglang import SGLangProvider
+
+# Set SGLANG_API_KEY in the application environment when authentication is needed.
+# The provider captures credentials before any subprocess/Ray serialization.
+provider = SGLangProvider()
+service = dict(
+    provider=provider,
+    model="served-multimodal-model",       # explicit deployed model identity
+    dimensions=768,                        # declared output size, checked on return
+    runtime="http",
+    base_url="http://localhost:30000/v1",
+    http_input_format="multimodal",
+    media_mime_types=["video/mp4"],          # formats enabled for this deployment
+    batch_size=8,                          # rows per Vane execution batch
+    request_batch_size=8,                  # maximum independent rows per HTTP request
+    max_concurrency_per_actor=4,
+    max_input_bytes=16 * 1024**2,           # original bytes per row, summed over parts
+    max_request_bytes=32 * 1024**2,         # entire serialized HTTP request
+    timeout=60.0,
+)
+documents = clips.select(
+    "clip_id",
+    embed(MultimodalInput([
+        VideoInput(vane.col("mp4_bytes"), mime_type="video/mp4"),
+        TextInput(vane.col("transcript")),
+    ]), **service).alias("vector"),
+)
+queries = questions.select(embed(TextInput(vane.col("query")), **service).alias("vector"))
+```
+
+`http_input_format="text"` (default) sends a batch of plain strings. Explicit
+`"multimodal"` applies the service's multimodal template even to text-only query
+rows, so query and document profile settings can stay paired. No retrieval
+instruction is inserted automatically. Deploy a matching model, processor and
+template on the server; declare supported media formats in `media_mime_types`.
+This declaration is an application contract, not model capability discovery.
+The server enforces its model's combinations, token counts and media limits.
+
+| Contract | SGLang 0.5.17 | vLLM 0.31 |
+| --- | --- | --- |
+| Text format | `input: [string, ...]` | `input: [string, ...]` |
+| Multimodal format | `input: [{text, image, video}, ...]` | `messages: [[{role, content}], ...]`, one conversation per row |
+| Encoded image | PNG / JPEG Base64 data URL | PNG / JPEG Base64 data URL |
+| Encoded video | MP4 / MOV / WebM / NUT Base64 data URL | MP4 / MOV / WebM / NUT Base64 data URL |
+| Encoded audio | Rejected before execution; embedding schema has no audio field | WAV / MP3 `input_audio`, raw Base64 plus format |
+| Decoded image | Lossless PNG when `image/png` is declared | Same |
+| Decoded video / PCM | Rejected; no implicit transcoding or resampling | Same |
+| Part cardinality/order | At most one nonempty text, image and video per row; named fields, ordering owned by server template | Ordered content parts, at most 16 per row |
+
+The pinned schemas are
+[SGLang EmbeddingRequest](https://github.com/sgl-project/sglang/blob/v0.5.17/python/sglang/srt/entrypoints/openai/protocol.py)
+and [vLLM EmbeddingBatchChatRequest](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/entrypoints/pooling/embed/protocol.py).
+These versions are wire targets, not promises that every model accepts every
+listed MIME type. In particular, SGLang's schema cannot carry two text parts;
+Context must explicitly assemble its ASR/subtitle/OCR text before embedding.
+An optional absent part is omitted; a second present part is never discarded.
+Both protocols require response indices to be a full permutation of input rows.
+
+```mermaid
+flowchart TD
+    A[Typed rows] --> B[Check declared formats, nonempty parts and combined raw bytes]
+    B --> C[Encode each row: original media bytes to Base64]
+    C --> D[Validate every row including complete JSON request overhead]
+    D --> E[Partition by request_batch_size and exact serialized byte count]
+    E --> F[Bounded async requests using one worker-owned HTTP client]
+    F --> G[Validate index permutation and each vector]
+    G --> H[Restore original input row order]
+```
+
+`max_input_bytes` defaults to 16 MiB per row; `max_request_bytes` defaults to
+32 MiB per request and includes Base64 expansion, Unicode/JSON escaping, model
+metadata, commas and all rows. Either byte limit can be set up to 256 MiB.
+All rows in the current Vane batch are validated before creating a client or
+issuing any request. Request packing reduces rows per request to stay within
+the limit. One oversized row raises `EmbeddingConfigurationError`, including
+with `on_error="ignore"`. Memory admission is per execution batch and per
+worker, not a shared global quota; total prepared media scales with `batch_size`
+and active workers. Request concurrency defaults to four per worker.
+
+Output `dimensions` is a declaration by default; set
+`supports_overriding_dimensions=True` only for a deployed model that accepts a
+dimension override. Responses are float vectors with exact length and finite
+values. Native engine/processor arguments are rejected in HTTP mode; configure
+them on the independently managed server.
+
+The existing request runner handles bounded retries, `Retry-After`, cancellation
+and row error attribution. With `on_error="ignore"`, genuine remote 400/413/422
+batch rejections may isolate smaller batches using the same codec and model;
+authentication/account failures and exhausted transient errors do not fan out.
+Local validation never enters this error policy. Cancellation drains the local
+HTTP tasks before executor cleanup; it is not an acknowledgement that remote GPU
+work has stopped. No shared-memory lease is involved in this transport.
+
+Use `SGLangProvider(api_key=...)` / `VLLMProvider(api_key=...)`, or the respective
+`SGLANG_API_KEY` / `VLLM_API_KEY` on the application, for optional bearer auth.
+Keys are captured and redacted like other provider descriptors. Workers do not
+read ambient OpenAI credentials or proxy settings; redirects are not followed.
+Serialized descriptors still contain the actual credential; use the existing
+trusted worker boundary.
+
 ## 7. Context channel processing and joins
 
 Context selects channels explicitly. This design does not add auto, priority or
@@ -349,18 +463,18 @@ PRs use the repository template and state limitations and dependencies.
 
 | Milestone | Deliverable | Acceptance | Status |
 | --- | --- | --- | --- |
-| 1 | Unified Python Embed, all four typed modalities, optional parts, Google joint/direct bytes; remove replaced APIs | Planning without I/O, bounded inputs, row/cardinality and lifecycle tests, real executor with local protocol fixtures, affected typing/examples | Implemented in this PR |
-| 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Planned |
+| 1 | Unified Python Embed, all four typed modalities, optional parts, Google joint/direct bytes; remove replaced APIs | Planning without I/O, bounded inputs, row/cardinality and lifecycle tests, real executor with local protocol fixtures, affected typing/examples | Merged in #1024 |
+| 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Implemented in #1026 against main; exact acceptance and model limits recorded in its validation |
 | 3 | Context uses unified Embed and explicit channel joins; remove independent joint execution | Single/batch/search, partial ASR/OCR failure, alignment without row multiplication, profile identity, restart/receipts | Planned; depends on 2 |
 | 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Planned; depends on 1 and 2 |
 | 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Planned after consumers migrate |
 | 6 | Frozen 100-video correctness and performance comparison | Same inputs/checkpoints/sampling, repeated warm runs, vector and provenance parity, request/queue/CPU/GPU breakdown | Planned after 3 and 4 |
 
-Milestone 1 does not claim SGLang HTTP, vLLM HTTP, Context partial-success
-migration, shared-memory service, or GPU throughput acceptance. Their worktrees
-and design do not imply implementation. Existing single-modality native paths
-continue through their actual provider contracts; multi-part unsupported
-providers fail explicitly.
+Milestone 2 adds HTTP transport, not Context migration, a shared-memory service,
+or a throughput result. Existing single-modality native paths continue through
+their actual provider contracts; unsupported multi-part native providers fail
+explicitly. Context integration and the frozen 100-video benchmark remain later
+milestones.
 
 Benchmark 6 compares encoded-video service decoding separately from already
 sampled identical-frame inputs. Original-video duration, clip count, selected
