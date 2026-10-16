@@ -18,7 +18,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import embed, embed_image, embed_video
+from vane.ai import ImageInput, VideoInput, embed
 
 REVISION = "787e0b996f5260a71ad474a283c90539a2e12986"
 VIDEO_SHA256 = "75ab52aa5868d866b9974b922bdf292b501d2e26a13396b5638a3c58058aae8a"
@@ -75,11 +75,11 @@ def test_video_file_to_joint_vector_retrieval(cosmos_assets, ray_local, monkeypa
             "1 + floor(i * (len(all_frames) - 1) / 7.0)::BIGINT)) AS frames FROM decoded",
             params=[video],
         )
-        result = clips.select(embed_video(vane.col("frames"), **options).alias("embedding"))
+        result = clips.select(embed(VideoInput(vane.col("frames")), **options).alias("embedding"))
         assert "ray_actor" in result.explain()
         video_vectors = np.asarray([row[0] for row in result.fetchall()], dtype=np.float32)
         images = clips.select(vane.SQLExpression("(frames[1]).data").alias("image"))
-        result = embed_image(images, vane.col("image"), **options)
+        result = embed(images, ImageInput(vane.col("image")), **options)
         assert "ray_actor" in result.explain()
         image_vectors = np.asarray(result.select("embedding").fetchall(), dtype=np.float32)[:, 0, :]
         conn.register("captions", pa.table({"id": range(len(CAPTIONS)), "text": CAPTIONS}))

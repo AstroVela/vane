@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import AudioInputSpec, embed, embed_audio
+from vane.ai import AudioInput, AudioInputSpec, embed
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai.functions import _EmbedAudioBatch
 from vane.ai.protocols import AudioEmbedderDescriptor
@@ -165,11 +165,11 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
         rel = conn.table("clips")
         options = dict(provider=provider, model=model, batch_size=2, max_retries=0)
         if entry == "expression":
-            result = rel.select(vane.col("id"), embed_audio(vane.col("audio"), **options).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(AudioInput(vane.col("audio")), **options).alias("embedding"))
         elif entry == "relation":
-            result = embed_audio(rel, vane.col("audio"), **options).select("id", "embedding")
+            result = embed(rel, AudioInput(vane.col("audio")), **options).select("id", "embedding")
         elif entry == "method":
-            result = rel.embed_audio(vane.col("audio"), **options).select("id", "embedding")
+            result = rel.embed(AudioInput(vane.col("audio")), **options).select("id", "embedding")
         else:
             result = conn.sql(
                 "SELECT id, ai_embed_audio(audio, provider => 'audio_fixture', "
@@ -226,7 +226,7 @@ def test_paired_clap_metadata_does_not_import_model_libraries(monkeypatch):
 
 def test_no_fallback_or_chunk_averaging(provider):
     with pytest.raises(ValueError, match="audio embedding provider"):
-        embed_audio(vane.col("audio"), provider="openai")
+        embed(AudioInput(vane.col("audio")), provider="openai")
     with pytest.raises(ValueError, match="requires model"):
         TransformersProvider().get_audio_embedder("unknown")
     with pytest.raises(ValueError, match="512"):

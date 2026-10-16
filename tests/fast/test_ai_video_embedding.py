@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import embed, embed_video
+from vane.ai import VideoInput, embed
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._video_embedding import VideoInputSpec, video_clips_from_arrow
 from vane.ai.functions import _EmbedVideoBatch
@@ -226,15 +226,15 @@ def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
         rel = conn.table("clips")
         opts = dict(provider=provider, batch_size=2, max_retries=0)
         if entry == "expression":
-            result = rel.select(vane.col("id"), embed_video(vane.col("frames"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(VideoInput(vane.col("frames")), **opts).alias("embedding"))
         elif entry == "keyword":
-            result = rel.select(vane.col("id"), embed_video(frames=vane.col("frames"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(input=VideoInput(vane.col("frames")), **opts).alias("embedding"))
         elif entry == "relation":
-            result = embed_video(rel, vane.col("frames"), **opts)
+            result = embed(rel, VideoInput(vane.col("frames")), **opts)
         elif entry == "relation_keyword":
-            result = embed_video(rel=rel, frames=vane.col("frames"), **opts)
+            result = embed(rel=rel, input=VideoInput(vane.col("frames")), **opts)
         elif entry == "method":
-            result = rel.embed_video(vane.col("frames"), **opts)
+            result = rel.embed(VideoInput(vane.col("frames")), **opts)
         else:
             result = conn.sql(
                 "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
@@ -272,7 +272,8 @@ def test_assembled_clip_fields_are_case_insensitive(request, provider, monkeypat
             )
         else:
             result = rel.select(
-                vane.col("id"), embed_video(vane.col("frames"), provider=provider, batch_size=2).alias("embedding")
+                vane.col("id"),
+                embed(VideoInput(vane.col("frames")), provider=provider, batch_size=2).alias("embedding"),
             )
         if runner == "ray":
             assert "ray_actor" in result.explain()
@@ -315,8 +316,8 @@ def test_all_null_clip_columns_execute_without_loading_models(
         else:
             result = conn.table("clips").select(
                 vane.col("id"),
-                embed_video(
-                    vane.col("frames"),
+                embed(
+                    VideoInput(vane.col("frames")),
                     provider=provider,
                     model="must_not_load",
                     on_error=on_error,
@@ -356,7 +357,7 @@ def test_sql_and_expression_reject_untyped_or_undecoded_inputs(provider, value):
             conn.sql(f"SELECT ai_embed_video({value}, provider => 'video_fixture')").fetchall()
         rel = conn.sql(f"SELECT {value} AS frames")
         with pytest.raises(Exception, match="LIST of frame records"):
-            rel.select(embed_video(vane.col("frames"), provider=provider)).fetchall()
+            rel.select(embed(VideoInput(vane.col("frames")), provider=provider)).fetchall()
 
 
 COSMOS_OPTIONS = dict(revision="a" * 40, trust_remote_code=True, device="cuda", dtype="float16")
@@ -405,7 +406,7 @@ def test_cosmos_rejects_unsupported_model_configuration(override):
 
 def test_no_provider_or_model_fallback():
     with pytest.raises(ValueError, match="video embedding provider"):
-        embed_video(vane.col("frames"), provider="openai")
+        embed(VideoInput(vane.col("frames")), provider="openai")
     with pytest.raises(ValueError, match="requires model"):
         TransformersProvider().get_video_embedder("sentence-transformers/all-MiniLM-L6-v2")
     with pytest.raises(ValueError, match="exactly 256"):
@@ -440,7 +441,7 @@ def test_default_ray_transports_ordered_nested_images(ray_local, provider, monke
                 "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
             )
         else:
-            result = conn.table("clips").embed_video(vane.col("frames"), provider=provider, batch_size=2)
+            result = conn.table("clips").embed(VideoInput(vane.col("frames")), provider=provider, batch_size=2)
         assert "ray_actor" in result.explain()
         assert result.select("id", "embedding").order("id").fetchall() == [
             (0, None),

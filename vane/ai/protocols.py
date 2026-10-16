@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from vane._image import Image
     from vane.ai._audio_embedding import AudioClip, AudioInputSpec
+    from vane.ai._embedding_content import EmbeddingContent, MultimodalInputSpec
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.typing import Embedding
 
@@ -134,6 +135,28 @@ class AudioEmbedderDescriptor(Descriptor["AudioEmbedder"]):
 
     def is_async(self) -> bool:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Multimodal embedding
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class MultimodalEmbedder(Protocol):
+    """One ordered set of parts per row, one vector per row."""
+
+    def embed_multimodal(self, inputs: list[EmbeddingContent]) -> list[Embedding] | Awaitable[list[Embedding]]: ...
+
+
+class MultimodalEmbedderDescriptor(Descriptor["MultimodalEmbedder"]):
+    """Model/protocol capabilities without network access or loading weights."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int: ...
+
+    @abstractmethod
+    def get_input_spec(self) -> MultimodalInputSpec: ...
 
 
 # ---------------------------------------------------------------------------

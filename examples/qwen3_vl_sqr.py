@@ -27,7 +27,7 @@ video embedding through the regular vane.ai APIs, with one fixed contract:
   at most 65536 pixels per frame;
 * videos with an even 2..64 ordered frames, at most 8 MiB decoded pixels per
   clip, and distinct increasing nonnegative microsecond timestamps. Input video
-  rows use the existing embed_video LIST of {frame_index, frame_time, data IMAGE}.
+  rows use the embed(VideoInput(...)) LIST of {frame_index, frame_time, data IMAGE}.
 
 Model dimensions, tokenizer vocabulary, saved embedding rows, vision patch
 configuration and weight-loading results are checked before inference. The

@@ -145,54 +145,6 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     dtype: Literal["float32", "float16"]
 
 
-class EmbedImageOptions(MultimodalEmbedOptions, total=False):
-    """Closed image embedding options; decoding belongs to the IMAGE pipeline."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-    dtype: Literal["float32", "float16"]
-
-
-class EmbedAudioOptions(TypedDict, total=False):
-    """Execution and model loading options for bounded decoded audio clips."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    max_concurrency_per_actor: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-
-
-class EmbedVideoOptions(MultimodalEmbedOptions, total=False):
-    """Ordered decoded clips; temporal sampling is explicit upstream work."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-    dtype: Literal["float32", "float16"]
-
-
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
