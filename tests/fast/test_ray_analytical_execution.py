@@ -309,7 +309,15 @@ def test_large_broadcast_uses_per_query_worker_budget(tmp_path, monkeypatch, mod
 
     if mode == "fte_retry":
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
-    limits = resources(tmp_path, max_active_queries=slots, task_contexts_per_worker=64, io_concurrency=256)
+    # The shuffle control has eight remote link endpoints on one worker.
+    # Full-size frames need 42 MiB of Flight staging with the 16-frame window.
+    limits = resources(
+        tmp_path,
+        max_active_queries=slots,
+        task_contexts_per_worker=64,
+        io_concurrency=256,
+        staging_buffer_bytes=64 << 20,
+    )
     limits = replace(
         limits,
         exchange=DirectExchangeLimits(),

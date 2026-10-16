@@ -43,12 +43,36 @@ string InputError(const std::map<string, vector<DirectInput>> &inputs) {
 	return string();
 }
 
+// A publication starts two readers to overlap scheduling with native work.
+// Successful readers hand off to another waiter for queued frames.
+void WakeSource(const shared_ptr<StateWithBlockableTasks> &waiters, idx_t count = 1) {
+	for (idx_t i = 0; i < count; i++) {
+		InterruptState task;
+		{
+			auto guard = waiters->Lock();
+			if (!waiters->TakeBlockedTask(guard, task)) {
+				return;
+			}
+		}
+		task.Callback();
+	}
+}
+
+ExchangeWakeup SourceWakeup(const shared_ptr<StateWithBlockableTasks> &waiters) {
+	return [waiters]() {
+		WakeSource(waiters, 2);
+	};
+}
+
 class DirectSourceState : public GlobalSourceState {
 public:
 	idx_t MaxThreads() override {
 		return NumericLimits<idx_t>::Maximum();
 	}
 	idx_t cursor = 0;
+	StateWithBlockableTasks &GetBlockingState() override {
+		return *waiters;
+	}
 	shared_ptr<StateWithBlockableTasks> waiters = make_shared_ptr<StateWithBlockableTasks>();
 };
 
@@ -95,29 +119,44 @@ public:
 		}
 		blocked->store(false);
 		auto &state = input.global_state.Cast<DirectSourceState>();
-		auto guard = state.waiters->Lock();
-		idx_t ended = 0;
-		for (idx_t step = 0; step < inputs.size(); step++) {
-			auto index = (state.cursor + step) % inputs.size();
-			// EOF and consumer closure do not freeze the channel's error state.
-			// Poll checks persistent errors before returning either terminal value.
-			shared_ptr<DirectBatch> batch;
-			auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, Wakeup(state.waiters));
-			if (result == DirectRead::DATA) {
-				state.cursor = (index + 1) % inputs.size();
-				// Replacing vector references can return upstream credit. Do not
-				// run another operator's callback under this waiter lock.
-				guard.unlock();
-				batch->Reference(chunk);
-				return SourceResultType::HAVE_MORE_OUTPUT;
+		try {
+			auto guard = state.waiters->Lock();
+			if (!state.waiters->CanBlock(guard)) {
+				return SourceResultType::FINISHED;
 			}
-			ended += result == DirectRead::END || result == DirectRead::CLOSED;
+			idx_t ended = 0;
+			for (idx_t step = 0; step < inputs.size(); step++) {
+				auto index = (state.cursor + step) % inputs.size();
+				// EOF and consumer closure do not freeze the channel's error state.
+				// Poll checks persistent errors before returning either terminal value.
+				shared_ptr<DirectBatch> batch;
+				auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, SourceWakeup(state.waiters));
+				if (result == DirectRead::DATA) {
+					state.cursor = (index + 1) % inputs.size();
+					// Poll consumes the channel callback. Pass the wakeup on before
+					// running operators that can block on downstream credit.
+					guard.unlock();
+					WakeSource(state.waiters);
+					// Replacing references can return upstream credit and invoke
+					// another operator's callback; keep it outside the waiter lock.
+					batch->Reference(chunk);
+					return SourceResultType::HAVE_MORE_OUTPUT;
+				}
+				ended += result == DirectRead::END || result == DirectRead::CLOSED;
+			}
+			blocked->store(ended != inputs.size());
+			if (ended == inputs.size()) {
+				guard.unlock();
+				Wakeup(state.waiters)();
+				return SourceResultType::FINISHED;
+			}
+			// Register under the same lock used by publication callbacks. An
+			// event between Poll and registration must observe this waiter.
+			return state.waiters->BlockSource(guard, input.interrupt_state);
+		} catch (...) {
+			Wakeup(state.waiters)();
+			throw;
 		}
-		blocked->store(ended != inputs.size());
-		// A channel owns one consumer callback; multiplex all native tasks
-		// behind it and register before a concurrent publisher can wake them.
-		return ended == inputs.size() ? SourceResultType::FINISHED
-		                              : state.waiters->BlockSource(guard, input.interrupt_state);
 	}
 	const vector<DirectInput> inputs;
 	shared_ptr<atomic<bool>> blocked;

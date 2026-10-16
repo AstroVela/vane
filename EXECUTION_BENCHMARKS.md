@@ -2210,3 +2210,92 @@ before temporary/spill cleanup; oracle hashes are retained before deletion,
 source inputs are preserved and disk guards remain untriggered. Formatting,
 applicable pre-commit hooks, copyleft and diff checks pass. The full release,
 fast and all-query suites are not rerun, following the related-test scope.
+
+
+## Bounded source wakeups (2026-10-16)
+
+The frozen baseline is `75c3954c5e`. A separate instrumented Q9 run shows
+67,108 empty source polls returning BLOCKED for 17,138 consumed frames:
+each publication wakes the entire source task group, which competes for
+the source lock before most tasks block again. The accepted implementation
+wakes at most two readers per publication. A reader that obtains a frame
+hands off to one more waiter before running downstream operators, so
+queued frames can use more readers even without another publication.
+Completion and errors wake the whole group. The source's shared waiter
+state also participates in early pipeline termination. If a forced
+coalescer flush blocks on sink credit after registering an input wait,
+the executor drains the source waiters before yielding, preventing an
+obsolete input registration from consuming a later publication callback.
+
+With the accepted implementation, a separate Q9 diagnostic records
+24,313 source BLOCKED returns for 16,988 frames, **63.8% fewer blocked
+polls**. Coalescing changes frame counts; result schemas, row counts and
+values still match. Aggregate source-lock acquisition wall time falls
+from 3.738 to 1.385 seconds across all source tasks. These instrumented
+times overlap across threads and cannot be added to query latency. The
+source callback's task-wakeup counter excludes the executor's new
+coalescer/termination wakeups, so it is not used to claim a reduction in
+total scheduler wakeups. Probes are removed before restoring the accepted
+production build; diagnostic runs are excluded from latency medians.
+
+Only Q9/Q18 are timed, in baseline/candidate then candidate/baseline order,
+with three samples per query/mode/runtime in each round. Driver, installed
+Python, SF10 input hashes and declared resources match: local 36 threads/
+32 GiB; two pipelined 18-CPU workers, two partitions and 16 GiB operator
+memory per worker; 64 KiB/2048-row frames, 1 MiB/16-slot channels, 128 MiB
+exchange and 256 MiB staging per worker, and a 1 GiB Ray object store.
+Both builds use the sixteen-frame Flight window and 5.25 MiB staging per
+remote link. Ray's automatically reported available host memory varies
+by about 0.14 GiB; declared operator limits remain fixed. Timings include
+submission, collection and successful close, excluding startup/comparison.
+The shared host has warm OS caches; no task-owned build/test/diagnostic
+overlaps a measured comparison window.
+
+| Query, median of six | Baseline local, seconds | Baseline pipelined | Candidate local | Candidate pipelined | Pipelined change | Candidate / local |
+|---|---:|---:|---:|---:|---:|---:|
+| Q9 | 0.866 | 1.501 | 0.861 | 1.430 | -4.7% | 1.66 |
+| Q18 | 0.691 | 1.064 | 0.712 | 1.070 | +0.6% | 1.50 |
+
+Q9 improves in both rounds, from 1.497 to 1.392 seconds and from 1.506 to
+1.460 seconds; its combined local control changes by -0.6%. Q18 has no
+established latency improvement. All **48 comparison samples**, including
+**24 on the accepted candidate**, match local schema, row counts and
+values with relative/absolute floating tolerances 1e-9/1e-6. These results
+do not establish local parity, an all-query total or large-query FTE
+performance. A one-reader publication variant had inconsistent Q9 gains
+and a 2.6% Q18 slowdown; it is rejected and its measurements are retained
+separately, as are preliminary and screening runs.
+
+The incremental non-editable Release build (`vane-ai 0.3.0.dev114`) passes
+**215 related native exchange/Flight tests** and **18 real-Ray tests**.
+New regressions exercise sparse-frame wakeup bounds, queued-frame handoff,
+coalescer input-to-output blocking, normal completion, failure and early
+sink termination at 4/16 threads. The sparse-frame wakeup check fails on
+the frozen baseline as expected: one frame produces 16 new blocked polls
+instead of at most three. Ray covers public/empty results, backpressure/
+early close, worker/result-process loss, staging/I/O admission rollback,
+interrupt/delivery timeout, HASH/Parquet routing, pipelined/FTE shared-input
+retry, budgeted broadcast and retained client views. The broadcast budget
+test explicitly reserves 64 MiB staging: its eight remote endpoints need
+42 MiB with the previously introduced sixteen-frame window, exceeding
+the fixture's 32 MiB default. Production capacities and rejection of
+insufficient budgets are unchanged.
+
+Native SHA-256 identities, baseline and accepted candidate:
+
+- `0972960bda0376fc02b514419cfa834e79120260cbbeb84b6236617adb3ef365`
+- `9fce9b0c9f764f9cc5a0ae9b4eb4aa1bd9031ba128a1da633de8ece6dbc8a981`
+
+The accepted DuckDB SourceID is
+`ff00fa7d41e2817abdc7e24a48081472f2a351f8`. Evidence is retained under
+`build/pipelined-wakeup-20261015/`: frozen runtime/source/configuration/input
+identities, raw samples, separate diagnostic patches and metrics,
+`pair-comparison.json`, `pair-local-vs-pipelined.csv`, test logs and cleanup
+manifests. The `pair-*` artifacts identify the accepted two-reader variant;
+the earlier `candidate-*` and `comparison.json` describe the rejected
+one-reader variant. All measured query/worker/result reservations return
+to zero. Owned processes stop before temporary/spill cleanup; oracle
+hashes are retained before deletion, source inputs are preserved and disk
+guards remain untriggered. Formatting, applicable pre-commit hooks,
+copyleft and diff checks pass. Only related tests and queries are run;
+the full release, fast and all-query suites are not repeated.

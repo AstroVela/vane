@@ -701,6 +701,8 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 
+并行 source 的每次数据通知最多唤醒两个等待任务，以重叠调度与原生计算；取到帧的任务在执行下游算子前继续唤醒一个同伴，使积压帧仍可并行处理，且不依赖下一次发布通知。全部输入结束或读取失败时唤醒整组任务。source 使用可被通道回调持有的共享等待状态；pipeline 提前停止时通过 `GlobalSourceState::GetBlockingState()` 禁止该状态继续阻塞并唤醒全部等待者，避免 LIMIT 或下游关闭留下休眠任务。状态检查与等待注册仍在同一把锁内完成，回调不持有裸 pipeline 指针。输入阻塞后的强制 coalescer flush 若又因输出额度阻塞，执行器先清空并唤醒 source 等待组，再由 sink 额度控制重试，避免同一任务的旧输入回调占用后续单次通知。该调整不改变帧大小、通道容量、Flight 窗口或 sink 的额度唤醒规则。
+
 并行 sink 任务按目标 channel 共享等待队列，序号分配、发布和等待注册在该队列的锁内完成。不同目标可以并行复制和发布，归还一个目标的额度只唤醒等待该目标的任务。同一生产者成功写入较小帧时，仍须保留其他任务为较大帧注册的回调；直到额度归还、关闭或取消触发通知，不能因这次成功写入而删除回调。
 
 [direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。已读到 EOF 或已关闭的输入仍参加后续轮询，Poll 始终先检查持久错误，不缓存永久结束状态。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。每次计算目标帧大小前先检查通道错误和消费者；已无消费者的目标直接丢弃剩余行，不因该分区的超大行取消其他分区。仍有消费者的目标继续执行帧容量限制，通道错误始终传播。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 在发送 FINISH 前检查全部输入通道的持久错误，避免 sink 提前停止绕过下一次 source 轮询；控制结果为空，不收集 fragment 数据，也不等待消费者。

@@ -144,6 +144,12 @@ public:
 		return 1;
 	}
 
+	//! Sources whose callbacks outlive the pipeline can own a separate shared waiter state.
+	//! Early pipeline termination must disable and wake that same state.
+	virtual StateWithBlockableTasks &GetBlockingState() {
+		return *this;
+	}
+
 	template <class TARGET>
 	TARGET &Cast() {
 		DynamicCastCheck<TARGET>(this);

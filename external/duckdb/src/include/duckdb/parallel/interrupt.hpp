@@ -109,6 +109,17 @@ public:
 		return true;
 	}
 
+	//! Take one waiter for a single unit of source work; terminal events still drain all waiters.
+	bool TakeBlockedTask(const unique_lock<mutex> &guard, InterruptState &task) {
+		VerifyLock(guard);
+		if (blocked_tasks.empty()) {
+			return false;
+		}
+		task = blocked_tasks.back();
+		blocked_tasks.pop_back();
+		return true;
+	}
+
 	vector<InterruptState> TakeBlockedTasks(const unique_lock<mutex> &guard) {
 		VerifyLock(guard);
 		vector<InterruptState> result;
