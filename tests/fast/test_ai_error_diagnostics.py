@@ -13,6 +13,25 @@ from vane.ai import DiagnosticError, summarize_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
 
 
+def onnx_allocation_error(kind="Fail", *, initialize=False, wrapped=False):
+    status = "1 : FAIL" if kind == "Fail" else "6 : RUNTIME_EXCEPTION"
+    operation = (
+        "Exception during initialization: "
+        if initialize
+        else "Non-zero status code returned while running Conv node. Name:'private-node' Status Message: "
+    )
+    error = type(kind, (Exception,), {})(
+        f"[ONNXRuntimeError] : {status} : {operation}"
+        "/private/build/bfc_arena.cc:360 void* onnxruntime::BFCArena::AllocateRawInternal"
+        "(size_t, bool, onnxruntime::Stream*) Failed to allocate memory for requested buffer of size 1073741824"
+    )
+    if wrapped:
+        outer = type("ONNXRuntimeError", (Exception,), {})("private traceback with credentials")
+        outer.__context__ = error
+        return outer
+    return error
+
+
 def native_error(error, envelope="native_json"):
     from vane._native import InvalidInputException
 
@@ -87,6 +106,9 @@ def test_spawn_diagnostic_requires_complete_typed_native_envelopes(invalid):
         ),
         (RuntimeError("CUDA out of memory. private request content"), "CUDA memory allocation failed"),
         (RuntimeError("CUDA failed with error out of memory"), "CUDA memory allocation failed"),
+        (onnx_allocation_error(), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error("RuntimeException", initialize=True), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error(wrapped=True), "ONNX Runtime memory allocation failed"),
         (
             RuntimeError(
                 "[enforce fail at /private/build/alloc_cpu.cpp:127] err == 0. "
@@ -133,6 +155,27 @@ def test_cpu_allocator_summary_rejects_unrecognized_messages(message):
 )
 def test_ctranslate_summary_accepts_only_the_allocation_error(message):
     assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize("kind", ["Fail", "RuntimeException"])
+@pytest.mark.parametrize("change", ["prefix", "suffix", "node_text", "allocator", "size"])
+def test_onnx_summary_requires_an_allocator_failure(kind, change):
+    error = onnx_allocation_error(kind)
+    message = str(error)
+    message = {
+        "prefix": "private text " + message,
+        "suffix": message + " private text",
+        "node_text": "[ONNXRuntimeError] : 1 : FAIL : private input mentions Failed to allocate memory",
+        "allocator": message.replace("Failed to allocate memory", "Invalid argument"),
+        "size": message.replace("1073741824", "private input"),
+    }[change]
+    assert summarize_error(type(error)(message)) == kind
+
+
+@pytest.mark.parametrize("kind", ["RuntimeError", "ONNXRuntimeError"])
+def test_onnx_traceback_text_without_a_typed_cause_is_not_decoded(kind):
+    error = type(kind, (Exception,), {})(str(onnx_allocation_error()))
+    assert summarize_error(error) == kind
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux address-space limit")

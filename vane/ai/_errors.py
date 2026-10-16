@@ -55,6 +55,15 @@ _CPU_MEMORY = re.compile(
     r"Error code [0-9]{1,10} \([^\r\n)]{1,128}\)"
 )
 _CPU_MEMORY_DETAIL = "CPU memory allocation failed; check model and worker CPU memory budgets"
+_ONNX_MEMORY = re.compile(
+    r"\[ONNXRuntimeError\] : (?:1 : FAIL|6 : RUNTIME_EXCEPTION) : "
+    r"(?:Non-zero status code returned while running [A-Za-z_][A-Za-z_0-9]{0,127} node\. ?"
+    r"Name:'[^\r\n]{0,2048}' Status Message: |Exception during initialization: )"
+    r"[^\r\n]{0,2048}bfc_arena\.cc:[0-9]{1,8} "
+    r"(?:void\* )?onnxruntime::BFCArena::AllocateRawInternal(?:\([^()\r\n]{0,512}\))? "
+    r"Failed to allocate memory for requested buffer of size [0-9]{1,20}"
+)
+_ONNX_MEMORY_DETAIL = "ONNX Runtime memory allocation failed; check model and worker memory budgets"
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
@@ -177,6 +186,12 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
             return f"insufficient GPU KV-cache memory; mem_fraction_static={match[1]}, required above {match[2]}"
     if error_type in {"OutOfMemoryError", "OutOfMemoryException", "MemoryError"}:
         return "memory allocation failed; check model and worker memory budgets"
+    # RapidOCR keeps the typed ONNX exception in its cause/context chain. Read
+    # that allocator error, never the wrapper's arbitrary traceback string.
+    if error_type in {"Fail", "RuntimeException"} and (
+        _ONNX_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_ONNX_MEMORY_DETAIL)
+    ):
+        return _ONNX_MEMORY_DETAIL
     if error_type == "RuntimeError":
         if _CPU_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_CPU_MEMORY_DETAIL):
             return _CPU_MEMORY_DETAIL
