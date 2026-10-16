@@ -86,6 +86,7 @@ def test_spawn_diagnostic_requires_complete_typed_native_envelopes(invalid):
             "mem_fraction_static=0.3, required above 0.346",
         ),
         (RuntimeError("CUDA out of memory. private request content"), "CUDA memory allocation failed"),
+        (RuntimeError("CUDA failed with error out of memory"), "CUDA memory allocation failed"),
         (
             RuntimeError(
                 "[enforce fail at /private/build/alloc_cpu.cpp:127] err == 0. "
@@ -119,6 +120,18 @@ def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, e
     ],
 )
 def test_cpu_allocator_summary_rejects_unrecognized_messages(message):
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA failed with error invalid argument",
+        "private input mentions CUDA failed with error out of memory",
+        "CUDA failed with error out of memory private input",
+    ],
+)
+def test_ctranslate_summary_accepts_only_the_allocation_error(message):
     assert summarize_error(RuntimeError(message)) == "RuntimeError"
 
 
