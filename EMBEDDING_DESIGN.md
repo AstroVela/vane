@@ -533,7 +533,10 @@ never replaced automatically, including after an ungraceful exit.
 The producer closes its FD after transfer. A receiver-held FD/mapping remains
 valid if the producer exits. Disconnect before publication releases admission;
 a producer that never publishes is bounded by `publication_timeout`. After
-mapping, a disconnected/cancelled request drains its model coroutine before
+acquisition, admission ownership is recorded before joining its watcher tasks.
+Repeated handler cancellation cannot skip returning credits, including while
+cleanup is waiting for the admission lock. After mapping, a disconnected/cancelled
+request drains its model coroutine before
 unmapping and returning credits. A stuck model consequently retains credits;
 timeout is not proof that reading stopped. Graceful shutdown drains requests
 then shuts down the engine. Kernel reference counting reclaims anonymous buffers
@@ -548,8 +551,12 @@ native adapter also measures local processor preparation time; vLLM processing
 inside its engine remains included in model time. These counters do not claim
 GPU kernel timing or a zero-copy path. Input/configuration errors and model/host
 OOM are fatal even with `on_error="ignore"`; other provider failures may yield
-NULL. Service requests are never retried after uncertain completion, even when
-the surrounding pipeline has a retry count configured.
+NULL. The public Embed wrappers preserve allocation failures from initialization,
+inference and vector conversion; they do not isolate/replay rows or substitute
+NULL for these failures. The service client never retries an individual request
+after uncertain completion, even when Embed's `max_retries` is configured.
+Ray's enclosing task/fragment retry policy is independent and may start a new
+request; exhausting those attempts still aborts the query on a resource error.
 
 ## 9. Errors, observability and cleanup
 

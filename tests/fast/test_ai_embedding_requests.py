@@ -61,6 +61,34 @@ def _drive(wrapper, texts):
         loop.close()
 
 
+@pytest.mark.parametrize("phase", ["initialization", "batch", "isolation", "conversion"])
+def test_embedding_memory_errors_are_not_wrapped_or_ignored(phase):
+    calls = []
+
+    class AllocatingVector:
+        def __array__(self, *args, **kwargs):
+            raise MemoryError("allocation failed")
+
+    async def request(texts):
+        calls.append(texts)
+        if phase == "conversion":
+            return [AllocatingVector() for _ in texts]
+        if phase == "isolation" and len(texts) > 1:
+            raise RuntimeError("isolate a row-level failure")
+        raise MemoryError("allocation failed")
+
+    wrapper = _wrapper(SimpleNamespace(embed_text=request), on_error="ignore")
+    if phase == "initialization":
+
+        def instantiate():
+            raise MemoryError("allocation failed")
+
+        wrapper._descriptor.instantiate = instantiate
+    with pytest.raises(MemoryError):
+        _drive(wrapper, ["first", "second"])
+    assert len(calls) == {"initialization": 0, "batch": 1, "isolation": 2, "conversion": 1}[phase]
+
+
 def test_bounded_requests_restore_order_without_replaying_success():
     from vane.ai.functions import RetryAfterError
 

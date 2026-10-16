@@ -47,10 +47,17 @@ class _Credits:
             self.inflight += 1
 
     async def release(self, size: int) -> None:
-        async with self.condition:
-            self.bytes -= size
-            self.inflight -= 1
-            self.condition.notify_all()
+        # Returning an owned reservation is mandatory cleanup. Repeated handler
+        # cancellation must not interrupt waiting for the condition lock.
+        while True:
+            try:
+                async with self.condition:
+                    self.bytes -= size
+                    self.inflight -= 1
+                    self.condition.notify_all()
+                return
+            except asyncio.CancelledError:
+                continue
 
 
 class EmbeddingService:
@@ -219,10 +226,13 @@ class EmbeddingService:
             finally:
                 if not admission.done():
                     admission.cancel()
+                elif not admission.cancelled() and admission.exception() is None:
+                    # Acquisition has no suspension after charging credits.
+                    # Adopt them before the next await so another cancellation
+                    # cannot strand a completed admission outside cleanup.
+                    reserved = size
                 disconnected.cancel()
                 await asyncio.gather(admission, disconnected, return_exceptions=True)
-                if not admission.cancelled() and admission.exception() is None:
-                    reserved = size
             if not reserved:
                 if not admission.cancelled():
                     admission.result()

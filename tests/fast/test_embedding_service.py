@@ -508,6 +508,84 @@ def check_public_embed(process, family, backend):
     asyncio.run(until(lambda: state(root).get("calls") == 2 and state(root).get("inflight") == 0))
 
 
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_public_embed_resource_failures_abort_without_retry(process, family, backend):
+    check_public_resource_failure(process, family, backend)
+
+
+@pytest.mark.real_ray
+@pytest.mark.ray_cluster_owner
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("backend", ["ray_task", "ray_actor"])
+def test_public_embed_resource_failures_abort_on_ray(process, monkeypatch, family, backend):
+    import ray
+
+    import vane
+
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    try:
+        ray.init(address="local", num_cpus=3, include_dashboard=False)
+        check_public_resource_failure(process, family, backend)
+    finally:
+        vane.teardown_runner()
+        ray.shutdown()
+
+
+def check_public_resource_failure(process, family, backend):
+    import pyarrow as pa
+
+    import vane
+    from vane.ai import MultimodalInput, TextInput
+
+    proc, root = process(family)
+    asyncio.run(until(lambda: (root / "ready").exists() or proc.poll() is not None))
+    assert proc.poll() is None
+
+    def query(joint=False):
+        inputs = TextInput(vane.col("text"))
+        if joint:
+            inputs = MultimodalInput([inputs])
+        with vane.connect() as connection:
+            return (
+                connection.from_arrow(pa.table({"text": ["query"]}))
+                .embed(
+                    inputs,
+                    provider=family,
+                    model="fixture",
+                    dimensions=2,
+                    runtime="service",
+                    service_path=str(root / "engine.sock"),
+                    service_id="fixture-v1",
+                    execution_backend=backend,
+                    on_error="ignore",
+                    max_retries=3,
+                    output_column="vector",
+                    normalize=False,
+                )
+                .select("vector")
+                .fetchall()
+            )
+
+    (root / "memory_error").touch()
+    for joint in (False, True):
+        with pytest.raises(Exception, match="MemoryError|resources") as failure:
+            query(joint)
+        assert "private model" not in str(failure.value)
+    (root / "memory_error").unlink()
+    (root / "execution_error").touch()
+    assert query() == [(None,)]
+    (root / "execution_error").unlink()
+    assert query() == [((3, 4),)]
+    # Ray's existing fragment policy attempts a failed UDF four times. The
+    # service client must not multiply those attempts by max_retries=3.
+    failed_attempts = 4 if backend.startswith("ray_") else 1
+    expected_calls = 2 * failed_attempts + 2
+    asyncio.run(until(lambda: state(root).get("calls") == expected_calls and state(root).get("inflight") == 0))
+    assert state(root)["engines"] == 1
+
+
 @pytest.mark.parametrize("failure", ["memory", "torch", "wrapped", "cpu", "wrapped_cpu", "execution"])
 def test_resource_failures_remain_fatal_with_ignore(tmp_path, monkeypatch, failure):
     from vane.ai import DiagnosticError
@@ -602,6 +680,96 @@ def test_handler_cancellation_joins_processor_before_unmapping(tmp_path, monkeyp
         finally:
             release.set()
             await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["queued", "handoff", "release"])
+@pytest.mark.parametrize("kind", ["text", "video"])
+def test_repeated_handler_cancellation_returns_admission_credits(tmp_path, monkeypatch, phase, kind):
+    state = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = EmbeddingService(
+        path=str(root / "engine.sock"),
+        service_id="fixture-v1",
+        family="sglang",
+        model="fixture",
+        dimensions=2,
+        options={"gpus_per_actor": 0},
+        max_inflight=1,
+    )
+
+    async def run():
+        await service.start()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        locked = False
+        try:
+            if phase != "release":
+                await service.credits.condition.acquire()
+                locked = True
+            await asyncio.get_running_loop().sock_connect(sock, service.path)
+            value = content() if kind == "text" else content("video", video())
+            parts, _, size = ipc.describe(value, service.spec)
+            await ipc.send(
+                sock,
+                {
+                    "version": 1,
+                    "service_id": "fixture-v1",
+                    "family": "sglang",
+                    "model": "fixture",
+                    "dimensions": 2,
+                    "request_id": "0" * 32,
+                    "parts": parts,
+                    "nbytes": size,
+                },
+            )
+            if phase == "release":
+                assert (await ipc.control(sock))["state"] == "reserved"
+                await service.credits.condition.acquire()
+                locked = True
+            else:
+                await until(
+                    lambda: any(
+                        getattr(task.get_coro(), "__qualname__", "") == "_Credits.acquire"
+                        for task in asyncio.all_tasks()
+                    )
+                )
+            handler = next(iter(service._tasks))
+            loop = asyncio.get_running_loop()
+            if phase == "handoff":
+                service.credits.condition.release()
+                locked = False
+                # First cancel races with completed admission; the second
+                # interrupts joining the cancelled disconnect watcher.
+                loop.call_soon(handler.cancel)
+                loop.call_soon(lambda: loop.call_soon(handler.cancel))
+                await asyncio.wait_for(ipc.control(sock), 3)
+            else:
+                handler.cancel()
+                await asyncio.wait_for(ipc.control(sock), 3)
+                handler.cancel()
+                await asyncio.sleep(0)
+                handler.cancel()
+                await asyncio.sleep(0)
+                service.credits.condition.release()
+                locked = False
+            await until(lambda: not service._tasks)
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert not state.calls and not service._connections
+            instance = client(root, timeout=3)
+            try:
+                np.testing.assert_equal(await instance.embed_text(["healthy successor"]), [[3, 4]])
+                assert len(state.calls) == 1
+                assert service.credits.bytes == service.credits.inflight == 0
+            finally:
+                await instance.aclose()
+        finally:
+            if locked:
+                service.credits.condition.release()
+            sock.close()
             await service.aclose()
 
     asyncio.run(run())

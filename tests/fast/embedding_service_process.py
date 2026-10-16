@@ -24,6 +24,10 @@ async def main():
         try:
             while (root / "hold").exists():
                 await asyncio.sleep(0.01)
+            if (root / "memory_error").exists():
+                raise MemoryError("private model allocation diagnostic")
+            if (root / "execution_error").exists():
+                raise RuntimeError("private model execution diagnostic")
             return [3, 4]
         finally:
             active -= 1
