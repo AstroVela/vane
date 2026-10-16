@@ -52,7 +52,7 @@ Context's development branch is not the mirror repository's default branch.
 | Google | `providers/_google_multimodal.py` | Joint parts and direct encoded media through standard Embed |
 | Native SGLang/vLLM | `providers/_native_inference.py` | Existing single decoded modality support via typed inputs |
 | Context joint dispatch | `video_runtime.py`, `video_plan.py` | Migrate in milestone 3 |
-| SQL functions | `_sql.py`, `src/vane_py/ai_sql_functions.cpp` | Still active; consolidate in milestone 5 |
+| SQL functions | `_sql.py`, `src/vane_py/ai_sql_functions.cpp` | One `ai_embed` entrypoint, sharing Python's typed executor plan |
 
 The local SGLang batching/SHM experiments supplied transport evidence. Milestone
 2 now implements standard HTTP providers separately; SHM remains milestone 4.
@@ -613,8 +613,8 @@ PRs use the repository template and state limitations and dependencies.
 | 1 | Unified Python Embed, all four typed modalities, optional parts, Google joint/direct bytes; remove replaced APIs | Planning without I/O, bounded inputs, row/cardinality and lifecycle tests, real executor with local protocol fixtures, affected typing/examples | Merged in #1024 |
 | 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Implemented in #1026 against main; exact acceptance and model limits recorded in its validation |
 | 3 | Context uses unified Embed and explicit channel joins; remove independent joint execution | Single/batch/search, partial ASR/OCR failure, alignment without row multiplication, profile identity, restart/receipts | Implemented in Context #91; includes fatal resource classification and partial channel diagnostics |
-| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Implemented in this change; CPU protocol/processor acceptance, GPU model and 100-video measurement remain milestone 6 |
-| 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Planned after consumers migrate |
+| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Implemented in #1028; CPU protocol/processor acceptance, GPU model and 100-video measurement remain milestone 6 |
+| 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Implemented in this change |
 | 6 | Frozen 100-video correctness and performance comparison | Same inputs/checkpoints/sampling, repeated warm runs, vector and provenance parity, request/queue/CPU/GPU breakdown | Planned after 3 and 4 |
 
 Milestones 2–4 add explicit transports, unified Context integration and a
@@ -636,10 +636,11 @@ Relation methods and per-modality public option classes. Use typed parts and
 `EmbedOptions`. The functional keyword becomes `input=` instead of `text=`.
 Do not add aliases, warnings that delegate to old code, or automatic migration.
 
-The SQL functions remain executable because the current native binder uses them;
-they are not Python compatibility wrappers. Context's internal descriptor calls
-and currently imported joint wrappers remain active until milestone 3 replaces
-their consumers. Dependency PRs must pin a Vane build containing the required
+SQL now exposes only `ai_embed`; `ai_embed_image`, `ai_embed_video`,
+`ai_embed_audio` and their separate hidden validators are removed. The modality
+descriptor interfaces remain active for models supporting only one modality;
+both public APIs use one shared executor-plan builder. Context's embedding
+consumers migrated in milestone 3. Dependency PRs must pin a Vane build containing the required
 contract and use matching native/extension identities. Documentation links should
 point to this design instead of duplicating it across repositories.
 
@@ -658,6 +659,70 @@ predicate and typed fields through binding; the worker filters it before input
 conversion, then restores vector positions. An entirely unselected batch never
 instantiates its provider client. Existing task/actor lifecycle, cancellation,
 normalization, retries and credentials remain owned by Embed.
+
+## Unified SQL embedding
+
+```sql
+-- A bare value is text, as in Python embed(col("text")).
+SELECT ai_embed(text, provider := 'openai', model := 'text-embedding-3-small') FROM documents;
+
+-- Decoded frames: no encoding or implicit file reads.
+SELECT ai_embed(frames, input_spec := {kind: 'video'},
+    provider := 'sglang', model := 'your-supported-checkpoint', dimensions := 768,
+    options := {runtime: 'service', service_path: '/tmp/my-embedding/engine.sock',
+                service_id: 'retrieval-model-revision-1'}) FROM clips;
+
+-- Encoded bytes use an explicit MIME type and a protocol supporting it.
+SELECT ai_embed(video_bytes, input_spec := {kind: 'video', mime_type: 'video/mp4'},
+    provider := 'google', model := 'gemini-embedding-2') FROM clips;
+
+-- One joint vector per selected row; field order matches the specification.
+SELECT clip_id, ai_embed({clip: video_bytes, transcript: text},
+    input_spec := [{kind: 'video', mime_type: 'video/mp4'}, {kind: 'text', mime_type: NULL}],
+    "where" := selected, provider := 'google', model := 'gemini-embedding-2') AS vector FROM clips;
+```
+
+`input_spec` is a foldable STRUCT for one typed input, or a nonempty LIST of
+STRUCTs for an explicit multimodal input. Each part has `kind` and an optional
+`mime_type`; other fields are rejected. A list requires an input STRUCT with
+exactly one field per part, in declaration order. Field names are local labels.
+Even a one-part list selects multimodal semantics. Omitted/NULL `input_spec`
+means text. Prepared statement parameters are supported; per-row layouts are not.
+
+Without a MIME type, `image` requires IMAGE, `video` requires ordered frame
+records, and `audio` requires decoded PCM with its sample rate. With a MIME
+type, media requires BLOB. The provider/model must explicitly support the
+declared representations; the binder neither decodes nor reads files.
+`provider` defaults to `openai` for every layout, matching Python.
+
+`"where"` defaults to TRUE and accepts BOOLEAN/NULL without implicit casts.
+Input logical types and model capabilities are checked during planning even
+for FALSE/NULL predicates. Only selected rows undergo conversion and budget
+checks. A non-NULL packed struct protects optional constant NULLs from native
+NULL folding. Missing joint parts are omitted; selected all-empty content is
+an input error, including with `on_error := 'ignore'`. Single decoded NULLs
+produce NULL vectors without instantiating a model. SQL options retain the
+inline-credential prohibition and the connection's actor execution backend.
+
+```mermaid
+flowchart LR
+    SQL[ai_embed + foldable input_spec] --> B[Native structural binding]
+    PY[Python embed + typed inputs] --> B
+    SQL --> P[Shared descriptor and batch plan]
+    PY --> P
+    B --> U[Packed input and selection]
+    P --> U
+    U --> S[Select TRUE rows]
+    S --> C[Convert inputs and check budgets]
+    C --> E[Existing provider executor]
+    E --> R[Restore rows as FLOAT dimensions]
+```
+
+The existing model/protocol configuration chooses HTTP, native, or service
+transport. This SQL change does not qualify new checkpoints or measure GPU
+throughput; those remain milestone 6. Run the installed SQL embedding tests,
+existing Prompt/Embed SQL tests, affected typed embedding tests and related
+Ray executor cases after the incremental native build.
 
 ```python
 rows = rows.embed(

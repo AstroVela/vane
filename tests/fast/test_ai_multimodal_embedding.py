@@ -498,16 +498,18 @@ def test_where_all_inactive_never_instantiates_the_client(backend, condition):
 def test_where_inactive_encoded_media_still_requires_blob(backend, condition, factory, mime_type):
     with vane.connect() as conn:
         source = conn.from_arrow(pa.table({"media": ["invalid VARCHAR", None]}))
-        result = embed(
-            source,
-            factory(vane.col("media"), mime_type=mime_type),
-            where=vane.ConstantExpression(condition),
-            provider=OptionalContentProvider(),
-            execution_backend=backend,
-            on_error="ignore",
-        )
         with pytest.raises(Exception, match="BLOB"):
-            result.fetchall()
+            result = embed(
+                source,
+                factory(vane.col("media"), mime_type=mime_type),
+                where=vane.ConstantExpression(condition),
+                provider=OptionalContentProvider(),
+                execution_backend=backend,
+                on_error="ignore",
+            )
+            # The unified native validator rejects the declared type during
+            # planning, before executing even an entirely unselected batch.
+            _ = result.types
 
 
 @pytest.mark.parametrize("rows", [0, 2])

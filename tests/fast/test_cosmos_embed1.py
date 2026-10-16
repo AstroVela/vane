@@ -278,7 +278,7 @@ def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local
             result = embed(rel, ImageInput(vane.col("image")), provider="transformers", model=COSMOS_MODEL, **options)
         else:
             result = conn.sql(
-                "SELECT ai_embed_image(NULL::IMAGE, model => 'nvidia/Cosmos-Embed1-224p', "
+                "SELECT ai_embed(NULL::IMAGE, input_spec => {kind: 'image'}, provider => 'transformers', model => 'nvidia/Cosmos-Embed1-224p', "
                 "options => {revision: $1, trust_remote_code: true, device: 'cuda', dtype: 'float16'}) AS embedding",
                 params=["a" * 40],
             )
@@ -290,10 +290,10 @@ def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local
 @pytest.mark.parametrize(
     "kind,value",
     [
-        ("", "'query'"),
-        ("_image", "image('abc'::BLOB, 1, 1, 3, 'RGB')"),
+        ("text", "'query'"),
+        ("image", "image('abc'::BLOB, 1, 1, 3, 'RGB')"),
         (
-            "_video",
+            "video",
             "list_transform(range(8), i -> {frame_index: i::BIGINT, frame_time: i::DOUBLE, "
             "data: image('abc'::BLOB, 1, 1, 3, 'RGB')})",
         ),
@@ -305,7 +305,7 @@ def test_cosmos_sql_gpu_resources_require_a_ray_plan(ray_local, monkeypatch, kin
     monkeypatch.setitem(sys.modules, "torch", None)
     monkeypatch.setitem(sys.modules, "transformers", None)
     query = (
-        f"SELECT ai_embed{kind}({value}, provider => 'transformers', model => 'nvidia/Cosmos-Embed1-224p', "
+        f"SELECT ai_embed({value}, input_spec => {{kind: '{kind}'}}, provider => 'transformers', model => 'nvidia/Cosmos-Embed1-224p', "
         "options => {revision: $1, trust_remote_code: true, device: 'cuda', dtype: 'float16'}) AS embedding"
     )
     for runner in ("ray", "local-fast"):

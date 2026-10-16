@@ -19,6 +19,18 @@ from vane._typing import Expression
 Modality: TypeAlias = Literal["text", "image", "video", "audio"]
 
 
+def _validate_mime_type(kind: Modality, mime_type: str | None) -> None:
+    if mime_type is not None and (
+        kind == "text"
+        or not isinstance(mime_type, str)
+        or not mime_type.startswith(f"{kind}/")
+        or not mime_type.removeprefix(f"{kind}/")
+        or any(character.isspace() for character in mime_type)
+        or ";" in mime_type
+    ):
+        raise ValueError(f"{kind.title()}Input requires an explicit {kind} MIME type")
+
+
 @dataclass(frozen=True)
 class TextInput:
     value: Expression
@@ -38,14 +50,7 @@ class _MediaInput:
     def __post_init__(self) -> None:
         if not is_expression(self.value):
             raise TypeError(f"{type(self).__name__} requires an Expression")
-        if self.mime_type is not None and (
-            not isinstance(self.mime_type, str)
-            or not self.mime_type.startswith(f"{self.kind}/")
-            or not self.mime_type.removeprefix(f"{self.kind}/")
-            or any(character.isspace() for character in self.mime_type)
-            or ";" in self.mime_type
-        ):
-            raise ValueError(f"{type(self).__name__} requires an explicit {self.kind} MIME type")
+        _validate_mime_type(self.kind, self.mime_type)
 
 
 @dataclass(frozen=True)
