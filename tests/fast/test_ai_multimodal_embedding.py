@@ -488,6 +488,49 @@ def test_where_all_inactive_never_instantiates_the_client(backend, condition):
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("condition", [False, None])
+@pytest.mark.parametrize(
+    "factory,mime_type", [(VideoInput, "video/mp4"), (AudioInput, "audio/wav"), (ImageInput, "image/png")]
+)
+def test_where_inactive_encoded_media_still_requires_blob(backend, condition, factory, mime_type):
+    with vane.connect() as conn:
+        source = conn.from_arrow(pa.table({"media": ["invalid VARCHAR", None]}))
+        result = embed(
+            source,
+            factory(vane.col("media"), mime_type=mime_type),
+            where=vane.ConstantExpression(condition),
+            provider=OptionalContentProvider(),
+            execution_backend=backend,
+            on_error="ignore",
+        )
+        with pytest.raises(Exception, match="BLOB"):
+            result.fetchall()
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_where_empty_selection_checks_types_without_decoding_or_creating_client(rows):
+    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "parts", "vector", 2, parts=(VIDEO,))
+    wrapper._selection_columns = ("parts",)
+
+    def selected_table(column):
+        fields = pa.table(
+            {
+                "condition": pa.array([False] * rows, type=pa.bool_()),
+                "parts": pa.table({"part_0": column}).to_struct_array(),
+            }
+        )
+        return pa.table({"selected_input": fields.to_struct_array()})
+
+    with pytest.raises(TypeError, match="BLOB"):
+        wrapper(selected_table(pa.array(["wrong type"] * rows, type=pa.string())))
+    # Invalid/over-budget encoded values are irrelevant when their rows are
+    # excluded. Only the declared column type is validated.
+    result = wrapper(selected_table(pa.array([b"", b"x" * 100][:rows], type=pa.binary())))
+    assert result["vector"].to_pylist() == [None] * rows
+    assert wrapper._embedder is None
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 @pytest.mark.parametrize("text", [None, "x" * 17])
 @pytest.mark.parametrize("on_error", ["raise", "ignore"])
 def test_where_selected_invalid_inputs_still_fail(backend, text, on_error):

@@ -1131,7 +1131,10 @@ class _EmbeddingBatch:
                 raise TypeError("Embed where must produce BOOLEAN or NULL")
             row_indices = [index for index, value in enumerate(condition.to_pylist()) if value is True]
             table = unpacked.drop(["condition"]).take(pa.array(row_indices, type=pa.int64()))
-        texts = self._input_values(table) if row_indices else []
+        # An empty selection still carries the declared input types. Validate
+        # those types on the empty table without converting any excluded rows
+        # or instantiating the provider.
+        texts = self._input_values(table)
         active_indices = [index for index, text in enumerate(texts) if text is not None]
 
         if active_indices:
