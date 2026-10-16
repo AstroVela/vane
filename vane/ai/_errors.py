@@ -183,8 +183,13 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
         match = _REMOTE_RESULT_COUNTS.match(message) if transported else _REMOTE_RESULT_COUNTS.fullmatch(message)
         if match:
             return match[0]
-        if "CUDA out of memory" in message or canonical(
-            "CUDA memory allocation failed; check model and worker GPU memory budgets"
+        # CTranslate2 (used by Faster-Whisper) throws RuntimeError rather than
+        # a typed OOM. Preserve its exact CUDA_CHECK allocation failure before
+        # sanitization discards the provider message; emit only our fixed text.
+        if (
+            "CUDA out of memory" in message
+            or message == "CUDA failed with error out of memory"
+            or canonical("CUDA memory allocation failed; check model and worker GPU memory budgets")
         ):
             return "CUDA memory allocation failed; check model and worker GPU memory budgets"
     return None
