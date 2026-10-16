@@ -404,6 +404,9 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
                                 const vector<DirectOutput> &outputs) {
 	lock_guard<mutex> operation(operation_lock);
 	CheckCanceled();
+	if (!database) {
+		throw InvalidInputException("direct task service is released");
+	}
 	if (started || id.empty()) {
 		throw InvalidInputException("prepare requires a task id and must precede start");
 	}
@@ -876,6 +879,8 @@ void DirectTaskService::Release() {
 		}
 		Cleanup(*task);
 	}
+	// Terminal diagnostics may outlive this query's database lease.
+	database.reset();
 }
 
 vector<DirectTaskStatus> DirectTaskService::Status() {

@@ -3,7 +3,11 @@
 
 from typing import Any
 
+from . import DuckDBPyConnection
+
 def check_entry() -> None: ...
+def worker_connection(anchor: DuckDBPyConnection) -> DuckDBPyConnection: ...
+def release_worker_database(anchor: DuckDBPyConnection, reuse: bool) -> bool: ...
 
 class StoreGuard:
     @staticmethod

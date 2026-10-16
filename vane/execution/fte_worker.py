@@ -18,6 +18,7 @@ from vane.execution.materialized_exchange import ObjectMeta
 from vane.execution.materialized_store import AttemptReservation
 from vane.execution.pipelined_plan import RayResources
 from vane.execution.submission import RayQuerySpec, prepare_worker_plan
+from vane.execution.worker_database import WorkerDatabaseLease
 
 
 class MaterializedAttempt:
@@ -29,7 +30,9 @@ class MaterializedAttempt:
         reservation: AttemptReservation,
         lease: dict[str, Any],
         on_orphan: Callable[[], None],
+        database: WorkerDatabaseLease,
     ) -> None:
+        self.database = database
         self.spec, self.resources, self.binding = spec, resources, binding
         self.reservation, self.lease_wire, self.on_orphan = reservation, lease, on_orphan
         self.lease: ActiveStoreLease | None = None
@@ -48,8 +51,7 @@ class MaterializedAttempt:
         self.closed = False
         self.error = ""
 
-    def prepare(self, operator_bytes: int) -> None:
-        import vane
+    def prepare(self) -> None:
         from vane._native import execution_runtime as native
         from vane.execution.pipelined_worker import _channel
 
@@ -75,13 +77,7 @@ class MaterializedAttempt:
             with self.control:
                 if self.stop.is_set():
                     raise RuntimeError(self.error or "attempt preparation canceled")
-                self.connection = vane.connect(
-                    backend="local",
-                    config={
-                        "threads": self.resources.cpus_per_worker,
-                        "memory_limit": f"{operator_bytes}B",
-                    },
-                )
+                self.connection = self.database.open()
             prepare_worker_plan(self.connection, self.spec)
             if self.stop.is_set():
                 raise RuntimeError(self.error or "attempt preparation canceled")
@@ -256,4 +252,5 @@ class MaterializedAttempt:
                 self.attempt_guard.close()
             if self.lease is not None:
                 self.lease.close()
+            self.database.release()
             self.closed = True

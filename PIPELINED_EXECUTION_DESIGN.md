@@ -783,6 +783,27 @@ producer_owned_bytes
 
 网络层额外限制连接数、在途消息、预取数和消息大小，并报告应用账本之外的 gRPC 与 socket 内存。流控不能替代应用层预算。
 
+### Worker 数据库复用
+
+Pipelined worker 在查询之间保留有界的私有内存数据库实例。每个实例同一时刻只服务一个查询；每次租用创建独立的 native connection 和 Vane session，任务服务、通道、取消状态和临时 catalog 均属于本次查询。连接快照与源文件身份仍在每次准备时验证，不能复用已经验证过的查询计划。
+
+每个槽位的 operator 预算是 `B = operator_memory_bytes // max_active_queries`，实例总数受 `operator_memory_bytes // B` 限制，与现有 worker 准入的整数除法一致。空闲实例占用这个容量池；FTE attempt 也必须取得同一个槽位，并在创建全新数据库前销毁该槽位的空闲实例。FTE 暂不保留数据库或复用快照。
+
+归还发生在执行线程退出、TaskService 释放任务及数据库引用、Flight 完成关闭、查询连接关闭之后。原生检查要求只剩锚点连接及其数据库引用；若仍有借用者，保留查询/attempt 的登记与资源预留，等待清理重试。重置失败的实例在重试确认无借用者后淘汰，不能再次复用部分重置的状态。实例失效时淘汰；可复用实例先清空 external file cache 和可驱逐的 object cache，仅在缓存为空、BufferManager 使用量为零且没有临时 spill 文件时进入空闲池，否则销毁实例。
+
+`resources_snapshot().databases` 单独报告槽位容量、活动 owner、空闲实例数及累计创建/复用次数。槽位预算和查询 reservation 是同一份 operator 容量，不能相加。保留的系统 catalog、线程栈等并非都由 BufferManager 计费；实例数量有上限不等于整个进程 RSS 有硬隔离。运行时关闭或 actor epoch 结束会销毁其空闲实例。
+
+2026-10-17 的 SF10 验证使用 [#1020](https://github.com/AstroVela/vane/pull/1020) 的 `c97e5bf31b` 作为共同性能基线，候选为该版本加数据库复用补丁。Local 使用 36 线程/32 GiB；Ray 使用两个 worker，每个 18 线程/16 GiB，两个分区。按基线、候选、候选、基线顺序运行，每个 query/mode/variant 有六个计时样本；计时包含提交、完整收集和成功关闭，启动后先执行一次 `select 1`。以下为中位数：
+
+| Query | Local（候选对照） | 原 pipelined | 复用后 pipelined | pipelined 耗时下降 |
+| --- | ---: | ---: | ---: | ---: |
+| Q9 | 0.842 s | 1.397 s | 1.250 s | 10.6% |
+| Q18 | 0.688 s | 1.047 s | 0.910 s | 13.0% |
+
+48 个计时样本均通过结果校验。独立分段诊断中，每个 worker 的连接创建中位耗时从约 37 ms 降到 0.4–0.5 ms，完整 worker 释放从 28–37 ms 降到 4–5 ms；这些分段统计不与端到端时间直接相加。候选每个 worker 的查询槽位只创建一次实例，清理后均为空闲且没有活动 owner。复用后 Q9/Q18 仍比对应 local 对照慢约 48%/32%，本次结果仅适用于这两个查询和当前共享主机。
+
+实现另在独立 `integration` 基线 `0920b4472d` 上通过 91 项相关回归和 Q9/Q18 大查询校验；与 #1020 组合的版本通过 32 项相关回归。保留了 [逐次计时与结果哈希](benchmarking/tpch/worker_database_reuse_20261017.csv) 和 [配置、输入及代码身份、分段诊断](benchmarking/tpch/worker_database_reuse_20261017.json)。各次运行的进程已停止，spill 与临时数据在计时窗口外清理。
+
 ### 混跑
 
 两种调度器共用会话内的 [WorkerResourceManager](vane/execution/worker_resources.py)。它以 contexts、operator bytes、exchange bytes、staging bytes 和 I/O links 为维度，一次预留一个图的全部 worker，或一个 FTE attempt 的目标 worker。actor 独立核对相同需求及容量，作为实际资源所有者的第二层校验。
