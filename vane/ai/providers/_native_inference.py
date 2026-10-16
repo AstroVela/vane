@@ -762,10 +762,14 @@ class InferenceEmbeddingProviderMixin(Provider):
     _native_family: str
 
     def _capture_http_client(self, api_key: str | None) -> None:
-        from vane.ai._client_config import _setting, copy_client_options
+        import os
 
+        from vane.ai._client_config import copy_client_options
+
+        # Snapshot on the application, but validate only when HTTP is selected.
+        # Native embedding and prompting do not consume HTTP credentials.
         self._http_client_options = copy_client_options(
-            {"api_key": _setting(api_key, f"{self._native_family.upper()}_API_KEY")}
+            {"api_key": api_key if api_key is not None else os.environ.get(f"{self._native_family.upper()}_API_KEY")}
         )
 
     def _embedding_descriptor(

@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from vane.ai._client_config import copy_client_options
+from vane.ai._client_config import _text, copy_client_options
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
@@ -43,6 +43,7 @@ class _HTTPEmbeddingDescriptor:
         if self.options.get("runtime") != "http" or self.options.keys() - _HTTP_EMBED_OPTIONS:
             raise EmbeddingConfigurationError("HTTP embedding descriptor requires HTTP request options")
         self.client_options = copy_client_options(self.client_options)
+        _text(unwrap_sensitive_options(self.client_options).get("api_key"), f"{self.family.upper()}_API_KEY")
         self._codec()  # All protocol/model metadata is checked without SDK imports or I/O.
 
     def _codec(self) -> EmbeddingHTTPCodec:

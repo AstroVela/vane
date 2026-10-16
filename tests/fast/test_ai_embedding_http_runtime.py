@@ -95,6 +95,74 @@ def test_planning_is_serializable_and_requires_no_runtime_or_client(monkeypatch,
 
 
 @pytest.mark.parametrize("family", PROVIDERS)
+@pytest.mark.parametrize("key", ["", " ", "invalid\ncredential"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_unused_http_credentials_do_not_block_native_embedding_or_prompt(monkeypatch, family, key, explicit):
+    from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
+    from vane.ai.providers._native_inference import (
+        NativeImageEmbedderDescriptor,
+        NativeTextEmbedderDescriptor,
+        NativeVideoEmbedderDescriptor,
+    )
+
+    monkeypatch.setenv(f"{family.upper()}_API_KEY", key)
+    provider = PROVIDERS[family](**({"api_key": key} if explicit else {}))
+    for options in (None, {"runtime": "native"}):
+        for kind, expected in (
+            ("text", NativeTextEmbedderDescriptor),
+            ("image", NativeImageEmbedderDescriptor),
+            ("video", NativeVideoEmbedderDescriptor),
+        ):
+            descriptor = getattr(provider, f"get_{kind}_embedder")("native-model", 2, options=options)
+            assert isinstance(descriptor, expected)
+    assert isinstance(provider.get_prompter("native-model"), NativeInferencePlan)
+    assert isinstance(
+        provider.get_prompter("native-model", options={"media_mime_types": ["image/png"]}), PrompterDescriptor
+    )
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
+@pytest.mark.parametrize("key", ["", " ", "invalid\ncredential"])
+@pytest.mark.parametrize("kind", ["text", "image", "multimodal"])
+def test_http_validates_the_captured_key_before_client_creation(monkeypatch, family, key, kind):
+    monkeypatch.setenv(f"{family.upper()}_API_KEY", key)
+    provider = pickle.loads(pickle.dumps(PROVIDERS[family]()))
+    # Later application/worker state must not repair an invalid snapshot.
+    monkeypatch.setenv(f"{family.upper()}_API_KEY", "later-valid-key")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: pytest.fail("client created before validation"))
+    with pytest.raises(ValueError, match=f"{family.upper()}_API_KEY") as error:
+        getattr(provider, f"get_{kind}_embedder")(
+            "served-model",
+            2,
+            options={
+                "runtime": "http",
+                "base_url": "http://embedding.invalid/v1",
+                "http_input_format": "multimodal",
+                "media_mime_types": ["image/png"],
+            },
+        )
+    assert "invalid\ncredential" not in str(error.value)
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
+@pytest.mark.parametrize("key", [None, "application-key"])
+def test_http_preserves_missing_or_valid_driver_key_across_serialization(monkeypatch, family, key):
+    from vane.ai._redaction import unwrap_sensitive_options
+
+    variable = f"{family.upper()}_API_KEY"
+    monkeypatch.delenv(variable, raising=False)
+    if key is not None:
+        monkeypatch.setenv(variable, key)
+    provider = pickle.loads(pickle.dumps(PROVIDERS[family]()))
+    monkeypatch.setenv(variable, "different-worker-key")
+    descriptor = provider.get_text_embedder(
+        "served-model", 2, options={"runtime": "http", "base_url": "http://embedding.invalid/v1"}
+    )
+    assert unwrap_sensitive_options(descriptor.client_options)["api_key"] == key
+    assert "application-key" not in repr(descriptor)
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
 @pytest.mark.parametrize(
     "options",
     [
