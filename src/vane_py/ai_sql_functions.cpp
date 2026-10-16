@@ -946,6 +946,14 @@ static void PackEmbeddingInput(ClientContext &context, vector<unique_ptr<Express
 	} else if (condition->return_type != LogicalType::BOOLEAN) {
 		throw BinderException("ai_embed where must be BOOLEAN or NULL");
 	}
+	if (!multimodal && IsFoldableNull(context, *value)) {
+		// A single text/decoded-media NULL has no model work. Preserve its
+		// NULL propagation after validating input and predicate types so the
+		// lowering callback can remove the UDF (including GPU requirements).
+		value = make_uniq<BoundConstantExpression>(Value(value->return_type));
+		arguments[7] = make_uniq<BoundConstantExpression>(Value());
+		return;
+	}
 	condition->SetAlias("condition");
 	vector<unique_ptr<Expression>> selection;
 	selection.push_back(std::move(condition));

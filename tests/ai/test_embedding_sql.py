@@ -9,7 +9,7 @@ import pytest
 
 import vane
 from tests.fast.test_ai_multimodal_embedding import ContentDescriptor, ContentProvider, OptionalContentProvider
-from vane.ai import MultimodalInput, TextInput, VideoInput, embed
+from vane.ai import AudioInput, ImageInput, MultimodalInput, TextInput, VideoInput, embed
 from vane.ai import provider as registry
 
 
@@ -20,6 +20,57 @@ def providers(monkeypatch):
 
 
 PARTS = "[{kind: 'text', mime_type: NULL}, {kind: 'video', mime_type: 'video/mp4'}]"
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("kind", ["text", "image", "video", "audio"])
+@pytest.mark.parametrize("condition", [None, "FALSE", "NULL"])
+def test_scalar_null_skips_gpu_execution_after_validation(monkeypatch, family, kind, condition):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    options = {"gpus_per_actor": 1, "input_modalities": [kind]}
+    if kind == "audio":
+        options.update(sample_rate=16000, max_samples=16000)
+    wrapper = {"text": TextInput, "image": ImageInput, "video": VideoInput, "audio": AudioInput}[kind]
+    predicate = "" if condition is None else f', "where" := {condition}'
+    with vane.connect() as conn:
+        python = conn.sql("SELECT 1").select(
+            embed(wrapper(vane.ConstantExpression(None)), provider=family, model="fixture", dimensions=2, **options)
+        )
+        sql = conn.sql(
+            f"""SELECT ai_embed(NULL, input_spec := {{kind: '{kind}'}}, provider := '{family}',
+                model := 'fixture', dimensions := 2, options := $1{predicate})""",
+            params=[options],
+        )
+        assert sql.types == python.types == [vane.array_type(vane.sqltypes.FLOAT, 2)]
+        assert sql.fetchall() == python.fetchall() == [(None,)]
+
+
+@pytest.mark.parametrize("value", ["NULL::IMAGE", "CASE WHEN TRUE THEN NULL::IMAGE ELSE NULL::IMAGE END", "$1::IMAGE"])
+def test_cosmos_foldable_null_image_requires_no_gpu(monkeypatch, value):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+        result = conn.sql(
+            f"""SELECT ai_embed({value}, input_spec := {{kind: 'image'}},
+                provider := 'transformers', model := 'nvidia/Cosmos-Embed1-224p',
+                options := {{revision: '{"a" * 40}', trust_remote_code: true, device: 'cuda', dtype: 'float16'}})""",
+            params=[None] if "$1" in value else None,
+        )
+        assert result.fetchall() == [(None,)]
+
+
+@pytest.mark.parametrize("kind", ["text", "image", "video", "audio"])
+def test_scalar_null_does_not_skip_type_or_predicate_validation(kind):
+    options = {"input_modalities": [kind], "gpus_per_actor": 1}
+    if kind == "audio":
+        options.update(sample_rate=16000, max_samples=16000)
+    with vane.connect() as conn:
+        for value, predicate, message in [("NULL::INTEGER", "FALSE", "requires|must be"), ("NULL", "1", "BOOLEAN")]:
+            with pytest.raises(Exception, match=message):
+                conn.sql(
+                    f"""SELECT ai_embed({value}, input_spec := {{kind: '{kind}'}}, provider := 'sglang',
+                        model := 'fixture', dimensions := 2, options := $1, "where" := {predicate})""",
+                    params=[options],
+                )
 
 
 def test_joint_sql_python_selection_and_plan_round_trip():

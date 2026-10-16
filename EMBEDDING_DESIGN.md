@@ -700,9 +700,12 @@ Input logical types and model capabilities are checked during planning even
 for FALSE/NULL predicates. Only selected rows undergo conversion and budget
 checks. A non-NULL packed struct protects optional constant NULLs from native
 NULL folding. Missing joint parts are omitted; selected all-empty content is
-an input error, including with `on_error := 'ignore'`. Single decoded NULLs
-produce NULL vectors without instantiating a model. SQL options retain the
-inline-credential prohibition and the connection's actor execution backend.
+an input error, including with `on_error := 'ignore'`. A foldable single text or
+decoded-media NULL is reduced to a typed NULL vector after input, predicate and
+model configuration validation. It leaves no model UDF or GPU requirement in the
+execution plan, matching Python. Joint and encoded-media inputs keep nonempty
+content validation. SQL options retain the inline-credential prohibition and
+the connection's actor execution backend.
 
 ```mermaid
 flowchart LR
@@ -710,8 +713,10 @@ flowchart LR
     PY[Python embed + typed inputs] --> B
     SQL --> P[Shared descriptor and batch plan]
     PY --> P
-    B --> U[Packed input and selection]
-    P --> U
+    B --> N{Single foldable NULL?}
+    P --> N
+    N -->|Yes| Z[Typed NULL without a model worker]
+    N -->|No| U[Packed input and selection]
     U --> S[Select TRUE rows]
     S --> C[Convert inputs and check budgets]
     C --> E[Existing provider executor]
