@@ -82,15 +82,15 @@ transformers = [
 qwen3_vl = [ # Fixed BF16 / special-token encoding paired with SQR checkpoints
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
-    "transformers==5.12.1",
+    "transformers==5.19.0",
     "safetensors>=0.5,<1",
     "pillow>=11,<13",
 ]
-clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
+clap = ["torch>=2.6", "transformers>=4.51.3,<6"]
 cosmos = [
     "torch>=2.7",
     "torchvision>=0.22",
-    "transformers==4.51.3",
+    "transformers==5.19.0",
     "einops>=0.8",
     "pillow>=10.4",
 ]
