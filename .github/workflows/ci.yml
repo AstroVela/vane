@@ -575,7 +575,7 @@ jobs:
       # successful cold build, while a partial bootstrap must not poison the key.
       - name: Save vcpkg binary cache
         if: ${{ steps.vcpkg_cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
