@@ -49,6 +49,12 @@ _MEMORY = re.compile(
 _SAFE_MEMORY = re.compile(
     rf"insufficient GPU KV-cache memory; mem_fraction_static=({_FRACTION}), required above ({_FRACTION})(?![0-9.])"
 )
+_CPU_MEMORY = re.compile(
+    r"(?:\[enforce fail at [^\]\r\n]{0,512}alloc_cpu\.cpp:[0-9]{1,8}\] err == 0\. )?"
+    r"DefaultCPUAllocator: can't allocate memory: you tried to allocate [0-9]{1,20} bytes\. "
+    r"Error code [0-9]{1,10} \([^\r\n)]{1,128}\)"
+)
+_CPU_MEMORY_DETAIL = "CPU memory allocation failed; check model and worker CPU memory budgets"
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
@@ -172,6 +178,8 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     if error_type in {"OutOfMemoryError", "OutOfMemoryException", "MemoryError"}:
         return "memory allocation failed; check model and worker memory budgets"
     if error_type == "RuntimeError":
+        if _CPU_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_CPU_MEMORY_DETAIL):
+            return _CPU_MEMORY_DETAIL
         match = _REMOTE_RESULT_COUNTS.match(message) if transported else _REMOTE_RESULT_COUNTS.fullmatch(message)
         if match:
             return match[0]
