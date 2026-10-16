@@ -57,8 +57,14 @@ def install_sdk(setitem, *, mock_transformers=True):
             return result
 
     class EmbeddingRequest(SimpleNamespace):
-        def __init__(self, *, input_ids, dimensions=None, image_data=None, video_data=None):
-            super().__init__(input_ids=input_ids, dimensions=dimensions, image_data=image_data, video_data=video_data)
+        def __init__(self, *, input_ids, dimensions=None, image_data=None, video_data=None, audio_data=None):
+            super().__init__(
+                input_ids=input_ids,
+                dimensions=dimensions,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+            )
 
     class Engine:
         def __init__(self, **kwargs):
@@ -711,15 +717,23 @@ def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
-@pytest.mark.parametrize("times", [(0.0,), (0.0, 0.5, 1.5, 2.0), (0.0, 0.5, 0.5, 1.0), (1.0, 0.5)])
-def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup(family, times, sdk):
+@pytest.mark.parametrize(
+    "times,error",
+    [
+        ((0.0,), "at least two uniformly spaced video frames"),
+        ((0.0, 0.5, 1.5, 2.0), "at least two uniformly spaced video frames"),
+        ((0.0, 0.5, 0.5, 1.0), "timestamps and indices must be ordered and aligned"),
+        ((1.0, 0.5), "timestamps and indices must be ordered and aligned"),
+    ],
+)
+def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup(family, times, error, sdk):
     sys.modules["transformers"].AutoProcessor.model_input_names = ["input_ids", "second_per_grid_ts"]
     frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in times)
 
     async def run():
         runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
         try:
-            with pytest.raises(ValueError, match="at least two uniformly spaced video frames"):
+            with pytest.raises(ValueError, match=error):
                 await runtime.embed_video([VideoClip(frames, times, tuple(range(len(times))))])
         finally:
             await runtime.aclose()
