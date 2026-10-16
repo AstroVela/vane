@@ -902,8 +902,9 @@ struct StreamingUDFConfig {
 	// row count is reached. EOS and byte pressure may still submit a short tail.
 	idx_t min_task_batch_rows = 0;
 	// Transport size is independent of the user-visible compute batch. Only
-	// ordinary synchronous Ray actor batches use the automatic byte target.
+	// ordinary synchronous actor batches use the automatic byte target.
 	bool auto_task_batching = false;
+	idx_t transport_input_target_bytes = 0;
 	idx_t actor_pool_size = 1;
 	idx_t task_input_max_bytes = 0;
 	idx_t output_target_bytes = 0;
@@ -1079,10 +1080,17 @@ struct StreamingHandoffCounters {
 static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t task_operator_width = 1);
 
 struct StreamingUDFState : public StateWithBlockableTasks {
-	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p)
-	    : original_payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
+	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p, idx_t transport_input_target_bytes_p)
+	    : original_payload(std::move(payload_p)), transport_input_target_bytes(transport_input_target_bytes_p),
+	      actor_handles(std::move(actor_handles_p)) {
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(original_payload);
+		config.transport_input_target_bytes = transport_input_target_bytes;
+		if (config.auto_task_batching &&
+		    GetStructStringField(payload, "execution_backend").second == "subprocess_actor" &&
+		    transport_input_target_bytes == 0) {
+			throw InvalidInputException("Local actor transport requires prepared arena capacity");
+		}
 		UDFWorkerSlotDebugLog(StringUtil::Format("streaming_ctor_unresolved udf_name=%s initial_config_width=1",
 		                                         UDFDebugNameFromPayload(original_payload).c_str()));
 	}
@@ -1140,6 +1148,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		    operator_width_resolved ? "true" : "false", static_cast<unsigned long long>(resolved_task_operator_width)));
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
+		config.transport_input_target_bytes = transport_input_target_bytes;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 		runtime_operator_width_resolved = operator_width_resolved;
@@ -1147,6 +1156,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 
 	Value original_payload;
 	Value payload;
+	const idx_t transport_input_target_bytes;
 	shared_ptr<void> actor_handles;
 	StreamingUDFConfig config;
 	idx_t resolved_task_operator_width = 0;
@@ -2042,7 +2052,11 @@ static StreamingSubmitPlan PlanStreamingAutoSubmit(const StreamingUDFState &stat
 	// applies the existing byte-bounded slicing and oversized-row rules.
 	const auto bytes_per_row = MaxValue<idx_t>(1, state.pending_bytes / state.pending_rows +
 	                                                  (state.pending_bytes % state.pending_rows != 0 ? 1 : 0));
-	const auto byte_rows = state.config.task_input_max_bytes / bytes_per_row;
+	const auto target_bytes =
+	    state.config.transport_input_target_bytes > 0
+	        ? MinValue(state.config.task_input_max_bytes, state.config.transport_input_target_bytes)
+	        : state.config.task_input_max_bytes;
+	const auto byte_rows = target_bytes / bytes_per_row;
 	const auto target_rows = MaxValue<idx_t>(compute_rows, byte_rows - byte_rows % compute_rows);
 	if (state.pending_rows >= target_rows) {
 		plan.target_rows = target_rows;
@@ -2778,7 +2792,7 @@ vector<idx_t> TestStreamingOutputCapacityPublication() {
 	                              {"call_mode", Value("map")},
 	                              {"udf_task_input_max_bytes", Value::BIGINT(4096)},
 	                              {"udf_output_target_max_bytes", Value::BIGINT(4096)}});
-	auto state = std::make_shared<StreamingUDFState>(payload, nullptr);
+	auto state = std::make_shared<StreamingUDFState>(payload, nullptr, 0);
 	state->self = state;
 	state->op = make_uniq<UDFOperatorState>(payload);
 	// Model a submit whose DATA has already been consumed downstream.
@@ -3003,7 +3017,8 @@ std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(Clien
 	lock_guard<std::mutex> guard(streaming_state_lock);
 	if (!streaming_state) {
 		auto &udf_bind = bind_data->Cast<UDFFunctionData>();
-		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles);
+		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles,
+		                                                      udf_bind.transport_input_target_bytes);
 		streaming_state->self = streaming_state;
 	}
 	return streaming_state;

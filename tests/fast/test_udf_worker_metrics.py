@@ -637,7 +637,11 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
     elif cleanup_failure == "wakeup":
         worker.register_wakeup(fail_cleanup)
     try:
-        message = "injected parent cleanup failure" if cleanup_failure else "FileNotFoundError"
+        message = (
+            "injected parent cleanup failure"
+            if cleanup_failure
+            else "pooled shared-memory block has an invalid identity"
+        )
         with pytest.raises(RuntimeError, match=message):
             worker._submit_ref_bundle_direct(payload)
         assert nonzero(metrics) == {"execution_errors": 1}
@@ -1440,7 +1444,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
     before_owners = set(ref_bundle.local_shm_budget_manager()._owned_output_grants)
     before_input_owners = dict(ref_bundle.local_shm_budget_manager()._owned_input_allocations)
     receive, acquire = local._recv_message, ref_bundle.acquire_allocation
-    release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
+    release_budget, close_data = ref_bundle._PooledBudgetCharge.release, worker._close_data_shm
     release_descriptor = local.release_local_shm_ref_bundle_descriptor
     descriptors = []
     injected = []
@@ -1464,18 +1468,18 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         injected.append(cleanup_failure)
         raise RuntimeError("injected adoption cleanup failure")
 
-    def fail_budget_callback(size, *, name="", output_owner=None, input_owner_id=None):
-        release_budget(size, name=name, output_owner=output_owner, input_owner_id=input_owner_id)
+    def fail_budget_callback(charge):
+        release_budget(charge)
         # Model a failing post-release notification, without leaking a test
         # allocation. The failed region acquisition remains the primary error.
-        if descriptors and not injected:
+        if descriptors and charge.name == descriptors[0]["block_refs"][0]["shm_name"] and not injected:
             fail_cleanup()
 
     monkeypatch.setattr(local, "_recv_message", missing_result)
     if failure in {"missing_shm", "allocation"}:
         monkeypatch.setattr(ref_bundle, "acquire_allocation", fail_allocation)
     if cleanup_failure == "budget":
-        monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", fail_budget_callback)
+        monkeypatch.setattr(ref_bundle._PooledBudgetCharge, "release", fail_budget_callback)
     elif cleanup_failure == "descriptor":
         monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", fail_cleanup)
     elif cleanup_failure == "worker":
@@ -1491,7 +1495,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         assert not worker.is_reusable()
     finally:
         monkeypatch.setattr(ref_bundle, "acquire_allocation", acquire)
-        monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", release_budget)
+        monkeypatch.setattr(ref_bundle._PooledBudgetCharge, "release", release_budget)
         monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", release_descriptor)
         monkeypatch.setattr(worker, "_close_data_shm", close_data)
         worker.close(kill=True)

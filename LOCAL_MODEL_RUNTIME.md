@@ -2230,9 +2230,13 @@ call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
 queues preserve per-replica submission order and cancellation ownership.
 Admitted materialized inputs are sized and written by the bounded prefetch
 threads before waiting for their actor's execution turn, overlapping the previous
-call's computation. Preparation also follows per-replica FIFO order, so a later
-input cannot take the earlier call's progress credit. Cancelling a prepared call
-releases its input lease even when it never acquires a worker. Input ACK returns
+call's computation. Preparation follows per-replica FIFO order and is speculative:
+it never waits for memory or spends an execution progress allowance. Executing
+calls take priority and can reclaim unclaimed prefetched blocks when they need
+space. The queued call retains its original Arrow input and prepares it again
+at execution handoff, without replaying user code. Explicit byte reservations
+are consumed only at that handoff. Cancelling a prepared call releases its
+blocks even when it never acquires a worker. Input ACK returns
 the materialized-input progress credit independently of retained physical bytes.
 The input lease owns newly materialized descriptors and releases the parent's
 reference on ACK; worker views and fork descendants retain their physical leases.
@@ -2246,6 +2250,14 @@ byte-budget transport aggregation policy. A task can carry multiple complete
 compute batches without changing `batch_size`. Ready actors receive a complete
 batch immediately; byte pressure and end-of-input drain partial tails. Explicit
 `min_task_batch_size` retains its existing upstream-block soft-minimum semantics.
+Local automatic aggregation also caps its byte target at half the actual worker
+arena capacity, leaving room for outputs. Query startup installs that capacity
+alongside the actor resource owners before native input planning; pipeline
+threads neither enter Python nor wait for capacity discovery. This remains an
+estimated transport target with the existing
+single-compute-batch and oversized-row rules, not a guarantee that arbitrary UDF
+outputs fit in the arena. Claimed inputs, live views and fork leases remain
+protected from speculative reclamation.
 
 Failed or cancelled workers are cleaned up before their invocation completes;
 their replacements initialize on the next invocation. Cancellation interrupts

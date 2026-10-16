@@ -47,6 +47,7 @@ from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
     InvalidLocalShmReferenceError,
+    LocalShmBlockRef,
     _create_shm,
     _open_existing_shm,
     _unlink_shm,
@@ -100,7 +101,12 @@ from vane.execution.udf_local_resources import LocalProcessCapacityError, local_
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_process_group import WorkerProcessGroup
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
-from vane.execution.udf_shm_store import LocalQueryShmStore, LocalShmStoreCapacityError, ParentShmPeer
+from vane.execution.udf_shm_store import (
+    LocalQueryShmStore,
+    LocalShmPrefetchDeferred,
+    LocalShmStoreCapacityError,
+    ParentShmPeer,
+)
 from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
 from vane.execution.udf_threading import subprocess_actor_thread_env
 from vane.execution.udf_threading import (
@@ -1174,39 +1180,42 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 if self._shm_peer is None:
                     raise RuntimeError("worker has no shared-memory ownership channel")
                 self._shm_peer.store.check_write_size(size)
-                while True:
-                    if reservation is not None:
-                        scope.raise_if_cancelled("UDF subprocess output grant")
-                        grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
-                    else:
-                        grant_id = request_local_shm_output_grant(
-                            size,
-                            name=f"udf-output-{request_id}",
-                            priority=priority,
-                            input_lease_id=input_lease_id,
-                            owner_id=scope.owner_id,
-                            cancel_event=scope,
-                            wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
-                        )
-                    self._track_output_grant(grant_id, scope)
-                    scope.raise_if_cancelled("UDF subprocess output grant")
-                    try:
-                        allocation = self._shm_peer.reserve_write(grant_id, size, producer_id=scope.owner_id)
-                        break
-                    except LocalShmStoreCapacityError:
+                with self._shm_peer.store.foreground_allocation():
+                    if not local_shm_budget_manager().can_claim_output(size):
+                        self._shm_peer.store.reclaim_prefetched_inputs()
+                    while True:
                         if reservation is not None:
-                            # Explicit envelopes are strict. They consume the
-                            # declared output allowance once, without escape.
-                            raise
-                        self._release_output_grant(grant_id, name="udf-output-waiting-for-storage")
-                        grant_id = 0
-                        self._shm_peer.store.wait_for_capacity(
-                            size,
-                            self._shm_peer.input_allocations(event["input_tokens"]),
-                            scope,
-                            lambda: self._capacity_wait_context("shared_memory_output"),
-                            local_shm_budget_manager().consuming_input_producers(input_lease_id),
-                        )
+                            scope.raise_if_cancelled("UDF subprocess output grant")
+                            grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
+                        else:
+                            grant_id = request_local_shm_output_grant(
+                                size,
+                                name=f"udf-output-{request_id}",
+                                priority=priority,
+                                input_lease_id=input_lease_id,
+                                owner_id=scope.owner_id,
+                                cancel_event=scope,
+                                wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
+                            )
+                        self._track_output_grant(grant_id, scope)
+                        scope.raise_if_cancelled("UDF subprocess output grant")
+                        try:
+                            allocation = self._shm_peer.reserve_write(grant_id, size, producer_id=scope.owner_id)
+                            break
+                        except LocalShmStoreCapacityError:
+                            if reservation is not None:
+                                # Explicit envelopes are strict. They consume the
+                                # declared output allowance once, without escape.
+                                raise
+                            self._release_output_grant(grant_id, name="udf-output-waiting-for-storage")
+                            grant_id = 0
+                            self._shm_peer.store.wait_for_capacity(
+                                size,
+                                self._shm_peer.input_allocations(event["input_tokens"]),
+                                scope,
+                                lambda: self._capacity_wait_context("shared_memory_output"),
+                                local_shm_budget_manager().consuming_input_producers(input_lease_id),
+                            )
             except BaseException as exc:
                 if grant_id > 0:
                     if self._shm_peer is not None:
@@ -3935,6 +3944,7 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 if "local_query_admission" in options:
                     raise ValueError("UDF node already has a query resource policy")
                 options["local_query_admission"] = LocalQueryAdmissionBinding(policy, unit_ids[node_id])
+                options["local_transport_input_target_bytes"] = query_store.store.capacity // 2
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
     except BaseException as creation_error:
@@ -4818,15 +4828,49 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
     def _submit_materialized(self, submit_id: int | None, table: pa.Table) -> None:
         admission = self._take_task_admission()
-        worker_payload = None
+        prepared: tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]] | None = None
+        worker_payload: dict[str, Any] | None = None
+        lease_id: int | None = None
+        claimed = False
+        preparation_lock = threading.RLock()
 
-        @contextmanager
-        def prepare(scope: ExecutionCancellationScope) -> Iterator[None]:
-            nonlocal worker_payload
-            scope.raise_if_cancelled("UDF subprocess input preparation")
-            if table.num_rows == 0:
-                yield
+        def unregister_prefetch() -> None:
+            pass
+
+        cleanup_failure: BaseException | None = None
+
+        def release_prepared() -> None:
+            nonlocal prepared, worker_payload, lease_id, cleanup_failure
+            if prepared is None:
                 return
+            errors = []
+            try:
+                if lease_id is not None:
+                    if cancel_local_shm_input_lease(lease_id, name="udf-materialized-input") is None:
+                        raise RuntimeError("input transport cleanup is still in progress")
+                    self._untrack_input_lease(lease_id)
+                    lease_id = None
+            except BaseException as error:
+                errors.append(error)
+            for ref in prepared[1]:
+                try:
+                    ref.release()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                details = _subprocess_cleanup_error_details(errors)
+                cleanup_failure = capture_cleanup(f"UDF prefetched input cleanup failed: {details}", *errors)
+                raise cleanup_failure from errors[0]
+            prepared = None
+            worker_payload = None
+
+        def reclaim() -> None:
+            with preparation_lock:
+                if not claimed:
+                    release_prepared()
+
+        def materialize(scope: ExecutionCancellationScope, *, prefetch: bool = False) -> None:
+            nonlocal prepared, worker_payload, lease_id
 
             def wait_context() -> AbstractContextManager[None]:
                 base = admission.suspend_for_wait(scope) if admission is not None else nullcontext()
@@ -4837,54 +4881,84 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             input_producer_id = None
             if self._actor_pool is not None:
                 assert admission is not None
-                # A resident replica can serve several query executors. Its
-                # queued inputs share one dependency, regardless of query ID.
                 input_producer_id = self._actor_pool._input_stream_ids[int(admission.lease["actor_index"])]
-            _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
+            prepared = make_local_shm_ref_bundle_result(
                 table,
                 cancel_event=scope,
                 wait_context=wait_context,
                 input_owner_id=scope.owner_id,
                 input_producer_id=input_producer_id,
                 task_reservation=reservation.transport if reservation is not None else None,
+                prefetch=prefetch,
             )
-            lease_id = None
+            _marker, refs, metadata, names = prepared
+            worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                refs, None, metadata, names, submit_id=submit_id, name="udf-materialized-input", owns_refs=True
+            )
+            if worker_payload is None or lease_id is None:
+                raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
+            # Keep failed cleanup retryable through the executor/query owner,
+            # including cancellation before this call ever acquires a worker.
+            self._track_input_lease(lease_id)
+
+        @contextmanager
+        def prepare(scope: ExecutionCancellationScope) -> Iterator[None]:
+            nonlocal unregister_prefetch
+            scope.raise_if_cancelled("UDF subprocess input preparation")
+            if table.num_rows == 0:
+                yield
+                return
+            owner = LocalQueryShmStore()
             preparation_error = None
             try:
-                if task is not None:
-                    track_local_shm_inputs(task, refs)
-                worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
-                    refs, None, metadata, names, submit_id=submit_id, name="udf-materialized-input", owns_refs=True
-                )
-                if worker_payload is None or lease_id is None:
-                    raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
-                self._track_input_lease(lease_id)
+                if self._actor_pool is not None:
+                    with preparation_lock:
+                        # Register before allocating: a concurrent output may
+                        # need this space even while serialization is finishing.
+                        unregister_prefetch = owner.store.register_prefetch(reclaim)
+                        try:
+                            materialize(scope, prefetch=True)
+                        except LocalShmPrefetchDeferred:
+                            unregister_prefetch()
                 scope.raise_if_cancelled("UDF subprocess prepared input")
                 yield
             except BaseException as error:
                 preparation_error = error
                 raise
             finally:
+                unregister_prefetch()
                 cleanup_errors = []
                 try:
-                    if lease_id is not None:
-                        if cancel_local_shm_input_lease(lease_id, name="udf-materialized-input") is None:
-                            raise RuntimeError("input transport cleanup is still in progress")
-                        self._untrack_input_lease(lease_id)
+                    with preparation_lock:
+                        release_prepared()
                 except BaseException as error:
                     cleanup_errors.append(error)
-                for ref in refs:
-                    try:
-                        ref.release()
-                    except BaseException as error:
-                        cleanup_errors.append(error)
+                finally:
+                    owner.shutdown()
                 if cleanup_errors:
                     errors = ([preparation_error] if preparation_error is not None else []) + cleanup_errors
                     details = _subprocess_cleanup_error_details(errors)
                     raise capture_cleanup(f"UDF materialized input cleanup failed: {details}", *errors) from errors[0]
 
         def run(worker: _SingleSubprocessExecutor) -> Any | None:
-            return worker._submit_ref_bundle_direct(worker_payload) if worker_payload is not None else None
+            nonlocal claimed
+            if table.num_rows == 0:
+                return None
+            scope = worker._current_execution_scope()
+            with preparation_lock:
+                # After handoff, only normal Arrow/worker/fork leases may release
+                # this input. Reclaimers racing with claim see the same lock.
+                claimed = True
+                unregister_prefetch()
+                if cleanup_failure is not None:
+                    raise cleanup_failure
+                if prepared is None:
+                    materialize(scope)
+                assert prepared is not None and worker_payload is not None
+                task = current_data_task()
+                if task is not None:
+                    track_local_shm_inputs(task, prepared[1])
+            return worker._submit_ref_bundle_direct(worker_payload)
 
         self._submit_async(
             submit_id,

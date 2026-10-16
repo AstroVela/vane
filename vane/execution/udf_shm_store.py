@@ -348,6 +348,10 @@ class StoreLease:
         self.release()
 
 
+class LocalShmPrefetchDeferred(Exception):
+    """Speculative input must wait for its execution turn before allocating."""
+
+
 class LocalShmStore:
     def __init__(self, capacity: int) -> None:
         _require_registry_owner()
@@ -358,6 +362,8 @@ class LocalShmStore:
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._capacity_condition = threading.Condition(self._lock)
+        self._foreground_allocations = 0
+        self._prefetch_reclaimers: set[Callable[[], None]] = set()
         self._waiting_writes: dict[tuple[str, int], tuple[int, set[int], frozenset[str]]] = {}
         self._retained_inputs: dict[str, set[int]] = {}
         self._shm: Any = None
@@ -397,15 +403,65 @@ class LocalShmStore:
             if not self._clients:
                 self._drain_locked()
 
-    def allocate(self, size: int, *, producer_id: str | None = None) -> StoreLease:
+    @contextmanager
+    def foreground_allocation(self) -> Iterator[None]:
+        """Give executing calls priority over reconstructible queued input."""
+        self._require_owner()
+        with self._lock:
+            self._foreground_allocations += 1
+        try:
+            yield
+        finally:
+            if self._owner_pid == os.getpid():
+                with self._lock:
+                    self._foreground_allocations -= 1
+
+    def register_prefetch(self, reclaim: Callable[[], None]) -> Callable[[], None]:
+        self._require_owner()
+        with self._lock:
+            self._prefetch_reclaimers.add(reclaim)
+
+        def unregister() -> None:
+            self._require_owner()
+            with self._lock:
+                self._prefetch_reclaimers.discard(reclaim)
+
+        return unregister
+
+    def reclaim_prefetched_inputs(self) -> None:
+        # Owners may be finishing a copy or acquiring the store lock to release
+        # their descriptors. Never invoke them while holding that lock.
+        self._require_owner()
+        with self._lock:
+            reclaimers = tuple(self._prefetch_reclaimers)
+            self._prefetch_reclaimers.clear()
+        for reclaim in reclaimers:
+            reclaim()
+
+    def allocate(self, size: int, *, producer_id: str | None = None, speculative: bool = False) -> StoreLease:
+        self._require_owner()
+        if speculative:
+            return self._allocate(size, producer_id=producer_id, speculative=True)
+        with self.foreground_allocation():
+            try:
+                return self._allocate(size, producer_id=producer_id)
+            except LocalShmStoreCapacityError:
+                self.reclaim_prefetched_inputs()
+                return self._allocate(size, producer_id=producer_id)
+
+    def _allocate(self, size: int, *, producer_id: str | None, speculative: bool = False) -> StoreLease:
         self._require_owner()
         required = self.check_write_size(size)
         with self._mutation():
             self._collect_fork_pins_locked()
             if self._closed:
                 raise RuntimeError("shared-memory store is closed")
+            if speculative and self._foreground_allocations:
+                raise LocalShmPrefetchDeferred()
             index = next((i for i, (_, length) in enumerate(self._free) if length >= required), None)
             if index is None:
+                if speculative:
+                    raise LocalShmPrefetchDeferred()
                 live = sum(entry.capacity for entry in self._live.values())
                 raise LocalShmStoreCapacityError(
                     f"shared-memory store cannot allocate {size} bytes: "

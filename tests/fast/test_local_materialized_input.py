@@ -206,3 +206,62 @@ def test_prefetched_input_does_not_take_another_replicas_progress_slot(arena, mo
                 manager.wake_waiters()
     finally:
         queued.release()
+
+
+@pytest.mark.parametrize("pressure", ["budget", "arena", "foreground"])
+def test_speculative_input_defers_without_spending_progress_or_waiting(arena, monkeypatch, pressure):
+    store, manager = arena
+    table = pa.table({"x": [b"x" * (64 * 1024)]})
+    occupied = None
+    if pressure == "budget":
+        monkeypatch.setattr(manager, "_limit_factory", lambda: 1)
+    elif pressure == "arena":
+        occupied = store.allocate(96 * 1024)
+    try:
+        with store.foreground_allocation() if pressure == "foreground" else nullcontext():
+            with pytest.raises(storage.LocalShmPrefetchDeferred):
+                publish(table, prefetch=True, input_owner_id="actor", input_producer_id="replica")
+        assert manager.snapshot()["allocated_bytes"] == 0
+        assert manager._owned_input_allocations == {}
+    finally:
+        if occupied is not None:
+            occupied.release()
+
+
+def test_reclaim_runs_outside_store_lock_and_excludes_new_prefetch(arena):
+    store, _ = arena
+    speculative = publish(pa.table({"x": [b"x" * (64 * 1024)]}), prefetch=True)
+    reclaimed = threading.Event()
+
+    def reclaim():
+        # Release on another thread to detect invoking a callback under the
+        # arena lock. Foreground priority must also span this callback.
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            threads.submit(speculative.release).result(timeout=5)
+        with pytest.raises(storage.LocalShmPrefetchDeferred):
+            publish(pa.table({"x": [1]}), prefetch=True)
+        reclaimed.set()
+
+    unregister = store.register_prefetch(reclaim)
+    try:
+        allocation = store.allocate(96 * 1024)
+        allocation.release()
+        assert reclaimed.is_set()
+        assert speculative._closed
+    finally:
+        unregister()
+        speculative.release()
+
+
+def test_speculative_input_does_not_consume_strict_reservation(arena):
+    _, manager = arena
+    table = pa.table({"x": [b"x" * 1024]})
+    size = refs.prepare_local_shm_block(table).ipc_size_bytes
+    reservation = manager.reserve_task_bytes(size, 1)
+    try:
+        with pytest.raises(storage.LocalShmPrefetchDeferred):
+            publish(table, task_reservation=reservation, prefetch=True)
+        ref = publish(table, task_reservation=reservation)
+        ref.release()
+    finally:
+        reservation.release()

@@ -57,6 +57,16 @@ def test_actor_automatically_aggregates_transport_without_changing_compute(tmp_p
     assert batches == [list(range(start, start + 32)) for start in range(0, 320, 32)]
 
 
+@pytest.mark.parametrize("batch_format", ["pyarrow", "numpy"])
+@pytest.mark.parametrize("change_arena_env", [False, True])
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_local_aggregation_respects_physical_arena_capacity(tmp_path, batch_format, change_arena_env, runner):
+    env = {**os.environ, "VANE_RUNNER": runner, "VANE_PROGRESS": "0", "VANE_LOCAL_SHM_STORE_BYTES": str(80 * 1024)}
+    result = run_probe(tmp_path, env, batch_format=batch_format, gate="aggregate", change_arena_env=change_arena_env)
+    assert result["output_rows"] == 320
+    assert all(task["rows"] <= 32 for task in result["tasks"].values())
+
+
 @pytest.mark.parametrize("rows", [0, 1, 31, 33, 95, 97, 277])
 def test_actor_aggregation_preserves_eos_tail(tmp_path, transport_env, rows):
     result = run_probe(tmp_path, transport_env, rows=rows, block_rows=9)

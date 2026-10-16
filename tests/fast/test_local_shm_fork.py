@@ -152,6 +152,9 @@ from vane.execution import udf_shm_store as storage
 
 store = storage.current_store('parent')
 lease = store.allocate(64)
+unregister_prefetch = store.register_prefetch(lambda: None)
+foreground = store.foreground_allocation()
+foreground.__enter__()
 slot = lease.allocation
 region = store.buffer(slot)
 region[:] = b'p' * 64
@@ -173,7 +176,11 @@ if pid == 0:
     # Explicit inherited handles cannot bypass the fresh registry or wait on
     # a vanished thread's allocator/lease lock.
     operations = [lease.fork, lambda: store.add_client('child'), lambda: store.allocate(64),
-                  lambda: store.acquire(slot), lambda: store.buffer(slot), store.snapshot]
+                  lambda: store.acquire(slot), lambda: store.buffer(slot), store.snapshot,
+                  lambda: store.allocate(64, speculative=True),
+                  lambda: store.foreground_allocation().__enter__(),
+                  lambda: store.register_prefetch(lambda: None),
+                  store.reclaim_prefetched_inputs, unregister_prefetch]
     for operation in operations:
         try:
             operation()
@@ -181,6 +188,7 @@ if pid == 0:
             assert 'different process' in str(error), str(error)
         else:
             raise AssertionError('inherited handle accepted in fork child')
+    foreground.__exit__(None, None, None)
     assert storage.local_shm_store_snapshot()['capacity_bytes'] == 0
     try:
         storage.acquire_allocation(slot.descriptor())
@@ -207,8 +215,10 @@ try:
     region = store.buffer(slot)
     assert bytes(region) == b'p' * 64
     region.release()
-    print(json.dumps({'rejected': 6, 'parent_intact': True}), flush=True)
+    print(json.dumps({'rejected': 11, 'parent_intact': True}), flush=True)
 finally:
+    foreground.__exit__(None, None, None)
+    unregister_prefetch()
     lease.release()
     store.remove_client('second-parent-client')
     store.remove_client('parent')
@@ -226,7 +236,7 @@ def test_forked_child_rejects_inherited_handles_before_taking_locks(held_lock):
         env={**os.environ, "VANE_LOCAL_SHM_STORE_BYTES": "1m"},
     )
     assert child.returncode == 0, child.stdout + child.stderr
-    assert json.loads(child.stdout) == {"rejected": 6, "parent_intact": True}
+    assert json.loads(child.stdout) == {"rejected": 11, "parent_intact": True}
 
 
 _WORKER_EXIT_FINALIZER = """

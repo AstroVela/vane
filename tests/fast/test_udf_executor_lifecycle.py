@@ -2243,6 +2243,7 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
             "local_actor_pool": created[1],
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
             "local_query_admission": handles_map["4"]["local_query_admission"],
+            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
         }
         binding = handles_map["5"]["local_task_progress"]
         assert binding.query is created[2]
@@ -2322,6 +2323,7 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
             "session_config": session_config,
             "local_actor_pool": existing_pool,
             "local_query_admission": handles_map["4"]["local_query_admission"],
+            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
         }
     }
 
@@ -10921,7 +10923,7 @@ def test_unready_actor_is_killed_without_close_rpc_even_after_partial_cleanup(mo
     assert closed == [True]
 
 
-@pytest.mark.parametrize("outcome", ["complete", "cancel", "copy_failure"])
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "copy_failure", "cleanup_failure"])
 def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypatch, tmp_path, outcome):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.ai import DiagnosticError, summarize_error
@@ -10948,6 +10950,7 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
     prepared = threading.Event()
     original = subprocess_exec.make_local_shm_ref_bundle_result
     captured = []
+    cleanup_allowed = threading.Event()
 
     def observe(table, **kwargs):
         if table.column("x")[0].as_py() != 2:
@@ -10957,6 +10960,16 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
             raise ValueError("planned input copy failure")
         result = original(table, **kwargs)
         captured.extend(result[1])
+        if outcome == "cleanup_failure":
+            ref = result[1][0]
+            release_ref = ref.release
+
+            def fail_until_retry():
+                if not cleanup_allowed.is_set():
+                    raise RuntimeError("planned prefetched cleanup failure")
+                release_ref()
+
+            monkeypatch.setattr(ref, "release", fail_until_retry)
         prepared.set()
         return result
 
@@ -10973,7 +10986,16 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
         # without acquiring it, including across separate query executors.
         assert prepared.wait(5)
         assert not release.exists()
-        if outcome == "cancel":
+        if outcome == "cleanup_failure":
+            with pytest.raises(RuntimeError, match="cleanup"):
+                second.close(kill=True)
+            assert second.cleanup_pending()
+            assert second._active_input_leases
+            cleanup_allowed.set()
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            assert all(ref._closed for ref in captured)
+        elif outcome == "cancel":
             second.close(kill=True)
             assert not second.cleanup_pending()
             assert captured and all(ref._closed for ref in captured)
@@ -10989,9 +11011,109 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
             assert _wait_for_results(second, 1)[0].column("x").to_pylist() == [2]
         assert pool.worker_pids() == [pid]
     finally:
+        cleanup_allowed.set()
         release.touch()
         second.close(kill=True)
         first.close(kill=True)
         pool.shutdown(kill=True)
     assert all(ref._closed for ref in captured)
+    assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
+
+
+@pytest.mark.parametrize("budget", ["auto", "0"])
+@pytest.mark.parametrize("input_kib,output_kib,cancel_prefetch", [(32, 32, False), (8, 64, False), (32, 32, True)])
+def test_prefetch_preserves_running_calls_output_capacity(
+    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch
+):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", budget)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("prefetch-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    entered, release = tmp_path / "entered", tmp_path / "release"
+
+    class Actor:
+        def __call__(self, table):
+            value = table["x"][0].as_py()
+            if value.startswith(b"1"):
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first call was never released")
+                    time.sleep(0.01)
+            return pa.table({"x": [value[:1] * (output_kib * 1024)]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    first, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    second = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    prepared = threading.Event()
+    captured = []
+    original = subprocess_exec.make_local_shm_ref_bundle_result
+    reclaimed, output_allowed = threading.Event(), threading.Event()
+    original_reclaim = store.reclaim_prefetched_inputs
+
+    def reclaim():
+        original_reclaim()
+        reclaimed.set()
+        assert output_allowed.wait(10), "test did not release output allocation"
+
+    if cancel_prefetch:
+        monkeypatch.setattr(store, "reclaim_prefetched_inputs", reclaim)
+
+    def observe(table, **kwargs):
+        if not table["x"][0].as_py().startswith(b"2"):
+            return original(table, **kwargs)
+        try:
+            result = original(table, **kwargs)
+            captured.extend(result[1])
+            return result
+        finally:
+            prepared.set()
+
+    monkeypatch.setattr(subprocess_exec, "make_local_shm_ref_bundle_result", observe)
+    try:
+        _submit_with_admission(first, pa.table({"x": [b"1" * (input_kib * 1024)]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        _submit_with_admission(second, pa.table({"x": [b"2" * (input_kib * 1024)]}))
+        assert prepared.wait(5), "prefetch did not finish or defer"
+        if budget == "0":
+            assert captured and not captured[0]._closed
+        release.touch()
+        if cancel_prefetch:
+            assert reclaimed.wait(5)
+            assert all(ref._closed for ref in captured)
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            output_allowed.set()
+        for index, executor in enumerate((first,) if cancel_prefetch else (first, second), 1):
+            result = _wait_for_results(executor, 1)[0]
+            assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+            try:
+                values = [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()]
+                assert values == [str(index).encode() * (output_kib * 1024)]
+            finally:
+                for ref in result[1]:
+                    ref.release()
+            del result
+    finally:
+        release.touch()
+        output_allowed.set()
+        second.close(kill=True)
+        first.close(kill=True)
+        pool.shutdown(kill=True)
+        store.remove_client("prefetch-test")
+    assert all(ref._closed for ref in captured)
+    assert store.snapshot()["live_allocations"] == 0
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0

@@ -175,8 +175,15 @@ def main():
 
         faulthandler.dump_traceback_later(35, repeat=True)
 
-    local = os.environ["VANE_RUNNER"] == "local"
+    local = os.environ["VANE_RUNNER"] in {"local", "local-fast"}
     config["local"] = local
+    pinned_arena = None
+    if config.get("change_arena_env"):
+        from vane.execution.udf_shm_store import LocalQueryShmStore
+
+        pinned_arena = LocalQueryShmStore()
+        # Runtime planning must use the arena already owned by this process.
+        os.environ["VANE_LOCAL_SHM_STORE_BYTES"] = str(1024 * 1024)
     if not local:
         vane.runners.set_runner_ray(noop_if_initialized=True)
     con = vane.connect()
@@ -278,6 +285,8 @@ def main():
     finally:
         con.close()
         vane.teardown_runner()
+        if pinned_arena is not None:
+            pinned_arena.shutdown()
     calls = []
     for path in sorted(root.glob("calls_*.jsonl")):
         calls.extend(json.loads(line) for line in path.read_text().splitlines())

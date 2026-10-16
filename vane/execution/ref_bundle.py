@@ -34,6 +34,7 @@ from vane.execution.udf_data_lease import DataAllocation, TaskDataScope
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_shm_store import (
     LocalQueryShmStore,
+    LocalShmPrefetchDeferred,
     LocalShmStoreCapacityError,
     ShmAllocation,
     StoreLease,
@@ -356,6 +357,16 @@ class LocalShmBudgetManager:
                 return True
             usage = self._usage_locked()
             return usage <= 0 or usage + requested <= limit
+
+    def try_acquire_allocation(
+        self, size: int, *, name: str, input_owner_id: str | None, input_slot_id: str | None
+    ) -> int:
+        """Prefetch cannot wait or spend an execution progress allowance."""
+        with self._cond:
+            limit = self._limit_locked()
+            if limit > 0 and self._usage_locked() + size > limit:
+                raise LocalShmPrefetchDeferred()
+            return self.acquire_allocation(size, name=name, input_owner_id=input_owner_id, input_slot_id=input_slot_id)
 
     def acquire_allocation(
         self,
@@ -1845,6 +1856,7 @@ def make_local_shm_ref_bundle_result(
     allocation_role: str = "input",
     input_owner_id: str | None = None,
     input_producer_id: str | None = None,
+    prefetch: bool = False,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     """Size, admit and write a materialized block directly into the query arena.
 
@@ -1860,45 +1872,58 @@ def make_local_shm_ref_bundle_result(
     allocation_lease = None
     charge = None
     try:
+        if prefetch and task_reservation is not None:
+            # Explicit envelopes are consumed once, at execution handoff.
+            raise LocalShmPrefetchDeferred()
         store.check_write_size(required)
         if task_reservation is not None:
             input_owner_id = None
         # One replica's prefetched input must not take another replica's only
         # progress slot. The source operator still owns the output window.
         input_slot_id = input_producer_id if input_owner_id is not None else None
-        while True:
-            if cancel_event is not None:
-                cancel_event.raise_if_cancelled("local_shm input allocation")
-            budget_bytes = (
-                task_reservation.allocate(required, role=allocation_role)
-                if task_reservation is not None
-                else _acquire_local_shm_ref_budget(
-                    required,
-                    name="local-shm-result",
-                    cancel_event=cancel_event,
-                    wait_context=wait_context,
-                    input_owner_id=input_owner_id,
-                    input_slot_id=input_slot_id,
+        with nullcontext() if prefetch else store.foreground_allocation():
+            manager = local_shm_budget_manager()
+            if not prefetch and not manager.can_claim_output(required):
+                store.reclaim_prefetched_inputs()
+            while True:
+                if cancel_event is not None:
+                    cancel_event.raise_if_cancelled("local_shm input allocation")
+                if prefetch:
+                    budget_bytes = manager.try_acquire_allocation(
+                        required,
+                        name="local-shm-result",
+                        input_owner_id=input_owner_id,
+                        input_slot_id=input_slot_id,
+                    )
+                elif task_reservation is not None:
+                    budget_bytes = task_reservation.allocate(required, role=allocation_role)
+                else:
+                    budget_bytes = _acquire_local_shm_ref_budget(
+                        required,
+                        name="local-shm-result",
+                        cancel_event=cancel_event,
+                        wait_context=wait_context,
+                        input_owner_id=input_owner_id,
+                        input_slot_id=input_slot_id,
+                    )
+                charge = _PooledBudgetCharge(
+                    budget_bytes, "local-shm-result", input_owner_id=input_slot_id or input_owner_id
                 )
-            )
-            charge = _PooledBudgetCharge(
-                budget_bytes, "local-shm-result", input_owner_id=input_slot_id or input_owner_id
-            )
-            try:
-                allocation_lease = store.allocate(required, producer_id=producer_id)
-                break
-            except LocalShmStoreCapacityError:
-                charge.release_unattached()
-                if task_reservation is not None or cancel_event is None:
-                    raise
-                # Never hold a soft budget charge while waiting for storage.
-                store.wait_for_capacity(
-                    required,
-                    (),
-                    cancel_event,
-                    wait_context or nullcontext,
-                    frozenset((producer_id,)) if producer_id is not None else frozenset(),
-                )
+                try:
+                    allocation_lease = store.allocate(required, producer_id=producer_id, speculative=prefetch)
+                    break
+                except LocalShmStoreCapacityError:
+                    charge.release_unattached()
+                    if task_reservation is not None or cancel_event is None:
+                        raise
+                    # Never hold a soft budget charge while waiting for storage.
+                    store.wait_for_capacity(
+                        required,
+                        (),
+                        cancel_event,
+                        wait_context or nullcontext,
+                        frozenset((producer_id,)) if producer_id is not None else frozenset(),
+                    )
         region = store.buffer(allocation_lease.allocation)
         try:
             block.write_to(region)
