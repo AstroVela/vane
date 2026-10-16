@@ -46,6 +46,9 @@ required transitive notices are rejected as well.
 
 ## Incremental package build
 
+The [unified embedding design](EMBEDDING_DESIGN.md) tracks the typed input
+contract, provider/protocol boundaries, Context integration and delivery gates.
+
 Create and activate a virtual environment, then reuse a persistent native build directory:
 
 ```bash
