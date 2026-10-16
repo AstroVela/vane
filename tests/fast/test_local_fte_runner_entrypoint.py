@@ -274,6 +274,72 @@ assert sorted(row[0] for row in conn.read_parquet(str(dst)).fetchall()) == [0, 1
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+@pytest.mark.parametrize("sink", ["parquet", "datasink"])
+def test_local_subprocess_actors_replay_stable_identities_across_write_fragments(tmp_path, sink):
+    script = """
+import sys
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+import vane
+from vane.datasink import BoundDataSink, DataSink, DataSinkWorker, WriteOutcome, WriteResult
+
+class AddOne:
+    def __call__(self, batch):
+        return pa.table({"x": pc.add(batch.column(0), 1)})
+
+class AddTen:
+    def __call__(self, batch):
+        return pa.table({"x": pc.add(batch.column(0), 10)})
+
+class Worker(DataSinkWorker):
+    def __init__(self, path):
+        self.path = path
+
+    def write(self, table):
+        pq.write_to_dataset(table, self.path)
+        return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows, bytes_received=table.nbytes)
+
+class Bound(BoundDataSink):
+    def __init__(self, path):
+        self.path = path
+
+    def open_worker(self, context):
+        return Worker(self.path)
+
+class Sink(DataSink):
+    def __init__(self, path):
+        self.path = path
+
+    def bind(self, schema):
+        return Bound(self.path)
+
+vane.set_runner_local(num_workers=1, max_running_tasks=1)
+try:
+    with vane.connect() as conn:
+        relation = conn.sql("SELECT i::BIGINT AS x FROM range(3) t(i)").map_batches(
+            AddOne, schema={"x": "BIGINT"}, execution_backend="subprocess_actor", actor_number=1
+        ).repartition(2).map_batches(
+            AddTen, schema={"x": "BIGINT"}, execution_backend="subprocess_actor", actor_number=1
+        )
+        if sys.argv[2] == "parquet":
+            relation.write_parquet(sys.argv[1])
+        else:
+            summary = relation.write_datasink(Sink(sys.argv[1]))
+            assert summary.outcome is WriteOutcome.APPLIED and summary.rows_received == 3
+    assert sorted(pq.read_table(sys.argv[1]).column(0).to_pylist()) == [11, 12, 13]
+finally:
+    vane.teardown_runner()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "actor.parquet"), sink],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_local_runner_repartition_write_uses_local_exchange_node_in_subprocess():
     script = """
 import pathlib
@@ -844,7 +910,10 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
                 "copy_output_outcome_unknown": terminal == "unknown",
             }
 
-    logical_plan = SimpleNamespace(idx=lambda: "interrupt-bound-write", to_physical_plan=lambda _connection: object())
+    physical_plan = SimpleNamespace(collect_query_resource_graph_metadata=lambda **_kwargs: None)
+    logical_plan = SimpleNamespace(
+        idx=lambda: "interrupt-bound-write", to_physical_plan=lambda _connection: physical_plan
+    )
 
     def interrupt_after_start():
         if started.is_set():

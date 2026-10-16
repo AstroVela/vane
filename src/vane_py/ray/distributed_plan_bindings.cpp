@@ -42,7 +42,7 @@ struct PyPhysicalPlanWrapper {
 	std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> plan_;
 	py::object arrow_schema_;        // Arrow schema for type information
 	py::object udf_registrations_;   // Connection-local Python UDF registrations captured from the source relation
-	py::object udf_actor_handles_;   // Node-id keyed actor handles for UDF worker execution
+	py::object udf_actor_handles_;   // Resource-unit keyed executor options survive fragment extraction
 	py::object memory_source_refs_;  // Query-owned Ray ObjectRefs for Python in-memory scans
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
 	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
@@ -91,7 +91,7 @@ struct PyPhysicalPlanWrapper {
 			return;
 		}
 		if (!py::isinstance<py::dict>(udf_actor_handles_)) {
-			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by node_id");
+			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by resource_unit_id");
 		}
 		auto handles_map = udf_actor_handles_.cast<py::dict>();
 		if (handles_map.empty()) {
@@ -99,12 +99,15 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		auto physical_plan = plan_->physical_plan();
-		idx_t node_counter = 0;
 		std::function<void(PhysicalOperator &)> inject = [&](PhysicalOperator &op) -> void {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
-				py::str key(std::to_string(node_counter++));
+				auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+				if (resource_unit_id.empty()) {
+					throw InternalException("Distributed UDF executor options require resource_unit_id");
+				}
+				py::str key(resource_unit_id);
 				if (handles_map.contains(key)) {
 					py::object handles_obj = handles_map[key];
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
@@ -1067,9 +1070,9 @@ struct PyPhysicalPlanWrapper {
 		if (handles_map.empty())
 			return;
 
-		if (!handles_map.empty()) {
-			udf_actor_handles_ = handles_map;
-		}
+		// Physical UDF ordinals are local to a plan. Fragment extraction can
+		// remove earlier UDFs, so replay must use the planner's stable unit ID.
+		py::dict by_resource;
 
 		auto physical_plan = plan_->physical_plan();
 		if (!physical_plan || !physical_plan->HasRoot())
@@ -1084,7 +1087,15 @@ struct PyPhysicalPlanWrapper {
 				py::str key(std::to_string(node_id));
 
 				if (handles_map.contains(key)) {
+					auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+					if (resource_unit_id.empty()) {
+						throw InternalException("Describe query resources before binding distributed UDF executors");
+					}
+					if (by_resource.contains(py::str(resource_unit_id))) {
+						throw InternalException("Duplicate distributed UDF resource_unit_id");
+					}
 					py::object handles_obj = handles_map[key];
+					by_resource[py::str(resource_unit_id)] = handles_obj;
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
 				}
 			}
@@ -1093,6 +1104,7 @@ struct PyPhysicalPlanWrapper {
 			}
 		};
 		inject(physical_plan->Root());
+		udf_actor_handles_ = std::move(by_resource);
 	}
 };
 

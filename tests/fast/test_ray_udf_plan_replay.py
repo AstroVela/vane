@@ -32,16 +32,9 @@ def _round_trip_to_fresh_physical_plan(relation):
 
 
 def _execute_fresh_physical_plan(target, physical):
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from tests.local_plan_helpers import execute_local_physical_plan
 
-    pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
-    try:
-        runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
-        result = runner.execute_native(target.cursor(), physical, None, None)
-        return _table_from_native_result(result)
-    finally:
-        for pool in pools:
-            pool.shutdown(kill=True)
+    return execute_local_physical_plan(target, physical)
 
 
 def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
@@ -507,3 +500,39 @@ def test_map_batches_ray_task_rejects_direct_execution_without_query_resource_gr
         relation.arrow().read_all()
     del relation
     con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_mixed_task_actor_pipeline_keeps_executor_options_after_fragment_extraction():
+    import pyarrow as pa
+    import ray
+
+    def prepare(batch):
+        return pa.table({"x": [value + 1 for value in batch.column(0).to_pylist()]})
+
+    class Encode:
+        def __call__(self, batch):
+            assert ray.get_gpu_ids() == []
+            return pa.table({"x": [value * 2 for value in batch.column(0).to_pylist()]})
+
+    def publish(batch):
+        return pa.table({"total": batch.column(0)})
+
+    _runners.set_runner_ray(noop_if_initialized=True)
+    runner = _runners.get_or_create_runner()
+    with vane.connect() as con:
+        relation = con.sql("SELECT i::BIGINT AS x FROM range(6) t(i)").map_batches(
+            prepare, schema={"x": "BIGINT"}, execution_backend="ray_task", batch_size=2, gpus=0
+        )
+        relation = relation.map_batches(
+            Encode, schema={"x": "BIGINT"}, execution_backend="ray_actor", actor_number=1, batch_size=2, gpus=0
+        )
+        relation = relation.aggregate("sum(x)::BIGINT AS total").map_batches(
+            publish, schema={"total": "BIGINT"}, execution_backend="ray_task", gpus=0
+        )
+        try:
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+            result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+            assert result.column(0).to_pylist() == [42]
+        finally:
+            runner.close()

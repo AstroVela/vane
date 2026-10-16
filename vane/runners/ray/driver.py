@@ -468,6 +468,7 @@ class _PreparedQueryResourceRegistration:
     graph: Any
     node_capacities: tuple[Any, ...]
     capacity_snapshot_started_at: float
+    max_native_task_attempts: int = 4
 
 
 def _udf_actor_init_timeout_message(query_id: str, unit_id: str, pool: UDFActorPoolBase) -> str:
@@ -5316,6 +5317,14 @@ class RayQueryDriverActor:
             graph=graph,
             node_capacities=tuple(capacities),
             capacity_snapshot_started_at=capacity_snapshot_started_at,
+            # A native fragment can replay its upstream UDFs. Respect an
+            # explicit no-retry contract at both the UDF and fragment layers.
+            max_native_task_attempts=1
+            if any(
+                node["udf_payload"] is not None and node["udf_payload"].get("max_task_retries") == 0
+                for node in metadata["nodes"]
+            )
+            else 4,
         )
 
     async def _register_query_resources(
@@ -5374,6 +5383,7 @@ class RayQueryDriverActor:
                     graph,
                     allocation,
                     admission_open=True,
+                    max_native_task_attempts=prepared.max_native_task_attempts,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
                     on_eligible_units_change=lambda eligible, fence_epoch: self._transition_query_execution_phase(

@@ -287,6 +287,29 @@ def test_real_processor_text_keeps_literal_video_tokens(real_processor):
     assert inputs["input_ids"][0].tolist() == real_processor.tokenizer(prompt, add_special_tokens=True)["input_ids"]
 
 
+@pytest.mark.parametrize("with_video", [False, True])
+@pytest.mark.filterwarnings(
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
+)
+def test_joint_encoding_uses_one_forward_pass_and_preserves_temporal_inputs(real_processor, with_video):
+    encoder = Qwen3VLEmbedder.__new__(Qwen3VLEmbedder)
+    encoder.processor = real_processor
+    calls = []
+
+    def infer(inputs):
+        calls.append(inputs)
+        return [np.ones(2048, dtype=np.float32)]
+
+    encoder._infer = infer
+    result = encoder.embed_joint(clip() if with_video else None, "OCR at 12.5: <|video_pad|> literal")
+    assert result.shape == (2048,) and len(calls) == 1
+    tokens = calls[0]["input_ids"][0].tolist()
+    assert tokens.count(real_processor.video_token_id) == (1 if with_video else 0)
+    decoded = real_processor.tokenizer.decode(tokens)
+    assert "12.5" in decoded
+    assert "video_grid_thw" in calls[0] if with_video else "video_grid_thw" not in calls[0]
+
+
 @pytest.fixture
 def sdk(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")

@@ -70,7 +70,7 @@ milvus = ["pymilvus>=3.0.1,<4"]
 qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
-google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
+google = ["google-genai>=1.73.0"] # floor preserves multimodal Content parts for Gemini Embedding 2
 typesafe = ["typesafe-sdk>=0.7.0,<0.8"] # validated AsyncTypeSafeClient System One API
 transformers = [
     "sentence-transformers>=5.1",
@@ -113,9 +113,11 @@ video = [ # VideoFile metadata and distributed frame streaming
     "pillow>=10",
     "psutil>=5.9",
 ]
+video_asr = ["faster-whisper>=1.2,<2"] # Local, explicitly provisioned Whisper checkpoints
+video_ocr = ["rapidocr==3.8.1", "onnxruntime>=1.20,<2"] # Validated detection/recognition interfaces
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
-    "google-genai>=1.22.0",
+    "google-genai>=1.73.0",
     "typesafe-sdk>=0.7.0,<0.8",
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support
@@ -290,6 +292,7 @@ include = [
     "/tests/fast/test_ai_image_embedding.py",
     "/tests/fast/test_ai_video_embedding.py",
     "/tests/fast/test_ai_audio_embedding.py",
+    "/tests/fast/test_ai_media_models.py",
     "/tests/fast/test_clap.py",
     "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_qwen3_vl.py",
@@ -492,7 +495,7 @@ stubdeps = [ # dependencies used for typehints in the stubs
 ]
 ai-test = [ # dependencies used for running tests/ai
     "anthropic>=0.117.0",
-    "google-genai>=1.22.0",
+    "google-genai>=1.73.0",
     "numpy<2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version < '3.12'",
     "numpy>=2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version >= '3.12'",
     "numpy>=2.3; sys_platform == 'win32' and platform_machine == 'ARM64' and python_version >= '3.11'",
@@ -631,8 +634,12 @@ module = [
     "aiohttp.*",
     "anthropic",
     "anthropic.*",
+    "av",
+    "av.*",
     "botocore.*",
     "cloudpickle",
+    "faster_whisper",
+    "faster_whisper.*",
     "fsspec.*",
     "google",
     "google.*",
@@ -641,10 +648,14 @@ module = [
     "openai",
     "openai.*",
     "pandas",
+    "PIL",
+    "PIL.*",
     "polars",
     "pydantic",
     "pydantic.*",
     "pyarrow.*",
+    "rapidocr",
+    "rapidocr.*",
     "ray",
     "ray.*",
     "sentence_transformers",

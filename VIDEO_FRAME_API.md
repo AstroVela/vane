@@ -430,3 +430,76 @@ followed by tightly packed, unscaled RGB bytes from the public video converter.
 It excludes allocator padding. Original encoded content is independently checked
 by source block digests. Builders and readers use this same procedure in both
 backends. Version 1 indexes must be rebuilt; there is no alternate parsing path.
+
+## Generic ASR, OCR and joint models
+
+`vane.ai.media` provides `MediaWindow` and `TimedContent` values. Explicit adapters
+in `vane.ai.media_models` can be instantiated inside a `map_batches` callable:
+
+```python
+from vane.ai.media import MediaWindow, TimedContent
+from vane.ai.media_models import FasterWhisperASR
+
+model = FasterWhisperASR("/models/whisper", device="cpu", compute_type="int8")
+# decoded_audio is an AudioClip; returned text has absolute timeline positions.
+text = model(MediaWindow(10, 20), [TimedContent(10, 20, decoded_audio)])
+model.close()
+```
+
+Local extraction uses `FasterWhisperASR` (`video_asr` extra) and
+`RapidOCRExtractor` (`video_ocr` extra, explicit ONNX detection/recognition models
+and character dictionary). Cloud adapters are `DeepgramASR` and `GoogleVisionOCR`.
+They resolve their configured API-key environment variable on the worker, bound
+requests/responses and make no retry or redirect attempts. Empty successful
+results are distinct from decode, provider, SDK or malformed-output errors.
+Local model loading is lazy and never downloads missing assets.
+
+`Qwen3VLJointEmbedder` (local 2048-dimensional CUDA contract) and
+`CohereJointEmbedder` (`embed-v4.0`, configured dimensions) expose
+`embed_joint(video: VideoClip | None, text: str)`. One input combines actual frame
+timestamps and text; vectors from independent models are never added. At least
+one input must be present. These models accept video and text, not decoded audio.
+Use each model's paired text encoding for retrieval.
+
+Google `gemini-embedding-2` supports `GoogleProvider.get_video_embedder`,
+`get_audio_embedder` and `get_image_embedder`. These descriptors are serializable,
+declare zero GPUs and use the same captured Google Gemini/Vertex client settings
+as text embedding. Install the `google`, `video` and `audio` extras as needed.
+Audio descriptors request 16 kHz PCM; extraction/resampling precedes embedding.
+VideoClip inputs contain at most six sampled RGB frames. The adapter encodes them
+as PNG parts with their absolute timestamps; it does not submit a video container
+for a second round of temporal sampling. Paired image queries share this space.
+
+`GoogleJointEmbedder` in `vane.ai.media_models` exposes asynchronous
+`embed_joint(video, text, audio=timed_audio)` and `embed_query(text)` methods.
+`timed_audio` is a sequence of `TimedContent` holding `AudioClip` values with
+nonoverlapping sample-aligned timestamps and a common sample rate. One Content
+contains frames, text and at most one WAV and produces one vector. Audio segments
+are placed on their sample timeline in that WAV; gaps become silence and count
+toward the 180-second limit. This satisfies Vertex's
+[one-audio-file-per-prompt limit](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/embedding-2).
+Audio from a video is extracted
+explicitly; the provider never assumes a video payload also encodes its soundtrack.
+`await model.aclose()` releases its worker-local client. Independent audio/video
+rows use separate Content objects/RPCs with bounded concurrency, including on
+Vertex, and preserve row count and order. `both` requires independent encodings
+in addition to the joint encoding; fused vectors cannot be decomposed.
+
+The adapter rejects unsupported models/options, invalid PCM/timelines, over-six
+frame clips, over-180-second audio, oversized decoded/encoded payloads and text
+over a local 8192-byte budget. The endpoint enforces the combined 8192-token limit;
+Vertex input truncation is disabled, and reported truncation is an error. The
+adapter never reduces frame counts, truncates text or substitutes transcription
+for audio. Output dimensions are
+128–3072; use the same model/dimensions and its paired query encoder for retrieval.
+The joint query encoder supplies Gemini's documented search-query instruction.
+See the [Google embedding guide](https://ai.google.dev/gemini-api/docs/embeddings).
+
+Use a callable function with `execution_backend="ray_task"` for task execution,
+or a callable class with `execution_backend="ray_actor"` to retain models across
+batches. CPU actors use `gpus=0`; CUDA models need explicit GPU resources. The
+ordinary Vane relation/resource APIs provide scheduling and backpressure. Apply
+`vane.udf.no_retries` to a callable before binding it to disable UDF and enclosing
+native-fragment retries.
+No video task service, selection policy, asset identifier or Lance application
+schema lives in these adapters. Context owns those application-level decisions.

@@ -330,6 +330,34 @@ class Qwen3VLEmbedder:
         )
         return self._infer(inputs)
 
+    def embed_joint(self, clip: VideoClip | None, text: str) -> np.ndarray[Any, Any]:
+        """Encode aligned text and video in one forward pass, with no vector sum."""
+        if not isinstance(text, str) or (clip is None and not text.strip()):
+            raise EmbeddingConfigurationError("Joint encoding requires video or nonempty text")
+        # OCR/transcription can contain literal special-token strings. Keep those
+        # bytes as escaped text rather than extra image/video placeholders.
+        content = [{"type": "text", "text": text.replace("<|", "\\u003c|")}]
+        if clip is not None:
+            content.insert(0, {"type": "video"})
+        conversations = [
+            [
+                {"role": "system", "content": [{"type": "text", "text": INSTRUCTION}]},
+                {"role": "user", "content": content},
+            ]
+        ]
+        prompts = self.processor.apply_chat_template(conversations, tokenize=False, add_generation_prompt=True)
+        options: dict[str, Any] = {}
+        if clip is not None:
+            pixels, metadata = video_payload(clip)
+            token = self.processor.video_token
+            wrapped = f"{self.processor.vision_start_token}{token}{self.processor.vision_end_token}"
+            prompts = [prompt.replace(wrapped, token) for prompt in prompts]
+            options.update(videos=[pixels], video_metadata=[metadata], do_resize=False, do_sample_frames=False)
+        inputs = self.processor(
+            text=prompts, add_special_tokens=True, truncation=False, padding=True, return_tensors="pt", **options
+        )
+        return self._infer(inputs)[0]
+
     def embed_image(self, images: list[np.ndarray[Any, Any]]) -> list[np.ndarray[Any, Any]]:
         if not images:
             return []

@@ -8,10 +8,20 @@ import typing
 
 from vane._native._func import (
     ARROW as ARROW,
+)
+from vane._native._func import (
     DEFAULT as DEFAULT,
+)
+from vane._native._func import (
     NATIVE as NATIVE,
+)
+from vane._native._func import (
     SPECIAL as SPECIAL,
+)
+from vane._native._func import (
     FunctionNullHandling as FunctionNullHandling,
+)
+from vane._native._func import (
     PythonUDFType as PythonUDFType,
 )
 
@@ -23,6 +33,11 @@ __all__: list[str] = [
     "FunctionNullHandling",
     "PythonUDFType",
     "vectorized",
+    "no_retries",
 ]
 
 def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., typing.Any]: ...
+
+_Function = typing.TypeVar("_Function", bound=typing.Callable[..., typing.Any])
+
+def no_retries(function: _Function) -> _Function: ...

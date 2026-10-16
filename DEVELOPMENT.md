@@ -438,6 +438,9 @@ messages are never interpreted as diagnostic envelopes, even if they contain
 typed cause chain before Ray serializes it, and executor creation captures it
 before the native dispatcher converts the exception to text. The Ray driver
 captures native diagnostics at result-stream, COPY and DataSink call boundaries.
+Terminal INSERT tasks can add a native `INTERNAL` spawn envelope around the FTE
+failure. Decoding requires the exact task prefix and the nested typed UDF
+diagnostic; unrelated internal errors and forged provider text remain opaque.
 COPY outcome exceptions retain sanitized cause/cleanup snapshots in their pickle
 state while preserving the committed/unknown outcome type and retry restrictions.
 Terminal query cleanup failures are captured from their exception objects into

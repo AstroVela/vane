@@ -328,6 +328,7 @@ class RayQueryResourceManager:
         allocation: QueryAllocation,
         *,
         admission_open: bool = True,
+        max_native_task_attempts: int = 4,
         reservation_ratio: float = 0.5,
         on_change: Callable[[], None] | None = None,
         on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
@@ -335,6 +336,9 @@ class RayQueryResourceManager:
         ratio = float(reservation_ratio)
         if not math.isfinite(ratio) or ratio < 0 or ratio > 1:
             raise ValueError("reservation_ratio must be in [0, 1]")
+        if type(max_native_task_attempts) is not int or max_native_task_attempts <= 0:
+            raise ValueError("max_native_task_attempts must be a positive integer")
+        self.max_native_task_attempts = max_native_task_attempts
         self.graph = graph
         self.allocation = allocation
         self._allocation_admission_open = bool(admission_open)
@@ -2875,6 +2879,7 @@ class RayQueryResourceManager:
                 "graph": self.graph.to_dict(),
                 "allocation": self.allocation.to_dict(),
                 "ray_core_owns_placement": True,
+                "max_native_task_attempts": self.max_native_task_attempts,
                 "usage": usage.to_dict(),
                 "soft_allocation_usage": soft_allocation_usage.to_dict(),
                 "actor_process_usage": self._actor_resident_usage_locked().to_dict(),
