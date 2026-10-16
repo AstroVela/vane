@@ -97,8 +97,10 @@ try:
         time.sleep(0.01)
     assert store.snapshot()['live_allocations'] == 0
     if action != 'close':
-        reused = store.allocate(slot.size)
-        assert reused.allocation.offset == slot.offset
+        # Inputs also use the arena; the first output need not start at zero.
+        # Reclaiming the whole arena proves the inherited region is reusable.
+        reused = store.allocate(store.capacity)
+        assert reused.allocation.offset == 0
         reused.release()
     worker.close(kill=True)
     assert store.snapshot()['mapped_capacity_bytes'] == 0

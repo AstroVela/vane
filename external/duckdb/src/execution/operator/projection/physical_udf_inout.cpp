@@ -1419,9 +1419,10 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 	auto prebatched_input = GetStructBoolField(payload, "prebatched_input");
 	auto row_preserving = GetStructBoolField(payload, "row_preserving");
 	config.auto_task_batching =
-	    execution_backend.second == "ray_actor" && call_mode.first && call_mode.second == "map_batches" &&
-	    config.compute_batch_rows > 0 && config.min_task_batch_rows == 0 &&
-	    !(prebatched_input.first && prebatched_input.second) && !(row_preserving.first && row_preserving.second);
+	    (execution_backend.second == "ray_actor" || execution_backend.second == "subprocess_actor") &&
+	    call_mode.first && call_mode.second == "map_batches" && config.compute_batch_rows > 0 &&
+	    config.min_task_batch_rows == 0 && !(prebatched_input.first && prebatched_input.second) &&
+	    !(row_preserving.first && row_preserving.second);
 	auto actor_number = GetStructIntField(payload, "actor_number");
 	if (actor_number.first && actor_number.second > 0) {
 		config.actor_pool_size = actor_number.second;

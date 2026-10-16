@@ -3892,27 +3892,28 @@ def test_local_shm_auto_budget_respects_explicit_small_arena(monkeypatch):
     assert ref_bundle._auto_local_shm_ref_budget_bytes() == 32 * ref_bundle._MIB
 
 
-def test_local_shm_ref_bundle_acquires_budget_before_creating_shm(monkeypatch):
+def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypatch):
     from vane.execution import ref_bundle
+    from vane.execution.udf_shm_store import LocalShmStore
 
     events = []
     acquire = ref_bundle._acquire_local_shm_ref_budget
-    create = ref_bundle._create_shm
+    allocate = LocalShmStore.allocate
 
-    def record_acquire(size, *, name=""):
+    def record_acquire(size, **kwargs):
         events.append(("acquire", size))
-        return acquire(size, name=name)
+        return acquire(size, **kwargs)
 
-    def record_create(size, *, track):
-        events.append(("create", size))
-        return create(size, track=track)
+    def record_allocate(store, size, **kwargs):
+        events.append(("allocate", size))
+        return allocate(store, size, **kwargs)
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
     monkeypatch.setattr(ref_bundle, "_acquire_local_shm_ref_budget", record_acquire)
-    monkeypatch.setattr(ref_bundle, "_create_shm", record_create)
+    monkeypatch.setattr(LocalShmStore, "allocate", record_allocate)
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2, 3]}))
     try:
-        assert [event[0] for event in events[:2]] == ["acquire", "create"]
+        assert [event[0] for event in events[:2]] == ["acquire", "allocate"]
     finally:
         for ref in refs:
             ref.release()
@@ -6191,7 +6192,7 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
     class FakeActorPool:
         pool_size = 1
 
-        def submit(self, _fn, scope, _debug_seq, *, admission=None):
+        def submit(self, _fn, scope, _debug_seq, *, admission=None, input_preparation=None):
             events.append(f"submit:{scope.generation}")
             raise RuntimeError("planned actor submit failure")
 
@@ -7331,8 +7332,6 @@ def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materializ
 
 
 def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
-    from multiprocessing import shared_memory
-
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
     from vane.execution.udf_subprocess import UDFExecutor
 
@@ -7348,7 +7347,8 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         return pa.table({"y": [value + 1 for value in values]})
 
     _marker, refs, metadata, names = make_local_shm_ref_bundle_result(pa.table({"x": [1], "sleep_ms": [0]}))
-    shm_name = refs[0].name
+    store = refs[0]._allocation_lease.store
+    allocation = refs[0]._allocation_lease.allocation
     executor = UDFExecutor(
         _subprocess_map_payload(
             maybe_sleep_add_one,
@@ -7376,15 +7376,8 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         assert by_id[302] == {"y": [2]}
     finally:
         executor.close(kill=True)
-        try:
-            shm = shared_memory.SharedMemory(name=shm_name)
-        except FileNotFoundError:
-            pass
-        else:
-            try:
-                shm.unlink()
-            finally:
-                shm.close()
+        with store._lock:
+            assert allocation.generation not in store._live
 
 
 def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
@@ -8401,7 +8394,7 @@ def test_local_shm_input_ack_does_not_fallback_to_destructive_release():
     assert ref.release_count == 0
 
 
-def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(monkeypatch):
+def test_local_shm_input_ack_keeps_borrowed_descriptor_and_physical_charge(monkeypatch):
     from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
@@ -8410,7 +8403,8 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
     ref = refs[0]
     try:
         assert getattr(ref, "_closed", False) is False
-        assert getattr(ref, "_budget_bytes", 0) > 0
+        assert ref._pooled_budget.size == ref.size
+        assert not ref._pooled_budget.released
 
         lease_id = ref_bundle.create_local_shm_input_lease(
             refs,
@@ -8420,6 +8414,7 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
 
         assert getattr(ref, "_closed", False) is False
         assert getattr(ref, "_budget_bytes", 0) == 0
+        assert not ref._pooled_budget.released
         assert ref_bundle.materialize_ref_bundle(refs, None, metadata, names).to_pydict() == {"x": [1, 2, 3]}
     finally:
         for ref in refs:
@@ -10091,6 +10086,8 @@ def test_input_ack_during_worker_close_retains_pending_cleanup_owner(monkeypatch
         assert worker._cleanup_finished
         assert not worker._active_input_leases
         assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == ref.size
+        ref.release()
         assert budget.snapshot()["usage_bytes"] == 0
     finally:
         proceed.set()
@@ -10155,6 +10152,8 @@ def test_close_during_input_ack_keeps_executor_cleanup_retryable(monkeypatch, ow
         executor.close(kill=True)
         assert not executor._active_input_leases
         assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == ref.size
+        ref.release()
         assert budget.snapshot()["usage_bytes"] == 0
     finally:
         proceed.set()
@@ -10396,7 +10395,7 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
         def stats(self):
             return {"active_workers": 0, "idle_workers": 1}
 
-        def submit(self, _fn, _scope, _debug_seq, *, admission=None):
+        def submit(self, _fn, _scope, _debug_seq, *, admission=None, input_preparation=None):
             submit_started.set()
             assert release_submit.wait(timeout=5.0)
             return submitted_future
@@ -10594,7 +10593,7 @@ def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):
         pool.shutdown(kill=True)
 
     after = ref_bundle.local_shm_ref_budget_snapshot()["reserved_bytes"]
-    assert after < before
+    assert after == before  # The caller still owns the pooled descriptor.
     for ref in refs:
         ref.release()
 
@@ -10920,3 +10919,79 @@ def test_unready_actor_is_killed_without_close_rpc_even_after_partial_cleanup(mo
     pool.shutdown()
     assert pool.actors == []
     assert closed == [True]
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "copy_failure"])
+def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypatch, tmp_path, outcome):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.execution import ref_bundle
+
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+
+    class GatedActor:
+        def __call__(self, table):
+            value = table.column("x")[0].as_py()
+            if value == 1:
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first actor call was never released")
+                    time.sleep(0.01)
+            return table
+
+    payload = _subprocess_map_payload(GatedActor, execution_backend="subprocess_actor", actor_number=1)
+    first, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    second = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    prepared = threading.Event()
+    original = subprocess_exec.make_local_shm_ref_bundle_result
+    captured = []
+
+    def observe(table, **kwargs):
+        if table.column("x")[0].as_py() != 2:
+            return original(table, **kwargs)
+        if outcome == "copy_failure":
+            prepared.set()
+            raise ValueError("planned input copy failure")
+        result = original(table, **kwargs)
+        captured.extend(result[1])
+        prepared.set()
+        return result
+
+    monkeypatch.setattr(subprocess_exec, "make_local_shm_ref_bundle_result", observe)
+    try:
+        _submit_with_admission(first, pa.table({"x": [1]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        pid = pool.worker_pids()[0]
+        _submit_with_admission(second, pa.table({"x": [2]}))
+        # The actor is still computing the first call; preparation must finish
+        # without acquiring it, including across separate query executors.
+        assert prepared.wait(5)
+        assert not release.exists()
+        if outcome == "cancel":
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            assert captured and all(ref._closed for ref in captured)
+            assert not second._active_input_leases
+        elif outcome == "copy_failure":
+            results = _wait_for_results(second, 1)
+            assert len(results) == 1 and isinstance(results[0], DiagnosticError)
+            assert summarize_error(results[0]) == "ValueError"
+            assert "planned input copy failure" in str(results[0])
+        release.touch()
+        assert _wait_for_results(first, 1)[0].column("x").to_pylist() == [1]
+        if outcome == "complete":
+            assert _wait_for_results(second, 1)[0].column("x").to_pylist() == [2]
+        assert pool.worker_pids() == [pid]
+    finally:
+        release.touch()
+        second.close(kill=True)
+        first.close(kill=True)
+        pool.shutdown(kill=True)
+    assert all(ref._closed for ref in captured)
+    assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0

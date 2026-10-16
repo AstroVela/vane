@@ -1578,10 +1578,10 @@ These bounds cover transport output, not arbitrary intermediate heap objects
 allocated inside user code before it returns or yields a table. A UDF that
 materializes its entire result before yielding still owns that heap allocation.
 
-## Reusable local output storage
+## Reusable local transport storage
 
-Local subprocess workers write output into a bounded shared-memory arena owned
-by the parent process. Workers share the arena and cache its mapping across
+Materialized inputs and subprocess outputs use one bounded shared-memory arena
+owned by the parent process. Workers share the arena and cache its mapping across
 tasks. Allocations carry a generation so a stale descriptor cannot refer to a
 later output that reuses the same offset. Multiple output blocks can share one
 allocation; its space becomes reusable only after every block is released.
@@ -1591,7 +1591,7 @@ Physical capacity includes this rounding.
 
 Stream-window permits are independent of storage ownership. Input acknowledgments
 return progress credits without reserving replacement output bytes. Pooled
-output bytes remain charged to the transport budget until the allocation's last
+input and output bytes remain charged to the transport budget until the allocation's last
 physical lease, including worker views and fork pins, is released. Before sending
 an input, the parent registers a read lease for the receiving worker. Arrow and
 NumPy views retain this lease through the underlying buffer owner, including
@@ -1615,7 +1615,7 @@ and inherited input finalizers check the creator PID before touching locks,
 release queues, or sockets, so a fork child's normal exit cannot shut down its
 parent's release channel.
 
-`VANE_LOCAL_SHM_STORE_BYTES` sets the physical output arena's capacity. The default
+`VANE_LOCAL_SHM_STORE_BYTES` sets the physical transport arena's capacity. The default
 `auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
 available `/dev/shm` space when the store is created. Pages are populated on use;
 the arena's virtual size is not its resident memory. Each worker maps the entire
@@ -1626,7 +1626,7 @@ address-space allowance. The automatic transport budget uses half of the configu
 or automatically sized arena, including on small `/dev/shm` mounts, leaving space
 for a consuming stage's output. The arena limit is separate from
 `VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
-outputs, not model heap or the existing input/control allocations. Ordinary
+inputs and outputs, not model heap, source Arrow tables, or control allocations. Ordinary
 outputs wait for physical releases when live buffers or fragmentation temporarily
 prevent an allocation, releasing their byte grant and worker CPU while waiting.
 Cancellation wakes this wait. If the current input plus output cannot fit, or
@@ -1635,10 +1635,10 @@ a capacity error instead of waiting cyclically. Explicit byte envelopes retain
 their strict capacity error. Reduce input/output block sizes, release retained
 views, or increase the store capacity when the working set cannot fit.
 
-Outputs are measured with a counting IPC stream before byte admission, then
+Materialized inputs and outputs are measured with a counting IPC stream before byte admission, then
 serialized directly into the granted arena region. Publication requires the
 exact measured size; no intermediate payload buffer is copied into the arena.
-The output writer matches Ray's large-buffer copy policy: individual writes
+The shared writer matches Ray's large-buffer copy policy: individual writes
 larger than 1 MiB use six copy threads and 64-byte blocks. Smaller writes remain
 serial. The copy completes before the result descriptor is published.
 
@@ -2228,6 +2228,25 @@ device identities, including when models expose overlapping device subsets.
 Actor prefetch defaults to two admitted calls per replica, with one executing
 call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
 queues preserve per-replica submission order and cancellation ownership.
+Admitted materialized inputs are sized and written by the bounded prefetch
+threads before waiting for their actor's execution turn, overlapping the previous
+call's computation. Preparation also follows per-replica FIFO order, so a later
+input cannot take the earlier call's progress credit. Cancelling a prepared call
+releases its input lease even when it never acquires a worker. Input ACK returns
+the materialized-input progress credit independently of retained physical bytes.
+The input lease owns newly materialized descriptors and releases the parent's
+reference on ACK; worker views and fork descendants retain their physical leases.
+Each replica has its own bounded input progress slot; a queued prefetch for one
+replica cannot prevent an idle replica from accepting its next input. Output
+progress credits remain bounded per producer operator.
+Queued materialized inputs carry a stream identity for physical-capacity waits.
+
+Ordinary synchronous local and Ray `map_batches` actors share the native
+byte-budget transport aggregation policy. A task can carry multiple complete
+compute batches without changing `batch_size`. Ready actors receive a complete
+batch immediately; byte pressure and end-of-input drain partial tails. Explicit
+`min_task_batch_size` retains its existing upstream-block soft-minimum semantics.
+
 Failed or cancelled workers are cleaned up before their invocation completes;
 their replacements initialize on the next invocation. Cancellation interrupts
 that replacement startup without waiting for the model to finish loading.

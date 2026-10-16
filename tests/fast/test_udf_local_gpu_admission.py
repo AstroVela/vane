@@ -350,6 +350,8 @@ def test_output_wait_yields_runtime_allowance_but_keeps_its_device_until_consume
         consumer.submit_ref_bundle_with_id(7, held[1], None, held[2], ["blob"])
         result = _result(consumer)
         assert result[2].to_pydict() == {"length": [3000]}
+        # ACK returns progress credit; this test still owns the source region.
+        udf_subprocess._release_local_ref_bundle_result(held)
         output = _result(producer)
         assert output[1][0].to_table().column(0).to_pylist() == [b"p" * 1000]
         assert _demand(producer_model[0]) == _demand(consumer_model[0]) == 0

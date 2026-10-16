@@ -211,8 +211,8 @@ try:
         assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
         assert consumer._cleanup_finished
         wait_for(lambda: store.snapshot()['live_allocations'] == 0)
-        reused = store.allocate(slot.size)
-        assert reused.allocation.offset == slot.offset
+        reused = store.allocate(store.capacity)
+        assert reused.allocation.offset == 0
         assert reused.allocation.generation != slot.generation
         reused.release()
     else:
@@ -235,8 +235,9 @@ try:
             if action in ('pipe_failure', 'watcher_failure'):
                 consumer.close(kill=True)
             wait_for(lambda: store.snapshot()['live_allocations'] == 0)
-            reused = store.allocate(slot.size)
-            assert reused.allocation.offset == slot.offset
+            # The producer's input may have preceded this output in the arena.
+            reused = store.allocate(store.capacity)
+            assert reused.allocation.offset == 0
             reused.release()
     print(json.dumps({'intact': True, 'reclaimed': True}), flush=True)
 finally:

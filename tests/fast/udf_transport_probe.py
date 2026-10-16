@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise actual native transport planning in an isolated Ray client."""
+"""Exercise actual native transport planning in an isolated runner client."""
 
 from __future__ import annotations
 
@@ -122,6 +122,19 @@ def make_consumer(config):
             from vane.execution.udf_actor_callable import ActorCallableRuntime
 
             self.task_id = None
+            if config.get("local"):
+                from vane.execution._udf_runtime import UDFExecutor
+
+                self.original_submit = UDFExecutor.iter_submit
+                self.submits = 0
+
+                def observe_submit(runtime, table):
+                    self.submits += 1
+                    self.task_id = f"{os.getpid()}:{self.submits}"
+                    return self.original_submit(runtime, table)
+
+                UDFExecutor.iter_submit = observe_submit
+                return
             self.original_invoke = ActorCallableRuntime.__call__
 
             def observe_task(runtime, udf, batch):
@@ -140,6 +153,11 @@ def make_consumer(config):
             return compute(batch, self.task_id)
 
         def _vane_close(self):
+            if config.get("local"):
+                from vane.execution._udf_runtime import UDFExecutor
+
+                UDFExecutor.iter_submit = self.original_submit
+                return
             from vane.execution.udf_actor_callable import ActorCallableRuntime
 
             ActorCallableRuntime.__call__ = self.original_invoke
@@ -157,7 +175,10 @@ def main():
 
         faulthandler.dump_traceback_later(35, repeat=True)
 
-    vane.runners.set_runner_ray(noop_if_initialized=True)
+    local = os.environ["VANE_RUNNER"] == "local"
+    config["local"] = local
+    if not local:
+        vane.runners.set_runner_ray(noop_if_initialized=True)
     con = vane.connect()
     try:
         con.execute("SET threads=2")
@@ -170,7 +191,7 @@ def main():
             rel = rel.map_batches(
                 identity,
                 schema={"id": "BIGINT", "payload": "VARCHAR"},
-                execution_backend="ray_task",
+                execution_backend="subprocess_task" if local else "ray_task",
                 cpus=1,
                 batch_size=config["block_rows"],
                 output_batch_size=config["block_rows"],
@@ -184,7 +205,7 @@ def main():
         rel = rel.map_batches(
             make_consumer(config),
             schema={"id": "BIGINT"},
-            execution_backend="ray_actor",
+            execution_backend="subprocess_actor" if local else "ray_actor",
             batch_format=config["batch_format"],
             actor_number=config.get("actors", 1),
             cpus=1,
@@ -202,7 +223,7 @@ def main():
             rel = rel.map_batches(
                 slow_consumer,
                 schema={"id": "BIGINT"},
-                execution_backend="ray_task",
+                execution_backend="subprocess_task" if local else "ray_task",
                 batch_format="numpy",
                 cpus=1,
                 batch_size=8,

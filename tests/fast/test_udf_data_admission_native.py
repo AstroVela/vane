@@ -554,7 +554,9 @@ def test_reservation_completion_failure_is_a_consumable_result(strict_transport,
             assert summarize_error(error) == "OSError"
             assert "reservation completion failure" in str(error)
             executor.stats()
-            assert strict_transport.snapshot()["usage_bytes"] == 0
+            # Worker buffer releases arrive on the independent lease channel.
+            with strict_transport._cond:
+                assert strict_transport._cond.wait_for(lambda: strict_transport._usage_locked() == 0, timeout=5)
         # Consuming the failure returns the physical slot, without poisoning
         # this executor or requiring the cached worker pool to be closed.
         assert executor.request_task_admission(8)
@@ -609,7 +611,12 @@ def test_failed_input_cleanup_keeps_runtime_owned(
 
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(strict_transport, cleanup_stage, fail_cleanup)
+            if input_kind == "table" and cleanup_stage == "_release_input_ack_ref":
+                # Newly materialized descriptors transfer ownership to the
+                # input lease; their ACK releases the ref, not just its budget.
+                patch.setattr(ref_bundle.LocalShmBlockRef, "release", fail_cleanup)
+            else:
+                patch.setattr(strict_transport, cleanup_stage, fail_cleanup)
             assert executor.request_task_admission(8)
             table = pa.table({"x": [1]})
             if input_kind == "ref_bundle":

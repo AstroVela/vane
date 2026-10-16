@@ -294,6 +294,7 @@ def _make_local_ref_bundle_worker_payload_with_lease(
     *,
     submit_id: int | None,
     name: str,
+    owns_refs: bool = False,
 ) -> tuple[dict[str, Any], int] | tuple[None, None]:
     worker_payload = make_local_ref_bundle_worker_payload(block_refs, slices, metadata, names)
     if worker_payload is None:
@@ -302,6 +303,7 @@ def _make_local_ref_bundle_worker_payload_with_lease(
         tuple(block_refs),
         name=name,
         submit_id=submit_id,
+        owns_refs=owns_refs,
     )
     if (task := current_data_task()) is not None:
         task.hold_input_transport(local_shm_budget_manager(), lease_id)
@@ -965,6 +967,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
+                owns_refs=True,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
@@ -2656,6 +2659,8 @@ class LocalSubprocessActorPool:
             )
         )
         self._actor_calls: list[deque[ExecutionCancellationScope]] = [deque() for _ in range(self.pool_size)]
+        self._prepared_calls: set[ExecutionCancellationScope] = set()
+        self._input_stream_ids = tuple(f"actor-input:{uuid.uuid4().hex}" for _ in range(self.pool_size))
         self._idle_workers: deque[tuple[int, int]] = deque()
         self._workers: list[_SingleSubprocessExecutor] = []
         self._cleanup_pending_workers: list[_SingleSubprocessExecutor] = []
@@ -3179,6 +3184,7 @@ class LocalSubprocessActorPool:
         debug_seq: int = 0,
         *,
         admission: AdmissionLease | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> Future[Any]:
         with self._lock:
             self._raise_if_unavailable_locked()
@@ -3201,9 +3207,11 @@ class LocalSubprocessActorPool:
             self._actor_calls[replica].append(scope)
         try:
             if execution is not None:
-                future = executor.submit(self._run_gpu, fn, scope, debug_seq, execution)
+                future = executor.submit(self._run_gpu, fn, scope, debug_seq, execution, input_preparation)
             else:
-                future = executor.submit(self._run, fn, scope, debug_seq, actor_index=replica)
+                future = executor.submit(
+                    self._run, fn, scope, debug_seq, actor_index=replica, input_preparation=input_preparation
+                )
         except BaseException:
             self._finish_actor_call(replica, scope)
             if execution is not None:
@@ -3223,9 +3231,10 @@ class LocalSubprocessActorPool:
             calls = self._actor_calls[replica]
             if scope in calls:
                 calls.remove(scope)
+            self._prepared_calls.discard(scope)
             self._cond.notify_all()
 
-    def _wait_actor_turn(self, replica: int, scope: ExecutionCancellationScope) -> None:
+    def _wait_actor_turn(self, replica: int, scope: ExecutionCancellationScope, *, preparing: bool = False) -> None:
         unregister = scope.register_cancel_wakeup(self._wake_waiters)
         try:
             with self._cond:
@@ -3233,7 +3242,8 @@ class LocalSubprocessActorPool:
                     scope.raise_if_cancelled("local actor prefetch")
                     self._raise_if_unavailable_locked()
                     calls = self._actor_calls[replica]
-                    if calls and calls[0] is scope:
+                    first = next((call for call in calls if not preparing or call not in self._prepared_calls), None)
+                    if first is scope:
                         return
                     self._cond.wait()
         finally:
@@ -3245,9 +3255,17 @@ class LocalSubprocessActorPool:
         scope: ExecutionCancellationScope,
         debug_seq: int,
         execution: LocalGpuExecution,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> Any | None:
         try:
-            return self._run(fn, scope, debug_seq, gpu_execution=execution, actor_index=execution.replica)
+            return self._run(
+                fn,
+                scope,
+                debug_seq,
+                gpu_execution=execution,
+                actor_index=execution.replica,
+                input_preparation=input_preparation,
+            )
         finally:
             with self._cond:
                 workers = {
@@ -3273,6 +3291,38 @@ class LocalSubprocessActorPool:
             execution.backend_finished(pending)
 
     def _run(
+        self,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
+        debug_seq: int = 0,
+        *,
+        gpu_execution: LocalGpuExecution | None = None,
+        actor_index: int | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
+    ) -> Any | None:
+        result = None
+        try:
+            if actor_index is not None:
+                # Preparation has its own FIFO turn. Later prefetch threads
+                # cannot occupy the input budget before an earlier invocation.
+                self._wait_actor_turn(actor_index, scope, preparing=True)
+            with input_preparation(scope) if input_preparation is not None else nullcontext():
+                if actor_index is not None:
+                    with self._cond:
+                        self._prepared_calls.add(scope)
+                        self._cond.notify_all()
+                result = self._run_actor_call(
+                    fn, scope, debug_seq, gpu_execution=gpu_execution, actor_index=actor_index
+                )
+            scope.raise_if_cancelled("local subprocess actor result")
+            return result
+        except BaseException:
+            _release_local_ref_bundle_result(result)
+            raise
+        finally:
+            scope.finish()
+
+    def _run_actor_call(
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
@@ -3313,7 +3363,6 @@ class LocalSubprocessActorPool:
                         gpu_execution.activity.transition("completing")
             result_ready = True
         finally:
-            scope.finish()
             try:
                 active_after = 0
                 if worker_idx is not None and worker is not None:
@@ -4461,6 +4510,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         input_data: Any = (),
         input_metadata: Any = None,
         prepare_inputs: Callable[[], None] | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> None:
         activity = getattr(self, "_unit_activity", None)
         unit_task = activity.open_task() if activity is not None else None
@@ -4473,6 +4523,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     input_data=input_data,
                     input_metadata=input_metadata,
                     prepare_inputs=prepare_inputs,
+                    input_preparation=input_preparation,
                     unit_task=unit_task,
                 )
         except BaseException:
@@ -4489,6 +4540,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         input_data: Any = (),
         input_metadata: Any = None,
         prepare_inputs: Callable[[], None] | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
         unit_task: UnitTaskActivity | None = None,
     ) -> None:
         query = getattr(self, "_data_scope", None)
@@ -4509,7 +4561,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 raise
             # Scheduling owns its admission/scope rollback, including errors
             # from that rollback. Do not retry it and hide the submit failure.
-            self._schedule_async(submit_id, fn, admission, unit_task=unit_task)
+            self._schedule_async(submit_id, fn, admission, unit_task=unit_task, input_preparation=input_preparation)
             return
         task: TaskDataScope | TaskInputCleanup | None = None
         try:
@@ -4534,7 +4586,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 with task.activate():
                     return fn(worker)
 
-            self._schedule_async(submit_id, run, admission, task_scope=task, unit_task=unit_task)
+            self._schedule_async(
+                submit_id, run, admission, task_scope=task, unit_task=unit_task, input_preparation=input_preparation
+            )
         except BaseException as submit_error:
             try:
                 try:
@@ -4557,6 +4611,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         *,
         task_scope: TaskDataScope | TaskInputCleanup | None = None,
         unit_task: UnitTaskActivity | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
         if lifecycle_lock is None:
@@ -4623,6 +4678,21 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
                 fn = run_observed
 
+            preparation = input_preparation
+            if input_preparation is not None:
+                prepare = input_preparation
+
+                @contextmanager
+                def prepare_in_task(scope: ExecutionCancellationScope) -> Iterator[None]:
+                    with (
+                        task_scope.activate() if task_scope is not None else nullcontext(),
+                        unit_task.activate() if unit_task is not None else nullcontext(),
+                        prepare(scope),
+                    ):
+                        yield
+
+                preparation = prepare_in_task
+
             if self._actor_pool is not None:
                 actor_pool = self._actor_pool
                 with self._pending_lock:
@@ -4638,7 +4708,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                             f"pool_active={pool_stats.get('active_workers', 0)} "
                             f"pool_idle={pool_stats.get('idle_workers', 0)}"
                         )
-                    future = actor_pool.submit(fn, scope, debug_seq, admission=admission)
+                    future = actor_pool.submit(fn, scope, debug_seq, admission=admission, input_preparation=preparation)
                     self._track_task_future(
                         future,
                         submit_id,
@@ -4663,6 +4733,21 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 return
 
             if self._task_pool is not None:
+                if preparation is not None:
+                    task_fn = fn
+
+                    def run_prepared(worker: _SingleSubprocessExecutor) -> Any | None:
+                        result = None
+                        try:
+                            assert preparation is not None
+                            with preparation(scope):
+                                result = task_fn(worker)
+                            return result
+                        except BaseException:
+                            _release_local_ref_bundle_result(result)
+                            raise
+
+                    fn = run_prepared
                 runtime = self._task_runtime
                 task_pool = self._task_pool
                 if runtime is None:
@@ -4726,21 +4811,86 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             raise missing_owner_error
 
     def submit(self, args: pa.Table) -> None:
-        table = _ensure_table(args)
-        admission = self._take_task_admission()
-        self._submit_async(
-            None,
-            lambda worker: worker._submit_table(table),
-            admission,
-        )
+        self._submit_materialized(None, _ensure_table(args))
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
-        table = _ensure_table(args)
+        self._submit_materialized(int(submit_id), _ensure_table(args))
+
+    def _submit_materialized(self, submit_id: int | None, table: pa.Table) -> None:
         admission = self._take_task_admission()
+        worker_payload = None
+
+        @contextmanager
+        def prepare(scope: ExecutionCancellationScope) -> Iterator[None]:
+            nonlocal worker_payload
+            scope.raise_if_cancelled("UDF subprocess input preparation")
+            if table.num_rows == 0:
+                yield
+                return
+
+            def wait_context() -> AbstractContextManager[None]:
+                base = admission.suspend_for_wait(scope) if admission is not None else nullcontext()
+                return observe_transport_wait(base, "shared_memory_input")
+
+            task = current_data_task()
+            reservation = task.reservation if task is not None else None
+            input_producer_id = None
+            if self._actor_pool is not None:
+                assert admission is not None
+                # A resident replica can serve several query executors. Its
+                # queued inputs share one dependency, regardless of query ID.
+                input_producer_id = self._actor_pool._input_stream_ids[int(admission.lease["actor_index"])]
+            _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
+                table,
+                cancel_event=scope,
+                wait_context=wait_context,
+                input_owner_id=scope.owner_id,
+                input_producer_id=input_producer_id,
+                task_reservation=reservation.transport if reservation is not None else None,
+            )
+            lease_id = None
+            preparation_error = None
+            try:
+                if task is not None:
+                    track_local_shm_inputs(task, refs)
+                worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                    refs, None, metadata, names, submit_id=submit_id, name="udf-materialized-input", owns_refs=True
+                )
+                if worker_payload is None or lease_id is None:
+                    raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
+                self._track_input_lease(lease_id)
+                scope.raise_if_cancelled("UDF subprocess prepared input")
+                yield
+            except BaseException as error:
+                preparation_error = error
+                raise
+            finally:
+                cleanup_errors = []
+                try:
+                    if lease_id is not None:
+                        if cancel_local_shm_input_lease(lease_id, name="udf-materialized-input") is None:
+                            raise RuntimeError("input transport cleanup is still in progress")
+                        self._untrack_input_lease(lease_id)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                for ref in refs:
+                    try:
+                        ref.release()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                if cleanup_errors:
+                    errors = ([preparation_error] if preparation_error is not None else []) + cleanup_errors
+                    details = _subprocess_cleanup_error_details(errors)
+                    raise capture_cleanup(f"UDF materialized input cleanup failed: {details}", *errors) from errors[0]
+
+        def run(worker: _SingleSubprocessExecutor) -> Any | None:
+            return worker._submit_ref_bundle_direct(worker_payload) if worker_payload is not None else None
+
         self._submit_async(
-            int(submit_id),
-            lambda worker: worker._submit_table(table),
+            submit_id,
+            run,
             admission,
+            input_preparation=prepare,
         )
 
     def submit_ref_bundle_with_id(
