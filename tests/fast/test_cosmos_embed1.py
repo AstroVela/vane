@@ -260,7 +260,7 @@ def test_image_pixels_must_be_rgb_uint8(sdk, shape, dtype):
 @pytest.mark.parametrize("entry", ["expression", "relation", "sql"])
 def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local, monkeypatch, entry):
     import vane
-    from vane.ai import embed_image
+    from vane.ai import ImageInput, embed
 
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     monkeypatch.setitem(sys.modules, "torch", None)
@@ -269,9 +269,13 @@ def test_cosmos_image_binding_accepts_precision_without_loading_models(ray_local
     with vane.connect() as conn:
         rel = conn.sql("SELECT NULL::IMAGE AS image")
         if entry == "expression":
-            result = rel.select(embed_image(vane.col("image"), model=COSMOS_MODEL, **options).alias("embedding"))
+            result = rel.select(
+                embed(ImageInput(vane.col("image")), provider="transformers", model=COSMOS_MODEL, **options).alias(
+                    "embedding"
+                )
+            )
         elif entry == "relation":
-            result = embed_image(rel, vane.col("image"), model=COSMOS_MODEL, **options)
+            result = embed(rel, ImageInput(vane.col("image")), provider="transformers", model=COSMOS_MODEL, **options)
         else:
             result = conn.sql(
                 "SELECT ai_embed_image(NULL::IMAGE, model => 'nvidia/Cosmos-Embed1-224p', "

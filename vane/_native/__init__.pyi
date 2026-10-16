@@ -31,11 +31,9 @@ if typing.TYPE_CHECKING:
     from vane._image_file import ImageMetadata
     from vane._video_clip import VideoClip
     from vane._video_file import VideoFrameData, VideoMetadata
+    from vane.ai.embedding import EmbeddingInput
     from vane.ai.options import (
-        EmbedAudioOptions,
-        EmbedImageOptions,
         EmbedOptions,
-        EmbedVideoOptions,
         JevOptions,
         PromptOptions,
     )
@@ -483,7 +481,7 @@ class DuckDBPyRelation:
     def distinct(self) -> DuckDBPyRelation: ...
     def embed(
         self,
-        text: Expression,
+        input: EmbeddingInput,
         *,
         provider: str | Provider = "openai",
         model: str | None = None,
@@ -491,39 +489,6 @@ class DuckDBPyRelation:
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
         **options: Unpack[EmbedOptions],
-    ) -> DuckDBPyRelation: ...
-    def embed_image(
-        self,
-        image: Expression,
-        *,
-        provider: str | Provider = "transformers",
-        model: str | None = None,
-        dimensions: int | None = None,
-        on_error: typing.Literal["raise", "ignore"] = "raise",
-        output_column: str = "embedding",
-        **options: Unpack[EmbedImageOptions],
-    ) -> DuckDBPyRelation: ...
-    def embed_video(
-        self,
-        frames: Expression,
-        *,
-        provider: str | Provider = "transformers",
-        model: str | None = None,
-        dimensions: int | None = None,
-        on_error: typing.Literal["raise", "ignore"] = "raise",
-        output_column: str = "embedding",
-        **options: Unpack[EmbedVideoOptions],
-    ) -> DuckDBPyRelation: ...
-    def embed_audio(
-        self,
-        audio: Expression,
-        *,
-        provider: str | Provider = "transformers",
-        model: str | None = None,
-        dimensions: int | None = None,
-        on_error: typing.Literal["raise", "ignore"] = "raise",
-        output_column: str = "embedding",
-        **options: Unpack[EmbedAudioOptions],
     ) -> DuckDBPyRelation: ...
     def jev(
         self,

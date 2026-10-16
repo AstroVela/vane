@@ -56,11 +56,9 @@ from vane.ai._schema import (
     compile_return_format,
     validate_raw_response_json,
 )
+from vane.ai.embedding import AudioInput, EmbeddingInput, ImageInput, MultimodalInput, TextInput, VideoInput
 from vane.ai.options import (
-    EmbedAudioOptions,
-    EmbedImageOptions,
     EmbedOptions,
-    EmbedVideoOptions,
     PromptOptions,
     normalize_prompt_options,
     validate_embed_audio_options,
@@ -84,7 +82,7 @@ from vane.ai.typing import JSONSchema, UDFOptions
 if TYPE_CHECKING:
     from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-    from vane.ai.protocols import ImageEmbedder, Prompter, TextEmbedder, VideoEmbedder
+    from vane.ai.protocols import ImageEmbedder, MultimodalEmbedder, Prompter, TextEmbedder, VideoEmbedder
 else:
     BaseModel = Any
 
@@ -626,7 +624,7 @@ def _prepare_embed_call(
     options: Mapping[str, Any],
     *,
     relation: bool,
-    input_kind: Literal["text", "image", "video", "audio"] = "text",
+    input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "text",
 ) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
     """Resolve one Embed call without performing network or model I/O."""
 
@@ -646,6 +644,7 @@ def _prepare_embed_call(
         "image": validate_embed_image_options,
         "video": validate_embed_video_options,
         "audio": validate_embed_audio_options,
+        "multimodal": validate_embed_image_options,
     }[input_kind]
     prepared = validator(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)
@@ -662,6 +661,7 @@ def _prepare_embed_call(
             "image": resolved_provider.get_image_embedder,
             "video": resolved_provider.get_video_embedder,
             "audio": resolved_provider.get_audio_embedder,
+            "multimodal": resolved_provider.get_multimodal_embedder,
         }[input_kind]
         descriptor: Any = factory(
             model=model,
@@ -685,6 +685,11 @@ def _prepare_embed_call(
 
         if not isinstance(descriptor.get_input_spec(), AudioInputSpec):
             raise TypeError("Audio descriptor must return an AudioInputSpec")
+    if input_kind == "multimodal":
+        from vane.ai._embedding_content import MultimodalInputSpec
+
+        if not isinstance(descriptor.get_input_spec(), MultimodalInputSpec):
+            raise TypeError("Multimodal descriptor must return a MultimodalInputSpec")
     resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
     descriptor_resources = descriptor.get_udf_options()
     udf_options = UDFOptions(
@@ -692,7 +697,9 @@ def _prepare_embed_call(
         num_gpus=descriptor_resources.num_gpus,
         max_retries=max_retries if max_retries is not None else 3,
         on_error=on_error,
-        batch_size=batch_size if batch_size is not None else (1 if input_kind in {"video", "audio"} else 64),
+        batch_size=batch_size
+        if batch_size is not None
+        else (1 if input_kind in {"video", "audio", "multimodal"} else 64),
     )
 
     return (
@@ -889,7 +896,7 @@ class _EmbeddingBatch:
         self._on_error: _OnError = on_error
         self._normalize = normalize
         self._arrow_type = pa.list_(pa.float32(), dimensions)
-        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | ManagedEmbedder | None = (
+        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | MultimodalEmbedder | ManagedEmbedder | None = (
             None  # lazy: instantiate on first __call__
         )
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
@@ -907,7 +914,7 @@ class _EmbeddingBatch:
     def _mark_loop_bound(self) -> None:
         self._embedder_loop_bound = True
 
-    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder | ManagedEmbedder:
+    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder | MultimodalEmbedder | ManagedEmbedder:
         if self._embedder is None:
             run_async = self._require_run_async()
 
@@ -1184,16 +1191,9 @@ class _EmbedImageBatch(_EmbeddingBatch):
     _method_name = "embed_image"
 
     def _input_values(self, table: pa.Table) -> list[Any]:
-        from vane._image import _image_arrow_scalar_to_numpy, _ImageArrowType
+        from vane.ai._embedding_content import image_values
 
-        column = table.column(self._column)
-        arrow_type = column.type
-        if not isinstance(arrow_type, _ImageArrowType):
-            raise TypeError("EmbedImage requires a decoded IMAGE column")
-        dtype = vane.image_type(arrow_type.mode, arrow_type.height, arrow_type.width)
-        # Preserve typed pixel buffers: to_pylist would create a Python object
-        # for every pixel of every image in the batch.
-        return [None if not value.is_valid else _image_arrow_scalar_to_numpy(value, dtype) for value in column]
+        return image_values(table.column(self._column))
 
 
 class _EmbedVideoBatch(_EmbeddingBatch):
@@ -1216,6 +1216,24 @@ class _EmbedAudioBatch(_EmbeddingBatch):
         from vane.ai._audio_embedding import audio_clips_from_arrow
 
         return audio_clips_from_arrow(table.column(self._column), self._descriptor.get_input_spec())
+
+
+class _EmbedMultimodalBatch(_EmbeddingBatch):
+    """Share executor lifecycle, retries and result validation with every Embed."""
+
+    _method_name = "embed_multimodal"
+
+    def __init__(self, *args: Any, parts: tuple[Any, ...], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._parts = parts
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        from vane.ai._embedding_content import content_from_columns
+
+        parts = pa.Table.from_arrays(
+            table.column(self._column).flatten(), names=[f"part_{index}" for index in range(len(self._parts))]
+        )
+        return content_from_columns(parts, self._parts, self._descriptor.get_input_spec())
 
 
 class _PromptBatch:
@@ -1626,80 +1644,30 @@ def _star_excluding_existing_output_column(rel: Relation, output_column: str) ->
     return vane.StarExpression(exclude=[existing_output_column])
 
 
-def _embed_expression(
-    text: Any,
+def _build_embed_expression(
+    input: Any,
     *,
     provider: Any,
     model: str | None,
     dimensions: int | None,
     on_error: _OnError,
     options: Mapping[str, Any],
-    input_kind: Literal["text", "image", "video", "audio"] = "text",
+    relation: bool,
+    output_column: str = "embedding",
 ) -> Expression:
-    if not is_expression(text):
-        raise TypeError(
-            "vane.ai.embed requires a text Expression"
-            if input_kind == "text"
-            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
-        )
-    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
-        provider,
-        model,
-        dimensions,
-        on_error,
-        options,
-        relation=False,
-        input_kind=input_kind,
-    )
-    input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
-    wrapper_class = {
-        "text": _EmbedTextBatch,
-        "image": _EmbedImageBatch,
-        "video": _EmbedVideoBatch,
-        "audio": _EmbedAudioBatch,
-    }[input_kind]
-    wrapper = wrapper_class(
-        descriptor,
-        input_name,
-        "embedding",
-        resolved_dimensions,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-        normalize=normalize,
-    )
-    output_type = f"FLOAT[{resolved_dimensions}]"
-    return _build_ai_batch_expression(
-        wrapper,
-        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
-        output_column="embedding",
-        output_type=output_type,
-        udf_opts=udf_opts,
-        name=_embed_function_name(input_kind),
-    ).cast(output_type)
+    from vane.ai._embedding_content import EmbeddingPartSpec
 
-
-def _embed_relation(
-    rel: Any,
-    text: Any,
-    *,
-    provider: Any,
-    model: str | None,
-    dimensions: int | None,
-    on_error: _OnError,
-    output_column: str,
-    options: Mapping[str, Any],
-    input_kind: Literal["text", "image", "video", "audio"] = "text",
-) -> Relation:
-    if not _is_relation_like(rel):
-        raise TypeError("vane.ai.embed relation API requires a Relation")
-    if not is_expression(text):
-        raise TypeError(
-            "vane.ai.embed requires a text Expression"
-            if input_kind == "text"
-            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
-        )
-    if not isinstance(output_column, str) or not output_column.strip():
-        raise ValueError("output_column must be a non-empty string")
+    input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "text"
+    if isinstance(input, (TextInput, ImageInput, VideoInput, AudioInput)):
+        if getattr(input, "mime_type", None) is not None:
+            input = MultimodalInput([input])
+        else:
+            input_kind = input.kind
+            input = input.value
+    if isinstance(input, MultimodalInput):
+        input_kind = "multimodal"
+    elif not is_expression(input):
+        raise TypeError("vane.ai.embed requires an Expression or a typed embedding input")
 
     (
         descriptor,
@@ -1709,45 +1677,55 @@ def _embed_relation(
         max_chunk_chars,
         chunk_overlap_chars,
         execution_backend,
-    ) = _prepare_embed_call(
-        provider,
-        model,
-        dimensions,
-        on_error,
-        options,
-        relation=True,
-        input_kind=input_kind,
-    )
-    input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
-    wrapper_class = {
-        "text": _EmbedTextBatch,
-        "image": _EmbedImageBatch,
-        "video": _EmbedVideoBatch,
-        "audio": _EmbedAudioBatch,
-    }[input_kind]
-    wrapper = wrapper_class(
-        descriptor,
-        input_name,
-        output_column,
-        resolved_dimensions,
+    ) = _prepare_embed_call(provider, model, dimensions, on_error, options, relation=relation, input_kind=input_kind)
+    wrapper_options: dict[str, Any] = dict(
         max_chunk_chars=max_chunk_chars,
         chunk_overlap_chars=chunk_overlap_chars,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
         normalize=normalize,
     )
+    wrapper: _EmbeddingBatch
+    if isinstance(input, MultimodalInput):
+        parts = tuple(EmbeddingPartSpec(part.kind, getattr(part, "mime_type", None)) for part in input.parts)
+        descriptor.get_input_spec().validate_layout(parts)
+        part_inputs = {
+            f"part_{index}": (
+                part.value
+                if spec.mime_type is not None
+                else vane.FunctionExpression(_embed_function_name(spec.kind, hidden=True), part.value)
+            )
+            for index, (part, spec) in enumerate(zip(input.parts, parts, strict=True))
+        }
+        # A content is non-NULL even when its optional fields are NULL. Passing
+        # fields as separate UDF arguments lets native binding fold the whole
+        # expression to NULL before optional/all-empty validation can run.
+        inputs = {
+            "parts": vane.FunctionExpression("struct_pack", *(value.alias(name) for name, value in part_inputs.items()))
+        }
+        wrapper = _EmbedMultimodalBatch(
+            descriptor, "parts", output_column, resolved_dimensions, parts=parts, **wrapper_options
+        )
+    else:
+        input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
+        wrapper_class = {
+            "text": _EmbedTextBatch,
+            "image": _EmbedImageBatch,
+            "video": _EmbedVideoBatch,
+            "audio": _EmbedAudioBatch,
+        }[input_kind]
+        wrapper = wrapper_class(descriptor, input_name, output_column, resolved_dimensions, **wrapper_options)
+        inputs = {input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), input)}
     output_type = f"FLOAT[{resolved_dimensions}]"
-    expression = _build_ai_batch_expression(
+    return _build_ai_batch_expression(
         wrapper,
-        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
+        inputs=inputs,
         output_column=output_column,
         output_type=output_type,
         udf_opts=udf_opts,
-        name=_embed_function_name(input_kind),
+        name="ai_embed",
         execution_backend=execution_backend,
     ).cast(output_type)
-    star = _star_excluding_existing_output_column(rel, output_column)
-    return rel.select(star, expression.alias(output_column))
 
 
 _EMBED_ARGUMENT_UNSET: Any = object()
@@ -1762,7 +1740,7 @@ _EMBED_OUTPUT_COLUMN_DEFAULT = _DefaultEmbedOutputColumn("embedding")
 
 @overload
 def embed(
-    text: Expression,
+    input: EmbeddingInput,
     /,
     *,
     provider: str | Provider = "openai",
@@ -1776,7 +1754,7 @@ def embed(
 @overload
 def embed(
     *,
-    text: Expression,
+    input: EmbeddingInput,
     provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
@@ -1789,7 +1767,7 @@ def embed(
 def embed(
     rel: Relation,
     /,
-    text: Expression,
+    input: EmbeddingInput,
     *,
     provider: str | Provider = "openai",
     model: str | None = None,
@@ -1804,7 +1782,7 @@ def embed(
 def embed(
     *,
     rel: Relation,
-    text: Expression,
+    input: EmbeddingInput,
     provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
@@ -1815,9 +1793,9 @@ def embed(
 
 
 def embed(
-    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
+    first: EmbeddingInput | Relation = _EMBED_ARGUMENT_UNSET,
     /,
-    text: Expression = _EMBED_ARGUMENT_UNSET,
+    input: EmbeddingInput = _EMBED_ARGUMENT_UNSET,
     *,
     rel: Relation = _EMBED_ARGUMENT_UNSET,
     provider: str | Provider = "openai",
@@ -1827,377 +1805,55 @@ def embed(
     output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[EmbedOptions],
 ) -> Expression | Relation:
-    """Embed an Expression or append an embedding column to a Relation."""
+    """Embed typed text, image, video, audio, or ordered multimodal parts.
+
+    A bare Expression denotes text. Decoded media uses ImageInput, VideoInput
+    or AudioInput. Supply mime_type to pass encoded bytes without decoding.
+    MultimodalInput combines optional parts into one vector for each row.
+    """
 
     if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
         raise TypeError("vane.ai.embed received both first and rel; pass only one relation argument")
 
     relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
     if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
-        if text is _EMBED_ARGUMENT_UNSET:
-            raise TypeError("vane.ai.embed relation API requires a text Expression")
+        if input is _EMBED_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.embed relation API requires an embedding input")
         resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
-        return _embed_relation(
-            relation,
-            text,
+        if not isinstance(resolved_output_column, str) or not resolved_output_column.strip():
+            raise ValueError("output_column must be a non-empty string")
+        result_expression = _build_embed_expression(
+            input,
+            relation=True,
             provider=provider,
             model=model,
             dimensions=dimensions,
             on_error=on_error,
             output_column=resolved_output_column,
             options=options,
+        )
+        return relation.select(
+            _star_excluding_existing_output_column(relation, resolved_output_column),
+            result_expression.alias(resolved_output_column),
         )
 
     if rel is not _EMBED_ARGUMENT_UNSET:
         raise TypeError("vane.ai.embed rel= must be a Relation")
-    if first is not _EMBED_ARGUMENT_UNSET and text is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed expression API accepts a single text Expression")
-    expression = text if first is _EMBED_ARGUMENT_UNSET else first
+    if first is not _EMBED_ARGUMENT_UNSET and input is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed expression API accepts a single input Expression")
+    expression = input if first is _EMBED_ARGUMENT_UNSET else first
     if expression is _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed requires a text Expression or a Relation plus text Expression")
+        raise TypeError("vane.ai.embed requires an embedding input or a Relation plus input Expression")
     if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
         raise TypeError("vane.ai.embed expression API does not accept output_column; use .alias(...)")
-    return _embed_expression(
+    return _build_embed_expression(
         expression,
         provider=provider,
         model=model,
         dimensions=dimensions,
         on_error=on_error,
         options=options,
-    )
-
-
-@overload
-def embed_image(
-    image: Expression,
-    /,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedImageOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_image(
-    *,
-    image: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedImageOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_image(
-    rel: Relation,
-    /,
-    image: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedImageOptions],
-) -> Relation: ...
-
-
-@overload
-def embed_image(
-    *,
-    rel: Relation,
-    image: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedImageOptions],
-) -> Relation: ...
-
-
-def embed_image(
-    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
-    /,
-    image: Expression = _EMBED_ARGUMENT_UNSET,
-    *,
-    rel: Relation = _EMBED_ARGUMENT_UNSET,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
-    **options: Unpack[EmbedImageOptions],
-) -> Expression | Relation:
-    """Embed decoded IMAGE values with a declared image model.
-
-    Cosmos-Embed1-224p accepts uint8 RGB images through its single-frame visual
-    path and returns 256-dimensional vectors paired with its video/text
-    encoders. Use the same pinned revision, dimensions and model options for
-    every modality. It requires CUDA, explicit float32/float16 precision and
-    trust_remote_code=True. Video clips still require eight frames.
-    """
-
-    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_image received both first and rel; pass only one relation argument")
-
-    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
-    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
-        if image is _EMBED_ARGUMENT_UNSET:
-            raise TypeError("vane.ai.embed_image relation API requires an image Expression")
-        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
-        return _embed_relation(
-            relation,
-            image,
-            provider=provider,
-            model=model,
-            dimensions=dimensions,
-            on_error=on_error,
-            output_column=resolved_output_column,
-            options=options,
-            input_kind="image",
-        )
-
-    if rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_image rel= must be a Relation")
-    if first is not _EMBED_ARGUMENT_UNSET and image is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_image expression API accepts a single image Expression")
-    expression = image if first is _EMBED_ARGUMENT_UNSET else first
-    if expression is _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_image requires an image Expression or a Relation plus image Expression")
-    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
-        raise TypeError("vane.ai.embed_image expression API does not accept output_column; use .alias(...)")
-    return _embed_expression(
-        expression,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
-        options=options,
-        input_kind="image",
-    )
-
-
-@overload
-def embed_video(
-    frames: Expression,
-    /,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedVideoOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_video(
-    *,
-    frames: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedVideoOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_video(
-    rel: Relation,
-    /,
-    frames: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedVideoOptions],
-) -> Relation: ...
-
-
-@overload
-def embed_video(
-    *,
-    rel: Relation,
-    frames: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedVideoOptions],
-) -> Relation: ...
-
-
-def embed_video(
-    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
-    /,
-    frames: Expression = _EMBED_ARGUMENT_UNSET,
-    *,
-    rel: Relation = _EMBED_ARGUMENT_UNSET,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
-    **options: Unpack[EmbedVideoOptions],
-) -> Expression | Relation:
-    """Embed ordered decoded frame records with a declared video model."""
-
-    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_video received both first and rel; pass only one relation argument")
-
-    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
-    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
-        if frames is _EMBED_ARGUMENT_UNSET:
-            raise TypeError("vane.ai.embed_video relation API requires a frames Expression")
-        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
-        return _embed_relation(
-            relation,
-            frames,
-            provider=provider,
-            model=model,
-            dimensions=dimensions,
-            on_error=on_error,
-            output_column=resolved_output_column,
-            options=options,
-            input_kind="video",
-        )
-
-    if rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_video rel= must be a Relation")
-    if first is not _EMBED_ARGUMENT_UNSET and frames is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_video expression API accepts a single frames Expression")
-    expression = frames if first is _EMBED_ARGUMENT_UNSET else first
-    if expression is _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_video requires a frames Expression or a Relation plus frames Expression")
-    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
-        raise TypeError("vane.ai.embed_video expression API does not accept output_column; use .alias(...)")
-    return _embed_expression(
-        expression,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
-        options=options,
-        input_kind="video",
-    )
-
-
-@overload
-def embed_audio(
-    audio: Expression,
-    /,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedAudioOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_audio(
-    *,
-    audio: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    **options: Unpack[EmbedAudioOptions],
-) -> Expression: ...
-
-
-@overload
-def embed_audio(
-    rel: Relation,
-    /,
-    audio: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedAudioOptions],
-) -> Relation: ...
-
-
-@overload
-def embed_audio(
-    *,
-    rel: Relation,
-    audio: Expression,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedAudioOptions],
-) -> Relation: ...
-
-
-def embed_audio(
-    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
-    /,
-    audio: Expression = _EMBED_ARGUMENT_UNSET,
-    *,
-    rel: Relation = _EMBED_ARGUMENT_UNSET,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
-    **options: Unpack[EmbedAudioOptions],
-) -> Expression | Relation:
-    """Embed STRUCT(sample_rate INTEGER, data TENSOR) decoded audio clips."""
-
-    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_audio received both first and rel; pass only one relation argument")
-
-    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
-    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
-        if audio is _EMBED_ARGUMENT_UNSET:
-            raise TypeError("vane.ai.embed_audio relation API requires a audio Expression")
-        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
-        return _embed_relation(
-            relation,
-            audio,
-            provider=provider,
-            model=model,
-            dimensions=dimensions,
-            on_error=on_error,
-            output_column=resolved_output_column,
-            options=options,
-            input_kind="audio",
-        )
-
-    if rel is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_audio rel= must be a Relation")
-    if first is not _EMBED_ARGUMENT_UNSET and audio is not _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_audio expression API accepts a single audio Expression")
-    expression = audio if first is _EMBED_ARGUMENT_UNSET else first
-    if expression is _EMBED_ARGUMENT_UNSET:
-        raise TypeError("vane.ai.embed_audio requires a audio Expression or a Relation plus audio Expression")
-    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
-        raise TypeError("vane.ai.embed_audio expression API does not accept output_column; use .alias(...)")
-    return _embed_expression(
-        expression,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
-        options=options,
-        input_kind="audio",
+        relation=False,
     )
 
 

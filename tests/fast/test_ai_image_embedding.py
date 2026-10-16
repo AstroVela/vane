@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import embed_image
+from vane.ai import ImageInput, embed
 from vane.ai.functions import _EmbedImageBatch
 from vane.ai.options import validate_embed_image_options
 from vane.ai.protocols import ImageEmbedderDescriptor
@@ -164,15 +164,15 @@ def test_public_entry_points_have_fixed_outputs(provider, entry):
         rel = conn.table("images")
         opts = dict(provider=provider, max_retries=0, batch_size=2)
         if entry == "expression":
-            result = rel.select(vane.col("id"), embed_image(vane.col("image"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(ImageInput(vane.col("image")), **opts).alias("embedding"))
         elif entry == "keyword":
-            result = rel.select(vane.col("id"), embed_image(image=vane.col("image"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(input=ImageInput(vane.col("image")), **opts).alias("embedding"))
         elif entry == "relation":
-            result = embed_image(rel, vane.col("image"), **opts)
+            result = embed(rel, ImageInput(vane.col("image")), **opts)
         elif entry == "relation_keyword":
-            result = embed_image(rel=rel, image=vane.col("image"), **opts)
+            result = embed(rel=rel, input=ImageInput(vane.col("image")), **opts)
         elif entry == "method":
-            result = rel.embed_image(vane.col("image"), **opts)
+            result = rel.embed(ImageInput(vane.col("image")), **opts)
         else:
             result = conn.sql(
                 "SELECT id, ai_embed_image(image, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
@@ -211,7 +211,7 @@ def test_rejects_implicit_decoding_in_both_apis(provider, sql):
             conn.sql(f"SELECT ai_embed_image({sql}, provider => 'image_fixture')").fetchall()
         rel = conn.sql(f"SELECT {sql} AS value")
         with pytest.raises(Exception, match="decoded IMAGE"):
-            rel.select(embed_image(vane.col("value"), provider=provider)).fetchall()
+            rel.select(embed(ImageInput(vane.col("value")), provider=provider)).fetchall()
 
 
 @pytest.mark.parametrize(
@@ -240,7 +240,7 @@ def test_model_capabilities_and_metadata_are_local(provider):
     with pytest.raises(ValueError, match="currently supports"):
         TransformersProvider().get_image_embedder(model="sentence-transformers/all-MiniLM-L6-v2", dimensions=384)
     with pytest.raises(ValueError, match="image embedding provider"):
-        embed_image(vane.col("image"), provider="openai")
+        embed(ImageInput(vane.col("image")), provider="openai")
     with pytest.raises(ValueError, match="cannot produce"):
         TransformersProvider().get_image_embedder(dimensions=513)
     with pytest.raises(ValueError, match="pinned revision"):
@@ -318,7 +318,7 @@ def test_decode_errors_remain_at_explicit_decode_boundary(provider):
 def test_relation_backends_replace_output_column(provider, backend):
     with vane.connect() as conn:
         rel = conn.sql("SELECT 1 AS Embedding, image('abc'::BLOB, 1, 1, 3, 'RGB') AS image")
-        result = embed_image(rel, vane.col("image"), provider=provider, execution_backend=backend)
+        result = embed(rel, ImageInput(vane.col("image")), provider=provider, execution_backend=backend)
         assert result.columns.count("embedding") == 1
         assert "Embedding" not in result.columns
         assert result.select("embedding").fetchall() == [((97, 1, 1),)]
@@ -341,6 +341,8 @@ def test_image_embedding_through_ray_actor(ray_local, provider, fixed, monkeypat
                 "SELECT i, ai_embed_image(image, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
             )
         else:
-            result = rel.embed_image(vane.col("image"), provider=provider, execution_backend="ray_actor", batch_size=2)
+            result = rel.embed(
+                ImageInput(vane.col("image")), provider=provider, execution_backend="ray_actor", batch_size=2
+            )
         assert "ray_actor" in result.explain()
         assert result.select("i", "embedding").order("i").fetchall() == [(0, (97, 1, 1)), (1, None), (2, (97, 1, 1))]

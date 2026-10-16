@@ -20,9 +20,16 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
+from vane.ai._embedding_content import EmbeddingContent, EmbeddingPartSpec, MultimodalInputSpec
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.media import TimedContent
-from vane.ai.protocols import AudioEmbedderDescriptor, ImageEmbedderDescriptor, VideoEmbedderDescriptor
+from vane.ai.protocols import (
+    AudioEmbedderDescriptor,
+    ImageEmbedderDescriptor,
+    MultimodalEmbedderDescriptor,
+    VideoEmbedderDescriptor,
+)
 from vane.ai.providers.google import GoogleTextEmbedder, GoogleTextEmbedderDescriptor, _canonical_model_id
 
 VIDEO_SPEC = VideoInputSpec(max_frames=6, max_input_bytes=16 * 1024**2)
@@ -69,6 +76,32 @@ class GoogleVideoEmbedderDescriptor(GoogleMediaEmbedderDescriptor, VideoEmbedder
 
 class GoogleImageEmbedderDescriptor(GoogleMediaEmbedderDescriptor, ImageEmbedderDescriptor):
     pass
+
+
+MULTIMODAL_SPEC = MultimodalInputSpec(
+    supported_parts=frozenset(
+        {
+            EmbeddingPartSpec("text"),
+            EmbeddingPartSpec("image"),
+            EmbeddingPartSpec("video"),
+            EmbeddingPartSpec("audio"),
+            EmbeddingPartSpec("image", "image/png"),
+            EmbeddingPartSpec("image", "image/jpeg"),
+            EmbeddingPartSpec("video", "video/mp4"),
+            EmbeddingPartSpec("video", "video/quicktime"),
+            EmbeddingPartSpec("audio", "audio/wav"),
+            EmbeddingPartSpec("audio", "audio/mpeg"),
+        }
+    ),
+    video=VIDEO_SPEC,
+    audio=AUDIO_SPEC,
+    max_input_bytes=MAX_REQUEST_BYTES,
+)
+
+
+class GoogleMultimodalEmbedderDescriptor(GoogleMediaEmbedderDescriptor, MultimodalEmbedderDescriptor):
+    def get_input_spec(self) -> MultimodalInputSpec:
+        return MULTIMODAL_SPEC
 
 
 def _image_part(frame: Image) -> types.Part:
@@ -176,6 +209,12 @@ def media_content(
     parts.extend(_audio_parts(audio))
     if not parts:
         raise ValueError("Google joint input requires content")
+    return _bounded_content(parts)
+
+
+def _bounded_content(parts: list[types.Part]) -> types.Content:
+    from google.genai import types
+
     # Bound text locally by bytes; the endpoint owns the combined multimodal
     # token count. Do not approximate image/audio tokens or truncate to fit.
     text_bytes = sum(len(part.text.encode("utf-8")) for part in parts if part.text)
@@ -187,14 +226,62 @@ def media_content(
     return content
 
 
+def embedding_content(content: EmbeddingContent) -> types.Content:
+    """Preserve ordered parts and original encoded bytes, without decoding video."""
+    from google.genai import types
+
+    spec = MULTIMODAL_SPEC
+    spec.validate_layout(tuple(part.spec for part in content.parts))
+    parts = []
+    images = videos = audios = 0
+    for part in content.parts:
+        kind, mime = part.spec.kind, part.spec.mime_type
+        if kind == "video":
+            videos += 1
+        if kind == "audio":
+            audios += 1
+        if kind == "image":
+            images += 1
+        if videos > 1 or audios > 1:
+            raise ValueError("Google multimodal embedding accepts at most one video and one audio input per row")
+        if mime is not None:
+            if not isinstance(part.value, bytes) or not 0 < len(part.value) <= MAX_REQUEST_BYTES:
+                raise ValueError("Google encoded media requires nonempty bounded bytes")
+            parts.append(types.Part.from_bytes(data=part.value, mime_type=mime))
+        elif kind == "text":
+            if not isinstance(part.value, str) or not part.value.strip():
+                raise ValueError("Google text parts must be nonempty strings")
+            parts.append(types.Part.from_text(text=part.value))
+        elif kind == "image":
+            parts.append(_image_part(part.value))
+        elif kind == "video":
+            images += len(part.value.frames)
+            parts.extend(media_content(video=part.value).parts)
+        else:
+            clip = part.value
+            if not isinstance(clip, AudioClip) or clip.sample_rate != AUDIO_SPEC.sample_rate:
+                raise ValueError("Google audio embedding requires 16000 Hz PCM")
+            parts.extend(_audio_parts((TimedContent(0, len(clip.samples) / clip.sample_rate, clip),)))
+        if images > 6:
+            raise ValueError("Google multimodal embedding accepts at most six image/frame parts per row")
+    return _bounded_content(parts)
+
+
 class GoogleMultimodalEmbedder(GoogleTextEmbedder):
     async def _media(self, inputs: Sequence[Any], encode: Callable[[Any], types.Content]) -> list[Embedding]:
-        async def one(batch: list[Any]) -> list[Embedding]:
-            return await self._embed_contents([encode(batch[0])])
+        # Input encoding/limits are configuration errors, not ignorable RPC
+        # failures. Validate the batch before dispatch and preserve that error
+        # class through the outer Embed wrapper's on_error handling as well.
+        try:
+            contents = [encode(item) for item in inputs]
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingConfigurationError(str(exc)) from exc
 
         # One clip per RPC bounds encoded payloads and also works with Vertex's
         # single-Content contract. The shared request runner bounds concurrency.
-        return await self._run_requests((([i], [item]) for i, item in enumerate(inputs)), one, [None] * len(inputs))
+        return await self._run_requests(
+            (([i], [content]) for i, content in enumerate(contents)), self._embed_contents, [None] * len(contents)
+        )
 
     async def embed_video(self, clips: list[VideoClip]) -> list[Embedding]:
         return await self._media(clips, lambda clip: media_content(video=clip))
@@ -212,6 +299,9 @@ class GoogleMultimodalEmbedder(GoogleTextEmbedder):
 
     async def embed_joint(self, video: VideoClip | None, text: str, *, audio: Sequence[TimedContent] = ()) -> Embedding:
         return (await self._embed_contents([media_content(video, text, audio=audio)]))[0]
+
+    async def embed_multimodal(self, inputs: list[EmbeddingContent]) -> list[Embedding]:
+        return await self._media(inputs, embedding_content)
 
     async def _embed_contents(self, contents: list[Any], *, reject_truncation: bool = True) -> list[Embedding]:
         values = await super()._embed_contents(contents, reject_truncation=reject_truncation)

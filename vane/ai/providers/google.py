@@ -363,6 +363,7 @@ class GoogleProvider(Provider):
         from vane.ai.providers._google_multimodal import (
             GoogleAudioEmbedderDescriptor,
             GoogleImageEmbedderDescriptor,
+            GoogleMultimodalEmbedderDescriptor,
             GoogleVideoEmbedderDescriptor,
         )
 
@@ -373,6 +374,7 @@ class GoogleProvider(Provider):
             "audio": GoogleAudioEmbedderDescriptor,
             "image": GoogleImageEmbedderDescriptor,
             "video": GoogleVideoEmbedderDescriptor,
+            "multimodal": GoogleMultimodalEmbedderDescriptor,
         }[kind]
         return descriptor(
             model_name=text.model_name,
@@ -397,6 +399,11 @@ class GoogleProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> ImageEmbedderDescriptor:
         return cast("ImageEmbedderDescriptor", self._media_embedder("image", model, dimensions, options))
+
+    def get_multimodal_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> Any:
+        return self._media_embedder("multimodal", model, dimensions, options)
 
     def get_prompter(
         self,

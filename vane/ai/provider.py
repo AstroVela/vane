@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vane.ai.protocols import (
         AudioEmbedderDescriptor,
         ImageEmbedderDescriptor,
+        MultimodalEmbedderDescriptor,
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
@@ -309,6 +310,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> AudioEmbedderDescriptor:
         raise _not_implemented(self, "embed_audio")
+
+    def get_multimodal_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> MultimodalEmbedderDescriptor:
+        raise _not_implemented(self, "embed_multimodal")
 
     # -- Prompting / chat completion ----------------------------------------
 
