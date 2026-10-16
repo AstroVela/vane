@@ -175,7 +175,8 @@ def test_failed_input_cleanup_retains_native_request(monkeypatch, track_data, ta
                 def fail_cleanup(*args, **kwargs):
                     raise RuntimeError("injected request input cleanup failure")
 
-                fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+                # Materialized input leases own their pooled descriptors.
+                fault.setattr(ref_bundle.LocalShmBlockRef, "release", fail_cleanup)
                 with pytest.raises(Exception, match="input cleanup failure"):
                     request.execute(plan, {}, conn=connection)
                 gc.collect()
@@ -238,7 +239,7 @@ def test_untracked_request_owns_input_cleanup_during_payload_setup(monkeypatch):
         request, queued = runtime.request(), runtime.request()
         try:
             with monkeypatch.context() as fault:
-                fault.setattr(manager, "_release_input_ack_ref", fail)
+                fault.setattr(ref_bundle.LocalShmBlockRef, "release", fail)
                 fault.setattr(local, "make_local_ref_bundle_worker_payload", fail_descriptor)
                 with pytest.raises(Exception, match="setup or cleanup failure"):
                     request.execute(plan, {}, conn=connection)
