@@ -4946,18 +4946,21 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 return None
             scope = worker._current_execution_scope()
             with preparation_lock:
-                # After handoff, only normal Arrow/worker/fork leases may release
-                # this input. Reclaimers racing with claim see the same lock.
+                # Transfer ownership under the lock so even a reclaimer already
+                # snapshotted by the store observes that this input is claimed.
                 claimed = True
                 unregister_prefetch()
                 if cleanup_failure is not None:
                     raise cleanup_failure
-                if prepared is None:
-                    materialize(scope)
-                assert prepared is not None and worker_payload is not None
-                task = current_data_task()
-                if task is not None:
-                    track_local_shm_inputs(task, prepared[1])
+            # Foreground materialization can wait for another actor's output.
+            # That output may still invoke a snapshotted reclaimer, so it must
+            # be able to acquire preparation_lock while we wait for memory.
+            if prepared is None:
+                materialize(scope)
+            assert prepared is not None and worker_payload is not None
+            task = current_data_task()
+            if task is not None:
+                track_local_shm_inputs(task, prepared[1])
             return worker._submit_ref_bundle_direct(worker_payload)
 
         self._submit_async(

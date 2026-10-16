@@ -11126,3 +11126,101 @@ def test_prefetch_preserves_running_calls_output_capacity(
     assert store.snapshot()["live_allocations"] == 0
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("reclaim-race-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    entered, release = tmp_path / "entered", tmp_path / "release"
+
+    class Actor:
+        def __call__(self, table):
+            if table["x"][0].as_py().startswith(b"A"):
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first call was never released")
+                    time.sleep(0.01)
+                return table
+            return pa.table({"x": [b"B"]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    registered, allow_prepare, waiting, reclaimed = (threading.Event() for _ in range(4))
+    original_register = store.register_prefetch
+    original_wait = store.wait_for_capacity
+
+    def register(reclaim):
+        def paused_reclaim():
+            # The output thread already holds a snapshot of this callback.
+            # Let the other actor claim its input and wait for memory before
+            # entering the callback, even though it has been unregistered.
+            allow_prepare.set()
+            assert waiting.wait(10), "second input did not wait for capacity"
+            reclaim()
+            reclaimed.set()
+
+        unregister = original_register(paused_reclaim)
+        registered.set()
+        assert allow_prepare.wait(10), "output did not snapshot the reclaimer"
+        return unregister
+
+    def wait_for_capacity(size, *args):
+        if size > 60 * 1024:
+            waiting.set()
+        return original_wait(size, *args)
+
+    executors, pools = [], []
+    try:
+        for _ in range(2):
+            executor, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+            executors.append(executor)
+            pools.append(pool)
+        _submit_with_admission(executors[0], pa.table({"x": [b"A" * (32 * 1024)]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        assert manager.snapshot()["limit_bytes"] == 40 * 1024
+        monkeypatch.setattr(store, "register_prefetch", register)
+        monkeypatch.setattr(store, "wait_for_capacity", wait_for_capacity)
+        _submit_with_admission(executors[1], pa.table({"x": [b"B" * (64 * 1024)]}))
+        assert registered.wait(5)
+        release.touch()
+        assert reclaimed.wait(5), "input capacity wait blocked the output's snapshotted reclaimer"
+        for executor, expected in zip(executors, (b"A" * (32 * 1024), b"B")):
+            result = _wait_for_results(executor, 1)[0]
+            assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+            try:
+                assert [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()] == [expected]
+            finally:
+                for ref in result[1]:
+                    ref.release()
+    finally:
+        allow_prepare.set()
+        waiting.set()
+        release.touch()
+        # A failing implementation needs its waiting input cancelled before
+        # the output thread can finish its snapshotted callback.
+        for executor in reversed(executors):
+            executor.close(kill=True)
+        for pool in pools:
+            pool.shutdown(kill=True)
+        store.remove_client("reclaim-race-test")
+    assert store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
