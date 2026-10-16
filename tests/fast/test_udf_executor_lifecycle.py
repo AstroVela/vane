@@ -11029,6 +11029,11 @@ def test_prefetch_preserves_running_calls_output_capacity(
     from vane.execution import ref_bundle, udf_shm_store
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", budget)
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    # Auto limits are cached per manager. Use a new query budget so preceding
+    # tests cannot leave this case using a much larger arena's cached limit.
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     store = udf_shm_store.LocalShmStore(80 * 1024)
     store.add_client("prefetch-test")
     monkeypatch.setattr(udf_shm_store, "_current_store", store)
@@ -11088,8 +11093,11 @@ def test_prefetch_preserves_running_calls_output_capacity(
             time.sleep(0.01)
         _submit_with_admission(second, pa.table({"x": [b"2" * (input_kib * 1024)]}))
         assert prepared.wait(5), "prefetch did not finish or defer"
+        assert manager.snapshot()["limit_bytes"] == (40 * 1024 if budget == "auto" else 0)
         if budget == "0":
             assert captured and not captured[0]._closed
+        elif input_kib == 32:
+            assert not captured, "prefetch spent the running call's progress allowance"
         release.touch()
         if cancel_prefetch:
             assert reclaimed.wait(5)
@@ -11117,3 +11125,4 @@ def test_prefetch_preserves_running_calls_output_capacity(
     assert all(ref._closed for ref in captured)
     assert store.snapshot()["live_allocations"] == 0
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
