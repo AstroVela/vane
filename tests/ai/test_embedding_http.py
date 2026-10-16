@@ -20,6 +20,121 @@ import vane
 from vane.ai import AudioInput, ImageInput, MultimodalInput, TextInput, VideoInput, embed
 
 
+@pytest.fixture
+def google_input_validation_server(monkeypatch):
+    pytest.importorskip("google.genai")
+    from vane.ai.providers.google import GoogleProvider
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(request)
+            parts = request["requests"][0]["content"]["parts"]
+            fails = any(part.get("text") == "provider failure" for part in parts)
+            response = (
+                {"error": {"code": 400, "message": "Rejected by fixture", "status": "INVALID_ARGUMENT"}}
+                if fails
+                else {"embeddings": [{"values": [float(len(parts))] + [1.0] * 127}]}
+            )
+            body = json.dumps(response).encode()
+            self.send_response(400 if fails else 200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield (
+            GoogleProvider(
+                api_key="local-embedding-test", vertexai=False, base_url=f"http://127.0.0.1:{server.server_port}"
+            ),
+            calls,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize(
+    "invalid,message",
+    [("text", "8192-byte text budget"), ("videos", "at most one video"), ("base64", "encoded request byte budget")],
+)
+def test_google_input_limits_raise_before_any_rpc(google_input_validation_server, backend, on_error, invalid, message):
+    import pyarrow as pa
+
+    from vane.ai.providers._google_multimodal import MAX_REQUEST_BYTES
+
+    provider, calls = google_input_validation_server
+    with vane.connect() as conn:
+        relation = conn.from_arrow(
+            pa.table(
+                {
+                    "text": ["healthy", "x" * 8193 if invalid == "text" else "caption"],
+                    "video": [b"first", b"x" * (MAX_REQUEST_BYTES * 3 // 4) if invalid == "base64" else b"second"],
+                    "extra": pa.array([None, b"extra" if invalid == "videos" else None], pa.binary()),
+                }
+            )
+        )
+        content = MultimodalInput(
+            [
+                TextInput(vane.col("text")),
+                VideoInput(vane.col("video"), mime_type="video/mp4"),
+                VideoInput(vane.col("extra"), mime_type="video/mp4"),
+            ]
+        )
+        with pytest.raises(Exception, match=message):
+            relation.embed(
+                content,
+                provider=provider,
+                dimensions=128,
+                batch_size=2,
+                max_retries=0,
+                execution_backend=backend,
+                on_error=on_error,
+            ).fetchall()
+    # A valid row precedes the invalid row. Validation must finish before the
+    # dispatcher submits either row, even with on_error="ignore".
+    assert calls == []
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_google_rpc_failure_can_still_be_ignored(google_input_validation_server, backend):
+    import pyarrow as pa
+
+    provider, calls = google_input_validation_server
+    with vane.connect() as conn:
+        relation = conn.from_arrow(pa.table({"id": [0, 1], "text": ["healthy", "provider failure"]}))
+        rows = (
+            relation.embed(
+                MultimodalInput([TextInput(vane.col("text"))]),
+                provider=provider,
+                dimensions=128,
+                batch_size=2,
+                max_retries=0,
+                on_error="ignore",
+                execution_backend=backend,
+            )
+            .select("id", "embedding")
+            .order("id")
+            .fetchall()
+        )
+    assert rows == [(0, (1.0,) * 128), (1, None)]
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 def test_google_unified_parts_use_real_sdk_base64_and_preserve_rows(monkeypatch, backend):
     pytest.importorskip("google.genai")

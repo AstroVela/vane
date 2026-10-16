@@ -14,7 +14,16 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import AudioInput, ImageInput, MultimodalInput, TextInput, VideoInput, embed
+from vane.ai import (
+    AudioInput,
+    AudioInputSpec,
+    ImageInput,
+    MultimodalInput,
+    TextInput,
+    VideoInput,
+    VideoInputSpec,
+    embed,
+)
 from vane.ai._embedding_content import (
     EmbeddingContent,
     EmbeddingPart,
@@ -67,6 +76,35 @@ class ContentProvider(Provider):
         return ContentDescriptor()
 
 
+@dataclass
+class OptionalContentDescriptor(ContentDescriptor):
+    def get_input_spec(self):
+        return MultimodalInputSpec(
+            frozenset(
+                {
+                    TEXT,
+                    VIDEO,
+                    EmbeddingPartSpec("image", "image/png"),
+                    EmbeddingPartSpec("audio", "audio/wav"),
+                    EmbeddingPartSpec("image"),
+                    EmbeddingPartSpec("video"),
+                    EmbeddingPartSpec("audio"),
+                }
+            ),
+            video=VideoInputSpec(),
+            audio=AudioInputSpec(sample_rate=16000, max_samples=16000),
+        )
+
+
+class OptionalContentProvider(ContentProvider):
+    def get_multimodal_embedder(self, model=None, dimensions=None, *, options=None):
+        return OptionalContentDescriptor()
+
+
+def packed_parts(table):
+    return pa.table({"parts": table.to_struct_array()})
+
+
 def test_optional_parts_preserve_row_order_and_do_not_expand_rows():
     table = pa.table(
         {
@@ -95,9 +133,11 @@ def test_optional_parts_preserve_row_order_and_do_not_expand_rows():
     ],
 )
 def test_invalid_content_is_rejected_before_client_creation_even_with_ignore(text, video, message):
-    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "", "vector", 2, parts=(TEXT, VIDEO), on_error="ignore")
+    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "parts", "vector", 2, parts=(TEXT, VIDEO), on_error="ignore")
     with pytest.raises(EmbeddingConfigurationError, match=message):
-        wrapper(pa.table({"part_0": pa.array([text], pa.string()), "part_1": pa.array([video], pa.binary())}))
+        wrapper(
+            packed_parts(pa.table({"part_0": pa.array([text], pa.string()), "part_1": pa.array([video], pa.binary())}))
+        )
     assert wrapper._embedder is None
 
 
@@ -106,8 +146,8 @@ def test_aggregate_budget_uses_utf8_bytes():
         content_from_columns(pa.table({"part_0": ["视频" * 3]}), (TEXT,), SPEC)
 
 
-def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps():
-    from vane.ai import AudioInputSpec, VideoInputSpec
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps(backend):
     from vane.execution.udf_file_contract import FileUDFContract
 
     pixels = np.full((2, 3, 3), 17, np.uint8)
@@ -149,6 +189,40 @@ def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps():
     assert video_part.value.frame_times == (0.75,) and video_part.value.frame_indices == (7,)
     np.testing.assert_array_equal(audio_part.value.samples, samples)
     assert audio_part.value.sample_rate == 16000
+
+    class Encoder:
+        async def embed_multimodal(self, contents):
+            for content in contents:
+                text, image, video, audio = content.parts
+                assert text.value == "text"
+                np.testing.assert_array_equal(image.value, pixels)
+                np.testing.assert_array_equal(video.value.frames[0], pixels)
+                assert video.value.frame_times == (0.75,) and video.value.frame_indices == (7,)
+                np.testing.assert_array_equal(audio.value.samples, samples)
+                assert audio.value.sample_rate == 16000
+            return [[4, 0.75] for _ in contents]
+
+    class Descriptor(OptionalContentDescriptor):
+        def instantiate(self):
+            return Encoder()
+
+    class DecodedProvider(ContentProvider):
+        def get_multimodal_embedder(self, model=None, dimensions=None, *, options=None):
+            return Descriptor()
+
+    with vane.connect() as conn:
+        relation = conn.from_arrow(pa.table({"text": ["text"], "image": image, "video": frames, "audio": audio}))
+        inputs = MultimodalInput(
+            [
+                TextInput(vane.col("text")),
+                ImageInput(vane.col("image")),
+                VideoInput(vane.col("video")),
+                AudioInput(vane.col("audio")),
+            ]
+        )
+        assert relation.embed(inputs, provider=DecodedProvider(), execution_backend=backend).select(
+            "embedding"
+        ).fetchall() == [((4, 0.75),)]
 
 
 @pytest.mark.parametrize("value", ["file.mp4", "data:video/mp4;base64,AA==", 42])
@@ -220,13 +294,59 @@ def test_public_relation_batches_keep_input_identity(backend):
         ]
 
 
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize(
+    "kind,mime,typed",
+    [
+        ("text", None, False),
+        ("image", None, False),
+        ("video", None, False),
+        ("audio", None, False),
+        ("image", "image/png", False),
+        ("audio", "audio/wav", False),
+        ("video", "video/mp4", False),
+        ("video", "video/mp4", True),
+    ],
+)
+def test_constant_null_part_is_omitted_without_nulling_valid_rows(backend, kind, mime, typed):
+    value = vane.ConstantExpression(None)
+    if typed:
+        value = value.cast("BLOB")
+    part_type = {"text": TextInput, "image": ImageInput, "video": VideoInput, "audio": AudioInput}[kind]
+    missing = part_type(value) if mime is None else part_type(value, mime_type=mime)
+    with vane.connect() as conn:
+        relation = conn.from_arrow(pa.table({"id": [0, 1], "text": ["hello", "world!"]}))
+        for text, second_length in ((vane.col("text"), 6), (vane.ConstantExpression("hello"), 5)):
+            result = relation.embed(
+                MultimodalInput([TextInput(text), missing]),
+                provider=OptionalContentProvider(),
+                batch_size=2,
+                execution_backend=backend,
+                output_column="vector",
+            )
+            assert result.select("id", "vector").order("id").fetchall() == [(0, (5, 1)), (1, (second_length, 1))]
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("joint", [False, True])
+def test_all_constant_null_parts_still_raise(backend, on_error, joint):
+    missing = VideoInput(vane.ConstantExpression(None), mime_type="video/mp4")
+    content = MultimodalInput([TextInput(vane.ConstantExpression(None)), missing]) if joint else missing
+    with vane.connect() as conn:
+        with pytest.raises(Exception, match="no nonempty parts"):
+            conn.sql("SELECT 1 AS id").embed(
+                content, provider=ContentProvider(), execution_backend=backend, on_error=on_error
+            ).fetchall()
+
+
 def test_wrapper_serialization_omits_client_and_loop_and_closes_on_same_loop():
     closed = []
     loop = asyncio.new_event_loop()
-    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "", "vector", 2, parts=(TEXT,))
+    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "parts", "vector", 2, parts=(TEXT,))
     wrapper.bind_async_runtime(loop.run_until_complete)
     try:
-        assert wrapper(pa.table({"part_0": ["ok"]}))["vector"].to_pylist() == [[2, 1]]
+        assert wrapper(packed_parts(pa.table({"part_0": ["ok"]})))["vector"].to_pylist() == [[2, 1]]
 
         async def close():
             closed.append(asyncio.get_running_loop())

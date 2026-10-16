@@ -1230,7 +1230,10 @@ class _EmbedMultimodalBatch(_EmbeddingBatch):
     def _input_values(self, table: pa.Table) -> list[Any]:
         from vane.ai._embedding_content import content_from_columns
 
-        return content_from_columns(table, self._parts, self._descriptor.get_input_spec())
+        parts = pa.Table.from_arrays(
+            table.column(self._column).flatten(), names=[f"part_{index}" for index in range(len(self._parts))]
+        )
+        return content_from_columns(parts, self._parts, self._descriptor.get_input_spec())
 
 
 class _PromptBatch:
@@ -1686,7 +1689,7 @@ def _build_embed_expression(
     if isinstance(input, MultimodalInput):
         parts = tuple(EmbeddingPartSpec(part.kind, getattr(part, "mime_type", None)) for part in input.parts)
         descriptor.get_input_spec().validate_layout(parts)
-        inputs = {
+        part_inputs = {
             f"part_{index}": (
                 part.value
                 if spec.mime_type is not None
@@ -1694,8 +1697,14 @@ def _build_embed_expression(
             )
             for index, (part, spec) in enumerate(zip(input.parts, parts, strict=True))
         }
+        # A content is non-NULL even when its optional fields are NULL. Passing
+        # fields as separate UDF arguments lets native binding fold the whole
+        # expression to NULL before optional/all-empty validation can run.
+        inputs = {
+            "parts": vane.FunctionExpression("struct_pack", *(value.alias(name) for name, value in part_inputs.items()))
+        }
         wrapper = _EmbedMultimodalBatch(
-            descriptor, "", output_column, resolved_dimensions, parts=parts, **wrapper_options
+            descriptor, "parts", output_column, resolved_dimensions, parts=parts, **wrapper_options
         )
     else:
         input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]

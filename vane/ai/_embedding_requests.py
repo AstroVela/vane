@@ -17,12 +17,13 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from vane.ai.provider import ProviderCapabilityError, _ProviderResultError
 from vane.execution._async_dispatch import map_async_ordered
 
 logger = logging.getLogger(__name__)
+_RequestInput = TypeVar("_RequestInput")
 
 
 class _EmbeddingBatchError(_ProviderResultError):
@@ -160,8 +161,8 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
 
     async def _run_requests(
         self,
-        batches: Iterable[tuple[list[int], list[str]]],
-        request: Callable[[list[str]], Awaitable[list[Any]]],
+        batches: Iterable[tuple[list[int], list[_RequestInput]]],
+        request: Callable[[list[_RequestInput]], Awaitable[list[Any]]],
         results: list[Any],
     ) -> list[Any]:
         # Imports are deferred to keep provider modules independent of the
@@ -181,7 +182,7 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
         on_error = getattr(self, "_request_on_error", "raise")
         validate = getattr(self, "_validate_vector", lambda value: value)
 
-        async def invoke(indices: list[int], texts: list[str], check_stopped: Callable[[], None]) -> None:
+        async def invoke(indices: list[int], texts: list[_RequestInput], check_stopped: Callable[[], None]) -> None:
             failure: Exception | None = None
             for attempt in range(retries + 1):
                 check_stopped()
@@ -242,7 +243,7 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
             self.metrics.failed_inputs += len(texts)
             _log_substituted_failure(failure, on_error="ignore")
 
-        async def dispatch(batch: tuple[list[int], list[str]], check_stopped: Callable[[], None]) -> None:
+        async def dispatch(batch: tuple[list[int], list[_RequestInput]], check_stopped: Callable[[], None]) -> None:
             self.metrics.queue_seconds += time.monotonic() - queued_at
             await invoke(*batch, check_stopped)
 

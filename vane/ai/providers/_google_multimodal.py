@@ -21,6 +21,7 @@ import numpy as np
 
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPartSpec, MultimodalInputSpec
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.media import TimedContent
 from vane.ai.protocols import (
@@ -268,12 +269,19 @@ def embedding_content(content: EmbeddingContent) -> types.Content:
 
 class GoogleMultimodalEmbedder(GoogleTextEmbedder):
     async def _media(self, inputs: Sequence[Any], encode: Callable[[Any], types.Content]) -> list[Embedding]:
-        async def one(batch: list[Any]) -> list[Embedding]:
-            return await self._embed_contents([encode(batch[0])])
+        # Input encoding/limits are configuration errors, not ignorable RPC
+        # failures. Validate the batch before dispatch and preserve that error
+        # class through the outer Embed wrapper's on_error handling as well.
+        try:
+            contents = [encode(item) for item in inputs]
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingConfigurationError(str(exc)) from exc
 
         # One clip per RPC bounds encoded payloads and also works with Vertex's
         # single-Content contract. The shared request runner bounds concurrency.
-        return await self._run_requests((([i], [item]) for i, item in enumerate(inputs)), one, [None] * len(inputs))
+        return await self._run_requests(
+            (([i], [content]) for i, content in enumerate(contents)), self._embed_contents, [None] * len(contents)
+        )
 
     async def embed_video(self, clips: list[VideoClip]) -> list[Embedding]:
         return await self._media(clips, lambda clip: media_content(video=clip))
