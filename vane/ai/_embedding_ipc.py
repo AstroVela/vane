@@ -81,7 +81,11 @@ def input_spec(options: dict[str, Any]) -> MultimodalInputSpec:
 def describe(
     content: EmbeddingContent, spec: MultimodalInputSpec
 ) -> tuple[list[dict[str, Any]], list[np.ndarray[Any, Any]], int]:
-    """Validate before admission/allocation; describe contiguous array copies."""
+    """Validate transport types/budgets before admission; describe array copies.
+
+    Standalone TextInput preserves blank strings. MultimodalInput's conversion
+    layer owns omission of blank parts and rejection of all-empty rows.
+    """
     spec.validate_layout(tuple(part.spec for part in content.parts))
     parts: list[dict[str, Any]] = []
     arrays: list[np.ndarray[Any, Any]] = []
@@ -107,8 +111,8 @@ def describe(
         kind, value = part.spec.kind, part.value
         entry: dict[str, Any] = {"kind": kind}
         if kind == "text":
-            if not isinstance(value, str) or not value.strip():
-                raise EmbeddingConfigurationError("Embedding text must be nonempty")
+            if not isinstance(value, str):
+                raise EmbeddingConfigurationError("Embedding text must be a string")
             entry["text"] = value
             text_bytes += len(value.encode("utf-8"))
         elif kind == "image":
@@ -166,8 +170,8 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
         if set(part) != keys:
             raise EmbeddingConfigurationError("Invalid embedding part fields")
         if kind == "text":
-            if not isinstance(part["text"], str) or not part["text"].strip():
-                raise EmbeddingConfigurationError("Embedding text must be nonempty")
+            if not isinstance(part["text"], str):
+                raise EmbeddingConfigurationError("Embedding text must be a string")
             text_bytes += len(part["text"].encode("utf-8"))
             continue
         buffers = part["buffers"] if kind == "video" else [part["buffer"]]

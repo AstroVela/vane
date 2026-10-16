@@ -288,6 +288,27 @@ def test_wire_bounds_rejected_before_mapping(bad):
         ipc.validate_layout(parts, size, spec)
 
 
+@pytest.mark.parametrize("value", ["", " \t\n", "\u3000"])
+def test_text_transport_preserves_blanks_and_charges_admission(value):
+    budget = max(1, len(value.encode("utf-8")))
+    spec = ipc.input_spec({"max_input_bytes": budget})
+    parts, arrays, size = ipc.describe(content("text", value), spec)
+    assert parts == [{"kind": "text", "text": value}]
+    assert arrays == [] and size == 0
+    assert ipc.validate_layout(parts, size, spec) == budget
+    assert ipc.sealed_buffer(arrays, size) is None
+    assert ipc.restore(parts, None) == content("text", value)
+
+
+@pytest.mark.parametrize("value", [None, 1, b"", [], {}, " " * 5, "\u3000" * 2])
+def test_text_transport_keeps_type_and_utf8_budget_validation(value):
+    spec = ipc.input_spec({"max_input_bytes": 4})
+    with pytest.raises(EmbeddingConfigurationError, match="string|byte budget"):
+        ipc.describe(content("text", value), spec)
+    with pytest.raises(EmbeddingConfigurationError, match="string|byte budget"):
+        ipc.validate_layout([{"kind": "text", "text": value}], 0, spec)
+
+
 def test_sealed_arrays_preserve_noncontiguous_pixels_and_audio():
     import fcntl
     import mmap
@@ -505,7 +526,33 @@ def check_public_embed(process, family, backend):
             normalize=False,
         )
         assert result.select("id", "vector").order("id").fetchall() == [(0, (3, 4)), (1, (3, 4)), (2, None)]
-    asyncio.run(until(lambda: state(root).get("calls") == 2 and state(root).get("inflight") == 0))
+        texts = connection.from_arrow(
+            pa.table({"id": list(range(5)), "text": ["healthy", "", " \t\n", "\u3000", None]})
+        )
+        result = texts.embed(
+            TextInput(vane.col("text")),
+            provider=family,
+            model="fixture",
+            dimensions=2,
+            runtime="service",
+            service_path=str(root / "engine.sock"),
+            service_id="fixture-v1",
+            execution_backend=backend,
+            on_error="ignore",
+            output_column="vector",
+            normalize=False,
+        )
+        assert result.select("id", "vector").order("id").fetchall() == [
+            (0, (3, 4)),
+            (1, (3, 4)),
+            (2, (3, 4)),
+            (3, (3, 4)),
+            (4, None),
+        ]
+    asyncio.run(
+        until(lambda: state(root).get("calls") == 6 and state(root).get("bytes") == state(root).get("inflight") == 0)
+    )
+    assert state(root)["engines"] == 1
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])

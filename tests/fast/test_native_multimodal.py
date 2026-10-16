@@ -166,6 +166,40 @@ def clip():
     return VideoClip((np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8, 3), dtype=np.uint8)), (0.125, 1.375), (4, 18))
 
 
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_native_single_text_preserves_blanks_and_nulls(family, on_error, sdk):
+    import pyarrow as pa
+
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+    from vane.ai.functions import _EmbedTextBatch
+    from vane.execution._async_runtime import AsyncRuntime
+
+    descriptor = load_provider(family).get_text_embedder(
+        "fixture", 2, options={"gpus_per_actor": 0, "max_input_bytes": 8}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "vector", 2, on_error=on_error, normalize=False)
+    loop = AsyncRuntime()
+    wrapper.bind_async_runtime(loop.run)
+    values = ["healthy", "", " \t\n", "\u3000", None]
+    try:
+        result = wrapper(pa.table({"text": values}))
+        assert result["vector"].to_pylist() == [[3.0, 4.0]] * 4 + [None]
+        prompts = (
+            [call["text"][0] for call in sdk.processing]
+            if family == "sglang"
+            else [call[1]["prompt"] for call in sdk.calls]
+        )
+        assert prompts == [f"rendered:{descriptor.options['instruction']}\n{value}" for value in values[:-1]]
+        with pytest.raises(EmbeddingConfigurationError, match="max_input_bytes"):
+            wrapper(pa.table({"text": ["\u3000" * 3]}))
+        assert len(sdk.calls) == 4
+    finally:
+        wrapper.close()
+        loop.close()
+    assert len(sdk.engines) == 1 and sdk.engines[0].closed == 1
+
+
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("kind", ["text", "image", "video"])
 def test_native_embedding_overlaps_requests_and_restores_order(family, kind, sdk):

@@ -111,6 +111,10 @@ model execution, including with `on_error="ignore"`. Invalid media, bad types
 and exceeded input budgets also raise; they are not converted into absent parts.
 Single decoded input expressions retain SQL NULL propagation. Use
 `MultimodalInput([part])` when nonempty-content enforcement is required.
+Standalone `TextInput` also preserves empty and whitespace-only strings for the
+selected model, including native and service execution. Its UTF-8 byte budget
+still applies. The transport validates types and budgets; it does not apply the
+multimodal omission rule to a standalone text input.
 
 An absent value does not explain whether extraction failed. Context records that
 state separately. A part declared in the plan must be supported even if its

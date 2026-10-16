@@ -126,7 +126,10 @@ def test_optional_parts_preserve_row_order_and_do_not_expand_rows():
     "text,video,message",
     [
         (None, None, "no nonempty"),
+        ("", None, "no nonempty"),
         ("  ", None, "no nonempty"),
+        (" \t\n", None, "no nonempty"),
+        ("\u3000", None, "no nonempty"),
         ("healthy text", b"", "empty"),
         ("x" * 10, b"x" * 10, "combined"),
         (None, b"x" * 17, "byte budget"),
