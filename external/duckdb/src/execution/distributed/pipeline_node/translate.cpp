@@ -668,6 +668,7 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 	}
 	case PhysicalOperatorType::CREATE_TABLE_AS:
 	case PhysicalOperatorType::BATCH_CREATE_TABLE_AS:
+	case PhysicalOperatorType::CREATE_TYPE:
 	case PhysicalOperatorType::INSERT:
 	case PhysicalOperatorType::BATCH_INSERT:
 	case PhysicalOperatorType::UPDATE:
@@ -681,8 +682,9 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 		// DuckDB owns these sinks: writes, session variables and profiling.
 		// Expose the input UDFs and the sink boundary without creating a
 		// distributed task.
+		// CREATE_TYPE is a sink only when its enum values come from a query.
 		node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
-		                                             MakeSchemaRef(op.GetTypes()), std::move(children), true));
+		                                             MakeSchemaRef(op.GetTypes()), std::move(children), op.IsSink()));
 		return;
 	}
 	case PhysicalOperatorType::RECURSIVE_CTE:

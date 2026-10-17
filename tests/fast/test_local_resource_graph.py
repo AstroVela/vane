@@ -255,6 +255,64 @@ def test_native_sink_wrappers_collect_and_execute_udf_inputs(
     build_local_resource_graph(graph, query_id="native_sink")
 
 
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize("statement", ["create_enum", "dynamic_pivot", "dynamic_physical_pivot", "static_pivot"])
+def test_native_enum_and_pivot_collect_udf_inputs(monkeypatch, threads, statement):
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    graphs = []
+    prepare = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes
+
+    def capture(nodes, **kwargs):
+        graphs.append(kwargs["resource_graph"])
+        return prepare(nodes, **kwargs)
+
+    monkeypatch.setattr(udf_subprocess, "ensure_local_subprocess_actor_pools_for_nodes", capture)
+    labels = ["label_0", "label_1", "label_2"]
+    with vane.connect(config={"threads": threads}) as conn:
+        vane.attach_function(
+            lambda value: f"label_{value}",
+            alias="enum_label",
+            parameters=["BIGINT"],
+            return_dtype="VARCHAR",
+            connection=conn,
+        )
+        if statement == "create_enum":
+            conn.execute(
+                "CREATE TYPE udf_enum AS ENUM (SELECT enum_label(i % 3) AS label FROM range(6) t(i) ORDER BY i)"
+            )
+            assert conn.execute("SELECT enum_range(NULL::udf_enum)").fetchone()[0] == labels
+        else:
+            if statement == "dynamic_physical_pivot":
+                conn.execute("SET pivot_filter_threshold = 0")
+            values = " IN ('label_0', 'label_1', 'label_2')" if statement == "static_pivot" else ""
+            result = conn.execute(
+                "PIVOT (SELECT enum_label(i % 3) AS label, i + 1 AS n FROM range(6) t(i)) "
+                f"ON label{values} USING sum(n)"
+            )
+            assert result.fetchall() == [(5, 7, 9)]
+            assert [column[0] for column in result.description] == labels
+
+    # Dynamic PIVOT first executes an enum query, then its aggregation query.
+    assert len(graphs) == (2 if statement.startswith("dynamic") else 1)
+    assert len({graph["query_id"] for graph in graphs}) == len(graphs)
+    enum_sinks = []
+    for graph in graphs:
+        assert len(graph["udf_node_ids"]) == 1
+        build_local_resource_graph(graph, query_id=graph["query_id"])
+        for node in graph["nodes"]:
+            if node["node_name"] == "CREATE_TYPE":
+                enum_sinks.append(node)
+                assert node["node_id"] in graph["terminal_node_ids"]
+                assert node["is_materialization_barrier"]
+                assert node["materialized_input_node_ids"] == node["input_node_ids"]
+                assert node["input_node_ids"]
+    assert len(enum_sinks) == (0 if statement == "static_pivot" else 1)
+    if statement == "dynamic_physical_pivot":
+        assert any(node["node_name"] == "Pivot" for node in graphs[-1]["nodes"])
+
+
 @pytest.mark.parametrize(
     "backend,adapter",
     [
