@@ -3761,8 +3761,11 @@ def test_dead_actor_query_teardown_releases_only_its_closed_query(monkeypatch, d
     worker_handle_mod.open_fte_registry_for_query(query_id)
 
 
-@pytest.mark.parametrize("death_stage", ["interrupt", "prepare", "cleanup"])
-def test_terminal_control_failure_survives_worker_death(death_stage):
+@pytest.mark.parametrize(
+    ("death_stage", "flush_before_drop"),
+    [("interrupt", True), ("interrupt", False), ("prepare", False), ("cleanup", False)],
+)
+def test_terminal_control_failure_survives_worker_death(death_stage, flush_before_drop):
     class _FailedRef:
         def __init__(self, error):
             self._future = Future()
@@ -3793,7 +3796,7 @@ def test_terminal_control_failure_survives_worker_death(death_stage):
     handle._fragment_query_ids = {query_id + ":node:1": query_id}
     worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
     handle.enqueue_fte_ack_task_result(task_id)
-    if death_stage == "interrupt":
+    if flush_before_drop:
         # An earlier barrier may record the failure before a teardown retry
         # discovers that its interrupt target has died.
         with pytest.raises(task_control_mod.FteControlBarrierTerminalError, match="result acknowledgement failed"):
@@ -3808,6 +3811,114 @@ def test_terminal_control_failure_survives_worker_death(death_stage):
     assert handle._has_fte_teardown_state_for_query(query_id) is False
     assert handle._registered_fragment_ids == set()
     assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize("outcome", ["ack-error", "timeout-error", "rejected-ack", "child-death", "target-death"])
+def test_dead_actor_teardown_collects_completed_controls_without_waiting(outcome):
+    query_id = f"query-dead-actor-completed-control-{outcome}"
+    pending_timeouts = []
+
+    class _PendingFuture(Future):
+        def result(self, timeout=None):
+            pending_timeouts.append(timeout)
+            assert timeout == 0
+            return super().result(timeout=timeout)
+
+    pending_future = _PendingFuture()
+    completed_future = Future()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+
+    def remote_method(future):
+        ref = SimpleNamespace(future=lambda: future)
+        return SimpleNamespace(remote=lambda *_args: ref)
+
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 1, "attempt_id": 0}
+    if outcome == "rejected-ack":
+        completed_future.set_result(
+            {
+                "task_id": task_id,
+                "state": "FINISHED",
+                "_fte_control_operation": "fte_ack_task_result",
+                "_fte_control_applied": False,
+            }
+        )
+    else:
+        error = {
+            "ack-error": RuntimeError("completed ACK failed"),
+            "timeout-error": TimeoutError("completed ACK timed out"),
+            "child-death": ray.exceptions.RayTaskError(
+                "fte_ack_task_result", "child actor failed during ACK", ray.exceptions.ActorDiedError()
+            ).as_instanceof_cause(),
+            "target-death": ray.exceptions.ActorDiedError(),
+        }[outcome]
+        completed_future.set_exception(error)
+
+    actor = _FakeActor()
+    actor.fte_interrupt_query = remote_method(dead_future)
+    actor.fte_cleanup_query = remote_method(dead_future)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    actor.fte_ack_task_result = remote_method(pending_future)
+    handle.enqueue_fte_ack_task_result({**task_id, "partition_id": 0})
+    actor.fte_ack_task_result = remote_method(completed_future)
+    handle.enqueue_fte_ack_task_result(task_id)
+    assert query_id not in handle._fte_prepare_terminal_errors
+
+    if outcome == "target-death":
+        assert handle.fte_drop_query(query_id)["flight_shuffle_cleanup_errors"] == 0
+    else:
+        with pytest.raises(RuntimeError, match="terminal control failure") as error_info:
+            handle.fte_drop_query(query_id)
+        assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert pending_timeouts == [0]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("completed ACK failed"),
+        ray.exceptions.RayTaskError(
+            "fte_ack_task_result", "completed ACK failed", ray.exceptions.GetTimeoutError("completed ACK failed")
+        ).as_instanceof_cause(),
+    ],
+    ids=["application-error", "nested-get-timeout"],
+)
+def test_dead_actor_teardown_observes_ready_object_before_future_bridge(monkeypatch, error):
+    query_id = "query-dead-actor-ready-object"
+
+    class _ReadyObjectRef:
+        def future(self):
+            return Future()
+
+    ref = _ReadyObjectRef()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+    dead_ref = SimpleNamespace(future=lambda: dead_future)
+    actor = _FakeActor()
+    actor.fte_ack_task_result = SimpleNamespace(remote=lambda *_args: ref)
+    actor.fte_interrupt_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    actor.fte_cleanup_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    handle.enqueue_fte_ack_task_result(task_id)
+
+    def get_completed(candidate, *, timeout):
+        assert candidate is ref
+        assert timeout == 0
+        raise error
+
+    monkeypatch.setattr(ray, "ObjectRef", _ReadyObjectRef)
+    monkeypatch.setattr(ray, "get", get_completed)
+
+    with pytest.raises(RuntimeError, match="completed ACK failed") as error_info:
+        handle.fte_drop_query(query_id)
+    assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
     worker_handle_mod.open_fte_registry_for_query(query_id)
 
 

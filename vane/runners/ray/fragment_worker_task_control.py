@@ -95,6 +95,12 @@ class FteWorkerTaskControlMixin:
         # The remote process is gone, but local submissions/observers must
         # still join before their registry or capacity can be released.
         quiesce_fte_registry_for_query(query_id)
+        try:
+            self.close_and_flush_fte_controls(query_id, rpc_target_dead=True)
+        except (FteControlBarrierPendingError, FteControlBarrierTerminalError):
+            # Completed failures are now recorded for final cleanup. The
+            # target's death also permits releasing its unresolved controls.
+            pass
         with self._fte_control_lock:
             for task_key, owner_query_id in list(self._fte_control_query_by_task.items()):
                 if owner_query_id == query_id:
@@ -741,7 +747,7 @@ class FteWorkerTaskControlMixin:
     def enqueue_fte_release_task_result(self, task_id: str | dict[str, Any]) -> Any:
         return self._enqueue_ordered_fte_control_ref("fte_release_task_result", task_id)
 
-    def close_and_flush_fte_controls(self, query_id: str) -> list[dict[str, Any]]:
+    def close_and_flush_fte_controls(self, query_id: str, *, rpc_target_dead: bool = False) -> list[dict[str, Any]]:
         query_key = str(query_id or "").strip()
         if not query_key:
             return []
@@ -761,17 +767,20 @@ class FteWorkerTaskControlMixin:
 
         raw_statuses: list[Any] | None = None
         barrier_resolution_error: BaseException | None = None
-        try:
-            resolved = resolve_object_refs_blocking(
-                [ref for _, ref, _ in pending],
-                timeout=_fte_control_rpc_timeout_s(),
-                honor_query_deadline=False,
-            )
-            if not isinstance(resolved, list) or len(resolved) != len(pending):
-                raise TypeError("FTE result-control barrier must return one status per task")
-            raw_statuses = resolved
-        except BaseException as exc:
-            barrier_resolution_error = exc
+        if rpc_target_dead:
+            import ray
+        else:
+            try:
+                resolved = resolve_object_refs_blocking(
+                    [ref for _, ref, _ in pending],
+                    timeout=_fte_control_rpc_timeout_s(),
+                    honor_query_deadline=False,
+                )
+                if not isinstance(resolved, list) or len(resolved) != len(pending):
+                    raise TypeError("FTE result-control barrier must return one status per task")
+                raw_statuses = resolved
+            except BaseException as exc:
+                barrier_resolution_error = exc
 
         status_entries: list[tuple[str, Any, dict[str, Any]]] = []
         terminal_entries: list[tuple[str, Any, str]] = []
@@ -784,6 +793,27 @@ class FteWorkerTaskControlMixin:
                 task_key, ref, _ = entry
                 if not self._is_current_ordered_fte_control_ref(task_key, ref):
                     continue
+                if rpc_target_dead and isinstance(ref, ray.ObjectRef):
+                    # A fresh future bridge may still be pending for an already
+                    # completed ObjectRef. Probe the object itself without
+                    # waiting before discarding the dead worker's references.
+                    try:
+                        raw_status = ray.get(ref, timeout=0)
+                    except BaseException as exc:
+                        if isinstance(exc, ray.exceptions.GetTimeoutError) and not isinstance(
+                            exc, ray.exceptions.RayTaskError
+                        ):
+                            pending_entries.append(entry)
+                            continue
+                        terminal_entries.append(entry)
+                        if not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
+                    else:
+                        terminal_entries.append(entry)
+                        resolved_entries.append((entry, raw_status))
+                    continue
                 future_method = getattr(ref, "future", None)
                 if not callable(future_method):
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
@@ -795,7 +825,10 @@ class FteWorkerTaskControlMixin:
                 except BaseException as exc:
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
                         terminal_entries.append(entry)
-                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
+                        if not rpc_target_dead or not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
                     continue
                 try:
                     raw_status = future.result(timeout=0)
@@ -813,13 +846,14 @@ class FteWorkerTaskControlMixin:
                         except BaseException as terminal_exc:
                             if self._is_current_ordered_fte_control_ref(task_key, ref):
                                 terminal_entries.append(entry)
-                                terminal_error_entries.append(
-                                    (
-                                        task_key,
-                                        ref,
-                                        f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}",
+                                if not rpc_target_dead or not self._rpc_target_is_dead(terminal_exc):
+                                    terminal_error_entries.append(
+                                        (
+                                            task_key,
+                                            ref,
+                                            f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}",
+                                        )
                                     )
-                                )
                         else:
                             if self._is_current_ordered_fte_control_ref(task_key, ref):
                                 terminal_entries.append(entry)
@@ -830,7 +864,10 @@ class FteWorkerTaskControlMixin:
                 except BaseException as exc:
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
                         terminal_entries.append(entry)
-                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
+                        if not rpc_target_dead or not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
                     continue
                 if self._is_current_ordered_fte_control_ref(task_key, ref):
                     terminal_entries.append(entry)
