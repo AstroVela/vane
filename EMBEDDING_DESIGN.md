@@ -1,7 +1,8 @@
 # Unified embedding design and delivery roadmap
 
-Status: milestone 1 merged in #1024; milestone 2 implemented in #1026 against
-main. Validation results and runtime acceptance limits are recorded in each PR.
+Status: Vane milestones 1 (#1024), 2 (#1026), and 4 (#1028) are merged.
+SQL consolidation (milestone 5, #1029) targets main directly. Validation results
+and runtime acceptance limits are recorded in each PR.
 This document separates the target design
 from capabilities delivered by each milestone. No compatibility aliases, model
 substitution, protocol guessing, or fallback transports are part of the design.
@@ -611,10 +612,10 @@ PRs use the repository template and state limitations and dependencies.
 | Milestone | Deliverable | Acceptance | Status |
 | --- | --- | --- | --- |
 | 1 | Unified Python Embed, all four typed modalities, optional parts, Google joint/direct bytes; remove replaced APIs | Planning without I/O, bounded inputs, row/cardinality and lifecycle tests, real executor with local protocol fixtures, affected typing/examples | Merged in #1024 |
-| 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Implemented in #1026 against main; exact acceptance and model limits recorded in its validation |
+| 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Merged in #1026; exact acceptance and model limits recorded in its validation |
 | 3 | Context uses unified Embed and explicit channel joins; remove independent joint execution | Single/batch/search, partial ASR/OCR failure, alignment without row multiplication, profile identity, restart/receipts | Implemented in Context #91; includes fatal resource classification and partial channel diagnostics |
-| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Implemented in #1028; CPU protocol/processor acceptance, GPU model and 100-video measurement remain milestone 6 |
-| 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Implemented in this change |
+| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Merged in #1028; CPU protocol/processor acceptance, GPU model and 100-video measurement remain milestone 6 |
+| 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Implemented in #1029, targeting main |
 | 6 | Frozen 100-video correctness and performance comparison | Same inputs/checkpoints/sampling, repeated warm runs, vector and provenance parity, request/queue/CPU/GPU breakdown | Planned after 3 and 4 |
 
 Milestones 2–4 add explicit transports, unified Context integration and a
