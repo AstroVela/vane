@@ -483,14 +483,14 @@ class LocalModelRuntime:
                 resource_graph=policy_metadata,
                 plan_identity=id(plan),
                 session_id=self._session_id,
-                set_handles=lambda options: plan.set_udf_actor_handles(
+                set_handles=lambda options: plan.set_local_udf_executor_options(
                     {**executor_options_by_node, **options}, conn=conn
                 ),
             )
             # The actor helper has no publication callback for a task-only plan.
             # There are no actor owners to roll back in this case.
             if not actor_options and executor_options_by_node:
-                plan.set_udf_actor_handles(executor_options_by_node, conn=conn)
+                plan.set_local_udf_executor_options(executor_options_by_node, conn=conn)
         except BaseException as error:
             from vane.execution.udf_local_request import _shutdown_resource
 

@@ -43,7 +43,7 @@ class _NativePlan:
         assert not annotate_udfs and self._graph is not None
         return self._graph
 
-    def set_udf_actor_handles(self, handles: dict[str, Any], *, conn: Any = None) -> None:
+    def set_local_udf_executor_options(self, handles: dict[str, Any], *, conn: Any = None) -> None:
         self.handles = handles
 
 

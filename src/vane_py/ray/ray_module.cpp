@@ -995,6 +995,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
 	         py::arg("conn") = py::none())
+	    .def("set_local_udf_executor_options", &PyPhysicalPlanWrapper::set_local_udf_executor_options,
+	         py::arg("options_map"), py::arg("conn") = py::none())
 	    .def(
 	        "_validate_serializable_for_submission",
 	        [](const PyPhysicalPlanWrapper &p) { p.validate_serializable_for_submission(); },

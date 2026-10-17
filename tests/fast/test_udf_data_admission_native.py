@@ -74,7 +74,13 @@ class _Plan:
     def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
         return linear_metadata(self.nodes)
 
+    def collect_query_resource_graph_metadata(self, conn=None):
+        return self.collect_resource_graph_metadata(conn=conn, annotate_udfs=True)
+
     def set_udf_actor_handles(self, options, conn=None):
+        self.options = options["one"]
+
+    def set_local_udf_executor_options(self, options, conn=None):
         self.options = options["one"]
 
 

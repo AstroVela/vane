@@ -1094,6 +1094,26 @@ struct PyPhysicalPlanWrapper {
 	}
 
 	// ── Inject actor handles into UDF nodes ─────────────────────
+	// Local runtime owners bind only to the current native plan. They must not
+	// become worker replay state or add per-query IDs to reusable model payloads.
+	void set_local_udf_executor_options(py::dict options_map, py::object) {
+		if (!IsInitialized() || !has_root() || options_map.empty()) {
+			return;
+		}
+		idx_t node_counter = 0;
+		VisitPhysicalExecutionGraph(plan_->physical_plan()->Root(), [&](PhysicalOperator &op) {
+			vector<UDFFunctionData *> bind_nodes;
+			CollectMutableUDFBindData(op, bind_nodes);
+			for (auto *bind_data : bind_nodes) {
+				py::str key(std::to_string(node_counter++));
+				if (options_map.contains(key)) {
+					ApplyUDFExecutorOptions(*bind_data, options_map[key]);
+				}
+			}
+		});
+		udf_actor_handles_ = py::none();
+	}
+
 	// Takes a dict {node_id: executor_options} and injects actor handles into
 	// the corresponding UDF bind data for worker execution.
 	void set_udf_actor_handles(py::dict handles_map, py::object) {

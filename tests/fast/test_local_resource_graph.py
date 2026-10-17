@@ -123,6 +123,33 @@ def test_backend_adapters_share_native_metadata_contract(backend, adapter):
             assert legacy == {key: value for key, value in metadata.items() if key != "udf_node_ids"}
 
 
+def test_local_executor_options_preserve_payloads_and_stay_out_of_worker_replay():
+    with vane.connect() as conn:
+        plan = _plan(
+            conn.sql("SELECT 7::INTEGER AS x").map_batches(
+                _identity,
+                schema={"x": vane.sqltypes.INTEGER},
+                execution_backend="subprocess_task",
+            ),
+            conn,
+        )
+        (before,) = plan.collect_udf_nodes(conn=conn)
+        assert "resource_unit_id" not in before["payload"]
+        options = {"session_config": {}, "local_transport_input_target_bytes": 4096}
+        plan.set_local_udf_executor_options({str(before["node_id"]): options}, conn=conn)
+        (bound,) = plan.collect_udf_nodes(conn=conn)
+        assert bound["payload"] == before["payload"]
+        assert plan.__getstate__()[5] is None
+
+        plan.collect_query_resource_graph_metadata(conn=conn)
+        plan.set_udf_actor_handles({str(before["node_id"]): options}, conn=conn)
+        assert plan.__getstate__()[5]
+        (annotated,) = plan.collect_udf_nodes(conn=conn)
+        plan.set_local_udf_executor_options({str(before["node_id"]): options}, conn=conn)
+        assert plan.collect_udf_nodes(conn=conn)[0]["payload"] == annotated["payload"]
+        assert plan.__getstate__()[5] is None
+
+
 def test_readonly_collection_restores_payloads_after_conversion_failure():
     with vane.connect() as conn:
         plan = _plan(
@@ -502,7 +529,7 @@ def test_graph_publication_failure_retires_diagnostics(task_limit):
             collect_udf_nodes = native.collect_udf_nodes
             collect_resource_graph_metadata = native.collect_resource_graph_metadata
 
-            def set_udf_actor_handles(self, *args, **kwargs):
+            def set_local_udf_executor_options(self, *args, **kwargs):
                 raise RuntimeError("publication failed")
 
         with LocalModelRuntime(

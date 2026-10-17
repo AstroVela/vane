@@ -59,6 +59,9 @@ def test_direct_model_binding_requires_the_owning_session(monkeypatch, session):
             def session_id(self):
                 return session
 
+            def collect_query_resource_graph_metadata(self, conn=None):
+                return linear_metadata(self.collect_udf_nodes(conn))
+
             def collect_udf_nodes(self, conn=None):
                 return [
                     {

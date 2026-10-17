@@ -59,7 +59,7 @@ class _Plan:
     def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
         return linear_metadata(self.nodes)
 
-    def set_udf_actor_handles(self, options, conn=None):
+    def set_local_udf_executor_options(self, options, conn=None):
         self.published.append(options)
         for node in self.nodes:
             if node["node_id"] in options:
@@ -198,7 +198,7 @@ def test_data_preparation_failure_releases_query_scopes_and_model_borrows(backen
         def fail(_, conn=None):
             raise RuntimeError("cannot publish data scope")
 
-        plan.set_udf_actor_handles = fail
+        plan.set_local_udf_executor_options = fail
         with pytest.raises(RuntimeError, match="cannot publish data scope"):
             runtime.prepare(plan, bindings)
         snapshot = runtime.resource_snapshot()
@@ -383,7 +383,7 @@ def test_plan_publication_failure_releases_borrow_without_closing_resident_model
         def fail(_, conn=None):
             raise RuntimeError("cannot publish plan handles")
 
-        plan.set_udf_actor_handles = fail
+        plan.set_local_udf_executor_options = fail
         with pytest.raises(RuntimeError, match="cannot publish"):
             runtime.prepare(plan, {"1": "model"})
         with model.acquire() as later:
@@ -436,7 +436,7 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
         if fail_publication:
             raise RuntimeError("cannot publish mixed plan")
 
-    plan.set_udf_actor_handles = publish
+    plan.set_local_udf_executor_options = publish
     with LocalModelRuntime(session_id="session", session_config=config) as runtime:
         model = runtime.register("model", version="v1", payload=payload)
         if fail_publication:
@@ -1140,7 +1140,7 @@ def test_task_admission_preparation_failure_releases_query_and_preserves_model()
         def fail(_, conn=None):
             raise RuntimeError("cannot publish admission")
 
-        plan.set_udf_actor_handles = fail
+        plan.set_local_udf_executor_options = fail
         with pytest.raises(RuntimeError, match="cannot publish admission"):
             runtime.prepare(plan, {"1": "model"})
         snapshot = runtime.resource_snapshot()

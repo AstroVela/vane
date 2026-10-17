@@ -292,7 +292,7 @@ def test_cancel_during_unregistered_actor_preparation_rolls_back_before_next_mod
             session_id=lambda: "session",
             session_config=lambda: {},
             collect_udf_nodes=lambda **kwargs: [{"node_id": str(i), "payload": payload} for i in range(2)],
-            set_udf_actor_handles=lambda *args, **kwargs: published.append(args),
+            set_local_udf_executor_options=lambda *args, **kwargs: published.append(args),
         )
         plan.collect_resource_graph_metadata = lambda **kwargs: linear_metadata(plan.collect_udf_nodes())
         monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", create)
@@ -318,7 +318,7 @@ def model_plan(monkeypatch, runtime, create):
         session_id=lambda: "session",
         session_config=lambda: {},
         collect_udf_nodes=lambda **k: [{"node_id": "1", "payload": payload}],
-        set_udf_actor_handles=lambda options, **k: published.update(options),
+        set_local_udf_executor_options=lambda options, **k: published.update(options),
     )
     plan.collect_resource_graph_metadata = lambda **kwargs: linear_metadata(plan.collect_udf_nodes())
     model = runtime.register("model", version="v1", payload=payload)
@@ -673,7 +673,7 @@ def test_failed_publication_keeps_query_cleanup_owners(monkeypatch):
                 }
             ]
 
-        def set_udf_actor_handles(self, options, conn=None):
+        def set_local_udf_executor_options(self, options, conn=None):
             raise ValueError("planned publication failure")
 
         def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
