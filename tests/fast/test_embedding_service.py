@@ -290,14 +290,25 @@ def test_wire_bounds_rejected_before_mapping(bad):
 
 @pytest.mark.parametrize("value", ["", " \t\n", "\u3000"])
 def test_text_transport_preserves_blanks_and_charges_admission(value):
+    import mmap
+
     budget = max(1, len(value.encode("utf-8")))
     spec = ipc.input_spec({"max_input_bytes": budget})
     parts, arrays, size = ipc.describe(content("text", value), spec)
-    assert parts == [{"kind": "text", "text": value}]
-    assert arrays == [] and size == 0
+    assert size == len(value.encode("utf-8"))
+    assert parts == [{"kind": "text", "offset": 0, "nbytes": size}]
+    assert len(arrays) == 1 and arrays[0].tobytes() == value.encode("utf-8")
     assert ipc.validate_layout(parts, size, spec) == budget
-    assert ipc.sealed_buffer(arrays, size) is None
-    assert ipc.restore(parts, None) == content("text", value)
+    fd = ipc.sealed_buffer(arrays, size)
+    if size:
+        try:
+            with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
+                assert ipc.restore(parts, memory) == content("text", value)
+        finally:
+            os.close(fd)
+    else:
+        assert fd is None
+        assert ipc.restore(parts, None) == content("text", value)
 
 
 @pytest.mark.parametrize("value", [None, 1, b"", [], {}, " " * 5, "\u3000" * 2])
@@ -305,18 +316,38 @@ def test_text_transport_keeps_type_and_utf8_budget_validation(value):
     spec = ipc.input_spec({"max_input_bytes": 4})
     with pytest.raises(EmbeddingConfigurationError, match="string|byte budget"):
         ipc.describe(content("text", value), spec)
-    with pytest.raises(EmbeddingConfigurationError, match="string|byte budget"):
-        ipc.validate_layout([{"kind": "text", "text": value}], 0, spec)
+
+
+@pytest.mark.parametrize(
+    "bad", ["negative", "boolean", "string", "hole", "overlap", "past_end", "extra", "trailing", "inline"]
+)
+def test_text_wire_bounds_rejected_before_mapping(bad):
+    spec = ipc.input_spec({"max_input_bytes": 3})
+    parts = [{"kind": "text", "offset": 0, "nbytes": 1}, {"kind": "text", "offset": 1, "nbytes": 2}]
+    if bad in {"negative", "boolean", "string", "past_end"}:
+        parts[1]["nbytes"] = {"negative": -1, "boolean": True, "string": "2", "past_end": 3}[bad]
+    elif bad in {"hole", "overlap"}:
+        parts[1]["offset"] = {"hole": 2, "overlap": 0}[bad]
+    elif bad == "extra":
+        parts[0]["text"] = "untrusted"
+    elif bad == "trailing":
+        parts.pop()
+    else:
+        parts = [{"kind": "text", "text": "old inline representation"}]
+    with pytest.raises(EmbeddingConfigurationError):
+        ipc.validate_layout(parts, 3, spec)
 
 
 def test_sealed_arrays_preserve_noncontiguous_pixels_and_audio():
     import fcntl
     import mmap
 
-    spec = ipc.input_spec({"input_modalities": ["image", "audio"], "sample_rate": 16000, "max_samples": 8})
+    spec = ipc.input_spec({"input_modalities": ["text", "image", "audio"], "sample_rate": 16000, "max_samples": 8})
     original = EmbeddingContent(
-        content("image", np.zeros((8, 4, 3), np.uint8)[::2]).parts
+        content("text", "中\x00\t").parts
+        + content("image", np.zeros((8, 4, 3), np.uint8)[::2]).parts
         + content("audio", AudioClip(np.array([[0.5], [-0.5]], dtype=np.float64), 16000)).parts
+        + content("text", "").parts
     )
     parts, arrays, size = ipc.describe(original, spec)
     assert ipc.validate_layout(parts, size, spec) == size
@@ -327,12 +358,120 @@ def test_sealed_arrays_preserve_noncontiguous_pixels_and_audio():
             os.ftruncate(fd, 1)
         with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
             restored = ipc.restore(parts, memory)
-            np.testing.assert_equal(restored.parts[0].value, original.parts[0].value)
-            np.testing.assert_equal(restored.parts[1].value.samples, original.parts[1].value.samples)
-            assert restored.parts[1].value.sample_rate == 16000
+            np.testing.assert_equal(restored.parts[1].value, original.parts[1].value)
+            np.testing.assert_equal(restored.parts[2].value.samples, original.parts[2].value.samples)
+            assert restored.parts[2].value.sample_rate == 16000
+            assert restored.parts[0].value == original.parts[0].value
+            assert restored.parts[3].value == ""
             del restored
     finally:
         os.close(fd)
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("joint", [False, True])
+@pytest.mark.parametrize("encoding", ["ascii", "unicode", "escaped"])
+def test_long_text_uses_input_budget_and_matches_native_processor(tmp_path, monkeypatch, family, joint, encoding):
+    sdk = install_sdk(monkeypatch.setitem)
+    value = {
+        "ascii": "x" * (ipc.MAX_CONTROL_BYTES + 1),
+        "unicode": "\U0001f680" * 100_000,
+        "escaped": "\n" * (ipc.MAX_CONTROL_BYTES // 2 + 1),
+    }[encoding]
+    original = EmbeddingContent(content("text", value).parts + (content("video", video()).parts if joint else ()))
+    size = len(value.encode("utf-8")) + (96 if joint else 0)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    options = {"gpus_per_actor": 0, "max_input_bytes": size}
+    descriptor = getattr(load_provider(family), f"get_{'multimodal' if joint else 'text'}_embedder")(
+        "fixture", 2, options=options
+    )
+    service = EmbeddingService(
+        path=str(root / "engine.sock"),
+        service_id="fixture-v1",
+        family=family,
+        model="fixture",
+        dimensions=2,
+        options=options,
+        max_bytes=size,
+        max_inflight=1,
+    )
+
+    def prompt():
+        return sdk.processing[-1]["text"] if family == "sglang" else sdk.calls[-1][1]["prompt"]
+
+    async def run():
+        await service.start()
+        native, instance = descriptor.instantiate(), client(root, family, max_input_bytes=size)
+        instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda v: v)
+        try:
+            parts, _, length = ipc.describe(original, instance.spec)
+            assert length == size
+            assert len(ipc.encode(instance._reservation(parts, length, "0" * 32))) < 2048
+            expected = await native.embed_multimodal([original]) if joint else await native.embed_text([value])
+            expected_prompt = prompt()
+            actual = await instance.embed_multimodal([original]) if joint else await instance.embed_text([value])
+            np.testing.assert_equal(actual, expected)
+            assert prompt() == expected_prompt
+            assert sdk.messages[-1]["content"][0] == {"type": "text", "text": value}
+            assert instance.metrics["input_bytes"] == size
+            assert service.credits.bytes == service.credits.inflight == 0
+            with pytest.raises(EmbeddingConfigurationError, match="byte budget"):
+                await instance.embed_multimodal([EmbeddingContent(original.parts + content("text", "x").parts)])
+            assert len(sdk.calls) == 2
+        finally:
+            await instance.aclose()
+            await native.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+def test_invalid_utf8_releases_admission_without_model_work(tmp_path, monkeypatch, family):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = EmbeddingService(
+        path=str(root / "engine.sock"),
+        service_id="fixture-v1",
+        family=family,
+        model="fixture",
+        dimensions=2,
+        options={"gpus_per_actor": 0},
+        max_inflight=1,
+    )
+
+    async def run():
+        await service.start()
+        instance = client(root, family)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        fd = None
+        request_id = "0" * 32
+        try:
+            parts = [{"kind": "text", "offset": 0, "nbytes": 1}]
+            await asyncio.get_running_loop().sock_connect(sock, service.path)
+            await ipc.send(sock, instance._reservation(parts, 1, request_id))
+            assert (await ipc.control(sock))["state"] == "reserved"
+            fd = ipc.sealed_buffer([np.array([255], dtype=np.uint8)], 1)
+            await ipc.send(sock, {"request_id": request_id, "state": "published"}, fd)
+            os.close(fd)
+            fd = None
+            assert await ipc.control(sock) == {"request_id": request_id, "error": "configuration"}
+            await until(lambda: not service._tasks)
+            assert not sdk.calls
+            assert service.credits.bytes == service.credits.inflight == 0
+            np.testing.assert_equal(await instance.embed_text(["healthy"]), [[3, 4]])
+            assert service.credits.bytes == service.credits.inflight == 0
+        finally:
+            if fd is not None:
+                os.close(fd)
+            sock.close()
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
@@ -527,7 +666,7 @@ def check_public_embed(process, family, backend):
         )
         assert result.select("id", "vector").order("id").fetchall() == [(0, (3, 4)), (1, (3, 4)), (2, None)]
         texts = connection.from_arrow(
-            pa.table({"id": list(range(5)), "text": ["healthy", "", " \t\n", "\u3000", None]})
+            pa.table({"id": list(range(6)), "text": ["healthy", "", " \t\n", "\u3000", None, "\U0001f680" * 100_000]})
         )
         result = texts.embed(
             TextInput(vane.col("text")),
@@ -548,9 +687,10 @@ def check_public_embed(process, family, backend):
             (2, (3, 4)),
             (3, (3, 4)),
             (4, None),
+            (5, (3, 4)),
         ]
     asyncio.run(
-        until(lambda: state(root).get("calls") == 6 and state(root).get("bytes") == state(root).get("inflight") == 0)
+        until(lambda: state(root).get("calls") == 7 and state(root).get("bytes") == state(root).get("inflight") == 0)
     )
     assert state(root)["engines"] == 1
 

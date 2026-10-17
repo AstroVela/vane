@@ -605,8 +605,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         remaining = tuple(part for part in content.parts if part.spec.kind != "image")
         size = 0
         if remaining:
-            parts, _, size = describe(EmbeddingContent(remaining), spec)
-            size += sum(len(part["text"].encode("utf-8")) for part in parts if part["kind"] == "text")
+            _, _, size = describe(EmbeddingContent(remaining), spec)
         for value in images:
             if not isinstance(value, np.ndarray) or not value.size or value.ndim != 3:
                 raise EmbeddingConfigurationError("Native images require nonempty HWC arrays")

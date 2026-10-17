@@ -89,7 +89,7 @@ def describe(
     spec.validate_layout(tuple(part.spec for part in content.parts))
     parts: list[dict[str, Any]] = []
     arrays: list[np.ndarray[Any, Any]] = []
-    offset, text_bytes = 0, 0
+    offset = 0
 
     def buffer(value: Any, kind: str) -> dict[str, Any]:
         nonlocal offset
@@ -113,8 +113,12 @@ def describe(
         if kind == "text":
             if not isinstance(value, str):
                 raise EmbeddingConfigurationError("Embedding text must be a string")
-            entry["text"] = value
-            text_bytes += len(value.encode("utf-8"))
+            encoded = value.encode("utf-8")
+            if offset + len(encoded) > spec.max_input_bytes:
+                raise EmbeddingConfigurationError("Embedding row exceeds combined input byte budget")
+            entry.update(offset=offset, nbytes=len(encoded))
+            arrays.append(np.frombuffer(encoded, dtype=np.uint8))
+            offset += len(encoded)
         elif kind == "image":
             entry["buffer"] = buffer(value, kind)
         elif kind == "video":
@@ -145,8 +149,6 @@ def describe(
             ):
                 raise EmbeddingConfigurationError("Audio exceeds sample budget or contains invalid PCM")
         parts.append(entry)
-    if offset + text_bytes > spec.max_input_bytes:
-        raise EmbeddingConfigurationError("Embedding row exceeds combined input byte budget")
     return parts, arrays, offset
 
 
@@ -156,13 +158,13 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
         raise EmbeddingConfigurationError("Invalid embedding buffer size or parts")
     if not 1 <= len(parts) <= spec.max_parts:
         raise EmbeddingConfigurationError("Invalid embedding part count")
-    offset, text_bytes = 0, 0
+    offset = 0
     for part in parts:
         if not isinstance(part, dict) or part.get("kind") not in {p.kind for p in spec.supported_parts}:
             raise EmbeddingConfigurationError("Unsupported embedding part")
         kind = part["kind"]
         keys = {
-            "text": {"kind", "text"},
+            "text": {"kind", "offset", "nbytes"},
             "image": {"kind", "buffer"},
             "video": {"kind", "buffers", "times", "indices"},
             "audio": {"kind", "buffer", "sample_rate"},
@@ -170,9 +172,15 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
         if set(part) != keys:
             raise EmbeddingConfigurationError("Invalid embedding part fields")
         if kind == "text":
-            if not isinstance(part["text"], str):
-                raise EmbeddingConfigurationError("Embedding text must be a string")
-            text_bytes += len(part["text"].encode("utf-8"))
+            if (
+                type(part["offset"]) is not int
+                or part["offset"] != offset
+                or type(part["nbytes"]) is not int
+                or part["nbytes"] < 0
+                or offset + part["nbytes"] > size
+            ):
+                raise EmbeddingConfigurationError("Text exceeds or overlaps the reserved buffer")
+            offset += part["nbytes"]
             continue
         buffers = part["buffers"] if kind == "video" else [part["buffer"]]
         if not isinstance(buffers, list) or not buffers or len(buffers) > 256:
@@ -228,9 +236,9 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
                 or buffers[0]["shape"][0] > spec.audio.max_samples
             ):
                 raise EmbeddingConfigurationError("Invalid audio sample rate or length")
-    if offset != size or size + text_bytes > spec.max_input_bytes:
+    if offset != size:
         raise EmbeddingConfigurationError("Embedding exceeds or mismatches its byte budget")
-    return max(1, size + text_bytes)
+    return max(1, size)
 
 
 def restore(parts: list[dict[str, Any]], memory: Any) -> EmbeddingContent:
@@ -238,10 +246,12 @@ def restore(parts: list[dict[str, Any]], memory: Any) -> EmbeddingContent:
         return np.ndarray(item["shape"], dtype=item["dtype"], buffer=memory, offset=item["offset"])
 
     values = []
+    value: Any
     for part in parts:
         kind = part["kind"]
         if kind == "text":
-            value = part["text"]
+            start, length = part["offset"], part["nbytes"]
+            value = bytes(memory[start : start + length]).decode("utf-8") if length else ""
         elif kind == "video":
             value = VideoClip(
                 tuple(array_value(item) for item in part["buffers"]), tuple(part["times"]), tuple(part["indices"])

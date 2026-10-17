@@ -519,12 +519,17 @@ argument; model-specific custom processor contracts are not inferred.
 The Linux implementation uses an anonymous `memfd`, not a named `/dev/shm`
 segment. After server byte/count admission, the client reserves pages, copies
 contiguous arrays, closes its writable mapping and seals writes/growth/shrinkage.
+Text is UTF-8 bytes in the same buffer as decoded media, so text rows are not
+limited by the separate 1 MiB JSON control-message cap or JSON escaping.
 It passes one FD with `SCM_RIGHTS`; the server checks every descriptor and the
 sealed file's size before mapping. The request ID identifies the lease, owned
 by the connection and the receiving server. Offsets are contiguous, nonoverlapping
 and exactly cover the FD. Frame indices/timestamps and sample rate remain JSON
-metadata. Text stays in the bounded control message. Neither side accepts media
-paths, pickles, arbitrary objects or CUDA handles.
+metadata; text descriptors contain only offsets and lengths. The configured
+`max_input_bytes` bounds the combined UTF-8 text and decoded-media bytes, and
+admission charges the complete buffer. Empty text still consumes one admission
+byte/slot without allocating a buffer. Invalid UTF-8 fails before model work.
+Neither side accepts media paths, pickles, arbitrary objects or CUDA handles.
 
 Both peers check `SO_PEERCRED` for the same UID. The socket is `0600` in a private
 directory. This is a trusted same-user, same-host Linux boundary, not a network
@@ -549,7 +554,7 @@ Max connections bounds waiting metadata; byte and in-flight limits include
 accepted requests whose clients have gone away. Limits govern service-owned
 ingress, not unrelated memory allocated by same-user applications or GPU KV.
 
-Client metrics record queue/admission, copy and request time plus media bytes.
+Client metrics record queue/admission, copy and request time plus input bytes.
 Service metrics record queue, request/model and cleanup time plus counts. The
 native adapter also measures local processor preparation time; vLLM processing
 inside its engine remains included in model time. These counters do not claim
