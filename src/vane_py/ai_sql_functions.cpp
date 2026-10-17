@@ -34,12 +34,9 @@ namespace duckdb {
 
 namespace {
 
-enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE, EMBED_VIDEO, EMBED_AUDIO, JEV };
+enum class AISQLKind : uint8_t { PROMPT, EMBED, JEV };
 enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
-static constexpr const char *HIDDEN_EMBED_AUDIO_FUNCTION = "__vane_ai_embed_audio";
-static constexpr const char *HIDDEN_EMBED_VIDEO_FUNCTION = "__vane_ai_embed_video";
-static constexpr const char *HIDDEN_EMBED_IMAGE_FUNCTION = "__vane_ai_embed_image";
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
 static constexpr const char *HIDDEN_PROMPT_PACK_FUNCTION = "__vane_ai_prompt_pack";
@@ -586,10 +583,10 @@ static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
 		throw BinderException("%s requires five arguments supplied by the ai_jev macro", HIDDEN_JEV_FUNCTION);
 	}
 	if (kind != AISQLKind::PROMPT) {
-		if (argument_count == 6) {
+		if (argument_count == 8) {
 			return 5;
 		}
-		throw BinderException("%s requires six arguments supplied by the ai_embed macro", HIDDEN_EMBED_FUNCTION);
+		throw BinderException("%s requires eight arguments supplied by the ai_embed macro", HIDDEN_EMBED_FUNCTION);
 	}
 	if (argument_count == 8) {
 		return 7;
@@ -657,12 +654,9 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
 	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
 	auto dimensions = ConstantArgumentToPython(context, arguments, 3, "dimensions");
 	auto on_error = ConstantArgumentToPython(context, arguments, 4, "on_error");
+	auto input_spec = ConstantArgumentToPython(context, arguments, 6, "input_spec");
 	return py::cast<py::dict>(sql_module.attr("build_ai_embed_sql_spec")(
-	    provider, model, dimensions, on_error, py_options,
-	    py::arg("input_kind") = (kind == AISQLKind::EMBED_AUDIO   ? "audio"
-	                             : kind == AISQLKind::EMBED_VIDEO ? "video"
-	                             : kind == AISQLKind::EMBED_IMAGE ? "image"
-	                                                              : "text")));
+	    provider, model, dimensions, on_error, py_options, py::arg("input_spec") = input_spec));
 }
 
 static string ParseExecutionKind(const py::dict &spec) {
@@ -834,7 +828,7 @@ static void ValidateVideoClipInput(unique_ptr<Expression> &frames) {
 		}
 	}
 	if (!has_index || !has_time || !has_data) {
-		throw BinderException("ai_embed_video requires a LIST of frame records with frame_index BIGINT, "
+		throw BinderException("ai_embed video input requires a LIST of frame records with frame_index BIGINT, "
 		                      "frame_time DOUBLE, and data IMAGE; use video_frames or explicitly ordered records");
 	}
 }
@@ -867,9 +861,107 @@ static void ValidateAudioClipInput(unique_ptr<Expression> &audio) {
 		}
 	}
 	if (!has_rate || !has_data) {
-		throw BinderException("ai_embed_audio requires STRUCT(sample_rate INTEGER or BIGINT, "
+		throw BinderException("ai_embed audio input requires STRUCT(sample_rate INTEGER or BIGINT, "
 		                      "data rank-two FLOAT or DOUBLE TENSOR); decode and resample audio first");
 	}
+}
+
+// Both Python expressions and SQL call this structural validator before
+// selection or NULL folding. MIME metadata selects BLOB, never an implicit cast.
+static void ValidateEmbeddingPart(unique_ptr<Expression> &value, const string &kind, bool encoded) {
+	auto type = value->return_type;
+	if (type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (kind != "text" && kind != "image" && kind != "video" && kind != "audio") {
+		throw BinderException("ai_embed input kind must be text, image, video or audio");
+	}
+	if (!encoded && kind == "video") {
+		ValidateVideoClipInput(value);
+		return;
+	}
+	if (!encoded && kind == "audio") {
+		ValidateAudioClipInput(value);
+		return;
+	}
+	auto expected = encoded ? LogicalType::BLOB : kind == "text" ? LogicalType::VARCHAR : ImageLogicalType::Create();
+	if (type.id() == LogicalTypeId::SQLNULL) {
+		value = make_uniq<BoundConstantExpression>(Value(expected));
+	} else if (encoded          ? type != LogicalType::BLOB
+	           : kind == "text" ? type != LogicalType::VARCHAR
+	                            : !ImageLogicalType::IsImage(type)) {
+		if (encoded) {
+			throw BinderException("Encoded embedding inputs require a BLOB column");
+		}
+		if (kind == "image") {
+			throw BinderException(
+			    "ai_embed image input must be a decoded IMAGE; use decode_image or decode_image_file");
+		}
+		throw BinderException("ai_embed %s input requires %s", kind, expected.ToString());
+	}
+}
+
+static void PackEmbeddingInput(ClientContext &context, vector<unique_ptr<Expression>> &arguments,
+                               const py::dict &spec) {
+	auto structured = py::cast<bool>(spec["struct_input"]);
+	auto multimodal = py::cast<bool>(spec["multimodal"]);
+	auto parts = py::cast<py::list>(spec["parts"]);
+	auto &value = arguments[0];
+	if (value->return_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (structured && (value->return_type.id() != LogicalTypeId::STRUCT ||
+	                   StructType::GetChildCount(value->return_type) != parts.size())) {
+		throw BinderException("ai_embed list input_spec requires a STRUCT with one field per part, in order");
+	}
+	if (structured) {
+		child_list_t<LogicalType> fields;
+		for (idx_t index = 0; index < parts.size(); ++index) {
+			auto &field = StructType::GetChildTypes(value->return_type)[index];
+			unique_ptr<Expression> typed_null = make_uniq<BoundConstantExpression>(Value(field.second));
+			auto part = py::cast<py::dict>(parts[index]);
+			ValidateEmbeddingPart(typed_null, py::cast<string>(part["kind"]), !part["mime_type"].is_none());
+			fields.emplace_back(field.first, typed_null->return_type);
+		}
+		// Validate by type, then retype only untyped NULL fields. Keep the
+		// original expression intact so upstream work executes once per row.
+		value = BoundCastExpression::AddCastToType(context, std::move(value), LogicalType::STRUCT(std::move(fields)));
+	} else {
+		auto part = py::cast<py::dict>(parts[0]);
+		ValidateEmbeddingPart(value, py::cast<string>(part["kind"]), !part["mime_type"].is_none());
+		if (multimodal) {
+			value->SetAlias("part_0");
+			vector<unique_ptr<Expression>> fields;
+			fields.push_back(std::move(value));
+			value = BindScalarFunction(context, "struct_pack", std::move(fields));
+		}
+	}
+	value->SetAlias(py::cast<string>(spec["input_column"]));
+	auto &condition = arguments[7];
+	if (condition->return_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (condition->return_type.id() == LogicalTypeId::SQLNULL) {
+		condition = make_uniq<BoundConstantExpression>(Value(LogicalType::BOOLEAN));
+	} else if (condition->return_type != LogicalType::BOOLEAN) {
+		throw BinderException("ai_embed where must be BOOLEAN or NULL");
+	}
+	if (!multimodal && IsFoldableNull(context, *value)) {
+		// A single text/decoded-media NULL has no model work. Preserve its
+		// NULL propagation after validating input and predicate types so the
+		// lowering callback can remove the UDF (including GPU requirements).
+		value = make_uniq<BoundConstantExpression>(Value(value->return_type));
+		arguments[7] = make_uniq<BoundConstantExpression>(Value());
+		return;
+	}
+	condition->SetAlias("condition");
+	vector<unique_ptr<Expression>> selection;
+	selection.push_back(std::move(condition));
+	selection.push_back(std::move(value));
+	// A non-NULL record prevents optional constant NULL parts from folding
+	// away the UDF, including validation of an all-empty selected row.
+	value = BindScalarFunction(context, "struct_pack", std::move(selection));
+	arguments[7] = make_uniq<BoundConstantExpression>(Value());
 }
 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
@@ -879,24 +971,8 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	auto runtime_argument_count = has_media_input ? idx_t(2) : idx_t(1);
 	auto prompt_input_kind = PromptInputKind::TEXT;
 	auto input_type_id = arguments[0]->return_type.id();
-	if (kind == AISQLKind::EMBED_AUDIO) {
-		ValidateAudioClipInput(arguments[0]);
-		bound_function.arguments[0] = arguments[0]->return_type;
-	} else if (kind == AISQLKind::EMBED_VIDEO) {
-		ValidateVideoClipInput(arguments[0]);
-		bound_function.arguments[0] = arguments[0]->return_type;
-	} else if (kind == AISQLKind::EMBED_IMAGE) {
-		if (input_type_id == LogicalTypeId::UNKNOWN) {
-			throw ParameterNotResolvedException();
-		}
-		if (input_type_id == LogicalTypeId::SQLNULL) {
-			arguments[0] = make_uniq<BoundConstantExpression>(Value(ImageLogicalType::Create()));
-		} else if (!ImageLogicalType::IsImage(arguments[0]->return_type)) {
-			throw BinderException(
-			    "ai_embed_image input must be a decoded IMAGE; use decode_image or decode_image_file");
-		}
-		bound_function.arguments[0] = arguments[0]->return_type;
-	} else if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
+	if (kind != AISQLKind::EMBED && input_type_id != LogicalTypeId::VARCHAR &&
+	    input_type_id != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
 	}
 	if (has_media_input) {
@@ -931,6 +1007,10 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	{
 		PythonGILWrapper acquire;
 		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, prompt_input_kind);
+		if (kind == AISQLKind::EMBED) {
+			PackEmbeddingInput(context, arguments, spec);
+			bound_function.arguments[0] = arguments[0]->return_type;
+		}
 		auto return_type_obj = DictGetOrNone(spec, "return_type");
 		if (!py::isinstance<py::str>(return_type_obj)) {
 			throw BinderException("ai SQL helper returned invalid return_type");
@@ -1017,21 +1097,6 @@ static unique_ptr<FunctionData> AISQLEmbedBind(ClientContext &context, ScalarFun
 	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED);
 }
 
-static unique_ptr<FunctionData> AISQLEmbedImageBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_IMAGE);
-}
-
-static unique_ptr<FunctionData> AISQLEmbedVideoBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_VIDEO);
-}
-
-static unique_ptr<FunctionData> AISQLEmbedAudioBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_AUDIO);
-}
-
 static unique_ptr<FunctionData> AISQLJevBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments) {
 	return AISQLBind(context, bound_function, arguments, AISQLKind::JEV);
@@ -1081,55 +1146,25 @@ static unique_ptr<Expression> LowerAISQLSingleInputExpressionUDF(FunctionBindExp
 	return LowerRegisteredExpressionUDF(input);
 }
 
-static unique_ptr<Expression> LowerAIEmbedVideoInput(FunctionBindExpressionInput &input) {
-	if (input.children.size() != 1) {
-		throw BinderException("ai_embed_video validation expected one runtime argument");
+static unique_ptr<FunctionData> BindEmbeddingPart(ClientContext &context, ScalarFunction &function,
+                                                  vector<unique_ptr<Expression>> &arguments) {
+	ThrowIfNotConstant(*arguments[1], "kind");
+	ThrowIfNotConstant(*arguments[2], "mime_type");
+	auto kind = EvaluateConstant(context, *arguments[1]);
+	auto mime = EvaluateConstant(context, *arguments[2]);
+	if (kind.IsNull()) {
+		throw BinderException("ai_embed input kind cannot be NULL");
 	}
-	ValidateVideoClipInput(input.children[0]);
+	ValidateEmbeddingPart(arguments[0], kind.GetValue<string>(), !mime.IsNull());
+	function.arguments[0] = arguments[0]->return_type;
+	function.SetReturnType(arguments[0]->return_type);
+	Function::EraseArgument(function, arguments, 2);
+	Function::EraseArgument(function, arguments, 1);
+	return nullptr;
+}
+
+static unique_ptr<Expression> LowerEmbeddingPart(FunctionBindExpressionInput &input) {
 	return std::move(input.children[0]);
-}
-
-static unique_ptr<Expression> LowerAIEmbedAudioInput(FunctionBindExpressionInput &input) {
-	if (input.children.size() != 1) {
-		throw BinderException("ai_embed_audio validation expected one runtime argument");
-	}
-	ValidateAudioClipInput(input.children[0]);
-	return std::move(input.children[0]);
-}
-
-static unique_ptr<Expression> LowerAIEmbedImageInput(FunctionBindExpressionInput &input) {
-	if (input.children.size() != 1) {
-		throw BinderException("ai_embed_image validation expected one runtime argument");
-	}
-	auto &image = input.children[0];
-	if (image->return_type.id() == LogicalTypeId::UNKNOWN) {
-		throw ParameterNotResolvedException();
-	}
-	if (image->return_type.id() == LogicalTypeId::SQLNULL) {
-		return make_uniq<BoundConstantExpression>(Value(ImageLogicalType::Create()));
-	}
-	if (!ImageLogicalType::IsImage(image->return_type)) {
-		throw BinderException("ai_embed_image input must be a decoded IMAGE; use decode_image or decode_image_file");
-	}
-	return std::move(image);
-}
-
-static unique_ptr<Expression> LowerAIEmbedTextInput(FunctionBindExpressionInput &input) {
-	if (input.children.size() != 1) {
-		throw BinderException("ai_embed text validation expected one runtime argument");
-	}
-	auto &text = input.children[0];
-	auto input_type_id = text->return_type.id();
-	if (input_type_id == LogicalTypeId::UNKNOWN) {
-		throw ParameterNotResolvedException();
-	}
-	if (input_type_id == LogicalTypeId::SQLNULL) {
-		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
-	}
-	if (input_type_id != LogicalTypeId::VARCHAR) {
-		throw BinderException("ai SQL input argument must be VARCHAR");
-	}
-	return std::move(text);
 }
 
 static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &input) {
@@ -1303,93 +1338,50 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	return info;
 }
 
-ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(AIEmbeddingKind kind) {
-	const bool image = kind == AIEmbeddingKind::IMAGE;
-	const bool video = kind == AIEmbeddingKind::VIDEO;
-	const bool audio = kind == AIEmbeddingKind::AUDIO;
-	ScalarFunctionSet set(audio   ? HIDDEN_EMBED_AUDIO_FUNCTION
-	                      : video ? HIDDEN_EMBED_VIDEO_FUNCTION
-	                      : image ? HIDDEN_EMBED_IMAGE_FUNCTION
-	                              : HIDDEN_EMBED_FUNCTION);
-	auto text_input = ScalarFunction({LogicalType::ANY},
-	                                 audio   ? EmptyAudioClipType()
-	                                 : video ? EmptyVideoClipType()
-	                                 : image ? ImageLogicalType::Create()
-	                                         : LogicalType::VARCHAR,
-	                                 AISQLExecute);
-	text_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	text_input.SetBindExpressionCallback(audio   ? LowerAIEmbedAudioInput
-	                                     : video ? LowerAIEmbedVideoInput
-	                                     : image ? LowerAIEmbedImageInput
-	                                             : LowerAIEmbedTextInput);
-	set.AddFunction(std::move(text_input));
+ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {
+	ScalarFunctionSet set(HIDDEN_EMBED_FUNCTION);
+	auto part = ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY,
+	                           AISQLExecute, BindEmbeddingPart);
+	part.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	part.SetBindExpressionCallback(LowerEmbeddingPart);
+	set.AddFunction(std::move(part));
 
 	auto implementation =
-	    ScalarFunction({kind != AIEmbeddingKind::TEXT ? LogicalType::ANY : LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
-	                   LogicalType::ANY, AISQLExecute,
-	                   audio   ? AISQLEmbedAudioBind
-	                   : video ? AISQLEmbedVideoBind
-	                   : image ? AISQLEmbedImageBind
-	                           : AISQLEmbedBind,
-	                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
-	// model, dimensions, and options legitimately default to NULL. The binder
-	// must still run so it can consume those call-level constants, resolve the
-	// fixed output type, and preserve it for a NULL text input.
+	    ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                    LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
+	                   LogicalType::ANY, AISQLExecute, AISQLEmbedBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
+	                   FunctionStability::VOLATILE);
 	implementation.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	implementation.SetBindExpressionCallback(LowerAISQLSingleInputExpressionUDF);
 	set.AddFunction(std::move(implementation));
 	return set;
 }
 
-unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(AIEmbeddingKind kind) {
-	const bool image = kind == AIEmbeddingKind::IMAGE;
-	const bool video = kind == AIEmbeddingKind::VIDEO;
-	const bool audio = kind == AIEmbeddingKind::AUDIO;
-	auto expressions =
-	    Parser::ParseExpressionList(StringUtil::Format("%s(%s, provider, model, dimensions, on_error, options)",
-	                                                   audio   ? HIDDEN_EMBED_AUDIO_FUNCTION
-	                                                   : video ? HIDDEN_EMBED_VIDEO_FUNCTION
-	                                                   : image ? HIDDEN_EMBED_IMAGE_FUNCTION
-	                                                           : HIDDEN_EMBED_FUNCTION,
-	                                                   audio   ? "audio"
-	                                                   : video ? "frames"
-	                                                   : image ? "image"
-	                                                           : "text"));
-	if (expressions.size() != 1) {
-		throw InternalException("Expected one ai_embed macro expression");
-	}
+unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro() {
+	auto expressions = Parser::ParseExpressionList(
+	    "__vane_ai_embed(input, provider, model, dimensions, on_error, options, input_spec, \"where\")");
 	auto function = make_uniq<ScalarMacroFunction>(std::move(expressions[0]));
-
 	auto add_parameter = [&](const string &name, const LogicalType &type, const char *default_sql) {
 		function->parameters.push_back(make_uniq<ColumnRefExpression>(name));
 		function->types.push_back(type);
-		if (!default_sql) {
-			return;
+		if (default_sql) {
+			auto defaults = Parser::ParseExpressionList(default_sql);
+			function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
 		}
-		auto defaults = Parser::ParseExpressionList(default_sql);
-		if (defaults.size() != 1) {
-			throw InternalException("Expected one default expression for ai_embed parameter '%s'", name);
-		}
-		function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
 	};
-
-	add_parameter(audio   ? "audio"
-	              : video ? "frames"
-	              : image ? "image"
-	                      : "text",
-	              kind != AIEmbeddingKind::TEXT ? LogicalType::UNKNOWN : LogicalType::VARCHAR, nullptr);
-	add_parameter("provider", LogicalType::VARCHAR, kind != AIEmbeddingKind::TEXT ? "'transformers'" : "'openai'");
+	// UNKNOWN prevents implicit casts before structural input/selection checks.
+	add_parameter("input", LogicalType::UNKNOWN, nullptr);
+	add_parameter("provider", LogicalType::VARCHAR, "'openai'");
 	add_parameter("model", LogicalType::VARCHAR, "NULL");
 	add_parameter("dimensions", LogicalType::INTEGER, "NULL");
 	add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
-	// Macro parameters cannot use ANY. UNKNOWN leaves options uncast so the
-	// hidden binder can require a foldable STRUCT (or NULL) precisely.
 	add_parameter("options", LogicalType::UNKNOWN, "NULL");
+	add_parameter("input_spec", LogicalType::UNKNOWN, "NULL");
+	add_parameter("where", LogicalType::UNKNOWN, "TRUE");
 
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
 	info->schema = DEFAULT_SCHEMA;
-	info->name = audio ? "ai_embed_audio" : video ? "ai_embed_video" : image ? "ai_embed_image" : "ai_embed";
+	info->name = "ai_embed";
 	info->temporary = true;
 	info->internal = true;
 	info->macros.push_back(std::move(function));

@@ -1653,9 +1653,53 @@ def _build_ai_batch_expression(
 # ---------------------------------------------------------------------------
 
 
-def _embed_function_name(input_kind: str, *, hidden: bool = False) -> str:
-    name = "ai_embed" if input_kind == "text" else f"ai_embed_{input_kind}"
-    return f"__vane_{name}" if hidden else name
+def _prepare_embedding_batch(
+    provider: Any,
+    model: str | None,
+    dimensions: int | None,
+    on_error: str,
+    options: Mapping[str, Any],
+    *,
+    parts: tuple[Any, ...],
+    multimodal: bool,
+    relation: bool,
+    output_column: str = "embedding",
+) -> tuple[_EmbeddingBatch, UDFOptions, str | None, int, str]:
+    """One descriptor and executor plan for Python and SQL typed inputs."""
+    input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "multimodal" if multimodal else parts[0].kind
+    descriptor, resolved_dimensions, udf_opts, normalize, chunk_size, overlap, backend = _prepare_embed_call(
+        provider, model, dimensions, on_error, options, relation=relation, input_kind=input_kind
+    )
+    wrapper_options: dict[str, Any] = dict(
+        max_chunk_chars=chunk_size,
+        chunk_overlap_chars=overlap,
+        max_retries=udf_opts.max_retries,
+        on_error=udf_opts.on_error,
+        normalize=normalize,
+    )
+    wrapper: _EmbeddingBatch
+    if multimodal:
+        descriptor.get_input_spec().validate_layout(parts)
+        input_name = "parts"
+        wrapper = _EmbedMultimodalBatch(
+            descriptor, input_name, output_column, resolved_dimensions, parts=parts, **wrapper_options
+        )
+    else:
+        input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
+        wrapper_class = {
+            "text": _EmbedTextBatch,
+            "image": _EmbedImageBatch,
+            "video": _EmbedVideoBatch,
+            "audio": _EmbedAudioBatch,
+        }[input_kind]
+        wrapper = wrapper_class(descriptor, input_name, output_column, resolved_dimensions, **wrapper_options)
+    return wrapper, udf_opts, backend, resolved_dimensions, input_name
+
+
+def _bind_embedding_part(value: Expression, part: Any) -> Expression:
+    return vane.FunctionExpression(
+        "__vane_ai_embed", value, vane.ConstantExpression(part.kind), vane.ConstantExpression(part.mime_type)
+    )
 
 
 def _star_excluding_existing_output_column(rel: Relation, output_column: str) -> Expression:
@@ -1684,44 +1728,35 @@ def _build_embed_expression(
 
     if where is not None and not is_expression(where):
         raise TypeError("vane.ai.embed where requires a BOOLEAN Expression")
-    input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "text"
+    input_kind: Literal["text", "image", "video", "audio"] = "text"
     if isinstance(input, (TextInput, ImageInput, VideoInput, AudioInput)):
         if getattr(input, "mime_type", None) is not None:
             input = MultimodalInput([input])
         else:
             input_kind = input.kind
             input = input.value
-    if isinstance(input, MultimodalInput):
-        input_kind = "multimodal"
-    elif not is_expression(input):
+    if not isinstance(input, MultimodalInput) and not is_expression(input):
         raise TypeError("vane.ai.embed requires an Expression or a typed embedding input")
 
-    (
-        descriptor,
-        resolved_dimensions,
-        udf_opts,
-        normalize,
-        max_chunk_chars,
-        chunk_overlap_chars,
-        execution_backend,
-    ) = _prepare_embed_call(provider, model, dimensions, on_error, options, relation=relation, input_kind=input_kind)
-    wrapper_options: dict[str, Any] = dict(
-        max_chunk_chars=max_chunk_chars,
-        chunk_overlap_chars=chunk_overlap_chars,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-        normalize=normalize,
+    parts = (
+        tuple(EmbeddingPartSpec(part.kind, getattr(part, "mime_type", None)) for part in input.parts)
+        if isinstance(input, MultimodalInput)
+        else (EmbeddingPartSpec(input_kind),)
     )
-    wrapper: _EmbeddingBatch
+    wrapper, udf_opts, execution_backend, resolved_dimensions, input_name = _prepare_embedding_batch(
+        provider,
+        model,
+        dimensions,
+        on_error,
+        options,
+        parts=parts,
+        multimodal=isinstance(input, MultimodalInput),
+        relation=relation,
+        output_column=output_column,
+    )
     if isinstance(input, MultimodalInput):
-        parts = tuple(EmbeddingPartSpec(part.kind, getattr(part, "mime_type", None)) for part in input.parts)
-        descriptor.get_input_spec().validate_layout(parts)
         part_inputs = {
-            f"part_{index}": (
-                part.value
-                if spec.mime_type is not None
-                else vane.FunctionExpression(_embed_function_name(spec.kind, hidden=True), part.value)
-            )
+            f"part_{index}": _bind_embedding_part(part.value, spec)
             for index, (part, spec) in enumerate(zip(input.parts, parts, strict=True))
         }
         # A content is non-NULL even when its optional fields are NULL. Passing
@@ -1730,19 +1765,8 @@ def _build_embed_expression(
         inputs = {
             "parts": vane.FunctionExpression("struct_pack", *(value.alias(name) for name, value in part_inputs.items()))
         }
-        wrapper = _EmbedMultimodalBatch(
-            descriptor, "parts", output_column, resolved_dimensions, parts=parts, **wrapper_options
-        )
     else:
-        input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
-        wrapper_class = {
-            "text": _EmbedTextBatch,
-            "image": _EmbedImageBatch,
-            "video": _EmbedVideoBatch,
-            "audio": _EmbedAudioBatch,
-        }[input_kind]
-        wrapper = wrapper_class(descriptor, input_name, output_column, resolved_dimensions, **wrapper_options)
-        inputs = {input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), input)}
+        inputs = {input_name: _bind_embedding_part(input, parts[0])}
     if where is not None:
         wrapper._selection_columns = tuple(inputs)
         inputs = {

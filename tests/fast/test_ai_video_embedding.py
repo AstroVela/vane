@@ -237,7 +237,7 @@ def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
             result = rel.embed(VideoInput(vane.col("frames")), **opts)
         else:
             result = conn.sql(
-                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
+                "SELECT id, ai_embed(frames, input_spec => {kind: 'video'}, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
             )
         assert str(result.types[result.columns.index("embedding")]) == "FLOAT[3]"
         assert result.select("id", "embedding").order("id").fetchall() == [
@@ -268,7 +268,7 @@ def test_assembled_clip_fields_are_case_insensitive(request, provider, monkeypat
         assert [name for name, _ in rel.types[1].children[0][1].children] == list(field_names)
         if entry == "sql":
             result = conn.sql(
-                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
+                "SELECT id, ai_embed(frames, input_spec => {kind: 'video'}, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
             )
         else:
             result = rel.select(
@@ -310,7 +310,7 @@ def test_all_null_clip_columns_execute_without_loading_models(
             )
         if entry == "sql":
             result = conn.sql(
-                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', model => 'must_not_load', "
+                "SELECT id, ai_embed(frames, input_spec => {kind: 'video'}, provider => 'video_fixture', model => 'must_not_load', "
                 f"on_error => '{on_error}', options => {{batch_size: 2, max_retries: 0}}) AS embedding FROM clips"
             )
         else:
@@ -334,7 +334,7 @@ def test_all_null_clip_columns_execute_without_loading_models(
 @pytest.mark.parametrize("value", ["NULL", "NULL::STRUCT(frame_index BIGINT, frame_time DOUBLE, data IMAGE)[]"])
 def test_null_sql_and_explain_never_load_models(provider, value):
     with vane.connect() as conn:
-        query = f"SELECT ai_embed_video({value}, provider => 'video_fixture', model => 'must_not_load')"
+        query = f"SELECT ai_embed({value}, input_spec => {{kind: 'video'}}, provider => 'video_fixture', model => 'must_not_load')"
         assert conn.sql(query).types == [vane.array_type(vane.sqltypes.FLOAT, 3)]
         assert conn.sql(query).fetchall() == [(None,)]
         conn.sql("EXPLAIN " + query).fetchall()
@@ -354,7 +354,9 @@ def test_null_sql_and_explain_never_load_models(provider, value):
 def test_sql_and_expression_reject_untyped_or_undecoded_inputs(provider, value):
     with vane.connect() as conn:
         with pytest.raises(Exception, match="LIST of frame records"):
-            conn.sql(f"SELECT ai_embed_video({value}, provider => 'video_fixture')").fetchall()
+            conn.sql(
+                f"SELECT ai_embed({value}, input_spec => {{kind: 'video'}}, provider => 'video_fixture')"
+            ).fetchall()
         rel = conn.sql(f"SELECT {value} AS frames")
         with pytest.raises(Exception, match="LIST of frame records"):
             rel.select(embed(VideoInput(vane.col("frames")), provider=provider)).fetchall()
@@ -438,7 +440,7 @@ def test_default_ray_transports_ordered_nested_images(ray_local, provider, monke
         )
         if entry == "sql":
             result = conn.sql(
-                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
+                "SELECT id, ai_embed(frames, input_spec => {kind: 'video'}, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
             )
         else:
             result = conn.table("clips").embed(VideoInput(vane.col("frames")), provider=provider, batch_size=2)

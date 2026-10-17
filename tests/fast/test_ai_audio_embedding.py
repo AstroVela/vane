@@ -172,7 +172,7 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
             result = rel.embed(AudioInput(vane.col("audio")), **options).select("id", "embedding")
         else:
             result = conn.sql(
-                "SELECT id, ai_embed_audio(audio, provider => 'audio_fixture', "
+                "SELECT id, ai_embed(audio, input_spec => {kind: 'audio'}, provider => 'audio_fixture', "
                 f"model => '{model}', options => {{batch_size: 2, max_retries: 0}}) AS embedding FROM clips"
             )
         assert result.types[-1] == vane.array_type(vane.sqltypes.FLOAT, 3)
@@ -195,17 +195,19 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
 )
 def test_undecoded_or_untyped_inputs_fail_binding(provider, value):
     with vane.connect() as conn:
-        with pytest.raises(Exception, match="ai_embed_audio requires"):
-            conn.sql(f"SELECT ai_embed_audio({value}, provider => 'audio_fixture')").fetchall()
+        with pytest.raises(Exception, match="ai_embed audio input requires"):
+            conn.sql(
+                f"SELECT ai_embed({value}, input_spec => {{kind: 'audio'}}, provider => 'audio_fixture')"
+            ).fetchall()
 
 
 def test_null_and_explain_do_not_load_models(provider):
     with vane.connect() as conn:
         assert conn.sql(
-            "SELECT ai_embed_audio(NULL, provider => 'audio_fixture', model => 'must_not_load')"
+            "SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'audio_fixture', model => 'must_not_load')"
         ).fetchall() == [(None,)]
         conn.sql(
-            "EXPLAIN SELECT ai_embed_audio(NULL, provider => 'audio_fixture', model => 'must_not_load')"
+            "EXPLAIN SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'audio_fixture', model => 'must_not_load')"
         ).fetchall()
 
 

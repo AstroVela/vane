@@ -481,14 +481,29 @@ def test_image_file_per_call_pixel_limit_does_not_change_pillow_global_limit(
     assert Image.MAX_IMAGE_PIXELS == 1
 
 
-def test_image_file_pixel_limit_is_isolated_from_unrelated_pillow_threads(monkeypatch):
-    payload = _encoded_image("PNG", size=(4, 3))
+@pytest.mark.parametrize("image_format", ["PNG", "WEBP"])
+def test_image_file_plugin_checks_enforce_scoped_pixel_limits(monkeypatch, image_format):
+    payload = _encoded_image(image_format, size=(4, 3))
+    original_check = Image._decompression_bomb_check
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", None)
+
+    with pytest.raises(vane.ImageFileLimitError, match="max_pixels=11"):
+        with _image_file._open_image_with_limit(Image, io.BytesIO(payload), max_pixels=11) as image:
+            image.load()
+    assert Image.MAX_IMAGE_PIXELS is None
+    assert Image._decompression_bomb_check is original_check
+
+
+@pytest.mark.parametrize("image_format", ["PNG", "WEBP"])
+@pytest.mark.parametrize("global_limit", [1, 8])
+def test_image_file_pixel_limit_is_isolated_from_unrelated_pillow_threads(monkeypatch, image_format, global_limit):
+    payload = _encoded_image(image_format, size=(4, 3))
     entered = threading.Event()
     release = threading.Event()
     worker_sizes: list[tuple[int, int]] = []
     worker_errors: list[BaseException] = []
     original_check = Image._decompression_bomb_check
-    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", global_limit)
 
     class BlockingBytesIO(io.BytesIO):
         def read(self, size=-1, /):
@@ -509,9 +524,15 @@ def test_image_file_pixel_limit_is_isolated_from_unrelated_pillow_threads(monkey
     worker.start()
     try:
         assert entered.wait(timeout=5)
-        with pytest.raises(Image.DecompressionBombError):
-            with Image.open(io.BytesIO(payload)) as unrelated:
-                unrelated.load()
+        if global_limit == 1:
+            with pytest.raises(Image.DecompressionBombError):
+                with Image.open(io.BytesIO(payload)) as unrelated:
+                    unrelated.load()
+        else:
+            with pytest.warns(Image.DecompressionBombWarning) as warnings:
+                with Image.open(io.BytesIO(payload)) as unrelated:
+                    unrelated.load()
+            assert len(warnings) == 1
     finally:
         release.set()
         worker.join(timeout=5)
@@ -519,7 +540,7 @@ def test_image_file_pixel_limit_is_isolated_from_unrelated_pillow_threads(monkey
     assert not worker.is_alive()
     assert worker_errors == []
     assert worker_sizes == [(4, 3)]
-    assert Image.MAX_IMAGE_PIXELS == 1
+    assert Image.MAX_IMAGE_PIXELS == global_limit
     assert Image._decompression_bomb_check is original_check
 
 
