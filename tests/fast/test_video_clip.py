@@ -453,6 +453,33 @@ def test_clip_initializes_video_properties_from_bitstream(tmp_path, duckdb_curso
         assert all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
 
 
+@pytest.mark.parametrize("sar", [Fraction(1281, 1280), Fraction(1000, 333)])
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_preserves_constant_sar_beyond_the_mpeg4_codec_precision(tmp_path, duckdb_cursor, sar, audio, facade):
+    source = make_av_video(
+        tmp_path / "precise-sar.mp4", codec="libx264", rate=10, b_frames=2, sample_aspect_ratio=sar, audio=audio
+    )
+    with av.open(source.url) as container:
+        assert container.streams.video[0].sample_aspect_ratio == sar
+    if facade == "python":
+        clip = source.clip(0.1, 0.6)
+        data, has_audio = clip.data, clip.has_audio
+    else:
+        clip = duckdb_cursor.execute("SELECT video_clip($1, 0.1, 0.6)", [source]).fetchone()[0]
+        data, has_audio = clip["data"], clip["has_audio"]
+    assert has_audio is audio
+    with av.open(io.BytesIO(data)) as container:
+        video = container.streams.video[0]
+        assert video.codec_context.name == "mpeg4"
+        assert video.sample_aspect_ratio == sar
+        # The container's exact ratio defines displayed geometry; the MPEG-4
+        # bitstream may carry a reduced approximation of that ratio.
+        assert Fraction(video.width, video.height) * video.sample_aspect_ratio == Fraction(4, 3) * sar
+        assert video.duration * video.time_base == Fraction(1, 2)
+        assert len(list(container.decode(video))) == 5
+
+
 def test_clip_rejects_changing_sample_aspect_ratio(source, monkeypatch):
     original_video_frame = clipping._ClipEncoder.video_frame
 
