@@ -244,6 +244,12 @@ jobs:
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
 
+      - name: Exercise Tantivy full-text search
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pip install 'tantivy>=0.25.1,<0.26'
+          scripts/run_installed_pytest.sh tests/fast/test_full_text_search.py
+
       - name: Exercise the native Gravitino provider
         if: matrix.python-version == '3.12'
         env:

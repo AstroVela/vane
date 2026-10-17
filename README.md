@@ -74,6 +74,7 @@ through Vane Context's models configuration.
 
 ### More Resources
 
+- [Tantivy full-text search user guide](docs/search/USER_GUIDE.md) · [Design](docs/search/DESIGN.md)
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
 - [Production deployment](https://vane.astrovela.ai/docs/data/deploy/deployment)
 

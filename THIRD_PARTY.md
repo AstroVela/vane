@@ -61,6 +61,12 @@ libraries, when redistributing an environment. PyAV/FFmpeg obligations are cover
 in [COPYLEFT.md](COPYLEFT.md). Cloud adapters use the Python standard library and
 do not include provider SDKs or model assets.
 
+The optional `search` extra installs [tantivy-py](https://github.com/quickwit-oss/tantivy-py)
+(MIT), whose native wheels embed [Tantivy](https://github.com/quickwit-oss/tantivy)
+(MIT) and its dependencies. These distributions are installed separately; no
+Tantivy sources or binaries are copied into Vane. Preserve the dependency
+wheels' license notices when redistributing an environment.
+
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.

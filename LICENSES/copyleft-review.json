@@ -5,7 +5,7 @@
   "source_files": {
     "LICENSES/Bison-parser-notice.txt": "e755172808aff395b87b210a0b2e55ed7bcbd54c4a574e219a2deef56c3510f1",
     "LICENSES/vcpkg-binary-dependencies.txt": "0e6f9bc3ed4dc11cdf15dee1432314c8ed33a877f314c3471e51c39481637aa9",
-    "THIRD_PARTY.md": "6a45f36c557359e0fb4e8378be6908745f2bac14c4b412c6cca4ff2a1e16e348",
+    "THIRD_PARTY.md": "1c03c5b24c5594f58009a98a7fccc00b2f409618b4306d88b0d9f9945291803b",
     "external/duckdb/third_party/libpg_query/include/parser/gram.hpp": "f0a028e4c71887ff30977fcc10d0bf2da83843f9142a4b83ac1fa4de520c8495",
     "external/duckdb/third_party/libpg_query/src_backend_parser_gram.cpp": "15417a1f7e77539c94fce811f2a5f9f0bf5cce598b51c7afe80ade8433d9ce15",
     "external/duckdb/third_party/mbedtls/LICENSE": "9b405ef4c89342f5eae1dd828882f931747f71001cfba7d114801039b52ad09b",
