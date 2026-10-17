@@ -670,12 +670,17 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 	case PhysicalOperatorType::BATCH_CREATE_TABLE_AS:
 	case PhysicalOperatorType::INSERT:
 	case PhysicalOperatorType::BATCH_INSERT:
-	case PhysicalOperatorType::UPDATE: {
+	case PhysicalOperatorType::UPDATE:
+	case PhysicalOperatorType::DELETE_OPERATOR:
+	case PhysicalOperatorType::MERGE_INTO:
+	case PhysicalOperatorType::SET_VARIABLE:
+	case PhysicalOperatorType::EXPLAIN_ANALYZE: {
 		if (!plan_config_.native_scan_metadata) {
 			throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());
 		}
-		// DuckDB owns the write and its transaction. Expose the input UDFs and
-		// the sink boundary without creating a distributed write task.
+		// DuckDB owns these sinks: writes, session variables and profiling.
+		// Expose the input UDFs and the sink boundary without creating a
+		// distributed task.
 		node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
 		                                             MakeSchemaRef(op.GetTypes()), std::move(children), true));
 		return;

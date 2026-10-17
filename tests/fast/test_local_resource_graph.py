@@ -80,25 +80,74 @@ def test_native_writes_collect_udf_inputs_and_sink_boundary(monkeypatch, threads
 
 @pytest.mark.parametrize("threads", [1, 2])
 @pytest.mark.parametrize(
-    "statement,expected_result,expected_values",
+    "statement,sink_name,expected_result,expected_values",
     [
-        ("UPDATE result SET x = update_increment(x)", [(3,)], [(1,), (2,), (3,)]),
-        ("UPDATE result SET x = (SELECT update_increment(10))", [(3,)], [(11,), (11,), (11,)]),
+        ("UPDATE result SET x = write_increment(x)", "UPDATE", [(3,)], [(1,), (2,), (3,)]),
+        ("UPDATE result SET x = (SELECT write_increment(10))", "UPDATE", [(3,)], [(11,), (11,), (11,)]),
         (
-            "UPDATE result SET x = update_increment(x) WHERE x > 0 RETURNING x",
+            "UPDATE result SET x = write_increment(x) WHERE x > 0 RETURNING x",
+            "UPDATE",
             [(2,), (3,)],
             [(0,), (2,), (3,)],
         ),
         (
-            "UPDATE result SET x = update_increment(v.y) FROM (VALUES (1, 10)) v(k, y) WHERE result.x = v.k",
+            "UPDATE result SET x = write_increment(v.y) FROM (VALUES (1, 10)) v(k, y) WHERE result.x = v.k",
+            "UPDATE",
             [(1,)],
             [(0,), (2,), (11,)],
         ),
+        ("DELETE FROM result WHERE x = (SELECT write_increment(0))", "DELETE", [(1,)], [(0,), (2,)]),
+        (
+            "DELETE FROM result USING (SELECT write_increment(0) AS k) s WHERE result.x = s.k RETURNING x",
+            "DELETE",
+            [(1,)],
+            [(0,), (2,)],
+        ),
+        (
+            "MERGE INTO result USING (SELECT 1 AS k, 10 AS v) s ON result.x = s.k "
+            "WHEN MATCHED THEN UPDATE SET x = write_increment(s.v)",
+            "MERGE_INTO",
+            [(1,)],
+            [(0,), (2,), (11,)],
+        ),
+        (
+            "MERGE INTO result USING (SELECT 3 AS k) s ON result.x = s.k "
+            "WHEN NOT MATCHED THEN INSERT VALUES (write_increment(s.k))",
+            "MERGE_INTO",
+            [(1,)],
+            [(0,), (1,), (2,), (4,)],
+        ),
+        (
+            "MERGE INTO result USING (SELECT write_increment(0) AS k) s ON result.x = s.k WHEN MATCHED THEN DELETE",
+            "MERGE_INTO",
+            [(1,)],
+            [(0,), (2,)],
+        ),
+        (
+            "MERGE INTO result USING ("
+            "SELECT k, write_increment(v) AS v FROM (VALUES (1, 10), (3, 20)) input(k, v)"
+            ") s ON result.x = s.k WHEN MATCHED THEN UPDATE SET x = s.v "
+            "WHEN NOT MATCHED THEN INSERT VALUES (s.v) RETURNING x",
+            "MERGE_INTO",
+            [(11,), (21,)],
+            [(0,), (2,), (11,), (21,)],
+        ),
     ],
-    ids=["expression", "scalar_subquery", "returning", "from"],
+    ids=[
+        "update_expression",
+        "update_scalar_subquery",
+        "update_returning",
+        "update_from",
+        "delete_subquery",
+        "delete_using_returning",
+        "merge_update",
+        "merge_insert",
+        "merge_delete",
+        "merge_actions_returning",
+    ],
 )
-def test_native_updates_collect_udf_inputs_and_sink_boundary(
-    monkeypatch, threads, statement, expected_result, expected_values
+def test_native_dml_collect_udf_inputs_and_sink_boundary(
+    monkeypatch, threads, statement, sink_name, expected_result, expected_values
 ):
     from vane.execution import udf_subprocess
 
@@ -116,7 +165,7 @@ def test_native_updates_collect_udf_inputs_and_sink_boundary(
         conn.execute("CREATE TABLE result AS SELECT i::INTEGER AS x FROM range(3) t(i)")
         vane.attach_function(
             lambda value: value + 1,
-            alias="update_increment",
+            alias="write_increment",
             parameters=["INTEGER"],
             return_dtype="INTEGER",
             connection=conn,
@@ -127,11 +176,83 @@ def test_native_updates_collect_udf_inputs_and_sink_boundary(
     assert len(graphs) == 1
     graph = graphs[0]
     assert len(graph["udf_node_ids"]) == 1
-    (sink,) = [node for node in graph["nodes"] if node["node_name"] == "UPDATE"]
+    (sink,) = [node for node in graph["nodes"] if node["node_name"] == sink_name]
     assert sink["is_materialization_barrier"]
     assert sink["materialized_input_node_ids"] == sink["input_node_ids"]
     assert sink["input_node_ids"]
-    build_local_resource_graph(graph, query_id="update")
+    build_local_resource_graph(graph, query_id="dml")
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize(
+    "statement,sink_name,expected_values,expected_inputs",
+    [
+        (
+            "EXPLAIN ANALYZE SELECT native_increment(x) FROM result",
+            "EXPLAIN_ANALYZE",
+            [(0,), (1,), (2,)],
+            [0, 1, 2],
+        ),
+        (
+            "EXPLAIN ANALYZE UPDATE result SET x = native_increment(x)",
+            "EXPLAIN_ANALYZE",
+            [(1,), (2,), (3,)],
+            [0, 1, 2],
+        ),
+        (
+            "SET VARIABLE resource_value = (SELECT native_increment(1))",
+            "SET_VARIABLE",
+            [(0,), (1,), (2,)],
+            [1],
+        ),
+    ],
+    ids=["explain_select", "explain_update", "set_variable"],
+)
+def test_native_sink_wrappers_collect_and_execute_udf_inputs(
+    monkeypatch, tmp_path, threads, statement, sink_name, expected_values, expected_inputs
+):
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    graphs = []
+    prepare = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes
+
+    def capture(nodes, **kwargs):
+        graphs.append(kwargs["resource_graph"])
+        return prepare(nodes, **kwargs)
+
+    monkeypatch.setattr(udf_subprocess, "ensure_local_subprocess_actor_pools_for_nodes", capture)
+    calls = tmp_path / "udf-inputs.txt"
+
+    def increment(value):
+        with calls.open("a") as output:
+            output.write(f"{value}\n")
+        return value + 1
+
+    with vane.connect(config={"threads": threads}) as conn:
+        conn.execute("CREATE TABLE result AS SELECT i::INTEGER AS x FROM range(3) t(i)")
+        vane.attach_function(
+            increment, alias="native_increment", parameters=["INTEGER"], return_dtype="INTEGER", connection=conn
+        )
+        rows = conn.execute(statement).fetchall()
+        if sink_name == "EXPLAIN_ANALYZE":
+            assert len(rows) == 1 and rows[0][0] == "analyzed_plan" and rows[0][1]
+        else:
+            assert conn.execute("SELECT getvariable('resource_value')").fetchall() == [(2,)]
+        assert conn.execute("SELECT x FROM result ORDER BY x").fetchall() == expected_values
+
+    assert sorted(int(value) for value in calls.read_text().splitlines()) == expected_inputs
+    assert len(graphs) == 1
+    graph = graphs[0]
+    assert len(graph["udf_node_ids"]) == 1
+    nodes = {node["node_id"]: node for node in graph["nodes"]}
+    (terminal,) = graph["terminal_node_ids"]
+    sink = nodes[terminal]
+    assert sink["node_name"] == sink_name
+    assert sink["is_materialization_barrier"]
+    assert sink["materialized_input_node_ids"] == sink["input_node_ids"]
+    assert sink["input_node_ids"]
+    build_local_resource_graph(graph, query_id="native_sink")
 
 
 @pytest.mark.parametrize(
