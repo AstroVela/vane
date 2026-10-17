@@ -756,7 +756,8 @@ def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
     [
         ((0.0,), "at least two uniformly spaced video frames"),
         ((0.0, 0.5, 1.5, 2.0), "at least two uniformly spaced video frames"),
-        ((0.0, 0.5, 0.5, 1.0), "timestamps and indices must be ordered and aligned"),
+        ((0.0, 0.5, 0.5, 1.0), "at least two uniformly spaced video frames"),
+        ((0.5, 0.5), "at least two uniformly spaced video frames"),
         ((1.0, 0.5), "timestamps and indices must be ordered and aligned"),
     ],
 )
@@ -766,6 +767,7 @@ def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup
 
     async def run():
         runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+        runtime.configure_execution(on_error="ignore", max_retries=2, validate=lambda v: v)
         try:
             with pytest.raises(ValueError, match=error):
                 await runtime.embed_video([VideoClip(frames, times, tuple(range(len(times))))])

@@ -288,6 +288,52 @@ def test_wire_bounds_rejected_before_mapping(bad):
         ipc.validate_layout(parts, size, spec)
 
 
+@pytest.mark.parametrize("times", [(0.0, 0.0), (0.5, 0.5), (0.0, 0.5, 0.5, 1.0)])
+def test_video_transport_preserves_nondecreasing_times(times):
+    import mmap
+
+    frames = tuple(np.full((4, 4, 3), i + 10, np.uint8) for i in range(len(times)))
+    original = VideoClip(frames, times, tuple(i * 3 for i in range(len(times))))
+    spec = ipc.input_spec({})
+    parts, arrays, size = ipc.describe(content("video", original), spec)
+    assert ipc.validate_layout(parts, size, spec) == size
+    fd = ipc.sealed_buffer(arrays, size)
+    try:
+        with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
+            restored = ipc.restore(parts, memory).parts[0].value
+            assert restored.frame_times == original.frame_times
+            assert restored.frame_indices == original.frame_indices
+            np.testing.assert_equal(restored.frames, original.frames)
+            del restored
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "times,indices",
+    [
+        ((1.0, 0.5), (0, 1)),
+        ((-0.5, 0.5), (0, 1)),
+        ((0.5, float("nan")), (0, 1)),
+        ((0.5, float("inf")), (0, 1)),
+        ((False, 0.5), (0, 1)),
+        ((0.5,), (0, 1)),
+        ((0.5, 0.5), (0, 0)),
+        ((0.5, 0.5), (1, 0)),
+        ((0.5, 0.5), (False, 1)),
+    ],
+)
+def test_invalid_video_timeline_rejected_on_both_sides(times, indices):
+    spec = ipc.input_spec({})
+    original = video()
+    with pytest.raises(EmbeddingConfigurationError):
+        ipc.describe(content("video", VideoClip(original.frames, times, indices)), spec)
+    parts, _, size = ipc.describe(content("video", original), spec)
+    parts[0].update(times=list(times), indices=list(indices))
+    with pytest.raises(EmbeddingConfigurationError):
+        ipc.validate_layout(parts, size, spec)
+
+
 @pytest.mark.parametrize("value", ["", " \t\n", "\u3000"])
 def test_text_transport_preserves_blanks_and_charges_admission(value):
     import mmap
@@ -551,7 +597,11 @@ def test_joint_audio_video_and_text_use_one_native_request(tmp_path, monkeypatch
     "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning:transformers.processing_utils"
 )
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
-def test_real_processor_equal_for_direct_and_shared_frames(tmp_path, monkeypatch, family, make_real_video_processor):
+@pytest.mark.parametrize("times", [(0.2, 0.6, 1.4), (0.5, 0.5), (0.0, 0.5, 0.5, 1.0)])
+@pytest.mark.parametrize("joint", [False, True])
+def test_real_processor_equal_for_direct_and_shared_frames(
+    tmp_path, monkeypatch, family, times, joint, make_real_video_processor
+):
     import transformers
     from transformers.video_utils import VideoMetadata
 
@@ -564,13 +614,13 @@ def test_real_processor_equal_for_direct_and_shared_frames(tmp_path, monkeypatch
         "gpus_per_actor": 0,
         "processor_kwargs": {"videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}}},
     }
-    row = EmbeddingContent(
-        content(
-            "video",
-            VideoClip(tuple(np.full((64, 64, 3), v, np.uint8) for v in (10, 20, 30)), (0.2, 0.6, 1.4), (2, 6, 14)),
-        ).parts
-        + content().parts
+    clip = VideoClip(
+        tuple(np.full((64, 64, 3), 10 * (i + 1), np.uint8) for i in range(len(times))),
+        times,
+        tuple(2 + i * 4 for i in range(len(times))),
     )
+    row = EmbeddingContent(content("video", clip).parts + (content().parts if joint else ()))
+    kind = "multimodal" if joint else "video"
     service = EmbeddingService(
         path=str(root / "engine.sock"),
         service_id="fixture-v1",
@@ -582,16 +632,22 @@ def test_real_processor_equal_for_direct_and_shared_frames(tmp_path, monkeypatch
 
     async def run():
         await service.start()
-        instance = client(root, family)
+        instance = client(root, family, kind=kind)
+        native = getattr(load_provider(family), f"get_{kind}_embedder")("fixture", 2, options=options).instantiate()
+        for runtime in (native, instance):
+            runtime.configure_execution(on_error="ignore", max_retries=0, validate=lambda v: v)
         try:
-            await service.runtime._embed_content(row)
-            np.testing.assert_equal(await instance.embed_multimodal([row]), [[3, 4]])
+            for runtime in (native, instance):
+                result = await runtime.embed_multimodal([row]) if joint else await runtime.embed_video([clip])
+                np.testing.assert_equal(result, [[3, 4]])
+            assert service.credits.bytes == service.credits.inflight == 0
         finally:
+            await native.aclose()
             await instance.aclose()
             await service.aclose()
 
     asyncio.run(run())
-    assert len(state.engines) == 1
+    assert len(state.engines) == len(state.calls) == 2
 
     def tensors(call):
         request = call[1]
@@ -606,12 +662,27 @@ def test_real_processor_equal_for_direct_and_shared_frames(tmp_path, monkeypatch
         )
 
     direct, shared = (tensors(call) for call in state.calls)
+    expected = processor(
+        text=["<|video_pad|>"],
+        videos=[np.stack(clip.frames)],
+        video_metadata=[
+            VideoMetadata(
+                fps=10, frames_indices=[round(t * 10) for t in times], total_num_frames=round(times[-1] * 10) + 1
+            )
+        ],
+        videos_kwargs=options["processor_kwargs"]["videos_kwargs"],
+        do_sample_frames=False,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
     assert direct.keys() == shared.keys()
     for key in direct:
         np.testing.assert_equal(
             direct[key] if isinstance(direct[key], str) else np.asarray(direct[key]),
             shared[key] if isinstance(shared[key], str) else np.asarray(shared[key]),
         )
+    for key in expected:
+        np.testing.assert_equal(np.asarray(direct[key]), np.asarray(expected[key]))
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
@@ -643,7 +714,8 @@ def check_public_embed(process, family, backend):
     import pyarrow as pa
 
     import vane
-    from vane.ai import MultimodalInput, TextInput
+    from tests.fast.test_ai_video_embedding import clip, clip_array
+    from vane.ai import MultimodalInput, TextInput, VideoInput
 
     proc, root = process(family)
     asyncio.run(until(lambda: (root / "ready").exists() or proc.poll() is not None))
@@ -689,8 +761,29 @@ def check_public_embed(process, family, backend):
             (4, None),
             (5, (3, 4)),
         ]
+        records = clip()
+        records[1]["frame_time"] = records[0]["frame_time"]
+        videos = connection.from_arrow(pa.table({"frames": clip_array([records]), "text": ["query"]}))
+        for embedding_input in (
+            VideoInput(vane.col("frames")),
+            MultimodalInput([VideoInput(vane.col("frames")), TextInput(vane.col("text"))]),
+        ):
+            result = videos.embed(
+                embedding_input,
+                provider=family,
+                model="fixture",
+                dimensions=2,
+                runtime="service",
+                service_path=str(root / "engine.sock"),
+                service_id="fixture-v1",
+                execution_backend=backend,
+                on_error="ignore",
+                output_column="vector",
+                normalize=False,
+            )
+            assert result.select("vector").fetchall() == [((3, 4),)]
     asyncio.run(
-        until(lambda: state(root).get("calls") == 7 and state(root).get("bytes") == state(root).get("inflight") == 0)
+        until(lambda: state(root).get("calls") == 9 and state(root).get("bytes") == state(root).get("inflight") == 0)
     )
     assert state(root)["engines"] == 1
 

@@ -130,7 +130,7 @@ def describe(
                 len(times) != len(value.frames)
                 or len(indices) != len(times)
                 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
-                or any(a >= b for a, b in zip(times, times[1:]))
+                or any(a > b for a, b in zip(times, times[1:]))
                 or any(type(i) is not int or i < 0 for i in indices)
                 or any(a >= b for a, b in zip(indices, indices[1:]))
             ):
@@ -224,7 +224,7 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
                 or len(indices) != len(buffers)
                 or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in times)
                 or any(type(i) is not int or i < 0 for i in indices)
-                or any(a >= b for a, b in zip(times, times[1:]))
+                or any(a > b for a, b in zip(times, times[1:]))
                 or any(a >= b for a, b in zip(indices, indices[1:]))
             ):
                 raise EmbeddingConfigurationError("Invalid frame timeline")

@@ -525,7 +525,10 @@ It passes one FD with `SCM_RIGHTS`; the server checks every descriptor and the
 sealed file's size before mapping. The request ID identifies the lease, owned
 by the connection and the receiving server. Offsets are contiguous, nonoverlapping
 and exactly cover the FD. Frame indices/timestamps and sample rate remain JSON
-metadata; text descriptors contain only offsets and lengths. The configured
+metadata; text descriptors contain only offsets and lengths. Video timelines
+keep strictly increasing frame indices and nondecreasing timestamps, including
+repeated timestamps, without dropping frames. Processor requirements such as a
+uniform positive frame interval are checked separately. The configured
 `max_input_bytes` bounds the combined UTF-8 text and decoded-media bytes, and
 admission charges the complete buffer. Empty text still consumes one admission
 byte/slot without allocating a buffer. Invalid UTF-8 fails before model work.
