@@ -448,8 +448,11 @@ class _ClipEncoder:
             if duration is None or duration <= 0:
                 raise VideoFileFormatError("video_clip requires the final picture's presentation duration")
             final_end = self.previous_time + duration * Fraction(self.previous.time_base)
-            # Input float endpoints may round one ULP past the exact stream end.
-            if float(final_end) < float(self.end):
+            # Reconstructing a quantized endpoint from a fractional start can
+            # round one ULP beyond the caller's endpoint. Check the requested
+            # bound as well; this normalization artifact is not a source gap.
+            requested_end = min(self.end, self.options["end_time"])
+            if float(final_end) < float(requested_end):
                 raise VideoFileFormatError("video_clip end exceeds the video timeline")
             self.emit_video(final_end)
         if not self.frame_count:
