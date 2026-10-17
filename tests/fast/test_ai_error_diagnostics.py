@@ -5,11 +5,31 @@ import base64
 import errno
 import json
 import pickle
+import sys
 
 import pytest
 
 from vane.ai import DiagnosticError, summarize_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
+
+
+def onnx_allocation_error(kind="Fail", *, initialize=False, wrapped=False):
+    status = "1 : FAIL" if kind == "Fail" else "6 : RUNTIME_EXCEPTION"
+    operation = (
+        "Exception during initialization: "
+        if initialize
+        else "Non-zero status code returned while running Conv node. Name:'private-node' Status Message: "
+    )
+    error = type(kind, (Exception,), {})(
+        f"[ONNXRuntimeError] : {status} : {operation}"
+        "/private/build/bfc_arena.cc:360 void* onnxruntime::BFCArena::AllocateRawInternal"
+        "(size_t, bool, onnxruntime::Stream*) Failed to allocate memory for requested buffer of size 1073741824"
+    )
+    if wrapped:
+        outer = type("ONNXRuntimeError", (Exception,), {})("private traceback with credentials")
+        outer.__context__ = error
+        return outer
+    return error
 
 
 def native_error(error, envelope="native_json"):
@@ -85,6 +105,18 @@ def test_spawn_diagnostic_requires_complete_typed_native_envelopes(invalid):
             "mem_fraction_static=0.3, required above 0.346",
         ),
         (RuntimeError("CUDA out of memory. private request content"), "CUDA memory allocation failed"),
+        (RuntimeError("CUDA failed with error out of memory"), "CUDA memory allocation failed"),
+        (onnx_allocation_error(), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error("RuntimeException", initialize=True), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error(wrapped=True), "ONNX Runtime memory allocation failed"),
+        (
+            RuntimeError(
+                "[enforce fail at /private/build/alloc_cpu.cpp:127] err == 0. "
+                "DefaultCPUAllocator: can't allocate memory: you tried to allocate 1073741824 bytes. "
+                "Error code 12 (Cannot allocate memory)\nprivate C++ stack"
+            ),
+            "CPU memory allocation failed",
+        ),
         (MemoryError("private allocation description"), "memory allocation failed"),
     ],
 )
@@ -99,6 +131,81 @@ def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, e
     for result in (summarize_error(error), summarize_error(public), summarize_error(flattened)):
         assert expected in result
         assert "private" not in result
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "private input mentions DefaultCPUAllocator: can't allocate memory",
+        "DefaultCPUAllocator: invalid argument in private input",
+        "DefaultCPUAllocator: can't allocate memory: private body",
+    ],
+)
+def test_cpu_allocator_summary_rejects_unrecognized_messages(message):
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA failed with error invalid argument",
+        "private input mentions CUDA failed with error out of memory",
+        "CUDA failed with error out of memory private input",
+    ],
+)
+def test_ctranslate_summary_accepts_only_the_allocation_error(message):
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize("kind", ["Fail", "RuntimeException"])
+@pytest.mark.parametrize("change", ["prefix", "suffix", "node_text", "allocator", "size"])
+def test_onnx_summary_requires_an_allocator_failure(kind, change):
+    error = onnx_allocation_error(kind)
+    message = str(error)
+    message = {
+        "prefix": "private text " + message,
+        "suffix": message + " private text",
+        "node_text": "[ONNXRuntimeError] : 1 : FAIL : private input mentions Failed to allocate memory",
+        "allocator": message.replace("Failed to allocate memory", "Invalid argument"),
+        "size": message.replace("1073741824", "private input"),
+    }[change]
+    assert summarize_error(type(error)(message)) == kind
+
+
+@pytest.mark.parametrize("kind", ["RuntimeError", "ONNXRuntimeError"])
+def test_onnx_traceback_text_without_a_typed_cause_is_not_decoded(kind):
+    error = type(kind, (Exception,), {})(str(onnx_allocation_error()))
+    assert summarize_error(error) == kind
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux address-space limit")
+def test_real_torch_cpu_allocator_survives_diagnostic_wrapping():
+    import subprocess
+    import sys
+
+    pytest.importorskip("torch")
+    code = """
+import json, pickle, resource
+from pathlib import Path
+import torch
+from vane.ai import DiagnosticError, summarize_error
+virtual = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmSize:'))) * 1024
+old = resource.getrlimit(resource.RLIMIT_AS)
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (virtual + 64 * 1024**2, old[1]))
+    torch.empty(256 * 1024**2, dtype=torch.float32, device='cpu')
+except RuntimeError as error:
+    resource.setrlimit(resource.RLIMIT_AS, old)
+    assert 'DefaultCPUAllocator' in str(error)
+    print(json.dumps([summarize_error(error), summarize_error(pickle.loads(pickle.dumps(DiagnosticError('fixture', error))))]))
+else:
+    raise AssertionError('CPU allocator probe did not fail')
+finally:
+    resource.setrlimit(resource.RLIMIT_AS, old)
+"""
+    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True, timeout=45)
+    summaries = json.loads(result.stdout)
+    assert summaries == ["RuntimeError: CPU memory allocation failed; check model and worker CPU memory budgets"] * 2
 
 
 @pytest.mark.parametrize(

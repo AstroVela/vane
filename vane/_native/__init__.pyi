@@ -487,6 +487,7 @@ class DuckDBPyRelation:
         model: str | None = None,
         dimensions: int | None = None,
         on_error: typing.Literal["raise", "ignore"] = "raise",
+        where: Expression | None = None,
         output_column: str = "embedding",
         **options: Unpack[EmbedOptions],
     ) -> DuckDBPyRelation: ...

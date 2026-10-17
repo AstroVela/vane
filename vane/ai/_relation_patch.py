@@ -48,6 +48,7 @@ def _embed(
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     output_column: str = "embedding",
     **options: Unpack[EmbedOptions],
 ) -> DuckDBPyRelation:
@@ -61,6 +62,7 @@ def _embed(
         model=model,
         dimensions=dimensions,
         on_error=on_error,
+        where=where,
         output_column=output_column,
         **options,
     )

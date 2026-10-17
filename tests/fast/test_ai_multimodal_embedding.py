@@ -147,7 +147,8 @@ def test_aggregate_budget_uses_utf8_bytes():
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
-def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps(backend):
+@pytest.mark.parametrize("selection", [None, True, False])
+def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps(backend, selection):
     from vane.execution.udf_file_contract import FileUDFContract
 
     pixels = np.full((2, 3, 3), 17, np.uint8)
@@ -220,9 +221,12 @@ def test_joint_decoded_columns_preserve_pixels_pcm_and_source_timestamps(backend
                 AudioInput(vane.col("audio")),
             ]
         )
-        assert relation.embed(inputs, provider=DecodedProvider(), execution_backend=backend).select(
-            "embedding"
-        ).fetchall() == [((4, 0.75),)]
+        assert relation.embed(
+            inputs,
+            provider=DecodedProvider(),
+            execution_backend=backend,
+            where=vane.ConstantExpression(selection) if selection is not None else None,
+        ).select("embedding").fetchall() == ([(None,)] if selection is False else [((4, 0.75),)])
 
 
 @pytest.mark.parametrize("value", ["file.mp4", "data:video/mp4;base64,AA==", 42])
@@ -418,3 +422,240 @@ def test_google_serialized_base64_budget_is_enforced():
     # Raw bytes fit; Base64 plus JSON does not.
     with pytest.raises(ValueError, match="encoded request byte budget"):
         embedding_content(EmbeddingContent((EmbeddingPart(VIDEO, b"x" * (MAX_REQUEST_BYTES * 3 // 4)),)))
+
+
+@pytest.mark.parametrize(
+    "api,backend",
+    [
+        ("expression", None),
+        ("relation", "subprocess_task"),
+        ("relation", "subprocess_actor"),
+        ("method", "subprocess_task"),
+        ("method", "subprocess_actor"),
+    ],
+)
+def test_where_preserves_rows_and_skips_invalid_unselected_inputs(backend, api):
+    with vane.connect() as conn:
+        source = conn.from_arrow(
+            pa.table(
+                {
+                    "id": [0, 1, 2, 3, 4],
+                    "selected": [False, True, None, True, False],
+                    "text": [None, "yes", "x" * 100, "ok", None],
+                    "video": [b"", None, b"x" * 100, b"v", None],
+                }
+            )
+        )
+        inputs = MultimodalInput([TextInput(vane.col("text")), VideoInput(vane.col("video"), "video/mp4")])
+        options = dict(provider=ContentProvider(), where=vane.col("selected"), execution_backend=backend, batch_size=2)
+        if api == "expression":
+            options.pop("execution_backend")
+            result = source.select("id", embed(inputs, **options).alias("embedding"))
+        elif api == "relation":
+            result = embed(rel=source, input=inputs, **options)
+        else:
+            result = source.embed(inputs, **options)
+        assert result.select("id", "embedding").order("id").fetchall() == [
+            (0, None),
+            (1, (3, 1)),
+            (2, None),
+            (3, (3, 2)),
+            (4, None),
+        ]
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("condition", [False, None])
+def test_where_all_inactive_never_instantiates_the_client(backend, condition):
+    class UnusedDescriptor(ContentDescriptor):
+        def instantiate(self):
+            raise AssertionError("no selected inputs: client must remain uninitialized")
+
+    class UnusedProvider(ContentProvider):
+        def get_multimodal_embedder(self, **kwargs):
+            return UnusedDescriptor()
+
+    with vane.connect() as conn:
+        inputs = MultimodalInput([TextInput(vane.ConstantExpression(None))])
+        result = embed(
+            conn.sql("SELECT range AS id FROM range(5)"),
+            inputs,
+            where=vane.ConstantExpression(condition),
+            provider=UnusedProvider(),
+            execution_backend=backend,
+        )
+        assert result.select("embedding").fetchall() == [(None,)] * 5
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("condition", [False, None])
+@pytest.mark.parametrize(
+    "factory,mime_type", [(VideoInput, "video/mp4"), (AudioInput, "audio/wav"), (ImageInput, "image/png")]
+)
+def test_where_inactive_encoded_media_still_requires_blob(backend, condition, factory, mime_type):
+    with vane.connect() as conn:
+        source = conn.from_arrow(pa.table({"media": ["invalid VARCHAR", None]}))
+        result = embed(
+            source,
+            factory(vane.col("media"), mime_type=mime_type),
+            where=vane.ConstantExpression(condition),
+            provider=OptionalContentProvider(),
+            execution_backend=backend,
+            on_error="ignore",
+        )
+        with pytest.raises(Exception, match="BLOB"):
+            result.fetchall()
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_where_empty_selection_checks_types_without_decoding_or_creating_client(rows):
+    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "parts", "vector", 2, parts=(VIDEO,))
+    wrapper._selection_columns = ("parts",)
+
+    def selected_table(column):
+        fields = pa.table(
+            {
+                "condition": pa.array([False] * rows, type=pa.bool_()),
+                "parts": pa.table({"part_0": column}).to_struct_array(),
+            }
+        )
+        return pa.table({"selected_input": fields.to_struct_array()})
+
+    with pytest.raises(TypeError, match="BLOB"):
+        wrapper(selected_table(pa.array(["wrong type"] * rows, type=pa.string())))
+    # Invalid/over-budget encoded values are irrelevant when their rows are
+    # excluded. Only the declared column type is validated.
+    result = wrapper(selected_table(pa.array([b"", b"x" * 100][:rows], type=pa.binary())))
+    assert result["vector"].to_pylist() == [None] * rows
+    assert wrapper._embedder is None
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("text", [None, "x" * 17])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_where_selected_invalid_inputs_still_fail(backend, text, on_error):
+    with vane.connect() as conn:
+        result = embed(
+            conn.sql("SELECT 1 AS id"),
+            MultimodalInput([TextInput(vane.ConstantExpression(text))]),
+            where=vane.ConstantExpression(True),
+            provider=ContentProvider(),
+            execution_backend=backend,
+            on_error=on_error,
+        )
+        with pytest.raises(Exception, match="no nonempty|byte budget"):
+            result.fetchall()
+
+
+@pytest.mark.parametrize("condition", [True, False, "selected", 1])
+def test_where_requires_an_expression(condition):
+    with pytest.raises(TypeError, match="BOOLEAN Expression"):
+        embed(TextInput(vane.col("text")), where=condition, provider=ContentProvider())
+
+
+def test_where_rejects_non_boolean_values_before_input_conversion():
+    wrapper = _EmbedMultimodalBatch(ContentDescriptor(), "parts", "vector", 2, parts=(TEXT,))
+    wrapper._selection_columns = ("parts",)
+    fields = pa.table({"condition": [1], "parts": pa.table({"part_0": [None]}).to_struct_array()})
+    with pytest.raises(TypeError, match="BOOLEAN"):
+        wrapper(pa.table({"selected_input": fields.to_struct_array()}))
+    assert wrapper._embedder is None
+
+
+@pytest.mark.real_ray
+@pytest.mark.ray_cluster_owner
+@pytest.mark.parametrize("backend", ["ray_task", "ray_actor"])
+def test_where_profiles_share_one_preprocessing_pass_on_ray(tmp_path, monkeypatch, backend):
+    import ray
+
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    marker = str(tmp_path / "prepared")
+
+    def prepare(batch):
+        from pathlib import Path
+
+        for row in batch.to_pylist():
+            with (Path(marker).with_name(str(row["id"]))).open("x") as stream:
+                stream.write("prepared once")
+        return batch
+
+    try:
+        ray.init(address="local", num_cpus=3, include_dashboard=False)
+        with vane.connect() as conn:
+            source = conn.from_arrow(
+                pa.table({"id": [0, 1, 2], "profile": ["a", "b", None], "text": ["aa", "b", None]})
+            )
+            source = source.map_batches(
+                prepare, schema={"id": "BIGINT", "profile": "VARCHAR", "text": "VARCHAR"}, batch_size=1
+            )
+            inputs = MultimodalInput([TextInput(vane.col("text"))])
+            for name in ("a", "b"):
+                source = source.embed(
+                    inputs,
+                    provider=ContentProvider(),
+                    output_column=name,
+                    where=vane.col("profile") == vane.ConstantExpression(name),
+                    execution_backend=backend,
+                )
+            assert source.select("id", "a", "b").order("id").fetchall() == [
+                (0, (2, 1), None),
+                (1, None, (1, 1)),
+                (2, None, None),
+            ]
+        assert {p.name for p in tmp_path.iterdir()} == {"0", "1", "2"}
+    finally:
+        vane.teardown_runner()
+        ray.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_where_text_retains_nulls_normalization_and_row_positions(backend):
+    from vane.ai.protocols import TextEmbedderDescriptor
+
+    class Encoder:
+        async def embed_text(self, texts):
+            assert all(text in {"a", "b"} for text in texts)
+            return [[3, 4] for text in texts]
+
+    class Descriptor(TextEmbedderDescriptor):
+        def get_provider(self):
+            return "selected_text_fixture"
+
+        def get_model(self):
+            return "selected_text_fixture"
+
+        def get_options(self):
+            return {}
+
+        def get_dimensions(self):
+            return 2
+
+        def supports_chunking(self):
+            return False
+
+        def instantiate(self):
+            return Encoder()
+
+    class TextProvider(Provider):
+        @property
+        def name(self):
+            return "selected_text_fixture"
+
+        def get_text_embedder(self, model=None, dimensions=None, *, options=None):
+            return Descriptor()
+
+    with vane.connect() as conn:
+        source = conn.from_arrow(pa.table({"id": [0, 1, 2, 3], "text": ["must not reach model", "a", None, "b"]}))
+        result = embed(
+            source,
+            TextInput(vane.col("text")),
+            provider=TextProvider(),
+            normalize=True,
+            where=vane.col("id") > vane.ConstantExpression(0),
+            execution_backend=backend,
+            batch_size=2,
+        )
+        values = result.order("id").select("embedding").fetchall()
+        assert values[0] == values[2] == (None,)
+        assert values[1][0] == pytest.approx((0.6, 0.8)) and values[3][0] == pytest.approx((0.6, 0.8))
