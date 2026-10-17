@@ -107,7 +107,7 @@ struct PyPhysicalPlanWrapper {
 				py::str key(std::to_string(node_counter++));
 				if (handles_map.contains(key)) {
 					py::object handles_obj = handles_map[key];
-					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
+					ApplyUDFExecutorOptions(*bind_data, handles_obj);
 				}
 			}
 		});
@@ -1117,7 +1117,7 @@ struct PyPhysicalPlanWrapper {
 
 				if (handles_map.contains(key)) {
 					py::object handles_obj = handles_map[key];
-					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
+					ApplyUDFExecutorOptions(*bind_data, handles_obj);
 				}
 			}
 		});

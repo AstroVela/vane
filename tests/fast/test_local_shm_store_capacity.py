@@ -68,6 +68,139 @@ def test_output_larger_than_space_left_by_its_input_fails_promptly(store):
         held.release()
 
 
+@pytest.mark.parametrize("outcome", ["release", "noop", "error", "cancel", "pinned"])
+def test_capacity_wait_tracks_inflight_prefetch_reclaim(store, outcome):
+    held = store.allocate(3072, producer_id="queued-stream")
+    started, resume, waiting = (threading.Event() for _ in range(3))
+    scope = ExecutionCancellationScope("inflight-reclaim", 1)
+
+    def reclaim():
+        started.set()
+        assert resume.wait(5), "reclaim was not resumed"
+        if outcome == "release":
+            held.release()
+        elif outcome == "error":
+            raise RuntimeError("planned reclaim failure")
+
+    def wait_context():
+        waiting.set()
+        return nullcontext()
+
+    unregister = store.register_prefetch(reclaim)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            reclaiming = threads.submit(store.reclaim_prefetched_inputs)
+            try:
+                assert started.wait(5)
+                # Unregistering cannot retract a callback already being run.
+                unregister()
+                pending = threads.submit(
+                    store.wait_for_capacity,
+                    2048,
+                    (held.allocation,) if outcome == "pinned" else (),
+                    scope,
+                    wait_context,
+                    frozenset({"queued-stream"}),
+                )
+                assert waiting.wait(5)
+                if outcome == "pinned":
+                    # Claimed input cannot be reclaimed, even if another callback
+                    # is active. Keep the unconditional physical capacity bound.
+                    with pytest.raises(LocalShmStoreCapacityError, match="pinned_input_bytes=3072"):
+                        pending.result(timeout=5)
+                else:
+                    with pytest.raises(FutureTimeoutError):
+                        pending.result(timeout=0.05)
+                if outcome == "cancel":
+                    scope.cancel("cancel while reclaiming")
+                    with pytest.raises(ExecutionCancelledError, match="cancel while reclaiming"):
+                        pending.result(timeout=5)
+                resume.set()
+                if outcome == "error":
+                    with pytest.raises(RuntimeError, match="planned reclaim failure"):
+                        reclaiming.result(timeout=5)
+                else:
+                    reclaiming.result(timeout=5)
+                if outcome == "release":
+                    pending.result(timeout=5)
+                    store.allocate(2048).release()
+                elif outcome in {"noop", "error"}:
+                    # A no-op or failed callback must wake capacity waiters to
+                    # recheck the dependency, even without a physical release.
+                    with pytest.raises(LocalShmStoreCapacityError, match="queued_input_bytes=3072"):
+                        pending.result(timeout=5)
+            finally:
+                scope.cancel()
+                resume.set()
+    finally:
+        unregister()
+        held.release()
+
+
+def test_capacity_wait_tracks_all_concurrent_prefetch_reclaim_batches(store):
+    held = store.allocate(3072, producer_id="queued-stream")
+    started = [threading.Event(), threading.Event()]
+    resume = [threading.Event(), threading.Event()]
+    calls = []
+    scope = ExecutionCancellationScope("concurrent-reclaims", 1)
+
+    def reclaim(index):
+        calls.append(index)
+        started[index].set()
+        assert resume[index].wait(5), "reclaim was not resumed"
+        if index == 1:
+            held.release()
+
+    unregister = []
+    try:
+        with ThreadPoolExecutor(max_workers=3) as threads:
+            try:
+                reclaiming = []
+                for index in range(2):
+                    unregister.append(store.register_prefetch(lambda index=index: reclaim(index)))
+                    reclaiming.append(threads.submit(store.reclaim_prefetched_inputs))
+                    assert started[index].wait(5)
+                pending = threads.submit(
+                    store.wait_for_capacity, 2048, (), scope, nullcontext, frozenset({"queued-stream"})
+                )
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                resume[0].set()
+                reclaiming[0].result(timeout=5)
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                resume[1].set()
+                reclaiming[1].result(timeout=5)
+                pending.result(timeout=5)
+                assert calls == [0, 1]
+            finally:
+                scope.cancel()
+                for event in resume:
+                    event.set()
+    finally:
+        for callback in unregister:
+            callback()
+        held.release()
+
+
+def test_prefetch_reclaim_failure_does_not_discard_other_callbacks(store):
+    called = []
+
+    def reclaim(index):
+        called.append(index)
+        raise RuntimeError("planned reclaim failure")
+
+    for index in range(3):
+        store.register_prefetch(lambda index=index: reclaim(index))
+    with pytest.raises(RuntimeError, match="planned reclaim failure"):
+        store.reclaim_prefetched_inputs()
+    assert sorted(called) == [0, 1, 2]
+    # Failed callbacks are still owned by their invocation's cleanup path,
+    # rather than run a second time by an unrelated output allocation.
+    store.reclaim_prefetched_inputs()
+    assert len(called) == 3
+
+
 @pytest.mark.parametrize("release_before_report", [False, True])
 def test_idle_worker_input_report_distinguishes_retained_views_from_pending_releases(
     store, monkeypatch, release_before_report

@@ -708,7 +708,9 @@ def test_connection_close_retries_failed_input_cleanup(native_environment, monke
             def fail_cleanup(*args, **kwargs):
                 raise RuntimeError("injected native-query input cleanup failure")
 
-            fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+            # Materialized inputs transfer descriptor ownership to their input
+            # lease. Borrowed upstream descriptors only release their credit.
+            fault.setattr(ref_bundle.LocalShmBlockRef, "release", fail_cleanup)
             with pytest.raises(Exception, match="input cleanup failure"):
                 _gated(connection, tmp_path, 2).fetchall()
             assert manager.snapshot()["active_input_leases"] == 1

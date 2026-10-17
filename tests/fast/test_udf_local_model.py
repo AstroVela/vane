@@ -1799,8 +1799,12 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
             time.sleep(0.01)
         return pa.table({"total": [sum(table.column(0).to_pylist())]})
 
-    source = pa.table({"x": list(range(8192))})
-    held = ref_bundle.make_local_shm_ref_bundle_result(source)
+    # A running input remains physically charged after ACK. Keep the producer's
+    # own input plus output within budget, and create pressure with an unrelated
+    # allocation that can be released while the consumer owns execution capacity.
+    source = pa.table({"x": list(range(4096))})
+    held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": list(range(10000))}))
+    consumer_input = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [sum(range(8192))]}))
     producer_payload = _payload(Producer, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
     consumer_payload = _payload(consumer, execution_backend="subprocess_task")
     runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
@@ -1820,8 +1824,10 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
         assert (tmp_path / "producer-entered").exists() == (phase == "output")
         assert consumer_executor.request_task_admission(source.nbytes)
         assert consumer_executor.task_admission_state()["available"]
-        consumer_executor.submit_ref_bundle_with_id(1, held[1], None, held[2], held[3])
+        consumer_executor.submit_ref_bundle_with_id(1, consumer_input[1], None, consumer_input[2], consumer_input[3])
         _wait_until(lambda: (tmp_path / "consumer-entered").exists(), "consumer did not acquire the input")
+        for ref in held[1]:
+            ref.release()
         _wait_until(
             lambda: runtime.resource_snapshot()["task_admission"]["resuming_tasks"] == 1,
             "producer did not wait to reacquire execution capacity",
@@ -1856,7 +1862,7 @@ def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capaci
             executor.close(kill=True)
         for resource in resources:
             resource.shutdown(kill=True)
-        for output in [held, *outputs]:
+        for output in [held, consumer_input, *outputs]:
             for ref in output[1]:
                 ref.release()
         competing_task.release()

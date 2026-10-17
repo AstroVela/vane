@@ -249,7 +249,7 @@ static void ApplyHandlesMap(const vector<UDFFunctionData *> &bind_nodes, const p
 			throw InvalidInputException("UDF actor resource helper returned unknown node_id %llu",
 			                            static_cast<unsigned long long>(node_id));
 		}
-		bind_nodes[node_id]->actor_handles = WrapPyObjectForUDFActorHandles(value);
+		ApplyUDFExecutorOptions(*bind_nodes[node_id], value);
 	}
 }
 
@@ -260,6 +260,27 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 }
 
 } // namespace
+
+void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object &options) {
+	if (!pybind11::isinstance<pybind11::dict>(options)) {
+		throw InvalidInputException("UDF executor options must be a dict");
+	}
+	auto values = pybind11::reinterpret_borrow<pybind11::dict>(options);
+	idx_t target = 0;
+	if (values.contains("local_transport_input_target_bytes")) {
+		auto value = values["local_transport_input_target_bytes"];
+		if (!PyLong_CheckExact(value.ptr())) {
+			throw InvalidInputException("Local transport input target must be positive integer bytes");
+		}
+		auto bytes = pybind11::cast<int64_t>(value);
+		if (bytes <= 0) {
+			throw InvalidInputException("Local transport input target must be positive integer bytes");
+		}
+		target = static_cast<idx_t>(bytes);
+	}
+	bind_data.actor_handles = WrapPyObjectForUDFActorHandles(options);
+	bind_data.transport_input_target_bytes = target;
+}
 
 class PythonUDFActorResourceState : public ClientContextState {
 public:

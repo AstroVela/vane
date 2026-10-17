@@ -213,7 +213,8 @@ def test_failed_input_cleanup_retries_partial_release_without_touching_other_que
             with pytest.raises(RuntimeError, match="planned partial input cleanup failure"):
                 task.finish()
             assert calls == [refs[0].name, refs[1].name]
-            assert budget.snapshot()["allocated_bytes"] == refs[0].size + refs[2].size
+            # These borrowed descriptors still own their physical allocations.
+            assert budget.snapshot()["allocated_bytes"] == sum(ref.size for ref in refs)
             assert ledger.snapshot()["input_bytes"] == sum(ref.size for ref in refs)
             task_ref = weakref.ref(task)
             del task
@@ -324,7 +325,8 @@ def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, firs
             assert budget.consume_input_lease(lease) == ref.size
         assert not budget.input_lease_pending(lease)
         snapshot = budget.snapshot()
-        assert snapshot["input_lease_bytes"] == snapshot["allocated_bytes"] == 0
+        assert snapshot["input_lease_bytes"] == 0
+        assert snapshot["allocated_bytes"] == ref.size
     finally:
         proceed.set()
         budget.cancel_input_lease(lease)
@@ -336,7 +338,7 @@ def test_reentrant_input_cancellation_does_not_wait_for_its_own_release(monkeypa
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
     ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
-    lease = ref_bundle.create_local_shm_input_lease([ref])
+    lease = ref_bundle.create_local_shm_input_lease([ref], owns_refs=True)
     pending = []
     with ThreadPoolExecutor(max_workers=1) as threads:
 
@@ -400,7 +402,7 @@ def test_zero_copy_consumers_keep_data_accounted_after_query_and_runtime_close(t
     ledger.close()
     ref.release()
     gc.collect()
-    assert budget.snapshot()["usage_bytes"] == 0
+    assert budget.snapshot()["usage_bytes"] == size
     assert ledger.snapshot()["retained_bytes"] == size
     assert ledger.snapshot()["output_state_bytes"]["external_consumer"] == size
     if view_kind in {"table", "slice"}:
@@ -486,7 +488,7 @@ def test_input_ack_does_not_release_data_borrows_or_double_count_shared_output(t
     transport_lease = ref_bundle.create_local_shm_input_lease([ref])
     try:
         ref_bundle.consume_local_shm_input_lease(transport_lease)
-        assert budget.snapshot()["allocated_bytes"] == 0
+        assert budget.snapshot()["allocated_bytes"] == size
         assert ledger.snapshot()["input_bytes"] == size
         ref.release()
         assert ledger.snapshot()["output_bytes"] == 0
@@ -507,7 +509,10 @@ def test_failed_materialization_returns_only_the_new_view_lease(tracked_transpor
         raise RuntimeError("planned materialization failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(ref_bundle, "_open_existing_shm" if failure == "open" else "_ipc_payload_bounds", fail)
+        if failure == "open":
+            patch.setattr(ref._allocation_lease.store, "buffer", fail)
+        else:
+            patch.setattr(pa.ipc, "open_stream", fail)
         with pytest.raises(RuntimeError, match="planned materialization failure"):
             ref.to_table()
     assert ledger.snapshot()["retained_bytes"] == ref.size

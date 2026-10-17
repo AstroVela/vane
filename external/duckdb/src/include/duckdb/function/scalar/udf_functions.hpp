@@ -125,6 +125,8 @@ struct UDFFunctionData : public FunctionData {
 	Value payload;
 	LogicalType return_type;
 	shared_ptr<void> actor_handles;
+	//! Execution-time capacity, supplied with the query's prepared actor resources.
+	idx_t transport_input_target_bytes = 0;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

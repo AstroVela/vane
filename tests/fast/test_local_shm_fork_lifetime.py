@@ -40,10 +40,21 @@ def submit(value):
 first = submit(11)
 slot = first._allocation_lease.allocation
 store = first._allocation_lease.store
+def wait_for_only_first_output():
+    with store._capacity_condition:
+        reclaimed = store._capacity_condition.wait_for(
+            lambda: len(store._live) == 1 and slot.generation in store._live,
+            timeout=5,
+        )
+    assert reclaimed, store.snapshot()
+
 view = first.to_table().column(0).chunk(0)
 if kind == 'numpy':
     view = view.to_numpy(zero_copy_only=True)
 first.release()
+# Input release uses an independent channel. Drain it before fork so the
+# descendant inherits only the output whose view is under test.
+wait_for_only_first_output()
 read_gate, write_gate = os.pipe()
 read_result, write_result = os.pipe()
 read_exit, write_exit = os.pipe()
@@ -77,6 +88,8 @@ try:
     assert second.to_table().column(0).to_pylist() == [22] * 2048
     assert second._allocation_lease.allocation.offset != slot.offset
     second.release()
+    # A terminal result does not fence the worker's input release notification.
+    wait_for_only_first_output()
     if action == 'close':
         worker.close(kill=True)
         assert store.snapshot()['live_allocations'] == 1
@@ -97,8 +110,10 @@ try:
         time.sleep(0.01)
     assert store.snapshot()['live_allocations'] == 0
     if action != 'close':
-        reused = store.allocate(slot.size)
-        assert reused.allocation.offset == slot.offset
+        # Inputs also use the arena; the first output need not start at zero.
+        # Reclaiming the whole arena proves the inherited region is reusable.
+        reused = store.allocate(store.capacity)
+        assert reused.allocation.offset == 0
         reused.release()
     worker.close(kill=True)
     assert store.snapshot()['mapped_capacity_bytes'] == 0

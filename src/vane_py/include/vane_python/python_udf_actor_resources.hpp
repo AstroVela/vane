@@ -14,6 +14,10 @@ class ClientContext;
 class ClientContextState;
 class PythonUDFActorResourceState;
 class PreparedStatementData;
+struct UDFFunctionData;
+
+//! Install opaque Python owners and native transport capacity together; requires the GIL.
+void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object &options);
 
 //! Read native topology through the common metadata collector without taking plan ownership.
 pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared);
