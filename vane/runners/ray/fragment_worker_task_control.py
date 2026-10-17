@@ -104,10 +104,11 @@ class FteWorkerTaskControlMixin:
         self._drop_fragment_registration_state(query_id)
         _drop_fragment_plan_refs_for_query(query_id)
         _drop_fte_registry_for_query(query_id)
+        # Keep recorded control failures until fte_cleanup_query reports them
+        # after final cleanup, even when the worker is already dead.
         with self._fte_control_lock:
             self._fte_drop_incomplete_queries.discard(query_id)
             self._fragment_drop_incomplete_queries.discard(query_id)
-            self._fte_prepare_terminal_errors.pop(query_id, None)
 
     @staticmethod
     def _validated_fte_add_splits_status(

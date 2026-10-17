@@ -3761,6 +3761,56 @@ def test_dead_actor_query_teardown_releases_only_its_closed_query(monkeypatch, d
     worker_handle_mod.open_fte_registry_for_query(query_id)
 
 
+@pytest.mark.parametrize("death_stage", ["interrupt", "prepare", "cleanup"])
+def test_terminal_control_failure_survives_worker_death(death_stage):
+    class _FailedRef:
+        def __init__(self, error):
+            self._future = Future()
+            self._future.set_exception(error)
+
+        def future(self):
+            return self._future
+
+    class _FailedMethod:
+        def __init__(self, error):
+            self.ref = _FailedRef(error)
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.ref
+
+    query_id = f"query-terminal-control-before-{death_stage}-death"
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    actor = _FakeActor()
+    actor.fte_ack_task_result = _FailedMethod(RuntimeError("result acknowledgement failed"))
+    actor.fte_cleanup_query = _FailedMethod(ray.exceptions.ActorDiedError())
+    if death_stage != "cleanup":
+        target = "fte_interrupt_query" if death_stage == "interrupt" else "fte_prepare_drop_query"
+        setattr(actor, target, _FailedMethod(ray.exceptions.ActorDiedError()))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    handle.enqueue_fte_ack_task_result(task_id)
+    if death_stage == "interrupt":
+        # An earlier barrier may record the failure before a teardown retry
+        # discovers that its interrupt target has died.
+        with pytest.raises(task_control_mod.FteControlBarrierTerminalError, match="result acknowledgement failed"):
+            handle.close_and_flush_fte_controls(query_id)
+
+    with pytest.raises(RuntimeError, match="terminal control failure.*result acknowledgement failed") as error:
+        handle.fte_drop_query(query_id)
+
+    assert isinstance(error.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert actor.fte_cleanup_query.calls == [(query_id,)]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._registered_fragment_ids == set()
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
 @pytest.mark.parametrize(
     "error",
     [
