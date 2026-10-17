@@ -2234,9 +2234,7 @@ def test_materialized_arrow_result_releases_execution_before_consumption(native_
                 schema={"value": vane.sqltypes.VARCHAR},
                 execution_backend="subprocess_task",
             )
-            result = (
-                relation.fetch_record_batch(rows_per_batch=2) if delivery == "reader" else relation.to_arrow_table()
-            )
+            result = relation.to_arrow_reader(batch_size=2) if delivery == "reader" else relation.to_arrow_table()
             assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
             assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
             assert second.execute("SELECT 9").fetchall() == [(9,)]
