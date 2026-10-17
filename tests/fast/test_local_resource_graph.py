@@ -78,6 +78,62 @@ def test_native_writes_collect_udf_inputs_and_sink_boundary(monkeypatch, threads
     build_local_resource_graph(graph, query_id="write")
 
 
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize(
+    "statement,expected_result,expected_values",
+    [
+        ("UPDATE result SET x = update_increment(x)", [(3,)], [(1,), (2,), (3,)]),
+        ("UPDATE result SET x = (SELECT update_increment(10))", [(3,)], [(11,), (11,), (11,)]),
+        (
+            "UPDATE result SET x = update_increment(x) WHERE x > 0 RETURNING x",
+            [(2,), (3,)],
+            [(0,), (2,), (3,)],
+        ),
+        (
+            "UPDATE result SET x = update_increment(v.y) FROM (VALUES (1, 10)) v(k, y) WHERE result.x = v.k",
+            [(1,)],
+            [(0,), (2,), (11,)],
+        ),
+    ],
+    ids=["expression", "scalar_subquery", "returning", "from"],
+)
+def test_native_updates_collect_udf_inputs_and_sink_boundary(
+    monkeypatch, threads, statement, expected_result, expected_values
+):
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    graphs = []
+    prepare = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes
+
+    def capture(nodes, **kwargs):
+        graphs.append(kwargs["resource_graph"])
+        return prepare(nodes, **kwargs)
+
+    monkeypatch.setattr(udf_subprocess, "ensure_local_subprocess_actor_pools_for_nodes", capture)
+
+    with vane.connect(config={"threads": threads}) as conn:
+        conn.execute("CREATE TABLE result AS SELECT i::INTEGER AS x FROM range(3) t(i)")
+        vane.attach_function(
+            lambda value: value + 1,
+            alias="update_increment",
+            parameters=["INTEGER"],
+            return_dtype="INTEGER",
+            connection=conn,
+        )
+        assert sorted(conn.execute(statement).fetchall()) == expected_result
+        assert conn.execute("SELECT x FROM result ORDER BY x").fetchall() == expected_values
+
+    assert len(graphs) == 1
+    graph = graphs[0]
+    assert len(graph["udf_node_ids"]) == 1
+    (sink,) = [node for node in graph["nodes"] if node["node_name"] == "UPDATE"]
+    assert sink["is_materialization_barrier"]
+    assert sink["materialized_input_node_ids"] == sink["input_node_ids"]
+    assert sink["input_node_ids"]
+    build_local_resource_graph(graph, query_id="update")
+
+
 @pytest.mark.parametrize(
     "backend,adapter",
     [

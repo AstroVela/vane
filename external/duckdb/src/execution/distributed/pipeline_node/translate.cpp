@@ -669,7 +669,8 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 	case PhysicalOperatorType::CREATE_TABLE_AS:
 	case PhysicalOperatorType::BATCH_CREATE_TABLE_AS:
 	case PhysicalOperatorType::INSERT:
-	case PhysicalOperatorType::BATCH_INSERT: {
+	case PhysicalOperatorType::BATCH_INSERT:
+	case PhysicalOperatorType::UPDATE: {
 		if (!plan_config_.native_scan_metadata) {
 			throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());
 		}
