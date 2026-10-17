@@ -983,8 +983,6 @@ class _EmbeddingBatch:
         try:
             with np.errstate(over="ignore", invalid="ignore"):
                 embedding = np.asarray(value, dtype=np.float32)
-        except MemoryError:
-            raise
         except Exception as exc:
             _raise_if_resource_error(exc)
             raise _ProviderResultError("Provider returned a non-numeric embedding") from None
@@ -1053,7 +1051,7 @@ class _EmbeddingBatch:
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
             )
-        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError, MemoryError):
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
             _raise_if_resource_error(exc)
@@ -1086,7 +1084,7 @@ class _EmbeddingBatch:
             return []
         try:
             return self._invoke_embedder(texts)
-        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError, MemoryError):
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
             _raise_if_resource_error(exc)
@@ -1111,7 +1109,7 @@ class _EmbeddingBatch:
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
-            except (_MissingAsyncRuntimeError, EmbeddingConfigurationError, MemoryError):
+            except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
                 raise
             except Exception as exc:
                 _raise_if_resource_error(exc)

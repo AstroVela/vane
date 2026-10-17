@@ -359,7 +359,7 @@ def test_service_image_wire_contract_stays_uint8_rgb():
         ipc.describe(content("image", np.zeros((2, 2, 3), dtype=np.float32)), spec)
 
 
-def check_public_native_resource_failure(monkeypatch, family, backend):
+def check_public_native_resource_failure(monkeypatch, family, backend, *, phase="execution", on_error="ignore"):
     import cloudpickle
 
     import vane
@@ -371,6 +371,8 @@ def check_public_native_resource_failure(monkeypatch, family, backend):
 
     class WorkerDescriptor(NativeMultimodalEmbedderDescriptor):
         def instantiate(self):
+            if phase == "initialization":
+                raise MemoryError("private native initialization credential")
             sdk = install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
 
             async def fail(_):
@@ -395,7 +397,7 @@ def check_public_native_resource_failure(monkeypatch, family, backend):
                 dimensions=2,
                 gpus_per_actor=0,
                 execution_backend=backend,
-                on_error="ignore",
+                on_error=on_error,
                 max_retries=3,
                 output_column="vector",
                 normalize=False,
@@ -409,9 +411,11 @@ def check_public_native_resource_failure(monkeypatch, family, backend):
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
-def test_public_native_resource_failure_aborts(monkeypatch, family, backend):
+@pytest.mark.parametrize("phase", ["initialization", "execution"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_public_native_resource_failure_aborts(monkeypatch, family, backend, phase, on_error):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    check_public_native_resource_failure(monkeypatch, family, backend)
+    check_public_native_resource_failure(monkeypatch, family, backend, phase=phase, on_error=on_error)
 
 
 @pytest.mark.real_ray
@@ -427,7 +431,8 @@ def test_public_native_resource_failure_aborts_on_ray(monkeypatch, family, backe
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     try:
         ray.init(address="local", num_cpus=3, include_dashboard=False)
-        check_public_native_resource_failure(monkeypatch, family, backend)
+        for phase in ("initialization", "execution"):
+            check_public_native_resource_failure(monkeypatch, family, backend, phase=phase)
     finally:
         vane.teardown_runner()
         ray.shutdown()
