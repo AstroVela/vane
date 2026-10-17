@@ -3704,6 +3704,120 @@ def test_fte_drop_query_remote_failure_retains_retryable_local_query_registry(mo
     assert worker_handle_mod._FTE_SCHEDULERS.get("query-dead") is None
 
 
+@pytest.mark.parametrize("death_stage", ["interrupt", "prepare", "cleanup"])
+def test_dead_actor_query_teardown_releases_only_its_closed_query(monkeypatch, death_stage):
+    query_id, keep_query = "query-terminal-actor-death", "query-keep-actor-death"
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1", keep_query + ":node:2"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id, keep_query + ":node:2": keep_query}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[keep_query] = [object()]
+
+    class PendingRef:
+        def future(self):
+            return Future()
+
+    for owner in (query_id, keep_query):
+        task_key = str(
+            FteTaskAttemptId.coerce({"query_id": owner, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0})
+        )
+        if death_stage == "interrupt" or owner == keep_query:
+            handle._fte_control_tails_by_task[task_key] = PendingRef()
+            handle._fte_control_query_by_task[task_key] = owner
+            handle._fte_control_operation_by_task[task_key] = "fte_ack_task_result"
+
+    dead = False
+    original = task_control_mod.resolve_object_refs_blocking
+    calls = []
+    target = {"interrupt": "fte_interrupt_query", "prepare": "fte_prepare_drop_query", "cleanup": "fte_cleanup_query"}[
+        death_stage
+    ]
+    submit = handle._submit_tracked_fte_drop_ref
+
+    def submitting(owner, operation):
+        nonlocal dead
+        calls.append(operation)
+        if operation == target:
+            dead = True
+        return submit(owner, operation)
+
+    def resolve(*args, **kwargs):
+        if dead:
+            raise ray.exceptions.ActorDiedError()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(handle, "_submit_tracked_fte_drop_ref", submitting)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", resolve)
+    result = handle.fte_drop_query(query_id)
+    assert result["flight_shuffle_cleanup_errors"] == 0
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._has_fte_control_state_for_query(keep_query) is True
+    assert handle._registered_fragment_ids == {keep_query + ":node:2"}
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert keep_query in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert "fte_cleanup_query" in calls
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("unavailable"),
+        RuntimeError("ActorDiedError"),
+        ray.exceptions.RayActorError(error_msg="unavailable"),
+    ],
+)
+def test_unconfirmed_worker_loss_cannot_release_query_controls(monkeypatch, error):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-unconfirmed-actor-loss"
+    original = task_control_mod.resolve_object_refs_blocking
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", fail)
+    with pytest.raises(RuntimeError):
+        handle.fte_drop_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", original)
+    handle.fte_drop_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+def test_child_actor_death_does_not_confirm_rpc_target_death():
+    child_error = ray.exceptions.ActorDiedError()
+    wrapper = ray.exceptions.RayTaskError("fte_interrupt_query", "remote traceback", child_error).as_instanceof_cause()
+    assert not _ProductionRayWorkerActorHandle._rpc_target_is_dead(wrapper)
+    assert _ProductionRayWorkerActorHandle._rpc_target_is_dead(child_error)
+
+
+def test_dead_actor_teardown_keeps_ownership_until_local_operations_join(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-dead-actor-local-operation"
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    original = task_control_mod.quiesce_fte_registry_for_query
+
+    def pending(owner):
+        raise TimeoutError("local operation has not joined")
+
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", pending)
+    with pytest.raises(TimeoutError, match="has not joined"):
+        handle._drop_dead_actor_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    assert query_id in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert handle._registered_fragment_ids == {query_id + ":node:1"}
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", original)
+    handle._drop_dead_actor_query(query_id)
+    assert not handle._has_fte_teardown_state_for_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
 def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
     calls = []
 
