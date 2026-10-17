@@ -502,7 +502,7 @@ def test_ai_embed_relation_rejects_non_string_output_column(output_column):
 def test_ai_embed_python_entries_reject_non_varchar_during_planning(relation_api, text_sql):
     rel = vane.connect().sql(f"SELECT {text_sql} AS text")
 
-    with pytest.raises(vane.BinderException, match="ai SQL input argument must be VARCHAR"):
+    with pytest.raises(vane.BinderException, match="ai_embed text input requires VARCHAR"):
         if relation_api:
             vane.ai.embed(
                 rel,
