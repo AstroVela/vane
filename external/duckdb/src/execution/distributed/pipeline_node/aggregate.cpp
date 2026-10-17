@@ -115,11 +115,19 @@ void MergeAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, 
 	state.ToUnifiedFormat(count, state_data);
 	auto state_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(state_data);
 
-	auto buffer = make_unsafe_uniq_array<data_t>(bind_data.state_size);
-	Vector source_vec(Value::POINTER(CastPointerToValue(buffer.get())));
+	// The native combine contract accepts a vector of state pointers. Keep a
+	// private, aligned copy of each state: exported strings may be unaligned,
+	// shared by a dictionary/constant vector, or modified by a destructive combine.
+	const auto stride = AlignValue(bind_data.state_size);
+	auto buffer = make_unsafe_uniq_array<data_t>(stride * count);
+	Vector source_vec(LogicalType::POINTER, count);
+	Vector target_vec(LogicalType::POINTER, count);
+	auto sources = FlatVector::GetData<data_ptr_t>(source_vec);
+	auto targets = FlatVector::GetData<data_ptr_t>(target_vec);
 	AggregateInputData child_input(bind_data.child_bind_data.get(), aggr_input_data.allocator,
 	                               AggregateCombineType::ALLOW_DESTRUCTIVE);
 
+	idx_t valid_count = 0;
 	for (idx_t row = 0; row < count; row++) {
 		auto input_idx = input_data.sel->get_index(row);
 		if (!input_data.validity.RowIsValid(input_idx)) {
@@ -131,9 +139,12 @@ void MergeAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, 
 			throw IOException("Aggregate state size mismatch, expect %llu, got %llu", bind_data.state_size,
 			                  entry.GetSize());
 		}
-		memcpy(buffer.get(), entry.GetData(), bind_data.state_size);
-		Vector target_vec(Value::POINTER(CastPointerToValue(state_ptrs[state_idx])));
-		child.combine(source_vec, target_vec, child_input, 1);
+		sources[valid_count] = buffer.get() + stride * valid_count;
+		memcpy(sources[valid_count], entry.GetData(), bind_data.state_size);
+		targets[valid_count++] = state_ptrs[state_idx];
+	}
+	if (valid_count) {
+		child.combine(source_vec, target_vec, child_input, valid_count);
 	}
 }
 

@@ -181,6 +181,9 @@ class QueryService:
         self.admission.close(timeout=cleanup_timeout(10))
         cleanup_timeout(10)
         self.pool.close()
+        for store in self.stores.values():
+            cleanup_timeout(10)
+            store.close()
         self.closed = True
 
 

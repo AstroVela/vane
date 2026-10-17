@@ -30,7 +30,7 @@ from vane.execution.materialized_store import (
     _publish,
     _sync_directory,
 )
-from vane.execution.plan import _fields
+from vane.execution.plan import _fields, _items
 from vane.execution.query_options import _seconds
 from vane.execution.resource_demand import _capacity
 
@@ -42,6 +42,8 @@ class ExchangeStore:
     Byte capacities cover source and exchange data. Protocol metadata has
     separate fixed count/size bounds. All sessions using a root must agree on
     capacity_bytes; each admitted query reserves its complete query_bytes.
+    Optional source_cache_bytes reserves a separate version cache per Runtime;
+    its immutable copies remain charged until Runtime.close().
     """
 
     name: str
@@ -51,6 +53,7 @@ class ExchangeStore:
     object_bytes: int = 64 << 20
     source_bytes: int = 256 << 20
     lease_seconds: float = 60
+    source_cache_bytes: int = 0
 
     def __post_init__(self) -> None:
         _label(self.name, "exchange store name")
@@ -58,10 +61,13 @@ class ExchangeStore:
             raise ValueError("FTE store root must be absolute and cannot contain '='")
         for name in ("capacity_bytes", "query_bytes", "object_bytes", "source_bytes"):
             _capacity(getattr(self, name), name)
+        _capacity(self.source_cache_bytes, "source_cache_bytes", minimum=0)
         if self.query_bytes > self.capacity_bytes or max(self.object_bytes, self.source_bytes) > self.query_bytes:
             raise ValueError("FTE storage reservations exceed their containing capacity")
         if max(self.object_bytes, self.source_bytes) > 1 << 40:
             raise ValueError("FTE files are limited to 1 TiB")
+        if self.source_cache_bytes > 1 << 40 or self.query_bytes + self.source_cache_bytes > self.capacity_bytes:
+            raise ValueError("FTE query and source cache reservations exceed store capacity")
         object.__setattr__(self, "lease_seconds", _seconds(self.lease_seconds, "lease_seconds"))
 
 
@@ -93,6 +99,10 @@ def replace_metadata(path: Path, value: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+class _StoreLockTimeout(TimeoutError):
+    """Metadata lock contention, distinct from storage publication failures."""
+
+
 @contextmanager
 def store_lock(path: Path, *, timeout: float = 5) -> Iterator[Any]:
     from vane._native import execution_runtime as native
@@ -103,7 +113,7 @@ def store_lock(path: Path, *, timeout: float = 5) -> Iterator[Any]:
         if guard is not None:
             break
         if time.monotonic() >= end:
-            raise TimeoutError("shared storage control lock timed out")
+            raise _StoreLockTimeout("shared storage control lock timed out")
         time.sleep(0.005)
     try:
         yield guard
@@ -117,7 +127,14 @@ class ActiveStoreLease:
     def __init__(self, wire: Mapping[str, Any]) -> None:
         from vane._native import execution_runtime as native
 
-        _fields(wire, {"store", "namespace", "lease_id"}, "active store lease")
+        fields = {"store", "namespace", "lease_id"}
+        if "source_leases" in wire:
+            fields.add("source_leases")
+        _fields(wire, fields, "active store lease")
+        sources = _items(wire.get("source_leases", ()), "source leases")
+        if len(sources) > 1 or any(not isinstance(s, Mapping) or "source_leases" in s for s in sources):
+            raise ValueError("invalid source cache leases")
+        self.source_leases: list[ActiveStoreLease] = []
         self.store = StoreDescriptor.from_dict(wire["store"])
         self.store.check()
         self.namespace = wire["namespace"]
@@ -135,6 +152,11 @@ class ActiveStoreLease:
             raise RuntimeError("query store is being cleaned")
         try:
             self.check()
+            for source in sources:
+                _fields(source, {"store", "namespace", "lease_id"}, "source cache lease")
+                if StoreDescriptor.from_dict(source["store"]) != self.store or source["namespace"] == self.namespace:
+                    raise ValueError("source cache lease belongs to another store or refers to itself")
+                self.source_leases.append(ActiveStoreLease(source))
         except BaseException:
             self.close()
             raise
@@ -145,11 +167,22 @@ class ActiveStoreLease:
             raise RuntimeError("query store lease changed")
         if value["expires"] <= time.time():
             raise RuntimeError("query store lease expired")
+        for source in self.source_leases:
+            source.check()
+        return value
+
+    def to_dict(self) -> dict[str, Any]:
+        value = {"store": self.store.to_dict(), "namespace": self.namespace, "lease_id": self.lease_id}
+        if self.source_leases:
+            value["source_leases"] = [source.to_dict() for source in self.source_leases]
         return value
 
     def close(self) -> None:
+        for source in self.source_leases:
+            source.close()
         if self.guard is not None:
             self.guard.close()
+            self.guard = None
 
 
 class StorePool:
@@ -165,6 +198,13 @@ class StorePool:
         self._collection_lock = threading.Lock()
         self._collection_thread: threading.Thread | None = None
         self._collection_error: BaseException | None = None
+        self._cache_lock = threading.Lock()
+        self._cache: Any = None
+        self._cache_lease: QueryStoreLease | None = None
+        self._cache_stop = threading.Event()
+        self._cache_thread: threading.Thread | None = None
+        self._cache_error: BaseException | None = None
+        self._cache_closing = False
 
     def _records(self) -> list[tuple[Path, dict[str, Any]]]:
         if self.allocations.resolve() != self.allocations:
@@ -185,8 +225,8 @@ class StorePool:
         if self.allocations.resolve() != self.allocations:
             raise ValueError("allocation root contains a symlink")
 
-    def _candidates(self) -> list[Path]:
-        with store_lock(self.root / "allocation.lock"):
+    def _candidates(self, *, timeout: float = 5) -> list[Path]:
+        with store_lock(self.root / "allocation.lock", timeout=timeout):
             self._check()
             return [record for record, value in self._records() if value["expires"] <= time.time()]
 
@@ -256,7 +296,12 @@ class StorePool:
                 raise error
             if self._collection_thread is not None and self._collection_thread.is_alive():
                 return
-            candidates = self._candidates()
+            try:
+                candidates = self._candidates(timeout=0)
+            except _StoreLockTimeout:
+                # Maintenance is opportunistic. Admission still takes the
+                # same lock and counts every allocation until it is retired.
+                return
             if not candidates:
                 return
 
@@ -271,6 +316,9 @@ class StorePool:
             self._collection_thread.start()
 
     def reserve(self, query_id: str) -> QueryStoreLease:
+        return self._reserve(query_id, self.config.query_bytes)
+
+    def _reserve(self, query_id: str, reserved_bytes: int) -> QueryStoreLease:
         from vane._native import execution_runtime as native
 
         _label(query_id, "query_id")
@@ -280,7 +328,7 @@ class StorePool:
             records = self._records()
             if (
                 len(records) >= 4096
-                or sum(v["bytes"] for _, v in records) + self.config.query_bytes > self.config.capacity_bytes
+                or sum(v["bytes"] for _, v in records) + reserved_bytes > self.config.capacity_bytes
             ):
                 raise RuntimeError("insufficient shared storage capacity")
             namespace = uuid.uuid4().hex
@@ -288,7 +336,7 @@ class StorePool:
                 "query_id": query_id,
                 "namespace": namespace,
                 "lease_id": uuid.uuid4().hex,
-                "bytes": self.config.query_bytes,
+                "bytes": reserved_bytes,
                 "seconds": self.config.lease_seconds,
                 "expires": time.time() + self.config.lease_seconds,
             }
@@ -306,6 +354,60 @@ class StorePool:
                 raise
             return QueryStoreLease(self, value, guard)
 
+    def source_cache(self, query: QueryStoreLease) -> Any:
+        """Borrow a version cache whose files have their own charged store lease."""
+        if not self.config.source_cache_bytes:
+            return None
+        from vane._native import execution_plan
+
+        with self._cache_lock:
+            if self._cache_closing:
+                raise RuntimeError("source snapshot cache is closing")
+            if self._cache_error is not None:
+                raise RuntimeError("source snapshot cache lease failed") from self._cache_error
+            if self._cache_lease is None:
+                owner = self._reserve(f"source-cache-{uuid.uuid4().hex}", self.config.source_cache_bytes)
+                try:
+                    cache = execution_plan.SourceSnapshotCache(
+                        str(owner.directory / "sources"), self.config.source_cache_bytes
+                    )
+                    thread = threading.Thread(
+                        target=self._renew_source_cache, args=(owner,), name="vane-source-cache-lease", daemon=True
+                    )
+                    thread.start()
+                except BaseException:
+                    owner.close(lambda: None)
+                    raise
+                self._cache, self._cache_lease, self._cache_thread = cache, owner, thread
+            query.pin_source(self._cache_lease.to_dict())
+            return self._cache
+
+    def _renew_source_cache(self, owner: QueryStoreLease) -> None:
+        try:
+            while not self._cache_stop.wait(min(1.0, self.config.lease_seconds / 4)):
+                owner.renew()
+        except BaseException as error:
+            with self._cache_lock:
+                self._cache_error = error.with_traceback(None)
+
+    def close(self) -> None:
+        """Retire the cache only after query/worker pins and its heartbeat end."""
+        from vane.execution.cleanup_deadline import cleanup_timeout
+
+        with self._cache_lock:
+            self._cache_closing = True
+            self._cache_stop.set()
+            thread = self._cache_thread
+        if thread is not None:
+            thread.join(timeout=cleanup_timeout(10))
+            if thread.is_alive():
+                raise StorageCleanupPending("source cache heartbeat cleanup is pending")
+        with self._cache_lock:
+            if self._cache_lease is not None:
+                self._cache_lease.close(lambda: None)
+                self._cache_lease = None
+                self._cache = None
+
     def snapshot(self) -> dict[str, int]:
         with store_lock(self.root / "allocation.lock"):
             values = self._records()
@@ -321,18 +423,36 @@ class QueryStoreLease:
         self.exclusive = False
         self.closing = False
         self.closed = False
+        self._source_pins: list[ActiveStoreLease] = []
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "store": self.pool.store.descriptor.to_dict(),
             "namespace": self.value["namespace"],
             "lease_id": self.value["lease_id"],
         }
+        if self._source_pins:
+            value["source_leases"] = [source.to_dict() for source in self._source_pins]
+        return value
+
+    def pin_source(self, wire: Mapping[str, Any]) -> None:
+        with self._close_lock:
+            if self.closed or self.closing or self._source_pins:
+                raise RuntimeError("query source lease is already fixed or closing")
+            if StoreDescriptor.from_dict(wire["store"]) != self.pool.store.descriptor:
+                raise ValueError("source cache lease belongs to another store")
+            self._source_pins.append(ActiveStoreLease(wire))
 
     def renew(self) -> None:
-        with store_lock(self.pool.root / "allocation.lock"):
+        if self.closed or self.closing:
+            return
+        # This owner's shared lease lock excludes orphan retirement. Serialize
+        # with its own close, but never hold the global quota lock across sync:
+        # renewal atomically changes expiry only, not the reserved byte count.
+        with self._close_lock:
             if self.closed or self.closing:
-                return
+                # Another thread may close while this one waits for the lock.
+                return  # type: ignore[unreachable]
             record = self.pool.allocations / f"{self.value['namespace']}.json"
             current = _read(record)
             if current["lease_id"] != self.value["lease_id"] or current["expires"] <= time.time():
@@ -385,4 +505,6 @@ class QueryStoreLease:
                 finally:
                     self.guard.close()
                     self.exclusive = False
+            for source in self._source_pins:
+                source.close()
             self.closed = True

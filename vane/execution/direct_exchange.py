@@ -31,7 +31,7 @@ class DirectExchangeLimits:
 
     window_bytes: int = 1 << 20
     frame_bytes: int = 1 << 16
-    frame_rows: int = 1024
+    frame_rows: int = 2048
     frame_slots: int = 16
 
     def __post_init__(self) -> None:

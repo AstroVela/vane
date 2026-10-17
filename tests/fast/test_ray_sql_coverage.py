@@ -4,6 +4,7 @@
 """Subqueries and shared native state through both public Ray execution modes."""
 
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
@@ -21,9 +22,12 @@ from tests.fast.test_fragment_sql_coverage import (
     UNSTABLE_AGES,
     UNSTABLE_LAMBDAS,
     UNSTABLE_TIMEZONES,
+    correlated_owner_queries,
     correlated_parquet_source,
     correlated_partition_cases,
     correlation_source,
+    early_join_filter_query,
+    large_join_key_query,
 )
 from tests.fast.test_ray_analytical_execution import resources
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
@@ -96,6 +100,149 @@ def test_public_partitioned_correlated_queries(tmp_path, mode, source_kind):
                 assert Counter(zip(*(c.to_pylist() for c in table.columns))) == Counter(expected), sql
                 assert result.execution_state == "SUCCEEDED"
             assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_correlated_key_filter_repeats_bound_parquet_scan(tmp_path, mode):
+    fact, keys = tmp_path / "fact.parquet", tmp_path / "keys.parquet"
+    config = {"threads": 4}
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config=config) as local,
+        vane.Runtime(limits) as application,
+        application.connect(config=config) as connection,
+    ):
+        local.execute(f"copy (select range%4096 k, range%97 v from range(131072)) to '{fact}' (row_group_size 2048)")
+        local.execute(f"copy (select range k, range in (2,2001,4001) keep from range(4096)) to '{keys}'")
+        sql = (
+            f"select p.k, f.v from read_parquet('{fact}') f join read_parquet('{keys}') p on f.k=p.k "
+            f"where p.keep and f.v < (select 0.2*avg(i.v) from read_parquet('{fact}') i where i.k=p.k) "
+            "order by p.k, f.v"
+        )
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        for _ in range(2):
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_correlated_owner_keys_and_shared_branches(tmp_path, mode):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config={"threads": 4}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        for index, comparison in enumerate(("=", "is not distinct from")):
+            queries = correlated_owner_queries(local, tmp_path / f"fact-{index}.parquet", comparison)
+            for sql in queries.values():
+                expected = local.execute(sql).to_arrow_table().to_pylist()
+                with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                    assert result.collect().to_pylist() == expected
+                assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_join_filter_before_exchange(tmp_path, mode):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        for index, (kind, comparison) in enumerate(
+            [("inner", "="), ("semi", "="), ("left", "="), ("anti", "is not distinct from")]
+        ):
+            sql = early_join_filter_query(local, tmp_path / f"fact-{index}.parquet", kind, comparison, wide_probe=True)
+            if kind in ("left", "anti"):
+                sql += " limit 4096"
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=90) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+@pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])
+def test_public_key_domain_before_hash_exchange(tmp_path, mode, domain):
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    if domain in ("estimated", "compressed", "join_estimate"):
+        limits = replace(
+            limits, exchange_stores=tuple(replace(store, source_bytes=128 << 20) for store in limits.exchange_stores)
+        )
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = large_join_key_query(local, tmp_path / "fact.parquet", domain)
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90) if mode == "fte" else None) as result:
+            assert result.collect().to_pylist() == expected
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize(
+    "query_kind", ["correlated", "join", "exact", "hashed", "estimated", "compressed", "join_estimate"]
+)
+def test_fte_shared_build_reuses_committed_fanout_after_worker_loss(tmp_path, monkeypatch, query_kind):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    dispatch, lost = RecoveryScheduler._dispatch, []
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        # Kill a consumer after a build shared by several stages has committed.
+        producers = {
+            e.producer_fragment_id for e in scheduler.spec.graph.exchanges if e.producer_fragment_id in upstream
+        }
+        shared = any(
+            len({e.consumer_fragment_id for e in scheduler.spec.graph.exchanges if e.producer_fragment_id == p}) > 1
+            for p in producers
+        )
+        if admitted and shared and not lost:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(tmp_path, max_active_queries=1, task_contexts_per_worker=64, io_concurrency=256)
+    if query_kind == "exact":
+        # Keep the key-domain fanout instead of broadcasting the entire build.
+        # Full-build broadcast recovery is covered in analytical execution tests.
+        limits = replace(limits, operator_memory_bytes=128 << 20)
+    if query_kind in ("estimated", "compressed", "join_estimate"):
+        limits = replace(
+            limits, exchange_stores=tuple(replace(store, source_bytes=128 << 20) for store in limits.exchange_stores)
+        )
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        path = tmp_path / "fact.parquet"
+        if query_kind in ("exact", "hashed", "estimated", "compressed", "join_estimate"):
+            sql = large_join_key_query(local, path, query_kind)
+        else:
+            sql = (
+                early_join_filter_query(local, path, wide_probe=True)
+                if query_kind == "join"
+                else correlated_owner_queries(local, path, "is not distinct from")["nested"]
+            )
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90)) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert len(lost) == 1
+            attempts = [t for t in scheduler.history if t.task_id == lost[0].task_id]
+            assert len(attempts) == 2
+            assert attempts[0].input_id == attempts[1].input_id
+            assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

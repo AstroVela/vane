@@ -538,3 +538,9 @@ def test_compile_options_snapshot_caller_owned_columns():
     options = FragmentCompileOptions(4, columns)
     columns.clear()
     assert options.hash_columns == (0, 1)
+
+
+@pytest.mark.parametrize("budget", [True, -1, 1.5, "256", 2**63])
+def test_compile_options_reject_invalid_worker_memory(budget):
+    with pytest.raises(ValueError, match="worker_operator_bytes"):
+        FragmentCompileOptions(worker_operator_bytes=budget)

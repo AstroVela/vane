@@ -388,7 +388,11 @@ def test_global_order_and_limit(tail):
 
 def test_broadcast_and_partitioned_join_plans():
     with vane.connect(backend="local", config={"threads": 1}) as connection:
-        for size, distribution in [(3, Distribution.BROADCAST), (100, Distribution.HASH)]:
+        for size, distribution in [
+            (3, Distribution.BROADCAST),
+            (100, Distribution.BROADCAST),
+            (800, Distribution.HASH),
+        ]:
             sql = f"select a.range from range(1000) a join range({size}) b using(range)"
             graph = compile_sql(connection, sql, 3)
             assert distribution in [e.distribution for e in graph.exchanges]

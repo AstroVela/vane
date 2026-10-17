@@ -212,6 +212,10 @@ with vane.Runtime(resources) as runtime, runtime.connect() as connection:
 
 `runtime.connect(execution="fte")` 可设置会话默认策略。未提供 options 时，FTE 要求恰好一个注册 store，默认最多 3 次 attempt、退避 0.1 秒；多个 store 时必须显式选择。options 与 execution override 冲突会报错。两个策略共用 worker 池、查询准入和 native 资源账本。
 
+重复查询同一批文件时，可以设置 `ExchangeStore(source_cache_bytes=4 << 30, ...)`，在同一个 Runtime 的会话之间复用未变化的输入快照。默认值为 0，保持每查询复制。缓存独立预留存储容量，必须满足 `query_bytes + source_cache_bytes <= capacity_bytes`；缓存目录所在的 store 应位于输入数据集之外，避免递归 glob 扫描到保留副本。缓存满后回退到查询独享副本，`Runtime.close()` 清理缓存并归还配额。
+
+SF10 的首次复制、缓存命中、配额峰值及超时限制见 [性能测量](EXECUTION_BENCHMARKS.md#flight-and-versioned-fte-snapshots-2026-10-14)。
+
 嵌入式 Runtime 的调用进程必须能访问 ResultService actor 公布的节点地址及 TCP 端口，worker 之间也须互通。消费者完成 Flight schema 握手后才启动生产，因此地址、ticket 或 schema 错误会在启动任务前失败。独立 Server 已提供固定的公开控制与结果端口及双端口 TLS；远程 Client 只需访问这些公开端点，不加入 Ray，详见 [Server 设计](SERVER_DESIGN.md)。
 
 连接提供默认值，query 提交时冻结快照。同一 Ray 连接的并发查询可以选择不同分布式策略，不修改进程环境；local 连接拒绝分布式策略 override。已经提交的查询不能原地切换目标。Relation 等上层表达入口如继续提供，也必须提交到同一个 QuerySpec 入口。
@@ -292,10 +296,18 @@ P4 的 `AnalyticalPlanner` 保留已有 native 算子，在分布边界创建唯
 | COUNT、SUM、AVG、具有可导出固定状态的单参数 MIN/MAX | source 分区执行 native partial，交换带类型的 AGGREGATE_STATE；final 调用原函数 combine/finalize，GROUP BY 使用 HASH，无分组使用 GATHER；FILTER 只在 partial 应用 |
 | DISTINCT、带排序的聚合、双参数 MIN/MAX(x,n)、具有动态状态的 MIN/MAX、Binder 内部聚合改写 | 原始行按 group key 分区后执行完整 native aggregate，保留去重、排序和动态状态的所有权 |
 | 等值 hash join | INNER/LEFT/RIGHT/FULL/SEMI/ANTI（含优化器翻转后的 RIGHT_SEMI/RIGHT_ANTI）；等值与 IS NOT DISTINCT FROM 键由 native 计算，残余条件保留在 join 中 |
-| BROADCAST | native 估计右侧不超过 32 行且为 INNER/LEFT/SEMI/ANTI 时广播 build 输入，probe 子树保留原分区并与 join 合并；probe 只有一个分区时改为 GATHER build；其他 join 两侧按等值键 HASH；不能广播会产生重复未匹配 build 行的 join |
+| BROADCAST | INNER/LEFT/SEMI/ANTI 的小 build 按下述大小与流量规则广播，probe 子树保留原分区并与 join 合并；probe 只有一个分区时改为 GATHER build；其他 join 两侧按等值键 HASH；不能广播会产生重复未匹配 build 行的 join |
 | ORDER BY | 在排序之前 GATHER，单分区执行完整 native sort；collation、NULL 顺序及 spill 仍由 DuckDB 决定 |
 | TopN | 各分区先保留 LIMIT+OFFSET 个候选，再 GATHER 并执行最终 native TopN；检查 LIMIT+OFFSET 溢出，清除引用原物理图的动态过滤器 |
 | LIMIT/OFFSET | GATHER 后使用串行 native streaming limit 维护全局计数；提前结束关闭对应输入消费者，既有通道错误继续具有优先级 |
+
+HASH join 和完整分组聚合的分区键若直接引用已有输入列，复用该列在交换 payload 中的位置，避免额外投影、复制和传输相同值。计算键仍追加计算结果；同一列在键序列中重复出现时，后续出现仍追加独立位置，保持原生多键散列的顺序和次数，例如 `a.k=b.k AND a.k=b.j` 不能只保留一个散列键。原始输入列的位置保持稳定，join 条件、聚合表达式和输出映射继续引用原列；所有键均可复用时省去新增的 projection。分区哈希和 NULL 语义仍由原生引擎执行，pipelined 与 FTE 使用同一图。
+
+任务准备时校验每个 HASH 输出的协议、引擎身份、schema、列引用及分区数，并保存该输出自己的列索引序列。后续批次直接使用原生 Hash/CombineHash 按相同顺序计算，避免重复解码表达式和创建执行器。每个 native sink task 独立持有哈希临时向量，可顺序复用于不同输出；缓存不引用输入向量、数据帧或连接状态，因此不延长输入 credit 的持有时间。FTE 重试在新任务中重新准备这些索引。
+
+分组聚合可以利用 Parquet split 的键范围证明组已完整：输入必须只有一个 Parquet source 且没有交换输入，至少一个整数分组键经原样 projection/filter 直接来自文件列。规划器检查已生成的实际 split 及其 row group，要求该列类型与绑定类型一致、统计信息包含非空的 min/max 且明确无 NULL，各 split 的闭区间严格不相交；边界相等也视为可能跨 split。这样每个组都在一个 split 内，分区可以直接执行完整 native aggregate，并在后续 HAVING 后再输出，省去 partial/final 聚合交换。其他分组键仍可含 NULL；有序、DISTINCT、宽累加器等语义继续由原生聚合负责。
+
+范围证明不穿过 join、aggregate、cast 或计算表达式，不借用行数估计。缺失统计、可能含 NULL 的证明键、范围重叠、文件列类型转换、union-by-name/hive/schema 映射和生成列都保留原交换路径。原 split、worker assignment、源版本检查和 FTE 冻结及重试规则保持有效；这不减少 Parquet 扫描行数，也不增加动态 split pruning。
 
 整数和 decimal AVG 的 native finalizer 使用精确累加值及 long double 中间运算，不能用过早转为 DOUBLE 的 SUM/COUNT 替代。例如 `[9007199254740993, 2, 2]` 的均值必须保持 `3002399751580332.5`，否则 HAVING/WHERE 会改变结果。partial 导出原生 sum/count 状态，final 合并后只做一次原生终结，保留 DECIMAL scale 和时间类型的舍入。
 
@@ -311,17 +323,47 @@ DuckDB 物理规划会把聚合内部的 ORDER BY 包装到函数中并清空 `o
 
 聚合的 FILTER 在 native hash/perfect-hash 算子内部会从输入列改为 payload 列。拆分之前通过原算子的映射恢复输入索引，构造 partial/final 后再由 native 绑定。状态合并复用引擎的 combine/finalize 包装器，FragmentGraph 独立构图。Join 的 build/probe 依赖交给 DuckDB 的 pipeline events；在 probe source 首次被调度时记录 BuildReady，空 build 直接完成的情形由 finalizer 记录。状态读取只访问原子标记，不读取并发修改的哈希表，也不等待 `pump()` 的执行锁。
 
+合并 partial 聚合状态时，按当前输入批次收集有效状态与目标地址，一次调用原生 combine。每条状态仍检查长度并复制到独立、对齐的临时空间，避免修改共享或未对齐的字符串存储；NULL 状态跳过，重复目标地址按输入顺序合并。临时空间随当前批次大小增长，不保留跨批次状态，也不改变 partial 状态的编码与最终数值范围检查。
+
 ### 大文件与交换吞吐
 
 Parquet 的物理 source 在绑定后读取 footer，把每个文件的 row groups 划为最多 `partition_count` 个连续范围，通过原生 `row_group_ids` 扫描。单个大文件因此能分配给多个 worker；重复扫描引用、Hive 路径以及原文件内的 `file_row_number` 都保留。优化前收集的数据源依赖仍按完整文件验证，不随行组或过滤裁剪丢失。
 
 同 worker 的 pipelined 边共用一个 DirectChannel，只有一份 credit 和窗口预留，不创建 Flight relay 或预留该边的网络 staging。跨 worker 和根结果链路继续使用 Flight。执行循环在 pump 有进展时立即继续，只有无进展时才短暂等待。
 
-广播 join 的每个 probe 分区都能看到完整 build，因此不再额外 HASH 分发 probe。保留 probe 的扫描、已有输入端口及分区数，后续过滤与可拆分聚合可以先在同一 fragment 执行。下游需要按键分组或 join 时仍显式建立自己的 HASH 边。单分区 probe 不会因为请求更高并行度而复制；MARK/SINGLE 与共享 delimiter/CTE 状态继续遵守独立的原生作用域规则。
+广播 join 的每个 probe 分区都能看到完整 build，因此不再额外 HASH 分发 probe。保留 probe 的扫描、已有输入端口及分区数，后续过滤与可拆分聚合可以先在同一 fragment 执行。下游需要按键分组或 join 时仍显式建立自己的 HASH 边。单分区 probe 不会因为请求更高并行度而复制；SINGLE 与共享 delimiter/CTE 状态继续遵守独立的原生作用域规则。
+
+非关联等值 MARK join 也可采用完整 build 广播，让 IN/NOT IN 的 probe 扫描和后续过滤保留分区。每个原生 join 都看到全部 build 行，包括 NULL、重复键与空集合，因此沿用原生三值逻辑。仅使用基础广播规则：估计至多 32 行，或估计至多 8 MiB 且额外副本流量不超过省下的 probe 交换；不使用 worker 预算允许的更大广播。这样后续规划即使为提前过滤收紧广播门槛，也不会将 MARK 改成缺失全局 NULL/空集合信息的 HASH 分发。不满足规则或带 delimiter 元数据的 MARK 继续使用原生作用域。
 
 DirectFrame 对固定宽度列按行数计算值区与 validity 大小，测量阶段不逐值转换向量。实际复制仍解析 dictionary/constant selection 与 NULL；字符串和嵌套列仍遍历选中的有效内容，检查子数组边界及 frame_bytes，不改变 credit 计费。
 
-DirectCollector 为本地扫描的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。依赖上游 exchange 的任务立即转发可用结果，避免等待下一批输入时扣住已有结果。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。
+构造帧时，若已校验的行选择连续，且定长列为 flat vector、整个输入范围无 NULL，则一次复制该连续值区并设置对应 validity 位。含 NULL、dictionary/constant、非连续选择及嵌套列继续逐值处理。选择边界检查、帧布局和大小计算保持相同；复制结果仍属于帧自己的内存，借用与释放规则不变。
+
+DirectCollector 为本地扫描和上游 exchange 输入的每个输出分区收集稀疏小批次，达到 frame_rows/frame_bytes 或生产结束时发送。执行器每 10 ms 检查尾批，并在等待上游输入前强制尝试发送，避免把已有结果扣在空闲生产者之后。拼批数据使用 DuckDB BufferAllocator，计入 operator memory；发布后的帧计入 channel window。已有满批次直接发送。阻塞时保留已复制行的偏移，Combine 可以等待 credit，全部尾批发送后才发布 FINISH；关闭与错误继续经过原有通道检查。默认 frame_rows 为原生向量容量 2048，frame_bytes 仍为 64 KiB，窗口仍为 1 MiB/16 帧；宽行继续按字节上限拆分。
+
+DirectSource 和没有固定输出顺序的 DirectCollector 允许原生 pipeline 在配置的线程数内并行执行，仍遵守中间算子的并行能力。显式 ORDER BY 的固定顺序输出继续使用串行 collector。每个原生任务独立持有输入、行选择和上述拼批缓存；缓存计入 operator memory，不扩大通道 credit。一个通道的单个读写回调通过共享等待集合唤醒所有已阻塞任务：状态检查与任务登记在同一把等待锁内完成，回调取出集合后在锁外唤醒。源端轮询游标受锁保护，但释放输入向量引用时不持有该锁；收集端将同一 producer 的序号分配与帧发布一起串行化。等待集合只持有引擎的弱任务回调，取消或销毁任务后的延迟 credit 归还仍然安全；全部任务 Combine 完成后才发布 FINISH。
+
+普通等值 INNER/LEFT/SEMI/ANTI join 的 build 估计不超过 32 行时保留小表广播策略。更大的 build 仅在估计交换大小不超过 8 MiB，且额外副本的流量不超过省下的 probe 重分区流量时广播；分区数为 N 时比较 `(N-1) × build_bytes <= probe_bytes`。估算包含定长类型宽度、有效性开销及每个变长标量 64 字节，缺少长度统计的嵌套类型继续使用原来的小行数策略。该阈值用于计划选择，实际执行仍受 operator memory 与通道窗口约束。广播保留 probe 分区和同一 fragment 内的扫描动态过滤。
+
+公共 Runtime 提供明确的 worker 内存份额时，还可广播超过 8 MiB 的 build，以避免传输宽 probe 行。这一路径将单份 build 估计限制为 `min(64 MiB, worker_operator_bytes / 16)`，并要求 `4 × (N-1) × build_bytes < probe_bytes`；无法估计嵌套 probe 宽度时不启用。内部编译参数 `worker_operator_bytes` 使用单 worker 的 operator memory 除以 `max_active_queries`，pipelined 和 FTE 都使用同一份额；不使用 coordinator 内存或所有 worker 的合计预算。未提供份额的独立编译继续采用基础策略。这些是计划估计，不代替原有内存预留、硬限制和 spill 机制。
+
+规划先按基础广播策略发现提前键过滤。若过滤跨越了更早的 join，或当前 join 的 probe 已被上层 join 的提前过滤缩小，则保留基础广播门槛，避免按未过滤的 probe 估计放大副本。仅过滤当前 join 直接 HASH 输入的键域，可以由较大的完整 build 广播替代，因为广播会消除这条交换边。较大广播不取消跨 join 的提前过滤，也不放宽这些过滤自身的大小和选择性门槛。
+
+若 INNER/SEMI 广播 join 的原生过滤信息表明 build 含选择条件，还可把必要的整数键过滤提前到 probe 子树中更早的 HASH 交换之前。只沿原样 projection、filter 与 INNER/SEMI join 的 probe 输出追踪直接引用；遇到计算键、LIMIT、聚合、外连接或共享作用域时停止下移。build 估计必须已知、不超过 8 MiB、行数少于目标输入八分之一，额外广播流量也必须小于该输入的估计交换量。没有跨越 HASH 边时继续使用原有同 fragment 动态过滤。
+
+提前过滤通过原生 NULL 安全 SEMI join 保留 probe 重复行，最终 join 仍负责实际匹配和输出重复次数。原 join 与提前过滤分支共用同一 build fragment 的完整输出，不复制扫描或重算 join；两个分支都先消费 build 再读取 probe，额外通道仍计入原来的窗口预留。FTE 两个下游绑定同一已提交 producer 的各自输出，失败消费者沿用输入身份并更换 fence。该路径不放宽广播大小，也不根据运行后的实际小结果忽略原来的基数估计。
+
+若 INNER HASH join 的 probe 键来自更早的 INNER join，还可复用那个 join 的小 build，过滤当前 join 的另一个输入。例如 Q9 已由带条件的 part 限定商品键，partsupp 在 HASH 之前也可以用相同键域过滤。键必须为同类型原生整数，沿直接 projection、filter 和 INNER join 输出追踪；输出来自 build 时使用完整 build 对应列，输出保留 probe 键时只通过原生等值或 NULL 安全等值关系证明它属于 build 键域。计算键、LIMIT、聚合、外连接和共享作用域不传播该证明。
+
+这个小 build 必须含显式过滤、无共享作用域、估计行数已知且完整输出不超过 8 MiB，并已符合原来的小 build 广播条件。其估计行数须少于待过滤输入八分之一，新增副本流量须低于该输入交换量。小 build 只规划一次，原 join 与新增 NULL 安全 SEMI join 共享其 producer；原来的多键及残余条件继续决定最终结果。优先保留既有 probe 提前过滤，不为同一 join 同时添加相互依赖的两侧过滤；当前 join 即使在 probe 汇集为单分区后可广播融合，也不使用该路径，保证两个消费者位于独立 HASH 输入中。该优化减少交换行数，本身不增加扫描或 split 裁剪。
+
+若完整 build 因宽字段超过广播上限，INNER/SEMI HASH join 也可复用该 producer，单独投影必要的连接键并广播，在 probe 的 HASH 边之前过滤。精确键域估计限制在 16 MiB，行数少于目标输入四分之一，并要求新增完整 build 边与键副本的估计流量小于被过滤输入。这些是规划估计，实际执行仍受 operator memory 和通道预算约束。完整 build 广播的额外提前过滤仍仅用于估计不超过 8 MiB 的 build。原 join 继续按完整连接条件重分区，多个不同 build 键保持原先的散列顺序；计算或重复的 build 散列键保留原有投影路径。
+
+若 build/probe 行数比例未达到上述门槛，单一等值条件的 HASH join 还可用预计连接输出衡量键域过滤的选择性：输出估计须已知且少于 probe 四分之一，新增 build/键副本流量须低于预计被消除的 probe 流量。此判断仅用于该 join 的直接 probe 输入，不把多键、残余条件或跨越其他 join 后的输出估计归给一个提前过滤键。16 MiB 键域上限、完整 build 广播门槛及最终精确匹配仍按原规则执行。
+
+原生 join-filter 优化启用时，除了已有的 build 过滤标记，规划器还检查 build 根部 projection 之下的 FILTER 或带表过滤的 scan。整数压缩投影可能阻止原生过滤下推至 scan，却不妨碍在该投影输出上按原 join 的键类型做 SEMI 过滤。该路径停在计算投影之后，不把压缩后的键直接用于原始扫描列；仍不穿过 LIMIT、聚合、外连接与共享状态边界。
+
+对于含 HAVING 的聚合子树，键数可能严重高估。键域估计超过 8 MiB 时，可将键转为 `hash(key) & 65535`，先在各分区去重，再聚合为完整集合，最后广播。每个 probe 分区最多接收 65,536 个 UBIGINT 哈希值；即使 HAVING 实际保留大量行，过滤集合也不会随原始基数无限增长。哈希碰撞只会多保留 probe 行，原 join 继续检查精确键、NULL 与其他条件。这一路径要求原生 build 过滤信息、目标输入估计大于 524,288 行，且新增 build 与过滤副本流量小于原输入交换；密集键域可能没有过滤收益。聚合与 SEMI build 都先消费共享 build，保留背压、取消和 FTE 已提交输入重放契约。
 
 FTE 在冻结复制时计算一次 SHA-256，并在复制前后比较源文件大小、inode/file ID、纳秒 mtime 与 ctime/change time。封存后记录副本的文件身份与版本，prepare/start 和重试检查这些元数据；恢复 mtime 的原地改写会改变 ctime，替换文件会改变文件身份。原始文件随后变化不影响冻结副本。此契约依赖支持准确变更时间和稳定文件身份的本地文件系统；缺少这些元数据直接拒绝。内容哈希继续作为副本的内容身份，worker 不再重复全文读取源文件。
 
@@ -465,15 +507,26 @@ sequenceDiagram
     P-->>S: Prepared
     C-->>S: Prepared
     O-->>S: Prepared
-    S->>C: Start consumer
-    S->>P: Start producer and splits
+    par Per-worker input connections
+        S->>P: Connect inputs
+    and
+        S->>C: Connect inputs
+    end
+    Note over S,O: All channels connected and ready
+    par Per-worker start batches
+        S->>C: Start consumer batch
+    and
+        S->>P: Start producer batch and splits
+    end
     P-->>C: Bounded batches
     C-->>O: Incremental result
     O-->>C: Release credit
     C-->>P: Release credit
 ~~~
 
-消费者及结果出口先准备好，再启动生产者。join 的 build 输入先推进，probe 输入根据 BuildReady 事件解除语义等待。单个 producer 暂时没有数据不会阻止读取其他就绪输入。
+所有 worker 完成准备并公布端点后，协调器先向各 worker 发出输入连接 RPC，再等待这些回执，允许不同 worker 同时连接。所有连接成功后才连接结果出口并检查就绪；任一连接失败或回执丢失，清理整个已准备组，并隔离仍在途的连接调用。
+
+所有 worker、输入通道和结果出口完成连接并报告就绪后，协调器向每个 worker 发出一次启动 RPC；批次内按逆拓扑顺序启动本 worker 的消费者及生产者。不同 worker 的启动可以重叠；native start 不等待输入，先到的数据受既有通道字节和帧数额度约束。任一批次启动失败或回执丢失，取消并清理整个已准备组，包括批次内尚未启动的 task。join 的 build 输入先推进，probe 输入根据 BuildReady 事件解除语义等待。单个 producer 暂时没有数据不会阻止读取其他就绪输入。
 
 PIPELINED 不重试已启动的 task。worker 丢失、不可恢复的数据连接中断或算子失败使整个查询失败，唤醒读端并关闭相关通道。已经返回的部分结果不能以正常 EOF 收尾。
 
@@ -521,11 +574,11 @@ MaterializedIO 在独立 C++ 线程中读写对象，通过有界 native channel
 
 整数使用 64 位小端编码。空分区也必须写入带 schema 和文件尾的对象。写端排空已封闭生产者后写入文件尾，sync 并关闭文件，才报告封存完成；关闭 writer 不删除文件。读端先以固定 64 KiB 缓冲核对整个文件的大小、SHA-256、schema 和文件尾，再逐帧校验、解码和交付；缺失、截断、变更或元数据不匹配均以错误结束。EOF 与 reader 完成状态在同一取消锁内发布，读到 EOF 后立即 close 不会把成功交付改为取消。
 
-每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 256 KiB` 的 staging，另外持有 channel 的窗口预算。native I/O 同时只处理一个帧，等待容量时保留所有权。每个 attempt 启动前在同一个 worker 账本中预留 context、operator share、channel window、native staging 和 I/O 槽；两个策略同时运行也不能突破各项容量。这些约束不等价于完整的进程 RSS 硬限。
+每个对象最多 1 TiB，native frame 最多 256 MiB；schema 最多 256 列、64 KiB。单帧编码长度上界为 `4 * frame_bytes + 64 KiB`，调用方须声明至少 `16 * frame_bytes + 320 KiB` 的 staging，其中额外的 64 KiB 用于顺序文件缓冲，另外持有 channel 的窗口预算。文件缓冲合并帧头、校验和与 payload 的小块读写，保持对象格式和内容校验和不变；写端在 sync 前排空缓冲，读端仍先验证整个对象。native I/O 同时只处理一个帧，等待容量时保留所有权。每个 attempt 启动前在同一个 worker 账本中预留 context、operator share、channel window、native staging 和 I/O 槽；两个策略同时运行也不能突破各项容量。这些约束不等价于完整的进程 RSS 硬限。
 
 SharedDirectoryStore 要求所有参与者访问同一个绝对路径和 `store_id`，支持独占创建、原子 hard link 发布和文件 sync。目录必须由部署方放在独立于计算 worker 的共享存储上；路径名称与 marker 只能校验身份和可见性，无法证明挂载的物理故障域。当前测试验证独立生产进程退出后数据保留，不宣称本地临时目录可承受整台存储节点失效。
 
-CommitCoordinator 按阶段接收固定的逻辑 task、输入指纹和全部输出分区声明；下游指纹包含实际已提交的上游 manifest，不能在上游选定之前伪造。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。存储配额按对象最大预留长度计费，成功清理后才释放。
+CommitCoordinator 按阶段接收固定的逻辑 task、输入指纹和全部输出分区声明；下游指纹包含实际已提交的上游 manifest，不能在上游选定之前伪造。每次 begin 产生递增 attempt、随机 fence 和指定 worker epoch；创建后续 attempt 会立即废弃旧提交资格，但不会提前归还旧对象配额。每个查询最多 4096 个逻辑 task/输出分区，活动 attempt 的总分区数也有相同上限。未提交对象按最大长度预留；完成完整验证且被 coordinator 选为成功输出后，改按实际封存长度计费，归还未用额度。仍保留对象实际占用，直到成功清理。
 
 commit 先核对 engine、查询、task、输入、epoch、fence、分区、schema 和对象预算，在决策锁外读取对象并发布不可变 `attempt.json`，最后再次验证 fence 并选择唯一成功输出。取消或新 attempt 可以在慢存储验证期间抢先生效。相同提交重复到达返回既有决定，冲突提交报错。`attempt.json` 是封存记录；即使文件存在，也不代表已被接受。只有本次 coordinator 的提交表选中的 attempt 可以进入 StageManifest。
 
@@ -533,7 +586,11 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 ### P3.2 不可变文件输入
 
-[file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制、核对源文件两次 SHA-256 与元数据，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
+[file_snapshot.cpp](src/vane_py/execution/file_snapshot.cpp) 在 Binder/Optimizer 之前复制本次查询的文件集合。当前支持绝对本地 Parquet 路径、glob 和字面量路径列表，最多 4096 个不同文件，每个 scan 的模式和展开后的文件引用也各限 4096；以 64 KiB 缓冲复制并计算 SHA-256，核对复制前后的精确文件状态，sync 后绑定冻结路径。复制受查询中断和 source_bytes 容量约束；不接受动态路径表达式、未声明能力的远程文件系统或其他 scan。
+
+启用 `source_cache_bytes` 后，`SourceSnapshotCache` 按物理源路径、Hive 分区值、文件大小、文件身份、纳秒修改时间和变更时间区分版本。命中前再次检查原文件版本和缓存文件身份；改写后恢复 mtime、替换或删除原文件均不能误用旧版本。首次复制保留原有哈希、状态与 sync 校验；命中避免重复复制和哈希，worker 对冻结输入的校验保持不变。并发查询只复制同一版本一次，单个查询的 `source_bytes` 上限在命中时仍适用。
+
+缓存每个 Runtime/store 独立，最多 1 TiB 数据和 4096 次填充尝试，不做持久索引恢复或淘汰；容量或条目额度耗尽后使用普通查询独享副本。旧版本保留到 Runtime 关闭，后续查询可以缓存新版本，已有查询及其重试继续使用原版本。失败复制尝试删除部分文件，删除失败则保留完整计费且不供复用。缓存属于独立的、持续续租的存储 allocation；每个借用查询、worker 和结果服务分别持有共享租约锁，清理必须等待所有读者释放。空闲时 `StorePool.snapshot()` 因此仍包含一个缓存 allocation 和它的完整容量预留；Runtime 关闭后才归零。
 
 创建任何快照前，先展开整个查询所有 scan 的路径模式，固定每个 scan 的完整文件引用列表并检查模式与引用数量。列表保留顺序和重复引用，之后才按快照身份去重复制和计费。exchange store 位于递归 glob 目录内时，本次复制产生的文件不会成为后续模式的新输入；展开时已存在且匹配的文件仍是合法输入。
 
@@ -547,7 +604,7 @@ stage 的全部预声明 task 提交后才能发布 StageManifest；读取方必
 
 [RecoveryScheduler](vane/execution/recovery_runtime.py) 使用 P2 的 worker 池与 native TaskService，每个阶段按 worker 数量分批运行，每个查询在一个 worker 上至多运行一个 attempt。所有 stage task 提交后才声明下一阶段的输入。worker actor 禁用自动重启和 RPC 自动重放；未提交 attempt 遇到 RayActorError 时，scheduler 创建新 epoch 的 worker，按固定输入生成新 fence。Ray 状态探测读取独立 native production/error 快照，不等待 pump 执行锁；准备和源文件校验受查询执行期限约束。
 
-[StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量，exchange 按各对象最大长度预留。失败 attempt 未清理完成时继续占用配额。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
+[StorePool](vane/execution/fte_store.py) 通过原子元数据与跨进程锁，在所有注册同一 root 的会话之间预留 query_bytes。容量配置必须一致；源文件按实际字节计入查询容量（命中共享缓存时也保守计入），exchange 在提交验证前按各对象最大长度预留，接受提交后改按实际封存长度计费。失败或过期 attempt 未清理完成时继续保留完整预留。启用的快照缓存另占 source_cache_bytes，不从查询额度中挪用。metadata 有独立的 4096 项和序列化长度限制；数据配额不包含文件系统 metadata 开销。
 
 每个查询具有随机 namespace、lease_id 和有限到期时间。coordinator 独立线程续租；worker 与 ResultService 独立线程检查 lease/fence，过期即取消 native 执行并清理。所有 native 参与者持有查询共享锁，attempt 另有 I/O 锁。查询锁位于数据目录外的 `allocations/<namespace>.lock`，不会被递归删除带走。删除必须取得独占锁；Unix 使用 open-description flock，Windows 使用 LockFileEx，不能用会被同进程其他 close 释放的进程级锁替代。
 
@@ -558,6 +615,8 @@ query 配额记录位于对象目录外，部分删除失败不会丢失计费�
 每次准入和活跃查询心跳请求后台回收；每个 StorePool 同时至多运行一个后台清理线程，慢删除不阻塞续租或有剩余容量的新查询。尚未清理的 allocation 继续占用容量，容量不足时准入明确拒绝，可在回收完成后重试。worker orphan 清理以及显式 `StorePool.collect_expired()` 可以同步回收，但仍不占用全局锁执行删除。租约使用墙钟，部署要求节点时钟同步；存储要求共享可见性、跨进程 advisory lock、原子创建/替换和 sync。coordinator 丢失会终止查询并回收 orphan，不恢复查询或接管旧提交账本。
 
 单个过期目录的加锁或删除 I/O 失败按目录隔离，继续回收其他 orphan；未删除的外部 allocation 保留配额，后续心跳或准入重试，有剩余容量时仍允许新查询。当前查询续租失败、存储身份变化及元数据损坏仍按原契约报错。
+
+续租只更新本租约的到期时间，不改变预留字节数；它持有所属租约的共享参与锁，与本地 close 串行，并在全局配额锁之外原子发布和 sync。慢续租因此不会阻塞其他租约的续租、准入和回收；回收者仍须取得租约独占锁，close 不能越过尚未完成的续租写入。后台回收扫描遇到全局锁竞争超时时延后至下次请求，保留全部 allocation 计费；准入仍须取得全局锁并重新检查容量。过期、身份变化和实际存储 I/O 超时均立即失败，查询期限保持不变。
 
 ### 重试与存储故障
 
@@ -653,6 +712,10 @@ ACK 可以按字节或时间合并，但必须有上限，不能让等待该 ACK
 
 Poll 和 TryWrite 在同一个 channel mutex 内检查条件并注册等待者。发布数据、FINISH、封闭成员、归还额度、关闭及错误都在锁外执行唤醒回调。回调复制 DuckDB 的 InterruptState，使用 weak task 引用及 interrupt epoch；不保留裸 pipeline 指针，不调用 Python。每个生产者/消费者最多保存一个等待者，元数据数量由固定成员和 frame_slots 限定。FINISH(last_sequence) 必须匹配最后一个已接受序号；拒绝重放、跳号和 FINISH 后的数据。错误保持可见，不能转成正常 EOF。
 
+并行 source 的每次数据通知最多唤醒两个等待任务，以重叠调度与原生计算；取到帧的任务在执行下游算子前继续唤醒一个同伴，使积压帧仍可并行处理，且不依赖下一次发布通知。全部输入结束或读取失败时唤醒整组任务。source 使用可被通道回调持有的共享等待状态；pipeline 提前停止时通过 `GlobalSourceState::GetBlockingState()` 禁止该状态继续阻塞并唤醒全部等待者，避免 LIMIT 或下游关闭留下休眠任务。状态检查与等待注册仍在同一把锁内完成，回调不持有裸 pipeline 指针。输入阻塞后的强制 coalescer flush 若又因输出额度阻塞，执行器先清空并唤醒 source 等待组，再由 sink 额度控制重试，避免同一任务的旧输入回调占用后续单次通知。该调整不改变帧大小、通道容量、Flight 窗口或 sink 的额度唤醒规则。
+
+并行 sink 任务按目标 channel 共享等待队列，序号分配、发布和等待注册在该队列的锁内完成。不同目标可以并行复制和发布，归还一个目标的额度只唤醒等待该目标的任务。同一生产者成功写入较小帧时，仍须保留其他任务为较大帧注册的回调；直到额度归还、关闭或取消触发通知，不能因这次成功写入而删除回调。
+
 [direct_task.cpp](src/vane_py/execution/direct_task.cpp) 的 DirectSource 支持一个输入端口连接多个通道，轮询就绪通道，不等待空闲输入；无数据时返回 BLOCKED。已读到 EOF 或已关闭的输入仍参加后续轮询，Poll 始终先检查持久错误，不缓存永久结束状态。DirectCollector 在 native 中求 HASH 分区，按输出、目标分区和行位置保存提交进度。BLOCKED 后只恢复未发送部分。每次计算目标帧大小前先检查通道错误和消费者；已无消费者的目标直接丢弃剩余行，不因该分区的超大行取消其他分区。仍有消费者的目标继续执行帧容量限制，通道错误始终传播。source/sink 强制使用 DuckDB 的 ExecutionBatch 路径，在获取下一批前释放已消费的中间引用，避免一帧窗口被执行器的旧视图占住。Finalize 在发送 FINISH 前检查全部输入通道的持久错误，避免 sink 提前停止绕过下一次 source 轮询；控制结果为空，不收集 fragment 数据，也不等待消费者。
 
 DirectTaskService 为每个 attempt 创建独立 native Connection。prepare 恢复连接快照、校验 source、加载输入 binding 和输出路由，尚不创建 PendingQuery。所有 task 准备完后才能 start；同一 task 的相同 start token 幂等，不同 token 报错。start 再次验证数据源，然后创建带 DirectCollector 的原生执行器。pump 轮转调用 PendingQuery.ExecuteTask，一个执行线程也可推进多个相互等待的 fragment。native 生产完成后，pump 收取控制结果并释放查询上下文，状态进入 OUTPUT_PENDING；所有输出没有错误且 lease 均释放后，才进入 FINISHED。
@@ -673,11 +736,11 @@ P1.2 的预算保证限定为通道拥有的实际值缓冲；operator 输入/�
 
 [direct_flight.cpp](src/vane_py/execution/direct_flight.cpp) 实现独立的 native Flight 服务，与旧 shuffle server 没有 ticket 或执行路径适配。传输对象先获得有限的 link 数量和 staging 预留，publish/subscribe 消耗这些额度。每条路由绑定完整的 query、attempt、双方 worker epoch、exchange、分区、schema 指纹、routing version 和随机 capability；服务按已注册 ticket 的完整字节匹配，日志与错误不回显凭据。
 
-DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流第一版只允许一个未确认帧；服务端保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，并 ACK 上游，所有权由发送窗口转入接收窗口。
+DoGet 首先发送固定 Arrow schema，然后传输带 `D:sequence` 元数据的 RecordBatch，最后发送零行的 `F:last_sequence` 并关闭数据流。没有 FINISH 的 EOF、重复/跳号、类型或帧上限不匹配均失败。每条流最多允许十六个未确认帧，同时受 native channel 的字节和帧数额度约束；服务端为每帧保留 DirectBatch lease，直到独立 DoAction 收到累计 ACK。ACK 可以重复，超过已发送位置则失败；流不支持重连重放。消费者把收到的批次复制到已计费的 native input channel 后释放接收 staging，由控制线程异步累计 ACK 上游，读取线程继续接收额度内的后续帧。关闭会释放全部发送 lease，随后到达的 ACK 只返回已关闭状态。
 
-每个 link 的 staging 上界预留为 `16 * frame_bytes + 256 KiB`，覆盖 Arrow/native 编解码、IPC payload 与传输帧；gRPC 接收消息限制为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅有有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。
+每个 link 的 staging 上界预留为 `80 * frame_bytes + 256 KiB`，覆盖十六个在途帧、Arrow/native 编解码和 IPC payload；单条 gRPC 接收消息限制仍为 `4 * frame_bytes + 64 KiB`。native 帧仍由 DirectLimits 精确计费，元数据受最多 256 列、ticket 长度和 link 数限制。库的连接管理、线程栈以及 DuckDB 算子属于各自资源域，不把该预留解释为进程总 RSS。I/O 与 native 计算独立；每个订阅复用有限的读取和控制线程，控制动作不等待数据额度，服务关闭有强制终止活动 RPC 的截止时间。Flight 与物化 I/O 的单等待者信号会保留通知，避免在检查状态和进入等待之间错过唤醒；读取和控制线程各有独立信号。 默认 64 KiB 帧下，每个远程 link 的 staging 预留由 3.25 MiB 增至 5.25 MiB；worker 的已配置总容量不变，整图准入继续按新需求核算，容量不足时在启动前拒绝。同 worker 的通道不计 Flight staging。
 
-数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
+接收端在最后一个 ACK 成功后才向 native channel 发布 FINISH，ACK 失败不能晚于成功的 EOF。数据流 FINISH 后控制检查继续存在，持续传播上游通道的持久错误。DirectTaskService.production_status 直接读取 native 错误记录及全部输入/输出通道，无需等待 pump 的操作锁。协调器的周期监控、执行期限探测和最终 EOF 核查均使用该入口，检查全部 worker 和结果服务。详细 task status 会等待执行锁，仅用于诊断；合法的长时间 native 执行不能因此被状态 RPC 期限误判为失效。查询失败会唤醒正在等待结果容量的客户端。已有失败、取消和执行/交付超时保持各自的结局。
 
 [pipelined_worker.py](vane/execution/pipelined_worker.py) 的 Ray actor 只接收计划、固定 split/routing 和控制信息。服务共享的 worker 池按显式 CPU/memory 资源放置，不启用 actor restart 或方法重试；每个 worker 有不可复用的 epoch。每个查询获得独立 native database、TaskService 和 Flight 服务，operator memory 按 max_active_queries 分配固定份额，上下文、exchange/staging 字节及 link/I/O 数由 worker 账本跨查询计费。第一版在 prepare 一次分配并封闭所有 split 和通道成员；后续动态扫描与路由版本扩展保持显式协议。
 
@@ -879,7 +942,7 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 | LIMIT | P4 全局 LIMIT/OFFSET，支持提前关闭 | 分布式 LIMIT pushdown 优化 |
 | ORDER BY、TopN | P4 单根全局排序及 partial/final TopN | 排序性能和 spill 基准 |
 | 标量子查询、EXISTS、IN/NOT IN、ANY/ALL | 原生 MARK/SINGLE 与 delimiter 执行语义 | 优化带全局摘要的分布式 MARK |
-| 非递归物化 CTE | 工作表和全部消费者保留在同一原生执行单元 | 独立的跨 worker 共享物化设计 |
+| 非递归物化 CTE | 工作表和全部消费者保留在同一原生执行单元；小 owner 可过滤独立输入 | 独立的跨 worker 共享物化设计 |
 | CROSS_PRODUCT、nested-loop join | 收集输入后执行完整连接 | 按代价与连接语义扩展分布式规则 |
 | window、ASOF 等复杂算子 | 明确拒绝 | 按语义和分布式计划逐项扩展 |
 | 递归 CTE 与迭代反馈 | 明确拒绝 | 需要独立的反馈执行设计 |
@@ -890,21 +953,37 @@ LIMIT 达到表示特定消费者不再需要输入。scheduler 依据算子状�
 
 编译器先遍历完整 SQL，包括表达式中的子查询、表子查询及 CTE 定义，再进入绑定。确定性内置 scalar function 按 catalog 来源和稳定性检查，不再维护函数名白名单。用户宏、UDF、带副作用及仅查询内稳定的函数继续拒绝；Binder 生成的标量子查询多行检查保留原生异常。所有文件引用在任何快照复制前完成展开，优化前的数据源依赖仍参与 worker 快照校验。
 
-普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter 及 MARK/SINGLE 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+普通 hash join、聚合和独立输入仍按既有规则拆分。CTE、delimiter、SINGLE 及未采用完整 build 广播的 MARK 连接包含共享工作表或全局 NULL/基数语义，作为完整原生子树序列化。文件扫描全部位于有 source assignment 的普通 fragment 中。子树载荷必须声明且恰好绑定每个显式输入，不能藏入未经快照检查的扫描。物化 CTE 工作表只属于本次反序列化及任务生命周期，不能在线程缓存中跨查询保留。
+
+非递归 CTE 的 owner 是独立子树、估计行数已知且完整输出不超过 8 MiB 时，可复用已规划的 owner producer，在独立 probe 输入的 GATHER 之前增加原生 NULL 安全 SEMI 过滤。只接受直接连接当前 owner 的 CTE_SCAN、同类型原生整数键、单一等值条件的 INNER/SEMI join；owner 估计行数须少于 probe 八分之一，全部新增副本流量须小于该输入的估计交换量。缺少宽度统计、计算键、多个或残余条件、保留 probe 行的 join，以及含嵌套 CTE/delimiter 或重复物理节点的消费子树，继续使用原有作用域计划。CTE_SCAN 输出类型及列位置必须对应完整 owner。
+
+owner 只执行一次，原有 GATHER 保留；每个提前过滤分支广播同一完整输出，最终 CTE join 仍决定匹配、重复次数和 NULL 语义。原生 CTE 在消费工作表前先物化 owner，提前过滤分支也先排空 owner 再读取 probe，因此共享 producer 的推进不依赖尚未过滤的事实行。各分支沿用有界通道及取消清理，FTE 复用已提交输入、失败重试更换 fence。这里的运行时键过滤减少交换行数；它本身不建立扫描动态过滤或协调端的 split 裁剪，不能将交换量下降等同于磁盘读取量下降。
 
 关联 delimiter 的分区由独立的 locality 分析决定，分析先于计划修改。只选择原生整数关联键；owner 输入按该键 HASH，同一关联键的外层行、去重缓存和内部完整聚合组属于同一分区。分析沿 projection、filter、hash join 与分组键追踪关联键，只认可直接引用和优化器证明无损的整数压缩/解压。等值条件能证明独立输入具有同类型关联键时，该输入也 HASH；其他完整独立输入可以 BROADCAST。外连接不能保留广播侧的未匹配行，分组的每个 grouping set 必须包含关联键，省略的分组列不能继续传播键身份。多个候选键按可避免广播的估计行数选择，例如 Q21 使用订单键而非供应商不等式。
 
-每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
+直接与当前 delimiter scan 做 INNER join 的独立输入，可以在 HASH 交换前增加必要条件过滤。规划器从 owner 的原样关联键向下追踪直接 projection、filter 和 INNER hash join，找到包含全部候选键的 Parquet 扫描；不穿过外连接、类型转换、聚合或嵌套共享状态。只复制估计不超过 8 MiB、估计行数少于待过滤输入八分之一且复制流量更小的扫描。键列经 BROADCAST（单消费分区时 GATHER）送到输入 fragment，原生 SEMI join 使用 NULL 安全等值过滤，保留 probe 重复行；原 delimiter 仍执行实际匹配与聚合。这能避免 Q17 将整张内层 lineitem 送入相关子查询，但不保证所有相关计划都适用。
+
+被重复规划的扫描保留协调端原始文件和 split 绑定，只有序列化的工作端副本去掉文件列表。额外扫描仍有显式 source assignment，遵守相同的文件版本检查和 FTE 冻结路径；不复制可能返回不同结果的任意表函数。
+
+若该 Parquet 扫描本身就是完整 delimiter owner，还可使用已声明的单 worker、单查询内存份额预算其投影键。此路径要求预算允许大于 8 MiB 的广播，键列估计不超过 `min(64 MiB, worker_operator_bytes / 16)`；与 owner 的 delimiter scan 直接相连的单键 INNER join 必须估计保留不到输入四分之一的行，全部键副本流量也必须低于预计省下的输入交换量。多个连接条件、残余条件、缺失基数估计或无法估算的嵌套输入宽度均不使用这一成本判断。较宽的 owner 键超集不能借用完整 owner 的选择性；原有小扫描及共享 owner 输出路径保持原来的门槛。
+
+投影键在额外的独立 Parquet 扫描后、交换前生成，不复制完整 owner payload，也不建立依赖 delimiter 消费者的共享分支。原生 NULL 安全 SEMI 过滤只删除不可能属于 owner 键域的输入行，最终 delimiter 仍负责全部连接条件、重复行、EXISTS/NOT EXISTS 及聚合语义。内存与流量都是规划估计，执行仍遵守原有 operator memory、通道 credit 和取消清理规则。
+
+找不到足够小的独立扫描时，可以复用已规划的 owner fragment 输出：保留原 HASH 边，另建 HASH 边将同一输出送到键列 projection，再广播给上述 SEMI join。owner 的 join、聚合和源只执行一次。只有 owner 估计行数已知且少于待过滤输入八分之一、键列估计不超过 8 MiB、额外完整 owner 交换加键列广播的估计字节数低于待过滤输入交换时才启用；原来的小扫描路径仍优先。这个回退也适用于 owner 是嵌套 delimiter 的 Q21。
+
+两种原生 delimiter 都先消费完整 owner，再运行 DELIM_SCAN 管线；键列分支也先消费 owner，供 SEMI join 构建过滤表。因此共享 producer 的两个分支都先排空 owner，不依赖待过滤输入才能释放其 credit。每条额外边沿用既有有界交换及取消清理规则。FTE 从已提交的 owner 输出绑定两个下游，失败消费者重放相同输入版本，不重新执行 owner。
+
+每个分区仍持有自己的完整 delimiter 原生状态。嵌套 delimiter 只有在其全部缓存引用均有内部 owner 时才可单独规划，不能拆出引用上层 delimiter 或 CTE 的子树。CTE、未采用完整 build 广播的 MARK、全局状态以及无法证明关联键局部性的计划保持单分区，经 GATHER 收集独立输入。标量子查询的多行检查在拥有完整匹配集合的 native join 中执行。
 
 这些单元由 Ray worker 的同一 native TaskRuntime 执行；pipelined 绑定 DirectSource，FTE 绑定已提交输入。`scalar_subquery_error_on_multiple_rows` 纳入连接快照，worker 采用提交时的配置。两种模式共用相同分区计划，子查询错误、取消、恢复及释放沿用任务生命周期。
 
-P4 使用 `vane.analytical-types:4`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
+P4 使用 `vane.analytical-types:5`：BOOLEAN、有/无符号整数（有符号包括 HUGEINT）、FLOAT/DOUBLE、DECIMAL、VARCHAR/BLOB、DATE、TIME、各精度 TIMESTAMP、TIMESTAMPTZ、INTERVAL，以及递归 LIST/STRUCT/MAP/ARRAY。嵌套深度不超过 32；native alias/扩展类型、UHUGEINT、TIME_TZ、UNION、ENUM、UUID、tensor、FILE 与媒体类型仍明确拒绝。NULL、空批次和 schema-only 结果保持支持。
 
-DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow codec，由用途决定 schema。使用 128 位存储的 DECIMAL 在内部交换中使用 `decimal256(39,scale)`，保留原生系数的完整 signed 128-bit 范围；例如内层 SUM 的 39 位结果可供外层 SUM 抵消，不能因声明精度只有 38 位而在中途拒绝。使用更小原生存储的 DECIMAL 仍按 `decimal128(width,scale)` 交换。公开结果中的所有 DECIMAL 保留 SQL 声明的 `decimal128(width,scale)`，包括嵌套字段和空结果。HUGEINT 在交换及公开结果中均使用 `decimal256(39,0)`。宽化通过符号扩展完成，解码先检查 signed 128-bit 边界，保留 scale、NULL 及 LIST/STRUCT/MAP/ARRAY 内的子值；额外缓冲计入既有 staging 预留。
+DirectFlight、MaterializedIO 与 Ray 结果导出共用递归 Arrow codec，由用途决定 schema。使用 128 位存储的 DECIMAL 在内部交换中使用 `decimal256(39,scale)`，保留原生系数的完整 signed 128-bit 范围；例如内层 SUM 的 39 位结果可供外层 SUM 抵消，不能因声明精度只有 38 位而在中途拒绝。小数精度 1–9 的内部交换采用 `decimal32(width,scale)`，精度 10–18 采用 `decimal64(width,scale)`，避免先扩成 128 位、传输后再收窄；精度、scale 与 NULL 语义保持相同。公开结果中的所有 DECIMAL 保留 SQL 声明的 `decimal128(width,scale)`，包括嵌套字段和空结果。HUGEINT 在交换及公开结果中均使用 `decimal256(39,0)`。宽化通过符号扩展完成，解码先检查 signed 128-bit 边界，保留 scale、NULL 及 LIST/STRUCT/MAP/ARRAY 内的子值；额外缓冲计入既有 staging 预留。
 
 TIME 使用 `int64` 微秒，允许闭区间 `[0, 86400000000]`，因此保留合法的 `24:00:00`。INTERVAL 使用 `struct<months:int32, days:int32, micros:int64>`，在 native Arrow exporter 之前转换，避免微秒乘 1000 溢出；非 NULL interval 的三个分量均不得为 NULL。两种存储表示同样用于公开 Ray Arrow 结果和嵌套子值，调用方可在 SQL 中转为 VARCHAR 获得时间文本。timestamp 保持单位，TIMESTAMPTZ 采用 UTC instant。
 
-旧 profile 不再接受，Arrow codec 源码纳入 fragment build identity。输入 Arrow schema 与 native profile 一致后才解码。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
+旧 profile（包括 `vane.analytical-types:4`）不再接受，Arrow codec 源码纳入 fragment build identity。内部使用原生 Arrow v1.5 导出窄 DECIMAL；该导出器产生的 BLOB/聚合状态 binary view 在适配层还原为既有 binary 布局，包括嵌套字段。公开结果继续使用原有导出设置。公共解码入口统一执行 schema 匹配和一次完整 Arrow 校验，再构造 native 值；Flight 和物化读取端保留帧大小、序号、校验和及封存检查，省去进入解码前的重复完整校验。列表、map、struct 和定长 array 的子值、有效性位图及非内联字符串均属于 native 帧预算；时间类型转换在私有紧凑向量上进行，有界副本属于已有 staging 预留，计算过程的输入向量及测量临时空间属于 operator/staging 域。
 
 算子检查依据实际物理函数、scan 和 owned subplan，不能只看 SELECT 关键字。阻塞聚合、sort 和 join 可以合法等待完整输入；pipelined 只承诺允许的执行重叠，不承诺每条 SQL 都早产出。
 
