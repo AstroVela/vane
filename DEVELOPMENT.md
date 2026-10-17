@@ -233,6 +233,11 @@ and final UDF statistics. See [coverage and failure diagnostics](LOCAL_MODEL_RUN
 Real-Ray release tests run in a separate process; the full local parameter
 matrices remain in the fast-test shards.
 
+The release launcher accepts `non-ray`, `shared-ray`, or `owner-ray` to run one
+phase. With no argument (or `all`), it runs all three phases in order. CI runs
+them as separate steps with independent deadlines so earlier phases cannot
+consume the time available to later phases.
+
 Vane's native extension is private to the installed `vane` package. Test
 launchers therefore run outside the checkout and put the installed
 site-packages directory before repository support modules. This prevents the
