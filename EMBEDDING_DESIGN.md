@@ -268,7 +268,7 @@ service = dict(
     http_input_format="multimodal",
     media_mime_types=["video/mp4"],          # formats enabled for this deployment
     batch_size=8,                          # rows per Vane execution batch
-    request_batch_size=8,                  # maximum independent rows per HTTP request
+    request_batch_size=1,                  # SGLang multimodal default: one row per HTTP request
     max_concurrency_per_actor=4,
     max_input_bytes=16 * 1024**2,           # original bytes per row, summed over parts
     max_request_bytes=32 * 1024**2,         # entire serialized HTTP request
@@ -291,6 +291,18 @@ instruction is inserted automatically. Deploy a matching model, processor and
 template on the server; declare supported media formats in `media_mime_types`.
 This declaration is an application contract, not model capability discovery.
 The server enforces its model's combinations, token counts and media limits.
+
+For SGLang's multimodal HTTP format, `request_batch_size` defaults to **1**, with
+up to **4** concurrent requests per actor (`max_concurrency_per_actor`). This
+also applies to text-only queries using that format. SGLang 0.5.17 can lose
+completed request state while preparing later media rows in a multirow request,
+causing an HTTP 500. Concurrent single-row requests avoid that lifecycle race
+and let the persistent server batch inference. Vane's `batch_size=8` still
+processes eight rows per execution batch; it does not put eight clips in one
+HTTP request. Text format and vLLM retain a default `request_batch_size` of **8**.
+An explicit `request_batch_size` overrides these defaults for deployments whose
+multirow behavior has been validated. Dispatch is selected before requests are
+sent; it does not probe server versions or change strategy after a failure.
 
 | Contract | SGLang 0.5.17 | vLLM 0.31 |
 | --- | --- | --- |

@@ -104,7 +104,11 @@ class HTTPEmbedder(ManagedTextEmbedder):
         self._url = options["base_url"].rstrip("/") + "/embeddings"
         self._timeout = options.get("timeout", 60.0)
         self._request_concurrency = options.get("max_concurrency_per_actor", 4)
-        self._request_batch_size = options.get("request_batch_size", 8)
+        # SGLang 0.5.17 can lose completed request state while preparing later
+        # media rows in one request. Concurrent single-row requests still let
+        # the server batch inference; qualified deployments can opt into more.
+        default_batch_size = 1 if descriptor.family == "sglang" and self._codec.input_format == "multimodal" else 8
+        self._request_batch_size = options.get("request_batch_size", default_batch_size)
         self._max_request_bytes = options.get("max_request_bytes", 32 * 1024**2)
         self._client_options = copy_client_options(descriptor.client_options)
         self._client: Any = None
