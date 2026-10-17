@@ -111,6 +111,10 @@ model execution, including with `on_error="ignore"`. Invalid media, bad types
 and exceeded input budgets also raise; they are not converted into absent parts.
 Single decoded input expressions retain SQL NULL propagation. Use
 `MultimodalInput([part])` when nonempty-content enforcement is required.
+Standalone `TextInput` also preserves empty and whitespace-only strings for the
+selected model, including native and service execution. Its UTF-8 byte budget
+still applies. The transport validates types and budgets; it does not apply the
+multimodal omission rule to a standalone text input.
 
 An absent value does not explain whether extraction failed. Context records that
 state separately. A part declared in the plan must be supported even if its
@@ -422,7 +426,7 @@ stateDiagram-v2
     Reserved --> Published: copy into owned buffers
     Published --> Mapped: server accepts lease
     Mapped --> Consumed: processor finished reading
-    Consumed --> Released: acknowledgement, unlink, close
+    Consumed --> Released: close FD and mapping, acknowledge
     Published --> Released: rejected before mapping
     Mapped --> Cancelling: disconnect / cancel
     Cancelling --> Released: server task joined and mappings closed
@@ -435,6 +439,147 @@ in-flight requests, including abandoned producers. Keep queue wait, copies,
 processor time, inference time and cleanup metrics separately. CPU preprocessing
 and transfer to GPU can still copy; SHM is not a zero-copy performance promise.
 vLLM's internal multimodal SHM cache does not implement this external ingress.
+
+### Explicit service configuration
+
+Milestone 4 implements `runtime="service"` for the registered `sglang` and
+`vllm` providers. The existing default `runtime="native"` still constructs an
+engine in each owning UDF worker; `runtime="http"` remains the separate encoded
+media protocol. There is no transport detection, local-engine startup by a
+service client, or fallback. A service client reserves zero worker GPUs.
+
+Create a private directory (`0700`) and start one process per model configuration:
+
+```bash
+mkdir -m 700 /tmp/my-embedding
+python -m vane.ai.embedding_service --config service.json
+```
+
+`service.json` (replace the model, dimension and engine options with those of
+the supported checkpoint):
+
+```json
+{
+  "path": "/tmp/my-embedding/engine.sock",
+  "service_id": "retrieval-model-revision-1",
+  "family": "sglang",
+  "model": "my-supported-embedding-checkpoint",
+  "dimensions": 768,
+  "max_bytes": 268435456,
+  "max_inflight": 8,
+  "max_connections": 128,
+  "publication_timeout": 30,
+  "options": {
+    "input_modalities": ["text", "image", "video"],
+    "max_frames": 64,
+    "max_input_bytes": 67108864,
+    "engine_args": {"tp_size": 1}
+  }
+}
+```
+
+For vLLM use `family="vllm"` and `engine_args.tensor_parallel_size=1`.
+The same native adapters target SGLang 0.5.17 / vLLM 0.31, as the in-process
+path does. Runtime support for a checkpoint and every declared modality is
+still required. A transport implementation does not add a model to either
+runtime's model registry. In particular, the earlier EmbeddingGemma 2 benchmark
+used a local SGLang backport; this change does not ship that backport.
+
+Both clients use the same endpoint and identity:
+
+```python
+from vane.ai import MultimodalInput, TextInput, VideoInput, embed
+
+service = dict(
+    provider="sglang", model="my-supported-embedding-checkpoint", dimensions=768,
+    runtime="service", service_path="/tmp/my-embedding/engine.sock",
+    service_id="retrieval-model-revision-1",
+)
+clip_vector = embed(MultimodalInput([
+    VideoInput(vane.col("frames")), TextInput(vane.col("transcript")),
+]), **service)
+query_vector = embed(TextInput(vane.col("query")), **service)
+```
+
+The native joint adapter renders the ordered parts once, then submits one
+embedding request per row. SGLang receives one combined `processor_output`
+bundle with the original processor token IDs; duplicating it across modality
+fields would duplicate visual/audio tensors. vLLM receives `multi_modal_data`
+and explicit processor arguments. Compatible requests overlap on the persistent
+engine and its scheduler batches them; an Arrow batch is not a single fused
+document. Separate image/audio inputs use this same transport. Audio requires
+`"audio"` in `input_modalities`, explicit `sample_rate` and `max_samples` on
+both service and client, and mono decoded floating PCM. Resample/downmix before
+embedding. Unsupported media, encoded BLOBs and conflicting processor options
+fail explicitly. Native joint audio uses the Transformers `audio` processor
+argument; model-specific custom processor contracts are not inferred.
+
+### Transport and lease ownership
+
+The Linux implementation uses an anonymous `memfd`, not a named `/dev/shm`
+segment. After server byte/count admission, the client reserves pages, copies
+contiguous arrays, closes its writable mapping and seals writes/growth/shrinkage.
+Text is UTF-8 bytes in the same buffer as decoded media, so text rows are not
+limited by the separate 1 MiB JSON control-message cap or JSON escaping.
+It passes one FD with `SCM_RIGHTS`; the server checks every descriptor and the
+sealed file's size before mapping. The request ID identifies the lease, owned
+by the connection and the receiving server. Offsets are contiguous, nonoverlapping
+and exactly cover the FD. Frame indices/timestamps and sample rate remain JSON
+metadata; text descriptors contain only offsets and lengths. Video timelines
+keep strictly increasing frame indices and nondecreasing timestamps, including
+repeated timestamps, without dropping frames. Processor requirements such as a
+uniform positive frame interval are checked separately. The configured
+`max_input_bytes` bounds the combined UTF-8 text and decoded-media bytes, and
+admission charges the complete buffer. Empty text still consumes one admission
+byte/slot without allocating a buffer. Invalid UTF-8 fails before model work.
+Neither side accepts media paths, pickles, arbitrary objects or CUDA handles.
+
+Both peers check `SO_PEERCRED` for the same UID. The socket is `0600` in a private
+directory. This is a trusted same-user, same-host Linux boundary, not a network
+authentication protocol. Ray workers must be placed on the service host with
+access to the socket; arbitrary multi-node scheduling is not supported by this
+transport. `service_id`, family, model and dimensions must match. Choose a new
+service ID when processor/checkpoint options change. Existing socket paths are
+never replaced automatically, including after an ungraceful exit.
+
+The producer closes its FD after transfer. A receiver-held FD/mapping remains
+valid if the producer exits. Disconnect before publication releases admission;
+a producer that never publishes is bounded by `publication_timeout`. After
+acquisition, admission ownership is recorded before joining its watcher tasks.
+Repeated handler cancellation cannot skip returning credits, including while
+cleanup is waiting for the admission lock. After mapping, a disconnected/cancelled
+request drains its model coroutine before
+unmapping and returning credits. A stuck model consequently retains credits;
+timeout is not proof that reading stopped. Graceful shutdown drains requests
+then shuts down the engine. Kernel reference counting reclaims anonymous buffers
+after owner death, without a segment scavenger or Python resource tracker.
+Max connections bounds waiting metadata; byte and in-flight limits include
+accepted requests whose clients have gone away. Limits govern service-owned
+ingress, not unrelated memory allocated by same-user applications or GPU KV.
+
+Client metrics record queue/admission, copy and request time plus input bytes.
+Service metrics record queue, request/model and cleanup time plus counts. The
+native adapter also measures local processor preparation time; vLLM processing
+inside its engine remains included in model time. These counters do not claim
+GPU kernel timing or a zero-copy path. Input/configuration errors and model/host
+OOM are fatal even with `on_error="ignore"`; other provider failures may yield
+NULL. The public Embed wrappers preserve allocation failures from initialization,
+inference and vector conversion; they do not isolate/replay rows or substitute
+NULL for these failures. The service client never retries an individual request
+after uncertain completion, even when Embed's `max_retries` is configured.
+Native request retries and NULL substitution also stop on allocation failures.
+The common classifier retains ENOMEM/ENOSPC and recognized model allocator
+errors through cause chains and sanitized diagnostics, including failures
+during socket setup, shared-memory publication and vector conversion.
+Ray's enclosing task/fragment retry policy is independent and may start a new
+request; exhausting those attempts still aborts the query on a resource error.
+
+Native image inputs retain Vane's UInt8, UInt16 and Float32 IMAGE modes and
+pixel values for the selected processor, including `do_rescale=False` for
+already scaled Float32 input. Native validation enforces image shape, finite
+pixels, declared modalities and the combined row byte budget. The shared-memory
+service's wire format separately requires uint8 RGB images and video frames;
+choosing the native runtime does not apply that transport restriction.
 
 ## 9. Errors, observability and cleanup
 
@@ -467,16 +612,15 @@ PRs use the repository template and state limitations and dependencies.
 | --- | --- | --- | --- |
 | 1 | Unified Python Embed, all four typed modalities, optional parts, Google joint/direct bytes; remove replaced APIs | Planning without I/O, bounded inputs, row/cardinality and lifecycle tests, real executor with local protocol fixtures, affected typing/examples | Merged in #1024 |
 | 2 | Explicit HTTP runtime modes; shared request machinery with SGLang and vLLM codecs | Real installed protocol fixtures, Base64 byte equality, batching/order, malformed/auth/413/cancel cases, pinned model smoke tests | Implemented in #1026 against main; exact acceptance and model limits recorded in its validation |
-| 3 | Context uses unified Embed and explicit channel joins; remove independent joint execution | Single/batch/search, partial ASR/OCR failure, alignment without row multiplication, profile identity, restart/receipts | Planned; depends on 2 |
-| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Planned; depends on 1 and 2 |
+| 3 | Context uses unified Embed and explicit channel joins; remove independent joint execution | Single/batch/search, partial ASR/OCR failure, alignment without row multiplication, profile identity, restart/receipts | Implemented in Context #91; includes fatal resource classification and partial channel diagnostics |
+| 4 | Persistent native service plus shared-memory ingress for SGLang and vLLM | Producer/server failure, cancellation while mapped, byte backpressure, ingest/search share one engine, real processor equality | Implemented in this change; CPU protocol/processor acceptance, GPU model and 100-video measurement remain milestone 6 |
 | 5 | SQL consolidation and removal of remaining obsolete internal paths | Unified SQL type binding, Python/SQL parity, relevant incremental native build and executor tests | Planned after consumers migrate |
 | 6 | Frozen 100-video correctness and performance comparison | Same inputs/checkpoints/sampling, repeated warm runs, vector and provenance parity, request/queue/CPU/GPU breakdown | Planned after 3 and 4 |
 
-Milestone 2 adds HTTP transport, not Context migration, a shared-memory service,
-or a throughput result. Existing single-modality native paths continue through
-their actual provider contracts; unsupported multi-part native providers fail
-explicitly. Context integration and the frozen 100-video benchmark remain later
-milestones.
+Milestones 2–4 add explicit transports, unified Context integration and a
+persistent native service. Their CPU acceptance is not a throughput result.
+The frozen 100-video benchmark remains milestone 6, after model/runtime
+qualification. Unsupported checkpoint/modality combinations fail explicitly.
 
 Benchmark 6 compares encoded-video service decoding separately from already
 sampled identical-frame inputs. Original-video duration, clip count, selected

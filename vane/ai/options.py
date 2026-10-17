@@ -30,6 +30,9 @@ class JevOptions(TypedDict, total=False):
 
 
 class MultimodalEmbedOptions(TypedDict, total=False):
+    input_modalities: list[str]
+    sample_rate: int
+    max_samples: int
     max_concurrency_per_actor: int
     instruction: str
     max_frames: int
@@ -105,7 +108,9 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     chunk_overlap_chars: int
 
     # SGLang / vLLM: choose a remote service explicitly instead of an engine.
-    runtime: Literal["native", "http"]
+    runtime: Literal["native", "http", "service"]
+    service_path: str
+    service_id: str
     http_input_format: Literal["text", "multimodal"]
     media_mime_types: list[str]
     max_request_bytes: int
@@ -168,15 +173,36 @@ _HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
 )
 
 
+_SERVICE_EMBED_OPTIONS = frozenset(
+    {
+        "runtime",
+        "service_path",
+        "service_id",
+        "timeout",
+        "max_concurrency_per_actor",
+        "input_modalities",
+        "max_frames",
+        "max_input_bytes",
+        "sample_rate",
+        "max_samples",
+    }
+)
+
+
 def _inference_embed_options(options: Mapping[str, Any]) -> frozenset[str]:
     runtime = options.get("runtime", "native")
-    if runtime not in ("native", "http"):
-        raise ValueError("Embed option 'runtime' must be 'native' or 'http'")
+    if runtime not in ("native", "http", "service"):
+        raise ValueError("Embed option 'runtime' must be 'native', 'http' or 'service'")
+    if runtime == "service":
+        return _SERVICE_EMBED_OPTIONS
     return _HTTP_EMBED_OPTIONS if runtime == "http" else _NATIVE_EMBED_OPTIONS | {"runtime"}
 
 
 _NATIVE_EMBED_OPTIONS = frozenset(
     {
+        "input_modalities",
+        "sample_rate",
+        "max_samples",
         "max_concurrency_per_actor",
         "instruction",
         "max_frames",

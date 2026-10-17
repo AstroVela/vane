@@ -48,6 +48,7 @@ from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
+from vane.ai._errors import _raise_if_resource_error
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
@@ -982,7 +983,8 @@ class _EmbeddingBatch:
         try:
             with np.errstate(over="ignore", invalid="ignore"):
                 embedding = np.asarray(value, dtype=np.float32)
-        except Exception:
+        except Exception as exc:
+            _raise_if_resource_error(exc)
             raise _ProviderResultError("Provider returned a non-numeric embedding") from None
         if embedding.ndim != 1:
             provider, model = _descriptor_identity(self._descriptor)
@@ -1052,10 +1054,12 @@ class _EmbeddingBatch:
         except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
+            _raise_if_resource_error(exc)
             capability_error = exc
         except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
             raise
         except Exception as exc:
+            _raise_if_resource_error(exc)
             provider_error = exc
         if capability_error is not None:
             raise _safe_provider_capability_error(capability_error) from None
@@ -1083,11 +1087,13 @@ class _EmbeddingBatch:
         except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
+            _raise_if_resource_error(exc)
             if self._on_error == "raise":
                 raise
             _log_substituted_failure(exc, on_error=self._on_error)
             return [None] * len(texts)
         except Exception as exc:
+            _raise_if_resource_error(exc)
             if self._on_error == "raise":
                 raise
             if isinstance(self._embedder, ManagedEmbedder):
@@ -1106,6 +1112,7 @@ class _EmbeddingBatch:
             except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
                 raise
             except Exception as exc:
+                _raise_if_resource_error(exc)
                 _log_substituted_failure(exc, on_error=self._on_error)
                 isolated.append(None)
         return isolated

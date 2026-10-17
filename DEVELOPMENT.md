@@ -48,6 +48,13 @@ required transitive notices are rejected as well.
 
 The [unified embedding design](EMBEDDING_DESIGN.md) tracks the typed input
 contract, provider/protocol boundaries, Context integration and delivery gates.
+For the persistent native service, see its
+[configuration and ownership contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
+Run `tests/fast/test_embedding_service.py`, `tests/fast/test_native_multimodal.py`
+and the affected unified/HTTP embedding tests through the installed launcher.
+The service tests use real Linux sockets, sealed memfd buffers and subprocesses
+with CPU SDK fixtures. Real processor tests require the optional Transformers
+test dependencies; they do not qualify a GPU checkpoint or throughput.
 
 Create and activate a virtual environment, then reuse a persistent native build directory:
 
