@@ -1191,21 +1191,28 @@ jobs:
               print(f"{distribution_name}: {version}")
           PY
 
-      - name: Run non-Ray AI tests
+      - name: Run non-Ray core AI tests
         run: |
-          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-          cd "$RUNNER_TEMP"
-          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
-            timeout --signal=INT --kill-after=30s 600s \
-            python -m pytest --import-mode=importlib --quiet -m 'not external_service and not real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
+          timeout --signal=INT --kill-after=30s 600s \
+            scripts/run_ai_tests.sh core --junitxml="$RUNNER_TEMP/ai-core.xml"
+
+      - name: Run non-Ray expression AI tests in a fresh process
+        run: |
+          timeout --signal=INT --kill-after=30s 600s \
+            scripts/run_ai_tests.sh expressions --junitxml="$RUNNER_TEMP/ai-expressions.xml"
 
       - name: Run Ray AI tests in a fresh process
         run: |
-          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-          cd "$RUNNER_TEMP"
-          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
-            timeout --signal=INT --kill-after=30s 600s \
-            python -m pytest --import-mode=importlib --quiet -m 'not external_service and real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
+          timeout --signal=INT --kill-after=30s 600s \
+            scripts/run_ai_tests.sh ray --junitxml="$RUNNER_TEMP/ai-ray.xml"
+
+      - name: Upload AI test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-test-results
+          path: ${{ runner.temp }}/ai-*.xml
+          if-no-files-found: ignore
 
   # Keep this as the stable branch-protection check; matrix jobs may be skipped.
   required-ci:

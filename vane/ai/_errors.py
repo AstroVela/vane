@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import json
 import re
 import sys
@@ -49,6 +50,22 @@ _MEMORY = re.compile(
 _SAFE_MEMORY = re.compile(
     rf"insufficient GPU KV-cache memory; mem_fraction_static=({_FRACTION}), required above ({_FRACTION})(?![0-9.])"
 )
+_CPU_MEMORY = re.compile(
+    r"(?:\[enforce fail at [^\]\r\n]{0,512}alloc_cpu\.cpp:[0-9]{1,8}\] err == 0\. )?"
+    r"DefaultCPUAllocator: can't allocate memory: you tried to allocate [0-9]{1,20} bytes\. "
+    r"Error code [0-9]{1,10} \([^\r\n)]{1,128}\)"
+)
+_CPU_MEMORY_DETAIL = "CPU memory allocation failed; check model and worker CPU memory budgets"
+_CUDA_MEMORY_DETAIL = "CUDA memory allocation failed; check model and worker GPU memory budgets"
+_ONNX_MEMORY = re.compile(
+    r"\[ONNXRuntimeError\] : (?:1 : FAIL|6 : RUNTIME_EXCEPTION) : "
+    r"(?:Non-zero status code returned while running [A-Za-z_][A-Za-z_0-9]{0,127} node\. ?"
+    r"Name:'[^\r\n]{0,2048}' Status Message: |Exception during initialization: )"
+    r"[^\r\n]{0,2048}bfc_arena\.cc:[0-9]{1,8} "
+    r"(?:void\* )?onnxruntime::BFCArena::AllocateRawInternal(?:\([^()\r\n]{0,512}\))? "
+    r"Failed to allocate memory for requested buffer of size [0-9]{1,20}"
+)
+_ONNX_MEMORY_DETAIL = "ONNX Runtime memory allocation failed; check model and worker memory budgets"
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
@@ -171,14 +188,27 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
             return f"insufficient GPU KV-cache memory; mem_fraction_static={match[1]}, required above {match[2]}"
     if error_type in {"OutOfMemoryError", "OutOfMemoryException", "MemoryError"}:
         return "memory allocation failed; check model and worker memory budgets"
+    # RapidOCR keeps the typed ONNX exception in its cause/context chain. Read
+    # that allocator error, never the wrapper's arbitrary traceback string.
+    if error_type in {"Fail", "RuntimeException"} and (
+        _ONNX_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_ONNX_MEMORY_DETAIL)
+    ):
+        return _ONNX_MEMORY_DETAIL
     if error_type == "RuntimeError":
+        if _CPU_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_CPU_MEMORY_DETAIL):
+            return _CPU_MEMORY_DETAIL
         match = _REMOTE_RESULT_COUNTS.match(message) if transported else _REMOTE_RESULT_COUNTS.fullmatch(message)
         if match:
             return match[0]
-        if "CUDA out of memory" in message or canonical(
-            "CUDA memory allocation failed; check model and worker GPU memory budgets"
+        # CTranslate2 (used by Faster-Whisper) throws RuntimeError rather than
+        # a typed OOM. Preserve its exact CUDA_CHECK allocation failure before
+        # sanitization discards the provider message; emit only our fixed text.
+        if (
+            "CUDA out of memory" in message
+            or message == "CUDA failed with error out of memory"
+            or canonical(_CUDA_MEMORY_DETAIL)
         ):
-            return "CUDA memory allocation failed; check model and worker GPU memory budgets"
+            return _CUDA_MEMORY_DETAIL
     return None
 
 
@@ -274,12 +304,12 @@ def _is_exception(error: BaseException, module_name: str, *names: str) -> bool:
     return any(isinstance(cls := namespace.get(name), type) and isinstance(error, cls) for name in names)
 
 
-def _native_invalid_input_message(message: str) -> str | None:
+def _native_exception_message(message: str, expected_type: str) -> str | None:
     try:
         payload = json.loads(message)
     except (ValueError, RecursionError):
         return None
-    if type(payload) is not dict or payload.get("exception_type") != "Invalid Input":
+    if type(payload) is not dict or payload.get("exception_type") != expected_type:
         return None
     nested_message = payload.get("exception_message")
     return nested_message if type(nested_message) is str else None
@@ -288,9 +318,20 @@ def _native_invalid_input_message(message: str) -> str | None:
 def _native_summary(message: str) -> str | None:
     """Decode complete native UDF/LLM envelopes, never search arbitrary text."""
     message = message.removeprefix("DuckDBError::ExternalError: ")
+    if message.startswith("{"):
+        # Terminal INSERT tasks can wrap the FTE failure in the native spawn
+        # boundary's INTERNAL envelope. Require that exact envelope; arbitrary
+        # internal-error bodies must not acquire diagnostic provenance.
+        nested = _native_exception_message(message, "INTERNAL")
+        prefix = "[PlanExecutionContext::spawn] task error: DuckDBError::InternalError: "
+        if nested is None or not nested.startswith(prefix):
+            return None
+        message = nested[len(prefix) :]
     for prefix in ("FTE query wait failed: FTE query failed: Execution failed: ", "Execution failed: "):
         if message.startswith(prefix):
-            nested = _native_invalid_input_message(message[len(prefix) :].partition("\n--- DIAGNOSTIC DUMP ---\n")[0])
+            nested = _native_exception_message(
+                message[len(prefix) :].partition("\n--- DIAGNOSTIC DUMP ---\n")[0], "Invalid Input"
+            )
             if nested is None:
                 return None
             message = nested
@@ -302,7 +343,7 @@ def _native_summary(message: str) -> str | None:
         # Initialization can reach either the slot error or the streaming
         # collector first. Both carry the native InvalidInputException JSON.
         if message.startswith("{"):
-            nested = _native_invalid_input_message(message)
+            nested = _native_exception_message(message, "Invalid Input")
             if nested is None or not nested.startswith("Failed to build udf executor: "):
                 return None
             message = nested.removeprefix("Failed to build udf executor: ")
@@ -497,3 +538,41 @@ def summarize_error(error: BaseException, *, max_chars: int = 512) -> str:
         suffix += separator + " <- ".join(rendered)
         remaining_items -= len(rendered)
     return " <- ".join(_bounded_chain(summaries[:remaining_items], max_chars - len(suffix))) + suffix
+
+
+def _is_resource_error(error: BaseException) -> bool:
+    """Recognize allocation failures through typed chains and safe diagnostics.
+
+    Never search arbitrary exception text for errno or diagnostic markers.
+    Keep this independent of torch, Ray and inference SDK imports.
+    """
+    for cause in _exception_chain(error):
+        if isinstance(cause, MemoryError):
+            return True
+        if isinstance(cause, OSError):
+            number = OSError.__dict__["errno"].__get__(cause)
+            if type(number) is int and number in {errno.ENOMEM, errno.ENOSPC}:
+                return True
+    primary, cleanup = _summary_parts(summarize_error(error, max_chars=4096))
+    atoms = primary + [atom for chain in cleanup for atom in _summary_parts(chain)[0]]
+    for atom in atoms:
+        name = _TYPE.match(atom)
+        if name is None:
+            continue
+        if name[0] in {"MemoryError", "OutOfMemoryError", "OutOfMemoryException"}:
+            return True
+        status = _STATUS_GROUP.match(atom, name.end())
+        if status and any(
+            field in {f"errno={errno.ENOMEM}", f"errno={errno.ENOSPC}"} for field in status[0][2:-1].split(", ")
+        ):
+            return True
+        detail = atom[name.end() + 2 :] if atom.startswith(": ", name.end()) else ""
+        if detail in {_CPU_MEMORY_DETAIL, _CUDA_MEMORY_DETAIL, _ONNX_MEMORY_DETAIL} or _SAFE_MEMORY.fullmatch(detail):
+            return True
+    return False
+
+
+def _raise_if_resource_error(error: BaseException) -> None:
+    """Normalize fatal allocation errors before retry or nullable-row handling."""
+    if _is_resource_error(error):
+        raise MemoryError("Embedding exhausted model or host resources") from None

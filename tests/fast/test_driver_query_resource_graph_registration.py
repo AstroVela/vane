@@ -1375,3 +1375,22 @@ def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():
     assert not blocked.granted and blocked.blocked_reason == "liveness_task_active"
     drain = manager.try_acquire_task(TaskRequest(query_id, native.resource_unit_id, "native-drain", "0", "node-a"))
     assert drain.granted and not drain.liveness
+
+
+@pytest.mark.parametrize("backend", ["ray_task", "ray_actor"])
+@pytest.mark.parametrize("retries,expected_attempts", [(None, 4), (0, 1), (2, 4)])
+def test_non_retryable_udf_fences_native_fragment_replay(backend, retries, expected_attempts):
+    events = []
+    runner_cls, runner = _runner(events, _FakeCoordinator(events))
+    runner._precreate_udf_actors = lambda *_args, **_kwargs: []
+    query_id = "query-no-udf-replay"
+    metadata = _metadata(query_id)
+    payload = metadata["nodes"][1]["udf_payload"]
+    payload["execution_backend"] = backend
+    if retries is not None:
+        payload["max_task_retries"] = retries
+    physical_plan = _FakePhysicalPlan(query_id, metadata, events)
+    asyncio.run(runner_cls.run_plan(runner, _OWNER_ID, _SESSION_ID, _FakeLogicalPlan(physical_plan, events)))
+    manager = get_query_resource_manager(query_id)
+    assert manager.max_native_task_attempts == expected_attempts
+    assert manager.snapshot()["max_native_task_attempts"] == expected_attempts

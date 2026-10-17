@@ -148,8 +148,7 @@ def test_descriptor_pins_application_identity_under_conflicting_sdk_environment(
         if family == "openai":
             assert state["project"] is None
             assert state["organization"] is None
-        else:
-            assert state["auth_token"] is None
+        assert state["auth_token"] is None
         assert "worker" not in repr(state["headers"])
         assert state["base_url"].startswith("https://api." + family + ".com")
 

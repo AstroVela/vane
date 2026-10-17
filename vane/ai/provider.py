@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vane.ai.protocols import (
         AudioEmbedderDescriptor,
         ImageEmbedderDescriptor,
+        MultimodalEmbedderDescriptor,
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
@@ -64,7 +65,7 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
 
 
 _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
-    {"anthropic", "cosmos", "google", "openai", "transformers", "typesafe", "vllm"}
+    {"anthropic", "cosmos", "embedding_http", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 
@@ -184,23 +185,29 @@ def _load_transformers(name: str | None = None) -> Provider:
     return TransformersProvider(name)
 
 
+def _load_qwen3_vl(name: str | None = None) -> Provider:
+    from vane.ai.providers.qwen3_vl import Qwen3VLProvider
+
+    return Qwen3VLProvider(name)
+
+
 def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.openai import OpenAIProvider
 
     return OpenAIProvider(name, **client_options)
 
 
-def _load_vllm(name: str | None = None) -> Provider:
+def _load_vllm(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.vllm import VLLMProvider
 
-    return VLLMProvider(name)
+    return VLLMProvider(name, **client_options)
 
 
-def _load_sglang(name: str | None = None) -> Provider:
+def _load_sglang(name: str | None = None, **client_options: Any) -> Provider:
     try:
         from vane.ai.providers.sglang import SGLangProvider
 
-        return SGLangProvider(name)
+        return SGLangProvider(name, **client_options)
     except ImportError as e:
         raise ProviderImportError("sglang") from e
 
@@ -219,6 +226,7 @@ def _load_google(name: str | None = None, **client_options: Any) -> Provider:
 
 PROVIDERS: dict[str, Callable[..., Provider]] = {
     "transformers": _load_transformers,
+    "qwen3_vl": _load_qwen3_vl,
     "openai": _load_openai,
     "vllm": _load_vllm,
     "sglang": _load_sglang,
@@ -302,6 +310,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> AudioEmbedderDescriptor:
         raise _not_implemented(self, "embed_audio")
+
+    def get_multimodal_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> MultimodalEmbedderDescriptor:
+        raise _not_implemented(self, "embed_multimodal")
 
     # -- Prompting / chat completion ----------------------------------------
 

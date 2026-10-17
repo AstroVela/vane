@@ -2128,8 +2128,15 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     class FakePlan:
         def __init__(self):
             self.set_calls = []
+            self.described = False
+
+        def collect_query_resource_graph_metadata(self, conn=None):
+            assert conn == "conn"
+            self.described = True
+            return {"nodes": []}
 
         def collect_udf_nodes(self, conn=None):
+            assert self.described
             return [
                 {
                     "node_id": 7,
@@ -2419,10 +2426,16 @@ def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
         subprocess_exec.UDFExecutor(payload, options)
 
 
-def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors():
+@pytest.mark.parametrize("failure", ["resources", "udf_nodes"])
+def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors(failure):
     import vane.execution.udf_subprocess as subprocess_exec
 
     class BrokenPlan:
+        def collect_query_resource_graph_metadata(self, conn=None):
+            if failure == "resources":
+                raise RuntimeError("collect failed")
+            return {"nodes": []}
+
         def collect_udf_nodes(self, conn=None):
             raise RuntimeError("collect failed")
 
@@ -2447,6 +2460,9 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
             self.shutdown_calls.append({"kill": kill})
 
     class BrokenPlan:
+        def collect_query_resource_graph_metadata(self, conn=None):
+            return {"nodes": []}
+
         def collect_udf_nodes(self, conn=None):
             return [
                 {

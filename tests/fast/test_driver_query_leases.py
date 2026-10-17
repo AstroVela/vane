@@ -2584,7 +2584,7 @@ def test_query_registration_open_failure_rolls_back_every_owner(monkeypatch):
 
     runner._open_query_resource_admission = fail_open
     plan = SimpleNamespace(
-        collect_resource_graph_metadata=lambda conn, annotate_udfs: object(),
+        collect_resource_graph_metadata=lambda conn, annotate_udfs: {"nodes": []},
         idx=lambda: query_id,
     )
 
@@ -2655,7 +2655,7 @@ def test_query_registration_retains_failed_coordinator_release_for_retry(monkeyp
     )
     runner._fence_query_resource_admission_for_teardown = lambda _query_id: None
     plan = SimpleNamespace(
-        collect_resource_graph_metadata=lambda conn, annotate_udfs: object(),
+        collect_resource_graph_metadata=lambda conn, annotate_udfs: {"nodes": []},
         idx=lambda: query_id,
     )
 

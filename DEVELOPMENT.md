@@ -46,6 +46,16 @@ required transitive notices are rejected as well.
 
 ## Incremental package build
 
+The [unified embedding design](EMBEDDING_DESIGN.md) tracks the typed input
+contract, provider/protocol boundaries, Context integration and delivery gates.
+For the persistent native service, see its
+[configuration and ownership contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
+Run `tests/fast/test_embedding_service.py`, `tests/fast/test_native_multimodal.py`
+and the affected unified/HTTP embedding tests through the installed launcher.
+The service tests use real Linux sockets, sealed memfd buffers and subprocesses
+with CPU SDK fixtures. Real processor tests require the optional Transformers
+test dependencies; they do not qualify a GPU checkpoint or throughput.
+
 Create and activate a virtual environment, then reuse a persistent native build directory:
 
 ```bash
@@ -63,6 +73,20 @@ Do not use `pip install -e`. An editable install can cause Ray workers to invoke
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
+
+For the optional `qwen3_vl` provider, run
+`scripts/run_installed_pytest.sh tests/fast/test_qwen3_vl.py` before the base gate.
+Its CPU fixtures check lazy registration, tokenizer postprocessing, trained
+weight validation and media budgets without downloaded weights. Real processor
+tests also check exact video tokens, temporal boundaries, timestamps, mixed
+batches and unchanged image/text processing with an authored tokenizer/template.
+Tensor/SDK cases require the `qwen3_vl` extra. Separately validate a real local
+checkpoint on a BF16 CUDA worker through the default Ray runner: compare query
+and video inputs/vectors with that checkpoint's reference encodings, then
+exercise video ingestion, search and restart with the paired Context profile.
+Query parity alone does not validate video encoding. Record model/dependency
+identities and sampling settings; CPU fixtures do not establish model quality.
+See the [provider example](examples/qwen3_vl_sqr.py) for its fixed contract.
 
 ## Building a loadable extension artifact
 
@@ -255,8 +279,16 @@ dependency group. Run them when changing the corresponding integration:
 ```bash
 scripts/run_fast_tests.sh
 scripts/run_installed_pytest.sh tests/slow
-scripts/run_installed_pytest.sh tests/ai
+scripts/run_ai_tests.sh
 ```
+
+The AI launcher runs non-Ray core tests, non-Ray expression tests and Ray tests
+in three fresh processes. Run one group with `scripts/run_ai_tests.sh core`,
+`expressions` or `ray`. Together they cover the same CPU-only AI suite; external
+services and GPU tests require explicit opt-in through the installed pytest
+launcher. CI keeps a 600-second deadline per group, reports the first failure
+immediately, and uploads JUnit results instead of allowing one long non-Ray run
+to exhaust that deadline before printing its failures.
 
 The fast-test launcher runs non-Ray tests, shared-cluster Ray tests, and
 test-owned Ray clusters in separate pytest processes. This keeps the real Ray
@@ -432,6 +464,9 @@ messages are never interpreted as diagnostic envelopes, even if they contain
 typed cause chain before Ray serializes it, and executor creation captures it
 before the native dispatcher converts the exception to text. The Ray driver
 captures native diagnostics at result-stream, COPY and DataSink call boundaries.
+Terminal INSERT tasks can add a native `INTERNAL` spawn envelope around the FTE
+failure. Decoding requires the exact task prefix and the nested typed UDF
+diagnostic; unrelated internal errors and forged provider text remain opaque.
 COPY outcome exceptions retain sanitized cause/cleanup snapshots in their pickle
 state while preserving the committed/unknown outcome type and retry restrictions.
 Terminal query cleanup failures are captured from their exception objects into

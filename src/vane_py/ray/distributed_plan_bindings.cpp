@@ -42,7 +42,7 @@ struct PyPhysicalPlanWrapper {
 	std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> plan_;
 	py::object arrow_schema_;        // Arrow schema for type information
 	py::object udf_registrations_;   // Connection-local Python UDF registrations captured from the source relation
-	py::object udf_actor_handles_;   // Node-id keyed actor handles for UDF worker execution
+	py::object udf_actor_handles_;   // Resource-unit keyed executor options survive fragment extraction
 	py::object memory_source_refs_;  // Query-owned Ray ObjectRefs for Python in-memory scans
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
 	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
@@ -91,7 +91,7 @@ struct PyPhysicalPlanWrapper {
 			return;
 		}
 		if (!py::isinstance<py::dict>(udf_actor_handles_)) {
-			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by node_id");
+			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by resource_unit_id");
 		}
 		auto handles_map = udf_actor_handles_.cast<py::dict>();
 		if (handles_map.empty()) {
@@ -99,12 +99,15 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		auto physical_plan = plan_->physical_plan();
-		idx_t node_counter = 0;
 		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
-				py::str key(std::to_string(node_counter++));
+				auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+				if (resource_unit_id.empty()) {
+					throw InternalException("Distributed UDF executor options require resource_unit_id");
+				}
+				py::str key(resource_unit_id);
 				if (handles_map.contains(key)) {
 					py::object handles_obj = handles_map[key];
 					ApplyUDFExecutorOptions(*bind_data, handles_obj);
@@ -1099,9 +1102,9 @@ struct PyPhysicalPlanWrapper {
 		if (handles_map.empty())
 			return;
 
-		if (!handles_map.empty()) {
-			udf_actor_handles_ = handles_map;
-		}
+		// Physical UDF ordinals are local to a plan. Fragment extraction can
+		// remove earlier UDFs, so replay must use the planner's stable unit ID.
+		py::dict by_resource;
 
 		auto physical_plan = plan_->physical_plan();
 		if (!physical_plan || !physical_plan->HasRoot())
@@ -1116,11 +1119,20 @@ struct PyPhysicalPlanWrapper {
 				py::str key(std::to_string(node_id));
 
 				if (handles_map.contains(key)) {
+					auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+					if (resource_unit_id.empty()) {
+						throw InternalException("Describe query resources before binding distributed UDF executors");
+					}
+					if (by_resource.contains(py::str(resource_unit_id))) {
+						throw InternalException("Duplicate distributed UDF resource_unit_id");
+					}
 					py::object handles_obj = handles_map[key];
+					by_resource[py::str(resource_unit_id)] = handles_obj;
 					ApplyUDFExecutorOptions(*bind_data, handles_obj);
 				}
 			}
 		});
+		udf_actor_handles_ = std::move(by_resource);
 	}
 };
 
@@ -1561,15 +1573,17 @@ public:
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query_streaming(const string &query_id, double timeout_s,
-	                         duckdb::distributed::MaterializedOutputCallback on_output) override {
+	                         duckdb::distributed::MaterializedOutputCallback on_output,
+	                         bool preserve_task_order = true) override {
 		const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
-		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true, preserve_task_order);
 	}
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
-	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs,
+	    bool preserve_task_order = true) {
 		if (query_id.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
@@ -1679,9 +1693,9 @@ public:
 					              0.0,
 					              std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
 					        : -1.0;
-					auto stream_res =
-					    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
-					                       task_contexts.empty() ? nullptr : &task_contexts, true, on_output, true);
+					auto stream_res = DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+					                                     task_contexts.empty() ? nullptr : &task_contexts, true,
+					                                     on_output, true, preserve_task_order);
 					if (stream_res.is_err()) {
 						return stream_res;
 					}
@@ -1713,10 +1727,11 @@ public:
 				return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
 				                                 ::vane::CaptureError(coverage_res.error()));
 			}
-			auto drain_res = DrainResultHandles(
-			    query_id, remaining_timeout_s, selected_attempt_task_ids,
-			    task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
-			    stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
+			auto drain_res =
+			    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+			                       task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
+			                       stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {},
+			                       false, preserve_task_order);
 			if (drain_res.is_err()) {
 				return drain_res;
 			}
@@ -2511,7 +2526,7 @@ private:
 	                   const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	                       *task_context_filter,
 	                   bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output = {},
-	                   bool selected_only = false) {
+	                   bool selected_only = false, bool preserve_task_order = true) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		{
 			lock_guard<mutex> guard(mutex_);
@@ -2591,7 +2606,7 @@ private:
 			}
 		}
 		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
-		if (on_output) {
+		if (on_output && preserve_task_order) {
 			std::stable_sort(pending.begin(), pending.end(),
 			                 [](const std::unique_ptr<PythonTaskResultHandle> &lhs,
 			                    const std::unique_ptr<PythonTaskResultHandle> &rhs) {
@@ -2637,7 +2652,7 @@ private:
 				auto polled = handle->poll();
 				if (!polled.first) {
 					still_pending.push_back(std::move(handle));
-					if (on_output) {
+					if (on_output && preserve_task_order) {
 						for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
 							still_pending.push_back(std::move(pending[pending_index]));
 						}
@@ -2710,6 +2725,12 @@ private:
 				}
 			}
 			if (still_pending.empty()) {
+				break;
+			}
+			if (selected_only && !preserve_task_order) {
+				// Refresh selected attempts between readiness sweeps. Waiting on
+				// a lagging handle here would hide newly completed sibling tasks.
+				StorePythonTaskResultHandles(query_id, std::move(still_pending));
 				break;
 			}
 			if (std::chrono::steady_clock::now() >= deadline) {

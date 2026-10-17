@@ -57,8 +57,14 @@ def install_sdk(setitem, *, mock_transformers=True):
             return result
 
     class EmbeddingRequest(SimpleNamespace):
-        def __init__(self, *, input_ids, dimensions=None, image_data=None, video_data=None):
-            super().__init__(input_ids=input_ids, dimensions=dimensions, image_data=image_data, video_data=video_data)
+        def __init__(self, *, input_ids, dimensions=None, image_data=None, video_data=None, audio_data=None):
+            super().__init__(
+                input_ids=input_ids,
+                dimensions=dimensions,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+            )
 
     class Engine:
         def __init__(self, **kwargs):
@@ -499,6 +505,40 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
 
 def clip():
     return VideoClip((np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8, 3), dtype=np.uint8)), (0.125, 1.375), (4, 18))
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_native_single_text_preserves_blanks_and_nulls(family, on_error, sdk):
+    import pyarrow as pa
+
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+    from vane.ai.functions import _EmbedTextBatch
+    from vane.execution._async_runtime import AsyncRuntime
+
+    descriptor = load_provider(family).get_text_embedder(
+        "fixture", 2, options={"gpus_per_actor": 0, "max_input_bytes": 8}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "vector", 2, on_error=on_error, normalize=False)
+    loop = AsyncRuntime()
+    wrapper.bind_async_runtime(loop.run)
+    values = ["healthy", "", " \t\n", "\u3000", None]
+    try:
+        result = wrapper(pa.table({"text": values}))
+        assert result["vector"].to_pylist() == [[3.0, 4.0]] * 4 + [None]
+        prompts = (
+            [call["text"][0] for call in sdk.processing]
+            if family == "sglang"
+            else [call[1]["prompt"] for call in sdk.calls]
+        )
+        assert prompts == [f"rendered:{descriptor.options['instruction']}\n{value}" for value in values[:-1]]
+        with pytest.raises(EmbeddingConfigurationError, match="max_input_bytes"):
+            wrapper(pa.table({"text": ["\u3000" * 3]}))
+        assert len(sdk.calls) == 4
+    finally:
+        wrapper.close()
+        loop.close()
+    assert len(sdk.engines) == 1 and sdk.engines[0].closed == 1
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
@@ -1052,15 +1092,25 @@ def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
 
 
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
-@pytest.mark.parametrize("times", [(0.0,), (0.0, 0.5, 1.5, 2.0), (0.0, 0.5, 0.5, 1.0), (1.0, 0.5)])
-def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup(family, times, sdk):
+@pytest.mark.parametrize(
+    "times,error",
+    [
+        ((0.0,), "at least two uniformly spaced video frames"),
+        ((0.0, 0.5, 1.5, 2.0), "at least two uniformly spaced video frames"),
+        ((0.0, 0.5, 0.5, 1.0), "at least two uniformly spaced video frames"),
+        ((0.5, 0.5), "at least two uniformly spaced video frames"),
+        ((1.0, 0.5), "timestamps and indices must be ordered and aligned"),
+    ],
+)
+def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup(family, times, error, sdk):
     sys.modules["transformers"].AutoProcessor.model_input_names = ["input_ids", "second_per_grid_ts"]
     frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in times)
 
     async def run():
         runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+        runtime.configure_execution(on_error="ignore", max_retries=2, validate=lambda v: v)
         try:
-            with pytest.raises(ValueError, match="at least two uniformly spaced video frames"):
+            with pytest.raises(ValueError, match=error):
                 await runtime.embed_video([VideoClip(frames, times, tuple(range(len(times))))])
         finally:
             await runtime.aclose()

@@ -2451,7 +2451,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         udf_exec.build_executor = build_executor
         connection = vane.connect()
         cursor = connection.cursor()
-        lazy = connection.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
+        lazy = connection.sql("SELECT i::BIGINT AS x FROM (VALUES (0), (1), (2), (3)) t(i)").map_batches(
             Stage1,
             schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
@@ -2460,7 +2460,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
             batch_size=4,
             task_input_max_bytes=1024 * 1024,
         )
-        materialized = connection.sql("SELECT (100 + i)::BIGINT AS y FROM range(4) t(i)")
+        materialized = connection.sql("SELECT i::BIGINT AS y FROM (VALUES (100), (101), (102), (103)) t(i)")
         relation = materialized.union(lazy).map_batches(
             Stage2,
             schema={"z": vane.sqltypes.BIGINT},
@@ -2484,6 +2484,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
             }
             for node in plan.collect_udf_nodes(conn=connection)
         }
+        plan.collect_query_resource_graph_metadata(conn=connection)
         plan.set_udf_actor_handles(handles, conn=connection)
 
         try:

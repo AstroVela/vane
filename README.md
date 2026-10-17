@@ -68,6 +68,10 @@ the `video_clip` Python/SQL expression, output codecs, and resource limits.
 The [multimodal provider example](examples/multimodal_providers.py) covers native
 vLLM/SGLang Python engines with configurable models and multimodal embeddings.
 
+The [Qwen3-VL SQR example](examples/qwen3_vl_sqr.py) documents the opt-in
+`qwen3_vl` provider, its fixed text/image/video encoding contract, and selection
+through Vane Context's models configuration.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)

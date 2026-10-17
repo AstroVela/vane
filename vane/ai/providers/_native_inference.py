@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Worker-owned Python inference engines. No serving process or HTTP client.
+"""Worker-owned Python inference engines and explicit runtime descriptor selection.
 
 The regular AI actor owns the engine and its asynchronous runtime. Descriptors
 carry configuration only; importing this module does not import model SDKs.
@@ -16,18 +16,23 @@ import io
 import json
 import math
 import tempfile
+import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 
+from vane.ai._audio_embedding import AudioInputSpec
+from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
+from vane.ai._errors import _raise_if_resource_error
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
+from vane.ai.embedding import Modality
 from vane.ai.options import (
     _NATIVE_EMBED_OPTIONS,
     _NATIVE_MEDIA_PROMPT_OPTIONS,
@@ -35,7 +40,9 @@ from vane.ai.options import (
     normalize_prompt_options,
 )
 from vane.ai.protocols import (
+    AudioEmbedderDescriptor,
     ImageEmbedderDescriptor,
+    MultimodalEmbedderDescriptor,
     PrompterDescriptor,
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
@@ -113,6 +120,8 @@ def _engine_options(family: str, options: dict[str, Any], *, embedding: bool) ->
 
 @dataclass
 class _NativeEmbeddingDescriptor:
+    _input_kind: ClassVar[Modality | None] = None
+
     model: str
     dimensions: int | None
     options: dict[str, Any]
@@ -148,7 +157,17 @@ class _NativeEmbeddingDescriptor:
         if self.family == "sglang" and pooling:
             raise ValueError("SGLang exposes no pooling_args; configure the embedding model through engine_args")
         processor = self.options.get("processor_kwargs", {})
-        if {"text", "images", "videos", "padding", "truncation", "return_tensors"} & processor.keys():
+        if {
+            "text",
+            "images",
+            "videos",
+            "audio",
+            "audios",
+            "sampling_rate",
+            "padding",
+            "truncation",
+            "return_tensors",
+        } & processor.keys():
             raise ValueError("processor_kwargs cannot override inputs, padding or truncation")
         text_options = processor.get("text_kwargs", {})
         if not isinstance(text_options, Mapping):
@@ -164,11 +183,20 @@ class _NativeEmbeddingDescriptor:
             raise TypeError("processor_kwargs.videos_kwargs must be a mapping")
         if not isinstance(processor.get("images_kwargs", {}), Mapping):
             raise TypeError("processor_kwargs.images_kwargs must be a mapping")
+        if not isinstance(processor.get("audio_kwargs", {}), Mapping):
+            raise TypeError("processor_kwargs.audio_kwargs must be a mapping")
+        if {"audio", "audios", "sampling_rate"} & processor.get("audio_kwargs", {}).keys():
+            raise ValueError("Native embedding owns audio input and sampling rate")
         for values in (processor, video):
             if {"video_metadata", "num_frames", "fps"} & values.keys() or values.get(
                 "do_sample_frames", False
             ) is not False:
                 raise ValueError("Embedding frame selection and timestamps belong to the input clip")
+        from vane.ai._embedding_ipc import input_spec
+
+        spec = input_spec(self.options)
+        if self._input_kind is not None:
+            spec.validate_layout((EmbeddingPartSpec(self._input_kind),))
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -194,20 +222,51 @@ class _NativeEmbeddingDescriptor:
 
 
 class NativeTextEmbedderDescriptor(_NativeEmbeddingDescriptor, TextEmbedderDescriptor):
+    _input_kind = "text"
+
     def supports_chunking(self) -> bool:
         return False
 
 
 class NativeImageEmbedderDescriptor(_NativeEmbeddingDescriptor, ImageEmbedderDescriptor):
-    pass
+    _input_kind = "image"
 
 
 class NativeVideoEmbedderDescriptor(_NativeEmbeddingDescriptor, VideoEmbedderDescriptor):
+    _input_kind = "video"
+
     def get_input_spec(self) -> VideoInputSpec:
         return VideoInputSpec(max_frames=self.options["max_frames"], max_input_bytes=self.options["max_input_bytes"])
 
     def supports_image_queries(self) -> bool:
         return bool(self.options["paired_image_queries"])
+
+
+class NativeMultimodalEmbedderDescriptor(_NativeEmbeddingDescriptor, MultimodalEmbedderDescriptor):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.get_input_spec()
+
+    def get_input_spec(self) -> MultimodalInputSpec:
+        from vane.ai._embedding_ipc import input_spec
+
+        return input_spec(self.options)
+
+
+class NativeAudioEmbedderDescriptor(_NativeEmbeddingDescriptor, AudioEmbedderDescriptor):
+    _input_kind = "audio"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.get_input_spec()
+
+    def get_input_spec(self) -> AudioInputSpec:
+        from vane.ai._embedding_ipc import input_spec
+
+        spec = input_spec(self.options).audio
+        if spec is None:
+            raise EmbeddingConfigurationError("Audio requires audio in input_modalities and explicit audio limits")
+        return spec
 
 
 @dataclass
@@ -521,25 +580,71 @@ class _NativeRuntime:
 
 
 class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
-    async def _embed(self, kind: str, value: Any) -> Any:
+    async def _embed(self, kind: Modality | Literal["multimodal"], value: Any) -> Any:
+        if kind == "multimodal":
+            return await self._embed_content(value)
         if kind == "video":
             self.descriptor.get_input_spec().validate_count(len(value.frames))
             size = sum(frame.nbytes for frame in value.frames)
+        elif kind == "audio":
+            size = value.samples.nbytes
         else:
             size = len(value.encode("utf-8")) if kind == "text" else value.nbytes
         if size > self.options["max_input_bytes"]:
             raise EmbeddingConfigurationError("Embedding input exceeds max_input_bytes")
-        content = {"type": kind, kind: value} if kind != "video" else {"type": "video"}
-        text = self._render([content], self.options["instruction"])
+        return await self._embed_content(EmbeddingContent((EmbeddingPart(EmbeddingPartSpec(kind), value),)))
+
+    def _validate_content(self, content: EmbeddingContent) -> None:
+        from vane import InvalidInputException
+        from vane._image import _array_mode, _validate_pixels
+        from vane.ai._embedding_ipc import describe, input_spec
+
+        spec = input_spec(self.options)
+        spec.validate_layout(tuple(part.spec for part in content.parts))
+        # Native processors accept Vane IMAGE modes without an IPC copy or
+        # conversion. The service wire format deliberately remains uint8 RGB.
+        images = [part.value for part in content.parts if part.spec.kind == "image"]
+        remaining = tuple(part for part in content.parts if part.spec.kind != "image")
+        size = 0
+        if remaining:
+            _, _, size = describe(EmbeddingContent(remaining), spec)
+        for value in images:
+            if not isinstance(value, np.ndarray) or not value.size or value.ndim != 3:
+                raise EmbeddingConfigurationError("Native images require nonempty HWC arrays")
+            size += value.nbytes
+            if size > spec.max_input_bytes:
+                raise EmbeddingConfigurationError("Embedding row exceeds combined input byte budget")
+            try:
+                _validate_pixels(value, _array_mode(value))
+            except InvalidInputException:
+                raise EmbeddingConfigurationError(
+                    "Native images require finite pixels in a supported IMAGE mode"
+                ) from None
+
+    async def _embed_content(self, content: EmbeddingContent) -> Any:
+        started = time.monotonic()
+        self._validate_content(content)
+        text = self._render(
+            [
+                {
+                    "type": part.spec.kind,
+                    **({part.spec.kind: part.value} if part.spec.kind in {"text", "image"} else {}),
+                }
+                for part in content.parts
+            ],
+            self.options["instruction"],
+        )
         media: dict[str, Any] = {}
-        if kind == "image":
-            media["image"] = [value]
-        elif kind == "video":
-            # Use the processor's temporal input contract, not a model-name
-            # dispatch. Other processors retain per-frame absolute timestamps.
-            media["video"] = [
-                _clip_data(value, requires_frame_rate="second_per_grid_ts" in self.processor.model_input_names)
-            ]
+        for part in content.parts:
+            kind, value = part.spec.kind, part.value
+            if kind == "image":
+                media.setdefault("image", []).append(value)
+            elif kind == "video":
+                media.setdefault("video", []).append(
+                    _clip_data(value, requires_frame_rate="second_per_grid_ts" in self.processor.model_input_names)
+                )
+            elif kind == "audio":
+                media.setdefault("audio", []).append((value.samples[:, 0], value.sample_rate))
         processing = copy.deepcopy(self.options.get("processor_kwargs", {}))
         # HF rejects duplicate flat/nested arguments. Normalize owned text
         # settings once. vLLM also injects flat text options in its media
@@ -556,7 +661,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         else:
             processing["text_kwargs"] = text_options
         processing["return_tensors"] = "pt"
-        if kind == "video":
+        if "video" in media:
             processing.setdefault("videos_kwargs", {}).pop("do_sample_frames", None)
             # vLLM's media adapters read this flat option before invoking HF.
             processing["do_sample_frames"] = False
@@ -564,12 +669,11 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         if self.descriptor.family == "vllm":
             from vllm import PoolingParams
 
-            # Each embedding request contains one modality. Flatten only its
-            # options: native adapters augment flat size/sampling keys, while
-            # retaining scoped copies would give HF duplicate arguments.
-            for modality, scope in (("image", "images_kwargs"), ("video", "videos_kwargs")):
+            # Native adapters augment flat keys. Reject conflicting multimodal
+            # settings instead of choosing one modality's settings silently.
+            for modality, scope in (("image", "images_kwargs"), ("video", "videos_kwargs"), ("audio", "audio_kwargs")):
                 scoped = processing.pop(scope, {})
-                if kind == modality:
+                if modality in media:
                     if scoped.keys() & processing.keys():
                         raise EmbeddingConfigurationError("Duplicate flat and nested embedding media options")
                     processing.update(scoped)
@@ -579,6 +683,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
                 "multi_modal_data": media,
                 "mm_processor_kwargs": processing,
             }
+            self.processor_seconds = getattr(self, "processor_seconds", 0.0) + time.monotonic() - started
             result = await self._vllm_result(
                 self._ensure_engine().encode(
                     request, params, uuid.uuid4().hex, tokenization_kwargs={"add_special_tokens": False}
@@ -590,17 +695,21 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         # together, retaining the caller's frame grid without resampling.
         kwargs: dict[str, Any] = {}
         payload: dict[str, Any] = {}
-        if kind == "video":
+        if "video" in media:
             from transformers.video_utils import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
                 VideoMetadata,
             )
 
-            frames, metadata = media["video"][0]
-            metadata = {key: item for key, item in metadata.items() if key != "do_sample_frames"}
-            processing["videos_kwargs"]["video_metadata"] = [VideoMetadata(**metadata)]
-            payload["videos"] = [frames]
-        elif kind == "image":
+            processing["videos_kwargs"]["video_metadata"] = [
+                VideoMetadata(**{key: item for key, item in metadata.items() if key != "do_sample_frames"})
+                for _, metadata in media["video"]
+            ]
+            payload["videos"] = [frames for frames, _ in media["video"]]
+        if "image" in media:
             payload["images"] = media["image"]
+        if "audio" in media:
+            payload["audio"] = [samples for samples, _ in media["audio"]]
+            processing.setdefault("audio_kwargs", {})["sampling_rate"] = self.options["sample_rate"]
         inputs = self.processor(
             text=[text],
             **payload,
@@ -610,8 +719,10 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         limit = self.options["engine_args"].get("context_length")
         if limit is not None and len(ids) > limit:
             raise EmbeddingConfigurationError("Embedding input exceeds context_length")
-        if kind != "text":
-            kwargs[kind + "_data"] = [{"format": "processor_output", **dict(inputs)}]
+        if media:
+            # SGLang collects all modality tensors from one processor_output
+            # dictionary. Sending it in every media field would duplicate them.
+            kwargs[next(iter(media)) + "_data"] = [{"format": "processor_output", **dict(inputs)}]
         # SGLang 0.5.17's async_encode only accepts text and tokenizes it again
         # with special tokens. Use its native request path to preserve the exact
         # template/processor IDs, including expanded image/video placeholders.
@@ -620,6 +731,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
         )
 
         request = EmbeddingReqInput(input_ids=ids, dimensions=dimensions, **kwargs)
+        self.processor_seconds = getattr(self, "processor_seconds", 0.0) + time.monotonic() - started
         stream = self._ensure_engine().tokenizer_manager.generate_request(request, None)
         try:
             result = await anext(stream)
@@ -629,16 +741,20 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
             raise ValueError("Native SGLang returned no embedding")
         return result["embedding"]
 
-    async def _embed_many(self, kind: str, values: list[Any]) -> list[Any]:
+    async def _embed_many(self, kind: Modality | Literal["multimodal"], values: list[Any]) -> list[Any]:
         # Native engines accept individual requests. Overlap those requests on
         # the actor-owned engine while keeping retries/validation per input;
         # the enclosing Arrow batch must never replay successful siblings.
         from vane.ai.functions import _log_substituted_failure, _retry_call_async
 
         async def invoke(value: Any, check_stopped: Callable[[], None]) -> Any:
-            def request() -> Awaitable[Any]:
+            async def request() -> Any:
                 check_stopped()
-                return self._embed(kind, value)
+                try:
+                    return await self._embed(kind, value)
+                except Exception as exc:
+                    _raise_if_resource_error(exc)
+                    raise
 
             try:
                 result = await _retry_call_async(
@@ -650,6 +766,7 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
             except EmbeddingConfigurationError:
                 raise
             except Exception as exc:
+                _raise_if_resource_error(exc)
                 if getattr(self, "_request_on_error", "raise") == "raise":
                     raise
                 _log_substituted_failure(exc, on_error="ignore")
@@ -665,6 +782,12 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
 
     async def embed_video(self, values: list[VideoClip]) -> list[Any]:
         return await self._embed_many("video", values)
+
+    async def embed_audio(self, values: list[Any]) -> list[Any]:
+        return await self._embed_many("audio", values)
+
+    async def embed_multimodal(self, values: list[EmbeddingContent]) -> list[Any]:
+        return await self._embed_many("multimodal", values)
 
 
 class NativePrompter(_NativeRuntime):
@@ -758,41 +881,96 @@ class NativePrompter(_NativeRuntime):
         return result["text"]
 
 
-class NativeEmbeddingProviderMixin(Provider):
+class InferenceEmbeddingProviderMixin(Provider):
     _native_family: str
 
-    def get_text_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeTextEmbedderDescriptor:
-        return NativeTextEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
+    def _capture_http_client(self, api_key: str | None) -> None:
+        import os
+
+        from vane.ai._client_config import copy_client_options
+
+        # Snapshot on the application, but validate only when HTTP is selected.
+        # Native embedding and prompting do not consume HTTP credentials.
+        self._http_client_options = copy_client_options(
+            {"api_key": api_key if api_key is not None else os.environ.get(f"{self._native_family.upper()}_API_KEY")}
         )
+
+    def _embedding_descriptor(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        prepared = dict(options or {})
+        runtime = prepared.get("runtime", "native")
+        if runtime == "service":
+            from vane.ai.providers._embedding_service import (
+                ServiceAudioDescriptor,
+                ServiceImageDescriptor,
+                ServiceMultimodalDescriptor,
+                ServiceTextDescriptor,
+                ServiceVideoDescriptor,
+            )
+
+            return {
+                "text": ServiceTextDescriptor,
+                "image": ServiceImageDescriptor,
+                "video": ServiceVideoDescriptor,
+                "audio": ServiceAudioDescriptor,
+                "multimodal": ServiceMultimodalDescriptor,
+            }[kind](model or "", dimensions, prepared, self.name, self._native_family)
+        if runtime == "http":
+            from vane.ai.providers._embedding_http import (
+                HTTPImageEmbedderDescriptor,
+                HTTPMultimodalEmbedderDescriptor,
+                HTTPTextEmbedderDescriptor,
+            )
+
+            if kind in {"video", "audio"}:
+                raise EmbeddingConfigurationError(
+                    "HTTP embedding requires encoded video/audio BLOBs with explicit mime_type; "
+                    "decoded frame timelines and PCM are not re-encoded"
+                )
+            return {
+                "text": HTTPTextEmbedderDescriptor,
+                "image": HTTPImageEmbedderDescriptor,
+                "multimodal": HTTPMultimodalEmbedderDescriptor,
+            }[kind](model or "", dimensions, prepared, self.name, self._native_family, self._http_client_options)
+        if runtime != "native":
+            raise EmbeddingConfigurationError("Embed runtime must be 'native', 'http' or 'service'")
+        prepared.pop("runtime", None)
+        factory = {
+            "text": NativeTextEmbedderDescriptor,
+            "image": NativeImageEmbedderDescriptor,
+            "video": NativeVideoEmbedderDescriptor,
+            "audio": NativeAudioEmbedderDescriptor,
+            "multimodal": NativeMultimodalEmbedderDescriptor,
+        }.get(kind)
+        if factory is None:
+            raise NotImplementedError(f"Native {self._native_family} does not support {kind} embedding")
+        return factory(model or "", dimensions, prepared, self.name, self._native_family)
+
+    def get_text_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> TextEmbedderDescriptor:
+        return self._embedding_descriptor("text", model, dimensions, options)
 
     def get_image_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeImageEmbedderDescriptor:
-        return NativeImageEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
-        )
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> ImageEmbedderDescriptor:
+        return self._embedding_descriptor("image", model, dimensions, options)
 
     def get_video_embedder(
-        self,
-        model: str | None = None,
-        dimensions: int | None = None,
-        *,
-        options: Mapping[str, Any] | None = None,
-    ) -> NativeVideoEmbedderDescriptor:
-        return NativeVideoEmbedderDescriptor(
-            model or "", dimensions, dict(options or {}), self.name, self._native_family
-        )
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> VideoEmbedderDescriptor:
+        return self._embedding_descriptor("video", model, dimensions, options)
+
+    def get_audio_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> AudioEmbedderDescriptor:
+        return self._embedding_descriptor("audio", model, dimensions, options)
+
+    def get_multimodal_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> MultimodalEmbedderDescriptor:
+        return self._embedding_descriptor("multimodal", model, dimensions, options)
 
     def _media_prompter(
         self,

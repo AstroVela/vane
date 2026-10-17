@@ -30,6 +30,9 @@ class JevOptions(TypedDict, total=False):
 
 
 class MultimodalEmbedOptions(TypedDict, total=False):
+    input_modalities: list[str]
+    sample_rate: int
+    max_samples: int
     max_concurrency_per_actor: int
     instruction: str
     max_frames: int
@@ -104,6 +107,14 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
+    # SGLang / vLLM: choose a remote service explicitly instead of an engine.
+    runtime: Literal["native", "http", "service"]
+    service_path: str
+    service_id: str
+    http_input_format: Literal["text", "multimodal"]
+    media_mime_types: list[str]
+    max_request_bytes: int
+
     # Remote embedding request batching (OpenAI and Google).
     request_batch_size: int
 
@@ -145,58 +156,53 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     dtype: Literal["float32", "float16"]
 
 
-class EmbedImageOptions(MultimodalEmbedOptions, total=False):
-    """Closed image embedding options; decoding belongs to the IMAGE pipeline."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-    dtype: Literal["float32", "float16"]
-
-
-class EmbedAudioOptions(TypedDict, total=False):
-    """Execution and model loading options for bounded decoded audio clips."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-
-
-class EmbedVideoOptions(MultimodalEmbedOptions, total=False):
-    """Ordered decoded clips; temporal sampling is explicit upstream work."""
-
-    normalize: bool
-    batch_size: int
-    actor_number: int
-    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
-    max_retries: int
-    cache_folder: str | None
-    device: str | None
-    local_files_only: bool
-    revision: str | None
-    trust_remote_code: bool
-    dtype: Literal["float32", "float16"]
-
-
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
+_HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
+    {
+        "runtime",
+        "base_url",
+        "timeout",
+        "http_input_format",
+        "media_mime_types",
+        "max_input_bytes",
+        "max_request_bytes",
+        "supports_overriding_dimensions",
+    }
+)
+
+
+_SERVICE_EMBED_OPTIONS = frozenset(
+    {
+        "runtime",
+        "service_path",
+        "service_id",
+        "timeout",
+        "max_concurrency_per_actor",
+        "input_modalities",
+        "max_frames",
+        "max_input_bytes",
+        "sample_rate",
+        "max_samples",
+    }
+)
+
+
+def _inference_embed_options(options: Mapping[str, Any]) -> frozenset[str]:
+    runtime = options.get("runtime", "native")
+    if runtime not in ("native", "http", "service"):
+        raise ValueError("Embed option 'runtime' must be 'native', 'http' or 'service'")
+    if runtime == "service":
+        return _SERVICE_EMBED_OPTIONS
+    return _HTTP_EMBED_OPTIONS if runtime == "http" else _NATIVE_EMBED_OPTIONS | {"runtime"}
+
+
 _NATIVE_EMBED_OPTIONS = frozenset(
     {
+        "input_modalities",
+        "sample_rate",
+        "max_samples",
         "max_concurrency_per_actor",
         "instruction",
         "max_frames",
@@ -348,6 +354,8 @@ def validate_embed_options(
     _reject_sensitive_embed_options(copied)
     family = (provider_family or "").casefold()
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
+    if family in {"sglang", "vllm"}:
+        allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
     unknown = sorted(set(copied) - allowed)
@@ -376,6 +384,31 @@ def validate_embed_options(
 
     if "supports_overriding_dimensions" in copied and not isinstance(copied["supports_overriding_dimensions"], bool):
         raise ValueError("Embed option 'supports_overriding_dimensions' must be a bool")
+    if family in {"sglang", "vllm"} and copied.get("runtime") == "http":
+        _validate_base_url_option(copied, api="Embed")
+        if not copied.get("base_url") or urlsplit(copied["base_url"]).query:
+            raise ValueError("HTTP embedding requires an explicit base_url without query parameters")
+        if copied.get("http_input_format", "text") not in ("text", "multimodal"):
+            raise ValueError("http_input_format must be 'text' or 'multimodal'")
+        timeout = copied.get("timeout", 60.0)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("HTTP embedding timeout must be finite and positive")
+        for name in ("max_input_bytes", "max_request_bytes"):
+            _require_embed_int(copied, name, minimum=1)
+            if copied.get(name, 1) > 256 * 1024**2:
+                raise ValueError(f"HTTP embedding {name} must not exceed 256 MiB")
+        if copied.get("max_concurrency_per_actor", 4) > 1024:
+            raise ValueError("HTTP embedding max_concurrency_per_actor must not exceed 1024")
+        mime_types = copied.get("media_mime_types", [])
+        if not isinstance(mime_types, list) or any(not isinstance(value, str) for value in mime_types):
+            raise TypeError("media_mime_types must be a list of MIME type strings")
+        if mime_types and copied.get("http_input_format", "text") != "multimodal":
+            raise ValueError("media_mime_types requires http_input_format='multimodal'")
     if "input_type" in copied and copied["input_type"] not in ("query", "document"):
         raise ValueError("Embed option 'input_type' must be 'query' or 'document'")
     if "overlength" in copied and copied["overlength"] not in ("error", "truncate", "chunk_mean"):
@@ -451,6 +484,8 @@ def validate_embed_image_options(
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset(
             {
@@ -468,7 +503,7 @@ def validate_embed_image_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _NATIVE_EMBED_OPTIONS
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -483,8 +518,12 @@ def validate_embed_audio_options(
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
+    if provider_family in {"vllm", "sglang"}:
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
@@ -499,6 +538,8 @@ def validate_embed_video_options(
 ) -> dict[str, Any]:
     """Video providers cannot inherit text chunking or image loading policies."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "google":
+        allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
         allowed |= frozenset(
             {
@@ -516,7 +557,7 @@ def validate_embed_video_options(
             }
         )
     if provider_family in {"vllm", "sglang"}:
-        allowed |= _NATIVE_EMBED_OPTIONS
+        allowed |= _inference_embed_options(options)
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)
