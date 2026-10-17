@@ -519,14 +519,31 @@ struct PyPhysicalPlanWrapper {
 		return original_payloads;
 	}
 
+	py::dict collect_local_resource_graph_metadata(py::object conn_obj) {
+		if (!IsInitialized() || !plan_ || !has_root() || idx().empty()) {
+			throw InternalException("Native resource metadata requires an initialized physical plan and query ID");
+		}
+		if (plan_->query_id() != idx()) {
+			throw InvalidInputException("Native resource metadata query ownership mismatch");
+		}
+		optional_ptr<ClientContext> context = client_context_.get();
+		if (!conn_obj.is_none()) {
+			context = ExtractPyConnectionWrapper(conn_obj).con.GetConnection().context.get();
+		}
+		if (!context) {
+			throw InvalidInputException("Native resource metadata requires its execution context");
+		}
+		return CollectNativeResourceGraph(plan_->physical_plan()->Root(), idx(), *context);
+	}
+
 	py::dict collect_query_resource_graph_metadata(py::object conn_obj) {
 		// Preserve the original Ray metadata schema for existing callers.
-		auto result = collect_resource_graph_metadata(conn_obj, true);
+		auto result = collect_resource_graph_metadata(conn_obj);
 		result.attr("pop")("udf_node_ids");
 		return result;
 	}
 
-	py::dict collect_resource_graph_metadata(py::object conn_obj, bool annotate_udfs) {
+	py::dict collect_resource_graph_metadata(py::object conn_obj) {
 		if (!IsInitialized() || !plan_ || !has_root()) {
 			throw duckdb::InternalException(
 			    "DistributedPhysicalPlan must have a root before query resource graph metadata collection");
@@ -541,38 +558,10 @@ struct PyPhysicalPlanWrapper {
 			                                    query_id, plan_->query_id());
 		}
 
-		// DAG translation assigns distributed scan identities on the source plan.
-		// Local metadata collection must restore them even if translation or validation fails.
-		struct ScanIdentityRollback {
-			struct Entry {
-				PhysicalTableScan &scan;
-				optional_idx node_id;
-				optional_idx group_id;
-			};
-			vector<Entry> entries;
-			~ScanIdentityRollback() {
-				for (auto &entry : entries) {
-					entry.scan.extra_info.scan_node_id = entry.node_id;
-					entry.scan.extra_info.scan_group_id = entry.group_id;
-				}
-			}
-		} scan_identity_rollback;
 		vector<UDFFunctionData *> physical_udfs;
 		auto physical_plan = plan_->physical_plan();
-		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
-			if (!annotate_udfs && op.type == PhysicalOperatorType::TABLE_SCAN) {
-				auto &scan = op.Cast<PhysicalTableScan>();
-				scan_identity_rollback.entries.push_back(
-				    {scan, scan.extra_info.scan_node_id, scan.extra_info.scan_group_id});
-			}
-			CollectMutableUDFBindData(op, physical_udfs);
-		});
-		vector<Value> local_payloads;
-		if (!annotate_udfs) {
-			for (auto *bind_data : physical_udfs) {
-				local_payloads.push_back(bind_data->payload);
-			}
-		}
+		VisitPhysicalExecutionGraph(physical_plan->Root(),
+		                            [&](PhysicalOperator &op) { CollectMutableUDFBindData(op, physical_udfs); });
 		auto unidentified_payloads = EnsureStableUDFOperatorIdentities(physical_udfs, query_id);
 		struct UDFIdentityRollback {
 			const vector<UDFFunctionData *> &bind_data;
@@ -597,7 +586,7 @@ struct PyPhysicalPlanWrapper {
 			}
 		} identity_rollback(physical_udfs, unidentified_payloads);
 
-		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get(), !annotate_udfs);
+		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get());
 		vector<duckdb::distributed::DistributedPipelineNodeRef> pipeline_nodes;
 		std::unordered_set<duckdb::distributed::NodeID> visited;
 		std::function<void(const duckdb::distributed::DistributedPipelineNodeRef &)> collect_pipeline =
@@ -766,8 +755,7 @@ struct PyPhysicalPlanWrapper {
 			if (udf_entry == udf_by_node.end()) {
 				metadata[py::str("udf_payload")] = py::none();
 			} else {
-				auto &payload =
-				    annotate_udfs ? pending_annotations[udf_entry->second].payload : local_payloads[udf_entry->second];
+				auto &payload = pending_annotations[udf_entry->second].payload;
 				metadata[py::str("udf_payload")] = PythonObject::FromValue(payload, payload.type(), client_properties);
 			}
 			nodes.append(std::move(metadata));
@@ -780,14 +768,10 @@ struct PyPhysicalPlanWrapper {
 		terminals.append(py::str(std::to_string(pipeline_root->node_id())));
 		result[py::str("terminal_node_ids")] = std::move(terminals);
 		result[py::str("udf_node_ids")] = std::move(udf_node_ids);
-		if (annotate_udfs) {
-			for (auto &pending : pending_annotations) {
-				pending.bind_data->payload = std::move(pending.payload);
-			}
-			identity_rollback.Commit();
+		for (auto &pending : pending_annotations) {
+			pending.bind_data->payload = std::move(pending.payload);
 		}
-		// Read-only collection rolls temporary identities back on success too.
-		// Local query identities travel separately in executor options.
+		identity_rollback.Commit();
 		return result;
 	}
 
@@ -1155,24 +1139,6 @@ struct PyPhysicalPlanWrapper {
 		udf_actor_handles_ = std::move(by_resource);
 	}
 };
-
-py::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared) {
-	if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
-		throw InternalException("local runtime graph requires a prepared physical plan");
-	}
-	// The wrapper exists only inside this synchronous callback. Neither the
-	// metadata nor Python preparation retains this borrowed native plan.
-	PyPhysicalPlanWrapper view;
-	auto query_id = UUID::ToString(UUID::GenerateRandomUUID());
-	auto config = std::make_shared<distributed::DuckDBExecutionConfig>();
-	auto borrowed = std::shared_ptr<PhysicalPlan>(prepared.physical_plan.get(), [](PhysicalPlan *) {});
-	view.plan_ = std::make_shared<distributed::DistributedPhysicalPlan>(
-	    distributed::get_query_idx_counter().fetch_add(1), query_id, std::move(borrowed), std::move(config));
-	view.query_id_ = query_id;
-	view.resource_query_id_ = query_id;
-	view.client_context_ = context.shared_from_this();
-	return view.collect_resource_graph_metadata(py::none(), false);
-}
 
 PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::object effective_session_config) const {
 	if (conn_obj.is_none()) {

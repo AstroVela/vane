@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "vane_python/native_resource_graph.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "task.hpp"
@@ -990,7 +991,9 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
 	         py::arg("conn") = py::none())
 	    .def("collect_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_resource_graph_metadata,
-	         py::arg("conn") = py::none(), py::kw_only(), py::arg("annotate_udfs") = false)
+	         py::arg("conn") = py::none())
+	    .def("collect_local_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_local_resource_graph_metadata,
+	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),

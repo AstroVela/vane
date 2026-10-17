@@ -80,6 +80,9 @@ public:
 	SourceResultType GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
 	                              OperatorSourceInput &input) const override;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+	vector<const_reference<PhysicalOperator>> GetMaterializedInputChildren(ClientContext &) const override {
+		return {};
+	}
 	// Call only after execution tasks have stopped. A retained physical plan
 	// must not keep cancelled partial inputs alive until its next execution.
 	// Final cleanup preserves statistics; building the next execution clears them.

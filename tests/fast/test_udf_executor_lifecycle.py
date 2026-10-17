@@ -2157,7 +2157,7 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
                 },
             ]
 
-        def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+        def collect_local_resource_graph_metadata(self, conn=None):
             return linear_metadata(self.collect_udf_nodes(conn))
 
         def set_udf_actor_handles(self, handles_map, conn=None):
@@ -2476,7 +2476,7 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
                 },
             ]
 
-        def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+        def collect_local_resource_graph_metadata(self, conn=None):
             return linear_metadata(self.collect_udf_nodes(conn))
 
         def set_udf_actor_handles(self, handles_map, conn=None):

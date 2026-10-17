@@ -330,6 +330,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	                    "Return the Arrow schema without executing the relation");
 	relation_module.def("_validate_datasink_transaction", &DuckDBPyRelation::ValidateDataSinkTransaction);
 	relation_module.def("_get_runner_type", &DuckDBPyRelation::GetRunnerType);
+	relation_module.def("_collect_local_resource_graph", &DuckDBPyRelation::CollectLocalResourceGraph,
+	                    "Bind and plan native resource metadata without executing the relation");
 	relation_module.def("_run_datasink", &DuckDBPyRelation::RunDataSink);
 	relation_module.def("_validate_datasink_retry_input", &DuckDBPyRelation::ValidateDataSinkRetryInput);
 	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));

@@ -242,6 +242,10 @@ vector<const_reference<PhysicalOperator>> PhysicalOperator::GetChildren() const 
 	return result;
 }
 
+vector<const_reference<PhysicalOperator>> PhysicalOperator::GetMaterializedInputChildren(ClientContext &) const {
+	return IsSink() ? GetChildren() : vector<const_reference<PhysicalOperator>> {};
+}
+
 void PhysicalOperator::SetEstimatedCardinality(InsertionOrderPreservingMap<string> &result,
                                                idx_t estimated_cardinality) {
 	result[RenderTreeNode::ESTIMATED_CARDINALITY] = StringUtil::Format("%llu", estimated_cardinality);

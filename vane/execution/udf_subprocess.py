@@ -3725,7 +3725,7 @@ def ensure_local_subprocess_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_local_subprocess_actor_pools_for_nodes(
         udf_nodes,
-        resource_graph=lambda: plan.collect_resource_graph_metadata(conn=conn, annotate_udfs=False),
+        resource_graph=lambda: plan.collect_local_resource_graph_metadata(conn=conn),
         plan_identity=id(plan),
         session_id=plan.session_id() if hasattr(plan, "session_id") else None,
         set_handles=lambda actor_options_map: plan.set_udf_actor_handles(actor_options_map, conn=conn),

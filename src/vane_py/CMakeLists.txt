@@ -54,6 +54,7 @@ add_library(
   python_import_cache.cpp
   python_input_callback.cpp
   python_replacement_scan.cpp
+  native_resource_graph.cpp
   python_udf_actor_resources.cpp
   python_udf_utils.cpp
   python_udf.cpp

@@ -386,8 +386,16 @@ class LocalModelRequest:
     def shutdown(self, *, kill: bool = False) -> None:
         """Cancel unstarted work or retry cleanup after execution has returned."""
         self._ticket.cancel()
+        self._cleanup_resources(kill=kill, release_request=True)
+
+    def _retire_prepared_query(self) -> None:
+        """Retire a quiescent native plan without ending its admitted request."""
+        self._check_cancelled()
+        self._cleanup_resources(kill=False, release_request=False)
+
+    def _cleanup_resources(self, *, kill: bool, release_request: bool) -> None:
         with self._lock:
-            if self._executing:
+            if release_request and self._executing:
                 # A cancelled waiter owns no execution. Its take() will wake
                 # and raise; do not interfere with a claimed execution lease.
                 if self._ticket.state in {"cancelled", "drained", "timed_out"}:
@@ -410,7 +418,7 @@ class LocalModelRequest:
                 self._resources = remaining
             self._runtime._retain_request_cleanup(self, pending=bool(remaining))
             with self._lock:
-                if not remaining and not self._result_pending and self._lease is not None:
+                if release_request and not remaining and not self._result_pending and self._lease is not None:
                     self._lease.release()
             if errors:
                 raise RuntimeError("request cleanup failed; retry request.shutdown() or runtime.close()") from errors[0]

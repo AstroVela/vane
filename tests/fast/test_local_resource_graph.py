@@ -34,6 +34,260 @@ def _collect(provider: ResourceGraphMetadataProvider, conn):
     return provider.collect_resource_graph_metadata(conn=conn)
 
 
+@pytest.mark.parametrize("nested,materialized", [(False, "MATERIALIZED"), (False, ""), (True, "MATERIALIZED")])
+@pytest.mark.parametrize("configured", [False, True])
+def test_materialized_cte_preserves_udfs_and_producer_dependencies(monkeypatch, nested, materialized, configured):
+    from vane.execution.resource_graph_metadata import udf_unit_id_for_node
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        for alias in ("producer_udf", "middle_udf", "consumer_udf"):
+
+            @vane.func(return_dtype="BIGINT", name=alias)
+            def identity(value):
+                return value
+
+            vane.attach_function(identity, alias=alias, parameters=["BIGINT"], connection=conn)
+        cte = f"c AS {materialized} (SELECT producer_udf(i) AS x FROM range(3) t(i))"
+        source = "c"
+        if nested:
+            cte += ", d AS MATERIALIZED (SELECT middle_udf(x) AS x FROM c)"
+            source = "d"
+        sql = f"WITH {cte} SELECT consumer_udf(a.x + b.x) FROM {source} a JOIN {source} b USING(x)"
+        plan = _plan(conn.sql(sql), conn)
+        before = plan.collect_udf_nodes(conn=conn)
+        metadata = _collect(LocalResourceGraphAdapter(plan), conn)
+        assert metadata == _collect(LocalResourceGraphAdapter(plan), conn)
+        assert plan.collect_udf_nodes(conn=conn) == before
+        physical = {str(node["node_id"]): node["payload"] for node in before}
+        bindings = {
+            metadata["udf_node_ids"][node["node_id"]]: node["udf_payload"]
+            for node in metadata["nodes"]
+            if node["udf_payload"] is not None
+        }
+        assert bindings == physical
+        assert len(bindings) == 2 + nested
+        nodes = {node["node_id"]: node for node in metadata["nodes"]}
+        barriers = [node for node in nodes.values() if node["node_name"] == "CTEInput"]
+        assert len(barriers) == 1 + nested
+        for node in barriers:
+            assert node["is_materialization_barrier"]
+            assert node["materialized_input_node_ids"] == node["input_node_ids"]
+        scans = [node for node in nodes.values() if node["node_name"] == "CTE_SCAN"]
+        assert len(scans) == 2 + nested
+        for scan in scans:
+            assert len(scan["input_node_ids"]) == 1
+            assert nodes[scan["input_node_ids"][0]]["node_name"] == "CTEInput"
+        graph = build_local_resource_graph(metadata, query_id="cte")
+        udf_units = {
+            int(metadata["udf_node_ids"][node["node_id"]]): udf_unit_id_for_node("cte", node["node_id"])
+            for node in nodes.values()
+            if node["udf_payload"] is not None
+        }
+        completed = set()
+        observed = []
+        while True:
+            eligible = set(graph.eligible_resource_unit_ids(completed))
+            active = eligible & set(udf_units.values())
+            if active:
+                assert len(active) == 1
+                if not observed or observed[-1] != active:
+                    observed.append(active)
+            frontier = graph.frontier_materialization_barriers(completed)
+            if not frontier:
+                break
+            completed.update(barrier.barrier_id for barrier in frontier)
+        assert observed == [{udf_units[index]} for index in range(2 + nested)]
+        if configured:
+            runtime = conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_graph=True)
+        assert sorted(conn.execute(sql).fetchall()) == [(0,), (2,), (4,)]
+        if configured:
+            assert not runtime.resource_snapshot()["prepared_query_graphs"]
+
+
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.parametrize("statement", ["select", "copy", "ctas", "insert"])
+def test_materialized_cte_native_execution(monkeypatch, tmp_path, actor, statement):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        if actor:
+
+            @vane.cls(return_dtype="BIGINT", actor_number=1)
+            class Identity:
+                def __call__(self, value):
+                    return value
+
+            udf = Identity()
+        else:
+
+            @vane.func(return_dtype="BIGINT")
+            def udf(value):
+                return value
+
+        vane.attach_function(udf, alias="cte_udf", parameters=["BIGINT"], connection=conn)
+        sql = "WITH c AS MATERIALIZED (SELECT cte_udf(i) AS x FROM range(3) t(i)) SELECT cte_udf(x) AS x FROM c"
+        if statement == "select":
+            # The configured runtime admits SELECT; write coverage uses the
+            # ordinary native entry below.
+            runtime = conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_graph=True)
+            assert conn.execute(sql).fetchall() == [(0,), (1,), (2,)]
+            assert not runtime.resource_snapshot()["prepared_query_graphs"]
+        elif statement == "copy":
+            path = tmp_path / "cte.csv"
+            assert conn.execute(f"COPY ({sql}) TO '{path}' (HEADER false)").fetchall() == [(3,)]
+            assert sorted(path.read_text().splitlines()) == ["0", "1", "2"]
+        else:
+            if statement == "ctas":
+                conn.execute(f"CREATE TABLE result AS {sql}")
+            else:
+                conn.execute("CREATE TABLE result(x BIGINT)")
+                conn.execute(f"INSERT INTO result {sql}")
+            assert conn.execute("SELECT x FROM result ORDER BY x").fetchall() == [(0,), (1,), (2,)]
+
+
+@pytest.mark.parametrize("mode", ["DICTIONARY_OPERATOR", "CONSTANT_OPERATOR", "SEQUENCE_OPERATOR", "NESTED_SHUFFLE"])
+@pytest.mark.parametrize("udf", [False, True])
+def test_verify_vector_native_metadata_is_streaming(monkeypatch, mode, udf):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        conn.execute(f"SET debug_verify_vector='{mode}'")
+        vane.attach_function(
+            lambda x: x, alias="verify_udf", parameters=["BIGINT"], return_dtype="BIGINT", connection=conn
+        )
+        value = "verify_udf(i)" if udf else "i"
+        sql = f"SELECT {value} AS x, [i, i + 1] AS nested FROM range(3) t(i)"
+        plan = _plan(conn.sql(sql), conn)
+        metadata = _collect(LocalResourceGraphAdapter(plan), conn)
+        wrappers = [node for node in metadata["nodes"] if node["node_name"] == "VERIFY_VECTOR"]
+        assert wrappers
+        for node in wrappers:
+            assert len(node["input_node_ids"]) == 1
+            assert not node["is_materialization_barrier"]
+        assert len(metadata["udf_node_ids"]) == int(udf)
+        runtime = conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_graph=True)
+        assert sorted(conn.execute(sql).fetchall()) == [(i, [i, i + 1]) for i in range(3)]
+        assert not runtime.resource_snapshot()["prepared_query_graphs"]
+
+
+@pytest.mark.parametrize("kind", ["hash", "ie", "asof"])
+@pytest.mark.timeout(30)
+def test_native_join_materialization_contract(monkeypatch, kind):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        vane.attach_function(
+            lambda x: x, alias="join_udf", parameters=["BIGINT"], return_dtype="BIGINT", connection=conn
+        )
+        source = "(SELECT join_udf(i) AS x, i % 2 AS g FROM range(6) t(i))"
+        if kind == "ie":
+            conn.execute("SET nested_loop_join_threshold=0")
+            conn.execute("SET merge_join_threshold=0")
+            join = "JOIN"
+            condition = "a.x < b.x AND a.g > b.g"
+            name = "IE_JOIN"
+            expected = [(a, b) for a in range(6) for b in range(6) if a < b and a % 2 > b % 2]
+        else:
+            if kind == "asof":
+                conn.execute("SET asof_loop_join_threshold=0")
+            join = "ASOF LEFT JOIN" if kind == "asof" else "JOIN"
+            condition = "a.g = b.g AND a.x >= b.x" if kind == "asof" else "a.x = b.x"
+            name = "ASOF_JOIN" if kind == "asof" else "HASH_JOIN"
+            expected = [(i, i) for i in range(6)]
+        sql = f"SELECT a.x, b.x FROM {source} a {join} {source} b ON {condition} ORDER BY a.x, b.x"
+        metadata = _collect(LocalResourceGraphAdapter(_plan(conn.sql(sql), conn)), conn)
+        (node,) = [node for node in metadata["nodes"] if node["node_name"] == name]
+        if kind == "hash":
+            assert not node["materialized_input_node_ids"]
+            (build,) = [item for item in metadata["nodes"] if item["node_name"] == "MaterializedInput"]
+            assert build["node_id"] == node["input_node_ids"][1]
+            assert len(build["input_node_ids"]) == 1
+            assert build["materialized_input_node_ids"] == build["input_node_ids"]
+        else:
+            assert node["materialized_input_node_ids"] == node["input_node_ids"]
+        graph = build_local_resource_graph(metadata, query_id="join")
+        eligible = set(graph.eligible_resource_unit_ids(set()))
+        assert sum(unit.backend == "subprocess_task" and unit.resource_unit_id in eligible for unit in graph.units) == 2
+        for node in metadata["nodes"]:
+            if node["udf_payload"] is not None:
+                assert not node["is_materialization_barrier"]
+        conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=15)
+        assert conn.execute(sql).fetchall() == expected
+
+
+@pytest.mark.parametrize("streaming,buffer,barrier", [(False, "0B", True), (True, "0B", False), (False, "16KB", False)])
+@pytest.mark.timeout(30)
+def test_native_exchange_materialization_matches_execution(monkeypatch, streaming, buffer, barrier):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        conn.execute(f"SET local_exchange_streaming={str(streaming).lower()}")
+        conn.execute(f"SET local_exchange_buffer_bytes='{buffer}'")
+        source = conn.sql("SELECT i AS x FROM range(6) t(i)").map_batches(
+            _identity, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+        )
+        relation = source.repartition(2).map_batches(
+            _identity, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+        )
+        metadata = _collect(LocalResourceGraphAdapter(_plan(relation, conn)), conn)
+        (exchange,) = [node for node in metadata["nodes"] if node["node_name"] == "REPARTITION"]
+        assert exchange["is_materialization_barrier"] == barrier
+        assert exchange["materialized_input_node_ids"] == (exchange["input_node_ids"] if barrier else [])
+        conn.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=15)
+        assert sorted(relation.fetchall()) == [(i,) for i in range(6)]
+
+
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.timeout(30)
+def test_recursive_body_keeps_materialized_udf_phases_repeatable(monkeypatch, actor):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"threads": 2}) as conn:
+        if actor:
+
+            @vane.cls(return_dtype="BIGINT", actor_number=1)
+            class Identity:
+                def __call__(self, value):
+                    return value
+
+            function = Identity()
+        else:
+
+            @vane.func(return_dtype="BIGINT")
+            def function(value):
+                return value
+
+        vane.attach_function(function, alias="repeat_udf", parameters=["BIGINT"], connection=conn)
+        sql = (
+            "WITH RECURSIVE r(n) AS (SELECT 1::BIGINT UNION ALL "
+            "SELECT repeat_udf(sum(x)::BIGINT) FROM "
+            "(SELECT repeat_udf(n+1) AS x FROM r WHERE n<3) HAVING count(*)>0) "
+            "SELECT n FROM r ORDER BY n"
+        )
+        metadata = _collect(LocalResourceGraphAdapter(_plan(conn.sql(sql), conn)), conn)
+        nodes = {node["node_id"]: node for node in metadata["nodes"]}
+        recursive = next(node for node in nodes.values() if node["node_name"] == "REC_CTE")
+        pending = [recursive["input_node_ids"][1]]
+        body = set()
+        while pending:
+            node_id = pending.pop()
+            if node_id not in body:
+                body.add(node_id)
+                pending.extend(nodes[node_id]["input_node_ids"])
+        assert any(nodes[node_id]["node_name"] == "UNGROUPED_AGGREGATE" for node_id in body)
+        assert all(not nodes[node_id]["is_materialization_barrier"] for node_id in body)
+        graph = build_local_resource_graph(metadata, query_id="loop")
+        eligible = set(graph.eligible_resource_unit_ids(set()))
+        assert (
+            sum(unit.backend.startswith("subprocess_") and unit.resource_unit_id in eligible for unit in graph.units)
+            == 2
+        )
+        # Native UDF restarts across multiple recursive iterations have a
+        # documented baseline limitation. One iteration exercises both units.
+        runtime = conn.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1), execution_timeout=10, track_graph=True
+        )
+        assert conn.execute(sql.replace("n<3", "n<2")).fetchall() == [(1,), (2,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert not runtime.resource_snapshot()["prepared_query_graphs"]
+
+
 @pytest.mark.parametrize("threads", [1, 2])
 @pytest.mark.parametrize("statement", ["create_table_as", "insert", "insert_returning"])
 def test_native_writes_collect_udf_inputs_and_sink_boundary(monkeypatch, threads, statement):
@@ -310,7 +564,7 @@ def test_native_enum_and_pivot_collect_udf_inputs(monkeypatch, threads, statemen
                 assert node["input_node_ids"]
     assert len(enum_sinks) == (0 if statement == "static_pivot" else 1)
     if statement == "dynamic_physical_pivot":
-        assert any(node["node_name"] == "Pivot" for node in graphs[-1]["nodes"])
+        assert any(node["node_name"] == "PIVOT" for node in graphs[-1]["nodes"])
 
 
 @pytest.mark.parametrize(
@@ -432,20 +686,20 @@ def test_ray_collection_rejects_an_unmapped_owned_udf(monkeypatch):
     ("transform", "has_barrier"),
     [
         (lambda relation: relation.order("x"), True),
-        (lambda relation: relation.aggregate("sum(x) AS x"), False),
+        (lambda relation: relation.aggregate("sum(x) AS x"), True),
         (lambda relation: relation.order("x").limit(3), True),
     ],
 )
-def test_local_and_ray_share_structural_barriers_and_phase_calculation(tmp_path, transform, has_barrier):
+def test_native_sink_metadata_uses_the_shared_phase_model(tmp_path, transform, has_barrier):
     with vane.connect() as conn:
         path = tmp_path / "input.parquet"
         conn.execute(f"COPY (SELECT i AS x FROM range(8) tbl(i)) TO '{path}' (FORMAT PARQUET)")
         plan = _plan(transform(conn.read_parquet(str(path)).repartition(2)), conn)
         local_metadata = _collect(LocalResourceGraphAdapter(plan), conn)
-        ray_metadata = _collect(RayResourceGraphAdapter(plan), conn)
-        assert local_metadata == ray_metadata
         local = build_local_resource_graph(local_metadata, query_id=plan.idx())
-        ray = build_query_resource_graph(ray_metadata, env={})
+        # Both consumers understand the common schema; native collection no
+        # longer translates through a distributed execution graph.
+        ray = build_query_resource_graph(local_metadata, env={})
         assert bool(local.materialization_barriers) == has_barrier
         assert local.materialization_barriers == ray.materialization_barriers
         assert local.topological_unit_ids() == ray.topological_unit_ids()
@@ -594,9 +848,14 @@ def test_join_branch_bindings_reach_the_matching_native_executor(monkeypatch):
             snapshot = request.resource_graph_snapshot()
             assert {identity["query_id"] for _, identity in seen} == {snapshot["graph"]["query_id"]}
             assert snapshot["phase_tracking"] == "structural_only"
-            # A distributed broadcast override must not add an exchange barrier
-            # to a native hash join's metadata.
-            assert not snapshot["graph"]["materialization_barriers"]
+            # The native join builds its RHS before probing, independently of
+            # the distributed broadcast override.
+            assert len(snapshot["graph"]["materialization_barriers"]) == 1
+            (join,) = [node for node in metadata["nodes"] if node["node_name"] == "HASH_JOIN"]
+            (build,) = [node for node in metadata["nodes"] if node["node_name"] == "MaterializedInput"]
+            assert not join["materialized_input_node_ids"]
+            assert build["node_id"] in join["input_node_ids"]
+            assert build["materialized_input_node_ids"] == build["input_node_ids"]
             assert "function_pickle" not in json.dumps(snapshot)
             assert not runtime.resource_snapshot()["prepared_query_graphs"]
         assert plan.collect_udf_nodes(conn=conn) == before
@@ -762,7 +1021,7 @@ def test_graph_publication_failure_retires_diagnostics(task_limit):
             session_id = native.session_id
             session_config = native.session_config
             collect_udf_nodes = native.collect_udf_nodes
-            collect_resource_graph_metadata = native.collect_resource_graph_metadata
+            collect_local_resource_graph_metadata = native.collect_local_resource_graph_metadata
 
             def set_local_udf_executor_options(self, *args, **kwargs):
                 raise RuntimeError("publication failed")

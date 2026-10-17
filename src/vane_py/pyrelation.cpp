@@ -1403,6 +1403,10 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 				check();
 			}
 			ScopedPythonUDFActorResourcePreparation preparation(*context, query);
+			// Verification executes internal queries inside PendingQuery. Bind
+			// interruption before entering it; started() replays cancellation after
+			// DuckDB's final query-start reset as it does for ordinary execution.
+			query.attr("bind_interrupt")(py::cpp_function([callback_context]() { callback_context->Interrupt(); }));
 			try {
 				unique_ptr<PendingQueryResult> pending;
 				{

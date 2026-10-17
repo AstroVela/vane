@@ -75,7 +75,7 @@ def test_local_graph_collection_preserves_scan_state(monkeypatch, tmp_path, sour
         adapter = LocalResourceGraphAdapter(plan)
         for _ in range(2):
             if failure:
-                # Conversion fails after DAG construction has annotated the scans.
+                # A rejected context must not mutate the physical plan either.
                 with pytest.raises(vane.InternalException, match="Connection object"):
                     adapter.collect_resource_graph_metadata(conn=object())
             else:

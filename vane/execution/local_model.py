@@ -183,8 +183,8 @@ def collect_model_payload(connection: Any, definition: _PreparedBatchSQLRegistra
         )
     inputs = tuple(vane.col(name) for name in definition.input_names)
     relation = relation.project(_model_expression(definition, inputs))
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
-    nodes = plan.collect_udf_nodes(conn=connection)
-    if len(nodes) != 1:
+    metadata = relation._collect_local_resource_graph()
+    payloads = [node["udf_payload"] for node in metadata["nodes"] if node["udf_payload"] is not None]
+    if len(payloads) != 1:
         raise RuntimeError("registered model prototype must contain exactly one UDF")
-    return nodes[0]["payload"]
+    return payloads[0]

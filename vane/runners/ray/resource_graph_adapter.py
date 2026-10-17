@@ -16,4 +16,4 @@ class RayResourceGraphAdapter(ResourceGraphMetadataProvider):
     plan: Any
 
     def collect_resource_graph_metadata(self, conn: Any = None) -> dict[str, Any]:
-        return self.plan.collect_resource_graph_metadata(conn=conn, annotate_udfs=True)
+        return self.plan.collect_resource_graph_metadata(conn=conn)

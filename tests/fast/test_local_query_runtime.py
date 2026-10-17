@@ -877,6 +877,157 @@ def test_executemany_rebinds_each_native_request(native_environment):
         assert runtime.resource_snapshot()["request_admission"]["completed_requests"] == 3
 
 
+@pytest.mark.parametrize("backend", ["none", "task", "actor"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "stream"])
+@pytest.mark.timeout(45)
+def test_query_verification_retires_each_plan_within_one_request(native_environment, monkeypatch, backend, entry):
+    from vane.execution.local_query import _NativeQuery
+    from vane.execution.result_delivery import ResultDeliveryLimits
+
+    queries = []
+    graphs = []
+    prepare = _NativeQuery.prepare
+
+    def observe(query, nodes, graph):
+        queries.append(query)
+        handles = prepare(query, nodes, graph)
+        state = query.request._runtime.resource_snapshot()
+        assert state["request_admission"]["running_requests"] == 1
+        assert len(state["prepared_query_graphs"]) == 1
+        graphs.append(state["prepared_query_graphs"][0]["graph"]["query_id"])
+        return handles
+
+    monkeypatch.setattr(_NativeQuery, "prepare", observe)
+    with vane.connect(config={"threads": 2}) as connection:
+        if backend == "actor":
+
+            @vane.cls(return_dtype="BIGINT", actor_number=1)
+            class Increment:
+                def __call__(self, value):
+                    return value + 1
+
+            function = Increment()
+        else:
+
+            @vane.func(return_dtype="BIGINT")
+            def function(value):
+                return value + 1
+
+        vane.attach_function(function, alias="verified_udf", parameters=["BIGINT"], connection=connection)
+        connection.execute("PRAGMA enable_verification")
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            result_limit=ResultDeliveryLimits(1, 65536),
+            track_graph=True,
+            track_data=True,
+        )
+        value = "i + 1" if backend == "none" else "verified_udf(i)"
+        sql = f"SELECT {value} AS x FROM range(3) t(i) ORDER BY x"
+        if entry == "execute":
+            assert connection.execute(sql).fetchall() == [(1,), (2,), (3,)]
+        elif entry == "sql":
+            assert connection.sql(sql).fetchall() == [(1,), (2,), (3,)]
+        else:
+            with connection.sql(sql).execute_result(stream=True) as result:
+                rows = []
+                while True:
+                    try:
+                        rows.extend(result.take().to_pylist())
+                    except StopIteration:
+                        break
+                assert rows == [{"x": 1}, {"x": 2}, {"x": 3}]
+        # Query verification really runs its internal variants. DuckDB skips
+        # prepared verification for UDF parameters that cannot be rebound.
+        assert len(queries) >= 8
+        assert len({id(query) for query in queries}) == 1
+        assert len(set(graphs)) == len(graphs)
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["executed_requests"] == 1
+        assert state["request_admission"]["completed_requests"] == 1
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["request_admission"]["cleanup_pending_requests"] == 0
+        assert not state["prepared_query_graphs"]
+        assert state["data"]["leases"] == state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("action", ["cancel", "timeout"])
+def test_query_verification_interrupts_internal_native_execution(native_environment, monkeypatch, action):
+    from vane.execution.local_query import _NativeQuery
+
+    prepared = threading.Event()
+    requests = []
+    prepare = _NativeQuery.prepare
+
+    def observe(query, nodes, graph):
+        handles = prepare(query, nodes, graph)
+        requests.append(query.request)
+        prepared.set()
+        return handles
+
+    monkeypatch.setattr(_NativeQuery, "prepare", observe)
+    with vane.connect(config={"threads": 2}) as connection:
+        connection.execute("PRAGMA enable_verification")
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            execution_timeout=0.2 if action == "timeout" else None,
+            track_graph=True,
+        )
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(connection.execute, "SELECT sum(sin(i::DOUBLE)) FROM range(100000000) t(i)")
+            try:
+                assert prepared.wait(5)
+                if action == "cancel":
+                    time.sleep(0.05)
+                    assert requests[0].cancel()
+                error = RequestCancelled if action == "cancel" else RequestExecutionTimeout
+                with pytest.raises(error):
+                    future.result(timeout=2)
+            finally:
+                connection.interrupt()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert not state["prepared_query_graphs"]
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+
+
+@pytest.mark.timeout(30)
+def test_query_verification_retains_failed_plan_cleanup(native_environment, monkeypatch):
+    from vane.execution.local_resource_graph import PreparedLocalResourceGraph
+
+    connection = vane.connect()
+    connection.execute("PRAGMA enable_verification")
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_graph=True)
+    shutdown = PreparedLocalResourceGraph.shutdown
+    failed = True
+    owners = []
+
+    def fail_cleanup(owner, *, kill=False):
+        if failed:
+            owners.append(owner)
+            raise RuntimeError("injected verification plan cleanup failure")
+        shutdown(owner, kill=kill)
+
+    monkeypatch.setattr(PreparedLocalResourceGraph, "shutdown", fail_cleanup)
+    monkeypatch.setattr(PreparedLocalResourceGraph, "cleanup_pending", lambda owner: owner._release is not None)
+    try:
+        with pytest.raises(Exception, match="cleanup failed"):
+            connection.execute("SELECT 42")
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["running_requests"] == 1
+        assert state["request_admission"]["cleanup_pending_requests"] == 1
+        assert len(state["prepared_query_graphs"]) == 1
+        assert len({id(owner) for owner in owners}) == 1
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            connection.close()
+    finally:
+        failed = False
+        connection.close()
+    assert runtime.resource_snapshot()["closed"]
+    assert not runtime.resource_snapshot()["prepared_query_graphs"]
+    assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
 def test_native_preparation_error_retains_owners_across_exception_translation(native_environment, monkeypatch):
     from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 

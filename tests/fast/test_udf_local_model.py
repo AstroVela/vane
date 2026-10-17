@@ -56,7 +56,7 @@ class _Plan:
     def collect_udf_nodes(self, conn=None):
         return self.nodes
 
-    def collect_resource_graph_metadata(self, conn=None, annotate_udfs=False):
+    def collect_local_resource_graph_metadata(self, conn=None):
         return linear_metadata(self.nodes)
 
     def set_local_udf_executor_options(self, options, conn=None):

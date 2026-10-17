@@ -41,6 +41,7 @@ public:
 
 	// Expose underlying Relation for C++ consumers
 	shared_ptr<Relation> GetRelation();
+	py::dict CollectLocalResourceGraph();
 
 public:
 	static void Initialize(py::handle &m);

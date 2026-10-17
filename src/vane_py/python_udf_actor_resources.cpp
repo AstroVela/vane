@@ -380,7 +380,7 @@ public:
 		prepared_statements.clear();
 		const auto capture_errors = capture_cleanup_warnings;
 		capture_cleanup_warnings = false;
-		if (resources.empty()) {
+		if (resources.empty() && !runtime_query) {
 			return;
 		}
 		if (!Py_IsInitialized() || PythonIsFinalizing()) {
@@ -392,6 +392,10 @@ public:
 		// actor callables can therefore release provider state even when the
 		// query itself failed; forced termination is reserved for setup rollback
 		// and context destruction where quiescence is not established here.
+		if (runtime_query) {
+			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
+			query.attr("query_finished")();
+		}
 		ShutdownResources(false, capture_errors);
 	}
 
@@ -456,8 +460,9 @@ private:
 
 	void Prepare(ClientContext &context, PreparedStatementData &prepared) {
 		if (runtime_query) {
-			if (!prepared.properties.IsReadOnly() ||
-			    prepared.properties.return_type != StatementReturnType::QUERY_RESULT) {
+			// The outer entry validates SELECT/Relation. Internal verification
+			// statements may return no rows, but must obey the same read-only policy.
+			if (!prepared.properties.IsReadOnly()) {
 				throw InvalidInputException("local runtime currently supports read-only queries");
 			}
 			PythonGILWrapper gil;

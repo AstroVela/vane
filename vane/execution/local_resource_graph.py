@@ -38,7 +38,7 @@ class LocalResourceGraphAdapter(ResourceGraphMetadataProvider):
     plan: Any
 
     def collect_resource_graph_metadata(self, conn: Any = None) -> dict[str, Any]:
-        return self.plan.collect_resource_graph_metadata(conn=conn, annotate_udfs=False)
+        return self.plan.collect_local_resource_graph_metadata(conn=conn)
 
 
 @dataclass(frozen=True)

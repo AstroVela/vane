@@ -275,6 +275,12 @@ public:
 
 	virtual void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline);
 
+	//! Inputs that must finish before this operator can produce output. This is
+	//! a read-only description of BuildPipelines dependencies, not an IsSink
+	//! alias: streaming sinks and iterative operators have no one-shot barrier.
+	//! Operators with custom pipeline dependencies must override this contract.
+	virtual vector<const_reference<PhysicalOperator>> GetMaterializedInputChildren(ClientContext &context) const;
+
 public:
 	// Serialization interface
 	//! Serialize this operator and all its children recursively

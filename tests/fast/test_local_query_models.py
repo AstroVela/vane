@@ -107,6 +107,23 @@ def _assert_idle(runtime):
         assert state["data"]["usage_bytes"] == 0
 
 
+@pytest.mark.timeout(45)
+def test_query_verification_reuses_registered_model(tmp_path):
+    with vane.connect(config={"threads": 2}) as connection:
+        connection.execute("PRAGMA enable_verification")
+        runtime = _runtime(connection)
+        model = _register(runtime, _class_model(tmp_path))
+        vane.attach_function(model, "verified_model", connection=connection)
+        assert not _initializations(tmp_path)
+        for _ in range(2):
+            rows = connection.execute("SELECT verified_model(i) FROM range(3) t(i) ORDER BY i").fetchall()
+            (pid,) = _initializations(tmp_path)
+            assert rows == [(f"{pid}:{i + 10}",) for i in range(3)]
+            _assert_idle(runtime)
+            assert not runtime.resource_snapshot()["prepared_query_graphs"]
+        assert runtime.resource_snapshot()["request_admission"]["completed_requests"] == 2
+
+
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("prewarm", [False, True])
 @pytest.mark.parametrize("budgets", [False, True])

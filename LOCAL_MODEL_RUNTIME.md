@@ -68,6 +68,14 @@ request and native preparation. Unregistered local subprocess actors remain
 query-owned in this entry point. Explicitly registered models use resident
 pools through the same preparation and cleanup path.
 
+If `PRAGMA enable_verification` is set before runtime configuration, DuckDB's
+internal verification plans share the outer request's admission, deadline and
+cancellation scope. `QueryEnd` confirms that the previous plan has stopped;
+its resources must finish cleanup before another plan is prepared. Failed
+cleanup retains both the owners and the request allowance. Registered models
+remain resident while each plan releases its own borrow. Verification is not
+disabled or routed through an alternative execution path.
+
 An active runtime query rejects another query or relation binding on the same
 cursor before taking connection locks. Concurrent clients use independent
 cursors. DataSource callbacks include task deserialization, `execute()`, batch
@@ -1799,18 +1807,32 @@ independently of soft reservations.
 common internal plan-adapter interface. `LocalResourceGraphAdapter` exports
 metadata without changing the plan's UDF payloads; `RayResourceGraphAdapter`
 registers the existing Ray query/operator identities during collection. Both
-use the same native traversal and return the same schema, including
-`udf_node_ids`, a mapping from pipeline nodes to physical UDF binding IDs. The
-two traversal orders can differ at joins, so consumers must use this mapping.
-The old native `collect_query_resource_graph_metadata()` entry point remains
-compatible with its original Ray annotation behavior and three-field result.
-Local metadata expands owned delim-join plans, including their UDFs. Ray still
+return the same schema, including `udf_node_ids`, a mapping from graph nodes to
+physical UDF binding IDs. Consumers must use this mapping because Ray's
+pipeline order can differ from the physical execution traversal.
+
+Local collection reads the physical execution graph directly through
+`collect_local_resource_graph_metadata()`. It does not construct a distributed
+plan, assign temporary scan/UDF identities, or use a distributed operator
+support list. `GetChildren()` exposes ordinary and owned execution subtrees;
+`GetMaterializedInputChildren()` describes the native operator's blocking
+inputs. Streaming sinks have no completion barrier, hash joins build their
+right side, and IE/ASOF joins materialize both sides. A local exchange uses the
+same streaming/buffer configuration for metadata and pipeline construction.
+When only some inputs materialize, their barriers sit on those input edges;
+upstream UDFs on the other inputs can run concurrently under native scheduling.
+Registered model prototypes use the same native collector after binding and
+planning their Relation, without exporting or serializing a distributed plan.
+
+CTE and delim scans reference their producer's materialized input. Local
+metadata expands owned delim-join plans, including their UDFs. Ray still
 serializes those plans into a worker fragment; graph registration rejects an
 internal UDF that has no corresponding resource unit instead of omitting it.
-Recursive CTEs and their working/recurring-table scans also have native-only
-metadata nodes. Both the seed and recursive branches expose their UDF units;
+Recursive CTEs and their working/recurring-table scans retain their native
+structure. Both the seed and recursive branches expose their UDF units;
 iteration feedback and working-table storage remain owned by DuckDB rather than
-forming cycles or one-shot completion barriers in the resource graph. Graph
+forming cycles in the resource graph. Sinks inside a repeated body do not
+retire its resources through one-shot completion barriers. Graph
 tracking and byte waiting therefore do not require distributed recursive-query
 support. Ray's existing recursive-scan rejection is unchanged.
 Repeated recursive steps that invoke a UDF still have a native executor restart
@@ -1823,9 +1845,8 @@ eligibility. Backend-specific unit validation remains separate: local units
 identify native fragments, subprocess tasks and subprocess actor pools; Ray
 units retain their existing process demands, output windows and authorization.
 Local graph modules do not import Ray or its cluster resource coordinator.
-Native metadata uses neutral distributed settings: join strategy, worker sizing
-and shuffle environment overrides do not alter the already planned native query
-or its resource graph. Collection does not modify the process environment. UDF
+Native collection does not read distributed join, worker sizing or shuffle
+settings and does not modify the plan or process environment. UDF
 execution continues to use the session's captured configuration; Ray execution
 keeps its distributed planning settings.
 
@@ -1851,7 +1872,7 @@ has succeeded.
 
 These snapshots are marked `phase_tracking="structural_only"`. They expose
 `initial_eligible_unit_ids`, not a live phase or a count of running operators.
-The barriers currently come from the common pipeline representation; local-fast
+The barriers come from the native operators' input contracts; local-fast
 still executes its native plan and does not emit barrier completion events into
 this graph. DuckDB manages native sort, aggregation and join-build memory
 inside local execution, as it does inside each Ray worker. Per-UDF byte budgets
@@ -1859,8 +1880,8 @@ use UDF admission lifetimes. Bounded waiting additionally protects the UDFs of
 each activated query, without inferring native phase completion.
 Graph tracking does not enable
 local spill or change admission
-limits. Tracking requires a plan supported by the common pipeline metadata
-exporter and accepts only local subprocess UDFs; unsupported UDF backends are
+limits. Tracking traverses all native execution children and accepts only local
+subprocess UDFs; unsupported UDF backends are
 rejected before model acquisition.
 
 ## UDF resource attribution

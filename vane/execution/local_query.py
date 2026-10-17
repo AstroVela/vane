@@ -39,8 +39,8 @@ class _NativePlan:
     def collect_udf_nodes(self, *, conn: Any = None) -> list[dict[str, Any]]:
         return self._nodes
 
-    def collect_resource_graph_metadata(self, *, conn: Any = None, annotate_udfs: bool = False) -> dict[str, Any]:
-        assert not annotate_udfs and self._graph is not None
+    def collect_local_resource_graph_metadata(self, *, conn: Any = None) -> dict[str, Any]:
+        assert self._graph is not None
         return self._graph
 
     def set_local_udf_executor_options(self, handles: dict[str, Any], *, conn: Any = None) -> None:
@@ -55,11 +55,17 @@ class _NativeQuery:
         self.track_graph = True
         self._binding = _NativeRequestCancellation(request._cancellation)
         self._prepared = False
+        self._plan_finished = False
 
     def prepare(self, nodes: list[dict[str, Any]], graph: dict[str, Any] | None) -> dict[str, Any]:
         if self._prepared:
-            raise RuntimeError("a native runtime request can prepare only one query")
+            if not self._plan_finished:
+                raise RuntimeError("a native runtime request must finish its previous query before preparing another")
+            # DuckDB verification executes several plans under one admission.
+            # QueryEnd confirms quiescence before we retire the previous owners.
+            self.request._retire_prepared_query()
         self._prepared = True
+        self._plan_finished = False
         plan = _NativePlan(self.request._runtime, nodes, graph)
         bindings = {}
         for node in nodes:
@@ -71,8 +77,14 @@ class _NativeQuery:
         self.request._prepare_execution(plan, bindings)
         return plan.handles
 
-    def started(self, interrupt: Callable[[], None]) -> None:
+    def query_finished(self) -> None:
+        self._plan_finished = True
+
+    def bind_interrupt(self, interrupt: Callable[[], None]) -> None:
         self._binding.started_callback(interrupt)
+
+    def started(self, interrupt: Callable[[], None]) -> None:
+        self.bind_interrupt(interrupt)
         self.request._check_cancelled()
 
     def close(self) -> None:

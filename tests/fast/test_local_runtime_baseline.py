@@ -213,7 +213,9 @@ def test_preparation_validation_does_not_block_reentrant_drain(monkeypatch):
             session_id=lambda: "session",
             session_config=lambda: {},
             collect_udf_nodes=lambda **kwargs: [{"node_id": "1", "payload": payload}],
-            collect_resource_graph_metadata=lambda **kwargs: linear_metadata([{"node_id": "1", "payload": payload}]),
+            collect_local_resource_graph_metadata=lambda **kwargs: linear_metadata(
+                [{"node_id": "1", "payload": payload}]
+            ),
         )
         fingerprint = udf_local_model._model_fingerprint
         with ThreadPoolExecutor(max_workers=1) as threads:
