@@ -1,0 +1,8 @@
+{
+  "status": "PASS",
+  "directory_count": 116,
+  "chunks": [
+    "cleanup/000.json",
+    "cleanup/001.json"
+  ]
+}

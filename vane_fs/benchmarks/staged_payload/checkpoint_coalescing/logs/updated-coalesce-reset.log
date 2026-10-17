@@ -1,0 +1,1 @@
+reset PASS hook_queries=1 worker_calls=2 passes=1

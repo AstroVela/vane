@@ -1,0 +1,68 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -139,19 +139,23 @@
+ 	}
+ 	void Run() {
+ 		bool retry = false;
++		bool clean_pending = false;
+ 		std::unique_lock<std::mutex> lock(mutex);
+ 		for (;;) {
+ 			if (retry)
+ 				wake.wait_for(lock, std::chrono::milliseconds(20), [this] { return stopped; });
++			else if (clean_pending)
++				wake.wait_until(lock, clean_deadline, [this] { return stopped || requested; });
+ 			else
+ 				wake.wait(lock, [this] { return stopped || requested; });
+ 			if (stopped) {
+ 				// A failed explicit close may restart this worker without any
+ 				// further commits. Preserve unfinished maintenance across Stop.
+-				requested = requested || retry;
++				requested = requested || retry || clean_pending;
+ 				return;
+ 			}
+ 			requested = false;
++			clean_pending = false;
+ 			lock.unlock();
+ 			int frames = -1, copied = -1, code = SQLITE_OK;
+ 			bool deferred = false;
+@@ -161,14 +165,26 @@
+ 					std::unique_ptr<Staging::CheckpointGuard> lease;
+ 					{
+ 						Staging::Guard publication(staging);
+-						// Only unpublished external data needs coalesced publication.
+-						// Once CLEAN, promptly backfill inline/namespace commits using
+-						// the original wake policy, even below the uncopied-byte budget.
+-						if (!retry && staging.Pending()) {
++						auto pending = staging.Pending();
++						if (!retry) {
+ 							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+-							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
+-							           Bytes(frames - copied) < START_BYTES;
++							auto small = code == SQLITE_OK && frames >= copied && copied >= 0 &&
++							             Bytes(frames - copied) < START_BYTES;
++							if (pending) {
++								// Preserve the existing OPEN publication budget.
++								deferred = small;
++							} else if (small && frames > copied) {
++								// FULL commits are already durable. Coalesce their small
++								// CLEAN maintenance from the first request, never by sliding
++								// the deadline on subsequent commits. Large tails bypass it.
++								auto now = std::chrono::steady_clock::now();
++								if (clean_deadline == std::chrono::steady_clock::time_point {})
++									clean_deadline = now + std::chrono::milliseconds(5);
++								deferred = clean_pending = now < clean_deadline;
++							}
+ 						}
++						if (!clean_pending)
++							clean_deadline = {};
+ 						if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
+ 							lease = std::make_unique<Staging::CheckpointGuard>(staging);
+ 							staging.Publish(db);
+@@ -220,6 +236,7 @@
+ 	std::mutex checkpoint_mutex;
+ 	std::condition_variable wake;
+ 	bool stopped = false, requested = false;
++	std::chrono::steady_clock::time_point clean_deadline {};
+ 	std::thread worker;
+ };
+ } // namespace vane_fs

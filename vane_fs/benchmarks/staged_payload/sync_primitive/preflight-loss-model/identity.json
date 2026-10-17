@@ -1,0 +1,71 @@
+{
+  "status": "REPRODUCED_LOSS_FIXTURE_ERROR",
+  "measured_comparisons": 0,
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/fdatasync-native.log": {
+      "sha256": "ce2582cb7c7bdb4860d4fcf97f976b7f8eddf48b6c44eee44cc3fec7ffb6fa0c",
+      "bytes": 1639
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/loss-probe": {
+      "sha256": "9f2506cc2f14447cf2f8d29f0b68d111660f54c2d4d2128e684e89104219774b",
+      "bytes": 1806848
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/reproduce.log": {
+      "sha256": "efe0bac609b605e985b887e5ed1b11676b511d34097dc1e6b3517a5804963c30",
+      "bytes": 1019
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/compile.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/loss-probe.cpp.txt": {
+      "sha256": "2ab233e0a81b5aba68dcd2f95c778d00dd3a38f5f2c81de3d14b8c0eff20e531",
+      "bytes": 8855
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/build.py.txt": {
+      "sha256": "f89a9a0b527ae7b3a3a20623c44a21a1c6b11e6d2a63731101d07300ebf60dad",
+      "bytes": 16704
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/build.json": {
+      "sha256": "500364c3fb12c9cd487a9b955fc8907f897adc65ea0694b54069ce1a0c44b636",
+      "bytes": 303008
+    }
+  },
+  "commands": [
+    {
+      "label": "compile",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fdatasync/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release/include",
+        "-x",
+        "c++",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/loss-probe.cpp.txt",
+        "-x",
+        "none",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fdatasync/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fdatasync",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/loss-probe"
+      ],
+      "returncode": 0,
+      "start": 1791886222.8332236,
+      "end": 1791886224.5017729
+    },
+    {
+      "label": "reproduce",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/preflight-loss-model/loss-probe"
+      ],
+      "returncode": 1,
+      "start": 1791886224.5017822,
+      "end": 1791886224.7670121
+    }
+  ]
+}

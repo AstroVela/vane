@@ -1,0 +1,165 @@
+{
+  "status": "REJECT",
+  "checks": [
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "stream_256",
+      "median_ratio": 0.9944807543344979,
+      "aggregate_ratio": 1.106039584669053,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "write_64",
+      "median_ratio": 1.0211957927867927,
+      "aggregate_ratio": 1.0135176214405217,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "read_64",
+      "median_ratio": 1.0435577256675217,
+      "aggregate_ratio": 1.05365590788336,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "random_read_4k",
+      "median_ratio": 1.006159952709351,
+      "aggregate_ratio": 1.0290382722746156,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "random_write_4k",
+      "median_ratio": 0.8978983233098582,
+      "aggregate_ratio": 0.9585029009804484,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "small_file_fsync",
+      "median_ratio": 1.029959150313257,
+      "aggregate_ratio": 2.303741717377161,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "mkdir",
+      "median_ratio": 1.0483607301689208,
+      "aggregate_ratio": 1.1879384393275798,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "rename",
+      "median_ratio": 1.0822277778392924,
+      "aggregate_ratio": 1.0895097532314213,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "rmdir",
+      "median_ratio": 1.0214245116707426,
+      "aggregate_ratio": 0.9756122059495685,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "lifecycle",
+      "median_ratio": 0.9943150116975528,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "stream_256",
+      "median_ratio": 0.9862259195407896,
+      "aggregate_ratio": 0.5615071420525984,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "write_64",
+      "median_ratio": 0.9812221687655165,
+      "aggregate_ratio": 0.5702559098192258,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "read_64",
+      "median_ratio": 0.973127630946293,
+      "aggregate_ratio": 0.9277572290658336,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_read_4k",
+      "median_ratio": 0.9668291256424499,
+      "aggregate_ratio": 0.9795269961524622,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_write_4k",
+      "median_ratio": 1.16413724412627,
+      "aggregate_ratio": 2.3922937737423142,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "small_file_fsync",
+      "median_ratio": 0.9597745007406187,
+      "aggregate_ratio": 2.566474321287694,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "mkdir",
+      "median_ratio": 1.0216919418216115,
+      "aggregate_ratio": 0.9811642263266556,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "rename",
+      "median_ratio": 0.9886785421064075,
+      "aggregate_ratio": 0.9957012061305497,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "rmdir",
+      "median_ratio": 1.033976373758858,
+      "aggregate_ratio": 1.0482807909206862,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "lifecycle",
+      "median_ratio": 1.2244513824129266,
+      "pass_gate": false
+    }
+  ],
+  "excluded_check": "The external-payload 10% large-write improvement target is not a lookup acceptance condition",
+  "identities_verified": true
+}

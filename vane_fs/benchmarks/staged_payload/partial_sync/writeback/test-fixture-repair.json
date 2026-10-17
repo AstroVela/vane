@@ -1,0 +1,5 @@
+{
+  "status": "PASS",
+  "epoch": 1791712543.36586,
+  "reason": "WriteFile truncation leaves an occupied/tombstone full first block; use the intended partial-edge Write at offset 1 to reach external batches. No candidate code or performance window changed."
+}

@@ -1,0 +1,299 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -5,6 +5,7 @@
+ #include "owner_lock.hpp"
+ #include "checkpoint.hpp"
+ #include "payload_file.hpp"
++#include "staging.hpp"
+ 
+ #include <sqlite3.h>
+ 
+@@ -28,7 +29,7 @@
+ namespace {
+ constexpr int64_t BLOCK_SIZE = 4096;
+ constexpr int WAL_CHECKPOINT_PAGES = 4096;
+-constexpr int APPLICATION_ID = 0x56465833; // Isolated external-payload format.
++constexpr int APPLICATION_ID = 0x56465834; // Isolated external-payload format.
+ 
+ [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
+ 	throw Error(code, message);
+@@ -589,6 +590,7 @@
+ 		bytes.reserve(blocks.size() * BLOCK_SIZE);
+ 		for (const auto &block : blocks)
+ 			bytes += block.second;
++		Staging::Get(db).BeginBatch(db);
+ 		external = PayloadFile::Get(db).Append(bytes);
+ 	}
+ 	Statement payloads(db, payload_sql), versions(db, version_sql);
+@@ -781,6 +783,7 @@
+ 	const Durability durability;
+ 	std::unique_ptr<Checkpointer> checkpointer;
+ 	std::unique_ptr<PayloadFile> payload_file;
++	std::unique_ptr<Staging> staging;
+ 	bool new_workspace = false;
+ 
+ 	explicit Database(const std::string &path, int timeout_ms, Durability durability) : durability(durability) {
+@@ -790,12 +793,15 @@
+ 		if (sqlite3_libversion_number() < 3051003) {
+ 			Fail(ErrorCode::Storage, "SQLite 3.51.3 or later is required");
+ 		}
++		staging = std::make_unique<Staging>(path, timeout_ms);
+ 		int code = sqlite3_open_v2(
+ 		    path.c_str(), &db,
+ 		    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, nullptr);
+ 		bool owner_committed = false;
+ 		try {
+ 			Check(db, code);
++			Staging::Configure(db);
++			Check(db, sqlite3_set_clientdata(db, Staging::CLIENT_DATA, staging.get(), nullptr));
+ 			Check(db, sqlite3_busy_timeout(db, timeout_ms));
+ 			Check(db, sqlite3_extended_result_codes(db, 1));
+ 			Check(db, sqlite3_set_clientdata(db, STATEMENT_CACHE, &statements, nullptr));
+@@ -823,11 +829,12 @@
+ 			}
+ 			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
+ 			// Strict mode also synchronizes every WAL commit before returning.
+-			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
++			Check(db, sqlite3_wal_autocheckpoint(db, 0));
+ 			Exec(db, "BEGIN IMMEDIATE");
+ 			ValidateIdentity();
+ 			Initialize();
+ 			payload_file->Initialize(uuid, new_workspace);
++			staging->Initialize(uuid, new_workspace);
+ 			Exec(db, R"SQL(
+ CREATE TABLE IF NOT EXISTS owners(id TEXT PRIMARY KEY, lock_path TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL) STRICT;
+ CREATE TABLE IF NOT EXISTS mounts(branch TEXT PRIMARY KEY REFERENCES branches(id), owner TEXT NOT NULL REFERENCES owners(id)) STRICT;
+@@ -842,7 +849,7 @@
+ CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload);
+ CREATE TABLE IF NOT EXISTS sync_barrier(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL CHECK(value IN(0,1))) STRICT;
+ INSERT OR IGNORE INTO sync_barrier VALUES(1,0);
+-UPDATE format SET version=1003;
++UPDATE format SET version=1004;
+ )SQL");
+ 			owner_lock.Create(sqlite3_db_filename(db, "main"), owner);
+ 			{
+@@ -853,8 +860,10 @@
+ 				insert.Bind(4, owner_lock.inode);
+ 				insert.Step();
+ 			}
++			staging->BeforeFullCommit();
+ 			Exec(db, "COMMIT");
+ 			owner_committed = true;
++			staging->AfterFullCommit();
+ 			if (durability == Durability::Fsync) {
+ 				Exec(db, "PRAGMA synchronous=NORMAL");
+ 				// Reuse a modest WAL allocation after restart, including after a
+@@ -862,9 +871,10 @@
+ 				Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
+ 				Statement pages(db, "PRAGMA page_size");
+ 				pages.Step();
+-				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
++				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms, *staging);
+ 				sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+ 			}
++			staging->Ready();
+ 		} catch (...) {
+ 			checkpointer.reset();
+ 			if (db) {
+@@ -919,7 +929,8 @@
+ 	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false,
+ 	            bool exclusive_payload = false)
+ 	    : database(database), lock(database.mutex, std::defer_lock),
+-	      restore_normal(write && synchronous && database.durability == Durability::Fsync), write(write) {
++	      restore_normal(write && synchronous && database.durability == Durability::Fsync), write(write),
++	      full(write && (synchronous || database.durability == Durability::Strict)) {
+ 		if (database.process != OwnerLock::Process()) {
+ 			Fail(ErrorCode::Closed, "Reopen the workspace after fork");
+ 		}
+@@ -927,13 +938,15 @@
+ 		if (!database.db) {
+ 			Fail(ErrorCode::Closed, "Workspace is closed");
+ 		}
+-		payload_guard = std::make_unique<PayloadFile::Guard>(*database.payload_file, exclusive_payload);
+ 		if (write && database.checkpointer) {
+ 			if (barrier)
+ 				database.checkpointer->CheckError();
+ 			else
+ 				database.checkpointer->BeforeWrite(database.db);
+ 		}
++		if (write)
++			publication = std::make_unique<Staging::Guard>(*database.staging);
++		payload_guard = std::make_unique<PayloadFile::Guard>(*database.payload_file, exclusive_payload);
+ 		// SQLite requires changing synchronous outside a transaction. On failure
+ 		// leave FULL enabled until a subsequent successful synchronous commit.
+ 		if (restore_normal)
+@@ -969,12 +982,28 @@
+ 		}
+ 	}
+ 	void Commit() {
+-		// Even NORMAL metadata commits may reach storage opportunistically.
+-		// Make every newly published external extent durable first.
+-		if (write)
+-			database.payload_file->Flush();
++		// OPEN keeps a durable recovery prefix while NORMAL commits remain visible.
++		if (full)
++			database.staging->BeforeFullCommit();
+ 		Exec(database.db, "COMMIT");
+ 		committed = true;
++		if (full)
++			database.staging->AfterFullCommit();
++		// Strict connections retain the former 16 MiB checkpoint threshold,
++		// but only after the publication fence is durably CLEAN.
++		if (write && database.durability == Durability::Strict) {
++			int frames = -1, copied = -1;
++			auto rc = sqlite3_wal_checkpoint_v2(database.db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++			if (rc == SQLITE_OK && frames >= WAL_CHECKPOINT_PAGES) {
++				try {
++					Staging::CheckpointGuard checkpoint(*database.staging);
++					sqlite3_wal_checkpoint_v2(database.db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++				} catch (...) {
++					// Like SQLite's default auto-checkpoint hook, maintenance
++					// must not turn an already committed operation into failure.
++				}
++			}
++		}
+ 		for (const auto &pin : retired_pins) {
+ 			Pins().Forget(pin);
+ 		}
+@@ -985,10 +1014,11 @@
+ private:
+ 	Database &database;
+ 	std::unique_lock<std::mutex> lock;
++	std::unique_ptr<Staging::Guard> publication;
+ 	std::unique_ptr<PayloadFile::Guard> payload_guard;
+ 	std::vector<std::shared_ptr<SnapshotPin>> retired_pins;
+ 	bool committed = false;
+-	bool restore_normal, write;
++	bool restore_normal, write, full;
+ };
+ 
+ void CheckMount(sqlite3 *db, const std::string &branch, bool require_unmounted = false) {
+@@ -1078,7 +1108,7 @@
+ 	app.Step();
+ 	if (app.Integer(0) == APPLICATION_ID) {
+ 		Statement meta(db, "SELECT uuid,version,block_size,coordinate_bytes FROM format");
+-		if (!meta.Step() || meta.Integer(1) != 1003 || meta.Integer(2) != BLOCK_SIZE || meta.Integer(3) != 32) {
++		if (!meta.Step() || meta.Integer(1) != 1004 || meta.Integer(2) != BLOCK_SIZE || meta.Integer(3) != 32) {
+ 			Fail(ErrorCode::Storage, "Unsupported VaneFS format");
+ 		}
+ 		uuid = meta.Text(0);
+@@ -1119,7 +1149,7 @@
+ 	}
+ 	uuid = NewId();
+ 	{
+-		Statement meta(db, "INSERT INTO format VALUES(?,1003,4096,32)");
++		Statement meta(db, "INSERT INTO format VALUES(?,1004,4096,32)");
+ 		meta.Bind(1, uuid);
+ 		meta.Step();
+ 	}
+@@ -1942,6 +1972,8 @@
+ 		// The worker and its locks belong to vanished parent threads. As with
+ 		// inherited SQLite handles, abandon them without joining or destroying.
+ 		checkpointer.release();
++		staging->AbandonInherited();
++		staging.release();
+ 		owner_lock.Close();
+ 		return;
+ 	}
+@@ -1954,12 +1986,16 @@
+ 	try {
+ 		if (checkpointer)
+ 			checkpointer->CheckError();
++		Staging::Guard publication(*staging);
++		PayloadFile::Guard payload(*payload_file, false);
+ 		if (durability == Durability::Fsync)
+ 			Exec(db, "PRAGMA synchronous=FULL");
+ 		Exec(db, "BEGIN IMMEDIATE");
+ 		try {
+ 			RetireOwner(db, owner);
++			staging->BeforeFullCommit();
+ 			Exec(db, "COMMIT");
++			staging->AfterFullCommit();
+ 		} catch (...) {
+ 			sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+ 			throw;
+@@ -1976,6 +2012,7 @@
+ 		checkpointer.reset();
+ 		Check(db, sqlite3_close(db));
+ 		db = nullptr;
++		staging->ReleaseLive();
+ 		owner_lock.Remove();
+ 	} catch (...) {
+ 		if (checkpointer)
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include "vane_fs/workspace.hpp"
++#include "staging.hpp"
+ #include <sqlite3.h>
+ #include <algorithm>
+ #include <atomic>
+@@ -24,12 +25,14 @@
+ 	static constexpr int64_t START_BYTES = 16 * 1024 * 1024;
+ 	static constexpr int64_t LIMIT_BYTES = 64 * 1024 * 1024;
+ 
+-	Checkpointer(sqlite3 *writer, int page_size, int timeout_ms)
+-	    : page_size(page_size), timeout_ms(timeout_ms),
++	Checkpointer(sqlite3 *writer, int page_size, int timeout_ms, Staging &staging)
++	    : staging(staging), page_size(page_size), timeout_ms(timeout_ms),
+ 	      wal_path(std::string(sqlite3_db_filename(writer, "main")) + "-wal") {
+ 		try {
+ 			Check(sqlite3_open_v2(sqlite3_db_filename(writer, "main"), &db,
+ 			                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, nullptr));
++			Staging::Configure(db);
++			Check(sqlite3_busy_timeout(db, timeout_ms));
+ 			Check(sqlite3_exec(db, "PRAGMA synchronous=NORMAL; SELECT count(*) FROM sqlite_master", nullptr, nullptr,
+ 			                   nullptr));
+ 			Start();
+@@ -96,6 +99,9 @@
+ 		// Turning a slow local sync into Busy can cause otherwise valid FUSE
+ 		// writes to fail halfway through their requests.
+ 		std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
++		Staging::Guard publication(staging);
++		Staging::CheckpointGuard checkpoint(staging);
++		staging.Publish(db);
+ 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+ 		for (;;) {
+ 			code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+@@ -147,7 +153,19 @@
+ 			int frames = -1, copied = -1, code;
+ 			{
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++				try {
++					std::unique_ptr<Staging::CheckpointGuard> lease;
++					{
++						Staging::Guard publication(staging);
++						lease = std::make_unique<Staging::CheckpointGuard>(staging);
++						staging.Publish(db);
++					}
++					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++				} catch (const Error &failure) {
++					code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
++				} catch (...) {
++					code = SQLITE_IOERR;
++				}
+ 			}
+ 			if (code != SQLITE_OK && code != SQLITE_BUSY) {
+ 				int expected = SQLITE_OK;
+@@ -158,6 +176,7 @@
+ 		}
+ 	}
+ 
++	Staging &staging;
+ 	sqlite3 *db = nullptr;
+ 	const int page_size, timeout_ms;
+ 	const std::string wal_path;
+--- a/src/payload_file.hpp
++++ b/src/payload_file.hpp
+@@ -50,7 +50,7 @@
+ 		return *file;
+ 	}
+ 	void Initialize(const std::string &uuid, bool fresh) {
+-		std::string header = "VANE-EXTERNAL-1003:" + uuid;
++		std::string header = "VANE-STAGED-1004:" + uuid;
+ 		header.resize(BLOCK, '\0');
+ 		if (fresh) {
+ 			// A failed first initialization may leave a sidecar. Refuse it rather

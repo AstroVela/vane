@@ -1,0 +1,61 @@
+{
+  "omitted_empty_published_copies": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-budget-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-corrected-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-final-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-writeback-test.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-writeback-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-budget-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-corrected-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-final-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-budget-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-corrected-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-final-helper-build.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-writeback-test.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/baseline-mount.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/updated-mount.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "original_logs_retained_locally": true
+}

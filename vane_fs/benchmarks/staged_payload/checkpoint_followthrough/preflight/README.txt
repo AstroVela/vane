@@ -1,0 +1,1 @@
+Recorder validation initially guessed SQLite CHECKPOINT_NOOP=3, then 4. Reading the pinned header verified NOOP=-1 (TRUNCATE=3). Corrected only the expected recorder test field. Both failed validations and cleanup retained. No measurement or runtime policy change preceded the correction.

@@ -1,0 +1,18 @@
+{
+  "captured_after_measurements": true,
+  "scheduler_statistics_enabled": "0",
+  "perf_event_paranoid": "4",
+  "kernel": "6.11.0-24-generic",
+  "kernel_config": {
+    "CONFIG_TASK_DELAY_ACCT": "y",
+    "CONFIG_SCHED_INFO": "y",
+    "CONFIG_SCHEDSTATS": "y"
+  },
+  "task_delayacct": "0",
+  "schedstat_interpretation": "Per-task runtime and run_delay are enabled by CONFIG_SCHED_INFO=y, independently of runtime sched_schedstats=0.",
+  "primary_sources": [
+    "https://github.com/torvalds/linux/blob/v6.11/fs/proc/base.c#L450",
+    "https://github.com/torvalds/linux/blob/v6.11/include/linux/sched/stat.h#L22",
+    "https://github.com/torvalds/linux/blob/v6.11/kernel/sched/stats.h#L187"
+  ]
+}

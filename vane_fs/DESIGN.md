@@ -91,7 +91,8 @@ can commit together. Initial table responsibilities are:
 | `inode_ids` | Monotonic SQLite integer | Allocates inode identities across all branches |
 | `owners` | Connection ID | OS lock location and file identity used to prove an owner has exited |
 | `mounts` | Branch ID | Exclusive writable mount owner |
-| `open_inodes` | Owner, branch, inode | Kernel lookup and open reference counts |
+| `open_inodes` | Owner, branch, inode | Durable pin while any lookup/open reference remains |
+| `temp.inode_references` | Branch, inode | Exact reference counts, private to each connection in memory |
 | `orphans` | Branch, inode | Unlinked nodes retained until their final reference closes |
 
 All three version tables carry `low`, `high`, `writer`, and `deleted`.
@@ -103,6 +104,21 @@ PLAN`; a constant-size visibility predicate does not imply constant-time I/O.
 Payloads are separate from version rows so splitting an inherited block's
 interval does not duplicate its bytes. Payload deduplication is deferred;
 semantic comparisons inspect bytes when payload IDs differ.
+Writes of at least 8 KiB check whether any block version intersects both the
+written block range and the replacement visibility interval. Only an entirely
+vacant range uses batches of up to 64 nonzero blocks, with one payload insert
+and one version insert per batch. The check includes tombstones and versions
+beyond the current read point; occupied ranges retain the usual interval
+splitting and unchanged-payload handling. Partial blocks in a vacant range are
+zero-filled, and all-zero blocks remain sparse.
+
+The enclosing `BEGIN IMMEDIATE` transaction serializes allocation of consecutive
+payload IDs above the current maximum. If the integer range cannot fit the
+write, the existing SQLite rowid allocation path is used. Every batch, inode
+update and branch-generation update commits or rolls back together. The batch
+holds at most 256 KiB of content before SQLite's binding copies; it does not
+change the format, 4 KiB logical blocks, checkpoint policy or durability mode.
+
 Allocate inode IDs across the entire workspace, including all branches.
 An index on `block_versions(payload)` supports GC reference checks; without
 it the correlated payload check scanned all block versions for each payload.
@@ -202,13 +218,52 @@ underlying serialization; the application must still enforce this ordering.
 The implementation configures WAL, `synchronous=FULL`, foreign-key checks and a
 bounded busy timeout on each connection, and verifies that WAL was enabled.
 Lock contention beyond the timeout raises `Busy`; other SQLite failures raise
-`Storage`. Apart from deferred pin cleanup, there is no additional application
-retry or cancellation mechanism.
+`Storage`. Deferred pin cleanup and background checkpoints retry maintenance;
+filesystem operations are not automatically replayed.
 Callers may retry complete operations, never an arbitrary suffix of a failed
 split. Keep SQL read transactions short; application snapshots and pins provide
 longer retention without holding a SQLite transaction for an entire query.
 The [synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous)
 describes the durability tradeoff; weakening it must be an explicit option.
+
+Strict connections trigger a passive WAL checkpoint at 4,096 pages (16 MiB with
+the default 4 KiB pages), amortizing checkpoint syncs across more commits than
+SQLite's default 1,000-page threshold. Every mutation still synchronizes its
+WAL commit before returning. The threshold is not a size limit: a transaction
+can exceed it and active readers can delay checkpoint progress. Larger WALs
+also increase recovery/closing work and can affect reads; see the
+[checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) and SQLite's
+[checkpoint documentation](https://www.sqlite.org/wal.html#checkpointing).
+
+Fsync-mode connections replace the automatic checkpoint hook with a notification
+to a per-connection worker. It runs passive checkpoints on a separate SQLite
+connection at a 16 MiB WAL threshold and retries incomplete work at 20 ms
+intervals. An idle, fully checkpointed database needs no polling. The hook
+always returns success: the triggering transaction has already committed, so
+checkpoint failures must not masquerade as a rolled-back write. Worker errors
+are latched until a mutation, barrier or explicit close reports them.
+
+Write admission queries `SQLITE_CHECKPOINT_NOOP` for current WAL frames. If
+another checkpointer holds its status lock, WAL file length provides a
+conservative upper bound. At 64 MiB, admission waits for a restart checkpoint
+before opening the write transaction, bounded by the connection's busy timeout.
+Waiting for this connection's in-flight checkpoint I/O is outside that lock
+timeout, just as foreground SQLite writes and syncs are. A slow disk alone
+must not turn a single connection's ongoing checkpoint into a Busy error.
+This also handles a fully backfilled log whose readers still prevent reuse.
+The budget accounts for page size and WAL frame headers; it does not mistake
+reusable file allocation for uncheckpointed data. `journal_size_limit` reduces
+retained allocation to 16 MiB on reuse. A transaction admitted below the budget
+can exceed it, and other connections may write in the interval before admission
+acquires the writer lock. Strict/external writers retain their own policies.
+
+FULL `Sync()` barriers bypass admission so callers can persist acknowledged
+writes even with a pinned WAL reader. Synchronous handle writes still undergo
+admission. Close joins the worker before its final FULL owner-retirement commit,
+reports pending checkpoint errors and restarts the worker if close fails.
+Inherited worker state is abandoned along with inherited SQLite handles after
+`fork()`; it must never be joined or reused in the child. No file format or
+snapshot visibility changes are involved.
 
 The native build and runtime require SQLite 3.51.3 or later. The pinned build
 uses 3.53.2, independent of the Python runtime's SQLite version. See the
@@ -233,6 +288,13 @@ blocks and clear the unused tail of its final block so re-extension cannot
 reveal old bytes. Writing data and unlinking or renaming its entry must never
 leave a partially updated namespace after a crash.
 
+Each SQLite connection reuses prepared statements under its existing mutex,
+resetting execution and clearing bindings after each use. This cache stores SQL
+programs, not branch frontiers or file contents. Offset reads fetch visible
+payloads for the requested block range in one ordered join, leaving holes zero.
+Full-block writes skip the preliminary read used for partial-block patching;
+payload equality checks and copy-on-write interval updates still run.
+
 Renames update directory entries atomically while preserving inode identity.
 Enforce directory-cycle checks, file/directory replacement rules and
 empty-directory requirements. Handle identity is a branch/snapshot plus inode,
@@ -249,11 +311,39 @@ mount is released, so snapshots and merges cannot capture transient orphans.
 Existing snapshots and other branches remain usable. The optional fsspec
 adapter's handles refer to immutable, pinned snapshots.
 
-Mutable mounts disable kernel writeback and data caching, use zero attribute
-and entry timeouts, and commit every mutation with SQLite `synchronous=FULL`.
-Read-only snapshot mounts may cache immutable bytes. Each mount currently uses
-one dispatch loop and one SQLite connection. The supported POSIX subset and
-metadata limitations are listed in [the usage guide](README.md#native-commands-and-linux-mounts).
+The first live reference inserts a durable `open_inodes` row. Further lookup
+and open references update only `temp.inode_references`; the last release
+deletes the durable pin and reclaims any orphan in the same transaction.
+SQLite rolls back temporary counts along with failed pin, namespace and lease
+operations, so retrying a failed release cannot lose or duplicate references.
+The [temporary store](https://www.sqlite.org/pragma.html#pragma_temp_store)
+uses memory. These counts need not survive process exit: recovery retires the
+dead owner's durable pins after proving its OS lock is available. Live owners
+remain protected from recovery and garbage collection.
+
+The persistent schema stays at format 2; new pins use its existing `refs`
+column with value 1, and legacy owners' positive counts remain valid pins.
+All sessions sharing a connection share the temporary counts, keyed by both
+branch and inode. Lease release clears that branch's counts transactionally.
+Reference operations still acquire the SQLite writer lock; this removes
+repeated WAL writes and syncs, not writer-lock contention. File-content and
+namespace/attribute mutations retain their FULL commit boundary.
+
+Mutable mounts disable kernel writeback and data caching and commit every
+mutation with SQLite `synchronous=FULL`. Positive directory entries and inode
+attributes use a 60-second kernel timeout. The exclusive lease keeps all live
+mutations on this mount; Linux's mutation paths invalidate affected metadata.
+The [libfuse guidance](https://github.com/libfuse/libfuse/blob/fuse-3.14.0/include/fuse_common.h)
+supports attribute caching when all changes go through the kernel.
+Missing entries are not cached. Writes and O_TRUNC additionally invalidate all
+inode attributes before replying: Linux's size/mtime invalidation alone does
+not cover VaneFS's atime alias when statx requests only atime. These notifications
+invalidate attributes only, without flushing or invalidating file data. Future
+out-of-band writers must add invalidation notifications before sharing a branch
+with a cached mount. Read-only snapshots may also cache immutable file bytes.
+Each mount currently uses one dispatch loop and one SQLite connection. The
+supported POSIX subset and metadata limitations are listed in
+[the usage guide](README.md#native-commands-and-linux-mounts).
 
 Directory cookies index a fixed entry list owned by each `opendir` handle.
 `readdir` uses that list for the handle's lifetime, including rewinds, so a

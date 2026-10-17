@@ -1,0 +1,47 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -154,25 +154,29 @@
+ 			bool deferred = false;
+ 			{
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				if (!retry) {
+-					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+-					deferred =
+-					    code == SQLITE_OK && frames >= copied && copied >= 0 && Bytes(frames - copied) < START_BYTES;
+-				}
+-				if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
+-					try {
+-						std::unique_ptr<Staging::CheckpointGuard> lease;
+-						{
+-							Staging::Guard publication(staging);
++				try {
++					std::unique_ptr<Staging::CheckpointGuard> lease;
++					{
++						Staging::Guard publication(staging);
++						// Only unpublished external data needs coalesced publication.
++						// Once CLEAN, promptly backfill inline/namespace commits using
++						// the original wake policy, even below the uncopied-byte budget.
++						if (!retry && staging.Pending()) {
++							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
++							           Bytes(frames - copied) < START_BYTES;
++						}
++						if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
+ 							lease = std::make_unique<Staging::CheckpointGuard>(staging);
+ 							staging.Publish(db);
+ 						}
++					}
++					if (lease)
+ 						code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
+-					} catch (const Error &failure) {
+-						code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
+-					} catch (...) {
+-						code = SQLITE_IOERR;
+-					}
++				} catch (const Error &failure) {
++					code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
++				} catch (...) {
++					code = SQLITE_IOERR;
+ 				}
+ 			}
+ 			if (code != SQLITE_OK && code != SQLITE_BUSY) {

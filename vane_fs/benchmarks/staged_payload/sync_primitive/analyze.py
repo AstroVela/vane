@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Reconcile the actual WAL primitive and compare every complete native phase."""
+
+import argparse
+import collections
+import hashlib
+import json
+import math
+import statistics
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def distribution(values):
+    ordered = sorted(values)
+    return dict(
+        count=len(values),
+        total=sum(values),
+        median=statistics.median(values) if values else 0,
+        p99=ordered[min(len(ordered) - 1, math.ceil(len(ordered) * 0.99) - 1)] if values else 0,
+        maximum=max(values, default=0),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    args = parser.parse_args()
+    out = args.artifacts.resolve()
+    raw_path, plan_path = out / "results.json", out / "plan.json"
+    raw, plan = (json.loads(path.read_text()) for path in (raw_path, plan_path))
+    assert raw["status"] == "PASS" and len(raw["runs"]) == 36
+    result = dict(
+        status="PASS",
+        diagnostic_only=True,
+        interpretation="Native core operations, not FUSE acceptance throughput; inclusive/overlapping intervals are not additive",
+        inputs={str(p): digest(p) for p in (Path(__file__), raw_path, plan_path)},
+        runs=[],
+        groups=[],
+        pairs=[],
+        sync_tails=[],
+    )
+    grouped = collections.defaultdict(list)
+    for row in raw["runs"]:
+        label = f"{row['state']}-{row['rep']}-{row['variant']}"
+        path = out / "runs" / (label + "-trace.json")
+        result["inputs"][str(path)] = digest(path)
+        trace = json.loads(path.read_text())
+        stages = trace["stages"]
+        requests, syncs, checkpoints = [], [], []
+        for thread in trace["threads"]:
+            rows = [dict(zip(trace["columns"], value, strict=True)) for value in thread["rows"]]
+            requests.extend(
+                r
+                for r in rows
+                if r["name"] not in ("checkpoint_worker", "phase_small_file_fsync")
+                and row["begin_ns"] <= r["begin_ns"] < row["end_ns"]
+            )
+            for value in thread["syncs"]:
+                s = dict(zip(trace["sync_columns"], value, strict=True), tid=thread["tid"])
+                s["request"] = rows[s["request_index"]]["name"] if s["request_index"] >= 0 else "unscoped"
+                assert s["result"] == s["errno"] == 0
+                if row["begin_ns"] <= s["begin_ns"] < row["end_ns"]:
+                    syncs.append(s)
+                    if s["end_ns"] - s["begin_ns"] >= 100_000_000:
+                        result["sync_tails"].append(dict(label=label, **s))
+            checkpoints.extend(
+                v for v in thread["checkpoints"] if row["begin_ns"] <= v[5] < row["end_ns"] and v[1] != -1
+            )
+        wal = [s for s in syncs if s["request"] == "fsync" and s["kind"] == "wal"]
+        database = [s for s in syncs if s["request"] == "checkpoint_worker" and s["kind"] == "database"]
+        assert len(wal) == 128
+        assert len([r for r in requests if r["name"] == "fsync"]) == 128
+        assert all(s["operation"] == row["variant"] for s in wal + database)
+        if row["state"] == "cold":
+            assert not checkpoints and not database
+        else:
+            assert checkpoints and database
+        assert all(v[1] == 0 and v[4] == 0 for v in checkpoints), "Unexpected restart or checkpoint error"
+        overlapping = [
+            s for s in wal if any(s["begin_ns"] < d["end_ns"] and d["begin_ns"] < s["end_ns"] for d in database)
+        ]
+        entry = dict(
+            label=label,
+            state=row["state"],
+            variant=row["variant"],
+            rep=row["rep"],
+            seconds=row["seconds"],
+            operations_per_second=128 / row["seconds"],
+            operation_ns=distribution(row["operation_ns"]),
+            foreground_wal_sync_ns=distribution([s["end_ns"] - s["begin_ns"] for s in wal]),
+            worker_database_sync_ns=distribution([s["end_ns"] - s["begin_ns"] for s in database]),
+            measured_syncs=syncs,
+            passive_calls=len(checkpoints),
+            foreground_wal_syncs_overlapping_worker_database=len(overlapping),
+            request_cpu_ns=sum(r["cpu_ns"] for r in requests),
+            begin_ns=sum(r["stage_ns"][stages.index("begin")] for r in requests),
+            publication_wait_ns=sum(r["stage_ns"][stages.index("publication_wait")] for r in requests),
+        )
+        result["runs"].append(entry)
+        grouped[(row["state"], row["variant"])].append(entry)
+    for (state, variant), runs in sorted(grouped.items()):
+        result["groups"].append(
+            dict(
+                state=state,
+                variant=variant,
+                **{
+                    metric: distribution([r[metric] for r in runs])
+                    for metric in (
+                        "seconds",
+                        "operations_per_second",
+                        "passive_calls",
+                        "request_cpu_ns",
+                        "begin_ns",
+                        "publication_wait_ns",
+                    )
+                },
+                aggregate_operations_per_second=768 / sum(r["seconds"] for r in runs),
+                pooled_operation_ns=distribution(
+                    [
+                        value
+                        for row in raw["runs"]
+                        if row["state"] == state and row["variant"] == variant
+                        for value in row["operation_ns"]
+                    ]
+                ),
+                foreground_wal_sync_ns=distribution([r["foreground_wal_sync_ns"]["total"] for r in runs]),
+                worker_database_sync_ns=distribution([r["worker_database_sync_ns"]["total"] for r in runs]),
+            )
+        )
+    for state in plan["states"]:
+        for rep in range(6):
+            a, q = (
+                next(r for r in result["runs"] if r["state"] == state and r["rep"] == rep and r["variant"] == v)
+                for v in ("fsync", "fdatasync")
+            )
+            result["pairs"].append(
+                dict(
+                    state=state,
+                    rep=rep,
+                    fsync_seconds=a["seconds"],
+                    fdatasync_seconds=q["seconds"],
+                    fdatasync_rate_ratio=a["seconds"] / q["seconds"],
+                )
+            )
+    (out / "findings.json").write_text(json.dumps(result, indent=2) + "\n")
+    print("PASS 36 runs; all 4,608 FULL WAL syncs retained;", len(result["sync_tails"]), "syncs >=100ms", flush=True)
+
+
+if __name__ == "__main__":
+    main()

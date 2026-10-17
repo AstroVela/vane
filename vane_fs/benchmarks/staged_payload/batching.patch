@@ -1,0 +1,86 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -150,28 +150,36 @@
+ 			}
+ 			requested = false;
+ 			lock.unlock();
+-			int frames = -1, copied = -1, code;
++			int frames = -1, copied = -1, code = SQLITE_OK;
++			bool deferred = false;
+ 			{
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				try {
+-					std::unique_ptr<Staging::CheckpointGuard> lease;
+-					{
+-						Staging::Guard publication(staging);
+-						lease = std::make_unique<Staging::CheckpointGuard>(staging);
+-						staging.Publish(db);
++				if (!retry) {
++					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++					deferred =
++					    code == SQLITE_OK && frames >= copied && copied >= 0 && Bytes(frames - copied) < START_BYTES;
++				}
++				if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
++					try {
++						std::unique_ptr<Staging::CheckpointGuard> lease;
++						{
++							Staging::Guard publication(staging);
++							lease = std::make_unique<Staging::CheckpointGuard>(staging);
++							staging.Publish(db);
++						}
++						code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++					} catch (const Error &failure) {
++						code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
++					} catch (...) {
++						code = SQLITE_IOERR;
+ 					}
+-					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
+-				} catch (const Error &failure) {
+-					code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
+-				} catch (...) {
+-					code = SQLITE_IOERR;
+ 				}
+ 			}
+ 			if (code != SQLITE_OK && code != SQLITE_BUSY) {
+ 				int expected = SQLITE_OK;
+ 				error.compare_exchange_strong(expected, code);
+ 			}
+-			retry = code != SQLITE_OK || frames > copied;
++			retry = !deferred && (code != SQLITE_OK || frames > copied);
+ 			lock.lock();
+ 		}
+ 	}
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -108,3 +108,12 @@
+  add_test(NAME vane_fs_external_faults COMMAND vane_fs_external_faults_test "${CMAKE_CURRENT_BINARY_DIR}/owned-external-faults")
+  set_tests_properties(vane_fs_external_faults PROPERTIES TIMEOUT 120)
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_checkpoint_coalescing_test tests/test_checkpoint_coalescing.cpp)
++  target_include_directories(vane_fs_checkpoint_coalescing_test PRIVATE src)
++  target_link_libraries(vane_fs_checkpoint_coalescing_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  target_link_options(vane_fs_checkpoint_coalescing_test PRIVATE "LINKER:--wrap=sqlite3_wal_checkpoint_v2")
++  add_test(NAME vane_fs_checkpoint_coalescing COMMAND vane_fs_checkpoint_coalescing_test "${CMAKE_CURRENT_BINARY_DIR}/owned-coalescing-test")
++  set_tests_properties(vane_fs_checkpoint_coalescing PROPERTIES TIMEOUT 30)
++endif()
+--- a/tests/test_checkpoint_coalescing.cpp
++++ b/tests/test_checkpoint_coalescing.cpp
+@@ -72,11 +72,15 @@
+ 			}
+ 		} cleanup {root};
+ 		auto path = (root / "workspace.sqlite").string();
++		vane_fs::Workspace workspace(path);
+ 		Connection writer(path.c_str()), reader(path.c_str()), progress(path.c_str());
+ 		writer.SQL("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0; "
+ 		           "PRAGMA journal_size_limit=16777216; CREATE TABLE padding(data BLOB)");
+ 		progress.SQL("SELECT count(*) FROM padding");
+-		vane_fs::Checkpointer worker(writer.db, 4096, 1000);
++		vane_fs::Staging staging(path, 1000);
++		staging.Initialize(workspace.Id(), false);
++		staging.Ready();
++		vane_fs::Checkpointer worker(writer.db, 4096, 1000, staging);
+ 		// Release the paused worker even if a later assertion fails.
+ 		struct Resume {
+ 			~Resume() {

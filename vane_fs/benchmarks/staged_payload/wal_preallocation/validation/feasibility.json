@@ -1,0 +1,102 @@
+{
+  "status": "PASS",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_preallocation/feasibility.cpp": "2c48e7eb2b552d979fe00207f1e7a15f562843df98c6967fb3a83ec2e9a64fe4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fsync": "da55f51679451bd8554e4e72b2fd55a138a1c422506a324c411a57828c4e9579",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fdatasync": "fb5f2dea2f378b8f62bd9fa356e09248505e53036d46116875091edfda4a5deb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release/lib/libsqlite3.a": "b951954b26fb6e11ba2e3cc3856f8723d785528217ade313fbe4ad37acdc3353"
+  },
+  "commands": [
+    {
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_preallocation/feasibility.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=pwrite64",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fsync"
+      ],
+      "start": 1791889357.942059,
+      "end": 1791889358.6083682,
+      "returncode": 0
+    },
+    {
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fsync",
+        "/dev/shm/owned-wal-feasibility-hbrz_rc1/db.sqlite"
+      ],
+      "start": 1791889358.6085844,
+      "end": 1791889358.6250608,
+      "returncode": 0
+    },
+    {
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_preallocation/feasibility.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=pwrite64",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fdatasync"
+      ],
+      "start": 1791889358.6504962,
+      "end": 1791889359.2668493,
+      "returncode": 0
+    },
+    {
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/feasibility-fdatasync",
+        "/dev/shm/owned-wal-feasibility-47rag_ob/db.sqlite"
+      ],
+      "start": 1791889359.2669797,
+      "end": 1791889359.2823856,
+      "returncode": 0
+    }
+  ],
+  "cases": [
+    {
+      "variant": "fsync",
+      "status": "PASS",
+      "before_bytes": 12392,
+      "reserved_bytes": 16777216,
+      "allocation_pwrite_calls": 4093,
+      "allocation_requested_bytes": 4093,
+      "prefix_unchanged": true,
+      "reopened_content": true
+    },
+    {
+      "variant": "fdatasync",
+      "status": "PASS",
+      "before_bytes": 12392,
+      "reserved_bytes": 16777216,
+      "allocation_pwrite_calls": 4093,
+      "allocation_requested_bytes": 4093,
+      "prefix_unchanged": true,
+      "reopened_content": true
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-wal-feasibility-hbrz_rc1",
+      "removed": true,
+      "process_stopped": true
+    },
+    {
+      "path": "/dev/shm/owned-wal-feasibility-47rag_ob",
+      "removed": true,
+      "process_stopped": true
+    }
+  ]
+}

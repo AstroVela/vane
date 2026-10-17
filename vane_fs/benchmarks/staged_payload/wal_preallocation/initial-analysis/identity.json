@@ -1,0 +1,14 @@
+{
+  "status": "PASS",
+  "reason": "Reduce redundant uninstrumented-core request fields in the retained derived report; all raw traces and measured sync records remain unchanged.",
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/initial-analysis/findings.json": {
+      "sha256": "08e35f471abe838ba55700b3f4f5cea8b71fffb24f851030503a9a5d227e488f",
+      "bytes": 8145487
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/initial-analysis/analyze.py.txt": {
+      "sha256": "1332a15c1f281eb8d11f6dabd11592c8872bee29234e4b4fb094c64c14d01f65",
+      "bytes": 8182
+    }
+  }
+}

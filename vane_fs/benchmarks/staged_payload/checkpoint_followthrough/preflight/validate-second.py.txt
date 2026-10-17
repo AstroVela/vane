@@ -1,0 +1,155 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Verify sync attribution, descriptor reuse, nesting, concurrency and errno."""
+
+import argparse
+import collections
+import errno
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def check_trace(path):
+    trace = json.loads(path.read_text())
+    kinds, errors, unscoped, calls = set(), [], 0, 0
+    for thread in trace["threads"]:
+        rows = [dict(zip(trace["columns"], row, strict=True)) for row in thread["rows"]]
+        selected = collections.defaultdict(list)
+        for values in thread["syncs"]:
+            call = dict(zip(trace["sync_columns"], values, strict=True))
+            assert call["end_ns"] >= call["begin_ns"] and call["cpu_ns"] >= 0 and call["probe_ns"] >= 0
+            kinds.add(call["kind"])
+            calls += 1
+            if call["result"]:
+                errors.append(call["errno"])
+            else:
+                assert call["errno"] == 0
+            index = call["request_index"]
+            if index < 0:
+                assert call["site"] == "unmarked"
+                unscoped += 1
+                continue
+            row = rows[index]
+            name = row["name"]
+            expected_site = (
+                "nested_outer"
+                if name == "nested_payload"
+                else "unmarked"
+                if name.split("_")[0] in ("error", "eintr", "invalid")
+                else "success"
+            )
+            assert call["site"] == expected_site
+            expected = name.split("_")[0] if name.split("_")[0] in kinds else name.split("_")[1]
+            assert call["kind"] == expected, (name, call)
+            assert row["begin_ns"] <= call["begin_ns"] <= call["end_ns"] <= row["end_ns"]
+            if call["file_size"] >= 0 and call["kind"] != "directory":
+                assert call["file_size"] == 4
+            selected[index].append(call)
+        for index, row in enumerate(rows):
+            for operation in ("fsync", "fdatasync"):
+                stage = trace["stages"].index(operation)
+                subset = [c for c in selected[index] if c["operation"] == operation]
+                assert row["counts"][stage] == len(subset)
+                assert row["stage_ns"][stage] == sum(c["end_ns"] - c["begin_ns"] for c in subset)
+    probes = [(t, i, dict(zip(trace["columns"], r, strict=True))) for t in trace["threads"] for i, r in enumerate(t["rows"]) if r[0] == "recorder_probe"]
+    assert len(probes) == 1
+    thread, index, probe = probes[0]
+    assert probe["decision"][1:] == [0, 5000, 4999, 0, 1, 1234567]
+    calls_wal = [c for c in thread["checkpoints"] if c[0] == index]
+    assert len(calls_wal) == 1 and calls_wal[0][1:5] == [4, -1, -1, 0]
+    assert probe["begin_ns"] <= calls_wal[0][5] <= calls_wal[0][6] <= probe["end_ns"]
+    assert kinds == {"database", "payload", "wal", "fence", "directory", "other"}
+    assert sorted(errors) == sorted([errno.EIO, errno.EINTR, errno.EBADF])
+    assert unscoped == 2 and calls == 25
+    return dict(calls=calls, kinds=sorted(kinds), errors=errors, unscoped=unscoped)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    parser.add_argument("--sqlite-prefix", type=Path, required=True)
+    args = parser.parse_args()
+    out = args.artifacts.resolve()
+    here, sdk = Path(__file__).resolve().parent, args.sqlite_prefix.resolve()
+    report = dict(status="RUNNING", runs=[], cleanup=[], inputs={})
+    for path in (
+        here / "validate.py",
+        here / "test_trace.cpp",
+        here / "trace.cpp",
+        here / "trace.hpp",
+        sdk / "lib/libsqlite3.a",
+    ):
+        report["inputs"][str(path)] = digest(path)
+    try:
+        for mode in ("release", "sanitize"):
+            binary = out / (mode + "-trace-test")
+            argv = [
+                "c++",
+                "-std=c++17",
+                "-O2",
+                "-I" + str(here),
+                "-I" + str(sdk / "include"),
+                str(here / "test_trace.cpp"),
+                str(here / "trace.cpp"),
+                str(sdk / "lib/libsqlite3.a"),
+                "-ldl",
+                "-pthread",
+            ]
+            if mode == "sanitize":
+                argv += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+            argv += [
+                "-Wl,--wrap=" + s
+                for s in ("sqlite3_wal_checkpoint_v2", "pread", "pwrite", "pread64", "pwrite64", "sync_file_range")
+            ]
+            argv += ["-o", str(binary)]
+            start = time.time()
+            with (out / (mode + "-trace-build.log")).open("w") as log:
+                subprocess.run(argv, stdout=log, stderr=log, check=True, timeout=120)
+            report["runs"].append(dict(label=mode + "-build", argv=argv, started_epoch=start, ended_epoch=time.time()))
+            report["inputs"][str(binary)] = digest(binary)
+            work = Path(tempfile.mkdtemp(prefix="owned-vane-sync-trace-", dir="/dev/shm"))
+            try:
+                start = time.time()
+                with (out / (mode + "-trace-test.log")).open("w") as log:
+                    subprocess.run(
+                        [str(binary), str(work / "db.sqlite")],
+                        stdout=log,
+                        stderr=log,
+                        check=True,
+                        timeout=60,
+                        env=dict(os.environ, ASAN_OPTIONS="abort_on_error=1", UBSAN_OPTIONS="halt_on_error=1"),
+                    )
+                trace = work / "db.sqlite.request-costs.json"
+                result = check_trace(trace)
+                shutil.copy2(trace, out / (mode + "-test-trace.json"))
+                report["runs"].append(
+                    dict(label=mode + "-test", started_epoch=start, ended_epoch=time.time(), result=result)
+                )
+            finally:
+                files = [
+                    dict(path=str(p), bytes=p.stat().st_size, sha256=digest(p)) for p in work.iterdir() if p.is_file()
+                ]
+                shutil.rmtree(work)
+                report["cleanup"].append(dict(path=str(work), removed=not work.exists(), files=files))
+        report["status"] = "PASS"
+        print("sync recorder Release and ASAN/UBSAN PASS", flush=True)
+    except BaseException as error:
+        report.update(status="FAIL", error=repr(error))
+        raise
+    finally:
+        (out / "sync-tests.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

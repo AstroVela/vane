@@ -1,0 +1,195 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -28,0 +29,6 @@
++// Experimental format; built only in the isolated benchmark directory.
++#ifndef VANE_FS_EXTENT_BYTES
++#define VANE_FS_EXTENT_BYTES 65536
++#endif
++constexpr size_t EXTENT_BLOCKS = VANE_FS_EXTENT_BYTES / BLOCK_SIZE;
++static_assert(VANE_FS_EXTENT_BYTES == 65536 || VANE_FS_EXTENT_BYTES == 262144);
+@@ -30 +36 @@
+-constexpr int APPLICATION_ID = 0x56465331;
++constexpr int APPLICATION_ID = 0x56465831; // VFX1: incompatible experimental format
+@@ -231 +237 @@
+-	return table == INODES ? "kind, size, mode, mtime_ns" : table == DIRENTS ? "inode" : "payload";
++	return table == INODES ? "kind, size, mode, mtime_ns" : table == DIRENTS ? "inode" : "payload, payload_offset";
+@@ -240 +246 @@
+-	return table == INODES ? 4 : 1;
++	return table == INODES ? 4 : table == BLOCKS ? 2 : 1;
+@@ -468,7 +474,38 @@
+-std::string Payload(sqlite3 *db, int64_t id) {
+-	Statement statement(db, "SELECT data FROM block_payloads WHERE id=?");
+-	statement.Bind(1, id);
+-	if (!statement.Step()) {
+-		Fail(ErrorCode::Storage, "Missing block payload");
+-	}
+-	return statement.Bytes(0);
++// Read only the requested slice; never materialize an entire extent for 4 KiB I/O.
++class PayloadReader {
++public:
++	explicit PayloadReader(sqlite3 *db) : db(db) {
++	}
++	~PayloadReader() {
++		sqlite3_blob_close(blob);
++	}
++	PayloadReader(const PayloadReader &) = delete;
++	PayloadReader &operator=(const PayloadReader &) = delete;
++	void Read(int64_t id, int64_t block_offset, int source_offset, int amount, char *target) {
++		if (!blob || current != id) {
++			int rc = blob ? sqlite3_blob_reopen(blob, id)
++			              : sqlite3_blob_open(db, "main", "block_payloads", "data", id, 0, &blob);
++			if (rc == SQLITE_ERROR)
++				Fail(ErrorCode::Storage, "Missing block payload");
++			Check(db, rc);
++			current = id;
++		}
++		auto size = sqlite3_blob_bytes(blob);
++		if (size < BLOCK_SIZE || size > 262144 || size % BLOCK_SIZE || block_offset < 0 || block_offset % BLOCK_SIZE ||
++		    block_offset > size - BLOCK_SIZE) {
++			Fail(ErrorCode::Storage, "Invalid block payload slice");
++		}
++		Check(db, sqlite3_blob_read(blob, target, amount, int(block_offset) + source_offset));
++	}
++
++private:
++	sqlite3 *db;
++	sqlite3_blob *blob = nullptr;
++	int64_t current = 0;
++};
++
++std::string Payload(sqlite3 *db, int64_t id, int64_t offset) {
++	std::string data(BLOCK_SIZE, '\0');
++	PayloadReader reader(db);
++	reader.Read(id, offset, 0, BLOCK_SIZE, &data[0]);
++	return data;
+@@ -479 +516 @@
+-	return Get(db, BLOCKS, {inode, {}, block}, view.point, record) ? Payload(db, record.fields[0])
++	return Get(db, BLOCKS, {inode, {}, block}, view.point, record) ? Payload(db, record.fields[0], record.fields[1])
+@@ -488,4 +525,3 @@
+-	// Keep absent blocks as zeroes. A LEFT JOIN must expose a missing payload
+-	// as corruption, rather than silently turning a dangling reference into a hole.
+-	Statement blocks(db, "SELECT b.block,p.data FROM block_versions b "
+-	                     "LEFT JOIN block_payloads p ON p.id=b.payload "
++	// Sparse blocks stay zero. The blob reader diagnoses dangling references.
++	PayloadReader reader(db);
++	Statement blocks(db, "SELECT b.block,b.payload,b.payload_offset FROM block_versions b "
+@@ -506,7 +541,0 @@
+-		auto bytes = blocks.BytesData(1);
+-		if (!bytes) {
+-			Fail(ErrorCode::Storage, "Missing block payload");
+-		}
+-		if (blocks.BytesSize(1) != BLOCK_SIZE) {
+-			Fail(ErrorCode::Storage, "Invalid block payload size");
+-		}
+@@ -517 +546,2 @@
+-		std::memcpy(&result[size_t(target_offset)], bytes + source_offset, size_t(amount));
++		reader.Read(blocks.Integer(1), blocks.Integer(2), int(source_offset), int(amount),
++		            &result[size_t(target_offset)]);
+@@ -528 +558 @@
+-			Put(db, BLOCKS, key, {0}, view, true);
++			Put(db, BLOCKS, key, {0, 0}, view, true);
+@@ -532 +562 @@
+-	if (exists && Payload(db, old.fields[0]) == data) {
++	if (exists && Payload(db, old.fields[0], old.fields[1]) == data) {
+@@ -538 +568 @@
+-	Put(db, BLOCKS, key, {sqlite3_last_insert_rowid(db)}, view);
++	Put(db, BLOCKS, key, {sqlite3_last_insert_rowid(db), 0}, view);
+@@ -546,2 +576,12 @@
+-	std::string payload_sql = "INSERT INTO block_payloads(id,data) VALUES ";
+-	std::string version_sql = "INSERT INTO block_versions(inode,block,low,high,writer,deleted,payload) VALUES ";
++	// One immutable extent, with independent 4 KiB version references.
++	std::string data;
++	data.reserve(blocks.size() * BLOCK_SIZE);
++	for (const auto &block : blocks)
++		data += block.second;
++	Statement payloads(db, "INSERT INTO block_payloads(id,data) VALUES(?,?)");
++	auto payload = ++last_payload;
++	payloads.Bind(1, payload);
++	payloads.BindBytes(2, data);
++	payloads.Step();
++	std::string version_sql =
++	    "INSERT INTO block_versions(inode,block,low,high,writer,deleted,payload,payload_offset) VALUES ";
+@@ -549,2 +589 @@
+-		if (i) {
+-			payload_sql += ',';
++		if (i)
+@@ -552,5 +591,3 @@
+-		}
+-		payload_sql += "(?,?)";
+-		version_sql += "(?1,?" + std::to_string(5 + 2 * i) + ",?2,?3,?4,0,?" + std::to_string(6 + 2 * i) + ")";
+-	}
+-	Statement payloads(db, payload_sql), versions(db, version_sql);
++		version_sql += "(?1,?" + std::to_string(6 + i) + ",?2,?3,?4,0,?5," + std::to_string(i * BLOCK_SIZE) + ")";
++	}
++	Statement versions(db, version_sql);
+@@ -561,8 +598,3 @@
+-	for (size_t i = 0; i < blocks.size(); ++i) {
+-		auto payload = ++last_payload;
+-		payloads.Bind(int(1 + 2 * i), payload);
+-		payloads.BindBytes(int(2 + 2 * i), blocks[i].second);
+-		versions.Bind(int(5 + 2 * i), blocks[i].first);
+-		versions.Bind(int(6 + 2 * i), payload);
+-	}
+-	payloads.Step();
++	versions.Bind(5, payload);
++	for (size_t i = 0; i < blocks.size(); ++i)
++		versions.Bind(int(6 + i), blocks[i].first);
+@@ -587 +619 @@
+-				Put(db, BLOCKS, block.key, {0}, view, true);
++				Put(db, BLOCKS, block.key, {0, 0}, view, true);
+@@ -634 +666 @@
+-	constexpr size_t BATCH_BLOCKS = 64;
++	constexpr size_t BATCH_BLOCKS = EXTENT_BLOCKS;
+@@ -699 +731 @@
+-			Put(db, BLOCKS, block.key, {0}, view, true);
++			Put(db, BLOCKS, block.key, {0, 0}, view, true);
+@@ -796 +828 @@
+-UPDATE format SET version=2;
++UPDATE format SET version=1001;
+@@ -1025,2 +1057 @@
+-		if (!meta.Step() || (meta.Integer(1) != 1 && meta.Integer(1) != 2) || meta.Integer(2) != BLOCK_SIZE ||
+-		    meta.Integer(3) != 32) {
++		if (!meta.Step() || meta.Integer(1) != 1001 || meta.Integer(2) != BLOCK_SIZE || meta.Integer(3) != 32) {
+@@ -1044 +1075 @@
+-CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(length(data)=4096)) STRICT;
++CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(length(data) BETWEEN 4096 AND 262144 AND length(data)%4096=0)) STRICT;
+@@ -1052,5 +1083,8 @@
+-		std::string fields = table == INODES    ? "kind INTEGER NOT NULL CHECK(kind IN (0,1)),size INTEGER NOT NULL "
+-		                                          "CHECK(size>=0),mode INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,"
+-		                     : table == DIRENTS ? "inode INTEGER NOT NULL REFERENCES inode_ids(id),"
+-		                                        : "payload INTEGER REFERENCES block_payloads(id),CHECK((deleted=1 AND "
+-		                                          "payload IS NULL) OR (deleted=0 AND payload IS NOT NULL)),";
++		std::string fields = table == INODES ? "kind INTEGER NOT NULL CHECK(kind IN (0,1)),size INTEGER NOT NULL "
++		                                       "CHECK(size>=0),mode INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,"
++		                     : table == DIRENTS
++		                         ? "inode INTEGER NOT NULL REFERENCES inode_ids(id),"
++		                         : "payload INTEGER REFERENCES block_payloads(id),payload_offset INTEGER DEFAULT 0,"
++		                           "CHECK((deleted=1 AND payload IS NULL AND payload_offset IS NULL) OR "
++		                           "(deleted=0 AND payload IS NOT NULL AND payload_offset IS NOT NULL "
++		                           "AND payload_offset>=0 AND payload_offset%4096=0)),";
+@@ -1066 +1100 @@
+-		Statement meta(db, "INSERT INTO format VALUES(?,1,4096,32)");
++		Statement meta(db, "INSERT INTO format VALUES(?,1001,4096,32)");
+@@ -1426 +1460 @@
+-	std::map<int64_t, int64_t> blocks;
++	std::map<int64_t, std::vector<int64_t>> blocks;
+@@ -1491 +1525 @@
+-		if (!entry.blocks.emplace(block.key.block, block.fields[0]).second) {
++		if (!entry.blocks.emplace(block.key.block, block.fields).second) {
+@@ -1525,2 +1559,3 @@
+-		int64_t aid = a == left->blocks.end() ? 0 : a->second, bid = b == right->blocks.end() ? 0 : b->second;
+-		if (aid == bid) {
++		auto ar = a == left->blocks.end() ? std::vector<int64_t> {0, 0} : a->second;
++		auto br = b == right->blocks.end() ? std::vector<int64_t> {0, 0} : b->second;
++		if (ar == br) {
+@@ -1529,2 +1564,2 @@
+-		if ((aid ? Payload(db, aid) : std::string(BLOCK_SIZE, '\0')) !=
+-		    (bid ? Payload(db, bid) : std::string(BLOCK_SIZE, '\0'))) {
++		if ((ar[0] ? Payload(db, ar[0], ar[1]) : std::string(BLOCK_SIZE, '\0')) !=
++		    (br[0] ? Payload(db, br[0], br[1]) : std::string(BLOCK_SIZE, '\0'))) {
+@@ -1641 +1676 @@
+-			desired[BLOCKS][{node.key.inode, {}, block.first}] = {block.second};
++			desired[BLOCKS][{node.key.inode, {}, block.first}] = block.second;
+@@ -1792 +1827 @@
+-			Put(db, BLOCKS, block.key, {0}, view, true);
++			Put(db, BLOCKS, block.key, {0, 0}, view, true);

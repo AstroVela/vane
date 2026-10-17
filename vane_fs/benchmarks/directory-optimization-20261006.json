@@ -1,0 +1,2162 @@
+{
+  "started_epoch": 1791219723.4532442,
+  "scope": "Three alternating pairs on a shared host, fresh copied SQLite database and mount for each variant. Warm metadata and OS caches, direct I/O, FULL commits, no FUSE debug. Owned builds/tests finished before measurement. Native SQL instrumentation runs separately after each unmount. Preparation and validation are untimed. Other host jobs remain active.",
+  "config": {
+    "entries": 1000,
+    "open_close_iterations": 500,
+    "list_iterations": 20,
+    "git_command_iterations": 20,
+    "git_payload_files": 100,
+    "git_payload_bytes_each": 41943,
+    "repetitions": 3
+  },
+  "build": {
+    "baseline_commit": "49545265f8569080a7d999d3ef42abbe00d56f40",
+    "prototype_command": [
+      "/usr/bin/c++",
+      "-std=c++17",
+      "-O3",
+      "-DNDEBUG",
+      "-I/home/kaka/astrovela_vane-fs/vane_fs/include",
+      "-isystem",
+      "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/include/fuse3",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/write-through.cpp",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/baseline-core.a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+      "-L/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+      "-Wl,-rpath,/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+      "-lfuse3",
+      "-ldl",
+      "-pthread",
+      "-o",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/write-through-mount"
+    ],
+    "hashes": {
+      "baseline-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4",
+      "write-through-mount": "7e70d5ec3d5e3a7ef0e0a8538fb56a71791f98658084235b14ba386a69b2d5cd",
+      "baseline-workspace.cpp": "9fbe2d0e3d0ce83d592b2410fb7cc979605c99aa740c64ca8571d16e646d256b",
+      "baseline-core.a": "55e61c5d2aa2a0555526ee092356d930f6e1db25ba99d3aa60cb2f833d7ff4a1",
+      "baseline-fuse.cpp": "5435a5b952dddb4e242f76a337a3241a38c05f11201481f70c0324bde194952f",
+      "directory_probe.cpp": "6baf89a86e579d4c3bff758852c264add1a831fbcf3d219a7e3127f6a6aa4ab7",
+      "write-through.cpp": "a618568c32cc8fa2692ddfd0055e8bafbac085ead8f97e6a882e5079882192f8",
+      "baseline-directory-probe": "2f6e672d5f25c1ff2a92df86bf70d6dd5e2a3e7551d588e21e4313b3c86829b0",
+      "baseline-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719"
+    },
+    "free_bytes": 32379211776,
+    "optimized_probe_command": [
+      "/usr/bin/c++",
+      "-std=c++20",
+      "-O3",
+      "-DNDEBUG",
+      "-I/home/kaka/astrovela_vane-fs/vane_fs/include",
+      "-isystem",
+      "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/directory_probe.cpp",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/core/libvane_fs.a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+      "-ldl",
+      "-pthread",
+      "-Wl,--wrap=fsync",
+      "-Wl,--wrap=fdatasync",
+      "-Wl,--wrap=sqlite3_prepare_v2",
+      "-Wl,--wrap=sqlite3_step",
+      "-Wl,--wrap=sqlite3_finalize",
+      "-Wl,--wrap=sqlite3_exec",
+      "-o",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/optimized-directory-probe"
+    ],
+    "optimized_sources": {
+      "vane_fs/src/fuse.cpp": "48f960848e00b18b0a559b65a69f5c9f5c725bddc72baf1769fb7d893bbc3448",
+      "vane_fs/src/workspace.cpp": "bfea8e6e87e32242ee37069e36d9ce6ea52609870977c294647c337b1e3de852"
+    },
+    "optimized_hashes": {
+      "optimized-cli": "e0bd41df6d4fe31c112985698856ed26b35f4fbc73b3125d1b625f6b6904894e",
+      "optimized-core.a": "3ea4f38b7e0aab4421dc72a467b90ea18028c81be584d9b74a5ea9c722d80e56",
+      "optimized-directory-probe": "6e4ed10998298db83361c8ebad418518bb741c652088ca6a9b5b3e54c186e223",
+      "optimized-mount": "2e0b1860362741742bff94cbb52999a2cc6b6b651bbcb2044bbb1ad0c0c11587"
+    },
+    "patch_sha256": "0a2f707a72edb5ac55de937cb9369b103572b6c04368e6e69a438a23a165a85f"
+  },
+  "kernel": "6.11.0-24-generic",
+  "samples": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 1.7500239289947785,
+      "seconds_per_iteration": 0.003500047857989557
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.08342388097662479,
+      "seconds_per_iteration": 0.004171194048831239
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.2266090459888801,
+      "seconds_per_iteration": 0.011330452299444006
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.7282865149900317,
+      "seconds_per_iteration": 1.7282865149900317
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.6414818259945605,
+      "seconds_per_iteration": 0.032074091299728026
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.2187682339863386,
+      "seconds_per_iteration": 0.01093841169931693
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.22273975500138476,
+      "seconds_per_iteration": 0.011136987750069239
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 0.04587723399163224,
+      "seconds_per_iteration": 9.175446798326448e-05
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.04723098099930212,
+      "seconds_per_iteration": 0.002361549049965106
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.1197693640133366,
+      "seconds_per_iteration": 0.00598846820066683
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.682621890999144,
+      "seconds_per_iteration": 1.682621890999144
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.5452207020134665,
+      "seconds_per_iteration": 0.027261035100673327
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.1322747890080791,
+      "seconds_per_iteration": 0.006613739450403955
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.2046559730079025,
+      "seconds_per_iteration": 0.010232798650395124
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 0.04022368200821802,
+      "seconds_per_iteration": 8.044736401643604e-05
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.046124116983264685,
+      "seconds_per_iteration": 0.002306205849163234
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.11854435401619412,
+      "seconds_per_iteration": 0.005927217700809706
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.7349139650177676,
+      "seconds_per_iteration": 1.7349139650177676
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.7773659399827011,
+      "seconds_per_iteration": 0.038868296999135056
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.13390551100019366,
+      "seconds_per_iteration": 0.006695275550009682
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.1943703439901583,
+      "seconds_per_iteration": 0.009718517199507915
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 1.816126321995398,
+      "seconds_per_iteration": 0.003632252643990796
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.0859193269861862,
+      "seconds_per_iteration": 0.004295966349309311
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.2156961550062988,
+      "seconds_per_iteration": 0.010784807750314939
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.7179775919939857,
+      "seconds_per_iteration": 1.7179775919939857
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.6761240730120335,
+      "seconds_per_iteration": 0.03380620365060168
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.12014655402163044,
+      "seconds_per_iteration": 0.006007327701081522
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.158713130018441,
+      "seconds_per_iteration": 0.00793565650092205
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 1.7898201110074297,
+      "seconds_per_iteration": 0.0035796402220148594
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.08347265000338666,
+      "seconds_per_iteration": 0.004173632500169333
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.20801696999114938,
+      "seconds_per_iteration": 0.010400848499557469
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.74834425500012,
+      "seconds_per_iteration": 1.74834425500012
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.7611044009972829,
+      "seconds_per_iteration": 0.03805522004986415
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.13105436801561154,
+      "seconds_per_iteration": 0.006552718400780577
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.2108625190157909,
+      "seconds_per_iteration": 0.010543125950789545
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "open_close_directory_1000_entries",
+      "iterations": 500,
+      "seconds": 0.04716540401568636,
+      "seconds_per_iteration": 9.433080803137273e-05
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "list_directory_1000_entries",
+      "iterations": 20,
+      "seconds": 0.049186811986146495,
+      "seconds_per_iteration": 0.0024593405993073247
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "find_flat_1000_files",
+      "iterations": 20,
+      "seconds": 0.12255384799209423,
+      "seconds_per_iteration": 0.006127692399604712
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "git_clone",
+      "iterations": 1,
+      "seconds": 1.7058021489938255,
+      "seconds_per_iteration": 1.7058021489938255
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "git_status",
+      "iterations": 20,
+      "seconds": 0.70044671400683,
+      "seconds_per_iteration": 0.0350223357003415
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "git_diff",
+      "iterations": 20,
+      "seconds": 0.25650548801058903,
+      "seconds_per_iteration": 0.012825274400529451
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "metric": "find_git",
+      "iterations": 20,
+      "seconds": 0.2003916620160453,
+      "seconds_per_iteration": 0.010019583100802264
+    }
+  ],
+  "native_samples": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0825278,
+      "user_seconds": 0.07856,
+      "system_seconds": 0.003948,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 61720,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 2.2671e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.000129054,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40080,
+          "vm_steps": 601200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.0249721,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 5.9191e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent, name, low, high, writer, deleted, inode FROM dirent_versions WHERE low<=? AND high>? AND deleted=0 AND parent=?",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 320240,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.00716007,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 4.9302e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000132761
+        }
+      ]
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0398204,
+      "user_seconds": 0.037893,
+      "system_seconds": 0.001932,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 41740,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 2.7515e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT d.name,i.inode,i.kind,i.size,i.mode,i.mtime_ns FROM dirent_versions d LEFT JOIN inode_versions i ON i.inode=d.inode AND i.low<=?1 AND i.high>?1 AND i.deleted=0 WHERE d.parent=?2 AND d.low<=?1 AND d.high>?1 AND d.deleted=0 ORDER BY d.name",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 640260,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.0252419,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.000145851,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 80,
+          "vm_steps": 1200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.00010161,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 6.7677e-05,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 6.1916e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000148533
+        }
+      ]
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0276245,
+      "user_seconds": 0.027616,
+      "system_seconds": 0,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 41740,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 1.8457e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT d.name,i.inode,i.kind,i.size,i.mode,i.mtime_ns FROM dirent_versions d LEFT JOIN inode_versions i ON i.inode=d.inode AND i.low<=?1 AND i.high>?1 AND i.deleted=0 WHERE d.parent=?2 AND d.low<=?1 AND d.high>?1 AND d.deleted=0 ORDER BY d.name",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 640260,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.0173421,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.000104924,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 80,
+          "vm_steps": 1200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 7.5329e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 4.6165e-05,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 4.573e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000109287
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0825948,
+      "user_seconds": 0.080838,
+      "system_seconds": 0.00176,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 61720,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 2.3082e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.000137806,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40080,
+          "vm_steps": 601200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.0248282,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 5.5883e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent, name, low, high, writer, deleted, inode FROM dirent_versions WHERE low<=? AND high>? AND deleted=0 AND parent=?",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 320240,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.00712606,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 5.5509e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000140326
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0841332,
+      "user_seconds": 0.082345,
+      "system_seconds": 0.001781,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 61720,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 2.5104e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.000136368,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40080,
+          "vm_steps": 601200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.0254542,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 6.0445e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent, name, low, high, writer, deleted, inode FROM dirent_versions WHERE low<=? AND high>? AND deleted=0 AND parent=?",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 320240,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.00732964,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 4.9597e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000167352
+        }
+      ]
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "phase": "directory_entries_20x",
+      "seconds": 0.0295391,
+      "user_seconds": 0.028683,
+      "system_seconds": 0.000858,
+      "sync_calls": 0,
+      "sync_seconds": 0,
+      "cache_hits": 41740,
+      "cache_misses": 0,
+      "cache_writes": 0,
+      "sql": [
+        {
+          "text": "SELECT 1 FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 280,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 1.9584e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT d.name,i.inode,i.kind,i.size,i.mode,i.mtime_ns FROM dirent_versions d LEFT JOIN inode_versions i ON i.inode=d.inode AND i.low<=?1 AND i.high>?1 AND i.deleted=0 WHERE d.parent=?2 AND d.low<=?1 AND d.high>?1 AND d.deleted=0 ORDER BY d.name",
+          "prepares": 0,
+          "steps": 20020,
+          "vm_steps": 640260,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.018448,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT id,name,parent,fork_base,state,generation,low,frontier,high,writer FROM branches WHERE id=? AND state!='deleted'",
+          "prepares": 0,
+          "steps": 20,
+          "vm_steps": 480,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 0.00011783,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT inode, low, high, writer, deleted, kind, size, mode, mtime_ns FROM inode_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 80,
+          "vm_steps": 1200,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 8.0973e-05,
+          "finalize_seconds": 0
+        },
+        {
+          "text": "SELECT parent FROM dirent_versions WHERE inode=? AND low<=? AND high>? AND deleted=0",
+          "prepares": 0,
+          "steps": 40,
+          "vm_steps": 540,
+          "fullscan_steps": 0,
+          "prepare_seconds": 0,
+          "step_seconds": 5.1043e-05,
+          "finalize_seconds": 0
+        }
+      ],
+      "exec": [
+        {
+          "text": "BEGIN",
+          "count": 20,
+          "seconds": 5.3453e-05
+        },
+        {
+          "text": "COMMIT",
+          "count": 20,
+          "seconds": 0.000123349
+        }
+      ]
+    }
+  ],
+  "validations": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "fixture": "flat",
+      "files": 1000,
+      "manifest_sha256": "02051d4dc6d85af592b9d8d602432c8735b1644fd6ff9fcd36ffc8e5abb8aa9b"
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "fixture": "git",
+      "payload_files": 100,
+      "manifest_sha256": "1aa1cf2bbce1729818a1b607544c228e101acead56b523ad118aeb60c25c9028",
+      "fsck": "PASS"
+    }
+  ],
+  "owners": [
+    {
+      "pid": 4020649,
+      "variant": "baseline",
+      "repetition": 0,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-0-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.022145936003653333
+    },
+    {
+      "pid": 4020827,
+      "variant": "optimized",
+      "repetition": 0,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-0-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.03803054001764394
+    },
+    {
+      "pid": 4021191,
+      "variant": "optimized",
+      "repetition": 1,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-1-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.021240836998913437
+    },
+    {
+      "pid": 4021367,
+      "variant": "baseline",
+      "repetition": 1,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-1-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.037684231996536255
+    },
+    {
+      "pid": 4021828,
+      "variant": "baseline",
+      "repetition": 2,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-2-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.03796067097573541
+    },
+    {
+      "pid": 4022050,
+      "variant": "optimized",
+      "repetition": 2,
+      "point": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-2-mount",
+      "returncode": 0,
+      "unmount_seconds": 0.03722239000489935
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-0.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/seed.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-2.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/seed.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-0.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/seed.sqlite",
+      "bytes": 5550080,
+      "sha256": "470ea19bdc0cd4109e3b820280cb1dbf9c5b8bbff999df7712bc6aec5537e232"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-1.sqlite",
+      "bytes": 11763712,
+      "sha256": "9fbea93c39e463aeec11220d9fbb9f0bd1a1ca2d60c36626fa2b8a3b96ee2edc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-2.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-1.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-2.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-0.sqlite",
+      "bytes": 11644928,
+      "sha256": "e79bc78ab0b370beeaf2b7c032cc40da8ec4236ae5d0d981242b08ea53f6d75c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-1.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-2.sqlite",
+      "bytes": 11939840,
+      "sha256": "840e0418448937732753c5e4b2492bc07b5033221bdbbaf61c3e668d16412ff4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-1.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-0.sqlite",
+      "bytes": 11993088,
+      "sha256": "4cf2cb14d05542453130277075a41ae1cfee7d5156f67e7f4c6fa523c963d508"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-0.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-2.sqlite-wal",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-1.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-2.sqlite",
+      "bytes": 11993088,
+      "sha256": "d90ccc4b59ca8e87771aaad32e3898f0c6742a1f009c51e801a45ba7102cc225"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-1.sqlite",
+      "bytes": 11857920,
+      "sha256": "88562845341f125f9594f077e26b9a78de1931bc317c6f3aa6f495c33871ef84"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-0.sqlite-shm",
+      "bytes": 32768,
+      "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/go.mod",
+      "bytes": 31,
+      "sha256": "c9d49fdcecda6d50798e7ca293a8cdfa9b9938f947564fa5dc772e98eee97ebd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/main.go",
+      "bytes": 29,
+      "sha256": "55a60bb97151b2b4b680462447ce60ec34511b14fa10d77440c97b9777101566"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/index",
+      "bytes": 9042,
+      "sha256": "aa5a361e1b7c7a8f0c59cf0b53c3b46618ad622dfa4b268ce7c6f12da3eef15a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/description",
+      "bytes": 73,
+      "sha256": "85ab6c163d43a17ea9cf7788308bca1466f1b0a8d1cc92e26e9bf63da4062aee"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/COMMIT_EDITMSG",
+      "bytes": 28,
+      "sha256": "c82f6b23fad53883279475a7496163909ef71f623699f4dce5a0c0f53ca8633f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/HEAD",
+      "bytes": 21,
+      "sha256": "28d25bf82af4c0e2b72f50959b2beb859e3e60b9630a5e8c603dad4ddb2b6e80"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/config",
+      "bytes": 159,
+      "sha256": "e00a362035cce224e944f79d1599fa6d919919750804c3fceea2ed34413a3ecf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00095.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00054.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00097.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00051.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00096.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00076.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00033.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00018.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00026.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00094.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00029.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00020.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00005.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00017.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00068.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00089.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00055.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00004.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00009.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00085.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00069.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00035.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00091.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00037.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00011.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00090.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00060.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00012.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00036.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00065.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00045.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00077.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00072.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00030.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00081.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00056.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00074.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00070.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00015.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00016.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00058.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00059.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00023.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00066.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00038.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00000.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00032.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00039.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00099.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00002.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00061.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00084.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00027.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00067.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00014.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00092.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00053.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00041.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00047.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00071.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00052.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00088.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00013.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00064.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00087.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00003.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00008.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00025.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00078.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00050.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00031.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00057.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00043.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00007.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00073.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00019.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00086.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00049.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00098.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00034.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00022.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00048.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00040.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00024.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00001.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00021.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00080.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00044.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00093.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00082.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00042.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00063.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00083.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00079.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00062.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00010.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00075.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00028.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00046.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/data/file00006.txt",
+      "bytes": 41943,
+      "sha256": "38dac248bd9587180b4b8c36022a7b49384fee61e50d24054c776f510a9cc33d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/logs/HEAD",
+      "bytes": 190,
+      "sha256": "ee9c0ba239556ca39a90fdf7aa631a5e758c22d228890ac300279344e1a5f807"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/info/exclude",
+      "bytes": 240,
+      "sha256": "6671fe83b7a07c8932ee89164d1f2793b2318058eb8b98dc5c06ee0a5a3b0ec1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/sendemail-validate.sample",
+      "bytes": 2308,
+      "sha256": "44ebfc923dc5466bc009602f0ecf067b9c65459abfe8868ddc49b78e6ced7a92"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/fsmonitor-watchman.sample",
+      "bytes": 4726,
+      "sha256": "e0549964e93897b519bd8e333c037e51fff0f88ba13e086a331592bf801fa1d0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-applypatch.sample",
+      "bytes": 424,
+      "sha256": "e15c5b469ea3e0a695bea6f2c82bcf8e62821074939ddd85b77e0007ff165475"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/prepare-commit-msg.sample",
+      "bytes": 1492,
+      "sha256": "e9ddcaa4189fddd25ed97fc8c789eca7b6ca16390b2392ae3276f0c8e1aa4619"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-push.sample",
+      "bytes": 1374,
+      "sha256": "ecce9c7e04d3f5dd9d8ada81753dd1d549a9634b26770042b58dda00217d086a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-merge-commit.sample",
+      "bytes": 416,
+      "sha256": "d3825a70337940ebbd0a5c072984e13245920cdf8898bd225c8d27a6dfc9cb53"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-rebase.sample",
+      "bytes": 4898,
+      "sha256": "4febce867790052338076f4e66cc47efb14879d18097d1d61c8261859eaaa7b3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-commit.sample",
+      "bytes": 1643,
+      "sha256": "f9af7d95eb1231ecf2eba9770fedfa8d4797a12b02d7240e98d568201251244a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/commit-msg.sample",
+      "bytes": 896,
+      "sha256": "1f74d5e9292979b573ebd59741d46cb93ff391acdd083d340b94370753d92437"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/applypatch-msg.sample",
+      "bytes": 478,
+      "sha256": "0223497a0b8b033aa58a3a521b8629869386cf7ab0e2f101963d328aa62193f7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/push-to-checkout.sample",
+      "bytes": 2783,
+      "sha256": "a53d0741798b287c6dd7afa64aee473f305e65d3f49463bb9d7408ec3b12bf5f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/pre-receive.sample",
+      "bytes": 544,
+      "sha256": "a4c3d2b9c7bb3fd8d1441c31bd4ee71a595d66b44fcf49ddb310252320169989"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/post-update.sample",
+      "bytes": 189,
+      "sha256": "81765af2daef323061dcbc5e61fc16481cb74b3bac9ad8a174b186523586f6c5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/hooks/update.sample",
+      "bytes": 3650,
+      "sha256": "8d5f2fa83e103cf08b57eaa67521df9194f45cbdbcb37da52ad586097a14d106"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/logs/refs/heads/main",
+      "bytes": 190,
+      "sha256": "ee9c0ba239556ca39a90fdf7aa631a5e758c22d228890ac300279344e1a5f807"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/refs/heads/main",
+      "bytes": 41,
+      "sha256": "1b195412f5b3acb8f2ab6a2d3621529be29fe1f0477aad9320dc6ba62461aecb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/38/dd16da61accb1a8de6ac8709d2e65ef4a51a4a",
+      "bytes": 41,
+      "sha256": "b630412d652683a36a763745aa64abe80d41fcaf9f335fc5d2b11c23e72b60c1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/fe/457e3ff982a3b80855c295675071ec0b646dda",
+      "bytes": 143,
+      "sha256": "afb349bddafe2fadd11393c7060f9332e377213743ddc0c08870d3ca37f673f5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/61/745f05806918823b8310c03c7c13345adf0ef9",
+      "bytes": 308,
+      "sha256": "721da913bd0f81f5711ae0f33f775ed9dabb6c91a5155de86544a4d003fb067c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/18/53095620ebaf35b8ff64c501df433c92565177",
+      "bytes": 47,
+      "sha256": "36d80e3749d467cbae5a623e70666837d9cdff91f7443ca2c73a9f3fadfd7a75"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/e5/3844b9ad98eb5e989515cbfab0b9f3e7fe39d4",
+      "bytes": 112,
+      "sha256": "78354770a68de036daa6f3a384f02607417564e27ca4b1a07d162a225066a767"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/source/.git/objects/71/4f2ec32eb49876a881d9d9171211db1b3f7990",
+      "bytes": 221,
+      "sha256": "3b364a074810bbb549676aea5cd3afb37665497657de5432f79364368dd0de6b"
+    }
+  ],
+  "free_bytes_before": 32364388352,
+  "source_git_commit": "fe457e3ff982a3b80855c295675071ec0b646dda",
+  "git_find_file_counts": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "files": 133
+    },
+    {
+      "variant": "optimized",
+      "repetition": 0,
+      "files": 133
+    },
+    {
+      "variant": "optimized",
+      "repetition": 1,
+      "files": 133
+    },
+    {
+      "variant": "baseline",
+      "repetition": 1,
+      "files": 133
+    },
+    {
+      "variant": "baseline",
+      "repetition": 2,
+      "files": 133
+    },
+    {
+      "variant": "optimized",
+      "repetition": 2,
+      "files": 133
+    }
+  ],
+  "median_seconds_per_iteration": {
+    "baseline": {
+      "find_flat_1000_files": 0.010784807750314939,
+      "find_git": 0.010543125950789545,
+      "git_clone": 1.7282865149900317,
+      "git_diff": 0.006552718400780577,
+      "git_status": 0.03380620365060168,
+      "list_directory_1000_entries": 0.004173632500169333,
+      "open_close_directory_1000_entries": 0.0035796402220148594
+    },
+    "optimized": {
+      "find_flat_1000_files": 0.00598846820066683,
+      "find_git": 0.010019583100802264,
+      "git_clone": 1.7058021489938255,
+      "git_diff": 0.006695275550009682,
+      "git_status": 0.0350223357003415,
+      "list_directory_1000_entries": 0.002361549049965106,
+      "open_close_directory_1000_entries": 9.175446798326448e-05
+    }
+  },
+  "status": "PASS",
+  "owned_mounts_remaining": [],
+  "database_checks": [
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/seed.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/baseline-0.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-2.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    {
+      "database": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/owned-data-6ew67aax/optimized-1.sqlite",
+      "quick_check": [
+        [
+          "ok"
+        ]
+      ]
+    }
+  ],
+  "cleanup_removed": true,
+  "runner_sha256": "d04bc405086dae790baa288919ebdfb34e4337f33415637bc63bebd9c46cbfce",
+  "ended_epoch": 1791219773.323956,
+  "free_bytes_after": 32363589632,
+  "validation": {
+    "component_pytest": {
+      "passed": 113,
+      "seconds": 85.19
+    },
+    "native_release": {
+      "passed": 3
+    },
+    "native_asan_ubsan": {
+      "passed": 3
+    },
+    "fuse_asan_ubsan": {
+      "passed": 10,
+      "seconds": 76.52
+    },
+    "baseline_new_test": "Expected failure: opendir captured the removed entry before the first readdir.",
+    "copyleft": "PASS",
+    "test_scope": "Related component tests only; no base/full Vane suite."
+  },
+  "native_summary": {
+    "baseline": {
+      "median_seconds_20_enumerations": 0.0825948,
+      "sqlite_step_counts": [
+        60180,
+        60180,
+        60180
+      ],
+      "sqlite_vm_steps": [
+        922740,
+        922740,
+        922740
+      ],
+      "sync_counts": [
+        0,
+        0,
+        0
+      ]
+    },
+    "optimized": {
+      "median_seconds_20_enumerations": 0.0295391,
+      "sqlite_step_counts": [
+        20180,
+        20180,
+        20180
+      ],
+      "sqlite_vm_steps": [
+        642760,
+        642760,
+        642760
+      ],
+      "sync_counts": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "write_through_prototype": {
+    "scope": "Diagnostic only, FUSE debug enabled. Cached write-through prototype uses the unchanged FULL SQLite core.",
+    "samples": [
+      {
+        "variant": "baseline",
+        "repetition": 0,
+        "write_seconds": 1.3903704599943012,
+        "fsync_seconds": 0.0001688599877525121,
+        "write_sizes": {
+          "1048528": 64,
+          "48": 64
+        },
+        "write_requests": 128,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "variant": "write-through",
+        "repetition": 0,
+        "write_seconds": 1.1845215600042138,
+        "fsync_seconds": 0.0001003929937724024,
+        "write_sizes": {
+          "1048576": 64
+        },
+        "write_requests": 64,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "variant": "write-through",
+        "repetition": 1,
+        "write_seconds": 1.1968574310012627,
+        "fsync_seconds": 0.00013763699098490179,
+        "write_sizes": {
+          "1048576": 64
+        },
+        "write_requests": 64,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "variant": "baseline",
+        "repetition": 1,
+        "write_seconds": 1.3447850449883845,
+        "fsync_seconds": 8.501601405441761e-05,
+        "write_sizes": {
+          "1048528": 64,
+          "48": 64
+        },
+        "write_requests": 128,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "variant": "baseline",
+        "repetition": 2,
+        "write_seconds": 1.3463504280080087,
+        "fsync_seconds": 0.00013674399815499783,
+        "write_sizes": {
+          "1048528": 64,
+          "48": 64
+        },
+        "write_requests": 128,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      {
+        "variant": "write-through",
+        "repetition": 2,
+        "write_seconds": 5.041054901026655,
+        "fsync_seconds": 0.00013770800433121622,
+        "write_sizes": {
+          "1048576": 64
+        },
+        "write_requests": 64,
+        "bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      }
+    ],
+    "mmap": [
+      {
+        "variant": "baseline",
+        "mmap_errno": 19,
+        "durable_byte": "a"
+      },
+      {
+        "variant": "write-through",
+        "mapped_read_after_store": "b",
+        "pread_after_store": "b",
+        "durable_byte": "a"
+      }
+    ],
+    "cleanup": [
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/baseline-0",
+        "pid": 4008409,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/write-through-0",
+        "pid": 4008479,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/write-through-1",
+        "pid": 4008487,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/baseline-1",
+        "pid": 4008496,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/baseline-2",
+        "pid": 4008684,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/write-through-2",
+        "pid": 4008783,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/baseline-mmap",
+        "pid": 4008857,
+        "returncode": 0
+      },
+      {
+        "mount": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm/write-through-mmap",
+        "pid": 4008861,
+        "returncode": -9
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006/prototype-data-bpojxkmm",
+        "bytes": 481181696
+      }
+    ],
+    "status": "PASS",
+    "free_bytes_after": 32378470400,
+    "decision": "Keep production direct I/O. Cached write-through halves unaligned WRITE requests but also enables shared writable mmap; its dirty pages follow separate fsync/msync semantics. The existing API excludes this feature."
+  },
+  "artifact_hashes": {
+    "vane_fs/build/directory-optimization-20261006/copyleft.log": "4e3cd9fa9130bef4c23bcf871bd9780cef000ec031ecdf22cc5399865b2b7030",
+    "vane_fs/build/directory-optimization-20261006/prototype-baseline-0.log": "3ed3e08b1571159a5916b15b4a8040c15d93c8d24df53d30701865ed27d2f59e",
+    "vane_fs/build/directory-optimization-20261006/install.log": "3fbe76316f9ca7e6efb4ab17cf88d0d70605d9dd5ee867245e4dfc2e2fe221fc",
+    "vane_fs/build/directory-optimization-20261006/run.py": "d04bc405086dae790baa288919ebdfb34e4337f33415637bc63bebd9c46cbfce",
+    "vane_fs/build/directory-optimization-20261006/baseline-0-native.jsonl": "68a33168a9f74101d4e3330aaaba2cf656bb2a3fad2a9fa9c59a86a65dd06dea",
+    "vane_fs/build/directory-optimization-20261006/prototype-baseline-mmap.log": "e5407fa12f268fc4e727a5381c13288648e74768089ed5346ff8e01012f78c24",
+    "vane_fs/build/directory-optimization-20261006/write-through-results.json": "06701193a810a75e1cc8828e57ac62bf1f3318b30a9c2c9902a3d96c0e3ad8df",
+    "vane_fs/build/directory-optimization-20261006/optimized-cli": "e0bd41df6d4fe31c112985698856ed26b35f4fbc73b3125d1b625f6b6904894e",
+    "vane_fs/build/directory-optimization-20261006/baseline-regression.log": "a5fed209d721619890831956c7c6b42f85e1c2778655058a46b1130be0b0b833",
+    "vane_fs/build/directory-optimization-20261006/prototype-write-through-0.log": "23fb2d99467835ed2b2774e49c8c39363436fbd912094dd84e07d427e05367bf",
+    "vane_fs/build/directory-optimization-20261006/baseline-2-native.jsonl": "b555b42e1b0e2e810136c1633c93a7f69bbf549f65cde0236979dfeeef786f93",
+    "vane_fs/build/directory-optimization-20261006/baseline-cli": "f47a218506a6eae2dfe9a08e87d5e3d4750a2a6a5f483bdb97c659a09328d4f4",
+    "vane_fs/build/directory-optimization-20261006/write-through-mount": "7e70d5ec3d5e3a7ef0e0a8538fb56a71791f98658084235b14ba386a69b2d5cd",
+    "vane_fs/build/directory-optimization-20261006/write-through-run.log": "a13ae4d82ec4b290f5ddaf5ba33424b250bd13a3c92d112d80046f0b121da4f2",
+    "vane_fs/build/directory-optimization-20261006/optimized-core.a": "3ea4f38b7e0aab4421dc72a467b90ea18028c81be584d9b74a5ea9c722d80e56",
+    "vane_fs/build/directory-optimization-20261006/baseline-1-native.jsonl": "5bbb703555ab0f150ce8dafb0e08bad3952be10ea0ae21eb79153fc7175561e0",
+    "vane_fs/build/directory-optimization-20261006/optimized-directory-probe": "6e4ed10998298db83361c8ebad418518bb741c652088ca6a9b5b3e54c186e223",
+    "vane_fs/build/directory-optimization-20261006/pytest-component.log": "180b6ebd579ade951ea223f887c89c64372cd4136e23c79fddefa9f7e65ac397",
+    "vane_fs/build/directory-optimization-20261006/optimized-1-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/ctest-release.log": "e59f5500306cea076b98274f354df25a3bab224eb7dffd626de183bd0365203b",
+    "vane_fs/build/directory-optimization-20261006/prototype-baseline-2.log": "3ed3e08b1571159a5916b15b4a8040c15d93c8d24df53d30701865ed27d2f59e",
+    "vane_fs/build/directory-optimization-20261006/optimized-2-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/optimized-1-native.jsonl": "646b75e365d16b47f1ae6ff9c44746afc8c714f2e582b1d9c0eae126e3541e4a",
+    "vane_fs/build/directory-optimization-20261006/baseline-workspace.cpp": "9fbe2d0e3d0ce83d592b2410fb7cc979605c99aa740c64ca8571d16e646d256b",
+    "vane_fs/build/directory-optimization-20261006/optimized-0-native.jsonl": "07b6ef809811119c7c4cdf7f04b2cfef5c82ed02d8552e39b486c2039f19c132",
+    "vane_fs/build/directory-optimization-20261006/run.log": "4a0bbcb469f2b8c621840d0dd172f5385ee95cebeb47cf28e694afdff1a581e3",
+    "vane_fs/build/directory-optimization-20261006/baseline-core.a": "55e61c5d2aa2a0555526ee092356d930f6e1db25ba99d3aa60cb2f833d7ff4a1",
+    "vane_fs/build/directory-optimization-20261006/baseline-fuse.cpp": "5435a5b952dddb4e242f76a337a3241a38c05f11201481f70c0324bde194952f",
+    "vane_fs/build/directory-optimization-20261006/ctest-sanitize.log": "88abeab7e7be88d0fa56e62e7dd924ff8d31aff478112cb55580fe6eb84b570d",
+    "vane_fs/build/directory-optimization-20261006/linux-6.11-fuse-inode.c": "918b5e44b060556f5593a509e5a72599973d52b860a63c7ea273d69b8c8137fb",
+    "vane_fs/build/directory-optimization-20261006/build-release.log": "142f6fc5eb82dbd402fa6b4d5c711b6324b7145749d161cfd434d034943a7bd8",
+    "vane_fs/build/directory-optimization-20261006/prototype-baseline-1.log": "3ed3e08b1571159a5916b15b4a8040c15d93c8d24df53d30701865ed27d2f59e",
+    "vane_fs/build/directory-optimization-20261006/baseline-1-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/directory_probe.cpp": "6baf89a86e579d4c3bff758852c264add1a831fbcf3d219a7e3127f6a6aa4ab7",
+    "vane_fs/build/directory-optimization-20261006/write-through.cpp": "a618568c32cc8fa2692ddfd0055e8bafbac085ead8f97e6a882e5079882192f8",
+    "vane_fs/build/directory-optimization-20261006/baseline-directory-probe": "2f6e672d5f25c1ff2a92df86bf70d6dd5e2a3e7551d588e21e4313b3c86829b0",
+    "vane_fs/build/directory-optimization-20261006/optimization.patch": "0a2f707a72edb5ac55de937cb9369b103572b6c04368e6e69a438a23a165a85f",
+    "vane_fs/build/directory-optimization-20261006/write_through_probe.py": "90536bb161f5b9319ebad7c6c9b7acf9488a2f8ed9edf5c3d37230bf79f34aaf",
+    "vane_fs/build/directory-optimization-20261006/prototype-write-through-1.log": "23fb2d99467835ed2b2774e49c8c39363436fbd912094dd84e07d427e05367bf",
+    "vane_fs/build/directory-optimization-20261006/prototype-write-through-2.log": "23fb2d99467835ed2b2774e49c8c39363436fbd912094dd84e07d427e05367bf",
+    "vane_fs/build/directory-optimization-20261006/baseline-mount": "3d18ef010fcef4df06aecd33c65ef70edf705a7e88f9036cf4ae018bf0d1a719",
+    "vane_fs/build/directory-optimization-20261006/optimized-2-native.jsonl": "07ef5b00f5c98b41b6e29e691ebf54ad315ddd49d2b5e3190ed1c975d53db512",
+    "vane_fs/build/directory-optimization-20261006/pytest-fuse-sanitize.log": "8d4aa47ae5e621958c0805cb518cbba435b1d981d8f5d3a4fbb7e974e106b99e",
+    "vane_fs/build/directory-optimization-20261006/baseline-0-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/optimized-0-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/optimized-mount": "2e0b1860362741742bff94cbb52999a2cc6b6b651bbcb2044bbb1ad0c0c11587",
+    "vane_fs/build/directory-optimization-20261006/baseline-2-mount.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/directory-optimization-20261006/prototype-write-through-mmap.log": "23d403ea130d177147ec84ef5c3fca485a92a0232cb9d2411ef27b94a3ebcbe6",
+    "vane_fs/build/directory-optimization-20261006/build-sanitize.log": "20d5d0bff813b3385d56eb3e037d4ec7088c523b077c66a8ad4e86cf9d81f4f5"
+  },
+  "artifact_directory": "/home/kaka/astrovela_vane-fs/vane_fs/build/directory-optimization-20261006",
+  "retention": {
+    "production_benchmark_removed_bytes": 81203069,
+    "prototype_removed_bytes": 481181696,
+    "mounts_removed": 14,
+    "owned_services_remaining": 0
+  }
+}
