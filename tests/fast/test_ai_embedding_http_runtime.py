@@ -184,7 +184,12 @@ def test_public_loader_authenticates_with_the_serialized_application_key(monkeyp
     descriptor = getattr(provider, f"get_{kind}_embedder")(
         "served-model",
         2,
-        options={"runtime": "http", "base_url": "http://embedding.invalid/v1", "http_input_format": "multimodal"},
+        options={
+            "runtime": "http",
+            "base_url": "http://embedding.invalid/v1",
+            "http_input_format": "multimodal",
+            "request_batch_size": 2,
+        },
     )
     assert provider.name == descriptor.get_provider() == "my-deployment"
     assert all(key not in repr(descriptor) for key in ("explicit-key", "environment-key", "different-worker-key"))
@@ -280,6 +285,64 @@ def test_native_is_explicit_and_http_endpoint_does_not_select_it(family):
     for method in (provider.get_video_embedder, provider.get_audio_embedder):
         with pytest.raises(EmbeddingConfigurationError, match="encoded"):
             method("model", 2, options={"runtime": "http", "base_url": "http://localhost/v1"})
+
+
+@pytest.mark.parametrize("family", PROVIDERS)
+@pytest.mark.parametrize("input_format", ["text", "multimodal"])
+def test_default_dispatch_preserves_protocol_batching_and_bounded_media_concurrency(family, input_format):
+    single_rows = family == "sglang" and input_format == "multimodal"
+    expected_rows, expected_concurrency = (1, 4) if single_rows else (8, 1)
+    media = b"\x00\xffMP4 bytes\x00"
+    contents = [
+        _content(_part("text", str(i)), _part("video", media, "video/mp4"))
+        if input_format == "multimodal"
+        else _text(str(i))
+        for i in range(8)
+    ]
+
+    async def run():
+        active, peak = 0, 0
+        calls = []
+        first_wave = asyncio.Event()
+
+        async def handler(request):
+            nonlocal active, peak
+            _, rows, texts = _inputs(request)
+            assert len(rows) == expected_rows
+            if input_format == "multimodal":
+                for row in rows:
+                    url = row["video"] if family == "sglang" else row[0]["content"][1]["video_url"]["url"]
+                    assert base64.b64decode(url.split(",", 1)[1], validate=True) == media
+            calls.append(texts)
+            active += 1
+            peak = max(peak, active)
+            if active == expected_concurrency:
+                first_wave.set()
+            try:
+                await first_wave.wait()
+                await asyncio.sleep(0)
+                return _response(texts)
+            finally:
+                active -= 1
+
+        result = await asyncio.wait_for(
+            _run(
+                _descriptor(
+                    family,
+                    http_input_format=input_format,
+                    media_mime_types=["video/mp4"] if input_format == "multimodal" else [],
+                ),
+                contents,
+                handler,
+            ),
+            timeout=2,
+        )
+        assert [vector.tolist() for vector in result] == [[i, 1] for i in range(8)]
+        assert len(calls) == 8 // expected_rows
+        assert peak == expected_concurrency
+        assert active == 0
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("family", PROVIDERS)
@@ -441,7 +504,9 @@ def test_account_errors_and_exhausted_transient_errors_do_not_fan_out(status):
             json={"error": {"code": "INVALID_API_KEY"}} if status in {400, 413} else {},
         )
 
-    result = asyncio.run(_run(_descriptor(), [_text("1"), _text("2")], handler, on_error="ignore", retries=1))
+    result = asyncio.run(
+        _run(_descriptor(request_batch_size=2), [_text("1"), _text("2")], handler, on_error="ignore", retries=1)
+    )
     assert result == [None, None]
     assert len(calls) == (2 if status in {429, 503} else 1)
 
@@ -492,7 +557,7 @@ def test_row_attributable_bad_vector_does_not_replay_successful_neighbors(bad):
         calls.append(request)
         return httpx.Response(200, json={"data": [{"index": 1, "embedding": bad}, {"index": 0, "embedding": [1, 2]}]})
 
-    result = asyncio.run(_run(_descriptor(), [_text("1"), _text("2")], handler, on_error="ignore"))
+    result = asyncio.run(_run(_descriptor(request_batch_size=2), [_text("1"), _text("2")], handler, on_error="ignore"))
     assert result[0].tolist() == [1, 2]
     assert result[1] is None
     assert len(calls) == 1
