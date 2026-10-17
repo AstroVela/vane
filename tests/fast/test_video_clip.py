@@ -962,3 +962,31 @@ def test_partial_boundary_pictures_below_output_precision_do_not_fail(source, st
     frames, duration = decode_video(clip.data)
     assert len(frames) == clip.frame_count == count
     assert duration == pytest.approx(end - start, abs=1 / 60000)
+
+
+@pytest.mark.parametrize("overrun", [False, True])
+def test_fractional_start_reconstruction_keeps_the_requested_stream_end(tmp_path, overrun):
+    path = tmp_path / "fractional-rate.mp4"
+    rate = Fraction(30000, 1001)
+    with av.open(str(path), mode="w", format="mp4") as output:
+        stream = output.add_stream("mpeg4", rate=rate)
+        stream.width, stream.height, stream.pix_fmt = 16, 12, "yuv420p"
+        for index in range(960):
+            frame = av.VideoFrame.from_ndarray(np.zeros((12, 16, 3), dtype=np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, 1 / rate
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    end = float(Fraction(960, 1) / rate)
+    start = float(Fraction(640, 1) / rate)
+    source = vane.VideoFile(str(path))
+    if overrun:
+        with pytest.raises(vane.VideoFileFormatError, match="end exceeds"):
+            source.clip(start, end + 1 / 60000, include_audio=False)
+        return
+    clip = source.clip(start, end, include_audio=False)
+    frames, duration = decode_video(clip.data)
+    assert len(frames) == clip.frame_count == 320
+    assert clip.end_time == pytest.approx(end, abs=1 / 60000)
+    assert duration == pytest.approx(end - start, abs=1 / 60000)

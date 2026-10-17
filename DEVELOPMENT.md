@@ -74,6 +74,13 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+Video clipping regression checks include fractional starts ending exactly at a
+stream's rational endpoint. Duration quantization must not manufacture an
+overrun, and an actual extension by an output clock tick must still fail. After
+two clean reviews, build/install the Python wheel noneditably and run
+`tests/fast/test_video_clip.py`; no native rebuild or unrelated suite is needed
+for a Python-only endpoint comparison change.
+
 For the optional `qwen3_vl` provider, run
 `scripts/run_installed_pytest.sh tests/fast/test_qwen3_vl.py` before the base gate.
 Its CPU fixtures check lazy registration, tokenizer postprocessing, trained
