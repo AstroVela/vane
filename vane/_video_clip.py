@@ -190,6 +190,7 @@ class _ClipEncoder:
             self.video.codec_context.colorspace = 1  # BT.709
             self.video.codec_context.color_range = 1  # MPEG / limited
             self.color: tuple[int, int] | None = None
+            self.sar: Fraction | None = None
             self.pending_audio_packets: list[Any] = []
             self.pending_audio_bytes = 0
             self.video.time_base = self.video.codec_context.time_base = _TIME_BASE
@@ -291,7 +292,18 @@ class _ClipEncoder:
             if self.color is None:
                 self.video.codec_context.color_primaries = primaries
                 self.video.codec_context.color_trc = trc
-                self.video.codec_context.sample_aspect_ratio = self.previous_sar
+                self.sar = self.previous_sar
+                self.video.codec_context.sample_aspect_ratio = self.sar
+                # MPEG-4 may reduce SAR when opening its codec. Preserve the
+                # exact source ratio in MP4's container header, while retaining
+                # the codec's representable ratio for subsequent picture encoding.
+                self.video.codec_context.open()
+                encoder_sar = self.video.codec_context.sample_aspect_ratio
+                try:
+                    self.video.codec_context.sample_aspect_ratio = self.sar
+                    self.output.start_encoding()
+                finally:
+                    self.video.codec_context.sample_aspect_ratio = encoder_sar
                 self.color = primaries, trc
                 for packet in self.pending_audio_packets:
                     self.check()
@@ -303,7 +315,7 @@ class _ClipEncoder:
                 raise VideoFileFormatError(
                     "video_clip does not support changing color primaries or transfer characteristics"
                 )
-            if self.previous_sar != self.video.codec_context.sample_aspect_ratio:
+            if self.previous_sar != self.sar:
                 raise VideoFileFormatError("video_clip does not support changing sample aspect ratios")
             # Only convert the matrix/range, including on PyAV 17 where the
             # reformatter otherwise attempts transfer/primaries conversion.
