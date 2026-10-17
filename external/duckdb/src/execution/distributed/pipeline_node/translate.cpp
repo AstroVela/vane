@@ -250,9 +250,6 @@ PhysicalPlanToPipelineNodeTranslator::gen_ordered_gather_node(std::shared_ptr<Di
 }
 
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {
-	// Translate only executable inputs. Some operators expose additional owned
-	// subplans through GetChildren(), but those are serialized into their owning
-	// distributed node rather than translated as independent pipelines.
 	auto physical_children = TranslationChildren(op);
 	for (auto &child : physical_children) {
 		VisitOperator(child.get());
@@ -465,9 +462,8 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		return;
 	}
 	case PhysicalOperatorType::RECURSIVE_CTE_SCAN:
-	case PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN: {
+	case PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
 		throw NotImplementedException("Distributed pipeline does not support recursive CTE scans");
-	}
 	case PhysicalOperatorType::COPY_TO_FILE:
 	case PhysicalOperatorType::BATCH_COPY_TO_FILE: {
 		if (op.type == PhysicalOperatorType::COPY_TO_FILE) {

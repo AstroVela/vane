@@ -3,7 +3,7 @@
 
 import pytest
 
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.query_resource_spec import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,

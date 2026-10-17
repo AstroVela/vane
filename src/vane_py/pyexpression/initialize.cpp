@@ -10,11 +10,13 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/vector.hpp"
 #include "vane_python/python_conversion.hpp"
+#include "vane_python/pyconnection/pyconnection.hpp"
 
 namespace duckdb {
 
 void InitializeStaticMethods(py::module_ &m) {
 	const char *docs;
+	m.def("_check_python_callback_entry", &DuckDBPyConnection::CheckCallbackEntry);
 
 	// Constant Expression
 	docs = "Create a constant expression from the provided value";

@@ -41,6 +41,7 @@ public:
 
 	// Expose underlying Relation for C++ consumers
 	shared_ptr<Relation> GetRelation();
+	py::dict CollectLocalResourceGraph();
 
 public:
 	static void Initialize(py::handle &m);
@@ -70,6 +71,7 @@ public:
 	void ValidateDataSinkRetryInput();
 	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
 	py::object RunDataSink();
+	py::object ExecuteResult(const py::object &delivery_timeout, bool stream, idx_t rows_per_batch);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 
@@ -336,7 +338,9 @@ private:
 
 	void AssertResult() const;
 	void AssertResultOpen() const;
-	void AssertRelation() const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> AssertRelation() const;
+	void AssertSameContext(const DuckDBPyRelation &other) const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
 	void ExecuteOrThrow(bool stream_result = false, const py::object &interrupt_check = py::object());
 	unique_ptr<QueryResult> ExecuteInternal(bool stream_result = false);
 

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
@@ -103,6 +109,10 @@ public:
 	LocalSortedTable table;
 	//! Local state for accumulating filter statistics
 	unique_ptr<JoinFilterLocalState> local_filter_state;
+
+	void ResetBatchInput() override {
+		table.ResetInput();
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalPiecewiseMergeJoin::GetGlobalSinkState(ClientContext &context) const {
@@ -252,6 +262,13 @@ public:
 	ExpressionExecutor rhs_executor;
 
 public:
+	void ResetBatchInput() override {
+		if (lhs_local_table) {
+			lhs_local_table->ResetInput();
+		}
+		rhs_executor.ResetInput();
+	}
+
 	void ResolveJoinKeys(ExecutionContext &context, DataChunk &input) {
 		// sort by join key
 		const auto &lhs_types = lhs_payload.GetTypes();

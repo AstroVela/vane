@@ -38,6 +38,7 @@ from vane.execution.udf_ray_stream_protocol import (
     validate_stream_block_metadata,
     validate_stream_error_metadata,
 )
+from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
 
 _GENERATOR_READINESS_POLL_INITIAL_DELAY_S = 0.001
 _GENERATOR_READINESS_POLL_MAX_DELAY_S = 0.01
@@ -64,13 +65,6 @@ def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> No
     ]
     parts.extend(f"{key}={value}" for key, value in fields.items())
     print("[vane-ray-stream-collector] " + " ".join(parts), file=sys.stderr, flush=True)
-
-
-@dataclass(frozen=True)
-class _DrainCapacity:
-    rows: int
-    bytes: int | None = None
-    item_bytes: int | None = None
 
 
 @dataclass
@@ -262,7 +256,7 @@ class UDFStreamResultCollector:
         self._wakeup_fn: Any | None = None
         self._records: dict[tuple[int, int], _StreamRecord] = {}
         self._ready_by_slot: dict[int, deque[_ReadyEvent]] = defaultdict(deque)
-        self._capacity_by_slot: dict[int, _DrainCapacity] = {}
+        self._capacity_by_slot: dict[int, StreamCapacity] = {}
         self._active_output_leases: dict[tuple[str, str], _OutputLeaseToken] = {}
         self._cancelled_slots: set[int] = set()
         self._next_sequence = 0
@@ -400,48 +394,19 @@ class UDFStreamResultCollector:
             self._raise_if_stopped_locked()
             for slot_id, capacity in parsed.items():
                 ready = self._ready_by_slot.get(slot_id)
-                delivered_rows = 0
-                delivered_bytes = 0
+                window = StreamReadWindow(capacity)
                 while ready:
                     event = ready[0]
-                    if event.kind == "data":
-                        if delivered_rows >= capacity.rows:
-                            break
-                        if capacity.bytes is not None:
-                            if capacity.bytes <= delivered_bytes:
-                                break
-                            if delivered_rows > 0 and delivered_bytes + event.size_bytes > capacity.bytes:
-                                break
-                        if capacity.item_bytes is not None and capacity.item_bytes <= 0:
-                            break
-                        if (
-                            capacity.item_bytes is not None
-                            and delivered_rows > 0
-                            and event.size_bytes > capacity.item_bytes
-                        ):
-                            break
-                        # The byte windows are soft backpressure targets. Let
-                        # one complete block cross either target when the slot
-                        # is otherwise empty, then report zero residual
-                        # capacity until C++ hands that block downstream. This
-                        # is the same bounded full-block liveness escape used
-                        # by Ray Data and by Vane's local subprocess budget.
-                        delivered_rows += 1
-                        delivered_bytes += event.size_bytes
+                    if event.kind == "data" and not window.take(event.size_bytes):
+                        break
                     results.append(ready.popleft().as_tuple())
-                if delivered_rows:
+                if window.delivered:
                     readiness_changed = True
                 if ready is not None and not ready:
                     self._ready_by_slot.pop(slot_id, None)
-                remaining_bytes = None if capacity.bytes is None else max(0, capacity.bytes - delivered_bytes)
-                updated_capacity = _DrainCapacity(
-                    rows=max(0, capacity.rows - delivered_rows),
-                    bytes=remaining_bytes,
-                    item_bytes=capacity.item_bytes,
-                )
-                if self._capacity_by_slot.get(slot_id) != updated_capacity:
+                if self._capacity_by_slot.get(slot_id) != window.remaining:
                     readiness_changed = True
-                self._capacity_by_slot[slot_id] = updated_capacity
+                self._capacity_by_slot[slot_id] = window.remaining
             if readiness_changed:
                 self._signal_readiness_change_locked()
             else:
@@ -931,21 +896,14 @@ class UDFStreamResultCollector:
     @staticmethod
     def _parse_capacities(
         capacities: dict[Any, Any] | None,
-    ) -> dict[int, _DrainCapacity]:
+    ) -> dict[int, StreamCapacity]:
         if capacities is None:
             return {}
-        parsed: dict[int, _DrainCapacity] = {}
+        parsed: dict[int, StreamCapacity] = {}
         for raw_slot, raw in capacities.items():
             if not isinstance(raw, dict) or "rows" not in raw:
                 raise ValueError(f"invalid Ray UDF drain capacity for slot {raw_slot!r}")
-            rows = max(0, int(raw["rows"]))
-            bytes_value = raw.get("bytes")
-            item_value = raw.get("item_bytes")
-            parsed[int(raw_slot)] = _DrainCapacity(
-                rows=rows,
-                bytes=None if bytes_value is None else max(0, int(bytes_value)),
-                item_bytes=None if item_value is None else max(0, int(item_value)),
-            )
+            parsed[int(raw_slot)] = StreamCapacity.parse(raw)
         return parsed
 
     def _pending_data_counts_locked(self) -> dict[int, int]:
@@ -967,13 +925,7 @@ class UDFStreamResultCollector:
         if not record.next_ref_ready:
             return False
         capacity = self._capacity_by_slot.get(record.slot_id)
-        if capacity is None or capacity.rows <= 0:
-            return False
-        if capacity.bytes is not None and capacity.bytes <= 0:
-            return False
-        if capacity.item_bytes is not None and capacity.item_bytes <= 0:
-            return False
-        return int(pending_data_count) < capacity.rows
+        return capacity is not None and StreamReadWindow(capacity).may_read(pending_data_count)
 
     def _signal_readiness_change_locked(self) -> None:
         """Request an immediate scheduler pass without a remote wakeup RPC."""
@@ -1001,10 +953,7 @@ class UDFStreamResultCollector:
         admissible_slots = {
             slot_id
             for slot_id, capacity in self._capacity_by_slot.items()
-            if capacity.rows > 0
-            and (capacity.bytes is None or capacity.bytes > 0)
-            and (capacity.item_bytes is None or capacity.item_bytes > 0)
-            and pending_data_counts.get(slot_id, 0) < capacity.rows
+            if StreamReadWindow(capacity).may_read(pending_data_counts.get(slot_id, 0))
         }
         for record in self._records.values():
             if (

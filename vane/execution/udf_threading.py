@@ -69,6 +69,7 @@ def ray_actor_uses_native_threads(payload: dict[str, Any] | None = None) -> bool
 
 
 def worker_thread_env(payload: dict[str, Any] | None) -> dict[str, str]:
+    """Return managed thread defaults for a subprocess task worker."""
     thread_count = str(payload_cpu_thread_count(payload))
     env: dict[str, str] = {}
     effective_thread_count = os.environ.get("OMP_NUM_THREADS") or thread_count
@@ -80,6 +81,17 @@ def worker_thread_env(payload: dict[str, Any] | None) -> dict[str, str]:
     if "VANE_TORCH_INTEROP_THREADS" not in os.environ:
         env["VANE_TORCH_INTEROP_THREADS"] = "1"
     return env
+
+
+def subprocess_actor_thread_env(payload: dict[str, Any] | None) -> dict[str, str]:
+    """Match Ray's native actor defaults without importing Ray.
+
+    Ray supplies OMP from assigned CPUs only when it is unset. Other libraries
+    keep their own defaults, including Rayon and PyTorch inter-op parallelism.
+    Subprocesses inherit explicit environment settings from their parent.
+    """
+    thread_count = str(payload_cpu_thread_count(payload))
+    return {} if "OMP_NUM_THREADS" in os.environ else {"OMP_NUM_THREADS": thread_count}
 
 
 def ray_actor_thread_env(payload: dict[str, Any] | None) -> dict[str, str]:
@@ -111,7 +123,13 @@ def configure_ray_actor_loaded_torch_threads(payload: dict[str, Any] | None) -> 
     return configure_loaded_torch_threads()
 
 
-def configure_loaded_torch_threads() -> bool:
+def configure_loaded_torch_threads(*, explicit_only: bool = False) -> bool:
+    """Apply managed task limits, or only explicit Vane overrides for an actor.
+
+    Native actors let PyTorch consume OMP/library settings during import and
+    preserve constructor-selected thread counts. Setting one Vane override
+    must not reset the other pool to a managed default.
+    """
     global _TORCH_THREADS_CONFIGURED
     if _TORCH_THREADS_CONFIGURED:
         return False
@@ -120,13 +138,20 @@ def configure_loaded_torch_threads() -> bool:
     if torch_module is None:
         return False
 
-    torch_threads = os.environ.get("VANE_TORCH_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS") or "1"
-    interop_threads = os.environ.get("VANE_TORCH_INTEROP_THREADS") or "1"
-    target_threads = _positive_int(torch_threads, name="VANE_TORCH_NUM_THREADS")
-    target_interop_threads = _positive_int(interop_threads, name="VANE_TORCH_INTEROP_THREADS")
-    if int(torch_module.get_num_threads()) != target_threads:
+    torch_threads = os.environ.get("VANE_TORCH_NUM_THREADS")
+    interop_threads = os.environ.get("VANE_TORCH_INTEROP_THREADS")
+    if not explicit_only:
+        torch_threads = torch_threads or os.environ.get("OMP_NUM_THREADS") or "1"
+        interop_threads = interop_threads or "1"
+    if torch_threads is None and interop_threads is None:
+        return False
+    target_threads = None if torch_threads is None else _positive_int(torch_threads, name="VANE_TORCH_NUM_THREADS")
+    target_interop_threads = (
+        None if interop_threads is None else _positive_int(interop_threads, name="VANE_TORCH_INTEROP_THREADS")
+    )
+    if target_threads is not None and int(torch_module.get_num_threads()) != target_threads:
         torch_module.set_num_threads(target_threads)
-    if int(torch_module.get_num_interop_threads()) != target_interop_threads:
+    if target_interop_threads is not None and int(torch_module.get_num_interop_threads()) != target_interop_threads:
         torch_module.set_num_interop_threads(target_interop_threads)
     _TORCH_THREADS_CONFIGURED = True
     return True

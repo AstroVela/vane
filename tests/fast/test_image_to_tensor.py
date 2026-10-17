@@ -367,7 +367,12 @@ def test_nullable_fixed_tensor_normalization_preserves_sliced_child_buffers(elem
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("execution", ["contract", "subprocess"])
-def test_nullable_large_tensor_udf_normalization_has_bounded_memory(nested, execution):
+def test_nullable_large_tensor_udf_normalization_has_bounded_memory(monkeypatch, nested, execution):
+    # Workers map the entire output arena on first use. Fix its capacity for
+    # this address-space test instead of including host-sized virtual mappings
+    # in the 512 MiB normalization allowance. Two 4K RGBA rows need about 64 MiB.
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "128m")
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "128m")
     program = """
 import resource
 import sys

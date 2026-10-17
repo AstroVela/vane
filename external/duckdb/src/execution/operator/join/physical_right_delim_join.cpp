@@ -57,6 +57,11 @@ class RightDelimJoinLocalState : public LocalSinkState {
 public:
 	unique_ptr<LocalSinkState> join_state;
 	unique_ptr<LocalSinkState> distinct_state;
+
+	void ResetBatchInput() override {
+		join_state->ResetBatchInput();
+		distinct_state->ResetBatchInput();
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalRightDelimJoin::GetGlobalSinkState(ClientContext &context) const {

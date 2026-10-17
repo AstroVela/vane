@@ -23,6 +23,7 @@ from vane._ray_cxx import require_ray_cxx_attr
 # Avoid importing C++ bindings at module import time (may not be registered yet).
 # Resolve `vane.ray_cxx` attributes lazily at use-time instead.
 from vane.event_loop import set_event_loop
+from vane.execution.admission_ledger import BoundedReplayMap, BoundedSet
 from vane.extensions import _dynamic_extension_snapshot_cache_identity
 from vane.runners.common import PartitionMetadata
 from vane.runners.fte import (
@@ -41,7 +42,6 @@ from vane.runners.fte.debug_memory import (
 from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
 from vane.runners.fte.fte_failures import FteTaskTerminalControlError, _safe_failure_message
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
-from vane.runners.ray.admission_ledger import BoundedReplayMap, BoundedSet
 from vane.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
 from vane.runners.ray.ray_env import build_explicit_session_process_env, scrub_shared_runtime_session_env
 

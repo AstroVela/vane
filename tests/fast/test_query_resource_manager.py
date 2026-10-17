@@ -7,8 +7,13 @@ import random
 
 import pytest
 
-from vane.runners.ray import query_resource_manager as manager_module
-from vane.runners.ray.query_resource_graph import (
+from vane.execution import query_resource_policy as manager_module
+from vane.execution.query_resource_policy import (
+    OutputBlockRequest,
+    QueryResourceManager,
+    TaskRequest,
+)
+from vane.execution.query_resource_spec import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
@@ -16,11 +21,95 @@ from vane.runners.ray.query_resource_graph import (
     ResourceVector,
 )
 from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
-from vane.runners.ray.query_resource_manager import (
-    OutputBlockRequest,
-    RayQueryResourceManager,
-    TaskRequest,
+
+
+@pytest.mark.parametrize("unit_count", [1, 2, 3, 7])
+@pytest.mark.parametrize("limit", [600, 601])
+def test_local_envelopes_and_ray_use_the_same_full_reservation_partition(unit_count, limit):
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_local_byte_budget import local_byte_budget_state
+
+    keys = [f"resource:q:udf:{index}" for index in range(unit_count)]
+    manager = _manager(*[_unit(key) for key in keys], resources=_r(store=limit), reservation_ratio=1, terminals=keys)
+    _ready(manager, *keys)
+    with manager._lock:
+        ray_budget = manager._object_store_budget_state_locked()
+    local_budget = local_byte_budget_state(
+        DataAdmissionLimits(limit, 50, 50, unit_reservation_ratio=1),
+        dict.fromkeys(keys, 0),
+        dict.fromkeys(keys, 0),
+        set(keys),
+    )
+    assert local_budget == ray_budget
+
+
+@pytest.mark.parametrize(
+    "ratio,initial,retired,released",
+    [
+        (0, (100, 0), (100, 0), (100, 0)),
+        (0.5, (200, 150), (310, 260), (350, 300)),
+        (1, (300, 300), (520, 520), (600, 600)),
+    ],
 )
+def test_common_byte_accounting_preserves_backend_reservation_baselines(ratio, initial, retired, released):
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_local_byte_budget import local_byte_budget_state
+
+    keys = ["resource:q:udf:a", "resource:q:udf:b"]
+    manager = _manager(
+        *[_unit(key, resources=_r(cpu=1, store=50), target=50, blocks=1) for key in keys],
+        resources=_r(cpu=2, store=600),
+        reservation_ratio=ratio,
+        terminals=keys,
+    )
+    _ready(manager, *keys)
+
+    def compare(expected_shares):
+        with manager._lock:
+            ray = manager._object_store_budget_state_locked()
+        local = local_byte_budget_state(
+            DataAdmissionLimits(600, 50, 50, unit_reservation_ratio=ratio),
+            {key: unit.task_internal_usage_bytes + unit.output_usage_bytes for key, unit in ray.units.items()},
+            {key: unit.output_usage_bytes for key, unit in ray.units.items()},
+            set(ray.reservation_unit_ids),
+        )
+        assert local.query_usage_bytes == ray.query_usage_bytes
+        assert local.ineligible_usage_bytes == ray.ineligible_usage_bytes
+        assert local.reservation_unit_ids == ray.reservation_unit_ids
+        for key in keys:
+            assert local.units[key].task_internal_usage_bytes == ray.units[key].task_internal_usage_bytes
+            assert local.units[key].output_usage_bytes == ray.units[key].output_usage_bytes
+        # Local protects a complete envelope even at ratio=0. Ray keeps its
+        # zero baseline and soft-limit/liveness policy. Only ratio=1 makes
+        # these equal demands produce identical protected/shared partitions.
+        for budget, share in zip((local, ray), expected_shares):
+            for key in budget.reservation_unit_ids:
+                unit = budget.units[key]
+                assert unit.task_reserved_bytes + unit.output_reserved_bytes == share
+        if ratio == 1:
+            assert local == ray
+        return local
+
+    task = manager.try_acquire_task(_task(keys[0], 0, retained=50))
+    assert task.granted
+    output = None
+    try:
+        assert compare(initial).query_usage_bytes == 100
+        output = manager.try_acquire_output_block(OutputBlockRequest("q", keys[0], task.lease.lease_id, "0", "out", 80))
+        assert output.granted
+        compare(initial)
+        manager.release_task_lease(task.lease.lease_id, attempt_id="0")
+        assert compare(initial).query_usage_bytes == 80
+        manager.update_unit_state(keys[0], runnable=False, completed=True)
+        state = compare(retired)
+        assert state.ineligible_usage_bytes == 80
+        assert state.reservation_unit_ids == (keys[1],)
+        manager.release_output_block(output.lease.lease_id)
+        assert compare(released).query_usage_bytes == 0
+    finally:
+        if output is not None and output.granted:
+            manager.release_output_block(output.lease.lease_id)
+        manager.release_task_lease(task.lease.lease_id, attempt_id="0")
 
 
 def _r(*, cpu=0.0, gpu=0.0, heap=0, store=0):
@@ -113,7 +202,7 @@ def _manager(
         allocation_resources,
         nodes=nodes,
     )
-    return RayQueryResourceManager(
+    return QueryResourceManager(
         graph,
         allocation,
         reservation_ratio=reservation_ratio,
@@ -765,7 +854,7 @@ def test_production_seal_keeps_fused_udf_consumers_live():
     """Regression for #835: sealing must not disable UDF output liveness."""
     graph = _fused_udf_chain_graph()
     changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_eligible_units_change=lambda *args: changes.append(args),
@@ -810,7 +899,7 @@ def test_sealed_fused_nodes_keep_dependencies_without_reserving_object_store(lat
     graph = _fused_udf_chain_graph()
     wakeups = []
     frontier_changes = []
-    manager = RayQueryResourceManager(
+    manager = QueryResourceManager(
         graph,
         _allocation(_r(cpu=100, gpu=1, store=1_000)),
         on_change=lambda: wakeups.append("changed"),
@@ -3728,6 +3817,82 @@ def test_task_and_output_liveness_tokens_have_independent_lifetimes():
     assert manager.snapshot()["usage"]["object_store_bytes"] == 0
 
 
+def test_partitioned_output_keeps_one_progress_grant_until_all_parts_leave_producer():
+    unit = _unit("resource:f:bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    request = OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    grant = manager.try_acquire_output_block(request)
+    assert grant.granted and grant.liveness
+    before = manager.snapshot()["usage"]
+    parts = manager.partition_output_block(grant.lease.lease_id, (2, 3, 7))
+    assert manager.snapshot()["usage"] == before
+    assert [part.size_bytes for part in parts] == [2, 3, 7]
+    assert manager.snapshot()["liveness"]["output_grants_total"] == 1
+    next_request = OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "next", 4)
+
+    def handoff(part):
+        manager.transition_output_block(part.lease_id, "unit_queue")
+        manager.transition_output_block(part.lease_id, "downstream_input")
+
+    handoff(parts[0])
+    manager.release_output_block(parts[1].lease_id)
+    assert manager.try_acquire_output_block(next_request).blocked_reason == "liveness_output_active"
+    handoff(parts[2])
+    # All parts have left the producer. Retained consumer bytes do not prevent
+    # the next publication from acquiring its single bounded progress grant.
+    next_grant = manager.try_acquire_output_block(next_request)
+    assert next_grant.granted and next_grant.liveness
+    manager.release_task_lease(task.lease_id, attempt_id=task.attempt_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 2 + 7 + 4
+    manager.release_output_block(parts[0].lease_id)
+    manager.release_output_block(parts[2].lease_id)
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 4
+    assert snapshot["liveness"]["active_output_lease_ids_by_unit"] == {unit.resource_unit_id: next_grant.lease.lease_id}
+    manager.release_output_block(next_grant.lease.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+    assert manager._liveness_output_members == {}
+
+
+@pytest.mark.parametrize("sizes", [(), (0, 12), (-1, 13), (4, 4), (6, 7)])
+def test_invalid_output_partition_preserves_original_lease(sizes):
+    unit = _unit("resource:f:invalid-bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    )
+    before = manager.snapshot()
+    with pytest.raises(ValueError, match="preserve admitted bytes"):
+        manager.partition_output_block(grant.lease.lease_id, sizes)
+    after = manager.snapshot()
+    # The existing soft-budget debt keeps aging while validation rejects the
+    # partition; the lease ledger, usage, and progress grant must stay intact.
+    assert after.pop("soft_allocation_debt_duration_s") >= before.pop("soft_allocation_debt_duration_s")
+    assert after == before
+    manager.cancel("test cleanup")
+    assert manager._liveness_output_members == {}
+
+
+def test_cancel_partitioned_output_removes_group_and_makes_late_release_idempotent():
+    unit = _unit("resource:f:cancel-bundle", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0)).lease
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest("q", unit.resource_unit_id, task.lease_id, task.attempt_id, "bundle", 12)
+    )
+    parts = manager.partition_output_block(grant.lease.lease_id, (5, 7))
+    manager.cancel("cancel bundle")
+    for part in parts:
+        assert not manager.release_output_block(part.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+    assert manager._liveness_output_members == {}
+
+
 def test_oversized_output_block_uses_one_bounded_liveness_grant():
     unit = _unit("resource:f:decode", target=50, blocks=2)
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=100))
@@ -4191,4 +4356,4 @@ def test_native_task_and_materialized_output_preserve_the_actual_runtime_node():
     granted = manager.try_acquire_task(_task(unit.resource_unit_id, 3, node_id=output.node_id))
     assert granted.granted
     assert granted.lease.node_id == output.node_id
-    assert manager.snapshot()["ray_core_owns_placement"] is True
+    assert manager.snapshot()["backend_owns_placement"] is True

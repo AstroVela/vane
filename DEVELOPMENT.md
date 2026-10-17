@@ -170,6 +170,8 @@ wheel. Test fixtures may use `--test-only`; they must never be published.
 
 For specialized workflows and their contracts, see:
 
+- [Local model lifetime](LOCAL_MODEL_RUNTIME.md): explicit registration, query
+  borrowing, and runtime shutdown contracts.
 - [Native media packaging](NATIVE_MEDIA_EXTENSIONS.md#build-and-package):
   dynamic runtime/source SDK inputs and static release materials.
 - [Media publication](NATIVE_MEDIA_RELEASE.md) and
@@ -253,6 +255,12 @@ need model downloads, cloud credentials, GPUs, or external services:
 ```bash
 scripts/run_release_tests.sh
 ```
+
+The gate includes native local-runtime backpressure acceptance: small-budget
+progress, concurrent model reuse, retained results, cancellation/cleanup retry,
+and final UDF statistics. See [coverage and failure diagnostics](LOCAL_MODEL_RUNTIME.md#backpressure-acceptance-gate).
+Real-Ray release tests run in a separate process; the full local parameter
+matrices remain in the fast-test shards.
 
 Vane's native extension is private to the installed `vane` package. Test
 launchers therefore run outside the checkout and put the installed

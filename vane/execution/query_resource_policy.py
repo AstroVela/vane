@@ -13,8 +13,18 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from vane.runners.ray.admission_ledger import BoundedSet
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.admission_ledger import BoundedSet
+from vane.execution.byte_budget import (
+    DEFAULT_RESOURCE_RESERVATION_RATIO,
+    ByteBudgetUsage,
+    allocate_resource_reservations,
+    build_byte_budget_state,
+    byte_budget_block_reason,
+    resource_budget_remaining,
+)
+from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
+from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
+from vane.execution.query_resource_spec import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
@@ -37,13 +47,6 @@ _SOFT_OUTPUT_BLOCK_REASONS = {
     "unit_soft_object_store_bytes",
     "unit_soft_limit",
 }
-_OUTPUT_STATES = (
-    "generator_pending",
-    "unit_queue",
-    "downstream_input",
-    "external_consumer",
-    "released",
-)
 _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _EPSILON = 1e-9
 _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
@@ -51,6 +54,9 @@ _SOFT_RESERVATION_WARNING_DELAY_S = 60.0
 _COPY_METADATA_OUTPUT_ESTIMATE_BYTES = 4 * 1024**2
 
 logger = logging.getLogger(__name__)
+
+# Preserve the existing internal import while sharing the policy implementation.
+_ObjectStoreUnitBudget = ByteBudgetUsage
 
 
 def _resource_dimension(resources: ResourceVector, field_name: str) -> int | float:
@@ -124,48 +130,6 @@ class _TaskAdmissionPlan:
 
 
 @dataclass(frozen=True)
-class _ObjectStoreUnitBudget:
-    task_reserved_bytes: int
-    output_reserved_bytes: int
-    task_internal_usage_bytes: int
-    output_usage_bytes: int
-
-    @property
-    def task_budget_usage_bytes(self) -> int:
-        return self.task_internal_usage_bytes + max(
-            0,
-            self.output_usage_bytes - self.output_reserved_bytes,
-        )
-
-    @property
-    def task_reserved_remaining_bytes(self) -> int:
-        return max(0, self.task_reserved_bytes - self.task_budget_usage_bytes)
-
-    @property
-    def output_reserved_remaining_bytes(self) -> int:
-        return max(0, self.output_reserved_bytes - self.output_usage_bytes)
-
-    @property
-    def shared_used_bytes(self) -> int:
-        return max(0, self.task_budget_usage_bytes - self.task_reserved_bytes)
-
-
-@dataclass(frozen=True)
-class _ObjectStoreBudgetState:
-    limit_bytes: int
-    ineligible_usage_bytes: int
-    shared_pool_bytes: int
-    shared_used_bytes: int
-    query_usage_bytes: int
-    reservation_unit_ids: tuple[str, ...]
-    units: dict[str, _ObjectStoreUnitBudget]
-
-    @property
-    def shared_remaining_bytes(self) -> int:
-        return max(0, self.shared_pool_bytes - self.shared_used_bytes)
-
-
-@dataclass(frozen=True)
 class _QueuedTaskEvaluation:
     rank: tuple[int, int, int]
     request: TaskRequest
@@ -201,6 +165,7 @@ class OutputBlockLease:
     state: str
     liveness: bool
     allocation_generation: int
+    liveness_group_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,63 +175,6 @@ class OutputBlockGrant:
     blocked_reason: str = ""
     fatal: bool = False
     liveness: bool = False
-
-
-class OutputBlockLeaseOwner:
-    """Shared lifetime owner carried with one query-produced ObjectRef."""
-
-    def __init__(self, manager: RayQueryResourceManager, lease: OutputBlockLease) -> None:
-        self._manager = manager
-        self._lease_id = str(lease.lease_id)
-        self._state = str(lease.state)
-        self._released = False
-        self._lock = threading.Lock()
-
-    @property
-    def lease_id(self) -> str:
-        return self._lease_id
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return "released" if self._released else self._state
-
-    def transition_to(self, state: str) -> bool:
-        target = str(state)
-        if target not in _OUTPUT_STATES or target == "released":
-            raise ValueError(f"invalid output lease owner transition target: {target}")
-        with self._lock:
-            if self._released:
-                return False
-            current_index = _OUTPUT_STATES.index(self._state)
-            target_index = _OUTPUT_STATES.index(target)
-            if target_index < current_index:
-                raise ValueError(f"output lease owner cannot move backward: {self._state} -> {target}")
-            while current_index < target_index:
-                next_state = _OUTPUT_STATES[current_index + 1]
-                if not self._manager.transition_output_block(self._lease_id, next_state):
-                    self._released = True
-                    return False
-                self._state = next_state
-                current_index += 1
-            return True
-
-    def release(self) -> bool:
-        with self._lock:
-            if self._released:
-                return False
-            released = self._manager.release_output_block(self._lease_id)
-            self._released = True
-            self._state = "released"
-            return bool(released)
-
-    def __del__(self) -> None:
-        try:
-            self.release()
-        except Exception:
-            # Query teardown may already have canceled and removed the manager's
-            # leases. Destructors cannot safely surface that idempotent race.
-            pass
 
 
 @dataclass
@@ -314,7 +222,7 @@ class _NativeFragmentState:
     completed: bool = False
 
 
-class RayQueryResourceManager:
+class QueryResourceManager:
     """Own Ray execution and streaming-output resources for one query DAG.
 
     DuckDB owns native-fragment CPU, heap, scheduling, and spill. Native units
@@ -329,7 +237,7 @@ class RayQueryResourceManager:
         *,
         admission_open: bool = True,
         max_native_task_attempts: int = 4,
-        reservation_ratio: float = 0.5,
+        reservation_ratio: float = DEFAULT_RESOURCE_RESERVATION_RATIO,
         on_change: Callable[[], None] | None = None,
         on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
     ) -> None:
@@ -352,7 +260,7 @@ class RayQueryResourceManager:
         self._units = {
             unit.resource_unit_id: _ResourceUnitState(
                 spec=unit,
-                actor_ready=unit.backend != "ray_actor",
+                actor_ready=unit.execution_kind != "actor",
             )
             for unit in graph.units
         }
@@ -380,6 +288,7 @@ class RayQueryResourceManager:
         self._submitted_actor_slots: set[tuple[str, int]] = set()
         self._retiring_actor_unit_ids: set[str] = set()
         self._actor_node_by_slot: dict[tuple[str, int], str] = {}
+        self._backend_actor_loads: dict[str, dict[int, int]] = {}
         self._active_actor_slots: dict[tuple[str, int], str] = {}
         self._queued_actor_slot_leases: dict[tuple[str, int], deque[str]] = {}
         self._terminal_attempts = BoundedSet[tuple[str, str]](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
@@ -392,6 +301,7 @@ class RayQueryResourceManager:
         self._terminal_output_blocks = BoundedSet[str](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
         self._active_liveness_task_lease_ids_by_unit: dict[str, str] = {}
         self._active_liveness_output_lease_ids_by_unit: dict[str, str] = {}
+        self._liveness_output_members: dict[str, set[str]] = {}
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
         self._completed_materialization_barrier_ids: set[str] = set()
@@ -497,7 +407,7 @@ class RayQueryResourceManager:
             raise ValueError("native fragment membership requires execution query and fragment IDs")
         with self._lock:
             unit = self._units[unit_key]
-            if unit.spec.backend != "ray_worker":
+            if unit.spec.execution_kind != "native":
                 raise ValueError("native fragment membership requires a ray_worker resource unit")
             if self._native_production_sealed:
                 raise RuntimeError("native task production is sealed")
@@ -574,7 +484,7 @@ class RayQueryResourceManager:
             changed = False
             memberless_units: list[str] = []
             for unit_key, unit in self._units.items():
-                if unit.spec.backend != "ray_worker":
+                if unit.spec.execution_kind != "native":
                     continue
                 if unit_key not in self._native_fragments:
                     memberless_units.append(unit_key)
@@ -657,7 +567,7 @@ class RayQueryResourceManager:
             eligible = set(self._eligible_resource_unit_ids_locked())
             return any(
                 lease.resource_unit_id not in eligible
-                and self._units[lease.resource_unit_id].spec.backend == "ray_actor"
+                and self._units[lease.resource_unit_id].spec.execution_kind == "actor"
                 for lease in self._task_leases.values()
             )
 
@@ -914,7 +824,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             for raw_actor_index in actor_indices:
                 if isinstance(raw_actor_index, bool):
@@ -955,6 +865,23 @@ class RayQueryResourceManager:
             )
             self._publish_change_locked()
 
+    def set_actor_slot_loads(self, resource_unit_id: str, loads: dict[int, int]) -> None:
+        """Observe shared backend occupancy when choosing an actor replica.
+
+        These counts affect placement preference only. Query leases still own
+        soft admission and the backend owns its physical prefetch capacity.
+        A query-private Ray pool needs no additional occupancy observation.
+        """
+        with self._lock:
+            spec = self._units[resource_unit_id].spec
+            if spec.execution_kind != "actor" or set(loads) != set(range(spec.actor_pool_size)):
+                raise ValueError("actor loads must describe every replica of an actor unit")
+            if any(type(count) is not int or count < 0 for count in loads.values()):
+                raise ValueError("actor loads must be nonnegative integers")
+            if self._backend_actor_loads.get(resource_unit_id) != loads:
+                self._backend_actor_loads[resource_unit_id] = dict(loads)
+                self._publish_change_locked()
+
     def set_ready_actor_slots(
         self,
         resource_unit_id: str,
@@ -968,7 +895,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             for raw_actor_index, raw_node_id in actor_node_ids.items():
                 if isinstance(raw_actor_index, bool):
@@ -1043,7 +970,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if slot_index < 0 or slot_index >= unit.spec.actor_pool_size:
                 raise ValueError(f"actor index is outside pool {unit_key}: {slot_index}")
@@ -1091,7 +1018,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if unit_key in self._eligible_resource_unit_ids_locked():
                 return False
@@ -1123,7 +1050,7 @@ class RayQueryResourceManager:
             unit = self._units.get(unit_key)
             if unit is None:
                 raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.spec.backend != "ray_actor":
+            if unit.spec.execution_kind != "actor":
                 raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
             if unit_key not in self._retiring_actor_unit_ids:
                 return False
@@ -1425,7 +1352,7 @@ class RayQueryResourceManager:
         if unit is None:
             return "unit_not_registered", True, empty_plan
         if request.output_kind not in {"data", "copy_metadata"} or (
-            request.output_kind == "copy_metadata" and unit.spec.backend != "ray_worker"
+            request.output_kind == "copy_metadata" and unit.spec.execution_kind != "native"
         ):
             return "invalid_task_output_kind", True, empty_plan
         if unit.completed:
@@ -1436,7 +1363,7 @@ class RayQueryResourceManager:
             return "materialization_barrier_pending", False, empty_plan
         if not unit.runnable:
             return "unit_not_runnable", False, empty_plan
-        if unit.spec.backend == "ray_actor" and not unit.actor_ready:
+        if unit.spec.execution_kind == "actor" and not unit.actor_ready:
             return "actor_not_ready", False, empty_plan
 
         task_key = str(request.task_id).strip()
@@ -1457,17 +1384,22 @@ class RayQueryResourceManager:
 
         node_id: str | None = None
         actor_index: int | None = None
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             node_id = "" if request.node_id is None else str(request.node_id).strip()
             if not node_id:
                 return "ray_worker_node_required", True, empty_plan
-        elif unit.spec.backend == "ray_task":
+        elif unit.spec.execution_kind == "task":
             if request.node_id is not None and str(request.node_id).strip():
                 return "ray_task_node_must_be_unset", True, empty_plan
-        elif unit.spec.backend == "ray_actor":
+        elif unit.spec.execution_kind == "actor":
             requested_node_id = "" if request.node_id is None else str(request.node_id).strip()
+            backend_loads = self._backend_actor_loads.get(unit.spec.resource_unit_id, {})
             candidates = [
-                (self._actor_slot_lease_count_locked(slot), slot[1], ready_node_id)
+                (
+                    max(self._actor_slot_lease_count_locked(slot), backend_loads.get(slot[1], 0)),
+                    slot[1],
+                    ready_node_id,
+                )
                 for slot, ready_node_id in self._actor_node_by_slot.items()
                 if slot[0] == unit.spec.resource_unit_id
                 and (not requested_node_id or ready_node_id == requested_node_id)
@@ -1553,7 +1485,7 @@ class RayQueryResourceManager:
 
         if spec.target_output_block_bytes <= 0:
             return 0
-        if spec.backend == "ray_worker":
+        if spec.execution_kind == "native":
             return int(spec.output_window_bytes)
         state = self._units[spec.resource_unit_id]
         if state.num_task_outputs_generated <= 0:
@@ -1579,7 +1511,7 @@ class RayQueryResourceManager:
         *,
         actor_index: int | None,
     ) -> int:
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             if actor_index is None:
                 raise RuntimeError("Ray actor admission requires a selected actor slot")
             if self._actor_slot_lease_count_locked((spec.resource_unit_id, actor_index)) > 0:
@@ -1590,9 +1522,9 @@ class RayQueryResourceManager:
 
     def _pending_output_estimate_for_lease_locked(self, lease: TaskLease) -> int:
         spec = self._units[lease.resource_unit_id].spec
-        if spec.backend == "ray_worker":
+        if spec.execution_kind == "native":
             return lease.output_window_bytes
-        if spec.backend == "ray_actor" and lease.lease_id not in self._active_actor_slots.values():
+        if spec.execution_kind == "actor" and lease.lease_id not in self._active_actor_slots.values():
             # Prefetched actor calls retain their inputs, but only the active
             # call can currently populate that actor's generator buffer.
             return 0
@@ -1663,24 +1595,17 @@ class RayQueryResourceManager:
             if amount <= 0:
                 continue
             assert usage_by_unit is not None
-            dimension_unit_ids, reserved_by_unit, limit = self._dimension_reservations_locked(
+            _, reserved_by_unit, limit = self._dimension_reservations_locked(
                 field_name,
                 requested_unit_id=resource_unit_id,
             )
-            reserved = reserved_by_unit[resource_unit_id]
-            current_amount = getattr(usage_by_unit[resource_unit_id], field_name)
-            if current_amount + amount <= reserved + _EPSILON:
-                continue
-            shared_pool = max(0.0, limit - sum(reserved_by_unit.values()))
-            shared_used = sum(
-                max(
-                    0.0,
-                    getattr(usage_by_unit[key], field_name) - reserved_by_unit[key],
-                )
-                for key in dimension_unit_ids
+            remaining = resource_budget_remaining(
+                resource_unit_id,
+                usage={key: getattr(usage_by_unit[key], field_name) for key in reserved_by_unit},
+                reserved=reserved_by_unit,
+                limit=limit,
             )
-            shared_need = amount - max(0.0, reserved - current_amount)
-            if shared_used + shared_need > shared_pool + _EPSILON:
+            if amount > remaining + _EPSILON:
                 return f"unit_soft_{field_name}"
 
         if not ignore_object_store and request.object_store_bytes > 0:
@@ -1712,22 +1637,17 @@ class RayQueryResourceManager:
         baseline_by_unit = {
             key: self._unit_dimension_commitment(self._units[key].spec, field_name) for key in dimension_unit_ids
         }
-        baseline_total = sum(baseline_by_unit.values())
-        if baseline_total <= limit + _EPSILON:
-            bonus_pool = max(0.0, limit - baseline_total) * self.reservation_ratio
-            bonus = bonus_pool / len(dimension_unit_ids)
-            reserved_by_unit = {key: baseline + bonus for key, baseline in baseline_by_unit.items()}
-        else:
-            reservation_pool = limit * self.reservation_ratio
-            reserved_by_unit = {
-                key: reservation_pool * baseline / baseline_total for key, baseline in baseline_by_unit.items()
-            }
         maximum_by_unit = {
             key: self._unit_dimension_maximum_locked(self._units[key].spec, field_name) for key in dimension_unit_ids
         }
-        reserved_by_unit = {key: min(reserved, maximum_by_unit[key]) for key, reserved in reserved_by_unit.items()}
-        if field_name in {"heap_bytes", "object_store_bytes"}:
-            reserved_by_unit = {key: math.floor(reserved) for key, reserved in reserved_by_unit.items()}
+        reserved_by_unit = allocate_resource_reservations(
+            baseline_by_unit,
+            maximum_by_unit,
+            limit=limit,
+            reservation_ratio=self.reservation_ratio,
+            integral=field_name in {"heap_bytes", "object_store_bytes"},
+            arithmetic_tolerance=_EPSILON,
+        )
         return dimension_unit_ids, reserved_by_unit, global_limit
 
     def _object_store_output_usage_for_unit_locked(
@@ -1793,52 +1713,26 @@ class RayQueryResourceManager:
             requested_unit_id=None,
             reservation_limit=max(0, object_limit - ineligible_usage),
         )
-        units: dict[str, _ObjectStoreUnitBudget] = {}
-        shared_used = 0
-        for resource_unit_id, unit in self._units.items():
-            total_usage = total_usage_by_unit[resource_unit_id]
-            output_usage = output_usage_by_unit[resource_unit_id]
-            if output_usage > total_usage:
-                raise RuntimeError(f"unit {resource_unit_id} output usage exceeds total object-store usage")
-
-            total_reserved = int(total_reserved_by_unit.get(resource_unit_id, 0))
-            has_streaming_outputs = bool(
-                unit.spec.target_output_block_bytes > 0 and unit.spec.generator_buffer_blocks > 0
-            )
-            output_reserved = (total_reserved + 1) // 2 if has_streaming_outputs else 0
-            budget = _ObjectStoreUnitBudget(
-                task_reserved_bytes=total_reserved - output_reserved,
-                output_reserved_bytes=output_reserved,
-                task_internal_usage_bytes=total_usage - output_usage,
-                output_usage_bytes=output_usage,
-            )
-            units[resource_unit_id] = budget
-            if resource_unit_id in reservation_unit_id_set:
-                shared_used += budget.shared_used_bytes
-
+        budget = build_byte_budget_state(
+            limit_bytes=object_limit,
+            usage_by_unit=total_usage_by_unit,
+            output_usage_by_unit=output_usage_by_unit,
+            reserved_by_unit={key: int(value) for key, value in total_reserved_by_unit.items()},
+            streaming_units={
+                key
+                for key, unit in self._units.items()
+                if unit.spec.target_output_block_bytes > 0 and unit.spec.generator_buffer_blocks > 0
+            },
+        )
         query_usage = self._soft_allocation_usage_locked(
             excluded_waiting_block_id=excluded_waiting_block_id,
         ).object_store_bytes
-        accounted_usage = sum(budget.task_internal_usage_bytes + budget.output_usage_bytes for budget in units.values())
-        if accounted_usage != query_usage:
+        if budget.query_usage_bytes != query_usage:
             raise RuntimeError(
                 "per-unit object-store accounting does not match query usage: "
-                f"units={accounted_usage} query={query_usage}"
+                f"units={budget.query_usage_bytes} query={query_usage}"
             )
-
-        shared_pool = max(
-            0,
-            object_limit - ineligible_usage - sum(int(total_reserved_by_unit[key]) for key in reservation_unit_ids),
-        )
-        return _ObjectStoreBudgetState(
-            limit_bytes=object_limit,
-            ineligible_usage_bytes=ineligible_usage,
-            shared_pool_bytes=shared_pool,
-            shared_used_bytes=shared_used,
-            query_usage_bytes=query_usage,
-            reservation_unit_ids=reservation_unit_ids,
-            units=units,
-        )
+        return budget
 
     def _object_store_soft_block_reason_locked(
         self,
@@ -1867,26 +1761,26 @@ class RayQueryResourceManager:
                 return None
             raise RuntimeError(f"unit {resource_unit_id} requested undeclared object_store_bytes capacity")
 
-        unit = state.units[resource_unit_id]
-        protected_remaining = unit.task_reserved_remaining_bytes
-        if request_kind == "output":
-            protected_remaining += unit.output_reserved_remaining_bytes
-        shared_need = max(0, int(amount) - protected_remaining)
-        if shared_need <= 0:
-            return None
-
-        query_usage_after = state.query_usage_bytes + int(amount)
-        if query_usage_after > state.limit_bytes:
-            return "query_soft_object_store_bytes"
-        if state.shared_used_bytes + shared_need > state.shared_pool_bytes:
-            return "unit_soft_object_store_bytes"
-        return None
+        reason = byte_budget_block_reason(
+            state.units[resource_unit_id],
+            int(amount),
+            request_kind=request_kind,
+            usage_bytes=state.query_usage_bytes,
+            limit_bytes=state.limit_bytes,
+            shared_used_bytes=state.shared_used_bytes,
+            shared_pool_bytes=state.shared_pool_bytes,
+        )
+        return (
+            {"total_bytes": "query_soft_object_store_bytes", "shared_bytes": "unit_soft_object_store_bytes"}[reason]
+            if reason
+            else None
+        )
 
     @staticmethod
     def _unit_uses_dimension(spec: ResourceUnitSpec, field_name: str) -> bool:
         if field_name == "object_store_bytes":
             return bool(spec.per_task.object_store_bytes or spec.target_output_block_bytes)
-        resources = spec.resident_per_actor if spec.backend == "ray_actor" else spec.per_task
+        resources = spec.resident_per_actor if spec.execution_kind == "actor" else spec.per_task
         return _resource_dimension(resources, field_name) > 0
 
     def _unit_dimension_commitment(self, spec: ResourceUnitSpec, field_name: str) -> int | float:
@@ -1896,7 +1790,7 @@ class RayQueryResourceManager:
             # charged to runtime usage; the default per-unit reservation below
             # supplies the protected progress share.
             return 0
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             return _resource_dimension(spec.resident_per_actor, field_name) * spec.actor_pool_size
         return _resource_dimension(spec.per_task, field_name)
 
@@ -1911,10 +1805,10 @@ class RayQueryResourceManager:
             # operator maximum and let the query-level soft budget, output
             # backpressure, spill, and liveness escape control the dimension.
             return self.allocation.resources.object_store_bytes
-        if spec.backend == "ray_actor" and field_name != "object_store_bytes":
+        if spec.execution_kind == "actor" and field_name != "object_store_bytes":
             return _resource_dimension(spec.resident_per_actor, field_name) * spec.actor_pool_size
         concurrency = self._unit_concurrency_cap(spec)
-        if spec.backend == "ray_actor":
+        if spec.execution_kind == "actor":
             concurrency = spec.actor_pool_size
         coexistence_bound = math.inf if concurrency is None else int(concurrency)
         commitment = self._task_commitment(spec)
@@ -2135,7 +2029,7 @@ class RayQueryResourceManager:
         recovery_liveness: bool = False,
     ) -> TaskGrant:
         unit = self._units[str(request.resource_unit_id)].spec
-        if unit.backend == "ray_task":
+        if unit.execution_kind == "task":
             if plan.node_id is not None:
                 raise RuntimeError("Ray task leases must leave placement to Ray Core")
         elif not str(plan.node_id or "").strip():
@@ -2149,13 +2043,13 @@ class RayQueryResourceManager:
 
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
-        if unit.backend == "ray_actor":
+        if unit.execution_kind == "actor":
             if actor_index is None:
                 raise RuntimeError("Ray actor task admission requires a concrete actor slot")
             actor_slot = (unit.resource_unit_id, int(actor_index))
             if self._actor_slot_lease_count_locked(actor_slot) >= unit.actor_prefetch_depth:
                 raise RuntimeError("Ray actor prefetch slot changed during atomic task admission")
-            execution_slot_id = f"ray_actor:{unit.resource_unit_id}:{int(actor_index)}"
+            execution_slot_id = f"{unit.backend}:{unit.resource_unit_id}:{int(actor_index)}"
         else:
             actor_slot = None
             execution_slot_id = f"{unit.backend}:{unit.resource_unit_id}:{lease_id}"
@@ -2177,7 +2071,7 @@ class RayQueryResourceManager:
         usage = self._units[resource_unit_id].usage
         usage.task_count += 1
         usage.task_input_bytes += lease.resources.object_store_bytes
-        if unit.backend == "ray_worker":
+        if unit.execution_kind == "native":
             usage.native_output_window_bytes += lease.output_window_bytes
         self._active_attempt_leases[(lease.task_id, lease.attempt_id)] = lease.lease_id
         if actor_slot is not None:
@@ -2199,7 +2093,7 @@ class RayQueryResourceManager:
         usage = unit.usage
         usage.task_count -= 1
         usage.task_input_bytes -= lease.resources.object_store_bytes
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             usage.native_output_window_bytes -= lease.output_window_bytes
         if lease.actor_index is None:
             return
@@ -2250,7 +2144,7 @@ class RayQueryResourceManager:
             if task.attempt_id != attempt_key:
                 raise RuntimeError(f"FTE task lease attempt mismatch: lease={task.attempt_id} result={attempt_key}")
             unit = self._units[task.resource_unit_id]
-            if unit.spec.backend != "ray_worker":
+            if unit.spec.execution_kind != "native":
                 raise RuntimeError(
                     f"atomic FTE completion requires a native fragment lease: "
                     f"{task.resource_unit_id} uses {unit.spec.backend}"
@@ -2587,8 +2481,9 @@ class RayQueryResourceManager:
         if liveness and not self._output_liveness_chain_available_locked(producer_unit_id):
             raise RuntimeError("cannot grant more than one liveness output per downstream chain unit")
         self._record_output_observation_locked(request)
+        lease_id = uuid.uuid4().hex
         lease = OutputBlockLease(
-            lease_id=uuid.uuid4().hex,
+            lease_id=lease_id,
             query_id=self.graph.query_id,
             producer_unit_id=producer_unit_id,
             task_lease_id=str(request.task_lease_id),
@@ -2599,6 +2494,7 @@ class RayQueryResourceManager:
             state=str(initial_state),
             liveness=liveness,
             allocation_generation=self.allocation.generation,
+            liveness_group_id=lease_id if liveness else None,
         )
         self._output_leases[lease.lease_id] = lease
         self._output_lease_by_block[lease.block_id] = lease.lease_id
@@ -2607,9 +2503,59 @@ class RayQueryResourceManager:
         self._recompute_unit_queued_output_locked(lease.producer_unit_id)
         if liveness:
             self._active_liveness_output_lease_ids_by_unit[lease.producer_unit_id] = lease.lease_id
+            self._liveness_output_members[lease.lease_id] = {lease.lease_id}
             self._output_liveness_grants_total += 1
         self._publish_change_locked()
         return OutputBlockGrant(True, lease=lease, liveness=liveness)
+
+    def partition_output_block(self, lease_id: str, sizes: tuple[int, ...]) -> tuple[OutputBlockLease, ...]:
+        """Divide an admitted publication into independently owned physical blocks.
+
+        Admission and the generator observation cover the complete publication.
+        Partitioning changes neither its byte charge nor its progress grant;
+        all parts must be handed off or freed before that grant is returned.
+        """
+        with self._lock:
+            lease = self._output_leases.get(str(lease_id))
+            if lease is None:
+                raise RuntimeError("cannot partition a released output lease")
+            if lease.state not in {"generator_pending", "unit_queue"}:
+                raise ValueError("cannot partition an output after consumer handoff")
+            if not sizes or any(size <= 0 for size in sizes) or sum(sizes) != lease.size_bytes:
+                raise ValueError("output partition sizes must be positive and preserve admitted bytes")
+            if len(sizes) == 1:
+                return (lease,)
+            parts = tuple(
+                replace(lease, lease_id=uuid.uuid4().hex, block_id=uuid.uuid4().hex, size_bytes=size) for size in sizes
+            )
+            self._output_leases.pop(lease.lease_id)
+            self._output_lease_by_block.pop(lease.block_id)
+            self._terminal_output_blocks.add(lease.block_id)
+            self._update_output_usage_locked(lease, added=False)
+            for part in parts:
+                self._output_leases[part.lease_id] = part
+                self._output_lease_by_block[part.block_id] = part.lease_id
+                self._update_output_usage_locked(part, added=True)
+            if lease.liveness_group_id is not None:
+                members = self._liveness_output_members[lease.liveness_group_id]
+                members.remove(lease.lease_id)
+                members.update(part.lease_id for part in parts)
+            self._recompute_unit_queued_output_locked(lease.producer_unit_id)
+            self._publish_change_locked()
+            return parts
+
+    def _return_output_progress_locked(self, lease: OutputBlockLease) -> None:
+        group_id = lease.liveness_group_id
+        if group_id is None:
+            return
+        members = self._liveness_output_members.get(group_id)
+        if members is None:
+            return
+        members.discard(lease.lease_id)
+        if not members:
+            del self._liveness_output_members[group_id]
+            if self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == group_id:
+                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
 
     def transition_output_block(self, lease_id: str, state: str) -> bool:
         lease_key = str(lease_id)
@@ -2625,16 +2571,10 @@ class RayQueryResourceManager:
             if target_index != current_index + 1:
                 raise ValueError(f"invalid output lease transition: {lease.state} -> {target}")
             self._output_leases[lease_key] = OutputBlockLease(**{**asdict(lease), "state": target})
-            if (
-                target == "downstream_input"
-                and self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == lease_key
-            ):
-                # A liveness escape limits each producer to one full block at
-                # a time. The handed-off object stays charged, while returning
-                # this unit's token lets a partial downstream batch request its
-                # next block.
-                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
             if target == "downstream_input":
+                # Retained bytes stay charged after the complete publication
+                # hands off its progress token to a downstream consumer.
+                self._return_output_progress_locked(lease)
                 self._units[lease.producer_unit_id].usage.producer_output_bytes -= lease.size_bytes
                 self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._recompute_unit_queued_output_locked(lease.producer_unit_id)
@@ -2650,8 +2590,7 @@ class RayQueryResourceManager:
             self._update_output_usage_locked(lease, added=False)
             self._output_lease_by_block.pop(lease.block_id, None)
             self._terminal_output_blocks.add(lease.block_id)
-            if self._active_liveness_output_lease_ids_by_unit.get(lease.producer_unit_id) == lease_key:
-                self._active_liveness_output_lease_ids_by_unit.pop(lease.producer_unit_id)
+            self._return_output_progress_locked(lease)
             self._maybe_clear_task_liveness_locked(lease.task_lease_id)
             self._recompute_unit_queued_output_locked(lease.producer_unit_id)
             self._publish_change_locked()
@@ -2686,8 +2625,9 @@ class RayQueryResourceManager:
                 self._recompute_unit_queued_output_locked(resource_unit_id)
             self._active_liveness_task_lease_ids_by_unit.clear()
             self._active_liveness_output_lease_ids_by_unit.clear()
+            self._liveness_output_members.clear()
             for unit in self._units.values():
-                if unit.spec.backend == "ray_actor":
+                if unit.spec.execution_kind == "actor":
                     unit.actor_ready = False
             self._allocation_admission_open = False
             self._cancelled = True
@@ -2732,10 +2672,10 @@ class RayQueryResourceManager:
     ) -> ResourceVector:
         unit = self._units[resource_unit_id]
         usage = unit.usage
-        if unit.spec.backend == "ray_worker":
+        if unit.spec.execution_kind == "native":
             pending_bytes = usage.native_output_window_bytes
         else:
-            generators = usage.active_actor_count if unit.spec.backend == "ray_actor" else usage.task_count
+            generators = usage.active_actor_count if unit.spec.execution_kind == "actor" else usage.task_count
             pending_bytes = generators * self._pending_output_estimate_per_task_locked(unit.spec)
         # Every managed output remains charged exactly once, even after its
         # producer task has finished. Its queue/consumer state affects progress
@@ -2817,7 +2757,7 @@ class RayQueryResourceManager:
             resource_unit_id,
             excluded_waiting_block_id=excluded_waiting_block_id,
         )
-        if self._units[resource_unit_id].spec.backend == "ray_actor":
+        if self._units[resource_unit_id].spec.execution_kind == "actor":
             total = total + self._actor_resident_usage_locked(
                 resource_unit_id=resource_unit_id,
             )
@@ -2878,7 +2818,7 @@ class RayQueryResourceManager:
                 "query_id": self.graph.query_id,
                 "graph": self.graph.to_dict(),
                 "allocation": self.allocation.to_dict(),
-                "ray_core_owns_placement": True,
+                "backend_owns_placement": True,
                 "max_native_task_attempts": self.max_native_task_attempts,
                 "usage": usage.to_dict(),
                 "soft_allocation_usage": soft_allocation_usage.to_dict(),
@@ -3004,7 +2944,7 @@ class RayQueryResourceManager:
                             # output contracts. Report the largest active
                             # estimate, with the exact total alongside it.
                             max(pending_estimates_by_unit[resource_unit_id])
-                            if unit.spec.backend == "ray_worker" and pending_estimates_by_unit[resource_unit_id]
+                            if unit.spec.execution_kind == "native" and pending_estimates_by_unit[resource_unit_id]
                             else self._pending_output_estimate_per_task_locked(unit.spec)
                         ),
                         "pending_output_estimate_bytes": sum(pending_estimates_by_unit[resource_unit_id]),
@@ -3065,7 +3005,7 @@ __all__ = [
     "OutputBlockLease",
     "OutputBlockLeaseOwner",
     "OutputBlockRequest",
-    "RayQueryResourceManager",
+    "QueryResourceManager",
     "TaskGrant",
     "TaskLease",
     "TaskRequest",

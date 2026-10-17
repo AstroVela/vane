@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 
 #include "duckdb/common/enum_util.hpp"
@@ -105,6 +111,11 @@ public:
 	ExpressionExecutor executor;
 	DataChunk intermediate_chunk;
 	bool found_match[STANDARD_VECTOR_SIZE];
+
+	void ResetBatchInput() override {
+		executor.ResetInput();
+		intermediate_chunk.Reset();
+	}
 
 	void ResetMatches() {
 		if (op.join_type != JoinType::SEMI && op.join_type != JoinType::ANTI) {

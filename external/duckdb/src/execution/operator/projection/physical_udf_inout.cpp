@@ -343,24 +343,6 @@ idx_t SaturatingAdd(idx_t left, idx_t right) {
 	return left + right;
 }
 
-idx_t ResolveUDFRuntimeWorkerSlots(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "subprocess_task") {
-		return MaxValue<idx_t>(idx_t(1), task_operator_width);
-	}
-	if (backend.second == "subprocess_actor") {
-		auto actor_number = GetStructIntField(payload, "actor_number");
-		if (!actor_number.first || actor_number.second == 0) {
-			throw InvalidInputException("actor_number is required for execution_backend='%s'", backend.second);
-		}
-		return actor_number.second;
-	}
-	throw InvalidInputException("unsupported udf execution_backend '%s'", backend.second);
-}
-
 Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements) {
 	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
 		return payload;
@@ -386,20 +368,6 @@ Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements
 		children.emplace_back(replacement.first, std::move(replacement.second));
 	}
 	return Value::STRUCT(std::move(children));
-}
-
-Value ResolveUDFRuntimePayload(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "ray_task" || backend.second == "ray_actor") {
-		return payload;
-	}
-	auto worker_slots = ResolveUDFRuntimeWorkerSlots(payload, task_operator_width);
-	child_list_t<Value> replacements;
-	replacements.emplace_back("udf_worker_slots", Value::BIGINT(static_cast<int64_t>(worker_slots)));
-	return ReplaceStructFields(payload, std::move(replacements));
 }
 
 string UDFDebugNameFromPayload(const Value &payload) {
@@ -757,7 +725,7 @@ private:
 		UDFWorkerSlotDebugLog(StringUtil::Format("resolve_runtime_commit udf_name=%s reason=%s width=%llu",
 		                                         DebugUDFName().c_str(), reason ? reason : "<missing>",
 		                                         static_cast<unsigned long long>(task_operator_width)));
-		resolved_payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		resolved_payload = original_payload;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 	}
@@ -827,10 +795,6 @@ static void AppendUDFExecutionConfigParams(InsertionOrderPreservingMap<string> &
 	auto ray_actor_thread_policy = GetStructStringField(payload, "ray_actor_thread_policy");
 	if (ray_actor_thread_policy.first && !ray_actor_thread_policy.second.empty()) {
 		result["ray_actor_thread_policy"] = ray_actor_thread_policy.second;
-	}
-	auto worker_slots = GetStructIntField(payload, "udf_worker_slots");
-	if (worker_slots.first && worker_slots.second > 0) {
-		result["udf_worker_slots"] = std::to_string(worker_slots.second);
 	}
 	auto min_task_batch_size = GetStructIntField(payload, "min_task_batch_size");
 	if (min_task_batch_size.first && min_task_batch_size.second > 0) {
@@ -938,8 +902,9 @@ struct StreamingUDFConfig {
 	// row count is reached. EOS and byte pressure may still submit a short tail.
 	idx_t min_task_batch_rows = 0;
 	// Transport size is independent of the user-visible compute batch. Only
-	// ordinary synchronous Ray actor batches use the automatic byte target.
+	// ordinary synchronous actor batches use the automatic byte target.
 	bool auto_task_batching = false;
+	idx_t transport_input_target_bytes = 0;
 	idx_t actor_pool_size = 1;
 	idx_t task_input_max_bytes = 0;
 	idx_t output_target_bytes = 0;
@@ -1115,10 +1080,17 @@ struct StreamingHandoffCounters {
 static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t task_operator_width = 1);
 
 struct StreamingUDFState : public StateWithBlockableTasks {
-	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p)
-	    : original_payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
+	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p, idx_t transport_input_target_bytes_p)
+	    : original_payload(std::move(payload_p)), transport_input_target_bytes(transport_input_target_bytes_p),
+	      actor_handles(std::move(actor_handles_p)) {
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(original_payload);
+		config.transport_input_target_bytes = transport_input_target_bytes;
+		if (config.auto_task_batching &&
+		    GetStructStringField(payload, "execution_backend").second == "subprocess_actor" &&
+		    transport_input_target_bytes == 0) {
+			throw InvalidInputException("Local actor transport requires prepared arena capacity");
+		}
 		UDFWorkerSlotDebugLog(StringUtil::Format("streaming_ctor_unresolved udf_name=%s initial_config_width=1",
 		                                         UDFDebugNameFromPayload(original_payload).c_str()));
 	}
@@ -1174,8 +1146,9 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		    "streaming_resolve_commit udf_name=%s width=%llu operator_width_resolved=%s previous_width=%llu",
 		    UDFDebugNameFromPayload(original_payload).c_str(), static_cast<unsigned long long>(task_operator_width),
 		    operator_width_resolved ? "true" : "false", static_cast<unsigned long long>(resolved_task_operator_width)));
-		payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		payload = original_payload;
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
+		config.transport_input_target_bytes = transport_input_target_bytes;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 		runtime_operator_width_resolved = operator_width_resolved;
@@ -1183,6 +1156,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 
 	Value original_payload;
 	Value payload;
+	const idx_t transport_input_target_bytes;
 	shared_ptr<void> actor_handles;
 	StreamingUDFConfig config;
 	idx_t resolved_task_operator_width = 0;
@@ -1455,9 +1429,10 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 	auto prebatched_input = GetStructBoolField(payload, "prebatched_input");
 	auto row_preserving = GetStructBoolField(payload, "row_preserving");
 	config.auto_task_batching =
-	    execution_backend.second == "ray_actor" && call_mode.first && call_mode.second == "map_batches" &&
-	    config.compute_batch_rows > 0 && config.min_task_batch_rows == 0 &&
-	    !(prebatched_input.first && prebatched_input.second) && !(row_preserving.first && row_preserving.second);
+	    (execution_backend.second == "ray_actor" || execution_backend.second == "subprocess_actor") &&
+	    call_mode.first && call_mode.second == "map_batches" && config.compute_batch_rows > 0 &&
+	    config.min_task_batch_rows == 0 && !(prebatched_input.first && prebatched_input.second) &&
+	    !(row_preserving.first && row_preserving.second);
 	auto actor_number = GetStructIntField(payload, "actor_number");
 	if (actor_number.first && actor_number.second > 0) {
 		config.actor_pool_size = actor_number.second;
@@ -2077,7 +2052,11 @@ static StreamingSubmitPlan PlanStreamingAutoSubmit(const StreamingUDFState &stat
 	// applies the existing byte-bounded slicing and oversized-row rules.
 	const auto bytes_per_row = MaxValue<idx_t>(1, state.pending_bytes / state.pending_rows +
 	                                                  (state.pending_bytes % state.pending_rows != 0 ? 1 : 0));
-	const auto byte_rows = state.config.task_input_max_bytes / bytes_per_row;
+	const auto target_bytes =
+	    state.config.transport_input_target_bytes > 0
+	        ? MinValue(state.config.task_input_max_bytes, state.config.transport_input_target_bytes)
+	        : state.config.task_input_max_bytes;
+	const auto byte_rows = target_bytes / bytes_per_row;
 	const auto target_rows = MaxValue<idx_t>(compute_rows, byte_rows - byte_rows % compute_rows);
 	if (state.pending_rows >= target_rows) {
 		plan.target_rows = target_rows;
@@ -2485,6 +2464,9 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 		pending = &state.planned_submit.Lazy();
 	} else {
 		auto plan = PlanStreamingLazySubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingLazySubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -2810,7 +2792,7 @@ vector<idx_t> TestStreamingOutputCapacityPublication() {
 	                              {"call_mode", Value("map")},
 	                              {"udf_task_input_max_bytes", Value::BIGINT(4096)},
 	                              {"udf_output_target_max_bytes", Value::BIGINT(4096)}});
-	auto state = std::make_shared<StreamingUDFState>(payload, nullptr);
+	auto state = std::make_shared<StreamingUDFState>(payload, nullptr, 0);
 	state->self = state;
 	state->op = make_uniq<UDFOperatorState>(payload);
 	// Model a submit whose DATA has already been consumed downstream.
@@ -2874,6 +2856,9 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 		envelope = &state.planned_submit.Materialized();
 	} else {
 		auto plan = PlanStreamingMaterializedSubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingMaterializedSubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -3032,26 +3017,42 @@ std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(Clien
 	lock_guard<std::mutex> guard(streaming_state_lock);
 	if (!streaming_state) {
 		auto &udf_bind = bind_data->Cast<UDFFunctionData>();
-		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles);
+		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles,
+		                                                      udf_bind.transport_input_target_bytes);
 		streaming_state->self = streaming_state;
 	}
 	return streaming_state;
 }
 
-void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+void PhysicalStreamingUDF::ResetStreamingState(bool preserve_statistics) {
+	InsertionOrderPreservingMap<string> final_stats;
+	if (preserve_statistics) {
+		// CancelTasks also runs on successful completion, before final task
+		// statistics are collected. Keep values, not the executor or its buffers.
+		for (auto &entry : ParamsToString()) {
+			if (StringUtil::StartsWith(entry.first, "udf_")) {
+				final_stats[entry.first] = entry.second;
+			}
+		}
+	}
 	sink_state.reset();
+	std::shared_ptr<StreamingUDFState> previous_streaming_state;
+	{
+		lock_guard<std::mutex> guard(streaming_state_lock);
+		final_streaming_stats = std::move(final_stats);
+		previous_streaming_state = std::move(streaming_state);
+	}
+	previous_streaming_state.reset();
+}
+
+void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
 	if (children.size() != 1) {
 		throw InternalException("PhysicalStreamingUDF requires exactly one child");
 	}
 
 	// Prepared statements reuse physical operators. Clear the source/sink
 	// rendezvous before either side initializes state for the next execution.
-	std::shared_ptr<StreamingUDFState> previous_streaming_state;
-	{
-		lock_guard<std::mutex> guard(streaming_state_lock);
-		previous_streaming_state = std::move(streaming_state);
-	}
-	previous_streaming_state.reset();
+	ResetStreamingState(false);
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, false);
@@ -3511,6 +3512,11 @@ InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const
 	{
 		lock_guard<std::mutex> guard(streaming_state_lock);
 		state = streaming_state;
+		if (!state) {
+			for (auto &entry : final_streaming_stats) {
+				result[entry.first] = entry.second;
+			}
+		}
 	}
 	if (state) {
 		result["udf_resolved_source_threads"] =

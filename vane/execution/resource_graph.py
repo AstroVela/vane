@@ -6,27 +6,9 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
-import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import Any, ClassVar
-
-_RESOURCE_UNIT_KIND_BY_BACKEND = {
-    "ray_worker": "native_fragment",
-    "ray_task": "ray_task_udf",
-    "ray_actor": "ray_actor_pool",
-}
-_RESOURCE_ABS_TOLERANCE = 1e-12
-_RESOURCE_REL_TOLERANCE = 1e-12
-
-
-def _float_resource_leq(value: float, capacity: float) -> bool:
-    return value <= capacity or math.isclose(
-        value,
-        capacity,
-        rel_tol=_RESOURCE_REL_TOLERANCE,
-        abs_tol=_RESOURCE_ABS_TOLERANCE,
-    )
+from dataclasses import dataclass
+from typing import Any, ClassVar, Generic, Protocol, TypeVar
 
 
 def _strict_fields(payload: Mapping[str, Any], expected: tuple[str, ...], type_name: str) -> None:
@@ -40,197 +22,36 @@ def _strict_fields(payload: Mapping[str, Any], expected: tuple[str, ...], type_n
         raise ValueError(f"{type_name} is missing required fields: {', '.join(missing)}")
 
 
-@dataclass(frozen=True)
-class ResourceVector:
-    """Resources requested by work or attributed to a soft query budget.
+class ResourceUnit(Protocol):
+    """Identity and dependencies shared by backend-specific resource units."""
 
-    CPU and GPU are Ray logical resources and may be fractional. Byte resources
-    use integer accounting units. On a concrete task or actor, CPU, GPU, and
-    declared heap become real Ray Core scheduling requests. On a
-    ``QueryAllocation`` all four fields are soft admission/reservation shares:
-    existing work is not revoked after an overage, and one bounded liveness
-    path may escape a soft block. Object-store bytes additionally describe
-    spillable flow rather than process memory. A vector is never allowed to
-    carry negative capacity; subtraction that would underflow is a
-    control-plane bug.
-    """
+    @property
+    def query_id(self) -> str: ...
 
-    cpu: float = 0.0
-    gpu: float = 0.0
-    heap_bytes: int = 0
-    object_store_bytes: int = 0
+    @property
+    def resource_unit_id(self) -> str: ...
 
-    _FIELDS: ClassVar[tuple[str, ...]] = (
-        "cpu",
-        "gpu",
-        "heap_bytes",
-        "object_store_bytes",
-    )
+    @property
+    def physical_node_id(self) -> str: ...
 
-    def __post_init__(self) -> None:
-        for name in ("cpu", "gpu"):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and >= 0")
-            object.__setattr__(self, name, value)
-        for name in ("heap_bytes", "object_store_bytes"):
-            value = int(getattr(self, name))
-            if value < 0:
-                raise ValueError(f"{name} must be >= 0")
-            object.__setattr__(self, name, value)
+    @property
+    def unit_kind(self) -> str: ...
 
-    def __add__(self, other: ResourceVector) -> ResourceVector:
-        if not isinstance(other, ResourceVector):
-            return NotImplemented
-        return ResourceVector(
-            cpu=self.cpu + other.cpu,
-            gpu=self.gpu + other.gpu,
-            heap_bytes=self.heap_bytes + other.heap_bytes,
-            object_store_bytes=self.object_store_bytes + other.object_store_bytes,
-        )
+    @property
+    def backend(self) -> str: ...
 
-    def __sub__(self, other: ResourceVector) -> ResourceVector:
-        if not isinstance(other, ResourceVector):
-            return NotImplemented
-        values = {
-            "cpu": self.cpu - other.cpu,
-            "gpu": self.gpu - other.gpu,
-            "heap_bytes": self.heap_bytes - other.heap_bytes,
-            "object_store_bytes": self.object_store_bytes - other.object_store_bytes,
-        }
-        underflow = [name for name in ("heap_bytes", "object_store_bytes") if values[name] < 0]
-        underflow.extend(
-            name
-            for name in ("cpu", "gpu")
-            if not _float_resource_leq(float(getattr(other, name)), float(getattr(self, name)))
-        )
-        if underflow:
-            raise ValueError(f"resource subtraction underflow: {', '.join(underflow)}")
-        return ResourceVector(
-            cpu=max(0.0, values["cpu"]),
-            gpu=max(0.0, values["gpu"]),
-            heap_bytes=int(values["heap_bytes"]),
-            object_store_bytes=int(values["object_store_bytes"]),
-        )
+    @property
+    def input_unit_ids(self) -> tuple[str, ...]: ...
 
-    def scale(self, factor: float) -> ResourceVector:
-        factor = float(factor)
-        if not math.isfinite(factor) or factor < 0:
-            raise ValueError("resource scale factor must be finite and >= 0")
-        return ResourceVector(
-            cpu=self.cpu * factor,
-            gpu=self.gpu * factor,
-            heap_bytes=math.floor(self.heap_bytes * factor),
-            object_store_bytes=math.floor(self.object_store_bytes * factor),
-        )
-
-    def fits_within(self, capacity: ResourceVector) -> bool:
-        return (
-            _float_resource_leq(self.cpu, capacity.cpu)
-            and _float_resource_leq(self.gpu, capacity.gpu)
-            and self.heap_bytes <= capacity.heap_bytes
-            and self.object_store_bytes <= capacity.object_store_bytes
-        )
-
-    def exceeded_dimensions(self, capacity: ResourceVector) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name in self._FIELDS
-            if (
-                not _float_resource_leq(float(getattr(self, name)), float(getattr(capacity, name)))
-                if name in {"cpu", "gpu"}
-                else getattr(self, name) > getattr(capacity, name)
-            )
-        )
-
-    def dominant_share(self, capacity: ResourceVector) -> float:
-        shares: list[float] = []
-        for name in self._FIELDS:
-            demand = float(getattr(self, name))
-            available = float(getattr(capacity, name))
-            if demand <= 0:
-                shares.append(0.0)
-            elif available <= 0:
-                shares.append(math.inf)
-            else:
-                shares.append(demand / available)
-        return max(shares, default=0.0)
-
-    def is_zero(self) -> bool:
-        return all(getattr(self, name) == 0 for name in self._FIELDS)
-
-    def to_dict(self) -> dict[str, int | float]:
-        return {
-            "cpu": self.cpu,
-            "gpu": self.gpu,
-            "heap_bytes": self.heap_bytes,
-            "object_store_bytes": self.object_store_bytes,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> ResourceVector:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        return cls(
-            cpu=float(values["cpu"]),
-            gpu=float(values["gpu"]),
-            heap_bytes=int(values["heap_bytes"]),
-            object_store_bytes=int(values["object_store_bytes"]),
-        )
+    def to_dict(self) -> dict[str, Any]: ...
 
 
-def _process_resources(resources: ResourceVector) -> ResourceVector:
-    """Return the non-spillable portion of a query resource vector."""
-    return ResourceVector(
-        cpu=resources.cpu,
-        gpu=resources.gpu,
-        heap_bytes=resources.heap_bytes,
-    )
-
-
-@dataclass(frozen=True)
-class QueryAllocation:
-    """One driver's aggregate soft budget for a query.
-
-    This is deliberately not a Ray placement claim. Concrete tasks and actors
-    carry their real resource requests to Ray Core, which owns node selection,
-    pending demand, and autoscaling. Vane uses this vector only to decide when
-    to apply query/operator backpressure.
-    """
-
-    resources: ResourceVector
-    generation: int
-
-    _FIELDS: ClassVar[tuple[str, ...]] = (
-        "resources",
-        "generation",
-    )
-
-    def __post_init__(self) -> None:
-        generation = int(self.generation)
-        if generation <= 0:
-            raise ValueError("generation must be > 0")
-        object.__setattr__(self, "generation", generation)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "resources": self.resources.to_dict(),
-            "generation": self.generation,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> QueryAllocation:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        return cls(
-            resources=ResourceVector.from_dict(values["resources"]),
-            generation=int(values["generation"]),
-        )
+UnitT = TypeVar("UnitT", bound=ResourceUnit)
 
 
 @dataclass(frozen=True)
 class MaterializationBarrierSpec:
-    """A true distributed boundary inside one physical materializer node.
+    """A materialization boundary inside one physical materializer node.
 
     Barriers are execution events, not resource-owning operators.  The
     materializer remains a normal native resource unit so its managed object
@@ -288,112 +109,12 @@ class MaterializationBarrierSpec:
 
 
 @dataclass(frozen=True)
-class ResourceUnitSpec:
-    """Resource accounting for one independently scheduled execution family.
-
-    Native-fragment units retain graph identity and managed object-flow
-    windows, but do not own process resources: the node-local shared DuckDB
-    instance schedules their threads and manages their working memory. Ray
-    task and actor units own the process resources declared by their UDFs.
-    """
-
-    query_id: str
-    resource_unit_id: str
-    physical_node_id: str
-    unit_kind: str
-    backend: str
-    input_unit_ids: tuple[str, ...]
-    per_task: ResourceVector
-    target_output_block_bytes: int
-    generator_buffer_blocks: int
-    max_concurrency: int | None
-    resident_per_actor: ResourceVector = field(default_factory=ResourceVector)
-    actor_pool_size: int = 0
-    actor_prefetch_depth: int = 1
-
-    _FIELDS: ClassVar[tuple[str, ...]] = (
-        "query_id",
-        "resource_unit_id",
-        "physical_node_id",
-        "unit_kind",
-        "backend",
-        "input_unit_ids",
-        "per_task",
-        "target_output_block_bytes",
-        "generator_buffer_blocks",
-        "max_concurrency",
-        "resident_per_actor",
-        "actor_pool_size",
-        "actor_prefetch_depth",
-    )
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "query_id", str(self.query_id).strip())
-        object.__setattr__(self, "resource_unit_id", str(self.resource_unit_id).strip())
-        object.__setattr__(self, "physical_node_id", str(self.physical_node_id).strip())
-        object.__setattr__(self, "unit_kind", str(self.unit_kind).strip())
-        object.__setattr__(self, "backend", str(self.backend).strip())
-        object.__setattr__(self, "input_unit_ids", tuple(str(item).strip() for item in self.input_unit_ids))
-        object.__setattr__(self, "target_output_block_bytes", int(self.target_output_block_bytes))
-        object.__setattr__(self, "generator_buffer_blocks", int(self.generator_buffer_blocks))
-        object.__setattr__(
-            self,
-            "max_concurrency",
-            None if self.max_concurrency is None else int(self.max_concurrency),
-        )
-        object.__setattr__(self, "actor_pool_size", int(self.actor_pool_size))
-        object.__setattr__(self, "actor_prefetch_depth", int(self.actor_prefetch_depth))
-
-    @property
-    def output_window_bytes(self) -> int:
-        return int(self.target_output_block_bytes) * int(self.generator_buffer_blocks)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "query_id": self.query_id,
-            "resource_unit_id": self.resource_unit_id,
-            "physical_node_id": self.physical_node_id,
-            "unit_kind": self.unit_kind,
-            "backend": self.backend,
-            "input_unit_ids": list(self.input_unit_ids),
-            "per_task": self.per_task.to_dict(),
-            "target_output_block_bytes": int(self.target_output_block_bytes),
-            "generator_buffer_blocks": int(self.generator_buffer_blocks),
-            "max_concurrency": None if self.max_concurrency is None else int(self.max_concurrency),
-            "resident_per_actor": self.resident_per_actor.to_dict(),
-            "actor_pool_size": int(self.actor_pool_size),
-            "actor_prefetch_depth": int(self.actor_prefetch_depth),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> ResourceUnitSpec:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        max_concurrency = values["max_concurrency"]
-        return cls(
-            query_id=str(values["query_id"]),
-            resource_unit_id=str(values["resource_unit_id"]),
-            physical_node_id=str(values["physical_node_id"]),
-            unit_kind=str(values["unit_kind"]),
-            backend=str(values["backend"]),
-            input_unit_ids=tuple(str(item) for item in values["input_unit_ids"]),
-            per_task=ResourceVector.from_dict(values["per_task"]),
-            target_output_block_bytes=int(values["target_output_block_bytes"]),
-            generator_buffer_blocks=int(values["generator_buffer_blocks"]),
-            max_concurrency=None if max_concurrency is None else int(max_concurrency),
-            resident_per_actor=ResourceVector.from_dict(values["resident_per_actor"]),
-            actor_pool_size=int(values["actor_pool_size"]),
-            actor_prefetch_depth=int(values["actor_prefetch_depth"]),
-        )
-
-
-@dataclass(frozen=True)
-class QueryResourceGraph:
+class ResourceGraph(Generic[UnitT]):
     """Dependency graph for query resource accounting and admission."""
 
     query_id: str
     plan_digest: str
-    units: tuple[ResourceUnitSpec, ...]
+    units: tuple[UnitT, ...]
     terminal_unit_ids: tuple[str, ...]
     materialization_barriers: tuple[MaterializationBarrierSpec, ...] = ()
 
@@ -423,7 +144,7 @@ class QueryResourceGraph:
         if not self.terminal_unit_ids:
             raise ValueError("query resource graph must contain at least one terminal unit")
 
-        by_id: dict[str, ResourceUnitSpec] = {}
+        by_id: dict[str, UnitT] = {}
         physical_nodes: dict[str, str] = {}
         for unit in self.units:
             self._validate_unit(unit)
@@ -477,7 +198,7 @@ class QueryResourceGraph:
             if materializer_unit_id not in by_id:
                 raise ValueError(f"barrier {barrier_id} references missing materializer unit {materializer_unit_id}")
             materializer = by_id[materializer_unit_id]
-            if materializer.backend != "ray_worker":
+            if materializer.unit_kind != "native_fragment":
                 raise ValueError(f"barrier {barrier_id} materializer must be a native fragment unit")
             expected_materializer_physical_node_id = f"node:{physical_node_id}:native-fragment"
             if materializer.physical_node_id != expected_materializer_physical_node_id:
@@ -523,7 +244,7 @@ class QueryResourceGraph:
         if missing_terminal_path:
             raise ValueError(f"unit {missing_terminal_path[0]} does not reach a terminal unit")
 
-    def _validate_unit(self, unit: ResourceUnitSpec) -> None:
+    def _validate_unit(self, unit: UnitT) -> None:
         if str(unit.query_id).strip() != self.query_id:
             raise ValueError(
                 f"unit {unit.resource_unit_id or '<empty>'} query_id {unit.query_id!r} does not match {self.query_id!r}"
@@ -540,65 +261,10 @@ class QueryResourceGraph:
         backend = str(unit.backend).strip()
         if not backend:
             raise ValueError(f"unit {unit.resource_unit_id} backend must be non-empty")
-        expected_unit_kind = _RESOURCE_UNIT_KIND_BY_BACKEND.get(backend)
-        if expected_unit_kind is None:
-            raise ValueError(f"unit {unit.resource_unit_id} has unsupported backend {backend!r}")
-        if unit_kind != expected_unit_kind:
-            raise ValueError(
-                f"unit {unit.resource_unit_id} kind {unit_kind!r} does not match "
-                f"backend {backend!r}; expected {expected_unit_kind!r}"
-            )
-        if int(unit.target_output_block_bytes) < 0:
-            raise ValueError(f"unit {unit.resource_unit_id} target_output_block_bytes must be >= 0")
-        if int(unit.generator_buffer_blocks) < 0:
-            raise ValueError(f"unit {unit.resource_unit_id} generator_buffer_blocks must be >= 0")
-        target = int(unit.target_output_block_bytes)
-        blocks = int(unit.generator_buffer_blocks)
-        if target == 0 and blocks != 0:
-            raise ValueError(
-                f"unit {unit.resource_unit_id} target_output_block_bytes and generator_buffer_blocks must both be zero"
-            )
-        if target > 0 and blocks <= 0:
-            raise ValueError(
-                f"unit {unit.resource_unit_id} target_output_block_bytes and generator_buffer_blocks must both be positive"
-            )
-        if unit.max_concurrency is not None and int(unit.max_concurrency) <= 0:
-            raise ValueError(f"unit {unit.resource_unit_id} max_concurrency must be > 0")
-        process_resources = (
-            unit.resident_per_actor if unit.backend == "ray_actor" else _process_resources(unit.per_task)
-        )
-        if unit.backend == "ray_worker":
-            if not process_resources.is_zero():
-                raise ValueError(f"native fragment unit {unit.resource_unit_id} process resources are owned by DuckDB")
-        else:
-            if process_resources.cpu <= 0 and process_resources.gpu <= 0:
-                raise ValueError(f"unit {unit.resource_unit_id} process commitment must request CPU or GPU resources")
-
-        actor_pool_size = int(unit.actor_pool_size)
-        actor_prefetch_depth = int(unit.actor_prefetch_depth)
-        if unit.backend == "ray_actor":
-            if actor_pool_size <= 0:
-                raise ValueError(f"ray_actor unit {unit.resource_unit_id} actor_pool_size must be > 0")
-            if actor_prefetch_depth <= 0:
-                raise ValueError(f"ray_actor unit {unit.resource_unit_id} actor_prefetch_depth must be > 0")
-            if unit.max_concurrency is not None:
-                raise ValueError(f"ray_actor unit {unit.resource_unit_id} concurrency is owned by concrete actor slots")
-            if unit.per_task.cpu or unit.per_task.gpu or unit.per_task.heap_bytes:
-                raise ValueError(
-                    f"ray_actor unit {unit.resource_unit_id} invocation resources may only contain object-store bytes"
-                )
-        elif actor_pool_size != 0:
-            raise ValueError(f"actor_pool_size is only valid for ray_actor units: {unit.resource_unit_id}")
-        elif actor_prefetch_depth != 1:
-            raise ValueError(f"actor_prefetch_depth is only configurable for ray_actor units: {unit.resource_unit_id}")
-        elif not unit.resident_per_actor.is_zero():
-            raise ValueError(f"resident_per_actor is only valid for ray_actor units: {unit.resource_unit_id}")
-        if unit.backend == "ray_task" and unit.max_concurrency is not None:
-            raise ValueError(f"ray_task unit {unit.resource_unit_id} concurrency is owned by resource credit")
 
     @staticmethod
     def _topological_order(
-        by_id: Mapping[str, ResourceUnitSpec],
+        by_id: Mapping[str, UnitT],
         downstream: Mapping[str, set[str]],
     ) -> tuple[str, ...]:
         indegree = {resource_unit_id: len(unit.input_unit_ids) for resource_unit_id, unit in by_id.items()}
@@ -614,7 +280,7 @@ class QueryResourceGraph:
                     heapq.heappush(ready, child)
         return tuple(ordered)
 
-    def unit_by_id(self, resource_unit_id: str) -> ResourceUnitSpec:
+    def unit_by_id(self, resource_unit_id: str) -> UnitT:
         key = str(resource_unit_id)
         for unit in self.units:
             if unit.resource_unit_id == key:
@@ -789,26 +455,3 @@ class QueryResourceGraph:
             "materialization_barriers": [barrier.to_dict() for barrier in self.materialization_barriers],
             "terminal_unit_ids": list(self.terminal_unit_ids),
         }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> QueryResourceGraph:
-        values = dict(payload)
-        _strict_fields(values, cls._FIELDS, cls.__name__)
-        return cls(
-            query_id=str(values["query_id"]),
-            plan_digest=str(values["plan_digest"]),
-            units=tuple(ResourceUnitSpec.from_dict(item) for item in values["units"]),
-            materialization_barriers=tuple(
-                MaterializationBarrierSpec.from_dict(item) for item in values["materialization_barriers"]
-            ),
-            terminal_unit_ids=tuple(str(item) for item in values["terminal_unit_ids"]),
-        )
-
-
-__all__ = [
-    "MaterializationBarrierSpec",
-    "QueryAllocation",
-    "QueryResourceGraph",
-    "ResourceVector",
-    "ResourceUnitSpec",
-]

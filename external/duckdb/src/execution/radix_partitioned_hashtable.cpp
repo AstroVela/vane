@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 
 #include "duckdb/common/radix_partitioning.hpp"
@@ -376,6 +382,19 @@ public:
 	unique_ptr<GroupedAggregateHashTable> ht;
 	//! Chunk with group columns
 	DataChunk group_chunk;
+	bool empty_grouping_set;
+
+	void ResetBatchInput() override {
+		if (!empty_grouping_set) {
+			for (auto &vector : group_chunk.data) {
+				vector.Reference(Vector(vector.GetType(), nullptr));
+			}
+		}
+		group_chunk.Reset();
+		if (ht) {
+			ht->ResetInput();
+		}
+	}
 
 	//! After seeing this many tuples, we decide whether to adapt our strategy
 	//! This also serves as the maximum HT sink capacity
@@ -390,7 +409,8 @@ public:
 };
 
 RadixHTLocalSinkState::RadixHTLocalSinkState(ClientContext &, const RadixPartitionedHashTable &radix_ht)
-    : adapted(false), local_sink_capacity(DConstants::INVALID_INDEX) {
+    : empty_grouping_set(radix_ht.grouping_set.empty()), adapted(false),
+      local_sink_capacity(DConstants::INVALID_INDEX) {
 	// If there are no groups we create a fake group so everything has the same group
 	group_chunk.InitializeEmpty(radix_ht.group_types);
 	if (radix_ht.grouping_set.empty()) {
