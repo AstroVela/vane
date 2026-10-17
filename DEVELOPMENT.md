@@ -407,6 +407,18 @@ join point.
 
 ## Debugging Ray workers
 
+Query teardown accepts the RPC target's terminal `ActorDiedError` as proof that
+the worker process cannot issue more side effects. It still joins local registry
+operations before dropping that query's control tails and registrations.
+Completed control failures are collected before those tails are released and
+reported after storage cleanup, even if no earlier control barrier observed them.
+A timeout, unavailable actor, or task exception caused by a different actor's
+death does not provide that proof and retains teardown ownership. The focused
+cases in `test_ray_fragment_submission.py` cover each teardown phase, unrelated
+queries and local operations that have not joined. Context's subtitle-source
+worker-exit integration also checks zero publication and query-owned scratch
+cleanup through a real Ray worker death.
+
 Set `DUCKDB_DISTRIBUTED_DEBUG=1`. Native debug output uses `DistributedDebugStream()` and appears in Ray worker error logs, normally below `/tmp/ray/session_latest/logs/worker-*.err`. Plain C `stdout` output is not reliably captured by Ray workers.
 
 Ray UDF pools return pending handles during executor construction; task admission

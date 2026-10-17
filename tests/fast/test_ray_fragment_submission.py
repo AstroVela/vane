@@ -3704,6 +3704,281 @@ def test_fte_drop_query_remote_failure_retains_retryable_local_query_registry(mo
     assert worker_handle_mod._FTE_SCHEDULERS.get("query-dead") is None
 
 
+@pytest.mark.parametrize("death_stage", ["interrupt", "prepare", "cleanup"])
+def test_dead_actor_query_teardown_releases_only_its_closed_query(monkeypatch, death_stage):
+    query_id, keep_query = "query-terminal-actor-death", "query-keep-actor-death"
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1", keep_query + ":node:2"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id, keep_query + ":node:2": keep_query}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[keep_query] = [object()]
+
+    class PendingRef:
+        def future(self):
+            return Future()
+
+    for owner in (query_id, keep_query):
+        task_key = str(
+            FteTaskAttemptId.coerce({"query_id": owner, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0})
+        )
+        if death_stage == "interrupt" or owner == keep_query:
+            handle._fte_control_tails_by_task[task_key] = PendingRef()
+            handle._fte_control_query_by_task[task_key] = owner
+            handle._fte_control_operation_by_task[task_key] = "fte_ack_task_result"
+
+    dead = False
+    original = task_control_mod.resolve_object_refs_blocking
+    calls = []
+    target = {"interrupt": "fte_interrupt_query", "prepare": "fte_prepare_drop_query", "cleanup": "fte_cleanup_query"}[
+        death_stage
+    ]
+    submit = handle._submit_tracked_fte_drop_ref
+
+    def submitting(owner, operation):
+        nonlocal dead
+        calls.append(operation)
+        if operation == target:
+            dead = True
+        return submit(owner, operation)
+
+    def resolve(*args, **kwargs):
+        if dead:
+            raise ray.exceptions.ActorDiedError()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(handle, "_submit_tracked_fte_drop_ref", submitting)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", resolve)
+    result = handle.fte_drop_query(query_id)
+    assert result["flight_shuffle_cleanup_errors"] == 0
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._has_fte_control_state_for_query(keep_query) is True
+    assert handle._registered_fragment_ids == {keep_query + ":node:2"}
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert keep_query in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert "fte_cleanup_query" in calls
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    ("death_stage", "flush_before_drop"),
+    [("interrupt", True), ("interrupt", False), ("prepare", False), ("cleanup", False)],
+)
+def test_terminal_control_failure_survives_worker_death(death_stage, flush_before_drop):
+    class _FailedRef:
+        def __init__(self, error):
+            self._future = Future()
+            self._future.set_exception(error)
+
+        def future(self):
+            return self._future
+
+    class _FailedMethod:
+        def __init__(self, error):
+            self.ref = _FailedRef(error)
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.ref
+
+    query_id = f"query-terminal-control-before-{death_stage}-death"
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    actor = _FakeActor()
+    actor.fte_ack_task_result = _FailedMethod(RuntimeError("result acknowledgement failed"))
+    actor.fte_cleanup_query = _FailedMethod(ray.exceptions.ActorDiedError())
+    if death_stage != "cleanup":
+        target = "fte_interrupt_query" if death_stage == "interrupt" else "fte_prepare_drop_query"
+        setattr(actor, target, _FailedMethod(ray.exceptions.ActorDiedError()))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    handle.enqueue_fte_ack_task_result(task_id)
+    if flush_before_drop:
+        # An earlier barrier may record the failure before a teardown retry
+        # discovers that its interrupt target has died.
+        with pytest.raises(task_control_mod.FteControlBarrierTerminalError, match="result acknowledgement failed"):
+            handle.close_and_flush_fte_controls(query_id)
+
+    with pytest.raises(RuntimeError, match="terminal control failure.*result acknowledgement failed") as error:
+        handle.fte_drop_query(query_id)
+
+    assert isinstance(error.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert actor.fte_cleanup_query.calls == [(query_id,)]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._registered_fragment_ids == set()
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize("outcome", ["ack-error", "timeout-error", "rejected-ack", "child-death", "target-death"])
+def test_dead_actor_teardown_collects_completed_controls_without_waiting(outcome):
+    query_id = f"query-dead-actor-completed-control-{outcome}"
+    pending_timeouts = []
+
+    class _PendingFuture(Future):
+        def result(self, timeout=None):
+            pending_timeouts.append(timeout)
+            assert timeout == 0
+            return super().result(timeout=timeout)
+
+    pending_future = _PendingFuture()
+    completed_future = Future()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+
+    def remote_method(future):
+        ref = SimpleNamespace(future=lambda: future)
+        return SimpleNamespace(remote=lambda *_args: ref)
+
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 1, "attempt_id": 0}
+    if outcome == "rejected-ack":
+        completed_future.set_result(
+            {
+                "task_id": task_id,
+                "state": "FINISHED",
+                "_fte_control_operation": "fte_ack_task_result",
+                "_fte_control_applied": False,
+            }
+        )
+    else:
+        error = {
+            "ack-error": RuntimeError("completed ACK failed"),
+            "timeout-error": TimeoutError("completed ACK timed out"),
+            "child-death": ray.exceptions.RayTaskError(
+                "fte_ack_task_result", "child actor failed during ACK", ray.exceptions.ActorDiedError()
+            ).as_instanceof_cause(),
+            "target-death": ray.exceptions.ActorDiedError(),
+        }[outcome]
+        completed_future.set_exception(error)
+
+    actor = _FakeActor()
+    actor.fte_interrupt_query = remote_method(dead_future)
+    actor.fte_cleanup_query = remote_method(dead_future)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    actor.fte_ack_task_result = remote_method(pending_future)
+    handle.enqueue_fte_ack_task_result({**task_id, "partition_id": 0})
+    actor.fte_ack_task_result = remote_method(completed_future)
+    handle.enqueue_fte_ack_task_result(task_id)
+    assert query_id not in handle._fte_prepare_terminal_errors
+
+    if outcome == "target-death":
+        assert handle.fte_drop_query(query_id)["flight_shuffle_cleanup_errors"] == 0
+    else:
+        with pytest.raises(RuntimeError, match="terminal control failure") as error_info:
+            handle.fte_drop_query(query_id)
+        assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert pending_timeouts == [0]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("completed ACK failed"),
+        ray.exceptions.RayTaskError(
+            "fte_ack_task_result", "completed ACK failed", ray.exceptions.GetTimeoutError("completed ACK failed")
+        ).as_instanceof_cause(),
+    ],
+    ids=["application-error", "nested-get-timeout"],
+)
+def test_dead_actor_teardown_observes_ready_object_before_future_bridge(monkeypatch, error):
+    query_id = "query-dead-actor-ready-object"
+
+    class _ReadyObjectRef:
+        def future(self):
+            return Future()
+
+    ref = _ReadyObjectRef()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+    dead_ref = SimpleNamespace(future=lambda: dead_future)
+    actor = _FakeActor()
+    actor.fte_ack_task_result = SimpleNamespace(remote=lambda *_args: ref)
+    actor.fte_interrupt_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    actor.fte_cleanup_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    handle.enqueue_fte_ack_task_result(task_id)
+
+    def get_completed(candidate, *, timeout):
+        assert candidate is ref
+        assert timeout == 0
+        raise error
+
+    monkeypatch.setattr(ray, "ObjectRef", _ReadyObjectRef)
+    monkeypatch.setattr(ray, "get", get_completed)
+
+    with pytest.raises(RuntimeError, match="completed ACK failed") as error_info:
+        handle.fte_drop_query(query_id)
+    assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("unavailable"),
+        RuntimeError("ActorDiedError"),
+        ray.exceptions.RayActorError(error_msg="unavailable"),
+    ],
+)
+def test_unconfirmed_worker_loss_cannot_release_query_controls(monkeypatch, error):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-unconfirmed-actor-loss"
+    original = task_control_mod.resolve_object_refs_blocking
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", fail)
+    with pytest.raises(RuntimeError):
+        handle.fte_drop_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", original)
+    handle.fte_drop_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+def test_child_actor_death_does_not_confirm_rpc_target_death():
+    child_error = ray.exceptions.ActorDiedError()
+    wrapper = ray.exceptions.RayTaskError("fte_interrupt_query", "remote traceback", child_error).as_instanceof_cause()
+    assert not _ProductionRayWorkerActorHandle._rpc_target_is_dead(wrapper)
+    assert _ProductionRayWorkerActorHandle._rpc_target_is_dead(child_error)
+
+
+def test_dead_actor_teardown_keeps_ownership_until_local_operations_join(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-dead-actor-local-operation"
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    original = task_control_mod.quiesce_fte_registry_for_query
+
+    def pending(owner):
+        raise TimeoutError("local operation has not joined")
+
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", pending)
+    with pytest.raises(TimeoutError, match="has not joined"):
+        handle._drop_dead_actor_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    assert query_id in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert handle._registered_fragment_ids == {query_id + ":node:1"}
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", original)
+    handle._drop_dead_actor_query(query_id)
+    assert not handle._has_fte_teardown_state_for_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
 def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
     calls = []
 
