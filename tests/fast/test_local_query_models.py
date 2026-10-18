@@ -108,10 +108,32 @@ def _assert_idle(runtime):
         assert state["data"]["usage_bytes"] == 0, state["data"]
 
 
+@pytest.fixture
+def retained_native_results(monkeypatch, native_environment):
+    from vane.execution.udf_subprocess import UDFExecutor
+
+    results = []
+    take = UDFExecutor.take_ready_result
+
+    def take_and_retain(executor, *args, **kwargs):
+        result = take(executor, *args, **kwargs)
+        if result is not None:
+            # Keep the dispatcher's Python containers alive after native
+            # consumption, as a delayed delivery frame can in production.
+            results.append(result)
+        return result
+
+    monkeypatch.setattr(UDFExecutor, "take_ready_result", take_and_retain)
+    try:
+        yield results
+    finally:
+        results.clear()
+
+
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("prewarm", [False, True])
 @pytest.mark.parametrize("budgets", [False, True])
-def test_sql_and_rebuilt_relations_reuse_explicit_model(tmp_path, batch, prewarm, budgets):
+def test_sql_and_rebuilt_relations_reuse_explicit_model(tmp_path, retained_native_results, batch, prewarm, budgets):
     options = {"offset": 10}
     with vane.connect(config={"threads": 2}) as connection:
         runtime = (
