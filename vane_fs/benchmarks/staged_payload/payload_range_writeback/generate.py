@@ -1,0 +1,197 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Derive isolated finite-range WRITE-only hints from advisory payload prewriteback."""
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def transform(relative, text, here):
+    changes = []
+
+    def replace(before, after):
+        nonlocal text
+        assert text.count(before) == 1, (relative, before)
+        text = text.replace(before, after)
+        changes.append([before, after, 1])
+
+    if relative == "src/payload_file.hpp":
+        replace("#include <thread>", "#include <thread>\n#include <utility>")
+        replace(
+            "\t\tappended += data.size();",
+            "\t\tappended += data.size();\n"
+            "\t\tif (!data.empty()) {\n"
+            "\t\t\tpending_range.first = pending_range.second ? std::min(pending_range.first, offset) : offset;\n"
+            "\t\t\tpending_range.second = std::max(pending_range.second, offset + int64_t(data.size()));\n\t\t}",
+        )
+        replace(
+            "\tuint64_t Appended() const { return appended; }",
+            "\tuint64_t Appended() const { return appended; }\n"
+            "\tstd::pair<int64_t, int64_t> TakeWritebackRange() {\n"
+            "\t\treturn std::exchange(pending_range, {});\n\t}\n"
+            "\tvoid WritebackRange(std::pair<int64_t, int64_t> range) {\n"
+            "\t\t// The caller holds its independent shared payload lease. GC may\n"
+            "\t\t// have reclaimed earlier pending bytes before that lease began.\n"
+            "\t\tif (!writeback_supported)\n\t\t\treturn;\n"
+            "\t\tauto end = std::min(range.second, Size());\n"
+            "\t\tauto begin = std::min(range.first, end);\n"
+            "\t\tif (begin >= end)\n\t\t\treturn;\n"
+            "\t\tint rc;\n\t\tdo {\n"
+            "\t\t\t// A positive finite length excludes future appends. WRITE only\n"
+            "\t\t\t// starts data I/O; it cannot clear dirty or acknowledge FULL.\n"
+            "\t\t\trc = sync_file_range(fd, begin, end - begin, SYNC_FILE_RANGE_WRITE);\n"
+            "\t\t} while (rc != 0 && errno == EINTR);\n"
+            "\t\tif (rc != 0 && (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL)) {\n"
+            "\t\t\twriteback_supported = false;\n\t\t\treturn;\n\t\t}\n"
+            '\t\tif (rc != 0)\n\t\t\tFailure("Starting payload range writeback");\n\t}',
+        )
+        replace(
+            "\tuint64_t appended = 0;",
+            "\tuint64_t appended = 0;\n\tstd::pair<int64_t, int64_t> pending_range {};\n"
+            "\tbool writeback_supported = true;",
+        )
+    if relative == "src/prewriteback.hpp":
+        replace(text, (here / "prewriteback.hpp").read_text())
+    if relative == "src/workspace.cpp":
+        replace(
+            "database.prewriteback->OnCommit(database.payload_file->Appended(), full);",
+            "database.prewriteback->OnCommit(database.payload_file->Appended(), full, database.payload_file->TakeWritebackRange());",
+        )
+    if relative == "src/staging.hpp":
+        replace(
+            '\t\t\tFile data;\n\t\t\tdata.Open(path + ".payload", false);\n'
+            "\t\t\tstd::array<char, 4096> header {};\n\t\t\tRead(data.fd, header.data(), header.size(), 0);",
+            '\t\t\tpayload_barrier.Open(path + ".payload", false);\n'
+            "\t\t\tstd::array<char, 4096> header {};\n\t\t\tRead(payload_barrier.fd, header.data(), header.size(), 0);",
+        )
+        replace(
+            "\t\tuuid = identity;",
+            "\t\tuuid = identity;\n"
+            "\t\t// Keep an error cursor from before external writes. Reopening only\n"
+            "\t\t// at FULL can miss an asynchronous error already seen elsewhere.\n"
+            "\t\tif (payload_barrier.fd < 0)\n"
+            '\t\t\tpayload_barrier.Open(path + ".payload", false);',
+        )
+        replace("\t\tliveness.Close();\n\t}", "\t\tpayload_barrier.Close();\n\t\tliveness.Close();\n\t}")
+        replace(
+            "\t\t// Do not unlock the parent's shared open-file descriptions after fork.",
+            "\t\t// Do not unlock the parent's shared open-file descriptions after fork.\n\t\tpayload_barrier.Close();",
+        )
+        replace(
+            '\t\tFile data;\n\t\tdata.Open(path + ".payload", false);\n\t\tSync(data.fd);',
+            "\t\tSync(payload_barrier.fd);",
+        )
+        replace(
+            "\tFile initialization, liveness, publication, fence;",
+            "\tFile initialization, liveness, publication, fence, payload_barrier;",
+        )
+    return text, changes
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    parser.add_argument("--parent", type=Path, required=True)
+    args = parser.parse_args()
+    out, parent, here = args.artifacts.resolve(), args.parent.resolve(), Path(__file__).resolve().parent
+    base = json.loads((parent / "source.json").read_text())
+    build = json.loads((parent / "build.json").read_text())
+    assert base["status"] == build["status"] == "PASS"
+    assert build["stages"]["payload_prewriteback"] == "PASS"
+    inputs = base["inputs"] | base["sources"] | build["binaries"] | build["inputs"] | base["default_unchanged"]
+    for path in [parent / "source.json", parent / "build.json", Path(__file__), here / "prewriteback.hpp"]:
+        inputs[str(path)] = digest(path)
+    assert all(digest(Path(p)) == sha for p, sha in inputs.items())
+    previous, target = Path(base["candidate"]), out / "candidate"
+    out.mkdir()
+    target.mkdir()
+    proof = {}
+    for name in (
+        "src",
+        "include",
+        "python",
+        "tests",
+        "LICENSES",
+        "triplets",
+        "CMakeLists.txt",
+        "pyproject.toml",
+        "README.md",
+        "LICENSE",
+        "vcpkg.json",
+    ):
+        path = previous / name
+        if path.is_dir():
+            shutil.copytree(path, target / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        elif path.is_file():
+            shutil.copy2(path, target / name)
+    for path in sorted(target.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = str(path.relative_to(target))
+        old = path.read_text()
+        text, changes = transform(relative, old, here)
+        if not changes:
+            continue
+        reverse = text
+        for before, after, count in reversed(changes):
+            assert reverse.count(after) == count
+            reverse = reverse.replace(after, before)
+        assert reverse == old
+        path.write_text(text)
+        proof[relative] = dict(
+            original_path=str(previous / relative),
+            original_sha256=digest(previous / relative),
+            candidate_sha256=digest(path),
+            changes=changes,
+            exact_reverse=True,
+        )
+    assert set(proof) == {"src/payload_file.hpp", "src/prewriteback.hpp", "src/workspace.cpp", "src/staging.hpp"}
+    for name in ("checkpoint.hpp",):
+        assert (target / "src" / name).read_bytes() == (previous / "src" / name).read_bytes()
+    save(
+        out / "source.json",
+        dict(
+            status="PASS",
+            created_epoch=time.time(),
+            head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=here.parents[3], text=True).strip(),
+            parent=str(parent),
+            mechanism_parent=str(previous),
+            original=base["original"],
+            candidate=str(target),
+            sdk=base["sdk"],
+            dependency_support=base["dependency_support"],
+            inputs=inputs,
+            sources={str(p): digest(p) for p in target.rglob("*") if p.is_file()},
+            default_unchanged=base["default_unchanged"],
+            transformations=proof,
+            format=1005,
+            original_format=1005,
+            payload_start_bytes=64 * 1024**2,
+            accounting=base["accounting"],
+            writeback="Physical append ranges coalesced per owner; positive finite WRITE-only requests, clipped at current EOF under a shared GC lease. FULL retains its original data sync.",
+            checkpoint_source_unchanged=True,
+            publication_ordering_unchanged=True,
+            retained_payload_barrier_descriptor=True,
+            unchanged=base["unchanged"],
+            interface_reference="https://man7.org/linux/man-pages/man2/sync_file_range.2.html",
+        ),
+    )
+    print("PASS: finite physical append ranges; unchanged 64 MiB budget, publication and FULL barriers")
+
+
+if __name__ == "__main__":
+    main()
