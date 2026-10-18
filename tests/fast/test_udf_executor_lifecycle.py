@@ -6137,7 +6137,8 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
         _release_callback=lambda: events.append("slot-released"),
     )
     executor = build_executor(_subprocess_map_payload(lambda table: table, execution_backend="subprocess_task"))
-    result = None
+    result = item = None
+    refs = ()
     try:
         future = Future()
         scope = executor._new_execution_scope()
@@ -6147,6 +6148,7 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
             future.set_exception(OSError(errno.EIO, "private execution error"))
         else:
             result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+            refs = tuple(result[1])
             future.set_result(result)
 
         # Completion returns execution capacity; consuming the terminal result
@@ -6184,15 +6186,22 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
             assert summary.count("cleanup:") == int(len(errors) > 1)
             assert "private" not in summary
             if result is not None:
-                assert all(ref._closed for ref in result[1])
+                assert all(ref._closed for ref in refs)
         else:
-            assert item is result
-            assert not any(ref._closed for ref in result[1])
-            assert result[1][0].to_table().to_pydict() == {"x": [1, 2]}
+            # The consumer owns a new container with the same underlying
+            # blocks; the producer's Future no longer retains their refs.
+            assert item[0] == result[0]
+            assert result[1] == []
+            assert len(item[1]) == len(refs)
+            assert all(actual is expected for actual, expected in zip(item[1], refs))
+            assert item[2:] == result[2:]
+            assert not any(ref._closed for ref in refs)
+            assert item[1][0].to_table().to_pydict() == {"x": [1, 2]}
         assert executor.take_ready_result() is None
         assert not executor._result_admissions
         executor.stats()
     finally:
+        local._release_local_ref_bundle_result(item)
         local._release_local_ref_bundle_result(result)
         executor.close(kill=True)
         local._shutdown_global_task_runtime()
