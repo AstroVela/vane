@@ -364,13 +364,17 @@ def test_sdist_public_stubs_must_use_their_exact_project_paths(required_path):
 
 
 @pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
-def test_sdist_must_include_every_test_referenced_by_its_release_launcher(omitted_test):
+@pytest.mark.parametrize(
+    "selector",
+    ["", "::test_case", "::test_case[param-case]", "::test_case[sample.py::value]", "::TestCase::test_method"],
+)
+def test_sdist_must_include_every_test_referenced_by_its_release_launcher(omitted_test, selector):
     root = TEST_LAYOUT.archive_root
-    launcher = b"""release_tests=(
+    launcher = f"""release_tests=(
       "$project_root/tests/fast/test_existing.py"
-      "$project_root/tests/fast/test_new.py"
+      "$project_root/tests/fast/test_new.py{selector}"
     )
-    """
+    """.encode()
     members = {f"{root}/scripts/run_release_tests.sh": launcher}
     for name in ("existing", "new"):
         # A copy under a different directory cannot satisfy the release gate.

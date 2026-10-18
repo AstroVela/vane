@@ -9,6 +9,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "vane_python/pytype.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "vane_python/pandas/pandas_scan.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -585,6 +586,7 @@ ScalarFunction DuckDBPyConnection::CreateScalarUDF(const string &name, const py:
                                                    const shared_ptr<DuckDBPyType> &return_type, bool vectorized,
                                                    FunctionNullHandling null_handling,
                                                    PythonExceptionHandling exception_handling, bool side_effects) {
+	PythonInputCallbackScope callback(nullptr);
 	PythonUDFData data(name, vectorized, null_handling);
 	auto &connection = con.GetConnection();
 

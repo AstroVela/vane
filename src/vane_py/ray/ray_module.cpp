@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "vane_python/native_resource_graph.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "task.hpp"
@@ -14,6 +15,8 @@
 #include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_objects.hpp"
+#include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/physical_plan_traversal.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/pandas/pandas_scan.hpp"
@@ -987,10 +990,16 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("scan_split_batch_map", &PyPhysicalPlanWrapper::scan_split_batch_map)
 	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
 	         py::arg("conn") = py::none())
+	    .def("collect_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_resource_graph_metadata,
+	         py::arg("conn") = py::none())
+	    .def("collect_local_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_local_resource_graph_metadata,
+	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
 	         py::arg("conn") = py::none())
+	    .def("set_local_udf_executor_options", &PyPhysicalPlanWrapper::set_local_udf_executor_options,
+	         py::arg("options_map"), py::arg("conn") = py::none())
 	    .def(
 	        "_validate_serializable_for_submission",
 	        [](const PyPhysicalPlanWrapper &p) { p.validate_serializable_for_submission(); },
@@ -1520,7 +1529,10 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
-	           py::object effective_session_config_obj) {
+	           py::object effective_session_config_obj, py::object native_execution_started_obj) {
+		        if (!native_execution_started_obj.is_none() && !PyCallable_Check(native_execution_started_obj.ptr())) {
+			        throw py::type_error("native_execution_started must be callable");
+		        }
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
 		        auto parse_node_id = [](py::handle key, const char *map_name) -> idx_t {
 			        if (!py::isinstance<py::str>(key)) {
@@ -1844,7 +1856,8 @@ void register_ray_bindings(py::module_ &mod) {
 				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
 				            scan_split_batch_map_ptr, exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
 				            fte_scan_source_queue_map_ptr, fte_exchange_source_queue_map_ptr, copy_output_info_ptr,
-				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj);
+				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj,
+				            native_execution_started_obj);
 				        return result;
 			        } catch (...) {
 				        throw;
@@ -1860,7 +1873,8 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
-	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
+	        py::arg("effective_session_config") = py::none(), py::arg("native_execution_started") = py::none(),
+	        "Execute physical plan using DuckDB's native Executor");
 
 	// Merge the independently scheduled splits assigned to one worker attempt
 	// into its transport batch.

@@ -10,6 +10,11 @@ if (($# == 0)); then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Anchor diagnostics to the caller before entering a disposable test directory.
+if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
+  VANE_TEST_DIAGNOSTICS_DIR="$(python -c 'import os; print(os.path.abspath(os.environ["VANE_TEST_DIAGNOSTICS_DIR"]))')"
+  export VANE_TEST_DIAGNOSTICS_DIR
+fi
 site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-pytest.XXXXXX")"
 cleanup_test_workdir() {

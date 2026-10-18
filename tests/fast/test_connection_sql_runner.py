@@ -396,7 +396,7 @@ def test_local_fast_keeps_native_prepared_and_explained_copy(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("hook", ["begin", "close", "interrupt"])
-def test_sql_copy_revalidates_after_parameter_conversion(monkeypatch, tmp_path, hook):
+def test_sql_copy_guards_connection_entry_during_parameter_conversion(monkeypatch, tmp_path, hook):
     runner = _SQLRunner()
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     connection = vane.connect()
@@ -412,11 +412,12 @@ def test_sql_copy_revalidates_after_parameter_conversion(monkeypatch, tmp_path, 
 
     try:
         error_type = {
-            "begin": vane.BinderException,
-            "close": vane.ConnectionException,
+            "begin": vane.InvalidInputException,
+            "close": vane.InvalidInputException,
             "interrupt": vane.InterruptException,
         }[hook]
-        with pytest.raises(error_type):
+        match = "Python input callback" if hook != "interrupt" else None
+        with pytest.raises(error_type, match=match):
             connection.execute(
                 "COPY (SELECT ? AS value) TO ? (FORMAT PARQUET)",
                 Parameters([str(tmp_path / "reentrant.parquet"), 7]),

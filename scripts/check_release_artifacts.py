@@ -387,7 +387,7 @@ def _check_sdist_release_tests(artifact: Artifact) -> None:
     """Require the test files referenced by the packaged release launcher."""
     names = artifact.names()
     launcher = _require_sdist_path(names, "scripts/run_release_tests.sh", artifact.path)
-    test_paths = re.findall(r'"\$project_root/(tests/[^"\r\n]+\.py)"', artifact.read(launcher).decode("utf-8"))
+    test_paths = re.findall(r'"\$project_root/(tests/[^"\r\n]+?\.py)(?:::|")', artifact.read(launcher).decode("utf-8"))
     if not test_paths:
         raise ValueError(f"{artifact.path}: release launcher must explicitly list its test files")
     for relative_path in sorted(set(test_paths)):
@@ -828,6 +828,10 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "tests/__init__.py",
         "tests/conftest.py",
         "tests/datasink_test_helpers.py",
+        "tests/local_admission_helpers.py",
+        "tests/local_plan_helpers.py",
+        "tests/local_runtime_helpers.py",
+        "tests/local_gpu_helpers.py",
         "tests/ray_diagnostic_helpers.py",
         "tests/ray_test_profile.py",
         "tests/result_stream_helpers.py",

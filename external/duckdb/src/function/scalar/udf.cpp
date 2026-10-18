@@ -27,7 +27,9 @@ UDFFunctionData::UDFFunctionData(Value payload_p, LogicalType return_type_p, sha
 }
 
 unique_ptr<FunctionData> UDFFunctionData::Copy() const {
-	return make_uniq<UDFFunctionData>(payload, return_type, actor_handles);
+	auto copy = make_uniq<UDFFunctionData>(payload, return_type, actor_handles);
+	copy->transport_input_target_bytes = transport_input_target_bytes;
+	return std::move(copy);
 }
 
 bool UDFFunctionData::Equals(const FunctionData &other_p) const {

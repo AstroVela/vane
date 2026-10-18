@@ -2268,23 +2268,3 @@ static void CollectMutableUDFBindData(PhysicalOperator &op, vector<UDFFunctionDa
 		out.push_back(bind_data);
 	}
 }
-
-static duckdb::shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
-	if (obj.is_none()) {
-		return nullptr;
-	}
-	auto *boxed = new py::object(py::reinterpret_borrow<py::object>(obj));
-	return duckdb::shared_ptr<void>(boxed, [](void *ptr) {
-		if (!ptr) {
-			return;
-		}
-		auto *boxed_obj = static_cast<py::object *>(ptr);
-		if (!Py_IsInitialized() || PythonIsFinalizing()) {
-			boxed_obj->release();
-			delete boxed_obj;
-			return;
-		}
-		PythonGILWrapper gil;
-		delete boxed_obj;
-	});
-}

@@ -3,7 +3,10 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_manager.hpp"
+#include "duckdb/parallel/task_notifier.hpp"
 #include "test_helpers.hpp"
+
+#include <thread>
 
 using namespace duckdb;
 using namespace Catch::Matchers;
@@ -167,3 +170,60 @@ TEST_CASE("Test ClientContextState", "[api]") {
 	}
 }
 // ClientContextState
+
+struct FailingTaskStartState : ClientContextState {
+	bool saw_own_context = false;
+	void OnTaskStart(ClientContext &context) override {
+		saw_own_context = TaskNotifier::GetCurrentContext().get() == &context;
+		throw InvalidInputException("task start failure");
+	}
+};
+
+TEST_CASE("Task callback contexts survive nested tasks and failed startup", "[api][task-context]") {
+	DuckDB db(nullptr);
+	Connection outer(db);
+	Connection inner(db);
+	REQUIRE(!TaskNotifier::GetCurrentContext());
+	{
+		TaskNotifier task(outer.context.get());
+		REQUIRE(TaskNotifier::GetCurrentContext().get() == outer.context.get());
+		{
+			TaskNotifier nested(inner.context.get());
+			REQUIRE(TaskNotifier::GetCurrentContext().get() == inner.context.get());
+		}
+		REQUIRE(TaskNotifier::GetCurrentContext().get() == outer.context.get());
+		auto state = make_shared_ptr<FailingTaskStartState>();
+		inner.context->registered_state->Insert("failing_task_start", state);
+		REQUIRE_THROWS_AS(TaskNotifier(inner.context.get()), InvalidInputException);
+		REQUIRE(state->saw_own_context);
+		REQUIRE(TaskNotifier::GetCurrentContext().get() == outer.context.get());
+		inner.context->registered_state->Remove("failing_task_start");
+	}
+	REQUIRE(!TaskNotifier::GetCurrentContext());
+}
+
+TEST_CASE("Task callback contexts are isolated between worker and control threads", "[api][task-context]") {
+	DuckDB db(nullptr);
+	Connection first(db);
+	Connection second(db);
+	bool started_without_context = false;
+	bool saw_own_context = false;
+	bool finished_without_context = false;
+	{
+		TaskNotifier task(first.context.get());
+		std::thread worker([&]() {
+			started_without_context = !TaskNotifier::GetCurrentContext();
+			{
+				TaskNotifier nested(second.context.get());
+				saw_own_context = TaskNotifier::GetCurrentContext().get() == second.context.get();
+			}
+			finished_without_context = !TaskNotifier::GetCurrentContext();
+		});
+		worker.join();
+		REQUIRE(TaskNotifier::GetCurrentContext().get() == first.context.get());
+	}
+	REQUIRE(started_without_context);
+	REQUIRE(saw_own_context);
+	REQUIRE(finished_without_context);
+	REQUIRE(!TaskNotifier::GetCurrentContext());
+}

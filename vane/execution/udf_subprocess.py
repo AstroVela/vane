@@ -21,56 +21,109 @@ import weakref
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from concurrent.futures import Future
     from multiprocessing import shared_memory
+    from typing import NoReturn
+
+    from vane.execution.local_gpu_devices import GpuDeviceLease
+    from vane.execution.local_query_admission import LocalQueryAdmission, LocalQueryAdmissionAuthority
 
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._subprocess_error import capture_cleanup, decode_error, native_result_error
 from vane.execution._udf_runtime import _bounded_close_error
+from vane.execution.local_output_read import LocalOutputRead
+from vane.execution.local_resource_graph import LocalResourceUnitContext
+from vane.execution.local_stream_adapter import LocalStreamAdapter
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
+    InvalidLocalShmReferenceError,
+    LocalShmBlockRef,
     _create_shm,
     _open_existing_shm,
     _unlink_shm,
-    can_admit_local_shm_ref_output_submit,
     cancel_local_shm_input_lease,
     consume_local_shm_input_lease,
     create_local_shm_input_lease,
     estimate_local_shm_ref_bundle_ipc_size,
+    local_shm_budget_manager,
     local_shm_ref_budget_snapshot,
     make_local_ref_bundle_worker_payload,
     make_local_shm_ref_bundle_result,
     make_local_shm_ref_bundle_result_from_descriptor,
+    normalize_local_shm_ref_bundle_descriptor,
     payload_requests_local_ref_bundle_output,
     register_local_shm_ref_budget_wakeup,
     release_local_shm_output_grant,
     release_local_shm_ref_bundle_descriptor,
     request_local_shm_output_grant,
+    track_local_shm_inputs,
+    track_local_shm_output,
+    transition_local_shm_output,
     wake_local_shm_ref_budget_waiters,
+)
+from vane.execution.resources import ResourceVector, udf_process_resources
+from vane.execution.udf_actor_pool_lifecycle import (
+    OwnedActorPoolsError,
+    actor_pool_cleanup_pending,
+    rollback_actor_pools,
 )
 from vane.execution.udf_admission import (
     AdmissionExecutorMixin,
     AdmissionLease,
+    LocalExecutionCapacity,
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
+    LocalTaskProgress,
+    LocalTaskProgressBinding,
 )
+from vane.execution.udf_data_admission import DataAdmissionAuthority
+from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
+from vane.execution.udf_data_wait import WaitingDataAdmissionAuthority
+from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
+from vane.execution.udf_input_cleanup import QueryInputCleanup, TaskInputCleanup, current_input_cleanup
 from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
     ExecutionCancelledError,
 )
+from vane.execution.udf_local_actor_admission import LocalActorExecutionSlotPool
+from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
+from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
+from vane.execution.udf_model_pool import ModelPoolBorrow
+from vane.execution.udf_process_group import WorkerProcessGroup
+from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
+from vane.execution.udf_shm_store import (
+    LocalQueryShmStore,
+    LocalShmPrefetchDeferred,
+    LocalShmStoreCapacityError,
+    ParentShmPeer,
+)
+from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
+from vane.execution.udf_threading import subprocess_actor_thread_env
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
+from vane.execution.udf_worker_metrics import WorkerLifecycle, WorkerMetrics, WorkerOutcome
 from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
+
+
+class _SubprocessExitDeadlineExceeded(RuntimeError):
+    """CLOSE was acknowledged and forced termination completed all cleanup."""
+
+
+_active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
+_active_local_output: ContextVar[Callable[[Any], None] | None] = ContextVar("vane_local_output", default=None)
+_active_local_stream: ContextVar[LocalStreamAdapter | None] = ContextVar("vane_local_stream", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -88,46 +141,20 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+_MSG_REF_BUNDLE_CHUNK = 0x11
+_MSG_OUTPUT_GRANT_FAILED = 0x12
+_MSG_STREAM_NEXT = 0x13
+_MSG_STREAM_CONTINUE = 0x14
+_MSG_INPUT_RETAINED = 0x15
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
 _DEFAULT_SHM_SIZE = 1 << 20
-_LOCAL_SHM_OUTPUT_BUDGET_OVERHEAD_BYTES = 1 << 20
-_LOCAL_SHM_BLOB_OUTPUT_ROW_BUDGET_BYTES = 1 << 20
-_LOCAL_SHM_TEXT_OUTPUT_ROW_BUDGET_BYTES = 4 << 10
-_LOCAL_SHM_NESTED_OUTPUT_ROW_BUDGET_BYTES = 16 << 10
 _DEFAULT_SUBPROCESS_CONTROL_TIMEOUT_S = 30.0
 _DEFAULT_SUBPROCESS_SHUTDOWN_GRACE_S = 5.0
 _SUBPROCESS_CLEANUP_ERROR_LIMIT = 16
 _SUBPROCESS_CLEANUP_MAX_WORKERS = 32
 _SUBPROCESS_CLEANUP_ERRORS_OMITTED = "additional subprocess cleanup errors omitted"
-_TENSOR_DTYPE_BYTES = {
-    "BOOL": 1,
-    "BOOLEAN": 1,
-    "TINYINT": 1,
-    "UTINYINT": 1,
-    "INT8": 1,
-    "UINT8": 1,
-    "SMALLINT": 2,
-    "USMALLINT": 2,
-    "INT16": 2,
-    "UINT16": 2,
-    "INTEGER": 4,
-    "UINTEGER": 4,
-    "INT": 4,
-    "INT32": 4,
-    "UINT32": 4,
-    "FLOAT": 4,
-    "FLOAT4": 4,
-    "FLOAT32": 4,
-    "BIGINT": 8,
-    "UBIGINT": 8,
-    "INT64": 8,
-    "UINT64": 8,
-    "DOUBLE": 8,
-    "FLOAT8": 8,
-    "FLOAT64": 8,
-}
 
 
 def _subprocess_debug_enabled() -> bool:
@@ -190,11 +217,19 @@ def _close_subprocess_workers_concurrently(
     workers: list[_SingleSubprocessExecutor],
     *,
     kill: bool,
+    close_worker: Callable[[_SingleSubprocessExecutor], None] | None = None,
 ) -> tuple[list[BaseException], list[_SingleSubprocessExecutor]]:
-    """Close distinct actors and retain owners whose cleanup is incomplete."""
+    """Close distinct workers and retain owners whose cleanup is incomplete."""
 
     if not workers:
         return [], []
+
+    def close(worker: _SingleSubprocessExecutor) -> None:
+        if close_worker is None:
+            worker.close(kill=kill)
+        else:
+            close_worker(worker)
+
     cleanup_errors: list[BaseException] = []
     pending_workers: list[_SingleSubprocessExecutor] = []
     close_executor: ThreadPoolExecutor | None = None
@@ -209,11 +244,11 @@ def _close_subprocess_workers_concurrently(
     try:
         close_executor = ThreadPoolExecutor(
             max_workers=min(len(workers), _SUBPROCESS_CLEANUP_MAX_WORKERS),
-            thread_name_prefix="vane-udf-subprocess-actor-close",
+            thread_name_prefix="vane-udf-subprocess-close",
         )
         for worker in workers:
             try:
-                futures.append((worker, close_executor.submit(worker.close, kill=kill)))
+                futures.append((worker, close_executor.submit(close, worker)))
                 submitted += 1
             except BaseException as error:
                 _append_subprocess_cleanup_error(cleanup_errors, error)
@@ -239,7 +274,7 @@ def _close_subprocess_workers_concurrently(
     # remaining workers still need a best-effort owner-side close.
     for worker in workers[submitted:]:
         try:
-            worker.close(kill=kill)
+            close(worker)
         except BaseException as error:
             _append_subprocess_cleanup_error(cleanup_errors, error)
             retain_if_incomplete(worker, close_failed=True)
@@ -257,49 +292,6 @@ def _should_debug_submit(seq: int) -> bool:
     return every > 0 and seq % every == 0
 
 
-def _product_ints(values: Any) -> int:
-    result = 1
-    for value in values or []:
-        parsed = int(value)
-        if parsed <= 0:
-            return 0
-        result *= parsed
-    return result
-
-
-def _payload_output_row_budget_bytes(payload: dict[str, Any]) -> int:
-    total = 0
-    for entry in payload.get("output_schema") or []:
-        if not isinstance(entry, dict):
-            continue
-        kind = str(entry.get("kind") or "").strip().lower()
-        if kind != "tensor":
-            type_name = str(entry.get("type") or "").strip().upper()
-            if type_name in {"BLOB", "BYTEA", "BINARY", "VARBINARY"}:
-                total += _LOCAL_SHM_BLOB_OUTPUT_ROW_BUDGET_BYTES
-            elif type_name in {"VARCHAR", "TEXT", "STRING", "JSON"}:
-                total += _LOCAL_SHM_TEXT_OUTPUT_ROW_BUDGET_BYTES
-            elif "[]" in type_name or type_name.startswith(("LIST", "ARRAY", "STRUCT", "MAP")):
-                total += _LOCAL_SHM_NESTED_OUTPUT_ROW_BUDGET_BYTES
-            continue
-        dtype = str(entry.get("dtype") or "").strip().upper()
-        dtype_bytes = _TENSOR_DTYPE_BYTES.get(dtype)
-        if dtype_bytes is None:
-            continue
-        element_count = _product_ints(entry.get("shape") or [])
-        if element_count <= 0:
-            continue
-        total += dtype_bytes * element_count
-    return total
-
-
-def _estimate_output_budget_from_rows(row_bytes: int, num_rows: int | None) -> int:
-    if row_bytes <= 0 or num_rows is None or num_rows <= 0:
-        return 0
-    payload_bytes = int(row_bytes) * int(num_rows)
-    return payload_bytes + max(_LOCAL_SHM_OUTPUT_BUDGET_OVERHEAD_BYTES, payload_bytes // 32)
-
-
 def _make_local_ref_bundle_worker_payload_with_lease(
     block_refs: Any,
     slices: Any,
@@ -308,7 +300,7 @@ def _make_local_ref_bundle_worker_payload_with_lease(
     *,
     submit_id: int | None,
     name: str,
-    reserve_output_credit: bool,
+    owns_refs: bool = False,
 ) -> tuple[dict[str, Any], int] | tuple[None, None]:
     worker_payload = make_local_ref_bundle_worker_payload(block_refs, slices, metadata, names)
     if worker_payload is None:
@@ -317,8 +309,12 @@ def _make_local_ref_bundle_worker_payload_with_lease(
         tuple(block_refs),
         name=name,
         submit_id=submit_id,
-        reserve_output_credit=reserve_output_credit,
+        owns_refs=owns_refs,
     )
+    if (task := current_data_task()) is not None:
+        task.hold_input_transport(local_shm_budget_manager(), lease_id)
+    if (input_cleanup := current_input_cleanup()) is not None:
+        input_cleanup.hold_input_transport(local_shm_budget_manager(), lease_id)
     worker_payload = make_local_ref_bundle_worker_payload(
         block_refs,
         slices,
@@ -391,19 +387,8 @@ class _SubprocessStartupCleanupError(RuntimeError):
     pass
 
 
-class _OwnedLocalSubprocessActorPoolsError(RuntimeError):
+class _OwnedLocalSubprocessActorPoolsError(OwnedActorPoolsError):
     """Carry local actor pools whose failed cleanup remains retryable."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        owned_actor_pools: list[Any],
-        creation_error: BaseException,
-    ) -> None:
-        super().__init__(message)
-        self.owned_actor_pools = list(owned_actor_pools)
-        self.creation_error = creation_error
 
 
 class _SingleSubprocessExecutor(BaseUDFExecutor):
@@ -421,12 +406,18 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise ValueError("UDF payload is required")
 
         self._queue: deque[Any] = deque()
+        self._stream_result_lock = threading.Lock()
         self._finished_submitting = False
         self._closed = False
         self._cleanup_finished = False
+        self._owner_pid = os.getpid()
+        self._process_group: WorkerProcessGroup | None = None
         self._broken_error: str | None = None
         self._actor_lost = False
+        self._worker_lifecycle = WorkerLifecycle()
+        self._local_gpu_assignment: tuple[str, int, int] | None = None
         self._pending_batches = 0
+        self._awaiting_submit_terminal = False
         self._wakeup: Callable[[], None] | None = None
         self._wakeup_error: BaseException | None = None
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
@@ -436,7 +427,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         )
         self._execution_scope_lock = threading.Lock()
         self._active_execution_scope: ExecutionCancellationScope | None = None
-        self._worker_lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+        self._worker_lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{uuid.uuid4().hex}", 1)
         self._close_lock = threading.Lock()
         self._startup_cancel_requested = threading.Event()
         self._active_input_leases: dict[int, ExecutionCancellationScope] = {}
@@ -449,8 +440,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._sock: socket.socket | None = None
         self._startup_child_sock: socket.socket | None = None
         self._proc: subprocess.Popen[bytes] | None = None
+        self._shm_peer: ParentShmPeer | None = None
 
-        self._start_worker(payload, startup_observer=startup_observer)
+        try:
+            self._start_worker(payload, startup_observer=startup_observer)
+        except BaseException:
+            self._record_worker_outcome(WorkerOutcome.INITIALIZATION_FAILURE)
+            raise
+        self._worker_lifecycle.ready()
         self._finalizer = weakref.finalize(
             self,
             _cleanup_subprocess_executor,
@@ -458,6 +455,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._sock,
             self._payload_shm,
             self._data_shm,
+            self._shm_peer,
+            self._process_group,
         )
 
     def _start_worker(
@@ -485,6 +484,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._sock = parent_sock
             self._startup_child_sock = child_sock
             child_fd = child_sock.fileno()
+            self._shm_peer = ParentShmPeer()
+            shm_fd = self._shm_peer.child_sock.fileno()
 
             _write_ipc_to_shm(payload_shm, payload_bytes)
             cmd = [
@@ -495,6 +496,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 payload_shm.name,
                 str(payload_size),
                 data_shm.name,
+                str(shm_fd),
             ]
             env = (
                 dict(os.environ)
@@ -505,15 +507,18 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             env["PYTHONUNBUFFERED"] = "1"
             self._proc = subprocess.Popen(
                 cmd,
-                pass_fds=(child_fd,),
+                pass_fds=(child_fd, shm_fd),
                 close_fds=True,
+                start_new_session=True,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=None if _subprocess_debug_enabled() else subprocess.DEVNULL,
             )
+            self._process_group = WorkerProcessGroup(self._proc.pid)
             child_sock.close()
             self._startup_child_sock = None
+            self._shm_peer.child_sock.close()
             self._raise_if_startup_cancelled()
             msg_type, payload_data = self._recv_expected(
                 (_MSG_READY, _MSG_ERROR),
@@ -528,6 +533,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             # The worker has loaded the payload. The parent no longer needs this shm.
             self._close_payload_shm()
         except BaseException as startup_error:
+            self._record_worker_outcome(WorkerOutcome.INITIALIZATION_FAILURE)
             cancel_requested = self._startup_cancel_requested.is_set()
             if isinstance(startup_error, _SubprocessStartupCleanupError):
                 raise
@@ -581,12 +587,20 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             cancel_requested = getattr(self, "_startup_cancel_requested", None)
             if cancel_requested is not None and cancel_requested.is_set():
                 raise _SubprocessStartupCancelledError(f"UDF subprocess worker startup was cancelled: {exc}") from exc
+            self._record_worker_protocol_failure(exc)
             self._mark_broken(f"UDF subprocess communication failed: {exc}", actor_lost=True)
             raise RuntimeError(self._broken_error) from exc
         if msg_type not in expected:
             self._mark_broken(f"UDF subprocess sent unexpected message type {msg_type:#x}", actor_lost=True)
             raise RuntimeError(self._broken_error)
         return msg_type, payload
+
+    def _send_worker_message(self, sock: socket.socket, msg_type: int, payload: bytes = b"") -> None:
+        try:
+            _send_message(sock, msg_type, payload)
+        except Exception as exc:
+            self._record_worker_protocol_failure(exc)
+            raise
 
     def _require_socket(self) -> socket.socket:
         if self._closed:
@@ -613,7 +627,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 return cast("ExecutionCancellationScope", scope)
             lifetime_scope = getattr(self, "_worker_lifetime_scope", None)
             if lifetime_scope is None:
-                lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{id(self)}", 1)
+                lifetime_scope = ExecutionCancellationScope(f"subprocess-worker:{uuid.uuid4().hex}", 1)
                 self._worker_lifetime_scope = lifetime_scope
             return cast("ExecutionCancellationScope", lifetime_scope)
 
@@ -690,6 +704,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._active_input_leases[int(lease_id)] = owner_scope
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        # ACK and cancellation can overlap. Only completed transport cleanup
+        # permits either path to drop this executor's retry ownership.
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.pop(int(lease_id), None)
 
@@ -703,7 +721,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id, owner_scope in leases:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -724,6 +743,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         owner_scope = scope or self._current_execution_scope()
         with self._active_output_grants_lock:
             self._active_output_grants[int(grant_id)] = owner_scope
+        # A broken task worker can leave the cache before its cleanup succeeds.
+        # Keep unconverted grants query-owned independently of the worker. Byte
+        # reservations already retain their own grants until transport cleanup.
+        if (task := current_data_task()) is not None and task.reservation is None:
+            task.hold_output_grant(local_shm_budget_manager(), int(grant_id))
+        if (input_cleanup := current_input_cleanup()) is not None:
+            input_cleanup.hold_output_grant(local_shm_budget_manager(), int(grant_id))
 
     def _untrack_output_grant(self, grant_id: int) -> None:
         if int(grant_id) <= 0:
@@ -798,6 +824,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         actor_lost: bool = False,
         graceful_close: bool = False,
     ) -> None:
+        self._record_worker_outcome(WorkerOutcome.WORKER_LOSS if actor_lost else WorkerOutcome.RUNTIME_ERROR)
         self._actor_lost = self._actor_lost or actor_lost
         if self._broken_error is None:
             self._broken_error = error
@@ -806,6 +833,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
     def _mark_reported_error(
         self, error: str, *, diagnostic: BaseException | None = None, graceful_close: bool = True
     ) -> None:
+        self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
         try:
             self._mark_broken(error, graceful_close=graceful_close)
         except BaseException as cleanup_error:
@@ -820,6 +848,43 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         except BaseException as cleanup_error:
             return f"; broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
         return ""
+
+    def _record_worker_outcome(self, outcome: WorkerOutcome) -> None:
+        lifecycle = getattr(self, "_worker_lifecycle", None)
+        if lifecycle is None:
+            return
+        cancel_requested = getattr(self, "_startup_cancel_requested", None)
+        if (cancel_requested is not None and cancel_requested.is_set()) or self._current_execution_scope().is_set():
+            outcome = WorkerOutcome.CANCELLED
+        lifecycle.finish(outcome)
+
+    def _record_worker_protocol_failure(self, error: BaseException) -> None:
+        # Frame assembly/reception and payload decoding allocate in the parent.
+        # A failed local allocation is not evidence of an invalid or lost peer.
+        self._record_worker_outcome(
+            WorkerOutcome.RUNTIME_ERROR if isinstance(error, MemoryError) else WorkerOutcome.WORKER_LOSS
+        )
+
+    def _result_decode_error_handler(self) -> Callable[[BaseException], None] | None:
+        lifecycle = getattr(self, "_worker_lifecycle", None)
+        if lifecycle is None:
+            return None
+        observe = lifecycle.capture_observer()
+        worker_ref = weakref.ref(self)
+
+        def failed(error: BaseException) -> None:
+            # The worker may be idle or serving a different runtime now. Use
+            # the producing collector, not its current binding/cancellation,
+            # and address the physical worker, never a replaceable pool slot.
+            observe(WorkerOutcome.RUNTIME_ERROR if isinstance(error, MemoryError) else WorkerOutcome.WORKER_LOSS)
+            worker = worker_ref()
+            if worker is not None:
+                worker._mark_broken(
+                    f"UDF subprocess deferred result decoding failed: {_bounded_close_error(error)}",
+                    actor_lost=True,
+                )
+
+        return failed
 
     def _close_payload_shm(self) -> None:
         self._close_shared_memory("_payload_shm")
@@ -849,7 +914,19 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _wrap_output(self, output: pa.Table) -> Any:
         if self._ref_bundle_output:
-            return make_local_shm_ref_bundle_result(output)
+            task = current_data_task()
+            reservation = task.reservation if task is not None else None
+            result = make_local_shm_ref_bundle_result(
+                output,
+                **({"task_reservation": reservation.transport, "allocation_role": "output"} if reservation else {}),
+            )
+            try:
+                if (task := current_data_task()) is not None:
+                    track_local_shm_output(task, result)
+                return result
+            except BaseException:
+                _release_local_ref_bundle_result(result)
+                raise
         return output
 
     def _notify_wakeup(self) -> None:
@@ -862,6 +939,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._record_wakeup_error(exc)
 
     def _record_wakeup_error(self, exc: BaseException) -> None:
+        self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
         if self._wakeup_error is None:
             self._wakeup_error = exc
         if self._broken_error is None:
@@ -874,12 +952,19 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         scope = self._current_execution_scope()
         scope.raise_if_cancelled("UDF subprocess input allocation")
+        task = current_data_task()
+        reservation = task.reservation if task is not None else None
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
+            wait_context=lambda: self._capacity_wait_context("shared_memory_input"),
+            input_owner_id=scope.owner_id,
+            **({"task_reservation": reservation.transport} if reservation else {}),
         )
         lease_id = None
         try:
+            if (task := current_data_task()) is not None:
+                track_local_shm_inputs(task, refs)
             scope.raise_if_cancelled("UDF subprocess input allocation")
             worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
                 refs,
@@ -888,7 +973,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
-                reserve_output_credit=self._ref_bundle_output,
+                owns_refs=True,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
@@ -915,67 +1000,273 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except Exception:
                     pass
 
-    def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
-        if msg_type == _MSG_INPUT_CONSUMED:
+    def _capacity_wait_context(self, reason: str) -> AbstractContextManager[None]:
+        admission = _active_local_admission.get()
+        base = nullcontext() if admission is None else admission.suspend_for_wait(self._current_execution_scope())
+        return observe_transport_wait(base, reason)
+
+    def _decode_submit_control_message(self, msg_type: int, payload: bytes) -> dict[str, Any] | None:
+        if msg_type not in (
+            _MSG_INPUT_CONSUMED,
+            _MSG_INPUT_CONSUME_FAILED,
+            _MSG_INPUT_RETAINED,
+            _MSG_OUTPUT_GRANT_REQUEST,
+            _MSG_OUTPUT_GRANT_RELEASE,
+        ):
+            return None
+        # Malformed worker events are protocol failures. Decode all fields before
+        # entering parent-side resource operations, which can fail independently.
+        try:
             event = vane_pickle.loads(payload)
-            lease_id = int(event["input_lease_id"])
+            if msg_type == _MSG_INPUT_RETAINED:
+                if not isinstance(event, list) or any(type(token) is not int or token <= 0 for token in event):
+                    raise ValueError("invalid retained shared-memory input tokens")
+                return {"tokens": set(event)}
+            if msg_type in (_MSG_INPUT_CONSUMED, _MSG_INPUT_CONSUME_FAILED):
+                decoded: dict[str, Any] = {"input_lease_id": int(event["input_lease_id"])}
+                if msg_type == _MSG_INPUT_CONSUME_FAILED and event.get("invalid_ipc_block") is not None:
+                    block_index = event["invalid_ipc_block"]
+                    if type(block_index) is not int or block_index < 0:
+                        raise ValueError("input decode failure requires a non-negative block index")
+                    error = event.get("error")
+                    if not isinstance(error, str):
+                        raise ValueError("input decode failure requires an error message")
+                    scope = self._current_execution_scope()
+                    with self._active_input_leases_lock:
+                        owned = self._active_input_leases.get(decoded["input_lease_id"]) is scope
+                    if not owned:
+                        if not scope.is_set():
+                            raise ValueError("input decode failure refers to an unowned input lease")
+                        # Cancellation may already have retired our lease. An
+                        # unverified late ID must neither notify nor release a
+                        # different query's input owner.
+                        decoded["ignore_cancelled_failure"] = True
+                        return decoded
+                    decoded["decode_error"] = error
+                    decoded["decode_error_handler"] = local_shm_budget_manager().input_decode_error_handler(
+                        decoded["input_lease_id"], block_index
+                    )
+                return decoded
+            if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
+                input_lease_id_raw = event.get("input_lease_id")
+                input_tokens = event["input_tokens"]
+                if not isinstance(input_tokens, list) or any(
+                    type(token) is not int or token <= 0 for token in input_tokens
+                ):
+                    raise ValueError("invalid output grant shared-memory input tokens")
+                return {
+                    "request_id": int(event.get("request_id", 0)),
+                    "size_bytes": int(event["size_bytes"]),
+                    "priority": str(event.get("priority") or "consumer"),
+                    "input_lease_id": int(input_lease_id_raw) if input_lease_id_raw is not None else None,
+                    "input_tokens": set(input_tokens),
+                }
+            return {"grant_id": int(event["grant_id"])}
+        except Exception as exc:
+            self._record_worker_protocol_failure(exc)
+            raise
+
+    def _decode_ref_bundle_result(self, payload: bytes) -> dict[str, Any]:
+        descriptor = None
+        try:
+            descriptor = vane_pickle.loads(payload)
+            normalized = normalize_local_shm_ref_bundle_descriptor(descriptor)
+            grant_id = normalized["grant_id"]
+            if self._shm_peer is None:
+                raise RuntimeError("worker has no shared-memory ownership channel")
+            for block in normalized["block_refs"]:
+                self._shm_peer.validate_write(grant_id, block["allocation"])
+            if grant_id is not None:
+                scope = self._current_execution_scope()
+                with self._active_output_grants_lock:
+                    # Cancellation releases grants before an in-flight result
+                    # arrives. A consumed terminal result can be discarded
+                    # without retiring a healthy worker; an interrupted chunk
+                    # stream is fenced by the receive loop.
+                    if grant_id not in self._active_output_grants and not scope.is_set():
+                        raise ValueError(f"UDF subprocess result returned an unowned output grant {grant_id}")
+            return normalized
+        except Exception as exc:
+            self._raise_result_decoding_error(exc, descriptor)
+
+    def _decode_ipc_result(self, result_size: int) -> pa.Table:
+        try:
+            data_shm = self._require_data_shm()
+            if result_size > len(cast(Any, data_shm.buf)):
+                name = data_shm.name
+                data_shm.close()
+                self._data_shm = data_shm = _open_existing_shm(name, track=False)
+            ipc_result = _read_ipc_from_shm(data_shm, result_size)
+            return _arrow_table_from_ipc_bytes(ipc_result)
+        except Exception as exc:
+            self._raise_result_decoding_error(exc)
+
+    def _raise_result_decoding_error(self, exc: Exception, descriptor: Any = None) -> NoReturn:
+        self._record_worker_protocol_failure(exc)
+        error = f"UDF subprocess result decoding failed: {exc}"
+        cleanup_errors: list[BaseException] = []
+        # Retain the raw descriptor for best-effort cleanup even when only part
+        # of its fields are invalid. Closing also owns all tracked grants.
+        if isinstance(descriptor, dict):
+            try:
+                release_local_shm_ref_bundle_descriptor(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        try:
+            self._mark_broken(error, actor_lost=True)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            error += "; result cleanup failed: " + _subprocess_cleanup_error_details(cleanup_errors)
+        raise RuntimeError(error) from exc
+
+    def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
+        event = self._decode_submit_control_message(msg_type, payload)
+        if event is None:
+            return False
+        if msg_type == _MSG_INPUT_RETAINED:
+            if self._shm_peer is None:
+                raise RuntimeError("worker has no shared-memory ownership channel")
+            self._shm_peer.retain_inputs(event["tokens"])
+            return True
+        if msg_type == _MSG_INPUT_CONSUMED:
+            lease_id = event["input_lease_id"]
             consume_local_shm_input_lease(lease_id, name="udf-input")
             self._untrack_input_lease(lease_id)
             self._notify_wakeup()
             return True
         if msg_type == _MSG_INPUT_CONSUME_FAILED:
-            event = vane_pickle.loads(payload)
-            lease_id = int(event["input_lease_id"])
-            cancel_local_shm_input_lease(lease_id, name="udf-input")
-            self._untrack_input_lease(lease_id)
-            self._notify_wakeup()
+            if event.get("ignore_cancelled_failure"):
+                return True
+            lease_id = event["input_lease_id"]
+            producer_cleanup_error: BaseException | None = None
+            try:
+                if (handler := event.get("decode_error_handler")) is not None:
+                    # Preserve the producer before releasing its input owner.
+                    # It may be the same physical cached task worker now serving
+                    # this consumer, so notify it before the consumer's outcome.
+                    handler(InvalidLocalShmReferenceError(event["decode_error"]))
+            except BaseException as exc:
+                producer_cleanup_error = exc
+            finally:
+                # The worker has reported a consumption error even if producer
+                # retirement or input cleanup prevents receiving its final ERROR.
+                self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
+            try:
+                cancel_local_shm_input_lease(lease_id, name="udf-input")
+                self._untrack_input_lease(lease_id)
+                self._notify_wakeup()
+            except BaseException as cleanup_error:
+                if "decode_error" in event:
+                    raise RuntimeError(event["decode_error"]) from cleanup_error
+                raise
+            if producer_cleanup_error is not None:
+                raise RuntimeError(event["decode_error"]) from producer_cleanup_error
+            if self._closed and "decode_error" in event:
+                # Notifying our own producing lifecycle already closed this
+                # socket; the received error is still the primary failure.
+                raise RuntimeError(event["decode_error"])
             return True
         if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
-            event = vane_pickle.loads(payload)
-            request_id = int(event.get("request_id", 0))
-            size = int(event["size_bytes"])
-            priority = str(event.get("priority") or "consumer")
-            input_lease_id_raw = event.get("input_lease_id")
-            input_lease_id = int(input_lease_id_raw) if input_lease_id_raw is not None else None
+            request_id = event["request_id"]
+            size = event["size_bytes"]
+            priority = event["priority"]
+            input_lease_id = event["input_lease_id"]
             scope = self._current_execution_scope()
             grant_id = 0
             try:
-                grant_id = request_local_shm_output_grant(
-                    size,
-                    name=f"udf-output-{request_id}",
-                    priority=priority,
-                    input_lease_id=input_lease_id,
-                    cancel_event=scope,
-                )
-                self._track_output_grant(grant_id, scope)
-                scope.raise_if_cancelled("UDF subprocess output grant")
+                task = current_data_task()
+                reservation = task.reservation if task is not None else None
+                if self._shm_peer is None:
+                    raise RuntimeError("worker has no shared-memory ownership channel")
+                self._shm_peer.store.check_write_size(size)
+                with self._shm_peer.store.foreground_allocation():
+                    if not local_shm_budget_manager().can_claim_output(size):
+                        self._shm_peer.store.reclaim_prefetched_inputs()
+                    while True:
+                        if reservation is not None:
+                            scope.raise_if_cancelled("UDF subprocess output grant")
+                            grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
+                        else:
+                            grant_id = request_local_shm_output_grant(
+                                size,
+                                name=f"udf-output-{request_id}",
+                                priority=priority,
+                                input_lease_id=input_lease_id,
+                                owner_id=scope.owner_id,
+                                cancel_event=scope,
+                                wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
+                            )
+                        self._track_output_grant(grant_id, scope)
+                        scope.raise_if_cancelled("UDF subprocess output grant")
+                        try:
+                            allocation = self._shm_peer.reserve_write(grant_id, size, producer_id=scope.owner_id)
+                            break
+                        except LocalShmStoreCapacityError:
+                            if reservation is not None:
+                                # Explicit envelopes are strict. They consume the
+                                # declared output allowance once, without escape.
+                                raise
+                            self._release_output_grant(grant_id, name="udf-output-waiting-for-storage")
+                            grant_id = 0
+                            self._shm_peer.store.wait_for_capacity(
+                                size,
+                                self._shm_peer.input_allocations(event["input_tokens"]),
+                                scope,
+                                lambda: self._capacity_wait_context("shared_memory_output"),
+                                local_shm_budget_manager().consuming_input_producers(input_lease_id),
+                            )
             except BaseException as exc:
                 if grant_id > 0:
+                    if self._shm_peer is not None:
+                        self._shm_peer.finish_write(grant_id)
                     self._release_output_grant(grant_id, name=f"udf-output-{request_id}-cancelled")
-                _send_message(
+                self._send_worker_message(
                     self._require_socket(),
-                    _MSG_OUTPUT_GRANT_CANCELLED,
+                    _MSG_OUTPUT_GRANT_CANCELLED if scope.is_set() else _MSG_OUTPUT_GRANT_FAILED,
                     str(exc).encode("utf-8", errors="replace"),
                 )
                 return True
-            response = {"request_id": request_id, "grant_id": int(grant_id)}
+            response = {"request_id": request_id, "grant_id": int(grant_id), "allocation": allocation}
             try:
-                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, vane_pickle.dumps(response))
+                try:
+                    response_payload = vane_pickle.dumps(response)
+                except BaseException:
+                    self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+                    raise
+                self._send_worker_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, response_payload)
             except BaseException as exc:
+                self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
                 self._release_output_grant(grant_id, name=f"udf-output-{request_id}-send-failed")
                 self._mark_broken(f"UDF subprocess output grant response failed: {exc}", actor_lost=True)
                 raise RuntimeError(self._broken_error) from exc
             self._notify_wakeup()
             return True
         if msg_type == _MSG_OUTPUT_GRANT_RELEASE:
-            event = vane_pickle.loads(payload)
-            grant_id = int(event["grant_id"])
+            grant_id = event["grant_id"]
+            if self._shm_peer is not None:
+                self._shm_peer.finish_write(grant_id)
             self._release_output_grant(grant_id, name="udf-output-worker-release")
             self._notify_wakeup()
             return True
         return False
 
     def _recv_submit_result(self) -> Any | None:
+        self._awaiting_submit_terminal = True
+        try:
+            return self._recv_submit_messages()
+        except BaseException as error:
+            if self._awaiting_submit_terminal and self._broken_error is None:
+                # A chunk transfers buffers, not the protocol connection. An
+                # interrupted receiver must retire the worker before another
+                # invocation can consume the previous task's remaining frames.
+                try:
+                    self._mark_broken("UDF subprocess output stream ended before its terminal response")
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
+
+    def _recv_submit_messages(self) -> Any | None:
         msg_type = None
         payload = b""
         while msg_type is None:
@@ -983,23 +1274,55 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 (
                     _MSG_OK,
                     _MSG_REF_BUNDLE_RESULT,
+                    _MSG_REF_BUNDLE_CHUNK,
                     _MSG_ERROR,
                     _MSG_INPUT_CONSUMED,
+                    _MSG_INPUT_RETAINED,
                     _MSG_INPUT_CONSUME_FAILED,
                     _MSG_OUTPUT_GRANT_REQUEST,
                     _MSG_OUTPUT_GRANT_RELEASE,
                     _MSG_TASK_CANCELLED,
+                    _MSG_STREAM_NEXT,
                 )
             )
+            if msg_type == _MSG_STREAM_NEXT:
+                scope = self._current_execution_scope()
+                stream = _active_local_stream.get()
+                if payload or stream is None:
+                    protocol_error = RuntimeError("invalid local output stream permit request")
+                    self._record_worker_protocol_failure(protocol_error)
+                    raise protocol_error
+                try:
+                    stream.reserve(scope, lambda: self._capacity_wait_context("shared_memory_output"))
+                except BaseException as exc:
+                    self._send_worker_message(
+                        self._require_socket(),
+                        _MSG_OUTPUT_GRANT_CANCELLED if scope.is_set() else _MSG_OUTPUT_GRANT_FAILED,
+                        str(exc).encode("utf-8", errors="replace"),
+                    )
+                else:
+                    self._send_worker_message(self._require_socket(), _MSG_STREAM_CONTINUE)
+                msg_type = None
+                continue
+            if msg_type in (_MSG_OK, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
+                self._awaiting_submit_terminal = False
             try:
                 if self._handle_submit_control_message(msg_type, payload):
                     msg_type = None
                     continue
             except BaseException as exc:
-                self._mark_broken(
-                    f"UDF subprocess control-message handling failed: {exc}",
-                    actor_lost=True,
-                )
+                # actor_lost also fences an unusable protocol owner; it is not
+                # evidence of process loss when parent-side handling failed.
+                # Protocol and worker-reported failures are recorded at their
+                # source before fallible cleanup and keep their earlier outcome.
+                self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+                error = f"UDF subprocess control-message handling failed: {exc}"
+                try:
+                    self._mark_broken(error, actor_lost=True)
+                except BaseException as cleanup_error:
+                    # A producer can also be this consuming worker. Its failed
+                    # retirement must not replace the input decoder's error.
+                    raise RuntimeError(error) from cleanup_error
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
                 message, diagnostic = decode_error(payload)
@@ -1012,40 +1335,78 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     raise ExecutionCancelledError(f"UDF subprocess task cancelled: {scope.cancel_reason or error}")
                 self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
                 raise RuntimeError(self._broken_error)
-            if msg_type == _MSG_REF_BUNDLE_RESULT:
-                descriptor = vane_pickle.loads(payload)
-                grant_id_raw = descriptor.get("grant_id") if isinstance(descriptor, dict) else None
-                grant_id = int(grant_id_raw) if grant_id_raw is not None else None
+            if msg_type in (_MSG_REF_BUNDLE_RESULT, _MSG_REF_BUNDLE_CHUNK):
+                descriptor = self._decode_ref_bundle_result(payload)
+                grant_id = descriptor["grant_id"]
                 scope = self._current_execution_scope()
                 if scope.is_set():
                     try:
                         release_local_shm_ref_bundle_descriptor(descriptor)
                     finally:
-                        if grant_id is not None:
-                            self._release_output_grant(grant_id, name="udf-output-cancelled-result")
+                        if self._shm_peer is not None and grant_id is not None:
+                            self._shm_peer.finish_write(grant_id)
+                        # The cancelled descriptor may refer to an already
+                        # released grant. Release only this scope's tracked
+                        # grants, never an unverified ID from the late result.
+                        self._release_active_output_grants(name="udf-output-cancelled-result", scope=scope)
                     raise ExecutionCancelledError(
                         f"UDF subprocess task cancelled: {scope.cancel_reason or 'cancelled'}"
                     )
+                result = None
                 try:
                     result = make_local_shm_ref_bundle_result_from_descriptor(
                         descriptor,
                         block_on_budget=False,
                         cancel_event=scope,
+                        on_decode_error=self._result_decode_error_handler(),
                     )
-                except BaseException:
+                    if (task := current_data_task()) is not None:
+                        track_local_shm_output(task, result)
+                except BaseException as exc:
+                    if self._shm_peer is not None and grant_id is not None:
+                        self._shm_peer.finish_write(grant_id)
+                    if result is None and isinstance(
+                        exc, (InvalidLocalShmReferenceError, FileNotFoundError, MemoryError)
+                    ):
+                        # Invalid mappings and IPC bounds are protocol failures;
+                        # parent allocation failures keep their runtime category.
+                        # Do not classify errors tracking an adopted result
+                        # as invalid worker references.
+                        self._raise_result_decoding_error(exc, descriptor)
                     try:
+                        _release_local_ref_bundle_result(result)
                         release_local_shm_ref_bundle_descriptor(descriptor)
                     finally:
                         if grant_id is not None:
                             self._release_output_grant(grant_id, name="udf-output-descriptor-wrap-failed")
                     raise
                 if grant_id is not None:
+                    if self._shm_peer is not None:
+                        self._shm_peer.finish_write(grant_id)
                     self._untrack_output_grant(grant_id)
                 try:
                     scope.raise_if_cancelled("UDF subprocess result")
                 except BaseException:
                     _release_local_ref_bundle_result(result)
                     raise
+                if msg_type == _MSG_REF_BUNDLE_CHUNK:
+                    receiver = _active_local_output.get()
+                    if receiver is None:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream has no receiver", actor_lost=True)
+                        raise RuntimeError(self._broken_error)
+                    try:
+                        receiver(result)
+                    except BaseException:
+                        _release_local_ref_bundle_result(result)
+                        self._mark_broken("UDF output stream receiver failed", actor_lost=True)
+                        raise
+                    finally:
+                        # Ownership moved to the receiver. A later terminal
+                        # error must not retain this block in its traceback.
+                        result = None
+                    msg_type = None
+                    continue
                 return result
             if len(payload) != 8:
                 self._mark_broken("UDF subprocess returned malformed OK response", actor_lost=True)
@@ -1063,13 +1424,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     actor_lost=True,
                 )
                 raise RuntimeError(self._broken_error)
-            data_shm = self._require_data_shm()
-            if result_size > len(cast(Any, data_shm.buf)):
-                name = data_shm.name
-                data_shm.close()
-                self._data_shm = data_shm = _open_existing_shm(name, track=False)
-            ipc_result = _read_ipc_from_shm(data_shm, result_size)
-            return self._wrap_output(_arrow_table_from_ipc_bytes(ipc_result))
+            return self._wrap_output(self._decode_ipc_result(result_size))
         raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:
@@ -1077,7 +1432,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if payload.get("estimated_num_rows") == 0:
             # The worker will never receive this bundle and therefore cannot
             # acknowledge its lease. Cancel rather than consume it so an empty
-            # result does not leave behind unused output credit.
+            # result does not leave behind an unacknowledged input lease.
             if lease_id_raw is not None:
                 cancel_local_shm_input_lease(int(lease_id_raw), name="udf-input-zero-row")
             return None
@@ -1092,8 +1447,18 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._untrack_input_lease(lease_id)
                 scope.raise_if_cancelled("UDF subprocess submit")
         try:
-            payload_bytes = vane_pickle.dumps(payload)
-            _send_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
+            try:
+                if self._shm_peer is not None:
+                    self._shm_peer.retain_inputs(set())
+                if any("allocation" in block for block in payload.get("block_refs", ())):
+                    if self._shm_peer is None:
+                        raise RuntimeError("worker has no shared-memory ownership channel")
+                    self._shm_peer.borrow_inputs(payload)
+                payload_bytes = vane_pickle.dumps(payload)
+            except Exception:
+                self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+                raise
+            self._send_worker_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
         except Exception as exc:
             broken_error = f"UDF subprocess ref-bundle submit failed: {exc}"
             try:
@@ -1108,7 +1473,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 ) from exc
             raise RuntimeError(self._broken_error) from exc
         try:
-            return self._recv_submit_result()
+            result = self._recv_submit_result()
+            if lease_id is not None:
+                local_shm_budget_manager().finish_consuming(lease_id)
+            return result
         except BaseException as submit_error:
             cleanup_error: BaseException | None = None
             if lease_id is not None:
@@ -1135,7 +1503,6 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             names,
             submit_id=None,
             name="udf-input",
-            reserve_output_credit=self._ref_bundle_output,
         )
         if worker_payload is not None:
             try:
@@ -1156,20 +1523,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
 
     def submit(self, args: pa.Table) -> None:
-        self._pending_batches += 1
-        try:
+        with self._collect_output_stream(None):
             result = self._submit_table(args)
-        finally:
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
         self._notify_wakeup()
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
-        self._pending_batches += 1
-        try:
+        with self._collect_output_stream(submit_id):
             result = self._submit_table(args)
-        finally:
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
@@ -1181,21 +1542,47 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
-        self._pending_batches += 1
-        try:
+        with self._collect_output_stream(submit_id):
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
-        finally:
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append((SUBMIT_RESULT_MARKER, int(submit_id), result))
         self._notify_wakeup()
 
     def submit_ref_bundle(self, block_refs: Any, slices: Any, metadata: Any, names: Any) -> None:
-        self._pending_batches += 1
-        try:
+        with self._collect_output_stream(None):
             result = self._submit_ref_bundle(block_refs, slices, metadata, names)
-        finally:
-            self._pending_batches = max(0, self._pending_batches - 1)
         self._queue.append(result if result is not None else (None, True))
+        self._notify_wakeup()
+
+    @contextmanager
+    def _collect_output_stream(self, submit_id: int | None) -> Iterator[None]:
+        # This low-level synchronous protocol client explicitly collects every
+        # block during submit(). The runner uses UDFExecutor's capacity-aware
+        # asynchronous receiver instead, and returns permits on native reads.
+        stream = LocalStreamAdapter()
+
+        def collect(result: Any) -> None:
+            self._queue_stream_result(submit_id, result)
+            stream.consumed()
+
+        self._pending_batches += 1
+        stream_token = _active_local_stream.set(stream)
+        output_token = _active_local_output.set(collect)
+        try:
+            yield
+        finally:
+            _active_local_output.reset(output_token)
+            _active_local_stream.reset(stream_token)
+            stream.close()
+            self._pending_batches = max(0, self._pending_batches - 1)
+
+    def _queue_stream_result(self, submit_id: int | None, result: Any) -> None:
+        with self._stream_result_lock:
+            if self._closed:
+                _release_local_ref_bundle_result(result)
+                raise ExecutionCancelledError("UDF output stream worker closed")
+            self._queue.append(
+                (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+            )
         self._notify_wakeup()
 
     def take_ready_result(self) -> Any | None:
@@ -1214,7 +1601,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             return
         sock = self._require_socket()
         try:
-            _send_message(sock, _MSG_FINISHED)
+            self._send_worker_message(sock, _MSG_FINISHED)
             msg_type, payload = self._recv_expected(
                 (_MSG_ACK, _MSG_ERROR),
                 timeout_s=_subprocess_control_timeout_s(),
@@ -1243,14 +1630,17 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             "udf_max_running_tasks": 1,
         }
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._wakeup = callback
 
     def is_reusable(self) -> bool:
         if self._closed or self._broken_error is not None:
             return False
         proc = self._proc
-        return proc is not None and proc.poll() is None
+        reusable = proc is not None and proc.poll() is None
+        if not reusable:
+            self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
+        return reusable
 
     def cancel_output_grants(self) -> None:
         scope = self._current_execution_scope()
@@ -1258,10 +1648,19 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _cancel_startup(self) -> None:
         """Interrupt startup without waiting for its cleanup thread."""
+        lifecycle = getattr(self, "_worker_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.finish(WorkerOutcome.CANCELLED)
         cleanup_errors: list[BaseException] = []
         cancel_requested = getattr(self, "_startup_cancel_requested", None)
         if cancel_requested is not None:
             cancel_requested.set()
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            try:
+                process_group.capture()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
@@ -1289,6 +1688,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError(f"UDF subprocess startup cancellation failed: {details}") from cleanup_errors[0]
 
     def close(self, kill: bool = False) -> None:
+        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
+            return
         close_lock = getattr(self, "_close_lock", None)
         if close_lock is None:
             close_lock = threading.Lock()
@@ -1299,7 +1700,23 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
     def _close_locked(self, *, kill: bool) -> None:
         if getattr(self, "_cleanup_finished", False):
             return
+        # Record intent before closing resources can cause a concurrent reader
+        # to observe EOF. Already recorded failures keep their original cause.
+        outcome = WorkerOutcome.SHUTDOWN
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
+            try:
+                if proc.poll() is not None:
+                    outcome = WorkerOutcome.WORKER_LOSS
+            except Exception:
+                pass
+        self._record_worker_outcome(outcome)
         self._closed = True
+        stream_lock = getattr(self, "_stream_result_lock", None)
+        if stream_lock is not None:
+            with stream_lock:
+                while self._queue:
+                    _release_local_ref_bundle_result(self._queue.popleft())
         cleanup_errors: list[BaseException] = []
         try:
             self.cancel_output_grants()
@@ -1316,8 +1733,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         proc = self._proc
         sock = self._sock
+        process_group = getattr(self, "_process_group", None)
+        if process_group is not None:
+            # Capture before asking the engine/worker to exit; escaped engine
+            # descendants remain owned even after they are reparented.
+            process_group.capture()
         shutdown_error: BaseException | None = None
         graceful_error: BaseException | None = None
+        exit_deadline_error: BaseException | None = None
         finalizer_cleanup_failed = False
 
         if proc is not None and proc.poll() is None and sock is not None and not kill:
@@ -1346,7 +1769,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     proc.wait(timeout=remaining)
                 except (subprocess.TimeoutExpired, TimeoutError) as exc:
                     if graceful_error is None:
-                        graceful_error = RuntimeError(
+                        exit_deadline_error = RuntimeError(
                             "UDF subprocess graceful shutdown did not exit before deadline: "
                             f"{type(exc).__name__}: {exc}"
                         )
@@ -1364,6 +1787,14 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             except BaseException as exc:
                 if shutdown_error is None:
                     shutdown_error = exc
+
+        if process_group is not None:
+            try:
+                process_group.close(_subprocess_control_timeout_s())
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._process_group = None
 
         if sock is not None:
             try:
@@ -1393,6 +1824,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._proc = proc
         else:
             self._proc = None
+        if self._proc is None and getattr(self, "_process_group", None) is None and self._shm_peer is not None:
+            try:
+                self._shm_peer.close_after_exit()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._shm_peer = None
         try:
             self._close_payload_shm()
         except BaseException as exc:
@@ -1413,7 +1851,15 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             and not active_output_grants
             and all(
                 getattr(self, attribute, None) is None
-                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm")
+                for attribute in (
+                    "_proc",
+                    "_sock",
+                    "_startup_child_sock",
+                    "_payload_shm",
+                    "_data_shm",
+                    "_shm_peer",
+                    "_process_group",
+                )
             )
         )
         finalizer = getattr(self, "_finalizer", None)
@@ -1428,9 +1874,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             )
         if graceful_error is not None:
             cleanup_errors.append(graceful_error)
+        if exit_deadline_error is not None:
+            if self._cleanup_finished and not cleanup_errors:
+                raise _SubprocessExitDeadlineExceeded(str(exit_deadline_error)) from exit_deadline_error
+            cleanup_errors.append(exit_deadline_error)
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
-            raise RuntimeError(f"UDF subprocess close failed: {details}") from cleanup_errors[0]
+            raise capture_cleanup(f"UDF subprocess close failed: {details}", *cleanup_errors) from cleanup_errors[0]
 
     def __del__(self) -> None:
         try:
@@ -1461,19 +1911,13 @@ def _payload_subprocess_mode(payload: dict[str, Any]) -> str:
     raise ValueError("payload.execution_backend must be one of: subprocess_task, subprocess_actor")
 
 
-def _payload_subprocess_pool_size(payload: dict[str, Any], mode: str) -> int:
-    if mode == "actor":
-        return _payload_positive_int(payload, "actor_number")
-    return _payload_positive_int(payload, "udf_worker_slots")
-
-
 def _worker_env_for_pool_index(payload: dict[str, Any], worker_idx: int, pool_size: int) -> dict[str, str]:
-    _payload_subprocess_mode(payload)
+    mode = _payload_subprocess_mode(payload)
     env = {
         "VANE_SUBPROCESS_WORKER_INDEX": str(int(worker_idx)),
         "VANE_SUBPROCESS_POOL_SIZE": str(int(pool_size)),
     }
-    env.update(_worker_thread_env(payload))
+    env.update(subprocess_actor_thread_env(payload) if mode == "actor" else _worker_thread_env(payload))
     return env
 
 
@@ -1510,9 +1954,23 @@ def _worker_is_reusable(worker: Any) -> bool:
     return proc is None or not callable(poll) or poll() is None
 
 
+def _bind_worker_metrics(worker: Any, metrics: WorkerMetrics | None) -> None:
+    lifecycle = getattr(worker, "_worker_lifecycle", None)
+    if lifecycle is not None:
+        lifecycle.bind(metrics)
+
+
+def _record_worker_cancellation(worker: Any) -> None:
+    lifecycle = getattr(worker, "_worker_lifecycle", None)
+    if lifecycle is not None:
+        lifecycle.finish(WorkerOutcome.CANCELLED)
+
+
 def _release_local_ref_bundle_result(value: Any) -> None:
     if isinstance(value, tuple) and len(value) >= 3 and value[0] == SUBMIT_RESULT_MARKER:
         value = value[2]
+    elif isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], bool):
+        value = value[0]
     if not (isinstance(value, tuple) and len(value) >= 2 and value[0] == REF_BUNDLE_RESULT_MARKER):
         return
     for ref in list(value[1] or []):
@@ -1546,10 +2004,13 @@ class _TaskWorkerPool:
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
         self.pool_size = max(1, int(pool_size))
+        self.resources = udf_process_resources(payload)
+        self.executor = ThreadPoolExecutor(max_workers=self.pool_size, thread_name_prefix="vane-udf-subprocess-task")
         self.ref_count = 0
         self.closing = False
         self.idle: list[_PooledTaskWorker] = []
         self._active_wrappers: set[_PooledTaskWorker] = set()
+        self._retiring_workers: dict[_PooledTaskWorker, None] = {}
         self._spawning_workers: set[int] = set()
         self._spawning_executors: dict[int, _SingleSubprocessExecutor] = {}
         self._spawn_cleanup_errors: list[BaseException] = []
@@ -1560,10 +2021,14 @@ class _TaskWorkerPool:
         self.admission_slots = LocalExecutionSlotPool(
             max_slots=self.pool_size,
             execution_slot_prefix=f"subprocess_task:{self.key}",
+            execution_capacity=runtime.execution_capacity,
+            resources=self.resources,
         )
 
-    def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
-        return self.admission_slots.create_authority()
+    def create_admission_authority(
+        self, progress: LocalTaskProgressBinding | None = None
+    ) -> LocalSlotAdmissionAuthority:
+        return self.admission_slots.create_task_authority(progress)
 
     def acquire_ref(self) -> None:
         with self.runtime.cond:
@@ -1572,7 +2037,7 @@ class _TaskWorkerPool:
             self.ref_count += 1
 
     def release_ref(self, *, kill: bool = False) -> None:
-        to_close: list[_SingleSubprocessExecutor] = []
+        to_close: list[_PooledTaskWorker] = []
         active_to_kill: list[_SingleSubprocessExecutor] = []
         close_pool = False
         close_kill = bool(kill)
@@ -1585,12 +2050,12 @@ class _TaskWorkerPool:
                 close_kill = self.kill_on_release
                 while self.idle:
                     wrapper = self.idle.pop()
-                    self.total = max(0, self.total - 1)
-                    self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                    to_close.append(wrapper.worker)
+                    self._retire_worker_locked(wrapper)
+                to_close.extend(self._retiring_workers)
                 if close_kill:
                     active_to_kill.extend(wrapper.worker for wrapper in self._active_wrappers)
-                self.runtime.pools.pop(self.key, None)
+                if self.runtime.pools.get(self.key) is self:
+                    self.runtime.pools.pop(self.key)
             self.runtime.cond.notify_all()
         if not close_pool:
             return
@@ -1599,11 +2064,21 @@ class _TaskWorkerPool:
             self.admission_slots.close()
         except BaseException as exc:
             cleanup_errors.append(exc)
-        for worker in to_close:
-            try:
-                worker.close(kill=close_kill)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        retiring_by_worker = {wrapper.worker: wrapper for wrapper in to_close}
+
+        def close_retiring_worker(worker: _SingleSubprocessExecutor) -> None:
+            self._close_retiring_worker(retiring_by_worker[worker], kill=close_kill)
+
+        # Keep the retirement ledger authoritative: the callback drops ownership
+        # and capacity only after that worker's close succeeds.
+        close_errors, _ = _close_subprocess_workers_concurrently(
+            list(retiring_by_worker), kill=close_kill, close_worker=close_retiring_worker
+        )
+        cleanup_errors.extend(close_errors)
         for worker in active_to_kill:
             try:
                 worker.close(kill=True)
@@ -1613,6 +2088,29 @@ class _TaskWorkerPool:
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"subprocess task worker pool close failed: {details}") from cleanup_errors[0]
+
+    def _retire_worker_locked(self, wrapper: _PooledTaskWorker) -> None:
+        # Retirement removes reuse rights, not physical cleanup ownership.
+        # The runtime also owns these workers after the final pool reference
+        # is released, including when executor shutdown itself fails.
+        self._retiring_workers[wrapper] = None
+        self.runtime._retiring_workers[wrapper] = self
+
+    def _close_retiring_worker(self, wrapper: _PooledTaskWorker, *, kill: bool) -> None:
+        try:
+            wrapper.worker.close(kill=kill or self.kill_on_release)
+        except _SubprocessExitDeadlineExceeded:
+            # An idle cache entry has no user work left. A post-ACK exit timeout
+            # is recoverable only after kill/reap and every cleanup succeeded.
+            # Other close failures retain ownership and propagate to the caller.
+            pass
+        with self.runtime.cond:
+            if wrapper in self._retiring_workers:
+                self._retiring_workers.pop(wrapper)
+                self.runtime._retiring_workers.pop(wrapper)
+                self.total = max(0, self.total - 1)
+                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
+                self.runtime.cond.notify_all()
 
     def cancel_output_grants(self) -> None:
         workers: list[_SingleSubprocessExecutor] = []
@@ -1700,12 +2198,16 @@ class _TaskWorkerPool:
                 except BaseException as exc:
                     cleanup_errors.append(exc)
 
-    def _spawn_worker(self, worker_idx: int) -> _PooledTaskWorker:
+    def _spawn_worker(self, worker_idx: int, worker_metrics: WorkerMetrics | None = None) -> _PooledTaskWorker:
+        def observe_startup(executor: _SingleSubprocessExecutor) -> None:
+            _bind_worker_metrics(executor, worker_metrics)
+            self._track_spawning_executor(worker_idx, executor)
+
         worker = _SingleSubprocessExecutor(
             self.payload,
             worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
             session_config=self.session_config,
-            startup_observer=lambda executor: self._track_spawning_executor(worker_idx, executor),
+            startup_observer=observe_startup,
         )
         return _PooledTaskWorker(worker)
 
@@ -1721,50 +2223,69 @@ class _TaskWorkerPool:
             errors.append(cleanup_error)
             self.runtime.cond.notify_all()
 
-    def acquire_worker(self, scope: ExecutionCancellationScope) -> _PooledTaskWorker:
+    def acquire_worker(
+        self, scope: ExecutionCancellationScope, *, worker_metrics: WorkerMetrics | None = None
+    ) -> _PooledTaskWorker:
         wrapper: _PooledTaskWorker | None = None
         spawn_idx: int | None = None
         unregister = scope.register_cancel_wakeup(self._wake_waiters)
         try:
             while wrapper is None and spawn_idx is None:
-                evicted: _SingleSubprocessExecutor | None = None
+                evicted: tuple[_TaskWorkerPool, _PooledTaskWorker] | None = None
+                retry_retirement = False
                 with self.runtime.cond:
                     scope.raise_if_cancelled("subprocess task worker acquisition")
                     if self.closing or self.runtime.closed:
                         raise RuntimeError("subprocess task worker pool is closed")
                     while self.idle:
                         candidate = self.idle.pop()
+                        _bind_worker_metrics(candidate.worker, worker_metrics)
                         if _worker_is_reusable(candidate.worker):
                             candidate.active_scope = scope
                             self.active += 1
                             self._active_wrappers.add(candidate)
                             return candidate
-                        self.total = max(0, self.total - 1)
-                        self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                        evicted = candidate.worker
+                        self._retire_worker_locked(candidate)
+                        evicted = (self, candidate)
                         self.runtime.cond.notify_all()
                         break
                     if evicted is not None:
                         pass
-                    elif self.total < self.pool_size and self.runtime.total_workers < self.runtime.max_workers:
-                        spawn_idx = self.next_worker_idx
-                        self.next_worker_idx += 1
-                        self._spawning_workers.add(spawn_idx)
-                        self.total += 1
-                        self.active += 1
-                        self.runtime.total_workers += 1
-                        break
-                    else:
-                        evicted = self.runtime._take_idle_worker_locked()
+                    elif self._retiring_workers:
+                        # A failed close still owns inventory but cannot wake
+                        # an acquisition waiting for a free slot. Retry it
+                        # outside the ledger lock; another failure must finish
+                        # this task with an error rather than retain its grant.
+                        evicted = (self, next(iter(self._retiring_workers)))
+                        retry_retirement = True
+                    elif self.total < self.pool_size:
+                        # Reclaim idle cache entries before growing inventory.
+                        # Transport waiters retain their processes, so their
+                        # count must not prevent an admitted consumer starting.
+                        if self.runtime.total_workers >= self.runtime.max_workers:
+                            evicted = self.runtime._take_idle_worker_locked()
                         if evicted is None:
-                            self.runtime.cond.wait()
-                            continue
+                            spawn_idx = self.next_worker_idx
+                            self.next_worker_idx += 1
+                            self._spawning_workers.add(spawn_idx)
+                            self.total += 1
+                            self.active += 1
+                            self.runtime.total_workers += 1
+                            break
+                    else:
+                        self.runtime.cond.wait()
+                        continue
                 if evicted is not None:
-                    evicted.close(kill=False)
+                    evicted_pool, evicted_wrapper = evicted
+                    evicted_pool._close_retiring_worker(evicted_wrapper, kill=retry_retirement)
 
             try:
                 assert spawn_idx is not None
-                wrapper = self._spawn_worker(spawn_idx)
+                wrapper = (
+                    self._spawn_worker(spawn_idx, worker_metrics)
+                    if worker_metrics is not None
+                    else self._spawn_worker(spawn_idx)
+                )
             except BaseException:
                 with self.runtime.cond:
                     self.total = max(0, self.total - 1)
@@ -1804,23 +2325,32 @@ class _TaskWorkerPool:
             unregister()
 
     def release_worker(self, wrapper: _PooledTaskWorker, *, reusable: bool = True) -> None:
-        to_close: _SingleSubprocessExecutor | None = None
+        to_close = False
         kill_close = False
         with self.runtime.cond:
+            retire = (
+                self.closing
+                or wrapper.abort_requested
+                or not reusable
+                or not _worker_is_reusable(wrapper.worker)
+                or self.runtime.total_workers > self.runtime.max_workers
+            )
             self._active_wrappers.discard(wrapper)
             self.active = max(0, self.active - 1)
             wrapper.active_scope = None
-            if self.closing or wrapper.abort_requested or not reusable or not _worker_is_reusable(wrapper.worker):
-                self.total = max(0, self.total - 1)
-                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                to_close = wrapper.worker
+            if retire:
+                self._retire_worker_locked(wrapper)
+                to_close = True
                 kill_close = self.kill_on_release or wrapper.abort_requested or not reusable
             else:
+                # Clear before publishing idle: another runtime may acquire it
+                # immediately, and must never inherit this borrower's collector.
+                _bind_worker_metrics(wrapper.worker, None)
                 wrapper.last_used = time.monotonic()
                 self.idle.append(wrapper)
             self.runtime.cond.notify_all()
-        if to_close is not None:
-            to_close.close(kill=kill_close)
+        if to_close:
+            self._close_retiring_worker(wrapper, kill=kill_close)
 
     def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
         workers: list[_SingleSubprocessExecutor] = []
@@ -1828,6 +2358,7 @@ class _TaskWorkerPool:
             for wrapper in self._active_wrappers:
                 if wrapper.active_scope in scopes:
                     wrapper.abort_requested = True
+                    _record_worker_cancellation(wrapper.worker)
                     workers.append(wrapper.worker)
             self.runtime.cond.notify_all()
         cleanup_errors: list[BaseException] = []
@@ -1842,17 +2373,27 @@ class _TaskWorkerPool:
 
 
 class _GlobalSubprocessTaskRuntime:
-    def __init__(self) -> None:
-        self.max_workers = max(1, os.cpu_count() or 1)
-        self.executor = ThreadPoolExecutor(
-            max_workers=self.max_workers,
-            thread_name_prefix="vane-udf-subprocess-task",
-        )
+    def __init__(self, *, resource_limit: ResourceVector | None = None) -> None:
+        self.resource_limit = local_process_capacity() if resource_limit is None else resource_limit
+        self.execution_capacity = LocalExecutionCapacity(max_slots=None, resource_limit=self.resource_limit)
         self.cond = threading.Condition()
         self.pools: dict[str, _TaskWorkerPool] = {}
+        from vane.execution.local_query_coordinator import LocalQueryCoordinator
+
+        self.query_coordinator = LocalQueryCoordinator()
+        self.query_policies: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._retiring_workers: dict[_PooledTaskWorker, _TaskWorkerPool] = {}
         self.total_workers = 0
         self.closed = False
         self._close_finished = True
+
+    @property
+    def max_workers(self) -> int:
+        # Waiting transport owners keep their workers while yielding CPU.
+        # This bounds runnable processes; each pool separately bounds owners.
+        with self.cond:
+            minimum_cpu = min((pool.resources.cpu for pool in self.pools.values()), default=1.0)
+            return max(1, int(self.resource_limit.cpu / minimum_cpu))
 
     def acquire_pool(
         self,
@@ -1878,10 +2419,14 @@ class _GlobalSubprocessTaskRuntime:
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        worker_metrics: WorkerMetrics | None = None,
     ) -> Future[Any]:
         if self.closed:
             raise RuntimeError("global subprocess task runtime is closed")
-        return self.executor.submit(self._run_task, pool, fn, scope, debug_seq)
+        if worker_metrics is None:
+            return pool.executor.submit(self._run_task, pool, fn, scope, debug_seq)
+        return pool.executor.submit(self._run_task, pool, fn, scope, debug_seq, worker_metrics=worker_metrics)
 
     def _run_task(
         self,
@@ -1889,10 +2434,16 @@ class _GlobalSubprocessTaskRuntime:
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        worker_metrics: WorkerMetrics | None = None,
     ) -> Any | None:
         acquire_start = time.perf_counter()
         wrapper: _PooledTaskWorker | None = None
-        wrapper = pool.acquire_worker(scope)
+        wrapper = (
+            pool.acquire_worker(scope, worker_metrics=worker_metrics)
+            if worker_metrics is not None
+            else pool.acquire_worker(scope)
+        )
         acquire_s = time.perf_counter() - acquire_start
         assert wrapper is not None
         reusable = True
@@ -1937,7 +2488,7 @@ class _GlobalSubprocessTaskRuntime:
             raise
         return result
 
-    def _take_idle_worker_locked(self) -> _SingleSubprocessExecutor | None:
+    def _take_idle_worker_locked(self) -> tuple[_TaskWorkerPool, _PooledTaskWorker] | None:
         oldest_pool: _TaskWorkerPool | None = None
         oldest_idx = -1
         oldest_time: float | None = None
@@ -1950,44 +2501,46 @@ class _GlobalSubprocessTaskRuntime:
         if oldest_pool is None or oldest_idx < 0:
             return None
         wrapper = oldest_pool.idle.pop(oldest_idx)
-        oldest_pool.total = max(0, oldest_pool.total - 1)
-        self.total_workers = max(0, self.total_workers - 1)
-        return wrapper.worker
+        oldest_pool._retire_worker_locked(wrapper)
+        return oldest_pool, wrapper
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         with self.cond:
-            return {
+            stats = {
                 "max_workers": self.max_workers,
                 "total_workers": self.total_workers,
                 "pool_count": len(self.pools),
                 "idle_workers": sum(len(pool.idle) for pool in self.pools.values()),
                 "active_workers": sum(pool.active for pool in self.pools.values()),
+                "retiring_workers": len(self._retiring_workers),
+                "process_resources": self.execution_capacity.resource_snapshot(),
             }
+        stats["query_policies"] = [policy.snapshot() for policy in tuple(self.query_policies)]
+        return stats
 
     def close(self, *, kill: bool = False) -> None:
-        to_close: list[_SingleSubprocessExecutor] = []
+        to_close: list[tuple[_PooledTaskWorker, _TaskWorkerPool]] = []
         active_to_kill: list[_SingleSubprocessExecutor] = []
         pools_to_cancel: list[_TaskWorkerPool] = []
-        active_workers = 0
         with self.cond:
-            if self.closed:
-                while not getattr(self, "_close_finished", True):
-                    self.cond.wait()
+            while not self._close_finished:
+                self.cond.wait()
+            if self.closed and not self._retiring_workers:
                 return
             self.closed = True
             self._close_finished = False
             for pool in list(self.pools.values()):
                 pools_to_cancel.append(pool)
                 pool.closing = True
-                pool.kill_on_release = kill
+                pool.kill_on_release = pool.kill_on_release or kill
                 while pool.idle:
                     wrapper = pool.idle.pop()
-                    to_close.append(wrapper.worker)
+                    pool._retire_worker_locked(wrapper)
                 active_to_kill.extend(wrapper.worker for wrapper in pool._active_wrappers)
-                pool.total = pool.active
-                active_workers += pool.active
+            to_close.extend(self._retiring_workers.items())
+            for pool in self._retiring_workers.values():
+                pool.kill_on_release = pool.kill_on_release or kill
             self.pools.clear()
-            self.total_workers = active_workers
             self.cond.notify_all()
         try:
             cleanup_errors: list[BaseException] = []
@@ -2001,13 +2554,14 @@ class _GlobalSubprocessTaskRuntime:
                     pool.cancel_output_grants()
                 except BaseException as exc:
                     cleanup_errors.append(exc)
-            try:
-                self.executor.shutdown(wait=False, cancel_futures=True)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-            for worker in to_close:
+            for pool in pools_to_cancel:
                 try:
-                    worker.close(kill=kill)
+                    pool.executor.shutdown(wait=False, cancel_futures=True)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            for wrapper, pool in to_close:
+                try:
+                    pool._close_retiring_worker(wrapper, kill=kill)
                 except BaseException as exc:
                     cleanup_errors.append(exc)
             for worker in active_to_kill:
@@ -2034,6 +2588,12 @@ _GLOBAL_TASK_RUNTIME: _GlobalSubprocessTaskRuntime | None = None
 def _global_task_runtime() -> _GlobalSubprocessTaskRuntime:
     global _GLOBAL_TASK_RUNTIME
     with _GLOBAL_TASK_RUNTIME_LOCK:
+        if _GLOBAL_TASK_RUNTIME is not None and _GLOBAL_TASK_RUNTIME.closed:
+            with _GLOBAL_TASK_RUNTIME.cond:
+                if not _GLOBAL_TASK_RUNTIME._close_finished or _GLOBAL_TASK_RUNTIME._retiring_workers:
+                    raise LocalProcessCapacityError(
+                        "global subprocess task runtime still owns workers awaiting cleanup"
+                    )
         if _GLOBAL_TASK_RUNTIME is None or _GLOBAL_TASK_RUNTIME.closed:
             _GLOBAL_TASK_RUNTIME = _GlobalSubprocessTaskRuntime()
         return _GLOBAL_TASK_RUNTIME
@@ -2045,7 +2605,9 @@ def _shutdown_global_task_runtime() -> None:
     if runtime is None:
         return
     runtime.close(kill=True)
-    _GLOBAL_TASK_RUNTIME = None
+    with _GLOBAL_TASK_RUNTIME_LOCK:
+        if _GLOBAL_TASK_RUNTIME is runtime:
+            _GLOBAL_TASK_RUNTIME = None
 
 
 atexit.register(_shutdown_global_task_runtime)
@@ -2061,12 +2623,27 @@ class LocalSubprocessActorPool:
         *,
         name: str | None = None,
         session_config: Mapping[str, Any] | None = None,
+        startup_cancellation: ExecutionCancellationScope | None = None,
+        worker_metrics: WorkerMetrics | None = None,
+        _gpu_devices: tuple[str, ...] | None = None,
     ) -> None:
+        if worker_metrics is not None and not isinstance(worker_metrics, WorkerMetrics):
+            raise TypeError("worker_metrics must be WorkerMetrics")
+        self._worker_metrics = worker_metrics
+        self._owner_pid = os.getpid()
         self.payload = dict(payload)
         self.session_config = (
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
         self.pool_size = max(1, int(pool_size))
+        self._gpu_devices: tuple[str, ...] = ()
+        self._query_owned_gpu = _gpu_devices is None
+        if _gpu_devices is not None:
+            from vane.execution.udf_local_gpu import _device_ids
+
+            self._gpu_devices = _device_ids(_gpu_devices)
+            if len(self._gpu_devices) != self.pool_size or self.payload.get("gpus") != 1:
+                raise ValueError("GPU pool requires one device and one GPU per replica")
         self.name = str(name or "")
         self._closed = False
         self._shutdown_finished = True
@@ -2082,37 +2659,82 @@ class LocalSubprocessActorPool:
         self._replacement_cleanup_errors: list[BaseException] = []
         self._aborting_workers: set[tuple[int, int]] = set()
         pool_identity = self.name or str(id(self))
-        self.admission_slots = LocalExecutionSlotPool(
-            max_slots=self.pool_size,
-            execution_slot_prefix=f"subprocess_actor:{pool_identity}",
+        self.admission_slots = (
+            LocalGpuExecutionSlotPool(self._gpu_devices, execution_slot_prefix=f"subprocess_actor:{pool_identity}")
+            if self._gpu_devices
+            else LocalActorExecutionSlotPool(
+                self.pool_size,
+                execution_slot_prefix=f"subprocess_actor:{pool_identity}",
+            )
         )
+        self._actor_calls: list[deque[ExecutionCancellationScope]] = [deque() for _ in range(self.pool_size)]
+        self._prepared_calls: set[ExecutionCancellationScope] = set()
+        self._input_stream_ids = tuple(f"actor-input:{uuid.uuid4().hex}" for _ in range(self.pool_size))
         self._idle_workers: deque[tuple[int, int]] = deque()
         self._workers: list[_SingleSubprocessExecutor] = []
         self._cleanup_pending_workers: list[_SingleSubprocessExecutor] = []
         self._executor: ThreadPoolExecutor | None = None
         self._cleanup_pending_executor: ThreadPoolExecutor | None = None
+        self._resident_release: Callable[[], None] | None = None
+        self._gpu_reservation: GpuDeviceLease | None = None
         initializing_workers: dict[int, _SingleSubprocessExecutor] = {}
+        startup_lock = threading.Lock()
+        starting_worker: _SingleSubprocessExecutor | None = None
+
+        def cancel_startup() -> None:
+            with startup_lock:
+                if starting_worker is not None:
+                    starting_worker._cancel_startup()
+
+        unregister_startup = (
+            startup_cancellation.register_cancel_wakeup(cancel_startup) if startup_cancellation is not None else None
+        )
 
         def startup_observer_for(
             worker_idx: int,
         ) -> Callable[[_SingleSubprocessExecutor], None]:
             def observe_startup(executor: _SingleSubprocessExecutor) -> None:
+                nonlocal starting_worker
+                _bind_worker_metrics(executor, self._worker_metrics)
+                self._bind_worker_device(executor, worker_idx, 0)
                 initializing_workers[worker_idx] = executor
+                with startup_lock:
+                    starting_worker = executor
+                    if startup_cancellation is not None and startup_cancellation.is_set():
+                        executor._cancel_startup()
 
             return observe_startup
 
         try:
+            declared = udf_process_resources(payload).scale(self.pool_size)
+            if declared.gpu:
+                from vane.execution.local_gpu_devices import reserve_gpu_devices
+
+                if payload.get("gpus") != 1 or type(payload.get("gpus")) not in (int, float):
+                    raise ValueError("local GPU actors require exactly one GPU per replica")
+                self._gpu_reservation = reserve_gpu_devices(
+                    self.pool_size, self._gpu_devices or None, cancellation=startup_cancellation
+                )
+                self._gpu_devices = self._gpu_reservation.devices
+                self.admission_slots = LocalGpuExecutionSlotPool(
+                    self._gpu_devices, execution_slot_prefix=f"subprocess_actor:{pool_identity}"
+                )
+            self._resident_release = _global_task_runtime().execution_capacity.reserve_resident(
+                ResourceVector(cpu=declared.cpu, heap_bytes=declared.heap_bytes), startup_cancellation
+            )
             for worker_idx in range(self.pool_size):
                 worker = _SingleSubprocessExecutor(
                     self.payload,
-                    worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+                    worker_env=self._worker_env(worker_idx),
                     session_config=self.session_config,
                     startup_observer=startup_observer_for(worker_idx),
                 )
                 self._workers.append(worker)
                 initializing_workers.pop(worker_idx, None)
+                with startup_lock:
+                    starting_worker = None
             self._executor = ThreadPoolExecutor(
-                max_workers=self.pool_size,
+                max_workers=self.pool_size * self.admission_slots.prefetch_depth,
                 thread_name_prefix="vane-udf-subprocess-actor",
             )
         except BaseException as init_error:
@@ -2139,6 +2761,8 @@ class LocalSubprocessActorPool:
                 _append_subprocess_cleanup_error(cleanup_errors, close_error)
             self._cleanup_pending_workers = pending_workers
             self._workers = []
+            if not self.cleanup_pending():
+                self._release_resident_resources()
             if cleanup_errors:
                 details = _subprocess_cleanup_error_details(cleanup_errors)
                 raise _OwnedLocalSubprocessActorPoolsError(
@@ -2147,6 +2771,14 @@ class LocalSubprocessActorPool:
                     creation_error=getattr(init_error, "creation_error", init_error),
                 ) from init_error
             raise
+        finally:
+            # Unregistering alone cannot fence a callback copied by cancel().
+            # Only query-owned initialization uses this cancellation scope;
+            # resident model initialization remains owned by its registry.
+            with startup_lock:
+                starting_worker = None
+            if unregister_startup is not None:
+                unregister_startup()
         for worker_idx in range(self.pool_size):
             self._idle_workers.append((worker_idx, 0))
         _subprocess_debug_log(
@@ -2157,8 +2789,46 @@ class LocalSubprocessActorPool:
         with self._lock:
             return [getattr(worker._proc, "pid", None) for worker in self._workers]
 
+    def _worker_env(self, worker_idx: int) -> dict[str, str]:
+        environment = _worker_env_for_pool_index(self.payload, worker_idx, self.pool_size)
+        if getattr(self, "_gpu_devices", ()):
+            environment["CUDA_VISIBLE_DEVICES"] = self._gpu_devices[worker_idx]
+        return environment
+
+    def _bind_worker_device(self, worker: _SingleSubprocessExecutor, index: int, generation: int) -> None:
+        if getattr(self, "_gpu_devices", ()):
+            worker._local_gpu_assignment = (self._gpu_devices[index], index, generation)
+
+    def device_snapshot(self) -> list[dict[str, Any]]:
+        """Describe live and retained worker generations, without taking admission."""
+        with self._cond:
+            workers = {
+                id(worker): worker
+                for worker in (*self._workers, *self._replacing_executors.values(), *self._cleanup_pending_workers)
+            }
+            return [
+                {
+                    "device": assignment[0],
+                    "replica": assignment[1],
+                    "generation": assignment[2],
+                    "pid": getattr(worker._proc, "pid", None),
+                    "cleanup_finished": worker._cleanup_finished,
+                }
+                for worker in workers.values()
+                if (assignment := getattr(worker, "_local_gpu_assignment", None)) is not None
+            ]
+
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
         return self.admission_slots.create_authority()
+
+    def gpu_execution_snapshot(self) -> dict[str, Any]:
+        """Sample device execution separately from resident model ownership."""
+        slots = self.admission_slots
+        if not isinstance(slots, LocalGpuExecutionSlotPool):
+            return {}
+        snapshot = slots.snapshot()
+        snapshot["workers"] = self.device_snapshot()
+        return snapshot
 
     def first_proc(self) -> Any | None:
         with self._lock:
@@ -2176,13 +2846,38 @@ class LocalSubprocessActorPool:
         if self._terminal_error is not None:
             raise RuntimeError(f"local subprocess actor pool failed: {self._terminal_error}") from self._terminal_error
 
-    def _spawn_worker(self, worker_idx: int) -> _SingleSubprocessExecutor:
-        return _SingleSubprocessExecutor(
-            self.payload,
-            worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
-            session_config=self.session_config,
-            startup_observer=lambda executor: self._track_replacing_executor(worker_idx, executor),
+    def _spawn_worker(
+        self, worker_idx: int, *, startup_cancellation: ExecutionCancellationScope | None = None
+    ) -> _SingleSubprocessExecutor:
+        starting_worker: _SingleSubprocessExecutor | None = None
+        startup_lock = threading.Lock()
+
+        def cancel_startup() -> None:
+            with startup_lock:
+                if starting_worker is not None:
+                    starting_worker._cancel_startup()
+
+        def observe_startup(worker: _SingleSubprocessExecutor) -> None:
+            nonlocal starting_worker
+            self._track_replacing_executor(worker_idx, worker)
+            with startup_lock:
+                starting_worker = worker
+                if startup_cancellation is not None and startup_cancellation.is_set():
+                    worker._cancel_startup()
+
+        unregister = (
+            startup_cancellation.register_cancel_wakeup(cancel_startup) if startup_cancellation is not None else None
         )
+        try:
+            return _SingleSubprocessExecutor(
+                self.payload,
+                worker_env=self._worker_env(worker_idx),
+                session_config=self.session_config,
+                startup_observer=observe_startup,
+            )
+        finally:
+            if unregister is not None:
+                unregister()
 
     def _set_terminal_error(self, error: BaseException) -> None:
         should_close_admission = False
@@ -2199,8 +2894,11 @@ class LocalSubprocessActorPool:
         worker_idx: int,
         worker: _SingleSubprocessExecutor,
     ) -> None:
+        _bind_worker_metrics(worker, getattr(self, "_worker_metrics", None))
         cancel_startup = False
         with self._cond:
+            if getattr(self, "_gpu_devices", ()):
+                self._bind_worker_device(worker, worker_idx, self._worker_generations[worker_idx] + 1)
             replacing_executors = getattr(self, "_replacing_executors", None)
             if replacing_executors is None:
                 replacing_executors = {}
@@ -2309,6 +3007,8 @@ class LocalSubprocessActorPool:
         self,
         attempted_workers: list[_SingleSubprocessExecutor],
         pending_workers: list[_SingleSubprocessExecutor],
+        *,
+        detach_workers: bool = False,
     ) -> None:
         """Commit one close attempt without discarding owners published concurrently."""
 
@@ -2324,22 +3024,66 @@ class LocalSubprocessActorPool:
                 retained.append(worker)
                 retained_ids.add(id(worker))
             self._cleanup_pending_workers = retained
+            if detach_workers:
+                # GPU completion samples both collections under this lock.
+                # Publish failed cleanup owners before removing live owners.
+                self._workers = []
+                self._idle_workers.clear()
             self._cond.notify_all()
+        if isinstance(self.admission_slots, LocalGpuExecutionSlotPool):
+            self.admission_slots.retry_cleanup()
+
+    def _return_retired_worker(
+        self, worker_idx: int, worker_generation: int, worker: _SingleSubprocessExecutor
+    ) -> None:
+        with self._cond:
+            if (
+                not self._closed
+                and worker_idx < len(self._workers)
+                and self._worker_generations[worker_idx] == worker_generation
+                and self._workers[worker_idx] is worker
+            ):
+                # Acquisition checks is_reusable() and reconstructs this slot.
+                # Keep the closed worker as its owner until that handoff.
+                self._idle_workers.append((worker_idx, worker_generation))
+            self._cond.notify_all()
+
+    def _retire_worker(self, worker_idx: int, worker_generation: int, worker: _SingleSubprocessExecutor) -> None:
+        retired = False
+        try:
+            try:
+                worker.close(kill=True)
+            except BaseException as exc:
+                self._record_replacement_cleanup_error(worker_idx, "failed worker", exc)
+                return
+            retired = True
+        finally:
+            with self._cond:
+                self._replacing_workers.discard(worker_idx)
+                if retired:
+                    self._return_retired_worker(worker_idx, worker_generation, worker)
+                self._cond.notify_all()
 
     def _replace_worker(
         self,
         worker_idx: int,
         worker_generation: int,
         failed_worker: _SingleSubprocessExecutor,
+        *,
+        startup_cancellation: ExecutionCancellationScope | None = None,
     ) -> None:
+        return_retired = False
         try:
             try:
                 failed_worker.close(kill=True)
             except BaseException as exc:
                 self._record_replacement_cleanup_error(worker_idx, "failed worker", exc)
                 return
+            if startup_cancellation is not None and startup_cancellation.is_set():
+                return_retired = True
+                return
             try:
-                replacement = self._spawn_worker(worker_idx)
+                replacement = self._spawn_worker(worker_idx, startup_cancellation=startup_cancellation)
             except BaseException as exc:
                 with self._cond:
                     pool_closed = self._closed
@@ -2351,6 +3095,13 @@ class LocalSubprocessActorPool:
                     self._retain_cleanup_pending_worker(provisional_worker)
                 if pool_closed and (isinstance(exc, _SubprocessStartupCleanupError) or provisional_cleanup_pending):
                     self._record_replacement_cleanup_error(worker_idx, "replacement startup", exc)
+                elif (
+                    startup_cancellation is not None
+                    and startup_cancellation.is_set()
+                    and not isinstance(exc, _SubprocessStartupCleanupError)
+                    and not provisional_cleanup_pending
+                ):
+                    return_retired = True
                 elif not pool_closed:
                     self._set_terminal_error(
                         RuntimeError(f"failed to replace local subprocess actor {worker_idx}: {exc}")
@@ -2361,6 +3112,7 @@ class LocalSubprocessActorPool:
             with self._cond:
                 if (
                     self._closed
+                    or (startup_cancellation is not None and startup_cancellation.is_set())
                     or worker_idx >= len(self._workers)
                     or self._worker_generations[worker_idx] != worker_generation
                     or self._workers[worker_idx] is not failed_worker
@@ -2377,6 +3129,8 @@ class LocalSubprocessActorPool:
                 except BaseException as exc:
                     self._retain_cleanup_pending_worker(replacement)
                     self._record_replacement_cleanup_error(worker_idx, "replacement", exc)
+                else:
+                    return_retired = True
         finally:
             # Keep replacement ownership visible until a rejected replacement
             # has also finished closing. Shutdown uses this set as its join
@@ -2385,11 +3139,15 @@ class LocalSubprocessActorPool:
             with self._cond:
                 getattr(self, "_replacing_executors", {}).pop(worker_idx, None)
                 self._replacing_workers.discard(worker_idx)
+                if return_retired:
+                    self._return_retired_worker(worker_idx, worker_generation, failed_worker)
                 self._cond.notify_all()
 
     def _acquire_worker(
         self,
         scope: ExecutionCancellationScope,
+        *,
+        replica: int | None = None,
     ) -> tuple[int, int, _SingleSubprocessExecutor]:
         unregister = scope.register_cancel_wakeup(self._wake_waiters)
         try:
@@ -2399,7 +3157,14 @@ class LocalSubprocessActorPool:
                     scope.raise_if_cancelled("local subprocess actor acquisition")
                     self._raise_if_unavailable_locked()
                     while self._idle_workers:
-                        worker_idx, worker_generation = self._idle_workers.popleft()
+                        if replica is None:
+                            worker_idx, worker_generation = self._idle_workers.popleft()
+                        else:
+                            selected = next((w for w in self._idle_workers if w[0] == replica), None)
+                            if selected is None:
+                                break
+                            self._idle_workers.remove(selected)
+                            worker_idx, worker_generation = selected
                         if worker_idx >= len(self._workers):
                             continue
                         if self._worker_generations[worker_idx] != worker_generation:
@@ -2417,7 +3182,7 @@ class LocalSubprocessActorPool:
                         self._cond.wait()
                         continue
                 assert replacement is not None
-                self._replace_worker(*replacement)
+                self._replace_worker(*replacement, startup_cancellation=scope)
         finally:
             unregister()
 
@@ -2426,30 +3191,169 @@ class LocalSubprocessActorPool:
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        admission: AdmissionLease | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> Future[Any]:
         with self._lock:
             self._raise_if_unavailable_locked()
             executor = self._executor
         if executor is None:
             raise RuntimeError("local subprocess actor pool is closed")
-        return executor.submit(self._run, fn, scope, debug_seq)
+        execution = (
+            self.admission_slots.claim(admission)
+            if isinstance(self.admission_slots, LocalGpuExecutionSlotPool)
+            else None
+        )
+        with self._cond:
+            replica = (
+                execution.replica
+                if execution is not None
+                else int(admission.lease["actor_index"])
+                if admission is not None
+                else min(range(self.pool_size), key=lambda index: len(self._actor_calls[index]))
+            )
+            self._actor_calls[replica].append(scope)
+        try:
+            if execution is not None:
+                future = executor.submit(self._run_gpu, fn, scope, debug_seq, execution, input_preparation)
+            else:
+                future = executor.submit(
+                    self._run, fn, scope, debug_seq, actor_index=replica, input_preparation=input_preparation
+                )
+        except BaseException:
+            self._finish_actor_call(replica, scope)
+            if execution is not None:
+                execution.backend_finished()
+            raise
+
+        def completed(done: Future[Any]) -> None:
+            self._finish_actor_call(replica, scope)
+            if execution is not None and done.cancelled():
+                execution.backend_finished()
+
+        future.add_done_callback(completed)
+        return future
+
+    def _finish_actor_call(self, replica: int, scope: ExecutionCancellationScope) -> None:
+        with self._cond:
+            calls = self._actor_calls[replica]
+            if scope in calls:
+                calls.remove(scope)
+            self._prepared_calls.discard(scope)
+            self._cond.notify_all()
+
+    def _wait_actor_turn(self, replica: int, scope: ExecutionCancellationScope, *, preparing: bool = False) -> None:
+        unregister = scope.register_cancel_wakeup(self._wake_waiters)
+        try:
+            with self._cond:
+                while True:
+                    scope.raise_if_cancelled("local actor prefetch")
+                    self._raise_if_unavailable_locked()
+                    calls = self._actor_calls[replica]
+                    first = next((call for call in calls if not preparing or call not in self._prepared_calls), None)
+                    if first is scope:
+                        return
+                    self._cond.wait()
+        finally:
+            unregister()
+
+    def _run_gpu(
+        self,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
+        debug_seq: int,
+        execution: LocalGpuExecution,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
+    ) -> Any | None:
+        try:
+            return self._run(
+                fn,
+                scope,
+                debug_seq,
+                gpu_execution=execution,
+                actor_index=execution.replica,
+                input_preparation=input_preparation,
+            )
+        finally:
+            with self._cond:
+                workers = {
+                    id(worker): worker
+                    for worker in (*self._workers, *self._cleanup_pending_workers, *self._replacing_executors.values())
+                }
+                pending = tuple(
+                    worker
+                    for worker in workers.values()
+                    if execution.generation is not None
+                    and worker._local_gpu_assignment is not None
+                    and worker._local_gpu_assignment[1] == execution.replica
+                    and worker._cleanup_finished is not True
+                    # Use the pool's ownership state. A worker that dies after
+                    # returning to idle belongs to resident-model recovery, not
+                    # to the invocation that already finished using it.
+                    and (
+                        self._closed
+                        or self._terminal_error is not None
+                        or worker._local_gpu_assignment[1:] not in self._idle_workers
+                    )
+                )
+            execution.backend_finished(pending)
 
     def _run(
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        gpu_execution: LocalGpuExecution | None = None,
+        actor_index: int | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
+    ) -> Any | None:
+        result = None
+        try:
+            if actor_index is not None:
+                # Preparation has its own FIFO turn. Later prefetch threads
+                # cannot occupy the input budget before an earlier invocation.
+                self._wait_actor_turn(actor_index, scope, preparing=True)
+            with input_preparation(scope) if input_preparation is not None else nullcontext():
+                if actor_index is not None:
+                    with self._cond:
+                        self._prepared_calls.add(scope)
+                        self._cond.notify_all()
+                result = self._run_actor_call(
+                    fn, scope, debug_seq, gpu_execution=gpu_execution, actor_index=actor_index
+                )
+            scope.raise_if_cancelled("local subprocess actor result")
+            return result
+        except BaseException:
+            _release_local_ref_bundle_result(result)
+            raise
+        finally:
+            scope.finish()
+
+    def _run_actor_call(
+        self,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
+        debug_seq: int = 0,
+        *,
+        gpu_execution: LocalGpuExecution | None = None,
+        actor_index: int | None = None,
     ) -> Any | None:
         worker_idx: int | None = None
         worker_generation = 0
         worker: _SingleSubprocessExecutor | None = None
         worker_pid = None
         reusable = False
-        replace_worker = False
+        retire_worker = False
         result: Any | None = None
         result_ready = False
         try:
-            worker_idx, worker_generation, worker = self._acquire_worker(scope)
+            if actor_index is not None:
+                self._wait_actor_turn(actor_index, scope)
+            worker_idx, worker_generation, worker = self._acquire_worker(scope, replica=actor_index)
+            if gpu_execution is not None:
+                gpu_execution.start(worker)
             with self._lock:
                 active = self._active
             worker_pid = getattr(worker._proc, "pid", None)
@@ -2460,10 +3364,14 @@ class LocalSubprocessActorPool:
                     f"pool_size={self.pool_size} worker_pid={worker_pid}"
                 )
             scope.raise_if_cancelled("local subprocess actor task")
-            result = worker._run_in_execution_scope(scope, fn)
+            with gpu_execution.activity.activate() if gpu_execution is not None else nullcontext():
+                try:
+                    result = worker._run_in_execution_scope(scope, fn)
+                finally:
+                    if gpu_execution is not None:
+                        gpu_execution.activity.transition("completing")
             result_ready = True
         finally:
-            scope.finish()
             try:
                 active_after = 0
                 if worker_idx is not None and worker is not None:
@@ -2479,10 +3387,12 @@ class LocalSubprocessActorPool:
                             self._idle_workers.append((worker_idx, worker_generation))
                         elif not self._closed and worker_idx not in self._replacing_workers:
                             self._replacing_workers.add(worker_idx)
-                            replace_worker = True
+                            retire_worker = True
                         self._cond.notify_all()
-                    if replace_worker:
-                        self._replace_worker(worker_idx, worker_generation, worker)
+                    if retire_worker:
+                        # A cancelled invocation must finish after retiring its
+                        # worker, without waiting for another model to initialize.
+                        self._retire_worker(worker_idx, worker_generation, worker)
                 if _should_debug_submit(debug_seq):
                     _subprocess_debug_log(
                         "local_actor_pool_worker_finished "
@@ -2532,6 +3442,10 @@ class LocalSubprocessActorPool:
                 or getattr(self, "_cleanup_pending_executor", None) is not None
                 or self._replacing_workers
                 or getattr(self, "_replacing_executors", {})
+                or (
+                    isinstance(self.admission_slots, LocalGpuExecutionSlotPool)
+                    and self.admission_slots.cleanup_pending()
+                )
             )
 
     def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
@@ -2542,6 +3456,7 @@ class LocalSubprocessActorPool:
                     continue
                 worker_generation = self._worker_generations[worker_idx]
                 self._aborting_workers.add((worker_idx, worker_generation))
+                _record_worker_cancellation(self._workers[worker_idx])
                 workers.append(self._workers[worker_idx])
             self._cond.notify_all()
         cleanup_errors, _ = _close_subprocess_workers_concurrently(workers, kill=True)
@@ -2550,9 +3465,12 @@ class LocalSubprocessActorPool:
             raise RuntimeError(f"local subprocess actor abort failed: {details}") from cleanup_errors[0]
 
     def shutdown(self, *, kill: bool = False) -> None:
+        if os.getpid() != self._owner_pid:
+            return
         retry_workers: list[_SingleSubprocessExecutor] = []
         retry_executor: ThreadPoolExecutor | None = None
         retry_cleanup = False
+        release_residency = False
         with self._cond:
             if self._closed:
                 while not getattr(self, "_shutdown_finished", True):
@@ -2564,16 +3482,26 @@ class LocalSubprocessActorPool:
                     or retry_executor is not None
                     or self._replacing_workers
                     or getattr(self, "_replacing_executors", {})
+                    or (
+                        isinstance(self.admission_slots, LocalGpuExecutionSlotPool)
+                        and self.admission_slots.cleanup_pending()
+                    )
                 )
                 if not retry_cleanup:
-                    return
+                    release_residency = True
             else:
                 self._closed = True
-            self._shutdown_finished = False
-            if not retry_cleanup:
-                self._replacement_startup_cancel_requested = bool(kill)
-            active_scopes = [] if retry_cleanup else list(self._active_scopes.values())
-            self._cond.notify_all()
+            if not release_residency:
+                self._shutdown_finished = False
+                if not retry_cleanup:
+                    self._replacement_startup_cancel_requested = bool(kill)
+                active_scopes = [] if retry_cleanup else list(self._active_scopes.values())
+                self._cond.notify_all()
+        if release_residency:
+            # A completing callback may have been the only cleanup owner at
+            # the first shutdown. It can finish without another worker close.
+            self._release_resident_resources()
+            return
         try:
             cleanup_errors: list[BaseException] = []
             if retry_cleanup:
@@ -2695,11 +3623,9 @@ class LocalSubprocessActorPool:
             for error in forced_close_errors:
                 _append_subprocess_cleanup_error(cleanup_errors, error)
             pending_workers.extend(forced_pending_workers)
-            with self._cond:
-                self._workers = []
-                self._idle_workers.clear()
-                self._cond.notify_all()
-            self._replace_attempted_cleanup_workers(graceful_workers + forced_workers, pending_workers)
+            self._replace_attempted_cleanup_workers(
+                graceful_workers + forced_workers, pending_workers, detach_workers=True
+            )
             if self.cleanup_pending() and not cleanup_errors:
                 _append_subprocess_cleanup_error(
                     cleanup_errors,
@@ -2710,9 +3636,24 @@ class LocalSubprocessActorPool:
                 details = _subprocess_cleanup_error_details(cleanup_errors)
                 raise RuntimeError(f"local subprocess actor pool shutdown failed: {details}") from cleanup_errors[0]
         finally:
-            with self._cond:
-                self._shutdown_finished = True
-                self._cond.notify_all()
+            try:
+                if not self.cleanup_pending():
+                    self._release_resident_resources()
+            finally:
+                with self._cond:
+                    self._shutdown_finished = True
+                    self._cond.notify_all()
+
+    def _release_resident_resources(self) -> None:
+        with self._cond:
+            release, self._resident_release = self._resident_release, None
+            gpu_reservation, self._gpu_reservation = self._gpu_reservation, None
+        try:
+            if release is not None:
+                release()
+        finally:
+            if gpu_reservation is not None:
+                gpu_reservation.release()
 
     def __del__(self) -> None:
         try:
@@ -2722,18 +3663,7 @@ class LocalSubprocessActorPool:
 
 
 def _local_actor_pool_size_from_node(node: dict[str, Any], payload: dict[str, Any]) -> int:
-    for container, key in (
-        (payload, "actor_number"),
-        (payload, "udf_worker_slots"),
-        (node, "actor_pool_size"),
-    ):
-        value = container.get(key)
-        if value is None:
-            continue
-        parsed = int(value)
-        if parsed > 0:
-            return parsed
-    raise ValueError("subprocess_actor payload is missing actor_number/udf_worker_slots")
+    return _payload_positive_int(payload, "actor_number")
 
 
 def _local_actor_pool_size_from_pool(actor_pool: Any) -> int:
@@ -2778,7 +3708,16 @@ def _validate_local_actor_pool_contract(actor_pool: Any) -> int:
 def ensure_local_subprocess_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
-) -> tuple[list[LocalSubprocessActorPool], dict[str, Any]]:
+) -> tuple[
+    list[
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
+    ],
+    dict[str, Any],
+]:
     """Pre-create local subprocess actors and inject them into UDF nodes."""
     # Binding and fragment replay both require the planner's stable resource IDs.
     # Describe the plan before collecting the payloads used to create actors.
@@ -2786,7 +3725,9 @@ def ensure_local_subprocess_actor_pools_for_plan(
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_local_subprocess_actor_pools_for_nodes(
         udf_nodes,
+        resource_graph=lambda: plan.collect_local_resource_graph_metadata(conn=conn),
         plan_identity=id(plan),
+        session_id=plan.session_id() if hasattr(plan, "session_id") else None,
         set_handles=lambda actor_options_map: plan.set_udf_actor_handles(actor_options_map, conn=conn),
     )
 
@@ -2794,12 +3735,77 @@ def ensure_local_subprocess_actor_pools_for_plan(
 def ensure_local_subprocess_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
+    resource_graph: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None,
     plan_identity: Any = None,
+    session_id: str | None = None,
     set_handles: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[list[LocalSubprocessActorPool], dict[str, Any]]:
+    startup_cancellation: ExecutionCancellationScope | None = None,
+) -> tuple[
+    list[
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
+    ],
+    dict[str, Any],
+]:
     """Pre-create local subprocess actors for already-collected UDF nodes."""
-    created: list[LocalSubprocessActorPool] = []
+    created: list[
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | LocalQueryAdmission
+        | LocalQueryShmStore
+    ] = []
     actor_options_map: dict[str, Any] = {}
+    udf_nodes = list(udf_nodes)
+    task_resources = {
+        str(node["node_id"]): udf_process_resources(node["payload"])
+        for node in udf_nodes
+        if isinstance(node.get("payload"), dict)
+        and str(node["payload"].get("execution_backend") or "").strip().lower() == "subprocess_task"
+    }
+    if task_resources:
+        runtime = _global_task_runtime()
+        # Actor pools stay resident while the query runs. Validate the query's
+        # complete minimum before any constructor can consume node capacity.
+        actors: dict[Any, ResourceVector] = {}
+        for node in udf_nodes:
+            payload = node.get("payload") or {}
+            if (
+                not isinstance(payload, dict)
+                or str(payload.get("execution_backend") or "").strip().lower() != "subprocess_actor"
+            ):
+                continue
+            options = node.get("executor_options") or {}
+            model = options.get("local_model_pool")
+            existing = options.get("local_actor_pool")
+            if model is not None:
+                from vane.execution.udf_local_model import RegisteredLocalModel
+
+                if not isinstance(model, RegisteredLocalModel):
+                    raise TypeError("local_model_pool must be an explicitly registered local model")
+            identity = (
+                (id(model._registry), model.identity)
+                if model is not None
+                else id(existing)
+                if existing is not None
+                else str(node["node_id"])
+            )
+            declared = udf_process_resources(payload).scale(_local_actor_pool_size_from_node(node, payload))
+            actors[identity] = ResourceVector(cpu=declared.cpu, heap_bytes=declared.heap_bytes)
+        minimum = sum(actors.values(), ResourceVector()) + ResourceVector(
+            cpu=max(resources.cpu for resources in task_resources.values()),
+            heap_bytes=sum(resources.heap_bytes for resources in task_resources.values()),
+        )
+        if not minimum.fits_within(runtime.resource_limit):
+            raise ValueError("local query actor residency and task progress exceed the node CPU/heap resource capacity")
+        for resources in task_resources.values():
+            local_task_capacity(resources, runtime.resource_limit)
+        for node in udf_nodes:
+            if str(node["node_id"]) in task_resources and "local_task_progress" in (node.get("executor_options") or {}):
+                raise ValueError("UDF node already has a task progress binding")
 
     try:
         identity = id(udf_nodes) if plan_identity is None else plan_identity
@@ -2812,10 +3818,34 @@ def ensure_local_subprocess_actor_pools_for_nodes(
 
             node_id = str(node.get("node_id"))
             pool_size = _local_actor_pool_size_from_node(node, raw_payload)
-            if float(raw_payload.get("gpus") or 0.0) > 0.0:
-                raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
+            cancellation = (
+                startup_cancellation
+                if startup_cancellation is not None
+                else executor_options.get("local_request_cancellation")
+            )
+            if cancellation is not None:
+                if not isinstance(cancellation, ExecutionCancellationScope):
+                    raise TypeError("local_request_cancellation must be ExecutionCancellationScope")
+                cancellation.raise_if_cancelled("local actor preparation")
             session_config = _normalize_session_config_option(executor_options)
+            worker_metrics = executor_options.get("local_worker_metrics")
+            if worker_metrics is not None and not isinstance(worker_metrics, WorkerMetrics):
+                raise TypeError("local_worker_metrics must be WorkerMetrics")
+            registered_model = executor_options.get("local_model_pool")
+            if "local_model_token" in raw_payload and registered_model is None:
+                raise ValueError("registered local models require their owning configured local runtime")
+            if registered_model is not None:
+                from vane.execution.udf_local_model import RegisteredLocalModel
+
+                if not isinstance(registered_model, RegisteredLocalModel):
+                    raise TypeError("local_model_pool must be an explicitly registered local model")
+                registered_model.validate(raw_payload, pool_size, session_config, session_id=session_id)
+                borrow = registered_model.acquire()
+                created.append(borrow)
+                executor_options["local_actor_pool"] = borrow.pool
+                actor_options_map[node_id] = executor_options
+                continue
             existing_pool = executor_options.get("local_actor_pool")
             if existing_pool is not None:
                 existing_pool_size = _validate_local_actor_pool_contract(existing_pool)
@@ -2827,45 +3857,116 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 existing_session_config = getattr(existing_pool, "session_config", None)
                 if existing_session_config != session_config:
                     raise ValueError("pre-created local_actor_pool belongs to a different Vane session")
+                if float(raw_payload.get("gpus") or 0.0) > 0.0:
+                    from vane.execution.udf_local_gpu import validate_query_gpu_pool
+
+                    validate_query_gpu_pool(raw_payload, existing_pool, session_config)
                 actor_options_map[node_id] = executor_options
                 continue
             pool_name = f"local-subprocess-actor-{identity}-{node_id}"
             pool_kwargs: dict[str, Any] = {"name": pool_name}
             if session_config is not None:
                 pool_kwargs["session_config"] = session_config
+            if cancellation is not None:
+                pool_kwargs["startup_cancellation"] = cancellation
+            if worker_metrics is not None:
+                pool_kwargs["worker_metrics"] = worker_metrics
             pool = LocalSubprocessActorPool(raw_payload, pool_size, **pool_kwargs)
             created.append(pool)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("local actor preparation")
             executor_options["local_actor_pool"] = pool
             actor_options_map[node_id] = executor_options
 
+        if task_resources:
+            progress = runtime.execution_capacity.reserve_task_progress(task_resources)
+            created.append(progress)
+            for node in udf_nodes:
+                node_id = str(node["node_id"])
+                if node_id in task_resources:
+                    options = dict(node.get("executor_options") or {})
+                    options["local_task_progress"] = progress.bind(node_id)
+                    actor_options_map[node_id] = options
+        if udf_nodes:
+            from vane.execution.local_query_admission import (
+                LocalQueryAdmission,
+                LocalQueryAdmissionBinding,
+                build_local_admission_graph,
+            )
+            from vane.execution.query_resource_spec import QueryAllocation
+
+            payloads = {}
+            gpu_devices: set[str] = set()
+            for node in udf_nodes:
+                node_id = str(node["node_id"])
+                payload = dict(node["payload"])
+                if payload["execution_backend"] == "subprocess_actor":
+                    payload["actor_pool_size"] = _local_actor_pool_size_from_node(node, payload)
+                    pool = actor_options_map[node_id]["local_actor_pool"]
+                    if udf_process_resources(payload).gpu:
+                        gpu_devices.update(pool._gpu_devices)
+                payloads[node_id] = payload
+            metadata = resource_graph() if callable(resource_graph) else resource_graph
+            if metadata is None:
+                raise ValueError("local query admission requires native resource graph metadata")
+            graph, unit_ids = build_local_admission_graph(
+                metadata,
+                payloads,
+                query_id=uuid.uuid4().hex,
+                env=os.environ,
+            )
+            runtime = _global_task_runtime()
+            query_store = LocalQueryShmStore()
+            created.append(query_store)
+            fraction = float(os.environ.get("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5"))
+            heap_reserve = int(os.environ.get("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE", "0"))
+            if not math.isfinite(fraction) or not 0 < fraction <= 1:
+                raise ValueError("VANE_QUERY_OBJECT_STORE_FRACTION must be in (0, 1]")
+            if heap_reserve < 0:
+                raise ValueError("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE must be nonnegative")
+            policy = LocalQueryAdmission(
+                graph,
+                QueryAllocation(
+                    resources=ResourceVector(
+                        cpu=runtime.resource_limit.cpu,
+                        heap_bytes=max(0, runtime.resource_limit.heap_bytes - heap_reserve),
+                        gpu=len(gpu_devices),
+                        object_store_bytes=math.floor(query_store.store.capacity * fraction),
+                    ),
+                    generation=1,
+                ),
+                coordinator=runtime.query_coordinator,
+                gpu_devices=tuple(sorted(gpu_devices)),
+            )
+            # Close execution/input owners before the query policy on teardown.
+            created.insert(0, policy)
+            runtime.query_policies.add(policy)
+            for node in udf_nodes:
+                node_id = str(node["node_id"])
+                options = actor_options_map.setdefault(node_id, dict(node.get("executor_options") or {}))
+                if "local_query_admission" in options:
+                    raise ValueError("UDF node already has a query resource policy")
+                options["local_query_admission"] = LocalQueryAdmissionBinding(policy, unit_ids[node_id])
+                options["local_transport_input_target_bytes"] = query_store.store.capacity // 2
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
     except BaseException as creation_error:
-        for pool in getattr(creation_error, "owned_actor_pools", ()):
-            if all(existing is not pool for existing in created):
-                created.append(pool)
         cleanup_errors: list[BaseException] = []
-        remaining_owned: list[LocalSubprocessActorPool] = []
-        for pool in reversed(created):
-            try:
-                pool.shutdown(kill=True)
-            except BaseException as cleanup_error:
-                _append_subprocess_cleanup_error(cleanup_errors, cleanup_error)
-                cleanup_pending = getattr(pool, "cleanup_pending", None)
-                try:
-                    if not callable(cleanup_pending) or cleanup_pending():
-                        remaining_owned.append(pool)
-                except BaseException as status_error:
-                    _append_subprocess_cleanup_error(cleanup_errors, status_error)
-                    remaining_owned.append(pool)
+        remaining_owned = rollback_actor_pools(
+            created,
+            creation_error,
+            shutdown=lambda pool: pool.shutdown(kill=True),
+            cleanup_pending=actor_pool_cleanup_pending,
+            record_error=lambda error: _append_subprocess_cleanup_error(cleanup_errors, error),
+        )
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
             raise _OwnedLocalSubprocessActorPoolsError(
                 f"local subprocess actor pool rollback failed: {details}",
-                owned_actor_pools=list(reversed(remaining_owned)),
+                owned_actor_pools=remaining_owned,
                 creation_error=getattr(creation_error, "creation_error", creation_error),
             ) from creation_error
-        if isinstance(creation_error, _OwnedLocalSubprocessActorPoolsError):
+        if isinstance(creation_error, OwnedActorPoolsError):
             raise creation_error.creation_error
         raise
 
@@ -2878,15 +3979,52 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     def __init__(self, payload: dict[str, Any], options: dict[str, Any] | None = None) -> None:
         options = dict(options or {})
         session_config = _normalize_session_config_option(options)
+        self._worker_metrics = options.get("local_worker_metrics")
+        if self._worker_metrics is not None and not isinstance(self._worker_metrics, WorkerMetrics):
+            raise TypeError("local_worker_metrics must be WorkerMetrics")
+        self._resource_unit = options.get("local_resource_unit")
+        if self._resource_unit is not None:
+            if not isinstance(self._resource_unit, LocalResourceUnitContext):
+                raise TypeError("local_resource_unit must be LocalResourceUnitContext")
+            if self._resource_unit.backend != payload.get("execution_backend"):
+                raise ValueError("local resource unit backend does not match the UDF")
+        self._unit_activity = options.get("local_resource_activity")
+        if self._unit_activity is not None:
+            if not isinstance(self._unit_activity, UnitResourceActivity):
+                raise TypeError("local_resource_activity must be UnitResourceActivity")
+            if self._resource_unit is None or self._unit_activity.identity != self._resource_unit.to_dict():
+                raise ValueError("local resource activity requires its matching resource unit")
+        self._query_policy_authority: LocalQueryAdmissionAuthority | None = None
+        self._data_scope = options.get("local_data_scope")
+        if self._data_scope is not None and not isinstance(self._data_scope, QueryDataScope):
+            raise TypeError("local_data_scope must be QueryDataScope")
+        self._input_cleanup = options.get("local_input_cleanup")
+        if self._input_cleanup is not None and not isinstance(self._input_cleanup, QueryInputCleanup):
+            raise TypeError("local_input_cleanup must be QueryInputCleanup")
+        self._executor_cleanup = options.get("local_executor_cleanup")
+        if self._executor_cleanup is not None and not isinstance(self._executor_cleanup, QueryExecutorCleanup):
+            raise TypeError("local_executor_cleanup must be QueryExecutorCleanup")
+        self._request_cancellation = options.get("local_request_cancellation")
+        if self._request_cancellation is not None and not isinstance(
+            self._request_cancellation, ExecutionCancellationScope
+        ):
+            raise TypeError("local_request_cancellation must be ExecutionCancellationScope")
+        self._request_cancel_unregister: Callable[[], None] | None = None
         self._subprocess_mode = _payload_subprocess_mode(payload)
-        self._pool_size = _payload_subprocess_pool_size(payload, self._subprocess_mode)
+        self._pool_size = (
+            _payload_positive_int(payload, "actor_number")
+            if self._subprocess_mode == "actor"
+            else local_task_capacity(udf_process_resources(payload), _global_task_runtime().resource_limit)
+        )
         _subprocess_debug_log(
             "executor_init "
             f"mode={self._subprocess_mode} backend={payload.get('execution_backend')!r} "
-            f"pool_size={self._pool_size} payload_udf_worker_slots={payload.get('udf_worker_slots')!r} "
+            f"pool_size={self._pool_size} "
             f"actor_number={payload.get('actor_number')!r}"
         )
         self._closed = False
+        self._cleanup_finished = False
+        self._close_cleanup_pending = False
         self._finished_submitting = False
         self._wakeup: Callable[[], None] | None = None
         self._workers: list[_SingleSubprocessExecutor] = []
@@ -2910,14 +4048,15 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._debug_submit_count = 0
         self._queue: deque[Any] = deque()
         self._result_admissions: deque[AdmissionLease | None] = deque()
+        self._result_streams: deque[LocalStreamAdapter | None] = deque()
+        self._result_reads: deque[LocalOutputRead | None] = deque()
+        self._output_reads: dict[int, LocalOutputRead] = {}
         self._queue_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
-        self._output_row_budget_bytes = _payload_output_row_budget_bytes(payload)
-        self._learned_output_budget_bytes = 0
-        self._last_output_budget_estimate_bytes = 0
-        self._output_budget_lock = threading.Lock()
+        if self._data_scope is not None and self._data_scope.limits is not None and not self._ref_bundle_output:
+            raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
         self._active_input_leases: set[int] = set()
         self._active_input_leases_lock = threading.Lock()
         self._budget_wakeup_unregister: Callable[[], None] | None = None
@@ -2934,7 +4073,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     self._pool_size,
                     session_config=session_config,
                 )
-                self._initialize_admission(self._task_pool.create_admission_authority())
+                progress = options.get("local_task_progress")
+                if progress is not None and not isinstance(progress, LocalTaskProgressBinding):
+                    raise TypeError("local_task_progress must be LocalTaskProgressBinding")
+                self._initialize_local_admission(self._task_pool.create_admission_authority(progress), options)
                 with self._task_runtime.cond:
                     task_pool_ref_count = self._task_pool.ref_count
                     task_pool_capacity = self._task_pool.pool_size
@@ -2943,6 +4085,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     f"pool_size={self._task_pool.pool_size} ref_count={task_pool_ref_count} "
                     f"capacity={task_pool_capacity} runtime_max_workers={self._task_runtime.max_workers}"
                 )
+                self._bind_request_lifetime()
                 return
 
             if options.get("local_actor_pool_name") is not None or payload.get("local_actor_pool_name") is not None:
@@ -2960,12 +4103,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             worker_pids = actor_pool.worker_pids()
             self._actor_pool = actor_pool
             self._pool_size = actor_pool_size
-            self._initialize_admission(actor_pool.create_admission_authority())
+            self._initialize_local_admission(actor_pool.create_admission_authority(), options)
             _subprocess_debug_log(
                 "local_actor_pool_attached "
                 f"name={getattr(actor_pool, 'name', '')!r} pool_size={self._pool_size} "
                 f"worker_pids={worker_pids}"
             )
+            self._bind_request_lifetime()
             return
         except BaseException as init_error:
             try:
@@ -2977,6 +4121,89 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 ) from init_error
             raise
 
+    def _initialize_local_admission(self, authority: LocalSlotAdmissionAuthority, options: dict[str, Any]) -> None:
+        from vane.execution.udf_runtime_admission import QueryTaskAdmission
+
+        # Install the backend owner first so failed wrapping uses normal executor
+        # cleanup, including task-pool reference release during initialization.
+        self._initialize_admission(authority)
+        query = options.get("local_task_admission")
+        if query is not None:
+            if not isinstance(query, QueryTaskAdmission):
+                raise TypeError("local_task_admission must be QueryTaskAdmission")
+        if self._data_scope is not None and self._data_scope.limits is not None and self._data_scope.limits.wait:
+            if self._resource_unit is None or not isinstance(authority, LocalSlotAdmissionAuthority):
+                raise ValueError("byte waiting requires a bound local UDF and local slot admission capacity")
+            self._initialize_admission(
+                WaitingDataAdmissionAuthority(
+                    authority,
+                    self._data_scope,
+                    task_query=query,
+                    resource_unit=self._resource_unit,
+                    activity=self._unit_activity,
+                )
+            )
+        elif query is not None:
+            self._initialize_admission(query.create_authority(authority))
+        policy = options.get("local_query_admission")
+        if policy is not None:
+            from vane.execution.local_query_admission import LocalQueryAdmissionBinding
+
+            if not isinstance(policy, LocalQueryAdmissionBinding):
+                raise TypeError("local_query_admission must be LocalQueryAdmissionBinding")
+            self._query_policy_authority = policy.query.create_authority(
+                policy.unit_id, self._admission_authority, authority
+            )
+            self._initialize_admission(self._query_policy_authority)
+        if (
+            self._data_scope is not None
+            and self._data_scope.limits is not None
+            and self._data_scope.limits.wait is None
+        ):
+            self._initialize_admission(
+                DataAdmissionAuthority(
+                    self._admission_authority,
+                    self._data_scope,
+                    resource_unit=self._resource_unit,
+                    activity=self._unit_activity,
+                )
+            )
+        if self._unit_activity is not None:
+            self._unit_activity.bind_admission(self._admission_authority)
+        gpu_slots = getattr(self._actor_pool, "admission_slots", None)
+        if isinstance(gpu_slots, LocalGpuExecutionSlotPool):
+            gpu_slots.admission_activity.bind_admission(self._admission_authority, replacing=authority)
+
+    def _bind_request_lifetime(self) -> None:
+        if self._executor_cleanup is not None:
+            self._executor_cleanup.hold(self)
+        if self._request_cancellation is not None:
+            self._request_cancel_unregister = self._request_cancellation.register_cancel_wakeup(self._cancel_request)
+
+    def _check_request_cancellation(self) -> None:
+        cancellation = getattr(self, "_request_cancellation", None)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("local request UDF")
+
+    def request_task_admission(self, retained_input_bytes: int) -> bool:
+        self._check_request_cancellation()
+        return super().request_task_admission(retained_input_bytes)
+
+    def task_admission_state(self) -> dict[str, Any]:
+        # A closed, empty authority has no ready transition to wake a blocked
+        # native pipeline. Publish the cancellation as this executor's error.
+        self._check_request_cancellation()
+        return super().task_admission_state()
+
+    def _cancel_request(self) -> None:
+        # Close this executor, including buffered result admission leases. Native
+        # interruption may bypass result consumption. Pool abort still targets
+        # only this executor's scopes and never closes another borrower's pool.
+        try:
+            self.close(kill=True)
+        finally:
+            self._notify_wakeup()
+
     @property
     def _proc(self) -> Any | None:
         if self._actor_pool is not None:
@@ -2985,56 +4212,52 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return None
         return self._workers[0]._proc
 
-    def _enqueue_result(self, item: Any | None) -> None:
-        if item is not None:
-            with self._queue_lock:
-                self._queue.append(item)
-        self._notify_wakeup()
-
     @staticmethod
     def _submit_result_item(submit_id: int | None, result: Any | None) -> Any:
         if submit_id is not None:
             return (SUBMIT_RESULT_MARKER, int(submit_id), result)
         return result if result is not None else (None, True)
 
-    def _output_budget_estimate(self, num_rows: int | None) -> int:
-        if not self._ref_bundle_output:
-            return 0
-        schema_estimate = _estimate_output_budget_from_rows(self._output_row_budget_bytes, num_rows)
-        with self._output_budget_lock:
-            learned_estimate = self._learned_output_budget_bytes
-            estimate = max(schema_estimate, learned_estimate)
-            if estimate > 0:
-                self._last_output_budget_estimate_bytes = int(estimate)
-        return estimate
+    def _buffer_output_read_locked(self, result: Any, admission: AdmissionLease | None) -> LocalOutputRead:
+        output_read = LocalOutputRead()
+        self._output_reads[id(output_read)] = output_read
+        try:
+            output_read.buffer(result, admission)
+        except BaseException as error:
+            try:
+                self._close_output_read_locked(output_read)
+            except BaseException as cleanup_error:
+                message = (
+                    f"{_bounded_close_error(error)}; UDF output cleanup failed: {_bounded_close_error(cleanup_error)}"
+                )
+                raise capture_cleanup(message, error, cleanup_error) from error
+            raise
+        return output_read
 
-    def _record_output_budget_result(self, result: Any | None) -> None:
-        if not self._ref_bundle_output or result is None:
-            return
-        size = estimate_local_shm_ref_bundle_ipc_size(result)
-        if size <= 0:
-            return
-        with self._output_budget_lock:
-            self._learned_output_budget_bytes = max(self._learned_output_budget_bytes, int(size))
-            self._last_output_budget_estimate_bytes = max(self._last_output_budget_estimate_bytes, int(size))
+    def _close_output_read_locked(self, output_read: LocalOutputRead) -> None:
+        output_read.close()
+        self._output_reads.pop(id(output_read), None)
+
+    def _publish_stream_result(self, submit_id: int | None, result: Any) -> None:
+        transition_local_shm_output(result, "unit_queue")
+        item = (SUBMIT_RESULT_MARKER, int(submit_id), result, False) if submit_id is not None else (result, False)
+        with self._queue_lock:
+            if self._closed:
+                raise ExecutionCancelledError("UDF output stream executor closed")
+            output_read = self._buffer_output_read_locked(result, _active_local_admission.get())
+            self._queue.append(item)
+            self._result_reads.append(output_read)
+            # A block transfers data ownership only. Backend completion
+            # independently releases execution capacity.
+            self._result_admissions.append(None)
+            self._result_streams.append(_active_local_stream.get())
+        self._notify_wakeup()
 
     def _output_budget_stats(self) -> dict[str, int]:
         if not self._ref_bundle_output:
             return {}
-        with self._output_budget_lock:
-            estimated_bytes = max(0, int(self._last_output_budget_estimate_bytes))
-        with self._pending_lock:
-            pending_batches = max(0, int(self._pending_batches))
-        projected_output_bytes = pending_batches * estimated_bytes
         budget_snapshot = local_shm_ref_budget_snapshot()
         return {
-            "udf_output_budget_available": int(
-                can_admit_local_shm_ref_output_submit(
-                    estimated_bytes,
-                    projected_output_bytes=projected_output_bytes,
-                )
-            ),
-            "udf_output_budget_estimated_bytes": estimated_bytes,
             "udf_output_budget_limit_bytes": int(budget_snapshot.get("limit_bytes", 0)),
             "udf_output_budget_usage_bytes": int(budget_snapshot.get("usage_bytes", 0)),
             "udf_output_budget_reserved_bytes": int(budget_snapshot.get("reserved_bytes", 0)),
@@ -3042,11 +4265,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             "udf_local_shm_budget_limit_bytes": int(budget_snapshot.get("limit_bytes", 0)),
             "udf_local_shm_allocated_bytes": int(budget_snapshot.get("allocated_bytes", 0)),
             "udf_local_shm_output_grant_bytes": int(budget_snapshot.get("output_grant_bytes", 0)),
-            "udf_local_shm_output_credit_bytes": int(budget_snapshot.get("output_credit_bytes", 0)),
             "udf_local_shm_input_lease_bytes": int(budget_snapshot.get("input_lease_bytes", 0)),
             "udf_local_shm_available_bytes": int(budget_snapshot.get("available_bytes", 0)),
             "udf_local_shm_active_input_leases": int(budget_snapshot.get("active_input_leases", 0)),
-            "udf_local_shm_active_output_credits": int(budget_snapshot.get("active_output_credits", 0)),
             "udf_local_shm_waiting_output_grants": int(budget_snapshot.get("waiting_output_grants", 0)),
             "udf_local_shm_input_consumed_count": int(budget_snapshot.get("input_consumed_count", 0)),
             "udf_local_shm_refs_released_by_input_ack": int(budget_snapshot.get("refs_released_by_input_ack", 0)),
@@ -3061,6 +4282,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         submit_start: float,
         admission: AdmissionLease | None,
         scope: ExecutionCancellationScope,
+        task_scope: TaskDataScope | TaskInputCleanup | None = None,
+        unit_task: UnitTaskActivity | None = None,
     ) -> None:
         with self._task_futures_lock:
             self._task_futures.add(future)
@@ -3073,12 +4296,43 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             )
 
         def complete_task(done: Future[Any], submit_id: int | None = submit_id) -> None:
-            self._complete_task_submit(submit_id, done)
+            if unit_task is not None:
+                unit_task.transition("completing")
+            cleanup_error = None
+            try:
+                if task_scope is not None:
+                    task_scope.finish()
+            except BaseException as exc:
+                cleanup_error = exc
+            finally:
+                # Cleanup failures belong to this result. Publishing them via
+                # wakeup state can bypass result consumption and strand the
+                # buffered result's slot in a cached task pool.
+                try:
+                    self._complete_task_submit(submit_id, done, cleanup_error=cleanup_error)
+                finally:
+                    try:
+                        if unit_task is not None:
+                            unit_task.finish()
+                    finally:
+                        # Future.done() only covers backend execution. Retain
+                        # this owner through input, admission, scope and activity
+                        # cleanup before allowing close() to release its pool.
+                        with self._pending_lock:
+                            self._pending_batches = max(0, self._pending_batches - 1)
+                        with self._task_futures_cv:
+                            self._task_futures.discard(done)
+                            self._task_future_meta.pop(done, None)
+                            self._task_futures_cv.notify_all()
+                        self._notify_wakeup()
 
         future.add_done_callback(complete_task)
 
     def _new_execution_scope(self) -> ExecutionCancellationScope:
         with self._execution_scopes_lock:
+            cancellation = getattr(self, "_request_cancellation", None)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("UDF submission")
             if self._closed:
                 raise RuntimeError("UDF subprocess executor is closed")
             self._execution_scope_generation += 1
@@ -3141,6 +4395,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._active_input_leases.add(int(lease_id))
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.discard(int(lease_id))
 
@@ -3150,7 +4406,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id in lease_ids:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -3159,9 +4416,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF input lease cancellation failed: {details}") from cleanup_errors[0]
 
-    def _complete_task_submit(self, submit_id: int | None, future: Future[Any]) -> None:
+    def _complete_task_submit(
+        self, submit_id: int | None, future: Future[Any], *, cleanup_error: BaseException | None = None
+    ) -> None:
         item: Any | None = None
         result: Any | None = None
+        error: BaseException | None = None
         debug_meta: (
             tuple[
                 int | None,
@@ -3174,20 +4434,43 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         ) = None
         admission: AdmissionLease | None = None
         scope: ExecutionCancellationScope | None = None
+        output_read: LocalOutputRead | None = None
+        with self._task_futures_lock:
+            debug_meta = self._task_future_meta.get(future)
+        if debug_meta is not None:
+            debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
         try:
             result = future.result()
-            self._record_output_budget_result(result)
-            item = self._submit_result_item(submit_id, result)
+            if cleanup_error is not None:
+                raise cleanup_error
+            transition_local_shm_output(result, "unit_queue")
+            if result is not None:
+                with self._queue_lock:
+                    if not self._closed:
+                        output_read = self._buffer_output_read_locked(result, admission)
         except BaseException as exc:
-            _release_local_ref_bundle_result(result)
-            result = None
-            diagnostic = native_result_error(exc)
-            item = (SUBMIT_RESULT_MARKER, int(submit_id), diagnostic) if submit_id is not None else diagnostic
+            error = exc
+            if cleanup_error is not None and cleanup_error is not exc:
+                message = (
+                    f"{_bounded_close_error(error)}; UDF input cleanup failed: {_bounded_close_error(cleanup_error)}"
+                )
+                error = capture_cleanup(message, error, cleanup_error)
         finally:
-            with self._task_futures_lock:
-                debug_meta = self._task_future_meta.get(future)
             if debug_meta is not None:
-                debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
+                if isinstance(admission, AdmissionLease):
+                    try:
+                        # The future includes backend cleanup. Output leases
+                        # independently retain buffered and zero-copy results.
+                        admission.complete_execution()
+                    except BaseException as exc:
+                        # Reservation cleanup is part of this task's result,
+                        # just like task_scope.finish(). Poisoning wakeups can
+                        # skip result consumption and strand its pool slot.
+                        if error is None:
+                            error = exc
+                        else:
+                            message = f"{_bounded_close_error(error)}; UDF execution cleanup failed: {_bounded_close_error(exc)}"
+                            error = capture_cleanup(message, error, exc)
                 try:
                     if _should_debug_submit(debug_seq):
                         _subprocess_debug_log(
@@ -3197,38 +4480,151 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         )
                 except BaseException as exc:
                     self._record_wakeup_error(exc)
-            if item is not None:
-                with self._queue_lock:
-                    if self._closed:
-                        _release_local_ref_bundle_result(result)
-                        if admission is not None:
-                            try:
-                                admission.release()
-                            except BaseException as exc:
+            with self._queue_lock:
+                if error is not None or self._closed:
+                    if output_read is not None:
+                        try:
+                            self._close_output_read_locked(output_read)
+                        except BaseException as exc:
+                            # The executor retains this owner for close/retry.
+                            # Cleanup must not skip completion bookkeeping or
+                            # replace the producer's error.
+                            if error is not None:
+                                message = f"{_bounded_close_error(error)}; UDF output cleanup failed: {_bounded_close_error(exc)}"
+                                error = capture_cleanup(message, error, exc)
+                            else:
                                 self._record_wakeup_error(exc)
-                    else:
-                        self._queue.append(item)
-                        self._result_admissions.append(admission)
-            elif admission is not None:
-                try:
-                    admission.release()
-                except BaseException as exc:
-                    self._record_wakeup_error(exc)
-            with self._pending_lock:
-                self._pending_batches = max(0, self._pending_batches - 1)
-            with self._task_futures_cv:
-                self._task_futures.discard(future)
-                self._task_future_meta.pop(future, None)
-                self._task_futures_cv.notify_all()
+                        output_read = None
+                    _release_local_ref_bundle_result(result)
+                    result = None
+                if self._closed:
+                    if admission is not None:
+                        try:
+                            admission.release()
+                        except BaseException as exc:
+                            self._record_wakeup_error(exc)
+                else:
+                    item = self._submit_result_item(
+                        submit_id, native_result_error(error) if error is not None else result
+                    )
+                    self._queue.append(item)
+                    self._result_reads.append(output_read)
+                    self._result_admissions.append(admission)
+                    self._result_streams.append(None)
             if scope is not None:
                 self._retire_execution_scope(scope)
-            self._notify_wakeup()
 
     def _submit_async(
         self,
         submit_id: int | None,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         admission: AdmissionLease | None = None,
+        *,
+        input_data: Any = (),
+        input_metadata: Any = None,
+        prepare_inputs: Callable[[], None] | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
+    ) -> None:
+        activity = getattr(self, "_unit_activity", None)
+        unit_task = activity.open_task() if activity is not None else None
+        try:
+            with unit_task.activate() if unit_task is not None else nullcontext():
+                self._submit_async_impl(
+                    submit_id,
+                    fn,
+                    admission,
+                    input_data=input_data,
+                    input_metadata=input_metadata,
+                    prepare_inputs=prepare_inputs,
+                    input_preparation=input_preparation,
+                    unit_task=unit_task,
+                )
+        except BaseException:
+            if unit_task is not None:
+                unit_task.finish()
+            raise
+
+    def _submit_async_impl(
+        self,
+        submit_id: int | None,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        admission: AdmissionLease | None = None,
+        *,
+        input_data: Any = (),
+        input_metadata: Any = None,
+        prepare_inputs: Callable[[], None] | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
+        unit_task: UnitTaskActivity | None = None,
+    ) -> None:
+        query = getattr(self, "_data_scope", None)
+        input_cleanup = getattr(self, "_input_cleanup", None)
+        if query is None and input_cleanup is None:
+            try:
+                if prepare_inputs is not None:
+                    prepare_inputs()
+            except BaseException as preparation_error:
+                if admission is not None:
+                    try:
+                        admission.release()
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            f"UDF input preparation failed: {preparation_error}; "
+                            f"admission cleanup failed: {cleanup_error}"
+                        ) from preparation_error
+                raise
+            # Scheduling owns its admission/scope rollback, including errors
+            # from that rollback. Do not retry it and hide the submit failure.
+            self._schedule_async(submit_id, fn, admission, unit_task=unit_task, input_preparation=input_preparation)
+            return
+        task: TaskDataScope | TaskInputCleanup | None = None
+        try:
+            if query is not None:
+                reservation = admission.lease.get("local_data_reservation") if admission is not None else None
+                data_task: TaskDataScope = query.open_task(
+                    reservation, resource_unit=getattr(self, "_resource_unit", None)
+                )
+                task = data_task
+                track_local_shm_inputs(data_task, input_data, input_metadata)
+            else:
+                assert input_cleanup is not None
+                task = input_cleanup.open_task()
+            assert task is not None
+            if prepare_inputs is not None:
+                with task.activate():
+                    prepare_inputs()
+
+            def run(worker: _SingleSubprocessExecutor) -> Any | None:
+                assert task is not None
+                # Context belongs to this invocation, never the reusable worker.
+                with task.activate():
+                    return fn(worker)
+
+            self._schedule_async(
+                submit_id, run, admission, task_scope=task, unit_task=unit_task, input_preparation=input_preparation
+            )
+        except BaseException as submit_error:
+            try:
+                try:
+                    if task is not None:
+                        task.finish()
+                finally:
+                    if admission is not None:
+                        admission.release()
+            except BaseException as cleanup_error:
+                # Roll back both owners without replacing the reason submission
+                # failed. A failed input release stays owned by the query scope.
+                raise submit_error from cleanup_error
+            raise
+
+    def _schedule_async(
+        self,
+        submit_id: int | None,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        admission: AdmissionLease | None = None,
+        *,
+        task_scope: TaskDataScope | TaskInputCleanup | None = None,
+        unit_task: UnitTaskActivity | None = None,
+        input_preparation: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = None,
     ) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
         if lifecycle_lock is None:
@@ -3249,6 +4645,67 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     admission.release()
                 raise
 
+            if admission is not None:
+                submit_fn = fn
+
+                def run_admitted(worker: _SingleSubprocessExecutor) -> Any | None:
+                    token = _active_local_admission.set(admission)
+                    try:
+                        return submit_fn(worker)
+                    finally:
+                        _active_local_admission.reset(token)
+
+                fn = run_admitted
+
+            output_fn = fn
+
+            def run_streaming(worker: _SingleSubprocessExecutor) -> Any | None:
+                stream = LocalStreamAdapter()
+                stream_token = _active_local_stream.set(stream)
+
+                def publish(result: Any) -> None:
+                    self._publish_stream_result(submit_id, result)
+
+                token = _active_local_output.set(publish)
+                try:
+                    result = output_fn(worker)
+                    return result
+                finally:
+                    _active_local_output.reset(token)
+                    _active_local_stream.reset(stream_token)
+                    stream.close()
+
+            fn = run_streaming
+
+            if unit_task is not None:
+                unit_task.transition("submitted")
+                observed_fn = fn
+
+                def run_observed(worker: _SingleSubprocessExecutor) -> Any | None:
+                    with unit_task.activate():
+                        unit_task.transition("running")
+                        try:
+                            return observed_fn(worker)
+                        finally:
+                            unit_task.transition("completing")
+
+                fn = run_observed
+
+            preparation = input_preparation
+            if input_preparation is not None:
+                prepare = input_preparation
+
+                @contextmanager
+                def prepare_in_task(scope: ExecutionCancellationScope) -> Iterator[None]:
+                    with (
+                        task_scope.activate() if task_scope is not None else nullcontext(),
+                        unit_task.activate() if unit_task is not None else nullcontext(),
+                        prepare(scope),
+                    ):
+                        yield
+
+                preparation = prepare_in_task
+
             if self._actor_pool is not None:
                 actor_pool = self._actor_pool
                 with self._pending_lock:
@@ -3264,7 +4721,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                             f"pool_active={pool_stats.get('active_workers', 0)} "
                             f"pool_idle={pool_stats.get('idle_workers', 0)}"
                         )
-                    future = actor_pool.submit(fn, scope, debug_seq)
+                    future = actor_pool.submit(fn, scope, debug_seq, admission=admission, input_preparation=preparation)
                     self._track_task_future(
                         future,
                         submit_id,
@@ -3272,6 +4729,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         submit_start,
                         admission,
                         scope,
+                        task_scope,
+                        unit_task,
                     )
                 except BaseException as submit_error:
                     with self._pending_lock:
@@ -3287,6 +4746,21 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 return
 
             if self._task_pool is not None:
+                if preparation is not None:
+                    task_fn = fn
+
+                    def run_prepared(worker: _SingleSubprocessExecutor) -> Any | None:
+                        result = None
+                        try:
+                            assert preparation is not None
+                            with preparation(scope):
+                                result = task_fn(worker)
+                            return result
+                        except BaseException:
+                            _release_local_ref_bundle_result(result)
+                            raise
+
+                    fn = run_prepared
                 runtime = self._task_runtime
                 task_pool = self._task_pool
                 if runtime is None:
@@ -3311,7 +4785,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                                 f"runtime_total_workers={runtime.total_workers} "
                                 f"runtime_max_workers={runtime.max_workers}"
                             )
-                    future = runtime.submit(task_pool, fn, scope, debug_seq)
+                    worker_metrics = getattr(self, "_worker_metrics", None)
+                    future = (
+                        runtime.submit(task_pool, fn, scope, debug_seq, worker_metrics=worker_metrics)
+                        if worker_metrics is not None
+                        else runtime.submit(task_pool, fn, scope, debug_seq)
+                    )
                     self._track_task_future(
                         future,
                         submit_id,
@@ -3319,6 +4798,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         submit_start,
                         admission,
                         scope,
+                        task_scope,
+                        unit_task,
                     )
                 except BaseException as submit_error:
                     with self._pending_lock:
@@ -3343,21 +4824,153 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             raise missing_owner_error
 
     def submit(self, args: pa.Table) -> None:
-        table = _ensure_table(args)
-        admission = self._take_task_admission()
-        self._submit_async(
-            None,
-            lambda worker: worker._submit_table(table),
-            admission,
-        )
+        self._submit_materialized(None, _ensure_table(args))
 
     def submit_with_id(self, submit_id: int, args: pa.Table) -> None:
-        table = _ensure_table(args)
+        self._submit_materialized(int(submit_id), _ensure_table(args))
+
+    def _submit_materialized(self, submit_id: int | None, table: pa.Table) -> None:
         admission = self._take_task_admission()
+        prepared: tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]] | None = None
+        worker_payload: dict[str, Any] | None = None
+        lease_id: int | None = None
+        claimed = False
+        preparation_lock = threading.RLock()
+
+        def unregister_prefetch() -> None:
+            pass
+
+        cleanup_failure: BaseException | None = None
+
+        def release_prepared() -> None:
+            nonlocal prepared, worker_payload, lease_id, cleanup_failure
+            if prepared is None:
+                return
+            errors = []
+            try:
+                if lease_id is not None:
+                    if cancel_local_shm_input_lease(lease_id, name="udf-materialized-input") is None:
+                        raise RuntimeError("input transport cleanup is still in progress")
+                    self._untrack_input_lease(lease_id)
+                    lease_id = None
+            except BaseException as error:
+                errors.append(error)
+            for ref in prepared[1]:
+                try:
+                    ref.release()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                details = _subprocess_cleanup_error_details(errors)
+                cleanup_failure = capture_cleanup(f"UDF prefetched input cleanup failed: {details}", *errors)
+                raise cleanup_failure from errors[0]
+            prepared = None
+            worker_payload = None
+
+        def reclaim() -> None:
+            with preparation_lock:
+                if not claimed:
+                    release_prepared()
+
+        def materialize(scope: ExecutionCancellationScope, *, prefetch: bool = False) -> None:
+            nonlocal prepared, worker_payload, lease_id
+
+            def wait_context() -> AbstractContextManager[None]:
+                base = admission.suspend_for_wait(scope) if admission is not None else nullcontext()
+                return observe_transport_wait(base, "shared_memory_input")
+
+            task = current_data_task()
+            reservation = task.reservation if task is not None else None
+            input_producer_id = None
+            if self._actor_pool is not None:
+                assert admission is not None
+                input_producer_id = self._actor_pool._input_stream_ids[int(admission.lease["actor_index"])]
+            prepared = make_local_shm_ref_bundle_result(
+                table,
+                cancel_event=scope,
+                wait_context=wait_context,
+                input_owner_id=scope.owner_id,
+                input_producer_id=input_producer_id,
+                task_reservation=reservation.transport if reservation is not None else None,
+                prefetch=prefetch,
+            )
+            _marker, refs, metadata, names = prepared
+            worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                refs, None, metadata, names, submit_id=submit_id, name="udf-materialized-input", owns_refs=True
+            )
+            if worker_payload is None or lease_id is None:
+                raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
+            # Keep failed cleanup retryable through the executor/query owner,
+            # including cancellation before this call ever acquires a worker.
+            self._track_input_lease(lease_id)
+
+        @contextmanager
+        def prepare(scope: ExecutionCancellationScope) -> Iterator[None]:
+            nonlocal unregister_prefetch
+            scope.raise_if_cancelled("UDF subprocess input preparation")
+            if table.num_rows == 0:
+                yield
+                return
+            owner = LocalQueryShmStore()
+            preparation_error = None
+            try:
+                if self._actor_pool is not None:
+                    with preparation_lock:
+                        # Register before allocating: a concurrent output may
+                        # need this space even while serialization is finishing.
+                        unregister_prefetch = owner.store.register_prefetch(reclaim)
+                        try:
+                            materialize(scope, prefetch=True)
+                        except LocalShmPrefetchDeferred:
+                            unregister_prefetch()
+                scope.raise_if_cancelled("UDF subprocess prepared input")
+                yield
+            except BaseException as error:
+                preparation_error = error
+                raise
+            finally:
+                unregister_prefetch()
+                cleanup_errors = []
+                try:
+                    with preparation_lock:
+                        release_prepared()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                finally:
+                    owner.shutdown()
+                if cleanup_errors:
+                    errors = ([preparation_error] if preparation_error is not None else []) + cleanup_errors
+                    details = _subprocess_cleanup_error_details(errors)
+                    raise capture_cleanup(f"UDF materialized input cleanup failed: {details}", *errors) from errors[0]
+
+        def run(worker: _SingleSubprocessExecutor) -> Any | None:
+            nonlocal claimed
+            if table.num_rows == 0:
+                return None
+            scope = worker._current_execution_scope()
+            with preparation_lock:
+                # Transfer ownership under the lock so even a reclaimer already
+                # snapshotted by the store observes that this input is claimed.
+                claimed = True
+                unregister_prefetch()
+                if cleanup_failure is not None:
+                    raise cleanup_failure
+            # Foreground materialization can wait for another actor's output.
+            # That output may still invoke a snapshotted reclaimer, so it must
+            # be able to acquire preparation_lock while we wait for memory.
+            if prepared is None:
+                materialize(scope)
+            assert prepared is not None and worker_payload is not None
+            task = current_data_task()
+            if task is not None:
+                track_local_shm_inputs(task, prepared[1])
+            return worker._submit_ref_bundle_direct(worker_payload)
+
         self._submit_async(
-            int(submit_id),
-            lambda worker: worker._submit_table(table),
+            submit_id,
+            run,
             admission,
+            input_preparation=prepare,
         )
 
     def submit_ref_bundle_with_id(
@@ -3368,87 +4981,137 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
-        worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
-            block_refs,
-            slices,
-            metadata,
-            names,
-            submit_id=int(submit_id),
-            name=f"udf-input-{int(submit_id)}",
-            reserve_output_credit=self._ref_bundle_output,
-        )
-        if worker_payload is not None:
+        worker_payload: dict[str, Any] | None = None
+        lease_id: int | None = None
+
+        def prepare_inputs() -> None:
+            nonlocal worker_payload, lease_id
+            worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                block_refs,
+                slices,
+                metadata,
+                names,
+                submit_id=int(submit_id),
+                name=f"udf-input-{int(submit_id)}",
+            )
+            if worker_payload is None:
+                raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
             assert lease_id is not None
             self._track_input_lease(lease_id)
 
-            def submit_worker(
-                worker: _SingleSubprocessExecutor,
-                payload: dict[str, Any] = worker_payload,
-                lease_id: int = lease_id,
-            ) -> Any | None:
-                try:
-                    result = worker._submit_ref_bundle_direct(payload)
-                except BaseException as submit_error:
-                    try:
-                        cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
-                    except BaseException as cleanup_error:
-                        broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
-                        raise RuntimeError(
-                            f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
-                            f"{submit_error}; input-lease cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
-                        ) from submit_error
-                    self._untrack_input_lease(lease_id)
-                    raise
-                self._untrack_input_lease(lease_id)
-                return result
-
+        def submit_worker(worker: _SingleSubprocessExecutor) -> Any | None:
+            assert worker_payload is not None and lease_id is not None
             try:
-                admission = self._take_task_admission()
-                self._submit_async(
-                    int(submit_id),
-                    submit_worker,
-                    admission,
-                )
+                result = worker._submit_ref_bundle_direct(worker_payload)
             except BaseException as submit_error:
-                cleanup_error: BaseException | None = None
+                try:
+                    cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
+                except BaseException as cleanup_error:
+                    broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
+                    raise RuntimeError(
+                        f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
+                        f"{submit_error}; input-lease cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
+                    ) from submit_error
+                self._untrack_input_lease(lease_id)
+                raise
+            self._untrack_input_lease(lease_id)
+            return result
+
+        try:
+            admission = self._take_task_admission()
+            self._submit_async(
+                int(submit_id),
+                submit_worker,
+                admission,
+                input_data=block_refs,
+                input_metadata=metadata,
+                prepare_inputs=prepare_inputs,
+            )
+        except BaseException as submit_error:
+            cleanup_error: BaseException | None = None
+            if lease_id is not None:
                 try:
                     cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
                 except BaseException as exc:
                     cleanup_error = exc
                 else:
                     self._untrack_input_lease(lease_id)
-                if cleanup_error is not None:
-                    raise RuntimeError(
-                        f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
-                        f"{submit_error}; input-lease cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    ) from submit_error
-                raise
-            return
-        raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
+                    f"{submit_error}; input-lease cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                ) from submit_error
+            raise
 
     def submit_ref_bundle(self, _block_refs: Any, _slices: Any, _metadata: Any, _names: Any) -> None:
         raise RuntimeError(
             "subprocess UDF ref-bundle submission requires submit_ref_bundle_with_id() and a pregranted admission lease"
         )
 
-    def take_ready_result(self) -> Any | None:
+    def _ready_result_index_locked(self, capacity: dict[str, Any] | None) -> int | None:
+        window = None if capacity is None else StreamReadWindow(StreamCapacity.parse(capacity))
+        blocked_submits = set()
+        data_blocked = False
+        for index, item in enumerate(self._queue):
+            submit_id = None
+            if isinstance(item, tuple) and item[0] == SUBMIT_RESULT_MARKER:
+                submit_id, output = item[1:3]
+            elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool):
+                output = item[0]
+            else:
+                output = item
+            if output is None or isinstance(output, BaseException):
+                # Another invocation's terminal event need not wait for DATA
+                # capacity, but it must never overtake its own output blocks.
+                if submit_id not in blocked_submits:
+                    return index
+                continue
+            if not data_blocked:
+                data_blocked = window is not None and not window.take(estimate_local_shm_ref_bundle_ipc_size(output))
+                if not data_blocked:
+                    output_read = self._result_reads[index] if self._result_reads else None
+                    data_blocked = output_read is not None and not output_read.poll(self._notify_wakeup)
+                if not data_blocked:
+                    return index
+            blocked_submits.add(submit_id)
+        return None
+
+    def take_ready_result(self, capacity: dict[str, Any] | None = None) -> Any | None:
+        self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._queue_lock:
-            try:
-                result = self._queue.popleft()
-            except IndexError:
+            index = self._ready_result_index_locked(capacity)
+            if index is None:
                 return None
+            result = self._queue[index]
+            del self._queue[index]
+            if self._result_reads:
+                output_read = self._result_reads[index]
+                del self._result_reads[index]
+                if output_read is not None:
+                    self._output_reads.pop(id(output_read), None)
             result_admissions = getattr(self, "_result_admissions", None)
-            admission = result_admissions.popleft() if result_admissions else None
+            admission = result_admissions[index] if result_admissions else None
+            if result_admissions:
+                del result_admissions[index]
+            stream = self._result_streams[index] if self._result_streams else None
+            if self._result_streams:
+                del self._result_streams[index]
+        if stream is not None:
+            stream.consumed()
         if admission is not None:
             admission.release()
+        transition_local_shm_output(result, "downstream_input")
         return result
 
     def finished_submitting(self) -> None:
         self._finished_submitting = True
+        if self._query_policy_authority is not None:
+            self._admission_authority.close()
+            self._query_policy_authority.finished_submitting()
 
     def all_tasks_finished(self) -> bool:
         with self._queue_lock:
@@ -3457,7 +5120,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             pending_empty = self._pending_batches == 0
         return self._finished_submitting and queue_empty and pending_empty
 
+    def resource_identity(self) -> dict[str, str] | None:
+        """Return this invocation's graph identity, independent of its pool."""
+        return None if self._resource_unit is None else self._resource_unit.to_dict()
+
     def stats(self) -> dict[str, int]:
+        self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._pending_lock:
@@ -3479,8 +5147,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         stats.update(self._output_budget_stats())
         return stats
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
-        self._wakeup = callback
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
+        self._wakeup = (
+            self._admission_authority.wrap_wakeup(callback)
+            if isinstance(self._admission_authority, (DataAdmissionAuthority, WaitingDataAdmissionAuthority))
+            else callback
+        )
         self._admission_authority.register_wakeup(callback)
 
     def _cancel_pending_futures(self) -> None:
@@ -3528,23 +5200,40 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 self._task_futures_cv.wait(timeout=remaining)
             return True
 
+    def cleanup_pending(self) -> bool:
+        with self._lifecycle_lock:
+            if not self._cleanup_finished:
+                return True
+            with self._task_futures_cv:
+                if self._task_futures:
+                    return True
+            with self._active_input_leases_lock:
+                if self._active_input_leases:
+                    return True
+            with self._queue_lock:
+                return bool(self._output_reads)
+
     def close(self, kill: bool = False) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
         if lifecycle_lock is None:
             lifecycle_lock = threading.RLock()
             self._lifecycle_lock = lifecycle_lock
         with lifecycle_lock:
+            cancellation = getattr(self, "_request_cancellation", None)
+            kill = kill or (cancellation is not None and cancellation.is_set())
+            unregister = getattr(self, "_request_cancel_unregister", None)
+            if unregister is not None:
+                unregister()
+                self._request_cancel_unregister = None
             if self._closed:
-                # ``_closed`` is the submission fence, not proof that every
-                # fallible parent-side input-lease cancellation completed.
-                # The first close retains failed lease ids, so an explicit
-                # retry (and the finalizer's last attempt) must still be able
-                # to release those owners after the rest of the executor has
-                # been detached.
+                # The submission fence does not prove callback or transport
+                # cleanup finished. A timed-out close must remain retryable.
                 self._cancel_active_input_leases()
-                return
+                if getattr(self, "_cleanup_finished", False):
+                    return
             self._closed = True
             self._close_after_marked_closed(kill=kill)
+            self._cleanup_finished = True
 
     def _close_after_marked_closed(self, *, kill: bool) -> None:
         cleanup_errors: list[BaseException] = []
@@ -3565,9 +5254,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 admissions = list(result_admissions or ())
                 if result_admissions is not None:
                     result_admissions.clear()
+                streams = list(self._result_streams)
+                self._result_streams.clear()
+                self._result_reads.clear()
+                for output_read in tuple(self._output_reads.values()):
+                    try:
+                        self._close_output_read_locked(output_read)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
         else:
             queued_results = []
             admissions = []
+            streams = []
         for result in queued_results:
             _release_local_ref_bundle_result(result)
         for admission in admissions:
@@ -3585,7 +5283,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 cleanup_errors.append(exc)
         cancelled_scopes, wait_cleanup_errors = self._cancel_local_shm_waits()
         cleanup_errors.extend(wait_cleanup_errors)
+        for stream in streams:
+            if stream is not None:
+                stream.close()
         close_kill = bool(kill)
+        callbacks_finished = False
         if close_kill:
             actor_pool = self._actor_pool
             if actor_pool is not None:
@@ -3604,7 +5306,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             except BaseException as exc:
                 cleanup_errors.append(exc)
         else:
-            if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
+            callbacks_finished = self._wait_for_pending_futures(_subprocess_shutdown_grace_s())
+            if not callbacks_finished:
                 close_kill = True
                 actor_pool = self._actor_pool
                 if actor_pool is not None:
@@ -3624,6 +5327,19 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     cleanup_errors.append(exc)
                 _, escalation_cleanup_errors = self._cancel_local_shm_waits()
                 cleanup_errors.extend(escalation_cleanup_errors)
+        if not callbacks_finished:
+            # Worker termination can precede its future's completion cleanup.
+            # Standalone and query-bound executors retain the same ownership:
+            # closing a worker does not yet return its task admission.
+            grace = 0.0 if getattr(self, "_close_cleanup_pending", False) else _subprocess_shutdown_grace_s()
+            if not self._wait_for_pending_futures(grace):
+                self._close_cleanup_pending = True
+                cleanup_errors.append(TimeoutError("executor still has pending UDF cleanup"))
+                # Retain futures and pool references for a later close retry.
+                # Waiting is per executor, so shared-pool peers can continue.
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]
+        self._close_cleanup_pending = False
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None
@@ -3633,11 +5349,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return
         task_pool = self._task_pool
         if task_pool is not None:
-            self._task_pool = None
             try:
                 task_pool.release_ref(kill=close_kill)
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                self._task_pool = None
             if cleanup_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]
@@ -3670,7 +5387,13 @@ def _cleanup_subprocess_executor(
     sock: socket.socket | None,
     payload_shm: shared_memory.SharedMemory | None,
     data_shm: shared_memory.SharedMemory | None,
+    shm_peer: ParentShmPeer | None = None,
+    process_group: WorkerProcessGroup | None = None,
 ) -> None:
+    if process_group is not None:
+        if process_group.owner_pid != os.getpid():
+            return
+        process_group.capture()
     if sock is not None:
         try:
             if proc is not None and proc.poll() is None:
@@ -3690,6 +5413,8 @@ def _cleanup_subprocess_executor(
             proc.wait(timeout=_subprocess_control_timeout_s())
         except Exception:
             pass
+    if process_group is not None:
+        process_group.close(_subprocess_control_timeout_s())
     for shm in (payload_shm, data_shm):
         if shm is None:
             continue
@@ -3697,10 +5422,14 @@ def _cleanup_subprocess_executor(
             shm.close()
         except Exception:
             pass
+
         try:
             _unlink_shm(shm, track=False)
         except Exception:
             pass
+
+    if shm_peer is not None and (proc is None or proc.poll() is not None):
+        shm_peer.close_after_exit()
 
 
 __all__ = ["UDFExecutor"]

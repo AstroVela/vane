@@ -4,7 +4,6 @@
 #
 # Modified by Vane contributors.
 
-import contextlib
 import subprocess
 import sys
 
@@ -298,49 +297,56 @@ class TestPyCapsuleConsumed:
         assert r2 == [(1,), (2,), (3,)]
 
 
-class TestSameConnectionRecordBatchReader:
-    """Issue #85: DuckDB-originated RecordBatchReader on the same connection.
+class TestNativeRecordBatchReader:
+    """Native readers must finish execution before being scanned by another query."""
 
-    When conn.sql(...).to_arrow_reader() returns a RecordBatchReader backed by
-    the same connection, scanning it on that connection may deadlock or return
-    empty results due to lock contention. Run in subprocess to avoid hanging
-    the test suite. The workaround is to use a different connection for the scan.
-    """
-
-    def test_same_connection_no_data(self):
-        """Same-connection RecordBatchReader scan fails to return data.
-
-        Run in subprocess to prevent hanging the test suite if it deadlocks.
-        """
+    @pytest.mark.parametrize("threads", [1, 4])
+    @pytest.mark.parametrize("connection", ["same", "different"])
+    @pytest.mark.parametrize("method", ["to_arrow_reader", "arrow"])
+    @pytest.mark.parametrize("preparation", ["live", "execute", "read_all"])
+    def test_query_input_requires_materialization(self, monkeypatch, threads, connection, method, preparation):
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        # A regression can block an Arrow producer on its consuming query's
+        # cursor lock, so both rejection and materialized controls are bounded.
         code = """\
+import sys
+from contextlib import ExitStack
 import vane
-conn = vane.connect("")
-reader = conn.sql("FROM range(5) T(a)").to_arrow_reader()
-result = conn.sql("FROM reader").fetchall()
-assert result != [(i,) for i in range(5)], "Expected no data due to lock contention"
+
+threads, connection, method, preparation = sys.argv[1:]
+with ExitStack() as owners:
+    source = owners.enter_context(vane.connect(config={"threads": int(threads)}))
+    target = source if connection == "same" else owners.enter_context(vane.connect(config={"threads": int(threads)}))
+    relation = source.sql("FROM range(5) T(a)")
+    if preparation == "execute":
+        relation.execute()
+    reader = getattr(relation, method)()
+    if preparation == "read_all":
+        with reader:
+            table = reader.read_all()
+        reader = table.to_reader()
+    try:
+        if preparation == "live":
+            try:
+                target.sql("FROM reader").fetchall()
+            except vane.InvalidInputException as error:
+                assert "Python input callback" in str(error) or "busy cursor" in str(error), str(error)
+            else:
+                raise AssertionError("a live reader was accepted as query input")
+        else:
+            assert target.sql("FROM reader").fetchall() == [(i,) for i in range(5)]
+    finally:
+        reader.close()
+    assert target.sql("SELECT 7").fetchall() == [(7,)]
+    assert source.sql("SELECT 8").fetchall() == [(8,)]
 """
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            subprocess.run(
-                [sys.executable, "-c", code],
-                timeout=5,
-                capture_output=True,
-            )
-
-    def test_different_connection_works(self, duckdb_cursor):
-        """RecordBatchReader from connection A scanned on connection B works fine."""
-        conn_a = vane.connect()
-        conn_b = vane.connect()
-        reader = conn_a.sql("FROM range(5) T(a)").to_arrow_reader()  # noqa: F841
-        result = conn_b.sql("FROM reader").fetchall()
-        assert result == [(i,) for i in range(5)]
-
-    def test_arrow_method_different_connection(self, duckdb_cursor):
-        """The .arrow() method (which returns RecordBatchReader) works cross-connection."""
-        conn_a = vane.connect()
-        conn_b = vane.connect()
-        arrow_reader = conn_a.sql("FROM range(5) T(a)").arrow()  # noqa: F841
-        result = conn_b.sql("FROM arrow_reader").fetchall()
-        assert result == [(i,) for i in range(5)]
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", code, str(threads), connection, method, preparation],
+            timeout=15,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 class TestPyCapsuleInterfaceNoPyarrowDataset:

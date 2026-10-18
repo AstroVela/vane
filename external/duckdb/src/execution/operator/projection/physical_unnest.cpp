@@ -58,6 +58,7 @@ public:
 public:
 	//! Reset the fields of the unnest operator state
 	void Reset();
+	void ResetBatchInput() override;
 	//! Prepare the input for the next unnest
 	void PrepareInput(DataChunk &input, const vector<unique_ptr<Expression>> &select_list);
 };
@@ -66,6 +67,20 @@ void UnnestOperatorState::Reset() {
 	current_row = 0;
 	list_position = 0;
 	first_fetch = true;
+}
+
+void UnnestOperatorState::ResetBatchInput() {
+	// The pipeline calls this only after every output (including continuations)
+	// has been consumed. Those outputs can reference the evaluated list children.
+	D_ASSERT(first_fetch);
+	for (auto &format : list_vector_data) {
+		format = UnifiedVectorFormat();
+	}
+	for (auto &format : list_child_data) {
+		format = UnifiedVectorFormat();
+	}
+	list_data.Reset();
+	executor.ResetInput();
 }
 
 PhysicalUnnest::PhysicalUnnest(PhysicalPlan &physical_plan, vector<LogicalType> types,

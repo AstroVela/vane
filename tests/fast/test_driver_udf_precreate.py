@@ -2897,10 +2897,8 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
-        plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
-
-        with pytest.raises(ValueError, match="udf executor options must be a dict"):
-            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+        with pytest.raises(vane.InvalidInputException, match="UDF executor options must be a dict"):
+            plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
     finally:
         con.close()
 

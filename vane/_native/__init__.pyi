@@ -40,10 +40,18 @@ if typing.TYPE_CHECKING:
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
+    from vane.execution.local_query import LocalQueryRuntime
+    from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.resources import ResourceVector
+    from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
+
+def _check_python_callback_entry() -> None: ...
 
 _ExpressionLike: typing.TypeAlias = (
     "Expression"
@@ -115,6 +123,19 @@ class DuckDBPyConnection:
     def checkpoint(self) -> DuckDBPyConnection: ...
     def close(self) -> None: ...
     def commit(self) -> DuckDBPyConnection: ...
+    def configure_local_runtime(
+        self,
+        *,
+        request_limit: RequestAdmissionLimits,
+        resident_limit: ResourceVector | None = None,
+        gpu_devices: typing.Sequence[str] | None = None,
+        task_limit: TaskAdmissionLimits | None = None,
+        data_limit: DataAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
+        track_data: bool = False,
+        track_graph: bool = False,
+        execution_timeout: float | None = None,
+    ) -> LocalQueryRuntime: ...
     def _create_vane_batch_function(
         self,
         name: str,
@@ -151,6 +172,15 @@ class DuckDBPyConnection:
         and catalog operations remain native. Distributed execution requires auto-commit.
         """
         ...
+    def execute_result(
+        self,
+        query: Statement | str,
+        parameters: object = None,
+        *,
+        delivery_timeout: float | None = None,
+        stream: bool = False,
+        rows_per_batch: int = 2048,
+    ) -> ManagedResult: ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...
     def extract_statements(self, query: str) -> lst[Statement]: ...
     def fetch_arrow_table(self, rows_per_batch: typing.SupportsInt = 1000000) -> pyarrow.lib.Table:
@@ -516,6 +546,9 @@ class DuckDBPyRelation:
     ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...
+    def execute_result(
+        self, *, delivery_timeout: float | None = None, stream: bool = False, rows_per_batch: int = 2048
+    ) -> ManagedResult: ...
     def explain(self, type: ExplainType | str | int = ...) -> str: ...
     def explode(self, column: str) -> DuckDBPyRelation: ...
     def favg(
@@ -597,6 +630,7 @@ class DuckDBPyRelation:
     def _mark_datasink(self, operation_id: str) -> DuckDBPyRelation: ...
     def _take_udf_actor_cleanup_warnings(self) -> lst[str]: ...
     def _get_runner_type(self) -> str: ...
+    def _collect_local_resource_graph(self) -> dict[str, typing.Any]: ...
     def _run_datasink(self) -> dict[str, typing.Any]: ...
     def map(
         self,
