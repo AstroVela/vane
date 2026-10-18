@@ -56,87 +56,55 @@ def test_execution_deadline_accepts_model_entry_observed_after_completion(monkey
 
 
 @pytest.mark.parametrize("release_on_snapshot", [False, True])
-@pytest.mark.timeout(60)
-def test_quiescent_waits_for_completed_callback_output_owners(monkeypatch, tmp_path, caplog, release_on_snapshot):
-    from vane.execution.udf_subprocess import UDFExecutor
+@pytest.mark.timeout(30)
+def test_quiescent_waits_for_exported_data_views(monkeypatch, tmp_path, release_on_snapshot):
+    from vane.execution.ref_bundle import LocalShmBlockRef
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    observer_registered = threading.Event()
-    callback_published = threading.Event()
-    release_callback = threading.Event()
-    callback_finished = threading.Event()
-    callback_timed_out = threading.Event()
+    views = []
     output_observed = threading.Event()
-    track = UDFExecutor._track_task_future
+    to_table = LocalShmBlockRef.to_table
 
-    def retain_completed_output(done):
-        try:
-            # This observer runs after executor-owned cleanup. Its Future
-            # keeps the original output alive after the managed copy is gone.
-            callback_published.set()
-            if not release_callback.wait(20):
-                callback_timed_out.set()
-            done.result()
-        finally:
-            callback_finished.set()
+    def retain_view(ref, **options):
+        table = to_table(ref, **options)
+        views.append(table)
+        return table
 
-    def track_with_observer(self, future, *args, **kwargs):
-        track(self, future, *args, **kwargs)
-        future.add_done_callback(retain_completed_output)
-        observer_registered.set()
-
-    monkeypatch.setattr(UDFExecutor, "_track_task_future", track_with_observer)
+    monkeypatch.setattr(LocalShmBlockRef, "to_table", retain_view)
     scenario = acceptance()["Scenario"](tmp_path)
     try:
-        with ThreadPoolExecutor(max_workers=1) as threads:
-            try:
-                # Prevent synchronous callback invocation during registration:
-                # the backend cannot finish until both callbacks are installed.
-                with scenario.client(mode="gated") as (_, token, execute):
-                    query = threads.submit(lambda: scenario.consume(execute()))
-                    try:
-                        assert observer_registered.wait(10)
-                    finally:
-                        scenario.release(token)
-                    assert callback_published.wait(10)
-                    query.result(timeout=10)
-                snapshot = scenario.runtime.resource_snapshot()
-                assert snapshot["active_borrows"] == snapshot["data"]["tasks"] == snapshot["data"]["queries"] == 0
-                assert snapshot["data"]["usage_bytes"] > 0
-                checkpoint = scenario.checkpoint
+        scenario.query()
+        assert views and views[0].to_pylist()
+        snapshot = scenario.runtime.resource_snapshot()
+        assert snapshot["active_borrows"] == snapshot["data"]["tasks"] == snapshot["data"]["queries"] == 0
+        assert snapshot["data"]["usage_bytes"] > 0
+        checkpoint = scenario.checkpoint
 
-                def observe_checkpoint(name):
-                    snapshot = checkpoint(name)
-                    if snapshot["data"]["usage_bytes"]:
-                        output_observed.set()
-                    return snapshot
+        def observe_checkpoint(name):
+            snapshot = checkpoint(name)
+            if snapshot["data"]["usage_bytes"]:
+                output_observed.set()
+            return snapshot
 
-                monkeypatch.setattr(scenario, "checkpoint", observe_checkpoint)
-                if release_on_snapshot:
+        monkeypatch.setattr(scenario, "checkpoint", observe_checkpoint)
+        if release_on_snapshot:
 
-                    def release_after_snapshot():
-                        assert output_observed.wait(5)
-                        release_callback.set()
+            def release_after_snapshot():
+                assert output_observed.wait(5)
+                views.clear()
 
-                    released = threads.submit(release_after_snapshot)
-                    settled = scenario.quiescent("callback_released")
-                    released.result(timeout=5)
-                    assert settled["data"]["usage_bytes"] == settled["data"]["leases"] == 0
-                else:
-                    with pytest.raises(TimeoutError, match="callback_retained: data owner retained"):
-                        scenario.quiescent("callback_retained", timeout=0)
-                    assert scenario.checkpoints["callback_retained"]["data"]["usage_bytes"] > 0
-            finally:
-                release_callback.set()
-        assert callback_finished.wait(5)
-        assert not callback_timed_out.is_set()
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                released = threads.submit(release_after_snapshot)
+                settled = scenario.quiescent("views_released")
+                released.result(timeout=5)
+            assert settled["data"]["usage_bytes"] == settled["data"]["leases"] == 0
+        else:
+            with pytest.raises(TimeoutError, match="views_retained: data owner retained"):
+                scenario.quiescent("views_retained", timeout=0)
+            assert scenario.checkpoints["views_retained"]["data"]["usage_bytes"] > 0
     finally:
-        release_callback.set()
+        views.clear()
         scenario.close()
-    assert not any(
-        record.name == "concurrent.futures" and "exception calling callback" in record.getMessage()
-        for record in caplog.records
-    )
 
 
 @pytest.mark.parametrize("expire_before_publication", [False, True])

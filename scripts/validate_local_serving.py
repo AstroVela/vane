@@ -361,9 +361,9 @@ class Scenario:
 
         def data_released():
             nonlocal snapshot
-            # A completed Future's callback can briefly retain the original
-            # UDF output after request teardown and managed-result copying.
-            # Observe its release without forcing GC or dropping the charge.
+            # Exported Arrow views can retain data after request teardown.
+            # Wait for their owners to release the leases without forcing GC
+            # or dropping the charge.
             snapshot = self.checkpoint(name)
             return all(
                 snapshot["data"][key] == 0 for key in ("queries", "tasks", "leases", "reservations", "usage_bytes")

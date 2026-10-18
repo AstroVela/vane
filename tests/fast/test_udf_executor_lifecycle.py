@@ -6137,7 +6137,8 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
         _release_callback=lambda: events.append("slot-released"),
     )
     executor = build_executor(_subprocess_map_payload(lambda table: table, execution_backend="subprocess_task"))
-    result = None
+    result = item = None
+    refs = ()
     try:
         future = Future()
         scope = executor._new_execution_scope()
@@ -6147,6 +6148,7 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
             future.set_exception(OSError(errno.EIO, "private execution error"))
         else:
             result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+            refs = tuple(result[1])
             future.set_result(result)
 
         # Completion returns execution capacity; consuming the terminal result
@@ -6184,15 +6186,22 @@ def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
             assert summary.count("cleanup:") == int(len(errors) > 1)
             assert "private" not in summary
             if result is not None:
-                assert all(ref._closed for ref in result[1])
+                assert all(ref._closed for ref in refs)
         else:
-            assert item is result
-            assert not any(ref._closed for ref in result[1])
-            assert result[1][0].to_table().to_pydict() == {"x": [1, 2]}
+            # The consumer owns a new container with the same underlying
+            # blocks; the producer's Future no longer retains their refs.
+            assert item[0] == result[0]
+            assert result[1] == []
+            assert len(item[1]) == len(refs)
+            assert all(actual is expected for actual, expected in zip(item[1], refs))
+            assert item[2:] == result[2:]
+            assert not any(ref._closed for ref in refs)
+            assert item[1][0].to_table().to_pydict() == {"x": [1, 2]}
         assert executor.take_ready_result() is None
         assert not executor._result_admissions
         executor.stats()
     finally:
+        local._release_local_ref_bundle_result(item)
         local._release_local_ref_bundle_result(result)
         executor.close(kill=True)
         local._shutdown_global_task_runtime()
@@ -10482,6 +10491,54 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     assert submitted_future.cancelled()
     assert not executor._task_futures
     assert actor_pool.aborted and len(actor_pool.aborted[0]) == 1
+
+
+@pytest.mark.parametrize("submit_id", [None, 73])
+@pytest.mark.parametrize("producer_cleanup", [False, True])
+def test_subprocess_result_handoff_preserves_consumer_and_retires_producer(submit_id, producer_cleanup):
+    import vane.execution.udf_subprocess as local
+    from vane.execution import ref_bundle
+    from vane.execution.udf_data_lease import RuntimeDataLedger
+
+    ledger = RuntimeDataLedger()
+    query = ledger.open_query()
+    task = query.open_task()
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    ref_bundle.track_local_shm_output(task, result)
+    task.finish()
+    query.shutdown()
+    future = Future()
+    future.set_result(result)
+
+    executor = object.__new__(local.UDFExecutor)
+    executor._queue = deque([local.UDFExecutor._submit_result_item(submit_id, result)])
+    executor._queue_lock = threading.Lock()
+    executor._result_admissions = deque()
+    executor._result_reads = deque()
+    executor._result_streams = deque()
+    executor._output_reads = {}
+    executor._request_cancellation = None
+    executor._request_cancel_unregister = None
+    executor._wakeup_error = None
+    executor._closed = True
+    executor._cleanup_finished = True
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
+    del result
+
+    taken = executor.take_ready_result()
+    output = taken if submit_id is None else taken[2]
+    if producer_cleanup:
+        local._release_local_ref_bundle_result(future.result())
+    table = output[1][0].to_table()
+    del output, taken
+    assert table.to_pydict() == {"x": [1, 2]}
+    # The exported Arrow view is the sole remaining data owner, even while the
+    # producer retains its Future or performs late result cleanup.
+    assert ledger.snapshot()["leases"] == 1
+    del table
+    assert ledger.snapshot()["retained_bytes"] == 0
+    assert future.done()
 
 
 def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
