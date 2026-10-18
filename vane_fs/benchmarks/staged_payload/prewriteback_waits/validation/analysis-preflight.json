@@ -1,0 +1,20 @@
+{
+  "status": "EXPECTED_ANALYSIS_ASSERTION_EXPLAINED",
+  "recorded_epoch": 1792324062.3954701,
+  "measurement_rerun": false,
+  "frozen_analyzer": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/prewriteback_waits/analyze.py",
+  "frozen_analyzer_sha256": "c9b10a0297b737613d41d7b518f95b740845b802fb7805ee5485f96b2fdfc4e8",
+  "error": "AssertionError: position == sample[\"bytes\"] == 64 * 1024**2",
+  "root_cause": "Native FUSE read roots record requested lengths, including one request at EOF; returned bytes must be clipped to the observed 64 MiB file size.",
+  "example": {
+    "state": "fuse",
+    "variant": "baseline",
+    "rep": 0,
+    "native_requests": 129,
+    "native_requested_bytes": 68155888,
+    "application_returned_bytes": 67108864,
+    "eof_request_offset": 67108864,
+    "eof_requested_bytes": 1047024
+  },
+  "resolution": "Retain the frozen analyzer unchanged and apply a reversible post-measurement EOF accounting adapter; preserve every root and include EOF CPU/time."
+}
