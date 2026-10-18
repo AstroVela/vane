@@ -10484,6 +10484,54 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     assert actor_pool.aborted and len(actor_pool.aborted[0]) == 1
 
 
+@pytest.mark.parametrize("submit_id", [None, 73])
+@pytest.mark.parametrize("producer_cleanup", [False, True])
+def test_subprocess_result_handoff_preserves_consumer_and_retires_producer(submit_id, producer_cleanup):
+    import vane.execution.udf_subprocess as local
+    from vane.execution import ref_bundle
+    from vane.execution.udf_data_lease import RuntimeDataLedger
+
+    ledger = RuntimeDataLedger()
+    query = ledger.open_query()
+    task = query.open_task()
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    ref_bundle.track_local_shm_output(task, result)
+    task.finish()
+    query.shutdown()
+    future = Future()
+    future.set_result(result)
+
+    executor = object.__new__(local.UDFExecutor)
+    executor._queue = deque([local.UDFExecutor._submit_result_item(submit_id, result)])
+    executor._queue_lock = threading.Lock()
+    executor._result_admissions = deque()
+    executor._result_reads = deque()
+    executor._result_streams = deque()
+    executor._output_reads = {}
+    executor._request_cancellation = None
+    executor._request_cancel_unregister = None
+    executor._wakeup_error = None
+    executor._closed = True
+    executor._cleanup_finished = True
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
+    del result
+
+    taken = executor.take_ready_result()
+    output = taken if submit_id is None else taken[2]
+    if producer_cleanup:
+        local._release_local_ref_bundle_result(future.result())
+    table = output[1][0].to_table()
+    del output, taken
+    assert table.to_pydict() == {"x": [1, 2]}
+    # The exported Arrow view is the sole remaining data owner, even while the
+    # producer retains its Future or performs late result cleanup.
+    assert ledger.snapshot()["leases"] == 1
+    del table
+    assert ledger.snapshot()["retained_bytes"] == 0
+    assert future.done()
+
+
 def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution import ref_bundle
