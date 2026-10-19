@@ -88,6 +88,7 @@ release_tests=(
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
   "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
+  "$project_root/tests/fast/test_local_query_models.py::test_model_releases_output_before_completion_callback_returns"
   "$project_root/tests/fast/test_local_task_scheduling.py"
   "$project_root/tests/fast/test_local_shm_credit_progress.py"
   "$project_root/tests/fast/test_local_shm_store_capacity.py::test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds"

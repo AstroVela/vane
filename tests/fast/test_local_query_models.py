@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -538,6 +539,41 @@ def test_model_initialization_uses_captured_session_environment(monkeypatch):
         for _ in range(2):
             assert connection.execute("SELECT environment(1)").fetchall() == [("captured",)]
             _assert_idle(runtime)
+
+
+@pytest.mark.timeout(20)
+def test_model_releases_output_before_completion_callback_returns(tmp_path, monkeypatch):
+    from vane.execution.udf_subprocess import UDFExecutor
+
+    entered, proceed = threading.Event(), threading.Event()
+    notify = UDFExecutor._notify_wakeup
+
+    def notify_before_callback_returns(executor):
+        notify(executor)
+        if not entered.is_set() and executor._pending_batches == 0 and not executor._task_futures:
+            entered.set()
+            assert proceed.wait(10)
+
+    monkeypatch.setattr(UDFExecutor, "_notify_wakeup", notify_before_callback_returns)
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        model = _register(runtime, _class_model(tmp_path))
+        vane.attach_function(model, connection=connection)
+
+        def query():
+            assert int(connection.execute("SELECT model_encode(1)").fetchall()[0][0].split(":")[1]) == 11
+            _assert_idle(runtime)
+
+        with ThreadPoolExecutor(1) as clients:
+            pending = clients.submit(query)
+            try:
+                assert entered.wait(5), "completion callback did not reach its final wakeup"
+                # Native consumption retires the output even while its
+                # producer's completion callback and Future remain alive.
+                pending.result(timeout=5)
+            finally:
+                proceed.set()
+        _assert_idle(runtime)
 
 
 @pytest.mark.parametrize("captured", [None, "1000000"])
