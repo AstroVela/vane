@@ -186,7 +186,8 @@ invalidate an open reader. Positional reads preserve the implicit cursor;
 short exact reads fail. Nonblocking virtual opens cannot encounter host FIFOs.
 Reads check cancellation between bounded chunks, with SQLite lock waits still
 limited by the configured busy timeout. The connector accepts explicit paths
-on `local-fast`; it does not serialize SQLite connections or callbacks to Ray.
+on `local` (also accepted as `local-fast`); it does not serialize SQLite
+connections or callbacks to Ray.
 
 ## Transactions and durability
 

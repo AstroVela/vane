@@ -7,7 +7,9 @@ from vane_fs import _native
 
 
 def register_workspace(connection, database, *, timeout_ms=5000):
-    """Register an existing database for native reads on a local-fast connection.
+    """Register an existing database for native reads on a local connection.
+
+    Select native execution with ``local`` or its ``local-fast`` alias.
 
     Returns its workspace ID. Registration owns an independent connection;
     every query and open reader pins the snapshots it uses. SQLite write

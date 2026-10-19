@@ -225,7 +225,7 @@ owns SQLite; the base Vane wheel does not link it.
 ```python
 import os
 
-os.environ["VANE_RUNNER"] = "local-fast"
+os.environ["VANE_RUNNER"] = "local"
 import vane
 from vane_fs import Workspace, register_workspace, snapshot_url, unregister_workspace
 
@@ -261,8 +261,9 @@ pins to unrelated active results. Unregistering prevents new opens without
 invalidating open readers.
 `drop_snapshot` fails while either kind of reference remains.
 
-The native connector is read-only and currently requires `local-fast`. It
-supports explicit file paths, not wildcard expansion or directory listing.
+The native connector is read-only and requires native local execution, selected
+with `local` or its `local-fast` alias. It supports explicit file paths, not
+wildcard expansion or directory listing.
 SQLite write access is required to record/release retention pins. Interrupts
 are checked between 1 MiB read chunks; a SQLite lock wait is bounded by
 `timeout_ms` (default 5000), not immediately interrupted. Query completion
@@ -282,7 +283,7 @@ media access through `connection.register_filesystem`.
 ```python
 import os
 
-os.environ["VANE_RUNNER"] = "local-fast"
+os.environ["VANE_RUNNER"] = "local"
 import vane
 from vane_fs import Workspace
 from vane_fs.fsspec import SnapshotFileSystem
