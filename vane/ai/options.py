@@ -111,7 +111,8 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     runtime: Literal["native", "http", "service"]
     service_path: str
     service_id: str
-    http_input_format: Literal["text", "multimodal"]
+    http_input_format: Literal["text", "multimodal", "encode"]
+    http_media_tokens: Mapping[str, str]
     media_mime_types: list[str]
     max_request_bytes: int
 
@@ -165,6 +166,7 @@ _HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
         "base_url",
         "timeout",
         "http_input_format",
+        "http_media_tokens",
         "media_mime_types",
         "max_input_bytes",
         "max_request_bytes",
@@ -388,8 +390,25 @@ def validate_embed_options(
         _validate_base_url_option(copied, api="Embed")
         if not copied.get("base_url") or urlsplit(copied["base_url"]).query:
             raise ValueError("HTTP embedding requires an explicit base_url without query parameters")
-        if copied.get("http_input_format", "text") not in ("text", "multimodal"):
-            raise ValueError("http_input_format must be 'text' or 'multimodal'")
+        wire_format = copied.get("http_input_format", "text")
+        if wire_format not in ("text", "multimodal", "encode"):
+            raise ValueError("http_input_format must be 'text', 'multimodal' or 'encode'")
+        if wire_format == "encode" and family != "sglang":
+            raise ValueError("http_input_format='encode' requires the SGLang provider")
+        if "http_media_tokens" in copied:
+            tokens = copied["http_media_tokens"]
+            if wire_format != "encode" or not isinstance(tokens, Mapping):
+                raise ValueError("http_media_tokens requires the SGLang encode format and a mapping")
+            if any(
+                key not in {"image", "video", "audio"}
+                or not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 1024
+                or "\x00" in value
+                for key, value in tokens.items()
+            ) or len(set(tokens.values())) != len(tokens):
+                raise ValueError("http_media_tokens requires distinct nonempty image/video/audio markers")
+            copied["http_media_tokens"] = dict(tokens)
         timeout = copied.get("timeout", 60.0)
         if (
             isinstance(timeout, bool)
@@ -407,8 +426,13 @@ def validate_embed_options(
         mime_types = copied.get("media_mime_types", [])
         if not isinstance(mime_types, list) or any(not isinstance(value, str) for value in mime_types):
             raise TypeError("media_mime_types must be a list of MIME type strings")
-        if mime_types and copied.get("http_input_format", "text") != "multimodal":
-            raise ValueError("media_mime_types requires http_input_format='multimodal'")
+        if mime_types and wire_format == "text":
+            raise ValueError("media_mime_types requires a multimodal HTTP format")
+        if (
+            wire_format == "encode"
+            and {mime.split("/", 1)[0] for mime in mime_types} - copied.get("http_media_tokens", {}).keys()
+        ):
+            raise ValueError("SGLang encode requires http_media_tokens for each declared media modality")
     if "input_type" in copied and copied["input_type"] not in ("query", "document"):
         raise ValueError("Embed option 'input_type' must be 'query' or 'document'")
     if "overlength" in copied and copied["overlength"] not in ("error", "truncate", "chunk_mean"):

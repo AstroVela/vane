@@ -249,8 +249,9 @@ Install `vane-ai[embedding_http]` on clients and workers. HTTP execution reserve
 zero worker GPUs and imports neither inference runtime. Keep the inference
 service running independently. `runtime="native"` remains the default;
 `runtime="http"` requires an explicit `base_url`, served `model`, and output
-`dimensions`. The base URL includes the API prefix (usually `/v1`); the codec
-appends `/embeddings`. It does not discover endpoints or change formats on error.
+`dimensions`. For text/multimodal formats the base URL includes the API prefix (usually `/v1`),
+and the codec appends `/embeddings`. SGLang's explicit `encode` format instead
+uses a server-root base URL and appends `/encode`. It does not discover endpoints or change formats on error.
 
 ```python
 from vane.ai import MultimodalInput, TextInput, VideoInput, embed
@@ -291,6 +292,37 @@ instruction is inserted automatically. Deploy a matching model, processor and
 template on the server; declare supported media formats in `media_mime_types`.
 This declaration is an application contract, not model capability discovery.
 The server enforces its model's combinations, token counts and media limits.
+
+SGLang also supports `http_input_format="encode"` for its native HTTP endpoint.
+It carries encoded video and raw audio together, including WAV/MP3 Base64 data
+URLs. This endpoint is separate from `/v1/embeddings`, whose schema still has no
+audio field. Select it explicitly; Vane does not change endpoints on an error.
+For an EmbeddingGemma 2 deployment, configure:
+
+```python
+runtime="http",
+base_url="http://localhost:30000",  # server root, without /v1
+http_input_format="encode",
+media_mime_types=["video/mp4", "audio/wav"],
+http_media_tokens={"video": "<|video|>", "audio": "<|audio|>"},
+```
+
+`/encode` does not apply a chat template. `http_media_tokens` supplies the exact
+model-specific placeholders for every declared media modality. Vane prepends one
+marker for each present media part, in input order, then the supplied text; absent
+parts add no marker. Text containing configured markers is rejected to prevent
+ambiguous media counts. Retrieval instructions remain explicit input text; no
+model names, prefixes or tokens are inferred. Select a new profile/storage when
+changing the wire format or template, as those choices affect vector identity.
+
+Single-row calls send `text`, `image_data`, `video_data`, and `audio_data`, with
+unused media set to null; a batch uses matching column lists. The response is a
+single object or an input-ordered list with `embedding` and `meta_info` fields.
+Raw/serialized budgets, bounded async concurrency, retries, error redaction and
+vector validation use the existing HTTP lifecycle. Both SGLang multimodal and
+encode formats default to one row per HTTP request because they share the
+server's media-preparation lifecycle; explicitly larger batches require deployment
+validation. No SGLang code change is needed.
 
 For SGLang's multimodal HTTP format, `request_batch_size` defaults to **1**, with
 up to **4** concurrent requests per actor (`max_concurrency_per_actor`). This

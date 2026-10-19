@@ -101,13 +101,17 @@ class HTTPEmbedder(ManagedTextEmbedder):
         self._codec = descriptor._codec()
         self._dimensions = descriptor.get_dimensions()
         options = descriptor.get_options()
-        self._url = options["base_url"].rstrip("/") + "/embeddings"
+        self._url = options["base_url"].rstrip("/") + (
+            "/encode" if self._codec.input_format == "encode" else "/embeddings"
+        )
         self._timeout = options.get("timeout", 60.0)
         self._request_concurrency = options.get("max_concurrency_per_actor", 4)
         # SGLang 0.5.17 can lose completed request state while preparing later
         # media rows in one request. Concurrent single-row requests still let
         # the server batch inference; qualified deployments can opt into more.
-        default_batch_size = 1 if descriptor.family == "sglang" and self._codec.input_format == "multimodal" else 8
+        default_batch_size = (
+            1 if descriptor.family == "sglang" and self._codec.input_format in {"multimodal", "encode"} else 8
+        )
         self._request_batch_size = options.get("request_batch_size", default_batch_size)
         self._max_request_bytes = options.get("max_request_bytes", 32 * 1024**2)
         self._client_options = copy_client_options(descriptor.client_options)
@@ -208,6 +212,17 @@ class HTTPEmbedder(ManagedTextEmbedder):
             )
             retry = None if _is_request_wide_error(error) else _retry_after_error(error)
             raise retry or error
+        if self._codec.input_format == "encode":
+            data = [payload] if len(rows) == 1 and isinstance(payload, dict) else payload
+            if not isinstance(data, list) or len(data) != len(rows) or any(not isinstance(item, dict) for item in data):
+                raise _EmbeddingBatchError("SGLang encode response must preserve input row count and order")
+            # Native /encode returns input-ordered results rather than indices.
+            for item in data:
+                meta = item.get("meta_info")
+                tokens = meta.get("prompt_tokens") if isinstance(meta, dict) else None
+                if type(tokens) is int and tokens >= 0:
+                    self.metrics.input_tokens += tokens
+            return self._decode_response_vectors(data, self._vector)
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or len(data) != len(rows):
             raise _EmbeddingBatchError("HTTP embedding response must preserve input row count")
