@@ -114,10 +114,12 @@ def test_failed_prepare_keeps_owner_until_cleanup_succeeds(monkeypatch):
     assert "cleanup pending" in str(error.value.__cause__)
     assert spec.query_id in worker.resources_snapshot()["reservations"]
     assert spec.query_id in worker.queries
+    assert worker.resources_snapshot()["databases"]["owners"] == [spec.query_id]
     monkeypatch.setattr(_Query, "close", close)
     worker.release(worker.epoch, spec.query_id, 1)
     assert worker.resources_snapshot()["reservations"] == {}
     assert worker.queries == {}
+    assert worker.resources_snapshot()["databases"]["owners"] == []
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])

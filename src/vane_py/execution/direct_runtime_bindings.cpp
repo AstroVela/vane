@@ -8,6 +8,14 @@
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/main/valid_checker.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/external_file_cache.hpp"
+#include "duckdb/storage/object_cache.hpp"
+#include "duckdb/execution/distributed/client_state.hpp"
+#include "vane_python/python_udf_actor_resources.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_conversion.hpp"
 
@@ -17,6 +25,59 @@ namespace duckdb {
 namespace {
 
 using namespace vane_execution;
+
+// Internal worker anchors are fresh, private in-memory databases. Only the
+// anchor's DuckDB wrapper and ClientContext may retain the instance at reuse.
+// Checking connection count alone misses a released TaskService or a detached
+// ClientContext still held by a concurrent cancellation probe.
+void CheckWorkerDatabaseIdle(DuckDBPyConnection &anchor) {
+	auto &database = anchor.con.GetDatabase().instance;
+	const auto connections = ConnectionManager::Get(*database).GetConnectionCount();
+	const auto owners = database.use_count();
+	if (connections != 1 || owners != 2) {
+		throw InvalidInputException("worker database cleanup is pending (%llu connections, %lld owners)", connections,
+		                            owners);
+	}
+}
+
+shared_ptr<DuckDBPyConnection> WorkerConnection(DuckDBPyConnection &anchor) {
+	auto lock = anchor.LockForQuery();
+	CheckWorkerDatabaseIdle(anchor);
+	auto result = make_shared_ptr<DuckDBPyConnection>();
+	result->con.SetDatabase(anchor.con);
+	{
+		py::gil_scoped_release release;
+		result->con.SetConnection(make_uniq<Connection>(result->con.GetDatabase()));
+		RunnerClientState::Initialize(*result->con.GetConnection().context, "local-fast");
+		EnableLocalRuntimeInputPolicy(*result->con.GetConnection().context);
+	}
+	result->SetConnectionBootstrapConfig(anchor.connection_database, anchor.connection_read_only,
+	                                     anchor.connection_config);
+	// cursor() inherits its parent's runtime and session. A worker query needs
+	// an independent session, environment snapshot, cancellation and temp catalog.
+	result->InitializeVaneSession();
+	return result;
+}
+
+bool ReleaseWorkerDatabase(DuckDBPyConnection &anchor, bool reuse) {
+	auto lock = anchor.LockForQuery();
+	py::gil_scoped_release release;
+	CheckWorkerDatabaseIdle(anchor);
+	auto &database = *anchor.con.GetDatabase().instance;
+	if (!reuse || ValidChecker::IsInvalidated(database)) {
+		return false;
+	}
+	// Retain initialized engine state, never query data or file metadata. Plans
+	// and source snapshots are validated again on every newly created session.
+	auto &files = database.GetExternalFileCache();
+	const auto enabled = files.IsEnabled();
+	files.SetEnabled(false);
+	files.SetEnabled(enabled);
+	auto &objects = database.GetObjectCache();
+	objects.EvictToReduceMemory(NumericLimits<idx_t>::Maximum());
+	auto &buffers = database.GetBufferManager();
+	return objects.IsEmpty() && buffers.GetUsedMemory() == 0 && buffers.GetTemporaryFiles().empty();
+}
 
 MaterializedObject ParseMaterializedObject(const py::dict &value) {
 	if (value.size() != 4 || !value.contains("bytes") || !value.contains("rows") || !value.contains("frames") ||
@@ -230,6 +291,8 @@ void Prepare(DirectTaskService &service, const string &id, const string &payload
 void RegisterDirectRuntimeBindings(py::module_ &module) {
 	auto runtime = module.def_submodule("execution_runtime", "Internal native DirectExchange and TaskService");
 	runtime.def("check_entry", &DuckDBPyConnection::CheckCallbackEntry);
+	runtime.def("worker_connection", &WorkerConnection);
+	runtime.def("release_worker_database", &ReleaseWorkerDatabase);
 	py::class_<StoreGuard, shared_ptr<StoreGuard>>(runtime, "StoreGuard")
 	    .def_static("acquire",
 	                [](const string &path, bool exclusive, bool create) {

@@ -264,3 +264,36 @@ def test_repeated_long_filter_keeps_the_declared_deadline(tmp_path, mode):
                 if result is not None:
                     close_result(result)
         evidence.write("report.json", {"status": "passed", "rounds": 4})
+
+
+def test_worker_database_reuse_and_fte_retirement(tmp_path):
+    import ray
+
+    limits = resources(tmp_path, worker_count=1, partitions=1, max_active_queries=1)
+    with vane.Runtime(limits) as application, application.connect() as connection:
+
+        def state():
+            assert_idle(connection)
+            worker = connection.query_runtime.pool.workers[0]
+            value = ray.get(worker.resources_snapshot.remote())["databases"]
+            assert value["capacity"] == 1
+            assert value["owners"] == []
+            return value
+
+        for value in (13, 17, 23):
+            with connection.query(f"select {value} as value", options=query_options("pipelined")) as result:
+                assert result.collect().column(0).to_pylist() == [value]
+        before = state()
+        assert before["created_instances"] == 1
+        assert before["reused_instances"] == 2
+        assert before["idle_instances"] == 1
+        with connection.query("select 29 as value", options=query_options("fte")) as result:
+            assert result.collect().column(0).to_pylist() == [29]
+        retired = state()
+        assert retired["idle_instances"] == 0
+        assert retired["created_instances"] > before["created_instances"]
+        with connection.query("select 31 as value", options=query_options("pipelined")) as result:
+            assert result.collect().column(0).to_pylist() == [31]
+        after = state()
+        assert after["created_instances"] == retired["created_instances"] + 1
+        assert after["idle_instances"] == 1

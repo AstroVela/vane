@@ -13,6 +13,7 @@ from typing import Any
 
 from vane.execution.pipelined_plan import RayResources, task_id
 from vane.execution.submission import RayQuerySpec, native_plan_capabilities, prepare_worker_plan
+from vane.execution.worker_database import WorkerDatabaseLease, WorkerDatabasePool
 
 
 def _host() -> str:
@@ -73,7 +74,9 @@ class _Query:
         resources: RayResources,
         index: int,
         routes: list[dict[str, Any]],
+        database: WorkerDatabaseLease,
     ) -> None:
+        self.database = database
         self.spec = spec
         self.resources = resources
         self.index = index
@@ -92,8 +95,7 @@ class _Query:
         self.closed = False
         self.control = threading.Lock()
 
-    def prepare(self, tasks: list[str], operator_bytes: int) -> None:
-        import vane
+    def prepare(self, tasks: list[str]) -> None:
         from vane._native import execution_runtime as native
 
         spec, resources, index, routes = self.spec, self.resources, self.index, self.routes
@@ -106,13 +108,10 @@ class _Query:
         with self.lifecycle:
             if self.stop.is_set():
                 raise RuntimeError("query preparation was canceled")
-            self.connection = vane.connect(
-                backend="local",
-                config={
-                    "threads": resources.cpus_per_worker,
-                    "memory_limit": f"{operator_bytes}B",
-                },
-            )
+            with self.control:
+                if self.stop.is_set():
+                    raise RuntimeError("query preparation was canceled")
+                self.connection = self.database.open()
             prepare_worker_plan(self.connection, spec)
             if self.stop.is_set():
                 raise RuntimeError("query preparation was canceled")
@@ -275,6 +274,7 @@ class _Query:
                 if self.connection is not None:
                     self.connection.close()
                     self.connection = None
+            self.database.release()
             self.closed = True
 
 
@@ -291,6 +291,7 @@ class PipelinedWorker:
         self.attempts: dict[str, Any] = {}
         self.reservations: dict[str, dict[str, int]] = {}
         self.retired = _RetiredCalls()
+        self.databases = WorkerDatabasePool(resources)
         with vane.connect(backend="local") as connection:
             self.engine = native_plan_capabilities(connection).engine_identity
 
@@ -328,11 +329,12 @@ class PipelinedWorker:
                 if amount + sum(r[name] for r in self.reservations.values()) > capacity[name]:
                     raise RuntimeError(f"worker has insufficient {name} capacity")
             resources = replace(self.resources, exchange=replace(self.resources.exchange, frame_rows=frame_rows))
-            query = _Query(spec, resources, index, routes)
+            database = self.databases.acquire(spec.query_id, reusable=True)
+            query = _Query(spec, resources, index, routes, database)
             self.reservations[spec.query_id] = reservation
             self.queries[spec.query_id] = query
         try:
-            query.prepare(tasks, reservation["operator"])
+            query.prepare(tasks)
             return str(query.flight.location) if query.flight is not None else ""
         except BaseException as primary:
             try:
@@ -389,7 +391,11 @@ class PipelinedWorker:
 
     def resources_snapshot(self) -> dict[str, Any]:
         with self.lock:
-            return {"epoch": self.epoch, "reservations": dict(self.reservations)}
+            return {
+                "epoch": self.epoch,
+                "reservations": dict(self.reservations),
+                "databases": self.databases.snapshot(),
+            }
 
     def check_store(self, epoch: str, descriptor: dict[str, str]) -> None:
         from pathlib import Path
@@ -473,11 +479,12 @@ class PipelinedWorker:
                 for name, amount in demand.items()
             ):
                 raise RuntimeError("worker has insufficient materialized capacity")
-            owner = MaterializedAttempt(spec, resources, binding, reservation, lease, orphan)
+            database = self.databases.acquire(key, reusable=False)
+            owner = MaterializedAttempt(spec, resources, binding, reservation, lease, orphan, database)
             self.reservations[key] = demand
             self.attempts[key] = owner
         try:
-            owner.prepare(demand["operator"])
+            owner.prepare()
         except BaseException as primary:
             try:
                 self.release_materialized(epoch, key, sequence)
