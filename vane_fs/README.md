@@ -9,6 +9,8 @@ This is a separately installed experimental component. It supports local
 workspaces, Linux FUSE mounts and native Vane FILE, CSV/Parquet and media reads
 over immutable snapshots. Remote Ray access remains a later stage in the
 [architecture and roadmap](DESIGN.md).
+The [performance closeout roadmap](PERFORMANCE_ROADMAP.md) records the fixed
+experiment budget, adoption decisions and delivery criteria for the current work.
 
 ## Build and install
 
