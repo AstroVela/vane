@@ -31,7 +31,7 @@ from vane.execution.query_options import DistributedMode, QueryExecutionOptions,
 from vane.execution.resource_demand import ResourceDemand
 
 SUBMISSION_PROTOCOL_VERSION = 1
-TYPE_PROFILE = "vane.analytical-types:4"
+TYPE_PROFILE = "vane.analytical-types:5"
 CONNECTION_PROFILE = "vane.builtin-session:1"
 
 
@@ -237,6 +237,7 @@ def prepare_ray_query(
         compile_options.partition_count,
         compile_options.hash_columns,
         options.target.mode is DistributedMode.FTE,
+        compile_options.worker_operator_bytes,
     )
     return _submission(value, options, resources)
 
@@ -251,8 +252,11 @@ def stage_ray_query(
     source_directory: str,
     source_budget: int,
     compile_options: FragmentCompileOptions = FragmentCompileOptions(),
+    source_cache: Any = None,
 ) -> tuple[RayQuerySpec, int]:
-    """Copy file inputs before binding; the admitted query owns partial copies.
+    """Freeze file inputs before binding, optionally borrowing cached versions.
+
+    The admitted query owns private copies and pins any shared cache lease.
 
     The pure planning entry above never creates these files. The execution
     service must hold the store reservation and lease before entering here.
@@ -275,6 +279,8 @@ def stage_ray_query(
         compile_options.hash_columns,
         source_directory,
         source_budget,
+        source_cache,
+        compile_options.worker_operator_bytes,
     )
     return _submission(value, options, resources), value["source_bytes"]
 

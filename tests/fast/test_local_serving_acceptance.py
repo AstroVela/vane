@@ -56,26 +56,25 @@ def test_execution_deadline_accepts_model_entry_observed_after_completion(monkey
 
 
 @pytest.mark.parametrize("release_on_snapshot", [False, True])
-def test_quiescent_waits_for_completed_callback_output_owners(monkeypatch, tmp_path, release_on_snapshot):
-    from vane.execution.udf_subprocess import UDFExecutor
+@pytest.mark.timeout(30)
+def test_quiescent_waits_for_exported_data_views(monkeypatch, tmp_path, release_on_snapshot):
+    from vane.execution.ref_bundle import LocalShmBlockRef
 
-    callback_published = threading.Event()
-    release_callback = threading.Event()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    views = []
     output_observed = threading.Event()
-    complete = UDFExecutor._complete_task_submit
+    to_table = LocalShmBlockRef.to_table
 
-    def delayed_completion(self, *args, **kwargs):
-        complete(self, *args, **kwargs)
-        # Future.result() still owns the output after request teardown has
-        # copied it into the managed result and consumed the executor queue.
-        callback_published.set()
-        assert release_callback.wait(10)
+    def retain_view(ref, **options):
+        table = to_table(ref, **options)
+        views.append(table)
+        return table
 
-    monkeypatch.setattr(UDFExecutor, "_complete_task_submit", delayed_completion)
+    monkeypatch.setattr(LocalShmBlockRef, "to_table", retain_view)
     scenario = acceptance()["Scenario"](tmp_path)
     try:
         scenario.query()
-        assert callback_published.wait(5)
+        assert views and views[0].to_pylist()
         snapshot = scenario.runtime.resource_snapshot()
         assert snapshot["active_borrows"] == snapshot["data"]["tasks"] == snapshot["data"]["queries"] == 0
         assert snapshot["data"]["usage_bytes"] > 0
@@ -92,19 +91,19 @@ def test_quiescent_waits_for_completed_callback_output_owners(monkeypatch, tmp_p
 
             def release_after_snapshot():
                 assert output_observed.wait(5)
-                release_callback.set()
+                views.clear()
 
             with ThreadPoolExecutor(max_workers=1) as threads:
                 released = threads.submit(release_after_snapshot)
-                settled = scenario.quiescent("callback_released")
+                settled = scenario.quiescent("views_released")
                 released.result(timeout=5)
             assert settled["data"]["usage_bytes"] == settled["data"]["leases"] == 0
         else:
-            with pytest.raises(TimeoutError, match="callback_retained: data owner retained"):
-                scenario.quiescent("callback_retained", timeout=0)
-            assert scenario.checkpoints["callback_retained"]["data"]["usage_bytes"] > 0
+            with pytest.raises(TimeoutError, match="views_retained: data owner retained"):
+                scenario.quiescent("views_retained", timeout=0)
+            assert scenario.checkpoints["views_retained"]["data"]["usage_bytes"] > 0
     finally:
-        release_callback.set()
+        views.clear()
         scenario.close()
 
 

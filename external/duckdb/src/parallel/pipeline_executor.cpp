@@ -514,11 +514,19 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 				source_chunk.Reset();
 				source_result = FetchFromSource(source_chunk);
 				if (source_result == SourceResultType::BLOCKED) {
-					if (FlushSink(context, *pipeline.sink, *local_sink_state, interrupt_state, true) ==
-					    SinkResultType::FINISHED) {
+					auto pending = FlushSink(context, *pipeline.sink, *local_sink_state, interrupt_state, true);
+					if (pending == SinkResultType::FINISHED) {
 						FinishProcessing();
 						exhausted_pipeline = true;
 						continue;
+					}
+					if (pending == SinkResultType::BLOCKED) {
+						// The sink now owns this task's next wakeup. Drain source
+						// registrations so a later data event cannot be consumed by
+						// an obsolete epoch or a task still waiting for sink credit.
+						auto &source_state = pipeline.source_state->GetBlockingState();
+						auto guard = source_state.Lock();
+						source_state.UnblockTasks(guard);
 					}
 					return PipelineExecuteResult::INTERRUPTED;
 				}
@@ -649,11 +657,19 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 				}
 				source_result = FetchFromSourceBatch(source_batch);
 				if (source_result == SourceResultType::BLOCKED) {
-					if (FlushSink(context, *pipeline.sink, *local_sink_state, interrupt_state, true) ==
-					    SinkResultType::FINISHED) {
+					auto pending = FlushSink(context, *pipeline.sink, *local_sink_state, interrupt_state, true);
+					if (pending == SinkResultType::FINISHED) {
 						FinishProcessing();
 						exhausted_pipeline = true;
 						continue;
+					}
+					if (pending == SinkResultType::BLOCKED) {
+						// The sink now owns this task's next wakeup. Drain source
+						// registrations so a later data event cannot be consumed by
+						// an obsolete epoch or a task still waiting for sink credit.
+						auto &source_state = pipeline.source_state->GetBlockingState();
+						auto guard = source_state.Lock();
+						source_state.UnblockTasks(guard);
 					}
 					return PipelineExecuteResult::INTERRUPTED;
 				}
@@ -728,9 +744,10 @@ void PipelineExecutor::FinishProcessing(int32_t operator_idx) {
 	blocked_on_finalize = false;
 
 	if (pipeline.GetSource()) {
-		auto guard = pipeline.source_state->Lock();
-		pipeline.source_state->PreventBlocking(guard);
-		pipeline.source_state->UnblockTasks(guard);
+		auto &source_state = pipeline.source_state->GetBlockingState();
+		auto guard = source_state.Lock();
+		source_state.PreventBlocking(guard);
+		source_state.UnblockTasks(guard);
 	}
 	if (pipeline.GetSink()) {
 		auto guard = pipeline.GetSink()->sink_state->Lock();

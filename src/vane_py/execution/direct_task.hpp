@@ -23,6 +23,8 @@ struct DirectOutput {
 	// Empty means replicate to each output (one channel for GATHER). HASH is
 	// evaluated by the native fragment codec, never by the transport.
 	string partitioning;
+	// Bound once during preparation; no input vectors or connection state.
+	vector<idx_t> hash_columns;
 };
 
 struct DirectTaskStatus {

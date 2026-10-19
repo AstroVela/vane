@@ -39,7 +39,7 @@ struct FrameColumn {
 // are compacted: unused elements and borrowed operator buffers never enter a
 // frame. The limit bounds even the temporary selection used for nested values.
 bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &rows, FrameColumn &layout, idx_t &size,
-                      idx_t limit, data_ptr_t buffer = nullptr) {
+                      idx_t limit, data_ptr_t buffer = nullptr, bool contiguous = false) {
 	const auto &type = column.GetType();
 	auto width = FrameWidth(type);
 	auto count = rows.size();
@@ -57,9 +57,21 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &r
 	// A fixed-width vector's frame size depends only on row count, including
 	// its validity bitmap. Sizing must not flatten or revisit every value on
 	// each retry; copying below still resolves selections and NULL validity.
-	if (!buffer && physical != PhysicalType::STRUCT && physical != PhysicalType::LIST &&
-	    physical != PhysicalType::ARRAY && physical != PhysicalType::VARCHAR) {
-		return true;
+	if (physical != PhysicalType::STRUCT && physical != PhysicalType::LIST && physical != PhysicalType::ARRAY &&
+	    physical != PhysicalType::VARCHAR) {
+		if (!buffer) {
+			return true;
+		}
+		// Coalesced frames normally contain contiguous flat, non-NULL values.
+		// Copy those as one span, keeping selected/nullable/nested vectors on
+		// the value-wise path and preserving the same owned frame allocation.
+		if (contiguous && column.GetVectorType() == VectorType::FLAT_VECTOR &&
+		    FlatVector::Validity(column).CheckAllValid(source_count)) {
+			ValidityMask validity(reinterpret_cast<validity_t *>(buffer + layout.validity), count);
+			validity.SetAllValid(count);
+			memcpy(buffer + layout.values, FlatVector::GetData(column) + rows[0] * width, count * width);
+			return true;
+		}
 	}
 	UnifiedVectorFormat data;
 	column.ToUnifiedFormat(source_count, data);
@@ -164,16 +176,18 @@ idx_t Measure(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t c
 	}
 	vector<idx_t> selected;
 	selected.reserve(count);
+	bool contiguous = true;
 	for (idx_t i = offset; i < offset + count; i++) {
 		if (rows[i] >= input.size()) {
 			throw InvalidInputException("direct frame row selection is out of bounds");
 		}
+		contiguous = contiguous && rows[i] == rows[offset] + i - offset;
 		selected.push_back(rows[i]);
 	}
 	idx_t size = 0;
 	for (auto &column : input.data) {
 		FrameColumn layout;
-		if (!VisitFrameVector(column, input.size(), selected, layout, size, limit, buffer)) {
+		if (!VisitFrameVector(column, input.size(), selected, layout, size, limit, buffer, contiguous)) {
 			return AddSize(limit, 1);
 		}
 		if (columns) {

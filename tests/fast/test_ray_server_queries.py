@@ -79,6 +79,28 @@ def test_remote_sql_results_schema_and_retirement(server, mode, sql, expected, m
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_remote_compact_decimals_keep_public_schema(server, mode):
+    sql = (
+        "select range k, (range-6)::decimal(4,2) a, (100000000+range)::decimal(9,0) b, "
+        "case when range%4=0 then null else (range-6)::decimal(18,5) end c, "
+        "{'amount':range::decimal(38,2), 'small':[range::decimal(4,2),null], "
+        "'payload':'long binary payload\\x00\\xFF'::blob} v "
+        "from range(12) where range%3<>0 order by range"
+    )
+    with vane.connect(backend="local") as local, Client(server.location, token=TOKEN, execution=mode) as client:
+        for query in [sql, sql + " limit 0"]:
+            expected = local.execute(query).to_arrow_table()
+            with client.query(query) as result:
+                actual = result.collect()
+                actual.validate(full=True)
+                assert actual.schema == expected.schema
+                assert actual.equals(expected)
+            assert client.resource_snapshot()["active_results"] == 0
+            wait_until(lambda: idle(server), timeout=10)
+    assert server.service.snapshot()["sessions"] == 0
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
 def test_client_in_separate_process_never_connects_to_ray(server, mode):
     code = """
 import json, sys, ray

@@ -8,13 +8,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from threading import Event
+from threading import Condition, Event
+from types import SimpleNamespace
 
 import pytest
 
 from vane import IOException
 from vane._native import execution_runtime as native
 from vane.execution.fte_store import ActiveStoreLease, ExchangeStore, StorePool, replace_metadata
+from vane.execution.materialized_store import StorageCleanupPending
 
 
 def pool(tmp_path, **changes):
@@ -64,6 +66,257 @@ def test_registration_cannot_change_existing_store_capacity(tmp_path):
     original = pool(tmp_path)
     with pytest.raises(ValueError, match="conflicting"):
         StorePool(replace(original.config, capacity_bytes=8192))
+
+
+@pytest.mark.parametrize("capacity", [-1, True, 4096, (1 << 40) + 1])
+def test_source_cache_requires_a_finite_separate_store_reservation(tmp_path, capacity):
+    with pytest.raises(ValueError, match="cache|capacity"):
+        pool(tmp_path, source_cache_bytes=capacity)
+
+
+def test_source_cache_is_charged_until_explicit_store_close(tmp_path):
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+    try:
+        cache = store.source_cache(query)
+        assert cache.snapshot()["capacity_bytes"] == 1024
+        assert store.snapshot() == {"queries": 2, "reserved_bytes": 3072}
+        query.close(lambda: None)
+        assert store.snapshot() == {"queries": 1, "reserved_bytes": 1024}
+        store.close()
+        assert store.snapshot() == {"queries": 0, "reserved_bytes": 0}
+    finally:
+        query.close(lambda: None)
+        store.close()
+
+
+def test_worker_source_pin_survives_coordinator_pin_release(tmp_path):
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+    store.source_cache(query)
+    worker = ActiveStoreLease(query.to_dict())
+    cache_directory = store._cache_lease.directory
+    sentinel = cache_directory / "borrowed.parquet"
+    sentinel.write_bytes(b"native reader owns these bytes")
+    try:
+        # Model loss of the coordinator's source pin: the worker must own an
+        # independent lock, rather than depending on the sending process.
+        for source in query._source_pins:
+            source.close()
+        with pytest.raises(StorageCleanupPending, match="participants"):
+            store.close()
+        assert sentinel.read_bytes() == b"native reader owns these bytes"
+        assert store.snapshot()["reserved_bytes"] == 3072
+        worker.close()
+        query.close(lambda: None)
+        store.close()
+        assert not cache_directory.exists()
+        assert store.snapshot()["reserved_bytes"] == 0
+    finally:
+        worker.close()
+        query.close(lambda: None)
+        store.close()
+
+
+@pytest.mark.parametrize("metadata_lock_busy", [False, True])
+def test_idle_source_cache_renews_its_lease(tmp_path, monkeypatch, metadata_lock_busy):
+    from vane.execution import fte_store
+
+    now = time.time()
+    monkeypatch.setattr(
+        fte_store, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic, sleep=time.sleep)
+    )
+    store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=0.5)
+    query = store.reserve("query")
+    blocker = None
+    try:
+        store.source_cache(query)
+        query.close(lambda: None)
+        owner = store._cache_lease
+        record = store.allocations / f"{owner.value['namespace']}.json"
+        original_expiry = fte_store._read(record)["expires"]
+        completed_expiry = original_expiry
+        renewed = Condition()
+        renew = owner.renew
+
+        def notify_renewal():
+            nonlocal completed_expiry
+            renew()
+            with renewed:
+                # A visible replacement can precede a failed directory sync.
+                # Publish completion only after renewal returns successfully.
+                completed_expiry = fte_store._read(record)["expires"]
+                renewed.notify_all()
+
+        monkeypatch.setattr(owner, "renew", notify_renewal)
+        if metadata_lock_busy:
+            blocker = native.StoreGuard.acquire(str(store.root / "allocation.lock"), True, True)
+            assert blocker is not None
+            acquire = fte_store.store_lock
+            monkeypatch.setattr(fte_store, "store_lock", lambda path, **kw: acquire(path, timeout=0.02))
+        # Exercise the real heartbeat beyond the original expiry without
+        # requiring the CI scheduler or fsync to finish within a 0.5s lease.
+        for _ in range(3):
+            with renewed:
+                now += 0.25
+                assert renewed.wait_for(lambda: completed_expiry >= now + store.config.lease_seconds, timeout=5)
+        assert now > original_expiry
+        assert store._cache_error is None
+        pin = ActiveStoreLease(owner.to_dict())
+        try:
+            assert pin.check()["expires"] > original_expiry
+        finally:
+            pin.close()
+    finally:
+        if blocker is not None:
+            blocker.close()
+        query.close(lambda: None)
+        store.close()
+    assert store.snapshot()["reserved_bytes"] == 0
+
+
+def test_failed_source_cache_creation_returns_its_reservation(tmp_path, monkeypatch):
+    from vane._native import execution_plan
+
+    store = pool(tmp_path, source_cache_bytes=1024)
+    query = store.reserve("query")
+
+    def fail(*args):
+        raise RuntimeError("cache creation failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(execution_plan, "SourceSnapshotCache", fail)
+            with pytest.raises(RuntimeError, match="cache creation failed"):
+                store.source_cache(query)
+        assert store.snapshot() == {"queries": 1, "reserved_bytes": 2048}
+        store.source_cache(query)
+        assert store.snapshot()["reserved_bytes"] == 3072
+    finally:
+        query.close(lambda: None)
+        store.close()
+
+
+def test_failed_source_cache_heartbeat_fences_later_queries(tmp_path, monkeypatch):
+    store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=0.5)
+    first = store.reserve("first")
+    second = None
+    try:
+        store.source_cache(first)
+        first.close(lambda: None)
+
+        def fail():
+            raise OSError("cache heartbeat failed")
+
+        monkeypatch.setattr(store._cache_lease, "renew", fail)
+        deadline = time.monotonic() + 5
+        while store._cache_error is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        second = store.reserve("second")
+        with pytest.raises(RuntimeError, match="source snapshot cache lease failed"):
+            store.source_cache(second)
+        assert store.snapshot()["reserved_bytes"] == 3072
+    finally:
+        first.close(lambda: None)
+        if second is not None:
+            second.close(lambda: None)
+        store.close()
+    assert store.snapshot()["reserved_bytes"] == 0
+
+
+def test_background_collection_defers_a_busy_metadata_lock(tmp_path):
+    store = pool(tmp_path)
+    orphan = store.reserve("orphan")
+    record = store.allocations / f"{orphan.value['namespace']}.json"
+    replace_metadata(record, {**orphan.value, "expires": time.time() - 1})
+    orphan.guard.close()
+    blocker = native.StoreGuard.acquire(str(store.root / "allocation.lock"), True, True)
+    assert blocker is not None
+    try:
+        with ThreadPoolExecutor(1) as workers:
+            try:
+                workers.submit(store.request_collection).result(timeout=1)
+                assert orphan.directory.exists() and record.exists()
+            finally:
+                blocker.close()
+        store.request_collection()
+        store._collection_thread.join(timeout=5)
+        assert not store._collection_thread.is_alive()
+        assert not orphan.directory.exists() and not record.exists()
+    finally:
+        blocker.close()
+        orphan.close(lambda: None)
+    assert store.snapshot()["reserved_bytes"] == 0
+
+
+def test_slow_renewal_keeps_other_leases_independent_and_serializes_own_close(tmp_path, monkeypatch):
+    from vane.execution import fte_store
+
+    store = pool(tmp_path, capacity_bytes=8192)
+    slow, live = store.reserve("slow"), store.reserve("live")
+    record = store.allocations / f"{slow.value['namespace']}.json"
+    publish = fte_store.replace_metadata
+    entered, release = Event(), Event()
+    extra = None
+    progressing = None
+
+    def slow_sync(path, value):
+        if path == record and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "test did not release metadata sync"
+        publish(path, value)
+
+    def other_work():
+        live.renew()
+        store.collect_expired()
+        return store.reserve("extra")
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(3) as workers:
+            patch.setattr(fte_store, "replace_metadata", slow_sync)
+            renewing = workers.submit(slow.renew)
+            try:
+                assert entered.wait(5)
+                closing = workers.submit(slow.close, lambda: None)
+                progressing = workers.submit(other_work)
+                extra = progressing.result(timeout=2)
+                assert store.snapshot() == {"queries": 3, "reserved_bytes": 6144}
+                assert not closing.done()
+            finally:
+                release.set()
+                renewing.result(timeout=5)
+            closing.result(timeout=5)
+            assert not record.exists()
+    finally:
+        release.set()
+        if extra is None and progressing is not None:
+            extra = progressing.result(timeout=5)
+        for lease in (slow, live, extra):
+            if lease is not None:
+                lease.close(lambda: None)
+    assert store.snapshot()["reserved_bytes"] == 0
+
+
+@pytest.mark.parametrize("invalid", ["recursive", "foreign_store", "too_many"])
+def test_source_lease_wire_rejects_unbounded_or_foreign_pins(tmp_path, invalid):
+    store, other = pool(tmp_path), pool(tmp_path / "other")
+    query, foreign = store.reserve("query"), other.reserve("foreign")
+    wire = query.to_dict()
+    if invalid == "recursive":
+        wire["source_leases"] = [wire]
+    elif invalid == "foreign_store":
+        wire["source_leases"] = [foreign.to_dict()]
+    else:
+        wire["source_leases"] = [foreign.to_dict(), foreign.to_dict()]
+    try:
+        with pytest.raises(ValueError, match="source cache"):
+            ActiveStoreLease(wire)
+        query.close(lambda: None)
+        assert store.snapshot()["reserved_bytes"] == 0
+    finally:
+        query.close(lambda: None)
+        foreign.close(lambda: None)
 
 
 def test_live_native_pin_blocks_query_cleanup(tmp_path):
@@ -141,6 +394,24 @@ def test_lease_renewal_keeps_a_live_query_from_expiring(tmp_path):
         assert lease.directory.exists()
     finally:
         worker.close()
+        lease.close(lambda: None)
+
+
+def test_lease_renewal_does_not_hide_storage_sync_timeouts(tmp_path, monkeypatch):
+    from vane.execution import fte_store
+
+    store = pool(tmp_path)
+    lease = store.reserve("query")
+
+    def fail(*args):
+        raise TimeoutError("metadata sync timed out")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(fte_store, "replace_metadata", fail)
+            with pytest.raises(TimeoutError, match="metadata sync timed out"):
+                lease.renew()
+    finally:
         lease.close(lambda: None)
 
 

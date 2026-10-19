@@ -5,6 +5,7 @@
 
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -16,7 +17,7 @@ from vane.execution.resource_demand import MemoryDemand, ResourceDemand
 from vane.execution.submission import RayQuerySpec, prepare_worker_plan, stage_ray_query
 
 
-def stage(connection, sql, directory, budget=1 << 20):
+def stage(connection, sql, directory, budget=1 << 20, *, cache=None):
     return stage_ray_query(
         connection,
         sql,
@@ -26,6 +27,7 @@ def stage(connection, sql, directory, budget=1 << 20):
         compile_options=FragmentCompileOptions(1),
         source_directory=str(directory),
         source_budget=budget,
+        source_cache=cache,
     )
 
 
@@ -60,6 +62,121 @@ def test_snapshot_sha256_matches_independent_digest(tmp_path, rows):
     splits = [s for f in spec.graph.fragments for source in f.sources + f.source_dependencies for s in source.splits]
     assert splits and all(digest in s.payload for s in splits)
     assert len(run(spec)) == rows
+
+
+@pytest.mark.parametrize("predicate", ["", " where value > 10"])
+def test_versioned_source_cache_reuses_only_unchanged_files(tmp_path, predicate):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20)
+    sql = f"select value from read_parquet('{path}')" + predicate
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        original = path.stat()
+        first, size = stage(connection, sql, tmp_path / "first", cache=cache)
+        again, repeated_size = stage(connection, sql, tmp_path / "again", cache=cache)
+        assert size == repeated_size == original.st_size
+        assert cache.snapshot()["hits"] == 1
+        assert cache.snapshot()["entries"] == 1
+        assert cache.snapshot()["used_bytes"] == size
+        assert not list((tmp_path / "again").rglob("*.parquet"))
+        connection.execute(f"copy (select 20 as value) to '{path}' (overwrite true)")
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        changed, _ = stage(connection, sql, tmp_path / "changed", cache=cache)
+    assert run(first) == run(again) == ([] if predicate else [(1,)])
+    assert run(changed) == [(20,)]
+    assert cache.snapshot()["entries"] == 2
+    assert cache.snapshot()["hits"] == 1
+
+
+def test_source_cache_never_serves_a_deleted_original(tmp_path):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20)
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select value from read_parquet('{path}')"
+        first, _ = stage(connection, sql, tmp_path / "first", cache=cache)
+        path.unlink()
+        with pytest.raises(Exception, match="No files|does not exist|not found"):
+            stage(connection, sql, tmp_path / "missing", cache=cache)
+    assert run(first) == [(1,)]
+
+
+def test_source_cache_rejects_damaged_copies_even_with_restored_mtime(tmp_path):
+    path = tmp_path / "original.parquet"
+    directory = tmp_path / "cache"
+    cache = execution_plan.SourceSnapshotCache(str(directory), 1 << 20)
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select value from read_parquet('{path}')"
+        first, _ = stage(connection, sql, tmp_path / "first", cache=cache)
+        frozen = next(directory.rglob("*.parquet"))
+        stamp, contents = frozen.stat(), frozen.read_bytes()
+        frozen.write_bytes(contents[:10] + bytes([contents[10] ^ 1]) + contents[11:])
+        os.utime(frozen, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        with pytest.raises(Exception, match="cached source snapshot changed"):
+            stage(connection, sql, tmp_path / "again", cache=cache)
+    with pytest.raises(Exception, match="snapshot changed"):
+        run(first)
+
+
+def test_full_source_cache_falls_back_to_query_owned_copies(tmp_path):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1)
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select value from read_parquet('{path}')"
+        first, _ = stage(connection, sql, tmp_path / "first", cache=cache)
+        second, _ = stage(connection, sql, tmp_path / "second", cache=cache)
+    assert run(first) == run(second) == [(1,)]
+    assert len(list((tmp_path / "first").rglob("*.parquet"))) == 1
+    assert len(list((tmp_path / "second").rglob("*.parquet"))) == 1
+    assert cache.snapshot()["entries"] == cache.snapshot()["used_bytes"] == 0
+    assert cache.snapshot()["bypasses"] == 2
+
+
+def test_source_cache_still_enforces_each_query_source_budget(tmp_path):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20)
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+        sql = f"select value from read_parquet('{path}')"
+        with pytest.raises(Exception, match="storage capacity"):
+            stage(connection, sql, tmp_path / "too-small", 1, cache=cache)
+        assert cache.snapshot()["used_bytes"] == 0
+        first, _ = stage(connection, sql, tmp_path / "first", cache=cache)
+        with pytest.raises(Exception, match="storage capacity"):
+            stage(connection, sql, tmp_path / "cached-too-small", 1, cache=cache)
+    assert run(first) == [(1,)]
+
+
+def test_concurrent_source_cache_misses_copy_one_version_once(tmp_path):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20)
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 1 as value) to '{path}'")
+
+    def submit(index):
+        with vane.connect(backend="local") as connection:
+            return stage(connection, f"select value from read_parquet('{path}')", tmp_path / str(index), cache=cache)[0]
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        specs = list(workers.map(submit, range(4)))
+    assert all(run(spec) == [(1,)] for spec in specs)
+    assert cache.snapshot()["misses"] == cache.snapshot()["entries"] == 1
+    assert cache.snapshot()["hits"] == 3
+
+
+def test_source_cache_rejects_globs_that_include_retained_snapshots(tmp_path):
+    path = tmp_path / "original.parquet"
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20)
+    sql = f"select value from read_parquet('{tmp_path}/**/*.parquet')"
+    with vane.connect(backend="local") as connection:
+        connection.execute(f"copy (select 42 as value) to '{path}'")
+        first, _ = stage(connection, sql, tmp_path / "first", cache=cache)
+        with pytest.raises(Exception, match="source patterns include snapshot cache files"):
+            stage(connection, sql, tmp_path / "again", cache=cache)
+    assert run(first) == [(42,)]
+    assert cache.snapshot()["entries"] == 1
 
 
 @pytest.mark.parametrize("predicate", ["", " where value > 10"])
@@ -106,7 +223,9 @@ def test_frozen_identity_detects_damage_with_restored_mtime(tmp_path, predicate,
         run(spec)
 
 
-def test_hive_paths_are_preserved_and_globs_are_not_reexpanded(tmp_path):
+@pytest.mark.parametrize("cached", [False, True])
+def test_hive_paths_are_preserved_and_globs_are_not_reexpanded(tmp_path, cached):
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20) if cached else None
     with vane.connect(backend="local") as connection:
         for part in (1, 2):
             directory = tmp_path / f"part={part}"
@@ -117,6 +236,7 @@ def test_hive_paths_are_preserved_and_globs_are_not_reexpanded(tmp_path):
             f"select part, value from read_parquet('{tmp_path}/part=*/*.parquet', "
             "hive_partitioning=true) where part = 2",
             tmp_path / "snapshots",
+            cache=cache,
         )
     assert run(spec) == [(2, 20)]
 
@@ -231,7 +351,8 @@ def test_snapshot_and_guard_support_unicode_paths(tmp_path):
         guard.close()
 
 
-def test_interrupted_staging_does_not_poison_the_planning_connection(tmp_path):
+@pytest.mark.parametrize("cached", [False, True])
+def test_interrupted_staging_does_not_poison_the_planning_connection(tmp_path, cached):
     import time
     from concurrent.futures import ThreadPoolExecutor
 
@@ -241,8 +362,11 @@ def test_interrupted_staging_does_not_poison_the_planning_connection(tmp_path):
     with path.open("wb") as handle:
         handle.truncate(512 << 20)
     directory = tmp_path / "snapshots"
+    cache = execution_plan.SourceSnapshotCache(str(directory), 1 << 30) if cached else None
     with vane.connect(backend="local") as connection, ThreadPoolExecutor(1) as executor:
-        future = executor.submit(stage, connection, f"select * from read_parquet('{path}')", directory, 1 << 30)
+        future = executor.submit(
+            stage, connection, f"select * from read_parquet('{path}')", directory, 1 << 30, cache=cache
+        )
         deadline = time.monotonic() + 5
         while not any(p.stat().st_size > 0 for p in directory.rglob("*.parquet")):
             assert not future.done()
@@ -251,6 +375,9 @@ def test_interrupted_staging_does_not_poison_the_planning_connection(tmp_path):
         connection.interrupt()
         with pytest.raises(vane.InterruptException):
             future.result(timeout=5)
+        if cached:
+            assert cache.snapshot()["used_bytes"] == cache.snapshot()["entries"] == 0
+            assert not list(directory.rglob("*.parquet"))
         assert connection.execute("select 42").fetchone() == (42,)
         spec, _ = stage(connection, "select range from range(3)", tmp_path / "second")
         assert run(spec) == [(0,), (1,), (2,)]
@@ -413,7 +540,9 @@ def test_parent_traversal_preserves_hive_schema_values_and_pruning(tmp_path, col
 
 
 @pytest.mark.parametrize("second", [42, 99])
-def test_physical_aliases_keep_distinct_hive_values(tmp_path, second):
+@pytest.mark.parametrize("cached", [False, True])
+def test_physical_aliases_keep_distinct_hive_values(tmp_path, second, cached):
+    cache = execution_plan.SourceSnapshotCache(str(tmp_path / "cache"), 1 << 20) if cached else None
     for value in {42, second}:
         (tmp_path / f"part={value}").mkdir()
     path = tmp_path / "data.parquet"
@@ -423,7 +552,11 @@ def test_physical_aliases_keep_distinct_hive_values(tmp_path, second):
         sql += f"'{tmp_path}/part={second}/./../data.parquet'], hive_partitioning=true)"
         expected = connection.execute(sql).fetchall()
         budget = path.stat().st_size * (1 if second == 42 else 2)
-        spec, used = stage(connection, sql, tmp_path / "store", budget=budget)
+        spec, used = stage(connection, sql, tmp_path / "store", budget=budget, cache=cache)
+        if cached:
+            repeated, _ = stage(connection, sql, tmp_path / "repeated", budget=budget, cache=cache)
+            assert sorted(run(repeated)) == sorted(expected)
+            assert cache.snapshot()["entries"] == cache.snapshot()["hits"] == (1 if second == 42 else 2)
     assert used == budget
     assert sorted(run(spec)) == sorted(expected) == [(1, 42), (1, second)]
 

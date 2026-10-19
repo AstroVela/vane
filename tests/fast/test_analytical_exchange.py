@@ -385,9 +385,10 @@ def test_build_barrier_precedes_probe_reads(threads):
     from vane._native import execution_plan as plan
 
     with vane.connect(backend="local", config={"threads": threads}) as connection:
-        # Keep both inputs above the broadcast threshold so the probe is an
-        # exchange channel whose unread frames can be observed at the barrier.
-        spec = submission(connection, "select a.range from range(50) a join range(40) b using(range)", partitions=2)
+        # Both inputs exceed the tiny-build threshold, and two extra build
+        # replicas cost more than shuffling the probe. Keep a hash exchange
+        # whose unread probe frames can be observed at the build barrier.
+        spec = submission(connection, "select a.range from range(50) a join range(40) b using(range)", partitions=3)
         fragment = next(f for f in spec.graph.fragments if len(f.inputs) == 2)
         incoming = [e for e in spec.graph.exchanges if e.consumer_fragment_id == fragment.fragment_id]
         channels, rows = {}, {}

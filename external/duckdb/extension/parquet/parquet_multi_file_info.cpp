@@ -13,6 +13,7 @@
 #include "duckdb/execution/distributed/process_id.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -232,6 +233,82 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 		}
 	}
 	return result;
+}
+
+bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
+                                idx_t column) {
+	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
+	// Schema mappings, virtual columns and casts require a separate proof. In
+	// particular, comparing file statistics before a lossy cast is not sufficient.
+	if (column >= bind.types.size() || column >= bind.names.size() || !bind.types[column].IsIntegral() ||
+	    bind.file_options.union_by_name || bind.file_options.hive_partitioning || !options.schema.empty() ||
+	    !bind.reader_bind.schema.empty()) {
+		return false;
+	}
+	vector<pair<Value, Value>> ranges;
+	for (auto &split : splits) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		ParquetReader reader(context, split, options);
+		optional_ptr<const ParquetColumnSchema> schema;
+		for (auto &child : reader.root_schema->children) {
+			if (child.name == bind.names[column]) {
+				schema = &child;
+				break;
+			}
+		}
+		if (!schema || schema->type != bind.types[column] || schema->schema_type != ParquetColumnSchemaType::COLUMN ||
+		    !schema->children.empty() || schema->max_repeat != 0) {
+			return false;
+		}
+		vector<idx_t> groups;
+		ParseRowGroupIdsFromOpenFile(split, groups);
+		if (groups.empty()) {
+			for (idx_t i = 0; i < reader.NumRowGroups(); i++) {
+				groups.push_back(i);
+			}
+		}
+		Value lower, upper;
+		auto &metadata = *reader.GetFileMetadata();
+		for (auto group : groups) {
+			if (group >= metadata.row_groups.size()) {
+				return false;
+			}
+			auto &row_group = metadata.row_groups[group];
+			if (row_group.num_rows == 0) {
+				continue;
+			}
+			auto stats = schema->Stats(metadata, options, group, row_group.columns);
+			// NULL is one SQL group too, even when non-null ranges are disjoint.
+			if (!stats || stats->CanHaveNull() || !NumericStats::HasMinMax(*stats)) {
+				return false;
+			}
+			auto min = NumericStats::Min(*stats);
+			auto max = NumericStats::Max(*stats);
+			if (min.IsNull() || max.IsNull() || min > max) {
+				return false;
+			}
+			if (lower.IsNull() || min < lower) {
+				lower = std::move(min);
+			}
+			if (upper.IsNull() || max > upper) {
+				upper = std::move(max);
+			}
+		}
+		if (!lower.IsNull()) {
+			ranges.emplace_back(std::move(lower), std::move(upper));
+		}
+	}
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const pair<Value, Value> &a, const pair<Value, Value> &b) { return a.first < b.first; });
+	for (idx_t i = 1; i < ranges.size(); i++) {
+		// Equality at a boundary means a group may span both splits.
+		if (ranges[i - 1].second >= ranges[i].first) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static void BindSchema(ClientContext &context, vector<LogicalType> &return_types, vector<string> &names,

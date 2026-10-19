@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Complete groups proven from the exact Parquet split ranges."""
+
+from collections import Counter
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import vane
+from tests.fast.test_direct_exchange import collect, submission
+from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
+from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
+from vane.execution.plan import Distribution
+
+
+def disjoint_aggregate_query(directory, variant="disjoint"):
+    # Four rows per group, with ranges too wide for native key compression.
+    keys = [(i // 4) * 10**15 for i in range(16384)]
+    values = [100 if i // 4 % 512 == 0 else 1 for i in range(16384)]
+    if variant == "overlap":
+        keys[8192] = keys[8191]
+    elif variant == "nulls":
+        for i in [*range(4), *range(8192, 8196)]:
+            keys[i] = None
+    elif variant == "unsorted":
+        keys[8192:] = keys[:8192]
+    elif variant == "unsigned":
+        keys = [key + 2**63 for key in keys]
+    elif variant == "negative":
+        keys = [key - 2**62 for key in keys]
+    key_type = pa.uint64() if variant == "unsigned" else pa.int64()
+    table = pa.table({"k": pa.array(keys, type=key_type), "v": values})
+    path = directory / "groups.parquet"
+    pq.write_table(table, path, row_group_size=2048, write_statistics=variant != "missing_stats")
+    files = f"'{path}'"
+    if variant == "repeated":
+        files = f"['{path}', '{path}']"
+    elif variant in {"multiple", "empty_file"}:
+        other = directory / "other.parquet"
+        split = 8192 if variant == "multiple" else 0
+        pq.write_table(table.slice(0, split), path, row_group_size=2048)
+        pq.write_table(table.slice(split), other, row_group_size=2048)
+        files = f"['{path}', '{other}']"
+    key = {"computed": "k % 4000000000000000", "cast": "k::double"}.get(variant, "k")
+    source = f"select v, {key} k from read_parquet({files}) where v > 0"
+    return (
+        f"select k, sum(v::decimal(15,2)) s, count(*) n from ({source}) "
+        "group by k having sum(v::decimal(15,2)) > 300 order by k nulls last"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3, 5])
+@pytest.mark.parametrize("threads", [1, 4])
+def test_complete_parquet_groups_filter_before_exchange(tmp_path, partitions, threads):
+    sql = disjoint_aggregate_query(tmp_path)
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert len(expected) == 8
+        spec = submission(connection, sql, partitions=partitions)
+        limits = DirectExchangeLimits(window_bytes=4096, frame_bytes=2048, frame_rows=32, frame_slots=2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            # Only qualifying groups and final results need to be transported.
+            assert sum(c.snapshot()["accepted_rows"] for c in service.channels.values()) == 2 * len(expected)
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+
+
+@pytest.mark.parametrize(
+    "variant,complete",
+    [
+        ("unsigned", True),
+        ("negative", True),
+        ("multiple", True),
+        ("empty_file", True),
+        ("overlap", False),
+        ("nulls", False),
+        ("unsorted", False),
+        ("missing_stats", False),
+        ("repeated", False),
+        ("computed", False),
+        ("cast", False),
+    ],
+)
+def test_parquet_group_ranges_require_complete_evidence(tmp_path, variant, complete):
+    sql = disjoint_aggregate_query(tmp_path, variant)
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, 2)
+        assert Counter(execute_graph(connection, graph)) == expected
+        assert any(edge.distribution is Distribution.HASH for edge in graph.exchanges) != complete
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [
+        "count(distinct v), sum(distinct v), avg(v) filter(where v > 1)",
+        "min(v, 2), max(v, 2), count(*) filter(where v < 0)",
+        "sum(v::double order by v desc), avg(v::double order by v)",
+        "sum(v::decimal(38,2)) filter(where v > 1), avg(v::hugeint)",
+    ],
+)
+def test_complete_parquet_groups_preserve_aggregate_semantics(tmp_path, aggregate):
+    disjoint_aggregate_query(tmp_path)
+    path = tmp_path / "groups.parquet"
+    # A second nullable grouping key cannot merge groups whose first key is
+    # already disjoint. Ordered, distinct and wide accumulators stay native.
+    sql = (
+        f"select k, v % 3 g, {aggregate} from "
+        f"(select k, case when k % 3 = 0 then null else v end v from read_parquet('{path}')) "
+        "group by k, g"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        actual = execute_graph(connection, graph)
+        assert sorted(actual, key=lambda row: row[0]) == sorted(expected, key=lambda row: row[0])
+        assert all(edge.distribution is Distribution.GATHER for edge in graph.exchanges)
+
+
+def test_group_ranges_do_not_cross_join_or_aggregate_boundaries(tmp_path):
+    disjoint_aggregate_query(tmp_path)
+    path = tmp_path / "groups.parquet"
+    queries = [
+        f"select k % 2 g, sum(s) from (select k, sum(v) s from read_parquet('{path}') group by k) group by g",
+        f"select b.range g, sum(a.v) from read_parquet('{path}') a join range(2) b on a.k % 2 = b.range group by g",
+        f"select sum(v), count(*) from read_parquet('{path}')",
+    ]
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        for sql in queries:
+            assert Counter(execute_graph(connection, compile_sql(connection, sql, 3))) == Counter(
+                connection.execute(sql).fetchall()
+            )
+
+
+@pytest.mark.parametrize("variant", ["union_by_name", "file_cast", "row_number"])
+def test_parquet_group_ranges_do_not_assume_file_schema_mapping(tmp_path, variant):
+    disjoint_aggregate_query(tmp_path)
+    path = tmp_path / "groups.parquet"
+    other = tmp_path / "other.parquet"
+    table = pq.read_table(path)
+    if variant == "file_cast":
+        table = table.set_column(0, "k", table["k"].cast(pa.float64(), safe=False))
+    pq.write_table(table, other, row_group_size=2048)
+    option = ", union_by_name=true" if variant == "union_by_name" else ""
+    key = "k"
+    if variant == "row_number":
+        option, key = ", file_row_number=true", "file_row_number"
+    sql = f"select {key}, sum(v) from read_parquet(['{path}', '{other}']{option}) group by {key}"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = Counter(connection.execute(sql).fetchall())
+        graph = compile_sql(connection, sql, 2)
+        assert Counter(execute_graph(connection, graph)) == expected
+        assert any(edge.distribution is Distribution.HASH for edge in graph.exchanges)
+
+
+def test_complete_groups_keep_ordered_sum_when_widening_other_accumulators(tmp_path):
+    disjoint_aggregate_query(tmp_path)
+    path = tmp_path / "groups.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(1, "v", pa.array([1e16, 1.0, -1e16, 2.0] * 4096))
+    table = table.append_column("i", pa.array(range(len(table))))
+    pq.write_table(table, path, row_group_size=2048)
+    sql = (
+        f"select k, sum(v order by i), sum(v order by i desc), sum(i::hugeint) "
+        f"from read_parquet('{path}') group by k order by k"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == expected
+        assert all(edge.distribution is Distribution.GATHER for edge in graph.exchanges)

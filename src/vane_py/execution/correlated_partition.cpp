@@ -9,6 +9,7 @@
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
@@ -103,6 +104,79 @@ struct Flow {
 	Keys keys;
 };
 
+// Trace an unchanged key through inner joins to a scan containing every value
+// the delimiter owner can produce. Do not cross null-extending joins, casts,
+// aggregates, or another shared-state scope. A scan is cheap to duplicate and
+// does not introduce a dependency cycle back to the delimiter being filtered.
+void FindKeySource(PhysicalOperator &op, idx_t column, const LogicalType &type, CorrelatedKeySource &result) {
+	if (column >= op.types.size() || op.types[column] != type) {
+		return;
+	}
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		// Repeated reads of bound Parquet files have the same key domain.
+		// Arbitrary table functions need not be deterministic across scans.
+		auto &name = op.Cast<PhysicalTableScan>().function.name;
+		if (name != "read_parquet" && name != "parquet_scan") {
+			return;
+		}
+		if (op.estimated_cardinality &&
+		    (!result.source || op.estimated_cardinality < result.source->estimated_cardinality)) {
+			result.source = &op;
+			result.column = column;
+		}
+		return;
+	}
+	if (op.type == PhysicalOperatorType::FILTER) {
+		FindKeySource(op.children[0], column, type, result);
+		return;
+	}
+	if (op.type == PhysicalOperatorType::PROJECTION) {
+		auto &expression = *op.Cast<PhysicalProjection>().select_list[column];
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			FindKeySource(op.children[0], expression.Cast<BoundReferenceExpression>().index, type, result);
+		}
+		return;
+	}
+	if (op.type != PhysicalOperatorType::HASH_JOIN) {
+		return;
+	}
+	auto &join = op.Cast<PhysicalHashJoin>();
+	if (join.join_type != JoinType::INNER) {
+		return;
+	}
+	idx_t side, input_column;
+	if (column < join.lhs_output_columns.col_idxs.size()) {
+		side = 0;
+		input_column = join.lhs_output_columns.col_idxs[column];
+	} else {
+		side = 1;
+		auto index = join.rhs_output_columns.col_idxs[column - join.lhs_output_columns.col_idxs.size()];
+		if (index < join.conditions.size()) {
+			auto &key = *join.conditions[index].right;
+			if (key.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				return;
+			}
+			input_column = key.Cast<BoundReferenceExpression>().index;
+		} else {
+			input_column = join.payload_columns.col_idxs[index - join.conditions.size()];
+		}
+	}
+	FindKeySource(join.children[side], input_column, type, result);
+	for (auto &condition : join.conditions) {
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
+		    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			continue;
+		}
+		auto &key = side == 0 ? *condition.left : *condition.right;
+		auto &other = side == 0 ? *condition.right : *condition.left;
+		if (key.GetExpressionClass() == ExpressionClass::BOUND_REF && key.return_type == type &&
+		    key.Cast<BoundReferenceExpression>().index == input_column &&
+		    other.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			FindKeySource(join.children[1 - side], other.Cast<BoundReferenceExpression>().index, type, result);
+		}
+	}
+}
+
 class Locality {
 public:
 	Locality(PhysicalDelimJoin &root, idx_t group, idx_t owner_column, const LogicalType &key_type)
@@ -119,6 +193,16 @@ public:
 		}
 		result.inputs.emplace(&owner, optional_idx(owner_column));
 		auto output = Visit(root.join);
+		if (output.valid && output.partitioned) {
+			CorrelatedKeyFilter filter;
+			FindKeySource(owner, owner_column, key_type, filter.scan);
+			filter.owner.source = &owner;
+			filter.owner.column = owner_column;
+			for (auto &input : filterable_inputs) {
+				filter.estimated_matching_rows = input.second;
+				result.filters.emplace(input.first, filter);
+			}
+		}
 		return output.valid && output.partitioned;
 	}
 
@@ -127,6 +211,7 @@ private:
 	idx_t group;
 	idx_t owner_column;
 	const LogicalType &key_type;
+	unordered_map<const PhysicalOperator *, idx_t> filterable_inputs;
 
 	Flow Seed(idx_t columns, idx_t column) {
 		Flow result(columns);
@@ -140,7 +225,8 @@ private:
 
 	// Only hash an independent input when equality identifies the original key,
 	// in the same native type. Other complete inputs can safely be broadcast.
-	void MatchInput(Flow &input, const Expression &input_key, const Flow &other, const Expression &other_key) {
+	void MatchInput(Flow &input, const Expression &input_key, const Flow &other, const Expression &other_key,
+	                bool filterable, idx_t estimated_matching_rows) {
 		if (!input.boundary || input.partitioned || !other.partitioned ||
 		    input_key.GetExpressionClass() != ExpressionClass::BOUND_REF || input_key.return_type != key_type) {
 			return;
@@ -157,6 +243,18 @@ private:
 		saved_broadcast_rows += double(input.boundary->estimated_cardinality);
 		input.partitioned = true;
 		input.keys[index] = std::move(key);
+		if (filterable) {
+			filterable_inputs.emplace(input.boundary, estimated_matching_rows);
+		}
+	}
+
+	bool IsOwnedScan(const PhysicalOperator &op) const {
+		for (auto &scan : root.delim_scans) {
+			if (&scan.get() == &op) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	Flow Join(PhysicalHashJoin &join) {
@@ -173,13 +271,18 @@ private:
 			return output;
 		}
 		bool colocated = false;
+		// A residual or second key can reduce the join without making this
+		// one-key filter selective. Keep those estimates out of its costing.
+		const auto estimated_matching_rows = join.conditions.size() == 1 ? join.estimated_cardinality : 0;
 		for (auto &condition : join.conditions) {
 			if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
 			    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 				continue;
 			}
-			MatchInput(left, *condition.left, right, *condition.right);
-			MatchInput(right, *condition.right, left, *condition.left);
+			MatchInput(left, *condition.left, right, *condition.right,
+			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[1]), estimated_matching_rows);
+			MatchInput(right, *condition.right, left, *condition.left,
+			           join.join_type == JoinType::INNER && IsOwnedScan(join.children[0]), estimated_matching_rows);
 			auto lk = CopyKey(*condition.left, left.keys);
 			auto rk = CopyKey(*condition.right, right.keys);
 			colocated = colocated || (lk && rk && lk->Equals(*rk));

@@ -105,19 +105,35 @@ def _assert_idle(runtime):
     assert state["request_admission"]["active_requests"] == 0
     assert state["request_admission"]["queued_requests"] == 0
     if state.get("data") is not None:
-        # The completed future's callback can still hold its output while
-        # unwinding after the native query has returned and retired its request.
-        deadline = time.monotonic() + 5
-        while state["data"]["usage_bytes"] and time.monotonic() < deadline:
-            time.sleep(0.001)
-            state = runtime.resource_snapshot()
         assert state["data"]["usage_bytes"] == 0, state["data"]
+
+
+@pytest.fixture
+def retained_native_results(monkeypatch, native_environment):
+    from vane.execution.udf_subprocess import UDFExecutor
+
+    results = []
+    take = UDFExecutor.take_ready_result
+
+    def take_and_retain(executor, *args, **kwargs):
+        result = take(executor, *args, **kwargs)
+        if result is not None:
+            # Keep the dispatcher's Python containers alive after native
+            # consumption, as a delayed delivery frame can in production.
+            results.append(result)
+        return result
+
+    monkeypatch.setattr(UDFExecutor, "take_ready_result", take_and_retain)
+    try:
+        yield results
+    finally:
+        results.clear()
 
 
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("prewarm", [False, True])
 @pytest.mark.parametrize("budgets", [False, True])
-def test_sql_and_rebuilt_relations_reuse_explicit_model(tmp_path, batch, prewarm, budgets):
+def test_sql_and_rebuilt_relations_reuse_explicit_model(tmp_path, retained_native_results, batch, prewarm, budgets):
     options = {"offset": 10}
     with vane.connect(config={"threads": 2}) as connection:
         runtime = (
@@ -467,10 +483,11 @@ def test_model_initialization_uses_captured_session_environment(monkeypatch):
             _assert_idle(runtime)
 
 
-def test_model_idle_check_waits_for_completion_callback_refs(tmp_path, monkeypatch):
+@pytest.mark.timeout(20)
+def test_model_releases_output_before_completion_callback_returns(tmp_path, monkeypatch):
     from vane.execution.udf_subprocess import UDFExecutor
 
-    entered, observed, proceed = threading.Event(), threading.Event(), threading.Event()
+    entered, proceed = threading.Event(), threading.Event()
     notify = UDFExecutor._notify_wakeup
 
     def notify_before_callback_returns(executor):
@@ -484,15 +501,6 @@ def test_model_idle_check_waits_for_completion_callback_refs(tmp_path, monkeypat
         runtime = _runtime(connection)
         model = _register(runtime, _class_model(tmp_path))
         vane.attach_function(model, connection=connection)
-        snapshot = runtime.resource_snapshot
-
-        def observe_callback_refs():
-            state = snapshot()
-            if entered.is_set() and state["data"]["usage_bytes"]:
-                observed.set()
-            return state
-
-        monkeypatch.setattr(runtime, "resource_snapshot", observe_callback_refs)
 
         def query():
             assert int(connection.execute("SELECT model_encode(1)").fetchall()[0][0].split(":")[1]) == 11
@@ -502,10 +510,11 @@ def test_model_idle_check_waits_for_completion_callback_refs(tmp_path, monkeypat
             pending = clients.submit(query)
             try:
                 assert entered.wait(5), "completion callback did not reach its final wakeup"
-                assert observed.wait(5), "idle check did not observe the callback's retained output"
+                # Native consumption retires the output even while its
+                # producer's completion callback and Future remain alive.
+                pending.result(timeout=5)
             finally:
                 proceed.set()
-            pending.result(timeout=10)
         _assert_idle(runtime)
 
 
