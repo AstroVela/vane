@@ -8,7 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from threading import Event
+from threading import Condition, Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -117,21 +118,58 @@ def test_worker_source_pin_survives_coordinator_pin_release(tmp_path):
         store.close()
 
 
-def test_idle_source_cache_renews_its_lease(tmp_path):
+@pytest.mark.parametrize("metadata_lock_busy", [False, True])
+def test_idle_source_cache_renews_its_lease(tmp_path, monkeypatch, metadata_lock_busy):
+    from vane.execution import fte_store
+
+    now = time.time()
+    monkeypatch.setattr(
+        fte_store, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic, sleep=time.sleep)
+    )
     store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=0.5)
     query = store.reserve("query")
+    blocker = None
     try:
         store.source_cache(query)
         query.close(lambda: None)
-        time.sleep(0.65)
-        pin = ActiveStoreLease(store._cache_lease.to_dict())
+        owner = store._cache_lease
+        record = store.allocations / f"{owner.value['namespace']}.json"
+        original_expiry = fte_store._read(record)["expires"]
+        renewed = Condition()
+        renew = owner.renew
+
+        def notify_renewal():
+            renew()
+            with renewed:
+                renewed.notify_all()
+
+        monkeypatch.setattr(owner, "renew", notify_renewal)
+        if metadata_lock_busy:
+            blocker = native.StoreGuard.acquire(str(store.root / "allocation.lock"), True, True)
+            assert blocker is not None
+            acquire = fte_store.store_lock
+            monkeypatch.setattr(fte_store, "store_lock", lambda path, **kw: acquire(path, timeout=0.02))
+        # Exercise the real heartbeat beyond the original expiry without
+        # requiring the CI scheduler or fsync to finish within a 0.5s lease.
+        for _ in range(3):
+            with renewed:
+                now += 0.25
+                assert renewed.wait_for(
+                    lambda: fte_store._read(record)["expires"] >= now + store.config.lease_seconds, timeout=5
+                )
+        assert now > original_expiry
+        assert store._cache_error is None
+        pin = ActiveStoreLease(owner.to_dict())
         try:
-            pin.check()
+            assert pin.check()["expires"] > original_expiry
         finally:
             pin.close()
     finally:
+        if blocker is not None:
+            blocker.close()
         query.close(lambda: None)
         store.close()
+    assert store.snapshot()["reserved_bytes"] == 0
 
 
 def test_failed_source_cache_creation_returns_its_reservation(tmp_path, monkeypatch):
@@ -180,36 +218,6 @@ def test_failed_source_cache_heartbeat_fences_later_queries(tmp_path, monkeypatc
         first.close(lambda: None)
         if second is not None:
             second.close(lambda: None)
-        store.close()
-    assert store.snapshot()["reserved_bytes"] == 0
-
-
-def test_source_cache_renews_while_shared_metadata_lock_is_busy(tmp_path, monkeypatch):
-    from vane.execution import fte_store
-
-    store = pool(tmp_path, source_cache_bytes=1024, lease_seconds=1)
-    query = store.reserve("query")
-    store.source_cache(query)
-    query.close(lambda: None)
-    owner = store._cache_lease
-    record = store.allocations / f"{owner.value['namespace']}.json"
-    original_expiry = fte_store._read(record)["expires"]
-    acquire = fte_store.store_lock
-    blocker = native.StoreGuard.acquire(str(store.root / "allocation.lock"), True, True)
-    assert blocker is not None
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(fte_store, "store_lock", lambda path, **kw: acquire(path, timeout=0.02))
-            time.sleep(max(0, original_expiry - time.time()) + 0.1)
-            assert store._cache_error is None
-            pin = ActiveStoreLease(owner.to_dict())
-            try:
-                assert pin.check()["expires"] > original_expiry
-            finally:
-                pin.close()
-    finally:
-        blocker.close()
-        query.close(lambda: None)
         store.close()
     assert store.snapshot()["reserved_bytes"] == 0
 
