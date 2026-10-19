@@ -93,10 +93,11 @@ def test_progress_snapshot_includes_query_resource_manager():
         clear_query_resource_managers()
 
 
-def test_progress_enabled_auto_supports_local_runner(monkeypatch):
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_progress_enabled_auto_supports_local_runner(monkeypatch, runner):
     monkeypatch.delenv("VANE_PROGRESS", raising=False)
 
-    assert progress_enabled("local")
+    assert progress_enabled(runner)
 
 
 def test_local_progress_snapshot_uses_common_progress_shape():

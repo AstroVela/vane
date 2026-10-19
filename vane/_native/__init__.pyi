@@ -168,7 +168,7 @@ class DuckDBPyConnection:
     def execute(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection:
         """Execute queries and writes through shared bound-plan runner dispatch.
 
-        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local-fast. Connection
+        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local. Connection
         and catalog operations remain native. Distributed execution requires auto-commit.
         """
         ...
@@ -1878,11 +1878,6 @@ def row_type(
 ) -> sqltypes.DuckDBPyType: ...
 def rowcount(*, connection: DuckDBPyConnection | None = None) -> int: ...
 def set_default_connection(connection: DuckDBPyConnection) -> None: ...
-def set_runner_local(
-    num_workers: object = None,
-    max_running_tasks: object = None,
-    execution_mode: object = None,
-) -> _Runner: ...
 def set_runner_ray(
     address: object = None,
     noop_if_initialized: bool = False,

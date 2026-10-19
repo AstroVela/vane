@@ -204,7 +204,7 @@ def test_rebuilt_soxr_changes_native_behavior_without_resigning_extension(tmp_pa
         import vane
         vane.use_native_media_runtime(sys.argv[1])
         if sys.argv[3] == 'local':
-            vane.set_runner_local(num_workers=1, max_running_tasks=1, execution_mode='in_process')
+            vane.set_runner_local()
         from importlib import import_module
         entry = next(ep for ep in entry_points(group='vane.dynamic_extension_providers') if ep.name == 'native_media')
         module = import_module(entry.module)
@@ -285,7 +285,7 @@ def test_distributed_runtime_identity_survives_local_plan_replay(tmp_path, sourc
         from vane.extensions import _capture_dynamic_extension_snapshot
 
         vane.use_native_media_runtime(sys.argv[1], allow_distributed=True)
-        vane.set_runner_local(num_workers=1, max_running_tasks=1, execution_mode='in_process')
+        vane.set_runner_local()
         digest = hashlib.sha256((Path(sys.argv[1]) / 'runtime-manifest.json').read_bytes()).hexdigest()
         with vane._native._connect_with_runner(sys.argv[3]) as source:
             vane.load_installed_extension('native_media', connection=source)

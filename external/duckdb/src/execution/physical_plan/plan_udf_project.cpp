@@ -466,11 +466,11 @@ static bool PayloadUsesActorBackend(const Value &payload) {
 
 static Value PayloadWithResolvedExpressionBackend(const Value &payload, const string &runner_type) {
 	const bool registered_local_model = PayloadHasField(payload, "local_model_token");
-	if (registered_local_model && runner_type != "local-fast") {
-		throw InvalidInputException("registered local models require VANE_RUNNER=local-fast");
+	if (registered_local_model && runner_type != "local") {
+		throw InvalidInputException("registered local models require VANE_RUNNER=local");
 	}
 	const auto gpus = PayloadNumericField(payload, "gpus");
-	const bool local_gpu_model = registered_local_model && runner_type == "local-fast" && gpus == 1.0 &&
+	const bool local_gpu_model = registered_local_model && runner_type == "local" && gpus == 1.0 &&
 	                             PayloadStringEquals(payload, "execution_backend", "subprocess_actor");
 	if (runner_type != "ray" && gpus > 0.0 && !local_gpu_model) {
 		throw InvalidInputException("GPU resources require VANE_RUNNER=ray");

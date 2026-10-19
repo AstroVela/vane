@@ -457,7 +457,7 @@ execution with explicitly registered CPU or fixed-device GPU models, native
 materialized results and opt-in managed streams. Stateful reuse remains
 explicit and session-owned. Input callbacks reject connection reentry;
 unsupported asynchronous input paths are rejected as documented in the
-[runtime guide](LOCAL_MODEL_RUNTIME.md#shared-runtime-for-ordinary-local-fast-queries).
+[runtime guide](LOCAL_MODEL_RUNTIME.md#shared-runtime-for-ordinary-local-queries).
 Ray keeps its query/generation authorization and object-store/liveness policy;
 shared contract tests do not enable a persistent Ray model registry.
 

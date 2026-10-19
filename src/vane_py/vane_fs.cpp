@@ -329,8 +329,8 @@ void InitializeVaneFS(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnecti
 		auto provider = make_shared_ptr<SnapshotProvider>(std::move(capsule));
 		const string id = provider->api->workspace_id;
 		py::gil_scoped_release release;
-		if (owner.GetRunnerType() != "local-fast") {
-			throw InvalidInputException("Native VaneFS registration requires runner='local-fast'");
+		if (owner.GetRunnerType() != "local") {
+			throw InvalidInputException("Native VaneFS registration requires runner='local'");
 		}
 		auto &context = *owner.con.GetConnection().context;
 		// Registration is infrequent. Serialize the list/register pair across

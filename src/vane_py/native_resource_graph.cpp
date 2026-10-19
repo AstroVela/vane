@@ -235,8 +235,8 @@ pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedS
 
 py::dict DuckDBPyRelation::CollectLocalResourceGraph() {
 	auto query_lock = LockForQuery();
-	if (GetRunnerType() != "local-fast") {
-		throw InvalidInputException("Native resource metadata requires a local-fast relation");
+	if (GetRunnerType() != "local") {
+		throw InvalidInputException("Native resource metadata requires a local relation");
 	}
 	auto relation = GetRelation();
 	auto context = relation->context->GetContext();

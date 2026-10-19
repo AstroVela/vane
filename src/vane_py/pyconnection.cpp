@@ -732,11 +732,11 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("execute", &DuckDBPyConnection::Execute,
 	      "Execute SQL with optional parameters. Queries and writes share bound-plan dispatch with the runner selected "
 	      "when connecting; "
-	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Connection and catalog operations "
+	      "VANE_RUNNER=local uses native DuckDB; ray (the default) uses Ray. Connection and catalog operations "
 	      "execute on the "
 	      "client. "
 	      "Distributed execution requires auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
+	      "local.",
 	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
@@ -822,19 +822,19 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
 	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
+	      "local.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
 	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
+	      "local.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
 	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
+	      "local.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
@@ -1378,7 +1378,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	InitializeConnectionMethods(connection_module);
 	InitializeVaneFS(connection_module);
 	connection_module.def("configure_local_runtime", &DuckDBPyConnection::ConfigureLocalRuntime,
-	                      "Configure shared admission for local-fast read-only queries before creating cursors");
+	                      "Configure shared admission for local read-only queries before creating cursors");
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");
@@ -1424,10 +1424,10 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	}
 	auto interrupt_check = CreateQueryInterruptCheck();
 	unique_ptr<PreparedStatement> native_prepared;
-	const bool local_fast = GetRunnerType() == "local-fast";
+	const bool native_execution = GetRunnerType() == "local";
 	for (idx_t index = 0; index < outer_list.size(); index++) {
 		unique_ptr<DuckDBPyRelation> result;
-		if (local_fast && last_statement->type != StatementType::MULTI_STATEMENT) {
+		if (native_execution && last_statement->type != StatementType::MULTI_STATEMENT) {
 			auto params = py::reinterpret_borrow<py::object>(outer_list[index]);
 			auto parameters =
 			    TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params, native_prepared.get());
@@ -3321,8 +3321,8 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 		execution_lock = LockConnection(py_connection_lock);
 	}
 	auto &context = *con.GetConnection().context;
-	if (GetRunnerType() != "local-fast") {
-		throw InvalidInputException("configure_local_runtime requires a local-fast connection");
+	if (GetRunnerType() != "local") {
+		throw InvalidInputException("configure_local_runtime requires a local connection");
 	}
 	if (context.transaction.HasActiveTransaction()) {
 		throw InvalidInputException("configure_local_runtime requires an idle auto-commit connection");

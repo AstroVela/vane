@@ -71,7 +71,7 @@ inline string NormalizeRunnerType(string runner_type) {
 		throw InvalidInputException("Invalid runner type '%s'. Please use 'local-fast', 'local', or 'ray'.",
 		                            runner_type);
 	}
-	return runner_type;
+	return runner_type == "local-fast" ? "local" : runner_type;
 }
 
 inline string ResolveRunnerTypeFromEnvironment() {
