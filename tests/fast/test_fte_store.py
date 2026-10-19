@@ -135,12 +135,17 @@ def test_idle_source_cache_renews_its_lease(tmp_path, monkeypatch, metadata_lock
         owner = store._cache_lease
         record = store.allocations / f"{owner.value['namespace']}.json"
         original_expiry = fte_store._read(record)["expires"]
+        completed_expiry = original_expiry
         renewed = Condition()
         renew = owner.renew
 
         def notify_renewal():
+            nonlocal completed_expiry
             renew()
             with renewed:
+                # A visible replacement can precede a failed directory sync.
+                # Publish completion only after renewal returns successfully.
+                completed_expiry = fte_store._read(record)["expires"]
                 renewed.notify_all()
 
         monkeypatch.setattr(owner, "renew", notify_renewal)
@@ -154,9 +159,7 @@ def test_idle_source_cache_renews_its_lease(tmp_path, monkeypatch, metadata_lock
         for _ in range(3):
             with renewed:
                 now += 0.25
-                assert renewed.wait_for(
-                    lambda: fte_store._read(record)["expires"] >= now + store.config.lease_seconds, timeout=5
-                )
+                assert renewed.wait_for(lambda: completed_expiry >= now + store.config.lease_seconds, timeout=5)
         assert now > original_expiry
         assert store._cache_error is None
         pin = ActiveStoreLease(owner.to_dict())
