@@ -8,10 +8,25 @@
 namespace duckdb {
 namespace vane_execution {
 
+struct CorrelatedKeySource {
+	PhysicalOperator *source = nullptr;
+	idx_t column = 0;
+};
+
+struct CorrelatedKeyFilter {
+	CorrelatedKeySource scan;
+	CorrelatedKeySource owner;
+	// Cost estimate from the inner join with this owner's delimiter keys.
+	idx_t estimated_matching_rows = 0;
+};
+
 // Every entry is a complete, independently executable subtree. A valid column
 // routes it by the common correlation key; an invalid column broadcasts it.
 struct CorrelatedPartition {
 	unordered_map<const PhysicalOperator *, optional_idx> inputs;
+	// Independent inputs joined directly to this delimiter may be filtered by
+	// a superset of its keys, before their partitioning exchange.
+	unordered_map<const PhysicalOperator *, CorrelatedKeyFilter> filters;
 };
 
 // Prove locality before changing the physical plan or creating any fragments.

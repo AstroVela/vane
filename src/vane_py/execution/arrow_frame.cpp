@@ -8,6 +8,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/client_properties.hpp"
 #include <arrow/c/bridge.h>
 
@@ -97,7 +98,7 @@ Vector StorageVector(Vector &source, idx_t count, const LogicalType &storage_typ
 	return result;
 }
 
-enum class ArrowLayout { NATIVE, EXCHANGE, RESULT };
+enum class ArrowLayout { NATIVE, NATIVE_COMPACT, EXCHANGE, RESULT };
 
 std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayout layout) {
 	CheckExchangeType(type);
@@ -128,11 +129,12 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayo
 		return arrow::utf8();
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::AGGREGATE_STATE:
-		return arrow::binary();
+		return layout == ArrowLayout::NATIVE_COMPACT ? arrow::binary_view() : arrow::binary();
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
 	case LogicalTypeId::HUGEINT:
-		return layout == ArrowLayout::NATIVE ? arrow::decimal128(38, 0) : arrow::decimal256(39, 0);
+		return layout == ArrowLayout::NATIVE || layout == ArrowLayout::NATIVE_COMPACT ? arrow::decimal128(38, 0)
+		                                                                              : arrow::decimal256(39, 0);
 	case LogicalTypeId::DATE:
 		return arrow::date32();
 	case LogicalTypeId::TIME:
@@ -155,6 +157,14 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayo
 		// them on exchanges without changing the public result's SQL precision.
 		if (layout == ArrowLayout::EXCHANGE && type.InternalType() == PhysicalType::INT128) {
 			return arrow::decimal256(39, DecimalType::GetScale(type));
+		}
+		if (layout == ArrowLayout::EXCHANGE || layout == ArrowLayout::NATIVE_COMPACT) {
+			if (type.InternalType() == PhysicalType::INT16 || type.InternalType() == PhysicalType::INT32) {
+				return arrow::decimal32(DecimalType::GetWidth(type), DecimalType::GetScale(type));
+			}
+			if (type.InternalType() == PhysicalType::INT64) {
+				return arrow::decimal64(DecimalType::GetWidth(type), DecimalType::GetScale(type));
+			}
 		}
 		return arrow::decimal128(DecimalType::GetWidth(type), DecimalType::GetScale(type));
 	case LogicalTypeId::STRUCT: {
@@ -181,10 +191,27 @@ void CheckArrow(const arrow::Status &status) {
 	}
 }
 
-std::shared_ptr<arrow::ArrayData> WidenDecimals(const std::shared_ptr<arrow::ArrayData> &data,
-                                                const std::shared_ptr<arrow::DataType> &type) {
+std::shared_ptr<arrow::ArrayData> NormalizeArray(const std::shared_ptr<arrow::ArrayData> &data,
+                                                 const std::shared_ptr<arrow::DataType> &type) {
 	if (data->type->Equals(type)) {
 		return data;
+	}
+	if (data->type->id() == arrow::Type::BINARY_VIEW) {
+		// The native v1.5 exporter also emits binary views. Keep the established
+		// BLOB/aggregate-state wire layout, including inside nested columns.
+		arrow::BinaryViewArray values(data);
+		arrow::BinaryBuilder builder;
+		CheckArrow(builder.Reserve(values.length()));
+		for (int64_t row = 0; row < values.length(); row++) {
+			if (values.IsNull(row)) {
+				builder.UnsafeAppendNull();
+			} else {
+				CheckArrow(builder.Append(values.GetView(row)));
+			}
+		}
+		std::shared_ptr<arrow::Array> result;
+		CheckArrow(builder.Finish(&result));
+		return result->data();
 	}
 	if (type->id() == arrow::Type::DECIMAL256) {
 		// The native exporter owns a signed 128-bit buffer. Its decimal128(38)
@@ -207,7 +234,7 @@ std::shared_ptr<arrow::ArrayData> WidenDecimals(const std::shared_ptr<arrow::Arr
 	auto result = data->Copy();
 	result->type = type;
 	for (idx_t i = 0; i < data->child_data.size(); i++) {
-		result->child_data[i] = WidenDecimals(data->child_data[i], type->field(i)->type());
+		result->child_data[i] = NormalizeArray(data->child_data[i], type->field(i)->type());
 	}
 	return result;
 }
@@ -242,7 +269,8 @@ std::shared_ptr<arrow::Schema> ResultSchemaFor(const vector<LogicalType> &types,
 	return SchemaFor(types, names, ArrowLayout::RESULT);
 }
 
-std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_ptr<arrow::Schema> &schema) {
+std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_ptr<arrow::Schema> &schema,
+                                           bool compact_decimals) {
 	DataChunk storage;
 	vector<LogicalType> storage_types;
 	for (auto &column : chunk.data) {
@@ -261,13 +289,17 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 		}
 	}
 	ClientProperties properties;
+	if (compact_decimals) {
+		properties.arrow_output_version = ArrowFormatVersion::V1_5;
+	}
 	ArrowArray array;
 	array.Init();
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extensions;
 	ArrowConverter::ToArrowArray(storage, &array, properties, extensions);
 	std::vector<std::shared_ptr<arrow::Field>> native_fields;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		native_fields.push_back(schema->field(i)->WithType(ArrowTypeFor(storage_types[i], ArrowLayout::NATIVE)));
+		native_fields.push_back(schema->field(i)->WithType(
+		    ArrowTypeFor(storage_types[i], compact_decimals ? ArrowLayout::NATIVE_COMPACT : ArrowLayout::NATIVE)));
 	}
 	auto result = arrow::ImportRecordBatch(&array, arrow::schema(std::move(native_fields)));
 	if (!result.ok()) {
@@ -276,7 +308,7 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 	auto native = std::move(result).ValueOrDie();
 	std::vector<std::shared_ptr<arrow::Array>> columns;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		columns.push_back(arrow::MakeArray(WidenDecimals(native->column(i)->data(), schema->field(i)->type())));
+		columns.push_back(arrow::MakeArray(NormalizeArray(native->column(i)->data(), schema->field(i)->type())));
 	}
 	return arrow::RecordBatch::Make(schema, chunk.size(), std::move(columns));
 }
@@ -368,22 +400,17 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 				FlatVector::GetData<hugeint_t>(target)[row] = DecodeInt128(source, row, "DECIMAL storage");
 				continue;
 			}
-			auto &values = static_cast<const arrow::Decimal128Array &>(source);
-			arrow::Decimal128 value(values.GetValue(row));
-			hugeint_t native(value.high_bits(), value.low_bits());
-			switch (type.InternalType()) {
-			case PhysicalType::INT16:
-				FlatVector::GetData<int16_t>(target)[row] = Hugeint::Cast<int16_t>(native);
-				break;
-			case PhysicalType::INT32:
-				FlatVector::GetData<int32_t>(target)[row] = Hugeint::Cast<int32_t>(native);
-				break;
-			case PhysicalType::INT64:
-				FlatVector::GetData<int64_t>(target)[row] = Hugeint::Cast<int64_t>(native);
-				break;
-			default:
-				FlatVector::GetData<hugeint_t>(target)[row] = native;
-				break;
+			if (type.InternalType() == PhysicalType::INT64) {
+				auto &values = static_cast<const arrow::Decimal64Array &>(source);
+				FlatVector::GetData<int64_t>(target)[row] = arrow::Decimal64(values.GetValue(row)).value();
+			} else {
+				auto &values = static_cast<const arrow::Decimal32Array &>(source);
+				auto value = arrow::Decimal32(values.GetValue(row)).value();
+				if (type.InternalType() == PhysicalType::INT16) {
+					FlatVector::GetData<int16_t>(target)[row] = NumericCast<int16_t>(value);
+				} else {
+					FlatVector::GetData<int32_t>(target)[row] = value;
+				}
 			}
 		}
 		break;

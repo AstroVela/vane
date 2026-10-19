@@ -31,7 +31,16 @@ from tests.fast.test_analytical_fragment_compiler import (
     scaled_wide_value,
     wide_aggregate_queries,
 )
-from tests.fast.test_execution_performance import interval_average_queries
+from tests.fast.test_execution_performance import (
+    batched_aggregate_query,
+    budgeted_correlated_scan_query,
+    interval_average_queries,
+    large_broadcast_query,
+    shared_cte_filter_query,
+)
+from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
+from tests.fast.test_join_build_filter import shared_join_build_query
+from tests.fast.test_parquet_aggregate_partitioning import disjoint_aggregate_query
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -44,6 +53,299 @@ def resources(tmp_path, **changes):
     # Analytical plans retain more partition objects across stage barriers.
     # These small test inputs need a 4 MiB bound per object, including retries.
     return replace(base, exchange_stores=tuple(replace(store, object_bytes=4 << 20) for store in base.exchange_stores))
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_reused_hash_key_columns_preserve_consumer_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and not lost and upstream:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    sql = hash_key_query("range*10000000000", "is not distinct from") + " order by all"
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert [len(s) for s in hash_input_schemas(local, scheduler.spec.graph)] == [2, 2]
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_shared_join_build_filter_preserves_consumer_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
+        shared = {p for p in producers if producers.count(p) > 1}
+        if admitted and not lost and shared.intersection(upstream):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(tmp_path, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        # Default optimizers retain the selective seed on the probe side at this scale.
+        sql, _, _ = shared_join_build_query(
+            local, tmp_path, "is not distinct from", fact_rows=4194304, fixed_plan=False
+        )
+        # Keep the aggregate decomposable: duplicate NULL matches need not all be materialized.
+        sql = sql.replace("max(b.payload)", "max(length(b.payload))")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
+            assert len(producers) > len(set(producers))
+            assert sum(len(f.sources) for f in scheduler.spec.graph.fragments) == 3
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and not lost:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    sql = disjoint_aggregate_query(tmp_path)
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert all(e.distribution.value == "gather" for e in scheduler.spec.graph.exchanges)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_shared_cte_filters_preserve_materialized_owner_on_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(tmp_path, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = shared_cte_filter_query(local, tmp_path / "fact.parquet", "is not distinct from")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert sum(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges) == 2
+            assert sum(s.function_name == "range" for f in scheduler.spec.graph.fragments for s in f.sources) == 1
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode,slots", [("pipelined", 1), ("pipelined", 2), ("fte", 1), ("fte", 2), ("fte_retry", 1)])
+def test_budgeted_correlated_scan_uses_per_query_worker_memory(tmp_path, monkeypatch, mode, slots):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(
+        tmp_path,
+        max_active_queries=slots,
+        operator_memory_bytes=256 << 20,
+        task_contexts_per_worker=64,
+        io_concurrency=256,
+    )
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = budgeted_correlated_scan_query(local, tmp_path / "fact.parquet", "is not distinct from", "anti")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert any(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges) == (slots == 1)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode,slots", [("pipelined", 1), ("pipelined", 2), ("fte", 1), ("fte", 2), ("fte_retry", 1)])
+def test_large_broadcast_uses_per_query_worker_budget(tmp_path, monkeypatch, mode, slots):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    # The shuffle control has eight remote link endpoints on one worker.
+    # Full-size frames need 42 MiB of Flight staging with the 16-frame window.
+    limits = resources(
+        tmp_path,
+        max_active_queries=slots,
+        task_contexts_per_worker=64,
+        io_concurrency=256,
+        staging_buffer_bytes=64 << 20,
+    )
+    limits = replace(
+        limits,
+        exchange=DirectExchangeLimits(),
+        exchange_stores=tuple(
+            # The low-memory control shuffles wide rows and reserves larger
+            # materialized outputs than the broadcast variant.
+            replace(store, query_bytes=512 << 20, source_bytes=128 << 20, object_bytes=32 << 20)
+            for store in limits.exchange_stores
+        ),
+    )
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql = large_broadcast_query(local, tmp_path / "fact.parquet")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=90) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert any(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges) == (slots == 1)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
 
 
 QUERIES = [
@@ -69,6 +371,21 @@ def test_interval_average_preserves_wide_partition_states(tmp_path, mode):
             expected = local.execute(sql).fetchall()
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 assert [tuple(row.values()) for row in result.collect().to_pylist()] == expected, sql
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte"])
+def test_public_batched_aggregate_states(tmp_path, mode):
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        for groups in (7, 4099):
+            sql = batched_aggregate_query(groups)
+            expected = local.execute(sql).to_arrow_table().to_pylist()
+            with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
+                assert result.collect().to_pylist() == expected
             assert_idle(connection)
 
 
@@ -121,6 +438,65 @@ def test_broadcast_probe_scans_and_small_builds_share_a_fragment(tmp_path, mode)
         for sql, rows in zip(queries, expected, strict=True):
             with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
                 assert result.collect().to_pylist() == rows
+            assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_public_broadcast_mark_join(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if (
+            admitted
+            and not lost
+            and any(
+                e.distribution.value == "broadcast" and e.producer_fragment_id in upstream
+                for e in scheduler.spec.graph.exchanges
+            )
+        ):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    path = tmp_path / "probe.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as local:
+        local.execute(
+            f"copy (select range i, case when range%7=0 then null else range%101 end k "
+            f"from range(16384)) to '{path}' (row_group_size 2048)"
+        )
+        build = "select case when range=0 then null else range%11 end from range(70)"
+        queries = [
+            f"select i, k in ({build}) is_match, k not in ({build}) is_unmatched "
+            f"from read_parquet('{path}') order by i limit 31",
+            f"select count(*), sum(i)::bigint from read_parquet('{path}') "
+            "where k in (1,3,5,7,9,11,13,15) and k not in (select range*3 from range(17))",
+            f"select count(*) from read_parquet('{path}') where k not in (select range from range(0))",
+            f"select k, k in ({build}) is_match from (select sum(range)::bigint k from range(4))",
+        ]
+        expected = [local.execute(sql).to_arrow_table().to_pylist() for sql in queries]
+    limits = resources(tmp_path, task_contexts_per_worker=64, io_concurrency=256)
+    with vane.Runtime(limits) as application, application.connect() as connection:
+        for index, (sql, rows) in enumerate(zip(queries, expected, strict=True)):
+            with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+                scheduler = result.context._reader
+                assert result.collect().to_pylist() == rows
+                if index == 0:
+                    assert any(e.distribution.value == "broadcast" for e in scheduler.spec.graph.exchanges)
+                    if mode == "fte_retry":
+                        assert len(lost) == 1
+                        attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                        assert len(attempts) == 2
+                        assert attempts[0].input_id == attempts[1].input_id
+                        assert attempts[0].fence != attempts[1].fence
             assert_idle(connection)
 
 

@@ -409,11 +409,13 @@ class PipelinedScheduler:
         locations = {
             index: _get(reference, self.context) for index, reference in zip(sorted(self.prepared), self.prepare_calls)
         }
-        for index in self.prepared:
-            _get(
-                self.pool.workers[index].connect.remote(self.pool.epochs[index], self.spec.query_id, locations),
-                self.context,
-            )
+        # Every endpoint is published; workers can connect their inputs in parallel.
+        connections = [
+            self.pool.workers[index].connect.remote(self.pool.epochs[index], self.spec.query_id, locations)
+            for index in sorted(self.prepared)
+        ]
+        for reference in connections:
+            _get(reference, self.context)
         root_route = next(route for route in routes if route["target_worker"] == -1)
         timeout = self.spec.options.execution_timeout + self.spec.options.delivery_timeout
         _get(
@@ -438,20 +440,21 @@ class PipelinedScheduler:
                 break
             self.stop.wait(0.01)
         self.context.deadline_probe = self.production_status
-        # Every context, input and endpoint now exists. Start consumers before
-        # their producers, retaining the same fixed attempt and split assignment.
+        # Every context, input and endpoint is ready. Batch starts per worker,
+        # keeping consumers before producers within each batch. Across workers,
+        # bounded channels can hold data until the peer's batch has started.
         fragments = {f.fragment_id: f for f in self.spec.graph.fragments}
+        by_worker: dict[int, list[str]] = {}
         for identity in reversed(self.spec.graph.topological_fragment_ids()):
-            by_worker: dict[int, list[str]] = {}
             for part in range(fragments[identity].partition_count):
                 task = task_id(identity, part)
                 by_worker.setdefault(assignments[task], []).append(task)
-            calls = [
-                self.pool.workers[index].start.remote(self.pool.epochs[index], self.spec.query_id, tasks)
-                for index, tasks in by_worker.items()
-            ]
-            for reference in calls:
-                _get(reference, self.context)
+        calls = [
+            self.pool.workers[index].start.remote(self.pool.epochs[index], self.spec.query_id, tasks)
+            for index, tasks in by_worker.items()
+        ]
+        for reference in calls:
+            _get(reference, self.context)
         self.monitor = threading.Thread(target=self._monitor, name="vane-pipelined-query", daemon=True)
         self.monitor.start()
 
@@ -729,12 +732,16 @@ class RayQueryRuntime(QueryRuntime):
                 ),
                 resources.worker_count * resources.io_concurrency,
             )
+            compile_options = FragmentCompileOptions(
+                resources.partitions,
+                worker_operator_bytes=resources.operator_memory_bytes // resources.max_active_queries,
+            )
             if mode is DistributedMode.FTE:
                 assert isinstance(options.target, RayExecution) and options.target.fte_options is not None
                 store = self.exchange_store(options.target.fte_options.exchange_store)
                 scheduler = RecoveryScheduler(self.pool, store, context, rows_per_batch, consumer)
                 context.started(scheduler.cancel)
-                scheduler.prepare(connection, sql, options, demand, FragmentCompileOptions(resources.partitions))
+                scheduler.prepare(connection, sql, options, demand, compile_options)
                 spec = scheduler.spec
             else:
                 spec = prepare_ray_query(
@@ -743,7 +750,7 @@ class RayQueryRuntime(QueryRuntime):
                     query_id=context.query_id,
                     options=options,
                     resources=demand,
-                    compile_options=FragmentCompileOptions(resources.partitions),
+                    compile_options=compile_options,
                 )
                 scheduler = PipelinedScheduler(self.pool, context, spec, rows_per_batch, consumer)
                 context.started(scheduler.cancel)

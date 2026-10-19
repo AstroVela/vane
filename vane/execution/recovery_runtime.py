@@ -139,6 +139,7 @@ class RecoveryScheduler:
                 source_directory=str(self.lease.directory / "sources"),
                 source_budget=self.store.config.source_bytes,
                 compile_options=compile_options,
+                source_cache=self.store.source_cache(self.lease),
             )
             self.coordinator.source_bytes(source_bytes)
             fragments = {f.fragment_id: f for f in self.spec.graph.fragments}

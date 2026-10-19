@@ -4,6 +4,32 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_release_tests.sh [all|non-ray|shared-ray|owner-ray]
+
+Run the base-installation release gate or one process-isolated phase.
+EOF
+}
+
+phase="${1:-all}"
+if (($# > 1)); then
+  usage >&2
+  exit 2
+fi
+case "$phase" in
+  all | non-ray | shared-ray | owner-ray) ;;
+  -h | --help)
+    usage
+    exit
+    ;;
+  *)
+    printf 'Unknown release-test phase: %s\n' "$phase" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Anchor diagnostics to the caller before entering a disposable test directory.
 if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
@@ -134,22 +160,28 @@ pytest_args=(
 
 # Let the non-Ray process release all Python/native state before a fresh pytest
 # process starts the real Ray runtime.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and not real_ray" \
-  "${release_tests[@]}" \
-  "${local_runtime_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "non-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and not real_ray" \
+    "${release_tests[@]}" \
+    "${local_runtime_tests[@]}"
+fi
 
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and not ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "shared-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and not ray_cluster_owner" \
+    "${release_tests[@]}"
+fi
 
 # Cluster-owner media/provider checks require optional signed artifacts and run
 # separately in their CI jobs and the fast-test owner-ray phase.
 # Base-installation CLI and wheel qualification own their clusters too; run
 # them only after the shared-cluster pytest process has completely exited.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "owner-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and ray_cluster_owner" \
+    "${release_tests[@]}"
+fi

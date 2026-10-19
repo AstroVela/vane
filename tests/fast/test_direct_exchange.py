@@ -187,6 +187,50 @@ def test_broadcast_one_allocation_independent_leases(connection):
     assert exchange.snapshot()["leased_bytes"] == 0
 
 
+@pytest.mark.parametrize("event", ["credit", "close", "abort"])
+def test_smaller_publication_preserves_blocked_writer_wakeup(connection, event):
+    exchange = channel(connection, sql="select 'text'::varchar", window=128, frame=128, slots=4)
+    exchange.add_producer("a")
+    exchange.seal_producers()
+    signal = native._TestSignal()
+    assert exchange._write_rows("a", 1, [("a" * 60,)]) == "accepted"
+    assert exchange._write_rows("a", 2, [("b" * 50,)], signal) == "blocked"
+    # Parallel sink tasks share a producer and allocate their sequence when
+    # publishing. A smaller task can fit without returning any credit, so its
+    # success must preserve the shared waiter callback.
+    assert exchange._write_rows("a", 2, [("c",)]) == "accepted"
+    _, batch = exchange.poll("client")
+    retained = batch.slice(0, 1)
+    batch.close()
+    assert signal.count == 0
+    try:
+        if event == "credit":
+            retained.close()
+            assert signal.count == 1
+            assert exchange._write_rows("a", 3, [("b" * 50,)]) == "accepted"
+            exchange.finish("a", 3)
+            for sequence, value in ((2, "c"), (3, "b" * 50)):
+                _, batch = exchange.poll("client")
+                assert batch.sequence == sequence and batch.to_rows() == [(value,)]
+                batch.close()
+            assert exchange.poll("client")[0] == "end"
+        else:
+            if event == "close":
+                exchange.close_consumer("client")
+                assert exchange._write_rows("a", 3, [("b" * 50,)]) == "closed"
+                exchange.finish("a", 2)
+            else:
+                exchange.abort("blocked writer failure")
+                with pytest.raises(vane.InvalidInputException, match="blocked writer failure"):
+                    exchange._write_rows("a", 3, [("b" * 50,)])
+            assert signal.count == 1
+            assert retained.to_rows() == [("a" * 60,)]
+    finally:
+        retained.close()
+        exchange.close_consumer("client")
+    assert exchange.snapshot()["bytes"] == exchange.snapshot()["leased_bytes"] == 0
+
+
 def test_error_is_sticky_and_wakes_readers_and_writers(connection):
     exchange = channel(connection, consumers=("one", "two"))
     exchange.add_producer("a")
@@ -543,6 +587,31 @@ def test_native_frame_basic_type_profile(connection, type_name, values):
     assert exchange.snapshot()["bytes"] == 0
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("frame_rows", [63, 64, 65])
+@pytest.mark.parametrize("shape", ["flat", "filtered", "nullable", "constant"])
+def test_fixed_width_frames_preserve_offsets_validity_and_owned_values(threads, frame_rows, shape):
+    value = "42" if shape == "constant" else "range"
+    if shape == "nullable":
+        value = "case when range%11=0 then null else range end"
+    predicate = "where range%3!=0" if shape == "filtered" else ""
+    sql = (
+        "select range k, v%2=0, (v%255-127)::tinyint, (v-1000)::smallint, v::integer, "
+        "v*10000000000, v::hugeint*1000000000000000000000000000000::hugeint, "
+        "v::decimal(38,5), v::float/2, v::double/2, date '2026-01-01'+v::integer "
+        f"from (select range, {value} v from range(8197) {predicate})"
+    )
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        limits = DirectExchangeLimits(8192, 8192, frame_rows, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert sorted(collect(service)) == sorted(expected)
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 def test_consumer_starts_before_producers_and_wakes_on_first_frame(connection):
     spec = submission(connection)
     with InProcessTaskService(connection, spec, TINY) as service:
@@ -624,7 +693,15 @@ def test_ended_input_error_prevents_native_finish(threads, borrowed):
                 assert time.monotonic() < deadline
                 service.pump(1)
             if borrowed:
-                status, batch = output.poll("client")
+                # A parallel source can block on the right before the left
+                # pipeline publishes its buffered row. Wait for the lease we
+                # intend to hold across the late input error.
+                while True:
+                    status, batch = output.poll("client")
+                    if status != "blocked":
+                        break
+                    assert time.monotonic() < deadline
+                    service.pump(1)
                 assert status == "data" and batch.to_rows() == [(42,)]
             assert service.status()[0]["state"] == "RUNNING"
             left.abort("input failed after EOF")
@@ -700,8 +777,9 @@ def test_input_error_after_production_fails_pending_delivery(connection, entry):
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_native_finalizer_checks_inputs_when_sink_stops_early(failed):
-    with vane.connect(backend="local", config={"threads": 4}) as connection:
+@pytest.mark.parametrize("threads", [4, 16])
+def test_native_finalizer_checks_inputs_when_sink_stops_early(failed, threads):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
         spec = submission(connection)
         left, right, output = (channel(connection) for _ in range(3))
         for source in (left, right):
@@ -1139,6 +1217,281 @@ with vane.connect(backend='local', config={'threads': int(sys.argv[1])}) as conn
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", script, str(threads)], capture_output=True, text=True, timeout=30
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_parallel_exchange_tasks_share_credit_without_losing_wakeups(threads, cancel):
+    script = r"""
+import runpy, sys, time
+from collections import Counter
+import vane
+
+helpers = runpy.run_path(sys.argv[1])
+threads, cancel = int(sys.argv[2]), sys.argv[3] == 'True'
+with vane.connect(backend='local', config={'threads': threads}) as connection:
+    spec = helpers['submission'](connection)
+    source = helpers['channel'](connection, window=8192, frame=1024, rows=64, slots=16)
+    output = helpers['channel'](connection, window=1024, frame=1024, rows=64, slots=1)
+    source.add_producer('upstream')
+    output.add_producer('task')
+    source.seal_producers()
+    output.seal_producers()
+    service = helpers['prepare_root_task'](connection, spec, [(source, 'client')], [output])
+    retained = None
+    try:
+        service.start('task', 'start')
+        deadline = time.monotonic() + 5
+        # All source tasks wait on the same empty consumer before publication.
+        # Its single callback must eventually activate every queued reader.
+        while source.snapshot()['read_blocks'] < threads:
+            service.pump(1)
+            assert time.monotonic() < deadline, source.snapshot()
+            time.sleep(0.001)
+        for sequence in range(1, 13):
+            assert source._write_rows('upstream', sequence, [(sequence,)] * 64) == 'accepted'
+        source.finish('upstream', 12)
+        deadline = time.monotonic() + 5
+        while retained is None:
+            service.pump(1)
+            _, batch = output.poll('client')
+            if batch is not None:
+                rows = batch.to_rows()
+                sequences = [batch.sequence]
+                retained = batch.slice(0, 1)
+                batch.close()
+            assert time.monotonic() < deadline
+        # The borrowed output consumes the only slot. Every scheduled task
+        # must be able to hold a distinct input while waiting for that credit.
+        while True:
+            service.pump(1)
+            state = source.snapshot()
+            held = state['outstanding_frames'] - state['queued_frames']
+            if held >= threads:
+                break
+            assert time.monotonic() < deadline, (threads, state)
+            time.sleep(0.001)
+        if cancel:
+            service.cancel('cancel parallel tasks')
+            service.release()
+            assert source.snapshot()['bytes'] == 0
+            assert retained.num_rows == 1
+            assert output.snapshot()['bytes'] > 0
+            retained.close()  # Credit callback after native task teardown.
+        else:
+            retained.close()
+            deadline = time.monotonic() + 5
+            while True:
+                service.pump(1)
+                status, batch = output.poll('client')
+                if status == 'end':
+                    break
+                if batch is not None:
+                    rows.extend(batch.to_rows())
+                    sequences.append(batch.sequence)
+                    batch.close()
+                assert time.monotonic() < deadline, service.status()
+            assert Counter(rows) == Counter({(value,): 64 for value in range(1, 13)})
+            assert sequences == list(range(1, 13))
+        assert source.snapshot()['bytes'] == output.snapshot()['bytes'] == 0
+        assert source.snapshot()['peak_bytes'] <= 8192
+        assert output.snapshot()['peak_bytes'] <= 1024
+    finally:
+        service.cancel('test cleanup')
+        service.release()
+        if retained is not None:
+            retained.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, __file__, str(threads), str(cancel)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("threads", [4, 16])
+@pytest.mark.parametrize("terminal", ["finish", "abort"])
+def test_sparse_source_frames_avoid_waking_every_task(threads, terminal):
+    script = r"""
+import runpy, sys, time
+from collections import Counter
+import vane
+
+helpers = runpy.run_path(sys.argv[1])
+threads, terminal = int(sys.argv[2]), sys.argv[3]
+with vane.connect(backend='local', config={'threads': threads}) as connection:
+    source = helpers['channel'](connection, window=8192, frame=1024, rows=64, slots=16)
+    output = helpers['channel'](connection, window=8192, frame=1024, rows=64, slots=16)
+    source.add_producer('upstream')
+    output.add_producer('task')
+    source.seal_producers()
+    output.seal_producers()
+    service = helpers['prepare_root_task'](
+        connection, helpers['submission'](connection), [(source, 'client')], [output])
+    rows = []
+    def pump():
+        service.pump(1)
+        status, batch = output.poll('client')
+        if batch is not None:
+            rows.extend(batch.to_rows())
+            batch.close()
+        return status
+    try:
+        service.start('task', 'start')
+        deadline = time.monotonic() + 5
+        while source.snapshot()['read_blocks'] < threads:
+            pump()
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        for sequence in range(1, 5):
+            before = source.snapshot()['read_blocks']
+            assert source._write_rows('upstream', sequence, [(sequence,)] * 64) == 'accepted'
+            deadline = time.monotonic() + 5
+            while source.snapshot()['queued_frames'] or source.snapshot()['read_blocks'] == before:
+                pump()
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            # Allow scheduled companions to run before the next isolated frame.
+            settle = time.monotonic() + 0.05
+            while time.monotonic() < settle:
+                pump()
+                time.sleep(0.001)
+            # A publication wakes two readers, and consuming the frame hands
+            # off once. Empty polls must not grow with the native thread count.
+            assert source.snapshot()['read_blocks'] <= before + 3, source.snapshot()
+        if terminal == 'finish':
+            source.finish('upstream', 4)
+            deadline = time.monotonic() + 5
+            while pump() != 'end':
+                assert time.monotonic() < deadline
+            assert Counter(rows) == Counter({(value,): 64 for value in range(1, 5)})
+            # Output FINISH can precede the pending query's final control step.
+            while service.status()[0]['state'] != 'FINISHED':
+                service.pump(1)
+                assert time.monotonic() < deadline, service.status()
+        else:
+            source.abort('sparse source failed')
+            deadline = time.monotonic() + 5
+            while service.status()[0]['state'] == 'RUNNING':
+                try:
+                    service.pump(1)
+                except vane.Error as error:
+                    assert 'sparse source failed' in str(error)
+                assert time.monotonic() < deadline
+            state = service.status()[0]
+            assert state['state'] == 'FAILED' and 'sparse source failed' in state['error'], state
+        service.release()
+        assert source.snapshot()['bytes'] == output.snapshot()['bytes'] == 0
+    finally:
+        service.cancel('test cleanup')
+        service.release()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, __file__, str(threads), terminal],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("threads", [4, 16])
+def test_source_wakeup_handoff_after_coalescer_waits_for_credit(threads):
+    script = r"""
+import runpy, sys, time
+import vane
+
+helpers = runpy.run_path(sys.argv[1])
+with vane.connect(backend='local', config={'threads': int(sys.argv[2])}) as connection:
+    source = helpers['channel'](connection, window=8192, frame=1024, rows=64, slots=16)
+    output = helpers['channel'](connection, window=1024, frame=1024, rows=64, slots=1)
+    source.add_producer('upstream')
+    output.add_producer('task')
+    source.seal_producers()
+    output.seal_producers()
+    service = helpers['prepare_root_task'](
+        connection, helpers['submission'](connection), [(source, 'client')], [output])
+    batch = None
+    rows = []
+    def until(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            service.pump(1)
+            assert time.monotonic() < deadline, (source.snapshot(), output.snapshot(), service.status())
+            time.sleep(0.001)
+    def settle():
+        # Finish callbacks already scheduled by the preceding phase before
+        # delivering an isolated event to the remaining parked readers.
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            service.pump(1)
+            time.sleep(0.001)
+    def take_output():
+        deadline = time.monotonic() + 5
+        while True:
+            service.pump(1)
+            _, result = output.poll('client')
+            if result is not None:
+                rows.extend(result.to_rows())
+                return result
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+    try:
+        service.start('task', 'start')
+        until(lambda: source.snapshot()['read_blocks'] >= int(sys.argv[2]))
+        assert source._write_rows('upstream', 1, [(1,)]) == 'accepted'
+        batch = take_output()
+        settle()
+        assert source._write_rows('upstream', 2, [(2,)]) == 'accepted'
+        until(lambda: output.snapshot()['write_blocks'])
+        settle()
+        # A sparse frame first blocks on empty input, then on flushing the
+        # coalescer. Returning sink credit must retire its old source wait.
+        before = source.snapshot()['read_blocks']
+        batch.close()
+        batch = take_output()
+        until(lambda: source.snapshot()['read_blocks'] > before)
+        settle()
+        before = output.snapshot()['write_blocks']
+        assert source._write_rows('upstream', 3, [(3,)]) == 'accepted'
+        until(lambda: output.snapshot()['write_blocks'] > before)
+        settle()
+        # Keep the output borrowed. An idle reader must consume this frame
+        # even while the previous reader remains blocked on downstream credit.
+        assert source._write_rows('upstream', 4, [(4,)]) == 'accepted'
+        until(lambda: source.snapshot()['queued_frames'] == 0)
+        source.finish('upstream', 4)
+        batch.close()
+        batch = None
+        deadline = time.monotonic() + 5
+        while True:
+            service.pump(1)
+            status, received = output.poll('client')
+            if received is not None:
+                rows.extend(received.to_rows())
+                received.close()
+            if status == 'end':
+                break
+            assert time.monotonic() < deadline
+        assert sorted(rows) == [(1,), (2,), (3,), (4,)]
+        until(lambda: service.status()[0]['state'] == 'FINISHED')
+        service.release()
+        assert source.snapshot()['bytes'] == output.snapshot()['bytes'] == 0
+    finally:
+        service.cancel('test cleanup')
+        service.release()
+        if batch is not None:
+            batch.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, __file__, str(threads)],
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

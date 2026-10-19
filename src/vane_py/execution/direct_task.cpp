@@ -6,6 +6,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
@@ -17,9 +18,16 @@ namespace duckdb {
 namespace vane_execution {
 namespace {
 
-ExchangeWakeup Wakeup(const InterruptState &interrupt) {
-	return [interrupt]() {
-		interrupt.Callback();
+ExchangeWakeup Wakeup(const shared_ptr<StateWithBlockableTasks> &waiters) {
+	return [waiters]() {
+		vector<InterruptState> tasks;
+		{
+			auto guard = waiters->Lock();
+			tasks = waiters->TakeBlockedTasks(guard);
+		}
+		for (auto &task : tasks) {
+			task.Callback();
+		}
 	};
 }
 
@@ -35,9 +43,37 @@ string InputError(const std::map<string, vector<DirectInput>> &inputs) {
 	return string();
 }
 
+// A publication starts two readers to overlap scheduling with native work.
+// Successful readers hand off to another waiter for queued frames.
+void WakeSource(const shared_ptr<StateWithBlockableTasks> &waiters, idx_t count = 1) {
+	for (idx_t i = 0; i < count; i++) {
+		InterruptState task;
+		{
+			auto guard = waiters->Lock();
+			if (!waiters->TakeBlockedTask(guard, task)) {
+				return;
+			}
+		}
+		task.Callback();
+	}
+}
+
+ExchangeWakeup SourceWakeup(const shared_ptr<StateWithBlockableTasks> &waiters) {
+	return [waiters]() {
+		WakeSource(waiters, 2);
+	};
+}
+
 class DirectSourceState : public GlobalSourceState {
 public:
+	idx_t MaxThreads() override {
+		return NumericLimits<idx_t>::Maximum();
+	}
 	idx_t cursor = 0;
+	StateWithBlockableTasks &GetBlockingState() override {
+		return *waiters;
+	}
+	shared_ptr<StateWithBlockableTasks> waiters = make_shared_ptr<StateWithBlockableTasks>();
 };
 
 class DirectSource : public PhysicalOperator {
@@ -62,6 +98,12 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+	bool ParallelSource() const override {
+		return true;
+	}
+	OrderPreservationType SourceOrder() const override {
+		return OrderPreservationType::NO_ORDER;
+	}
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
 	}
@@ -77,22 +119,44 @@ public:
 		}
 		blocked->store(false);
 		auto &state = input.global_state.Cast<DirectSourceState>();
-		idx_t ended = 0;
-		for (idx_t step = 0; step < inputs.size(); step++) {
-			auto index = (state.cursor + step) % inputs.size();
-			// EOF and consumer closure do not freeze the channel's error state.
-			// Poll checks persistent errors before returning either terminal value.
-			shared_ptr<DirectBatch> batch;
-			auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, Wakeup(input.interrupt_state));
-			if (result == DirectRead::DATA) {
-				batch->Reference(chunk);
-				state.cursor = (index + 1) % inputs.size();
-				return SourceResultType::HAVE_MORE_OUTPUT;
+		try {
+			auto guard = state.waiters->Lock();
+			if (!state.waiters->CanBlock(guard)) {
+				return SourceResultType::FINISHED;
 			}
-			ended += result == DirectRead::END || result == DirectRead::CLOSED;
+			idx_t ended = 0;
+			for (idx_t step = 0; step < inputs.size(); step++) {
+				auto index = (state.cursor + step) % inputs.size();
+				// EOF and consumer closure do not freeze the channel's error state.
+				// Poll checks persistent errors before returning either terminal value.
+				shared_ptr<DirectBatch> batch;
+				auto result = inputs[index].channel->Poll(inputs[index].consumer, batch, SourceWakeup(state.waiters));
+				if (result == DirectRead::DATA) {
+					state.cursor = (index + 1) % inputs.size();
+					// Poll consumes the channel callback. Pass the wakeup on before
+					// running operators that can block on downstream credit.
+					guard.unlock();
+					WakeSource(state.waiters);
+					// Replacing references can return upstream credit and invoke
+					// another operator's callback; keep it outside the waiter lock.
+					batch->Reference(chunk);
+					return SourceResultType::HAVE_MORE_OUTPUT;
+				}
+				ended += result == DirectRead::END || result == DirectRead::CLOSED;
+			}
+			blocked->store(ended != inputs.size());
+			if (ended == inputs.size()) {
+				guard.unlock();
+				Wakeup(state.waiters)();
+				return SourceResultType::FINISHED;
+			}
+			// Register under the same lock used by publication callbacks. An
+			// event between Poll and registration must observe this waiter.
+			return state.waiters->BlockSource(guard, input.interrupt_state);
+		} catch (...) {
+			Wakeup(state.waiters)();
+			throw;
 		}
-		blocked->store(ended != inputs.size());
-		return ended == inputs.size() ? SourceResultType::FINISHED : SourceResultType::BLOCKED;
 	}
 	const vector<DirectInput> inputs;
 	shared_ptr<atomic<bool>> blocked;
@@ -135,6 +199,8 @@ public:
 		}
 	};
 	vector<vector<Buffer>> buffers;
+	// Scratch belongs to this native sink task and never retains input leases.
+	unique_ptr<Vector> hashes;
 	bool initialized = false;
 	idx_t output = 0;
 	idx_t channel = 0;
@@ -149,9 +215,15 @@ public:
 
 class DirectSinkGlobal : public GlobalSinkState {
 public:
-	explicit DirectSinkGlobal(ClientContext &context_p) : context(context_p) {
+	DirectSinkGlobal(ClientContext &context_p, const vector<DirectOutput> &outputs) : context(context_p) {
+		for (auto &output : outputs) {
+			for (auto &channel : output.channels) {
+				waiters.emplace(channel.get(), make_shared_ptr<StateWithBlockableTasks>());
+			}
+		}
 	}
 	ClientContext &context;
+	std::map<const DirectChannel *, shared_ptr<StateWithBlockableTasks>> waiters;
 };
 
 class DirectCollector : public PhysicalResultCollector {
@@ -164,19 +236,44 @@ public:
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const override {
 		return ExecutionBatchRequirement::BATCH_REQUIRED;
 	}
+	bool ParallelSink() const override {
+		// Exchange arrival has no insertion-order contract. Explicit ORDER BY
+		// still uses a serial collector for the native sorted output.
+		return PhysicalPlanGenerator::OrderPreservationRecursive(plan) != OrderPreservationType::FIXED_ORDER;
+	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
-		return make_uniq<DirectSinkGlobal>(context);
+		return make_uniq<DirectSinkGlobal>(context, outputs);
 	}
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &) const override {
 		auto state = make_uniq<DirectSinkLocal>();
 		state->buffers.resize(outputs.size());
 		for (idx_t i = 0; i < outputs.size(); i++) {
 			state->buffers[i].resize(outputs[i].channels.size());
+			if (!outputs[i].hash_columns.empty() && !state->hashes) {
+				state->hashes = make_uniq<Vector>(LogicalType::HASH);
+			}
 		}
 		return std::move(state);
 	}
-	bool Flush(DirectSinkLocal::Buffer &buffer, const DirectOutput &output, DirectChannel &channel,
-	           const InterruptState &interrupt) const {
+	DirectWrite Write(DirectSinkGlobal &state, const DirectOutput &output, DirectChannel &channel, DataChunk &chunk,
+	                  const vector<idx_t> &rows, idx_t offset, idx_t count, const InterruptState &interrupt) const {
+		// Sequence allocation and waiter registration are shared by tasks that
+		// publish to this channel. Other targets can copy and publish in parallel,
+		// and returning their credit does not reschedule this channel's tasks.
+		auto &waiters = state.waiters.at(&channel);
+		auto guard = waiters->Lock();
+		// Sequence allocation and publication are atomic across native sink
+		// tasks. Each blocked task retains its own input until credit returns.
+		auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk, rows, offset,
+		                               count, Wakeup(waiters));
+		if (result == DirectWrite::BLOCKED) {
+			waiters->BlockTask(guard, interrupt);
+			progress->output_blocked.store(true);
+		}
+		return result;
+	}
+	bool Flush(DirectSinkGlobal &global, DirectSinkLocal::Buffer &buffer, const DirectOutput &output,
+	           DirectChannel &channel, const InterruptState &interrupt) const {
 		if (!buffer.Count()) {
 			return true;
 		}
@@ -194,8 +291,7 @@ public:
 		for (idx_t row = 0; row < chunk.size(); row++) {
 			rows.push_back(row);
 		}
-		auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk, rows, 0,
-		                               rows.size(), Wakeup(interrupt));
+		auto result = Write(global, output, channel, chunk, rows, 0, rows.size(), interrupt);
 		if (result == DirectWrite::BLOCKED) {
 			progress->output_blocked.store(true);
 			return false;
@@ -204,10 +300,8 @@ public:
 		return true;
 	}
 	SinkResultType FlushPending(ExecutionContext &, OperatorSinkInput &input, bool force) const override {
-		if (!inputs.empty()) {
-			return SinkResultType::NEED_MORE_INPUT;
-		}
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		auto &global = input.global_state.Cast<DirectSinkGlobal>();
 		auto now = DirectSinkLocal::Clock::now();
 		if (!force && now < state.next_flush) {
 			return SinkResultType::NEED_MORE_INPUT;
@@ -218,7 +312,7 @@ public:
 			for (idx_t target = 0; target < outputs[out].channels.size(); target++) {
 				auto &channel = *outputs[out].channels[target];
 				live = channel.HasConsumers() || live;
-				if (!Flush(state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
+				if (!Flush(global, state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
 					return SinkResultType::BLOCKED;
 				}
 			}
@@ -229,6 +323,7 @@ public:
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
 		progress->output_blocked.store(false);
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		auto &global = input.global_state.Cast<DirectSinkGlobal>();
 		bool live = false;
 		for (auto &output : outputs) {
 			for (auto &channel : output.channels) {
@@ -250,8 +345,8 @@ public:
 				auto &output = outputs[out];
 				auto &selection = state.selections[out];
 				selection.resize(output.channels.size());
-				if (!output.partitioning.empty()) {
-					auto ids = HashPartitions(context.client, output.partitioning, chunk, output.channels.size());
+				if (!output.hash_columns.empty()) {
+					auto ids = HashPartitions(output.hash_columns, chunk, output.channels.size(), *state.hashes);
 					for (idx_t row = 0; row < ids.size(); row++) {
 						selection[ids[row]].push_back(row);
 					}
@@ -279,23 +374,22 @@ public:
 						break;
 					}
 					if (buffer.Count() == channel.limits.frame_rows &&
-					    !Flush(buffer, output, channel, input.interrupt_state)) {
+					    !Flush(global, buffer, output, channel, input.interrupt_state)) {
 						return SinkResultType::BLOCKED;
 					}
 					auto count = channel.FrameRows(chunk, rows, state.offset);
 					count = MinValue<idx_t>(count, channel.limits.frame_rows - buffer.Count());
 					auto bytes = channel.FrameSize(chunk, rows, state.offset, count);
 					if (buffer.Count() && bytes > channel.limits.frame_bytes - buffer.bytes) {
-						if (!Flush(buffer, output, channel, input.interrupt_state)) {
+						if (!Flush(global, buffer, output, channel, input.interrupt_state)) {
 							return SinkResultType::BLOCKED;
 						}
 						continue;
 					}
-					// Forward input-driven tasks immediately. Local scans coalesce
-					// until the frame fills or their periodic pipeline flush fires,
-					// including when later scan batches are entirely filtered out.
-					if (inputs.empty() && (buffer.Count() || (count < channel.limits.frame_rows &&
-					                                          count == rows.size() - state.offset))) {
+					// Coalesce sparse scan and exchange inputs. The executor flushes
+					// periodically and before waiting for more input, so a partial
+					// frame cannot be stranded behind an idle upstream producer.
+					if (buffer.Count() || (count < channel.limits.frame_rows && count == rows.size() - state.offset)) {
 						if (!buffer.data) {
 							// The bounded coalescer is an operator allocation charged
 							// to DuckDB's buffer pool, separately from channel credit.
@@ -314,8 +408,8 @@ public:
 						state.offset += count;
 						continue;
 					}
-					auto result = channel.TryWrite(output.producer, channel.LastSequence(output.producer) + 1, chunk,
-					                               rows, state.offset, count, Wakeup(input.interrupt_state));
+					auto result =
+					    Write(global, output, channel, chunk, rows, state.offset, count, input.interrupt_state);
 					if (result == DirectWrite::BLOCKED) {
 						progress->output_blocked.store(true);
 						return SinkResultType::BLOCKED;
@@ -326,7 +420,7 @@ public:
 					state.offset += count;
 				}
 				if ((buffer.Count() == channel.limits.frame_rows || buffer.bytes == channel.limits.frame_bytes) &&
-				    !Flush(buffer, output, channel, input.interrupt_state)) {
+				    !Flush(global, buffer, output, channel, input.interrupt_state)) {
 					return SinkResultType::BLOCKED;
 				}
 			}
@@ -339,9 +433,10 @@ public:
 	SinkCombineResultType Combine(ExecutionContext &, OperatorSinkCombineInput &input) const override {
 		progress->output_blocked.store(false);
 		auto &state = input.local_state.Cast<DirectSinkLocal>();
+		auto &global = input.global_state.Cast<DirectSinkGlobal>();
 		for (idx_t out = 0; out < outputs.size(); out++) {
 			for (idx_t channel = 0; channel < outputs[out].channels.size(); channel++) {
-				if (!Flush(state.buffers[out][channel], outputs[out], *outputs[out].channels[channel],
+				if (!Flush(global, state.buffers[out][channel], outputs[out], *outputs[out].channels[channel],
 				           input.interrupt_state)) {
 					return SinkCombineResultType::BLOCKED;
 				}
@@ -463,7 +558,7 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 	if (used.size() != inputs.size() || outputs.empty()) {
 		throw InvalidInputException("unexpected direct input port or missing output");
 	}
-	for (auto &output : outputs) {
+	for (auto &output : task->outputs) {
 		if (output.channels.empty() || output.producer.empty()) {
 			throw InvalidInputException("missing direct output channel or producer");
 		}
@@ -474,10 +569,10 @@ void DirectTaskService::Prepare(const string &id, const string &payload, const s
 			}
 			channel->LastSequence(output.producer); // Registration must precede preparation.
 		}
+		output.hash_columns.clear();
 		if (!output.partitioning.empty()) {
-			DataChunk empty;
-			empty.Initialize(Allocator::Get(context), task->fragment.root.types);
-			HashPartitions(context, output.partitioning, empty, output.channels.size());
+			output.hash_columns =
+			    BindHashColumns(context, output.partitioning, task->fragment.root.types, output.channels.size());
 		}
 	}
 	task->prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 from local_gpu_helpers import (
@@ -25,6 +25,7 @@ from local_gpu_helpers import query_gpu_environment as query_gpu_environment
 
 import vane
 from vane.execution import udf_subprocess
+from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
 from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
 from vane.execution.udf_model_pool import ModelPoolCapacityError, ModelPoolResourceBusy
@@ -117,6 +118,42 @@ def test_gpu_model_can_declare_zero_cpu_within_a_gpu_resident_limit(tmp_path):
         assert run(connection, 7)["value"] == 84
         assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector(gpu=1).to_dict()
         assert_idle(runtime)
+
+
+@pytest.mark.parametrize("cpus", [0, 1])
+@pytest.mark.timeout(20)
+def test_completed_query_releases_output_while_producer_retains_future(tmp_path, monkeypatch, cpus):
+    published, release_producer = threading.Event(), threading.Event()
+    set_result = Future.set_result
+
+    def publish(future, result):
+        set_result(future, result)
+        if isinstance(result, tuple) and len(result) == 4 and result[0] == REF_BUNDLE_RESULT_MARKER:
+            # Keep the producer's Future and result alive after its completion
+            # callback, while the native consumer finishes reading the output.
+            published.set()
+            assert release_producer.wait(10)
+
+    monkeypatch.setattr(Future, "set_result", publish)
+    with vane.connect() as connection:
+        runtime = configure(connection, resident_limit=ResourceVector(cpu=cpus, gpu=1))
+        model = runtime.register_model(
+            "encoder",
+            model_definition(tmp_path),
+            version="v1",
+            parameters=["BIGINT"],
+            cpus=cpus,
+            gpu_devices=DEVICES[:1],
+        )
+        vane.attach_function(model, connection=connection)
+        with ThreadPoolExecutor(1) as threads:
+            pending = threads.submit(run, connection, 7)
+            try:
+                assert published.wait(5)
+                assert pending.result(timeout=5)["value"] == 84
+                assert_idle(runtime)
+            finally:
+                release_producer.set()
 
 
 @pytest.mark.parametrize("entry", ["query", "close"])

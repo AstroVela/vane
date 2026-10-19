@@ -3,6 +3,7 @@
 
 #include "materialized_exchange.hpp"
 #include "arrow_frame.hpp"
+#include "exchange_signal.hpp"
 #include "fragment_plan.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/local_file_system.hpp"
@@ -11,7 +12,7 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <chrono>
-#include <condition_variable>
+#include <cstring>
 #include <thread>
 
 namespace duckdb {
@@ -19,6 +20,7 @@ namespace vane_execution {
 namespace {
 
 using Hash = SHA256State;
+constexpr idx_t IO_BUFFER_BYTES = 65536;
 
 void Check(const arrow::Status &status) {
 	if (!status.ok()) {
@@ -99,23 +101,6 @@ void VerifyHandle(FileHandle &file, const MaterializedObject &expected, const st
 	}
 }
 
-struct Signal : public std::enable_shared_from_this<Signal> {
-	std::mutex lock;
-	std::condition_variable changed;
-	void Wait() {
-		std::unique_lock<std::mutex> guard(lock);
-		changed.wait_for(guard, std::chrono::milliseconds(10));
-	}
-	ExchangeWakeup Wakeup() {
-		std::weak_ptr<Signal> weak = shared_from_this();
-		return [weak]() {
-			if (auto signal = weak.lock()) {
-				signal->changed.notify_all();
-			}
-		};
-	}
-};
-
 } // namespace
 
 struct MaterializedIO::Impl {
@@ -126,7 +111,7 @@ struct MaterializedIO::Impl {
 	const idx_t max_bytes;
 	const idx_t frame_limit;
 	const MaterializedObject expected;
-	std::shared_ptr<Signal> signal = std::make_shared<Signal>();
+	std::shared_ptr<ExchangeSignal> signal = std::make_shared<ExchangeSignal>();
 	std::mutex close_lock;
 	mutable std::mutex state_lock;
 	MaterializedStatus state;
@@ -178,7 +163,7 @@ struct MaterializedIO::Impl {
 			stop = true;
 		}
 		channel->Abort(reason.empty() ? "materialized I/O canceled" : reason);
-		signal->changed.notify_all();
+		signal->Notify();
 	}
 
 	MaterializedObject Write() {
@@ -187,14 +172,33 @@ struct MaterializedIO::Impl {
 		                                  FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE | FileFlags::FILE_FLAGS_PRIVATE);
 		MaterializedObject result;
 		Hash hash;
+		vector<char> buffer(IO_BUFFER_BYTES);
+		idx_t buffered = 0, written = 0;
+		auto flush = [&]() {
+			if (buffered) {
+				CheckRunning();
+				fs.Write(*file, buffer.data(), buffered, written);
+				written += buffered;
+				buffered = 0;
+			}
+		};
 		auto write = [&](const char *data, idx_t size) {
 			CheckRunning();
 			if (size > max_bytes - result.bytes) {
 				throw OutOfMemoryException("materialized object exceeds reserved storage bytes");
 			}
-			fs.Write(*file, const_cast<char *>(data), size, result.bytes);
 			hash.AddBytes(reinterpret_cast<const_data_ptr_t>(data), size);
 			result.bytes += size;
+			while (size) {
+				auto count = MinValue<idx_t>(size, buffer.size() - buffered);
+				std::memcpy(buffer.data() + buffered, data, count);
+				buffered += count;
+				data += count;
+				size -= count;
+				if (buffered == buffer.size()) {
+					flush();
+				}
+			}
 		};
 		auto text = [&](const string &value) {
 			write(value.data(), value.size());
@@ -242,6 +246,7 @@ struct MaterializedIO::Impl {
 		text(Number(0));
 		text(Number(result.frames));
 		text(Number(result.rows));
+		flush();
 		file->Sync();
 		file->Close();
 		CheckRunning();
@@ -254,14 +259,27 @@ struct MaterializedIO::Impl {
 		auto file = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ | FileLockType::READ_LOCK);
 		VerifyHandle(*file, expected, SerializeSchema(channel->types), &stop);
 		idx_t offset = 0;
+		vector<char> buffer(IO_BUFFER_BYTES);
+		idx_t buffered = 0, cursor = 0;
 		auto read = [&](idx_t size) {
 			CheckRunning();
 			if (size > expected.bytes - offset) {
 				throw IOException("truncated materialized object");
 			}
 			string value(size, '\0');
-			file->Read(&value[0], size, offset);
-			offset += size;
+			for (idx_t copied = 0; copied < size;) {
+				if (cursor == buffered) {
+					CheckRunning();
+					buffered = MinValue<idx_t>(buffer.size(), expected.bytes - offset);
+					file->Read(buffer.data(), buffered, offset);
+					cursor = 0;
+				}
+				auto count = MinValue<idx_t>(size - copied, buffered - cursor);
+				std::memcpy(&value[copied], buffer.data() + cursor, count);
+				cursor += count;
+				offset += count;
+				copied += count;
+			}
 			return value;
 		};
 		auto number = [&]() {
@@ -314,7 +332,6 @@ struct MaterializedIO::Impl {
 			if (!batch || idx_t(batch->num_rows()) != count) {
 				throw IOException("materialized Arrow row count mismatch");
 			}
-			Check(batch->ValidateFull());
 			Check(reader->ReadNext(&extra));
 			if (extra) {
 				throw IOException("materialized frame has trailing batches");
@@ -381,7 +398,8 @@ idx_t MaterializedIO::StagingBytes(idx_t frame_bytes) {
 	if (!frame_bytes || frame_bytes > (1ULL << 28)) {
 		throw InvalidInputException("materialized frame_bytes must be between 1 and 256 MiB");
 	}
-	return 16 * frame_bytes + (1 << 18);
+	// Arrow/native conversion, IPC and one bounded sequential file buffer.
+	return 16 * frame_bytes + (1 << 18) + IO_BUFFER_BYTES;
 }
 
 void MaterializedIO::Verify(const string &path, const MaterializedObject &expected, const string &schema) {

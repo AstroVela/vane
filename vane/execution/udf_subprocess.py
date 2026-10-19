@@ -1803,6 +1803,20 @@ def _record_worker_cancellation(worker: Any) -> None:
         lifecycle.finish(WorkerOutcome.CANCELLED)
 
 
+def _take_local_ref_bundle_result(value: Any) -> Any:
+    """Transfer SHM refs out of producer-owned containers at dequeue."""
+    if isinstance(value, tuple) and len(value) == 3 and value[0] == SUBMIT_RESULT_MARKER:
+        return (value[0], value[1], _take_local_ref_bundle_result(value[2]))
+    if isinstance(value, tuple) and len(value) == 4 and value[0] == REF_BUNDLE_RESULT_MARKER:
+        # The Future and its completion stack can outlive native consumption.
+        # Move only the ref list so they no longer keep the consumer's storage
+        # alive; the blocks themselves remain owned by the returned result.
+        refs = list(value[1])
+        value[1].clear()
+        return (value[0], refs, value[2], value[3])
+    return value
+
+
 def _release_local_ref_bundle_result(value: Any) -> None:
     if isinstance(value, tuple) and len(value) >= 3 and value[0] == SUBMIT_RESULT_MARKER:
         value = value[2]
@@ -4244,7 +4258,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._queue_lock:
             try:
-                result = self._queue.popleft()
+                result = _take_local_ref_bundle_result(self._queue.popleft())
             except IndexError:
                 return None
             result_admissions = getattr(self, "_result_admissions", None)

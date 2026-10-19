@@ -178,6 +178,116 @@ DETERMINISTIC_TIMEZONES = [
 ]
 
 
+def large_join_key_query(connection, path, domain="exact", kind="inner", comparison="="):
+    if domain == "join_estimate":
+        build_path = path.with_stem("build")
+        connection.execute(
+            "copy (select range%4096 i, case when range%1048576=0 then null else range%1048576 end k, "
+            "range%2 flag, 'fact-'||(range%4096)::varchar payload, 'other-'||(range%4096)::varchar extra "
+            f"from range(2097152)) to '{path}' (row_group_size 2048)"
+        )
+        connection.execute(
+            "copy (select case when range<2 then null else range//2 end k, (range//2)%4096 active, "
+            f"'build-'||(range%4096)::varchar v from range(1048576)) to '{build_path}' (row_group_size 2048)"
+        )
+        # Scan filters estimate a 2:1 probe/build ratio, but the single-key
+        # join estimates fewer than one quarter of the probes will survive.
+        # Duplicate and NULL build keys must still reach the original join.
+        output = ", b.v" if kind in ("inner", "left") else ""
+        return (
+            f"select p.i, p.k, p.payload, p.extra{output} from read_parquet('{path}') p "
+            f"{kind} join (select * from read_parquet('{build_path}') where active=0) b "
+            f"on p.k {comparison} b.k where p.flag=0 order by all"
+        )
+    if domain == "compressed":
+        build_path = path.with_stem("build")
+        connection.execute(
+            "copy (select range%4096 i, range%65536 k, 'fact-'||(range%4096)::varchar payload "
+            f"from range(5242880)) to '{path}' (row_group_size 2048)"
+        )
+        connection.execute(
+            "copy (select range%65536 k, 'build-'||(range%4096)::varchar v, 'other-'||(range%4096)::varchar w, "
+            f"'third-'||(range%4096)::varchar z from range(1048576)) to '{build_path}' (row_group_size 2048)"
+        )
+        # Both key columns have statistics: native compression creates a
+        # computed projection through which scan filter pushdown cannot pass.
+        output = ", b.v, b.w, b.z" if kind in ("inner", "left") else ""
+        return (
+            f"select p.i, p.k, p.payload{output} from read_parquet('{path}') p "
+            f"{kind} join (select * from read_parquet('{build_path}') where k%16384=0) b "
+            f"on p.k {comparison} b.k order by all"
+        )
+    count = 8388608 if domain == "estimated" else 1048576
+    value = "range%4096" if domain == "estimated" else "range"
+    connection.execute(
+        f"copy (select {value} i, case when range%8192=0 then null else range%65536 end k, "
+        f"'fact-'||({value})::varchar payload from range({count})) to '{path}' (row_group_size 2048)"
+    )
+    key = "case when range%8192=0 then null else range%65536 end"
+    if domain == "dense":
+        # More distinct input keys than the filter's fixed domain bound.
+        key = key.replace("range%65536", "range%262144")
+    if domain in ("exact", "estimated"):
+        # The estimated variant has 1.5M build rows: its BIGINT key domain
+        # is 12.9 MiB, and the probe/build row ratio is between 4 and 8.
+        source = (
+            "range(7500000) where range%65536=1024" if domain == "estimated" else "range(327680) where range%1024=0"
+        )
+        build = f"select {key} k, 'build-'||range::varchar v, 'other-'||range::varchar w from {source}"
+        output = ", b.v, b.w" if kind in ("inner", "left") else ""
+    else:
+        total = "sum(range*1024)" if domain == "dense" else "sum(range)"
+        predicate = f"{total}%1024={'-1' if domain == 'empty' else '0'}"
+        build = f"select {key} k, {total} s from range(2000000) group by k having {predicate}"
+        output = ", b.s" if kind in ("inner", "left") else ""
+    return (
+        f"select p.i, p.k, p.payload{output} from read_parquet('{path}') p "
+        f"{kind} join ({build}) b on p.k {comparison} b.k order by all"
+    )
+
+
+def early_join_filter_query(connection, path, kind="inner", comparison="=", *, wide_probe=False):
+    extra = ", 'fact-' || range::varchar fact_payload" if wide_probe else ""
+    payload = "f.fact_payload || o.payload as payload" if wide_probe else "o.payload"
+    connection.execute(
+        "copy (select range i, case when range%4096=0 then null else range%4096 end k "
+        f"{extra} from range(131072)) to '{path}' (row_group_size 2048)"
+    )
+    # The wide order payload keeps the first join above the broadcast limit.
+    # A later selective build has duplicate and NULL keys and can filter facts
+    # before that first hash exchange without executing the build twice.
+    # A wider probe also retains this orientation with default optimizers.
+    return (
+        f"select a.i, a.k, a.payload from (select f.i, f.k, {payload} "
+        f"from read_parquet('{path}') f join "
+        "(select range i, 'order-' || range::varchar as payload from range(131072)) o using(i)) a "
+        f"{kind} join (select case when range%4096=0 then null else range%4096 end k "
+        f"from range(8192) where range%512=0) b on a.k {comparison} b.k order by a.i, a.payload"
+    )
+
+
+def correlated_owner_queries(connection, path, comparison="="):
+    connection.execute(
+        "copy (select case when range%65536=0 then null else range%4096 end k, range%97 v "
+        f"from range(131072)) to '{path}' (row_group_size 2048)"
+    )
+    # No independent Parquet scan contains the owner's key domain. Its output
+    # has duplicates and exceeds one-slot exchange windows on both branches.
+    owner = (
+        "(select range i, case when range%4=0 then null else (range%4)*257 end k, range%3 t "
+        "from range(65536) where range%31=0) a"
+    )
+    match = f"select 1 from read_parquet('{path}') b where b.k {comparison} a.k and b.v<>a.t"
+    exclude = f"select 1 from read_parquet('{path}') c where c.k {comparison} a.k and c.v>a.t+95"
+    return {
+        "semi": f"select a.i, a.k from {owner} where exists ({match}) order by a.i",
+        "anti": f"select a.i, a.k from {owner} where not exists ({exclude}) order by a.i",
+        "nested": f"select a.i, a.k from {owner} where exists ({match}) and not exists ({exclude}) order by a.i",
+        "scalar": f"select a.i, a.k, (select avg(b.v) from read_parquet('{path}') b "
+        f"where b.k {comparison} a.k and b.v<>a.t) v from {owner} order by a.i",
+    }
+
+
 def correlation_source(count=31):
     # Repeated and NULL keys exercise ownership separately from row splitting.
     return f"(select case when range % 11=0 then null else range % 7 end k, range % 5 s, range v from range({count}))"
