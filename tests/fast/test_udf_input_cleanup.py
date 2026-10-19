@@ -395,6 +395,136 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
         query.shutdown()
 
 
+@pytest.mark.parametrize("delay_release", [False, True])
+def test_materialized_input_cleanup_failure_releases_bytes_and_reuses_live_worker(monkeypatch, delay_release):
+    import pyarrow as pa
+
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle, udf_subprocess
+    from vane.execution.resources import ResourceVector
+    from vane.execution.udf import build_executor
+    from vane.execution.udf_subprocess import _release_local_ref_bundle_result
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    runtime = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1 << 30))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", runtime)
+    payload = dict(
+        function_pickle=vane_pickle.dumps(lambda table: table),
+        call_mode="map_batches",
+        execution_backend="subprocess_task",
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    query, next_query = QueryInputCleanup(), QueryInputCleanup()
+    executor = build_executor(payload, {"local_input_cleanup": query})
+    next_executor = None
+    block = view = None
+    entered, proceed, released = threading.Event(), threading.Event(), threading.Event()
+    if not delay_release:
+        proceed.set()
+    pool = executor._task_pool
+    spawn = pool._spawn_worker
+
+    def spawn_with_release_gate(*args, **kwargs):
+        wrapper = spawn(*args, **kwargs)
+        peer = wrapper.worker._shm_peer
+        release = peer.release_read
+
+        def release_read(token):
+            entered.set()
+            assert proceed.wait(10), "remote input release was not resumed"
+            release(token)
+            released.set()
+
+        monkeypatch.setattr(peer, "release_read", release_read)
+        return wrapper
+
+    monkeypatch.setattr(pool, "_spawn_worker", spawn_with_release_gate)
+    cancel = manager.cancel_input_lease
+
+    def fail_completion(*args, **kwargs):
+        if kwargs.get("name") == "task-input-cleanup":
+            raise RuntimeError("planned materialized input cleanup failure")
+        return cancel(*args, **kwargs)
+
+    try:
+        next_executor = build_executor(payload, {"local_input_cleanup": next_query})
+        assert next_executor._task_pool is pool
+        with monkeypatch.context() as fault:
+            fault.setattr(manager, "cancel_input_lease", fail_completion)
+            assert executor.request_task_admission(8)
+            executor.submit_with_id(1, pa.table({"x": [7]}))
+            assert executor._wait_for_pending_futures(15)
+            assert entered.wait(5), "worker did not release its input"
+            block = executor.take_ready_result()
+            assert block[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 1)
+            assert block[3] is False
+            output_bytes = block[2][1][0].size
+            view = block[2][1][0].to_table()
+            assert view.to_pydict() == {"x": [7]}
+            _release_local_ref_bundle_result(block)
+            block = None
+            terminal = executor.take_ready_result()
+            assert isinstance(terminal[2], BaseException)
+            assert "materialized input cleanup failure" in str(terminal[2])
+            executor.stats()
+            with pytest.raises(RuntimeError, match="materialized input cleanup failure"):
+                query.shutdown()
+            assert query.cleanup_pending()
+        query.shutdown()
+        assert not query.cleanup_pending()
+        assert manager.snapshot()["active_input_leases"] == 0
+        with runtime.cond:
+            assert pool.total == len(pool.idle) == 1
+            worker = pool.idle[0].worker
+            process = worker._proc
+        assert process.poll() is None
+        if delay_release:
+            assert not released.is_set()
+            assert manager.snapshot()["usage_bytes"] > output_bytes
+        proceed.set()
+        assert released.wait(5), "remote input release did not finish"
+        # The live consumer view remains charged after input cleanup and ACK.
+        assert manager.snapshot()["usage_bytes"] == output_bytes
+        assert view.to_pydict() == {"x": [7]}
+        view = None
+        assert manager.snapshot()["usage_bytes"] == 0
+        assert process.poll() is None
+
+        released.clear()
+        assert next_executor.request_task_admission(8)
+        next_executor.submit_with_id(2, pa.table({"x": [8]}))
+        assert next_executor._wait_for_pending_futures(15)
+        block = next_executor.take_ready_result()
+        assert block[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, 2)
+        assert block[3] is False
+        assert block[2][1][0].to_table().to_pydict() == {"x": [8]}
+        _release_local_ref_bundle_result(block)
+        block = None
+        assert next_executor.take_ready_result() == (ref_bundle.SUBMIT_RESULT_MARKER, 2, None)
+        next_query.shutdown()
+        assert not next_query.cleanup_pending()
+        assert released.wait(5)
+        assert manager.snapshot()["active_input_leases"] == 0
+        assert manager.snapshot()["usage_bytes"] == 0
+        with runtime.cond:
+            assert pool.total == len(pool.idle) == 1
+            assert pool.idle[0].worker is worker
+            assert worker._proc is process
+        assert process.poll() is None
+    finally:
+        proceed.set()
+        view = None
+        _release_local_ref_bundle_result(block)
+        executor.close(kill=True)
+        if next_executor is not None:
+            next_executor.close(kill=True)
+        query.shutdown()
+        next_query.shutdown()
+        runtime.close(kill=True)
+
+
 @pytest.mark.parametrize("failure", ["schedule", "spawn"])
 def test_ref_input_cleanup_survives_failure_before_worker_submission(monkeypatch, failure):
     import pyarrow as pa
