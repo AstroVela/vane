@@ -460,8 +460,8 @@ SinkResultType PhysicalLocalExchange::SinkBatch(ExecutionContext &context, Execu
 	const auto repartition_type = repartition_spec ? repartition_spec->type() : RepartitionSpec::Type::Random;
 	if (repartition_type != RepartitionSpec::Type::Random &&
 	    repartition_type != RepartitionSpec::Type::IntoPartitions) {
-		auto barrier = MaterializeExternalBlockBarrier(context.client, *batch.lazy, GetName());
-		return Sink(context, *barrier.chunk, input);
+		// Retain the payload in the input batch if the queue budget blocks Sink.
+		return PhysicalOperator::SinkBatch(context, batch, input);
 	}
 
 	auto &gstate = input.global_state.Cast<LocalExchangeGlobalSinkState>();
