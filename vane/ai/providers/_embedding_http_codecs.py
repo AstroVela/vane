@@ -36,7 +36,13 @@ class EmbeddingHTTPCodec:
             raise EmbeddingConfigurationError("Unknown embedding HTTP protocol")
         self.family = family
         self.input_format = options.get("http_input_format", "text")
-        allowed = IMAGE_TYPES | VIDEO_TYPES | (AUDIO_TYPES if family == "vllm" else frozenset())
+        allowed = (
+            IMAGE_TYPES
+            | VIDEO_TYPES
+            | (AUDIO_TYPES if family == "vllm" or self.input_format == "encode" else frozenset())
+        )
+        self.media_tokens = options.get("http_media_tokens", {})
+        self.dimensions = dimensions if options.get("supports_overriding_dimensions", False) else None
         declared = frozenset(options.get("media_mime_types", []))
         if declared - allowed:
             raise EmbeddingConfigurationError(
@@ -55,6 +61,8 @@ class EmbeddingHTTPCodec:
         field = "messages" if family == "vllm" and self.input_format == "multimodal" else "input"
         self.prefix = json_bytes(metadata)[:-1] + b',"' + field.encode() + b'":['
         self.suffix = b"]}"
+        if self.input_format == "encode":
+            self.prefix = self.suffix = b""
 
     def encode(self, content: EmbeddingContent) -> bytes:
         self.spec.validate_layout(tuple(part.spec for part in content.parts))
@@ -125,6 +133,21 @@ class EmbeddingHTTPCodec:
                 )
             else:
                 messages.append({"type": f"{kind}_url", f"{kind}_url": {"url": url}})
+        if self.input_format == "encode":
+            # /encode is a raw-input endpoint: unlike /v1/embeddings, it does
+            # not render a chat template. Markers belong to explicit deployment
+            # configuration, never a guessed model-family convention.
+            text = fields.get("text", "")
+            if any(token in text for token in self.media_tokens.values()):
+                raise EmbeddingConfigurationError("Text cannot contain configured HTTP media markers")
+            prompt = "".join(self.media_tokens[kind] for kind in fields if kind != "text") + text
+            row: dict[str, Any] = {
+                "text": prompt,
+                **{kind + "_data": fields.get(kind) for kind in ("image", "video", "audio")},
+            }
+            if self.dimensions is not None:
+                row["dimensions"] = self.dimensions
+            return json_bytes(row)
         if self.family == "sglang":
             # The protocol has named fields; its server template owns their order.
             return json_bytes(fields)
@@ -132,4 +155,16 @@ class EmbeddingHTTPCodec:
         return json_bytes([{"role": "user", "content": messages}])
 
     def body(self, rows: list[bytes]) -> bytes:
+        if self.input_format == "encode":
+            if len(rows) == 1:
+                return rows[0]
+            values = [json.loads(row) for row in rows]
+            # Every encoded row includes every media column, including nulls.
+            # The sum of row sizes therefore bounds the column-oriented body.
+            body: dict[str, Any] = {
+                key: [value[key] for value in values] for key in ("text", "image_data", "video_data", "audio_data")
+            }
+            if self.dimensions is not None:
+                body["dimensions"] = self.dimensions
+            return json_bytes(body)
         return self.prefix + b",".join(rows) + self.suffix

@@ -509,3 +509,13 @@ Validate changes with the AI diagnostic tests, actor-pool lifecycle tests and
 isolated Ray regressions for initialization, fetching results and writing Parquet.
 The dependent Context HTTP regressions exercise actual `vane.cls.batch`
 constructor failures through a complete query and HTTP error response.
+
+For the explicit SGLang `/encode` HTTP format, complete two clean reviews before
+building/installing the Python-only wheel noneditably. Run the affected
+`test_ai_embedding_sglang_encode.py` and `test_ai_embedding_http_runtime.py`
+through the installed launcher. Cover Base64 video/audio, explicit media tokens,
+text-only queries, mixed absent inputs, batching/order and serialized byte limits
+before client creation, including ignore mode. Real-model acceptance uses the
+unchanged SGLang server with audio/video/subtitles and a matching Context catalog;
+CPU HTTP fixtures do not establish model quality. Only related tests are required;
+no native rebuild or Ray suite is needed for these Python-only HTTP changes.
