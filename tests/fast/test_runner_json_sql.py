@@ -37,7 +37,7 @@ _INNER_QUERY_LITERAL = "'SELECT getvariable(''answer'') AS value'"
 @pytest.mark.parametrize("entry", ["execute", "sql", "parameterized_sql", "relation_query", "relation"])
 @pytest.mark.parametrize(
     "runner_type, operation",
-    [("ray", "select"), ("ray", "copy"), ("local", "copy"), ("ray", "insert"), ("ray", "ctas")],
+    [("ray", "select"), ("ray", "copy"), ("ray", "insert"), ("ray", "ctas")],
 )
 def test_runner_rejects_json_serialization(monkeypatch, tmp_path, function, options, entry, runner_type, operation):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
@@ -46,7 +46,6 @@ def test_runner_rejects_json_serialization(monkeypatch, tmp_path, function, opti
         raise AssertionError("JSON SQL serialization must fail before initializing a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     destination = tmp_path / "rejected.parquet"
     with vane.connect() as connection:
         connection.execute("SET VARIABLE answer=41")
@@ -109,7 +108,7 @@ def test_native_json_plan_serialization_observes_client_variables(monkeypatch, r
         assert json.loads(actual) == json.loads(expected)
 
 
-@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
+@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy")])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 def test_runner_rejects_json_execution_before_nested_execution(monkeypatch, tmp_path, runner_type, operation, entry):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -121,7 +120,6 @@ def test_runner_rejects_json_execution_before_nested_execution(monkeypatch, tmp_
         raise AssertionError("nested JSON SQL must fail before initializing a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     database = str(tmp_path / "json_nested_binding.duckdb")
     destination = tmp_path / "rejected.parquet"
     with vane.connect(database) as connection:
@@ -143,7 +141,7 @@ def test_runner_rejects_json_execution_before_nested_execution(monkeypatch, tmp_
         assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
 
 
-@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
+@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy")])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 def test_runner_json_execution_preserves_nested_binding_errors(monkeypatch, tmp_path, runner_type, operation, entry):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -155,7 +153,6 @@ def test_runner_json_execution_preserves_nested_binding_errors(monkeypatch, tmp_
         raise AssertionError("nested JSON binding errors must precede runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     destination = tmp_path / "rejected.parquet"
     with vane.connect() as connection:
         argument = serialized.replace("'", "''")
@@ -210,9 +207,7 @@ def test_runner_keeps_json_sql_deserialization(monkeypatch):
 
 
 @pytest.mark.parametrize("version", ["v1.3.0", "latest"])
-@pytest.mark.parametrize(
-    "runner_type, operation", [("ray", "select"), ("ray", "insert"), ("ray", "ctas"), ("local", "copy")]
-)
+@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "insert"), ("ray", "ctas")])
 def test_runner_rejects_json_serializer_with_file_database_global_setting(
     monkeypatch, tmp_path, version, runner_type, operation
 ):
@@ -222,7 +217,6 @@ def test_runner_rejects_json_serializer_with_file_database_global_setting(
         raise AssertionError("database-global serializer settings cannot be read on a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     destination = tmp_path / "rejected.parquet"
     with vane.connect(str(tmp_path / "serializer.duckdb")) as connection:
         connection.execute(f"SET GLOBAL storage_compatibility_version='{version}'")

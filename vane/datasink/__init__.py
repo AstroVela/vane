@@ -984,11 +984,11 @@ def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult
     import pyarrow as pa
 
     if not isinstance(table, pa.Table):
-        raise TypeError(f"local-fast DataSink returned {type(table).__name__}, expected pyarrow.Table")
+        raise TypeError(f"local DataSink returned {type(table).__name__}, expected pyarrow.Table")
     if tuple(table.column_names) != _WIRE_COLUMNS:
-        raise RuntimeError("local-fast DataSink returned an invalid worker result schema")
+        raise RuntimeError("local DataSink returned an invalid worker result schema")
     if table.num_rows > _MAX_WRITE_RESULTS:
-        raise ValueError("local-fast DataSink result exceeds the write-result limit")
+        raise ValueError("local DataSink result exceeds the write-result limit")
     results: list[WriteResult] = []
     total_bytes = 0
     # Converting the entire bounded Arrow table at once would still create up
@@ -1029,7 +1029,7 @@ def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult
             )
             total_bytes += _result_wire_bytes(operation_id, result)
             if total_bytes > _MAX_TOTAL_RESULT_BYTES:
-                raise ValueError("local-fast DataSink result exceeds the 64 MiB coordinator payload limit")
+                raise ValueError("local DataSink result exceeds the 64 MiB coordinator payload limit")
             results.append(result)
     return tuple(results)
 
@@ -1199,7 +1199,7 @@ def _execute_datasink_once(
     results: tuple[WriteResult, ...] = ()
     warnings: tuple[str, ...] = ()
     try:
-        if runner_type == "local-fast":
+        if runner_type == "local":
             try:
                 table = terminal.to_arrow_table()
             finally:

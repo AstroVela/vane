@@ -195,7 +195,7 @@ def test_connection_query_ray_rejects_invalid_parameters_before_runner(monkeypat
     assert factory_calls == []
 
 
-@pytest.mark.parametrize("configured", ["local-fast", "ray", "", None])
+@pytest.mark.parametrize("configured", ["local", "local-fast", "ray", "", None])
 @pytest.mark.parametrize("method", ["sql", "query", "from_query", "module_sql"])
 def test_parameterized_sql_entrypoints_are_lazy_and_select_the_runner(monkeypatch, configured, method):
     runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
@@ -212,8 +212,8 @@ def test_parameterized_sql_entrypoints_are_lazy_and_select_the_runner(monkeypatc
             assert relation.alias == "captured"
         assert relation.columns == ["value"]
         assert factory_calls == []
-        assert relation.fetchall() == [(7 if configured == "local-fast" else 42,)]
-        assert len(runner.calls) == (0 if configured == "local-fast" else 1)
+        assert relation.fetchall() == [(7 if configured in {"local", "local-fast"} else 42,)]
+        assert len(runner.calls) == (0 if configured in {"local", "local-fast"} else 1)
 
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray"])

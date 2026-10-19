@@ -21,12 +21,27 @@ The [integrated stage acceptance record](LOCAL_SERVING_ACCEPTANCE.md#integrated-
 identifies the merged CPU/CUDA and streaming version, its validation evidence,
 and the unresolved historical startup incident.
 
-## Shared runtime for ordinary local-fast queries
+## Selecting local execution
+
+`vane.configure(runner="local")`, `vane.set_runner_local()`, and
+`VANE_RUNNER=local` select native local execution for new connections.
+`local-fast` remains a compatibility alias accepted by the environment and
+`vane.configure()`; configuration snapshots and connection runner names
+normalize it to `local`. The default remains `ray`.
+
+The former local FTE runner has been removed. `set_runner_local()` returns
+`None` and takes no worker or execution-mode arguments. Set native thread
+counts with `vane.connect(config={"threads": ...})` and configure shared
+admission with `connection.configure_local_runtime()`. Existing connections
+retain their runner, so choose the mode before opening a connection (before
+importing Vane when using its module-level default connection).
+
+## Shared runtime for ordinary local queries
 
 Enable session-wide request, task and UDF byte admission through the existing
 connection. Configure it once on the owning connection, after connection setup
 and before creating cursors. The configuration is immutable for that session.
-For example, with `VANE_RUNNER=local-fast`:
+For example, with `VANE_RUNNER=local`:
 
 ```python
 import vane
@@ -319,7 +334,7 @@ Register an instantiated `vane.cls` or `vane.cls.batch` with the runtime returne
 by `configure_local_runtime()`. Registration binds a prototype using declared
 input types; it does not execute rows or initialize a worker. The returned
 model builds typed positional expressions and can be attached as a SQL function.
-Use `VANE_RUNNER=local-fast` for this example.
+Use `VANE_RUNNER=local` for this example.
 
 ```python
 import vane
@@ -424,7 +439,7 @@ context manager performs the same close on exit.
 ## Bounded local requests
 
 The first serving increment of [#843](https://github.com/AstroVela/vane/issues/843)
-adds an internal CPU request entry point around native local-fast execution:
+adds an internal CPU request entry point around native local execution:
 
 ```python
 from vane.execution.request_admission import RequestAdmissionLimits
@@ -657,7 +672,7 @@ those are scenario evidence, separate from these runtime observations.
 ## Managed results from SQL and Relation queries
 
 Configure `result_limit` on the owning connection to enable explicit managed
-delivery for ordinary local-fast queries. Both `connection.execute_result()`
+delivery for ordinary local queries. Both `connection.execute_result()`
 and `relation.execute_result()` return the existing `ManagedResult` handle:
 
 ```python
@@ -947,7 +962,7 @@ declare `gpus=1` and a fixed `actor_number` on the class UDF, then assign one
 inventory UUID per replica in `register_model(gpu_devices=...)`. The resulting
 handle supports prewarm, SQL attachment, Relation expressions and managed
 results through the existing runtime APIs. For example, on a CUDA host with
-PyTorch installed and `VANE_RUNNER=local-fast`:
+PyTorch installed and `VANE_RUNNER=local`:
 
 ```python
 import vane
@@ -1001,7 +1016,7 @@ registration even if the inventory contains devices.
 
 ### Query-owned GPU table UDFs
 
-With `VANE_RUNNER=local-fast`, `relation.map_batches(Model, schema=...,
+With `VANE_RUNNER=local`, `relation.map_batches(Model, schema=...,
 actor_number=1, gpus=1)` and `flat_map` assign one visible physical CUDA GPU
 per fixed actor replica. Workers, GPU residency, and query admission belong to
 that query and close on completion or failure. They use the same subprocess
@@ -1712,7 +1727,7 @@ models = LocalModelRuntime(
 All three byte limits are positive integers, and the total must fit at least
 one input/output envelope. `task_limit` remains optional. Byte-limited plans
 must use local shared-memory ref-bundle output; preparation validates every
-node before creating actor pools. Native local-fast plans use this transport.
+node before creating actor pools. Native local plans use this transport.
 
 Existing task/pool arbitration runs first. Before its ready state is exposed,
 the byte authority reserves the full per-task input and output bounds from
@@ -1872,7 +1887,7 @@ has succeeded.
 
 These snapshots are marked `phase_tracking="structural_only"`. They expose
 `initial_eligible_unit_ids`, not a live phase or a count of running operators.
-The barriers come from the native operators' input contracts; local-fast
+The barriers come from the native operators' input contracts; local
 still executes its native plan and does not emit barrier completion events into
 this graph. DuckDB manages native sort, aggregation and join-build memory
 inside local execution, as it does inside each Ray worker. Per-UDF byte budgets

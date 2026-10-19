@@ -17,7 +17,7 @@ from ray_test_profile import ray_test_object_store_options
 
 # Vane's import can create its default connection. Set the test policy before
 # that import; later environment changes do not change an existing connection.
-os.environ.setdefault("VANE_RUNNER", "local-fast")
+os.environ.setdefault("VANE_RUNNER", "local")
 vane = import_module("vane")
 
 try:
@@ -46,7 +46,7 @@ def default_vane_runner_for_tests(monkeypatch):
     """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
     # Record the current value even when it is already set. Runner-selection
     # APIs mutate the environment directly and must not leak to later tests.
-    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
+    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local"))
 
 
 def is_string_dtype(dtype):

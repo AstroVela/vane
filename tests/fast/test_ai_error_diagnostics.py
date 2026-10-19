@@ -389,10 +389,8 @@ def test_cleanup_chain_is_bounded_and_does_not_trust_ray_error_bodies():
     assert "RuntimeError" in message and "private" not in message and len(message) <= 64
 
 
-@pytest.mark.parametrize("runner", ["local", "ray"])
-def test_worker_and_query_cleanup_diagnostics_merge_across_transports(runner):
+def test_worker_and_query_cleanup_diagnostics_merge_across_transports():
     from vane.execution._subprocess_error import capture_cleanup
-    from vane.runners.local.runner import _local_write_diagnostic
     from vane.runners.ray.driver import _capture_datasink_diagnostic
 
     diagnostic = capture_cleanup(
@@ -403,12 +401,9 @@ def test_worker_and_query_cleanup_diagnostics_merge_across_transports(runner):
     expected_errno = [errno.EIO]
     for number in (errno.ENOSPC, errno.EACCES):
         teardown = OSError(number, "private query teardown")
-        if runner == "local":
-            diagnostic = _local_write_diagnostic(diagnostic, [teardown])
-        else:
-            result = {"outcome_unknown": True, "outcome_diagnostic": diagnostic}
-            _capture_datasink_diagnostic(result, cleanup_error=teardown)
-            diagnostic = result["outcome_diagnostic"]
+        result = {"outcome_unknown": True, "outcome_diagnostic": diagnostic}
+        _capture_datasink_diagnostic(result, cleanup_error=teardown)
+        diagnostic = result["outcome_diagnostic"]
         expected_errno.append(number)
         for _ in range(3):
             serialized = pickle.dumps(diagnostic)

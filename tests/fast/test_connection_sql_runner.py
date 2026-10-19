@@ -53,20 +53,12 @@ def test_execute_select_binds_after_abandoned_result_cleanup(monkeypatch, explic
 
 
 def _install_sql_runner(monkeypatch, runner, runner_type):
-    calls = _install_fake_ray_runner(monkeypatch, runner)
-    if runner_type == "local":
-        monkeypatch.setenv("VANE_RUNNER", "local")
-
-        def set_runner_local():
-            calls.append((None, False))
-            return runner
-
-        monkeypatch.setattr(vane._native, "set_runner_local", set_runner_local)
-    return calls
+    assert runner_type == "ray"
+    return _install_fake_ray_runner(monkeypatch, runner)
 
 
-@pytest.mark.parametrize("initial", ["local-fast", "ray"])
-@pytest.mark.parametrize("later", ["local-fast", "ray", "invalid"])
+@pytest.mark.parametrize("initial", ["local", "local-fast", "ray"])
+@pytest.mark.parametrize("later", ["local", "local-fast", "ray", "invalid"])
 def test_connection_and_derived_relations_keep_runner_policy(monkeypatch, initial, later):
     runner = _SQLRunner()
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
@@ -76,11 +68,11 @@ def test_connection_and_derived_relations_keep_runner_policy(monkeypatch, initia
         assert factory_calls == []
         monkeypatch.setenv("VANE_RUNNER", later)
         with connection.cursor() as cursor:
-            assert cursor.sql("SELECT 1")._get_runner_type() == initial
+            assert cursor.sql("SELECT 1")._get_runner_type() == ("local" if initial == "local-fast" else initial)
             assert cursor.execute("SELECT ?::BIGINT AS value", [8]).fetchall() == [(8,)]
         assert relation.filter("value > 0").project("value + 1 AS value").fetchall() == [(8,)]
         assert connection.execute("SELECT 9::BIGINT AS value").fetchall() == [(9,)]
-        assert connection.sql("SELECT 1")._get_runner_type() == initial
+        assert connection.sql("SELECT 1")._get_runner_type() == ("local" if initial == "local-fast" else initial)
         assert len(runner.plans) == (3 if initial == "ray" else 0)
         assert os.environ["VANE_RUNNER"] == later
         if later == "invalid":
@@ -88,15 +80,15 @@ def test_connection_and_derived_relations_keep_runner_policy(monkeypatch, initia
                 vane.connect()
         else:
             with vane.connect() as fresh:
-                assert fresh.sql("SELECT 1")._get_runner_type() == later
+                assert fresh.sql("SELECT 1")._get_runner_type() == ("local" if later == "local-fast" else later)
 
 
-@pytest.mark.parametrize("initial", ["local-fast", "ray"])
+@pytest.mark.parametrize("initial", ["local", "local-fast", "ray"])
 @pytest.mark.parametrize("transport", [False, True])
 def test_udf_physical_planning_keeps_source_policy(monkeypatch, initial, transport):
     monkeypatch.setenv("VANE_RUNNER", initial)
     with vane.connect() as connection:
-        monkeypatch.setenv("VANE_RUNNER", "ray" if initial == "local-fast" else "local-fast")
+        monkeypatch.setenv("VANE_RUNNER", "local" if initial == "ray" else "ray")
 
         @vane.func(return_dtype="BIGINT")
         def identity(value):
@@ -104,7 +96,7 @@ def test_udf_physical_planning_keeps_source_policy(monkeypatch, initial, transpo
 
         relation = connection.sql("SELECT 1::BIGINT AS value").select(identity(vane.col("value")))
         logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"policy-{initial}-{transport}")
-        assert logical.session_config()["VANE_RUNNER"] == initial
+        assert logical.session_config()["VANE_RUNNER"] == ("local" if initial == "local-fast" else initial)
         if transport:
             logical = pickle.loads(pickle.dumps(logical))
         with vane.connect() as planning_connection:
@@ -115,7 +107,7 @@ def test_udf_physical_planning_keeps_source_policy(monkeypatch, initial, transpo
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
 @pytest.mark.parametrize("parameters", ["none", "positional", "named", "statement"])
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method, parameters, runner_type):
     runner = _SQLRunner()
     factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
@@ -145,11 +137,12 @@ def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method,
         assert not target.exists()
 
 
+@pytest.mark.parametrize("runner_type", ["local", "local-fast"])
 @pytest.mark.parametrize("method", ["execute", "sql"])
-def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method):
+def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method, runner_type):
     runner = _SQLRunner()
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         monkeypatch.setenv("VANE_RUNNER", "ray")
         target = tmp_path / "native.parquet"
@@ -164,7 +157,7 @@ def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method):
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 @pytest.mark.parametrize("destination", ["stdout", "parameter", "expression", "descriptor", "device", "fifo"])
 def test_runner_copy_rejects_non_file_destinations(monkeypatch, tmp_path, method, runner_type, destination):
     runner = _SQLRunner()
@@ -197,9 +190,10 @@ def test_runner_copy_rejects_non_file_destinations(monkeypatch, tmp_path, method
     assert sorted(path.name for path in tmp_path.iterdir()) == (["output.fifo"] if destination == "fifo" else [])
 
 
+@pytest.mark.parametrize("runner_type", ["local", "local-fast"])
 @pytest.mark.parametrize("method", ["execute", "sql"])
-def test_local_fast_copy_stdout_remains_native(monkeypatch, capfd, method):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_local_fast_copy_stdout_remains_native(monkeypatch, capfd, method, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         result = getattr(connection, method)("COPY (SELECT 7 AS value) TO STDOUT (FORMAT CSV, HEADER true)")
         if method == "execute":
@@ -209,7 +203,7 @@ def test_local_fast_copy_stdout_remains_native(monkeypatch, capfd, method):
     assert "value\n7\n" in capfd.readouterr().out
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_sql_copy_keeps_commit_when_interrupt_races_with_result(monkeypatch, tmp_path, runner_type):
     class CommittedRunner(_SQLRunner):
         def run_write(self, relation):
@@ -229,42 +223,21 @@ def test_sql_copy_keeps_commit_when_interrupt_races_with_result(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
-@pytest.mark.parametrize("runner_type", ["local", pytest.param("ray", marks=pytest.mark.real_ray)])
+@pytest.mark.parametrize("runner_type", [pytest.param("ray", marks=pytest.mark.real_ray)])
 def test_connection_interrupt_stops_runner_copy(monkeypatch, tmp_path, request, method, runner_type):
     waiting = threading.Event()
     finished = threading.Event()
     errors = []
-    if runner_type == "ray":
-        request.getfixturevalue("ray_local")
-        from vane.runners.ray import driver
+    request.getfixturevalue("ray_local")
+    from vane.runners.ray import driver
 
-        resolve = driver._RayProgressSession.resolve
+    resolve = driver._RayProgressSession.resolve
 
-        def observe_wait(self, ref):
-            waiting.set()
-            return resolve(self, ref)
+    def observe_wait(self, ref):
+        waiting.set()
+        return resolve(self, ref)
 
-        monkeypatch.setattr(driver._RayProgressSession, "resolve", observe_wait)
-    else:
-        from vane.runners.local import runner as local_module
-
-        execute_fragment = local_module._InProcessFragmentExecutor.__call__
-
-        def observe_fragment(self, request):
-            request = dict(request)
-            report_progress = request.get("native_progress_callback")
-
-            def observe_progress(stats):
-                # The initial native progress event follows pending-query
-                # initialization, so this cancels an admitted native call.
-                waiting.set()
-                if report_progress is not None:
-                    report_progress(stats)
-
-            request["native_progress_callback"] = observe_progress
-            return execute_fragment(self, request)
-
-        monkeypatch.setattr(local_module._InProcessFragmentExecutor, "__call__", observe_fragment)
+    monkeypatch.setattr(driver._RayProgressSession, "resolve", observe_wait)
     vane.teardown_runner()
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     connection = vane.connect()
@@ -300,7 +273,7 @@ def test_connection_interrupt_stops_runner_copy(monkeypatch, tmp_path, request, 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
 @pytest.mark.parametrize("form", ["from", "return_files", "return_stats", "transaction"])
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, method, form, runner_type):
     runner = _SQLRunner()
     factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
@@ -328,7 +301,7 @@ def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, me
 
 @pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
 @pytest.mark.parametrize("wrapper", ["prepare_copy", "prepare_select", "execute", "analyze_copy", "analyze_select"])
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_sql_execution_wrappers_cannot_bypass_runner(monkeypatch, tmp_path, method, wrapper, runner_type):
     runner = _SQLRunner()
     factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
@@ -356,7 +329,7 @@ def test_sql_execution_wrappers_cannot_bypass_runner(monkeypatch, tmp_path, meth
 
 
 @pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_plain_explain_plans_copy_without_executing_it(monkeypatch, tmp_path, method, runner_type):
     runner = _SQLRunner()
     factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
@@ -372,9 +345,10 @@ def test_plain_explain_plans_copy_without_executing_it(monkeypatch, tmp_path, me
         assert not target.exists()
 
 
+@pytest.mark.parametrize("runner_type", ["local", "local-fast"])
 @pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
-def test_local_fast_keeps_native_prepared_and_explained_copy(monkeypatch, tmp_path, method):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_local_fast_keeps_native_prepared_and_explained_copy(monkeypatch, tmp_path, method, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     prepared_target = tmp_path / "prepared.parquet"
     analyzed_target = tmp_path / "analyzed.parquet"
     with vane.connect() as connection:
@@ -455,7 +429,7 @@ def test_executemany_uses_shared_runner_entry(monkeypatch, tmp_path):
         assert len(runner.writes) == 2
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_copy_failure_never_runs_locally(monkeypatch, tmp_path, runner_type):
     class FailingRunner:
         def run_write(self, relation):
@@ -471,7 +445,7 @@ def test_copy_failure_never_runs_locally(monkeypatch, tmp_path, runner_type):
         assert connection.description is None
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path, runner_type):
     runner = _SQLRunner()
     runner.outcome["rows_copied"] = "malformed count"
@@ -486,57 +460,24 @@ def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path, ru
 
 
 @pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
-@pytest.mark.parametrize("cleanup_error", [False, True])
-def test_sql_copy_to_runs_on_local_fte(monkeypatch, tmp_path, method, cleanup_error):
-    from vane.runners.local import runner as local_module
-
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_sql_copy_to_runs_natively(monkeypatch, tmp_path, method, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
     source = tmp_path / "source.parquet"
     target = tmp_path / "output.parquet"
     pq.write_table(pa.table({"value": list(range(12))}), source)
-    if cleanup_error:
-
-        class CleanupError(RuntimeError):
-            def __str__(self):
-                raise AssertionError("cleanup diagnostics must not call exception formatting hooks")
-
-        shutdown = local_module._shutdown_local_write_resources
-
-        def fail_after_shutdown(*args, **kwargs):
-            return [*shutdown(*args, **kwargs), CleanupError("planned cleanup failure after commit")]
-
-        monkeypatch.setattr(local_module, "_shutdown_local_write_resources", fail_after_shutdown)
-    vane.teardown_runner()
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    try:
-        with vane.connect() as connection:
-            monkeypatch.setenv("VANE_RUNNER", "invalid")
-            query = "COPY (SELECT * FROM read_parquet($source) WHERE value >= $min) TO $target (FORMAT PARQUET)"
-            params = {"source": str(source), "min": 7, "target": str(target)}
-
-            def write():
-                if method == "sql":
-                    assert connection.sql(query, params=params) is None
-                elif method == "executemany":
-                    assert connection.executemany(query, [params]).fetchall() == [(5,)]
-                else:
-                    assert connection.execute(query, params).fetchall() == [(5,)]
-
-            if cleanup_error:
-                with pytest.raises(CopyResultUnavailableError, match="planned cleanup failure after commit") as error:
-                    write()
-                assert error.value.operation_id
-                assert error.value.safe_to_retry is False
-                assert error.value.write_state == "committed"
-            else:
-                write()
-            assert os.environ["VANE_RUNNER"] == "invalid"
-            files = list(target.glob("*.parquet"))
-            assert files
-            assert sorted(pq.read_table([str(path) for path in files]).column("value").to_pylist()) == list(
-                range(7, 12)
-            )
-    finally:
-        vane.teardown_runner()
+    with vane.connect() as connection:
+        monkeypatch.setenv("VANE_RUNNER", "invalid")
+        query = "COPY (SELECT * FROM read_parquet($source) WHERE value >= $min) TO $target (FORMAT PARQUET)"
+        params = {"source": str(source), "min": 7, "target": str(target)}
+        if method == "sql":
+            assert connection.sql(query, params=params) is None
+        elif method == "executemany":
+            assert connection.executemany(query, [params]).fetchall() == [(5,)]
+        else:
+            assert connection.execute(query, params).fetchall() == [(5,)]
+        assert os.environ["VANE_RUNNER"] == "invalid"
+        assert pq.read_table(target).column("value").to_pylist() == list(range(7, 12))
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])

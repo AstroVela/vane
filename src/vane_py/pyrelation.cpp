@@ -1267,9 +1267,6 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<ClientContext> 
 		// already created by another database instance in this process.
 		auto set_fn = runners_mod.attr("set_runner_ray");
 		runner = set_fn(py::none(), /*noop_if_initialized=*/true);
-	} else if (runner_type == "local") {
-		auto set_fn = runners_mod.attr("set_runner_local");
-		runner = set_fn();
 	} else {
 		throw InternalException("Cannot create unsupported runner type '%s'", runner_type);
 	}
@@ -1341,8 +1338,8 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	if (!context || bool(statement) == bool(relation)) {
 		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
 	}
-	if (native_prepared_cache && (!statement || RunnerClientState::Get(*context) != "local-fast")) {
-		throw InternalException("Native prepared execution requires a local-fast SQL statement");
+	if (native_prepared_cache && (!statement || RunnerClientState::Get(*context) != "local")) {
+		throw InternalException("Native prepared execution requires a local SQL statement");
 	}
 	if (cleanup_warnings) {
 		cleanup_warnings->clear();
@@ -1552,7 +1549,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	pending_parameters.parameters = parameters;
 	pending_parameters.query_parameters = stream_result;
 	const bool direct_client_command = statement ? IsDirectClientCommand(*statement) : IsDirectClientCommand(*relation);
-	if (RunnerClientState::Get(*context) != "local-fast" && !direct_client_command) {
+	if (RunnerClientState::Get(*context) != "local" && !direct_client_command) {
 		pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
 		                                            PreparedStatementData &prepared) {
 			bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
@@ -1568,7 +1565,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (!check.is_none()) {
 			check();
 		}
-		if (statement && RunnerClientState::Get(*context) != "local-fast") {
+		if (statement && RunnerClientState::Get(*context) != "local") {
 			// Even binding can execute scalar table-function arguments. Reject
 			// unsupported wrappers before starting the native query lifecycle.
 			ValidateRunnerStatement(*statement);
