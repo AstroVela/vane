@@ -28,8 +28,6 @@ if(ENABLE_UNITTEST_CPP_TESTS
     PRIVATE
       VANE_BATCH_DEMO_PATH="$<TARGET_FILE:loadable_extension_batch_demo_loadable_extension>"
   )
-  add_dependencies(test_execution
-                   loadable_extension_batch_demo_loadable_extension)
   if(VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY)
     find_package(
       Python3
