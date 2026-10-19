@@ -385,7 +385,9 @@ def test_materialized_input_cleanup_failure_is_a_consumable_task_result(monkeypa
         query.shutdown()
         assert not query.cleanup_pending()
         assert manager.snapshot()["active_input_leases"] == 0
-        # The consumed output and retried input cleanup release both owners.
+        # Task completion does not drain the worker's independent release
+        # channel. Close it before checking that all physical bytes returned.
+        executor.close(kill=True)
         assert manager.snapshot()["usage_bytes"] == 0
     finally:
         _release_local_ref_bundle_result(block)
