@@ -576,8 +576,8 @@ static bool IsPythonRefBundleResult(const py::handle &value) {
 	       tuple[0].cast<string>() == REF_BUNDLE_RESULT_MARKER;
 }
 
-static unique_ptr<LazyRefDataChunk> ConvertPythonRefBundleResult(const py::handle &value,
-                                                                 const vector<LogicalType> &expected_types) {
+static unique_ptr<LazyRefDataChunk> TakePythonRefBundleResult(const py::handle &value,
+                                                              const vector<LogicalType> &expected_types) {
 	if (!IsPythonRefBundleResult(value)) {
 		throw InvalidInputException("udf result is not a ref bundle result");
 	}
@@ -635,6 +635,10 @@ static unique_ptr<LazyRefDataChunk> ConvertPythonRefBundleResult(const py::handl
 		bundle->blocks.push_back(std::move(block));
 	}
 	bundle->RecomputeCardinality();
+	// Delivery can wake a consumer that finishes before this dispatcher's
+	// Python result containers leave scope. Transfer the refs to the native
+	// blocks so those producer containers cannot retain consumed output.
+	refs.attr("clear")();
 	return bundle;
 }
 
@@ -2674,7 +2678,7 @@ private:
 			if (RequiresDistributedRefBundleOutput(slot.payload)) {
 				g_udf_distributed_ref_bundle_data_events.fetch_add(1, std::memory_order_relaxed);
 			}
-			ref_outputs = ConvertPythonRefBundleResult(result, slot.expected_ref_output_types);
+			ref_outputs = TakePythonRefBundleResult(result, slot.expected_ref_output_types);
 		} else if (RequiresDistributedRefBundleOutput(slot.payload)) {
 			g_udf_distributed_direct_table_rejected_events.fetch_add(1, std::memory_order_relaxed);
 			ReleaseTerminalSubmit(slot, submit_id);
@@ -2997,7 +3001,7 @@ private:
 				if (RequiresDistributedRefBundleOutput(slot.payload)) {
 					g_udf_distributed_ref_bundle_data_events.fetch_add(1, std::memory_order_relaxed);
 				}
-				ref_outputs = ConvertPythonRefBundleResult(output_obj, slot.expected_ref_output_types);
+				ref_outputs = TakePythonRefBundleResult(output_obj, slot.expected_ref_output_types);
 			} else if (RequiresDistributedRefBundleOutput(slot.payload)) {
 				g_udf_distributed_direct_table_rejected_events.fetch_add(1, std::memory_order_relaxed);
 				ReleaseTerminalSubmit(slot, submit_id);
@@ -3196,7 +3200,7 @@ private:
 								} else {
 									g_udf_distributed_ref_bundle_data_events.fetch_add(1, std::memory_order_relaxed);
 									event.ref_outputs =
-									    ConvertPythonRefBundleResult(payload, slot->expected_ref_output_types);
+									    TakePythonRefBundleResult(payload, slot->expected_ref_output_types);
 									event.output_lease = std::move(output_lease);
 								}
 							} catch (const std::exception &ex) {
