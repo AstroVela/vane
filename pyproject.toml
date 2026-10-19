@@ -325,6 +325,7 @@ include = [
     "/tests/fast/test_local_shm_credit_progress.py",
     "/tests/fast/test_local_shm_store_capacity.py",
     "/tests/fast/test_local_runtime_baseline.py",
+    "/tests/fast/test_local_query_models.py",
     "/tests/fast/test_local_query_runtime.py",
     "/tests/fast/test_local_query_results.py",
     "/tests/fast/test_local_query_streaming.py",
