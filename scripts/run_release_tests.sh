@@ -4,6 +4,32 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_release_tests.sh [all|non-ray|shared-ray|owner-ray]
+
+Run the base-installation release gate or one process-isolated phase.
+EOF
+}
+
+phase="${1:-all}"
+if (($# > 1)); then
+  usage >&2
+  exit 2
+fi
+case "$phase" in
+  all | non-ray | shared-ray | owner-ray) ;;
+  -h | --help)
+    usage
+    exit
+    ;;
+  *)
+    printf 'Unknown release-test phase: %s\n' "$phase" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Anchor diagnostics to the caller before entering a disposable test directory.
 if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
@@ -61,6 +87,7 @@ release_tests=(
 # use real native plans/subprocesses and small shared-memory budgets, without
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
+  "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
   "$project_root/tests/fast/test_local_task_scheduling.py"
   "$project_root/tests/fast/test_local_shm_credit_progress.py"
   "$project_root/tests/fast/test_local_shm_store_capacity.py::test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds"
@@ -131,19 +158,25 @@ pytest_args=(
 
 # Let the non-Ray process release all Python/native state before a fresh pytest
 # process starts the real Ray runtime.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and not real_ray" \
-  "${release_tests[@]}" \
-  "${local_runtime_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "non-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and not real_ray" \
+    "${release_tests[@]}" \
+    "${local_runtime_tests[@]}"
+fi
 
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and not ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "shared-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and not ray_cluster_owner" \
+    "${release_tests[@]}"
+fi
 
 # Tests which start their own cluster must not share a process with Ray fixtures.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "owner-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and ray_cluster_owner" \
+    "${release_tests[@]}"
+fi

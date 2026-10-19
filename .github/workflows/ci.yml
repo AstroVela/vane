@@ -445,14 +445,21 @@ jobs:
           cd "$RUNNER_TEMP"
           env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
 
-      - name: Run the base-installation release tests
-        # Includes bounded callback probes and native local backpressure acceptance.
-        # The merged release matrix includes non-Ray and separate Ray processes.
-        # Allow the complete gate to finish; individual deadlock probes retain
-        # their short watchdogs. Bound stuck teardown and signal its whole process
-        # group so it cannot block jobs that consume the Python 3.12 artifact.
+      # Give each process-isolated release phase its own deadline so the non-Ray
+      # suite cannot consume the Ray phases' budget. Per-test watchdogs still
+      # bound deadlock probes; timeout signals the entire process group and kills
+      # stuck teardown before the Actions step deadline.
+      - name: Run the base-installation non-Ray release tests
         timeout-minutes: 64
-        run: timeout --signal=INT --kill-after=30s 3600s scripts/run_release_tests.sh
+        run: timeout --signal=INT --kill-after=30s 3600s scripts/run_release_tests.sh non-ray
+
+      - name: Run the base-installation shared-Ray release tests
+        timeout-minutes: 34
+        run: timeout --signal=INT --kill-after=30s 1800s scripts/run_release_tests.sh shared-ray
+
+      - name: Run the base-installation owner-Ray release tests
+        timeout-minutes: 14
+        run: timeout --signal=INT --kill-after=30s 600s scripts/run_release_tests.sh owner-ray
 
       - name: Upload local runtime failure diagnostics
         if: ${{ always() }}
