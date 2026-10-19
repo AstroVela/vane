@@ -34,7 +34,7 @@ flowchart TD
     E --> N[Native runtime adapter]
     H --> S[Persistent inference service]
     N --> O[Engine owner process]
-    S --> R[One vector per input row]
+    S --> R[Declared native outputs per input row]
     O --> R
 ```
 
@@ -153,6 +153,73 @@ space compatibility. Query vectors must use the paired model/profile. A frame
 sequence, an encoded video decoded by a server, and text-only content are not
 assumed numerically equivalent. Reindexing is explicit when identity changes.
 
+### Native output descriptors
+
+This is the Vane foundation of the Context ingestion roadmap's native-output
+milestone. Context's consumer work is a separate change: persist output names,
+spaces and channel provenance, pair search encoders, then remove its
+`separate`/`fused`/`both` mode branches. The descriptor does not perform that
+storage or pipeline migration. Existing HTTP/native-service codecs continue to
+declare a single vector; a multi-output wire protocol requires its own adapter.
+
+Every embedding descriptor exposes `get_output_spec(dimensions=...)` without
+model loading or network access. The `EmbeddingOutputSpec` declares a native
+`vector` or `named` layout and a closed tuple of `EmbeddingOutput` declarations.
+Each output has a stable name, positive dimension, provider-owned semantic
+`space`, contributing `source_modalities` and an explicit `optional` flag.
+Source modalities describe input provenance; they are independent of Context's
+ASR/OCR/subtitle channel names and of the number of independent request rows.
+
+The existing built-in adapters return a single `embedding` vector in their
+model's space. Their result remains `FLOAT[N]`. A descriptor with named native
+outputs returns `STRUCT(name FLOAT[N], ...)`, with independently declared sizes
+and spaces. A named result may contain one output or several. Every result row
+must contain exactly the declared keys; only optional outputs may be NULL. At
+least one output must be present. Non-NULL outputs must have contributing input
+parts in that row. No model implementation is given new output capabilities by
+this contract; the named-output acceptance uses an authored provider fixture.
+
+```python
+from vane.ai import EmbeddingOutput, EmbeddingOutputSpec
+
+# Implemented by a model adapter that actually returns these two outputs.
+outputs = EmbeddingOutputSpec(
+    (
+        EmbeddingOutput("joint", 768, "model-revision/joint", ("video", "audio", "text")),
+        EmbeddingOutput("sound", 512, "model-revision/sound", ("audio",), optional=True),
+    ),
+    layout="named",
+)
+```
+
+The same typed output passes through expression, Relation and SQL Embed APIs.
+NULL/unselected rows retain the whole result's type and do not call a model.
+Shape, keys, dimensions, finite values, input provenance and row cardinality are
+validated before exposure. `normalize=True` normalizes each native output
+independently. A malformed named result nulls the whole input row under
+`on_error="ignore"`; it does not partially accept malformed outputs or repeat
+an otherwise attributable row. Resource failures remain fatal and sanitized.
+
+Named outputs reject scalar `dimensions=` and character chunk averaging. Their
+dimensions are the native descriptor's per-output declarations. Single-vector
+models retain explicit size overrides without consulting the default size.
+Query and document descriptors must explicitly identify compatible output
+spaces; a name/dimension match alone does not establish compatibility. Context
+must persist the selected deployment, model revision, preprocessing, role,
+output space/name and actual channel contributors with every stored output.
+
+```mermaid
+flowchart LR
+    R[Independent input rows] --> I[Validate typed parts and row budgets]
+    I --> M[One selected model invocation per input batch]
+    M --> O{Declared native layout}
+    O -->|vector| V[One FLOAT N per row]
+    O -->|named| N[Closed named outputs per row]
+    V --> C[Validate values and row identity]
+    N --> C
+    C --> P[Caller stores each native output with space and provenance]
+```
+
 ## 5. Capability and provider design
 
 The registry continues to identify providers such as `openai`, `google`,
@@ -160,7 +227,7 @@ The registry continues to identify providers such as `openai`, `google`,
 Google's open EmbeddingGemma model served by SGLang belongs to the SGLang runtime.
 
 Single decoded modality factories are internal backend strategies, still used
-by SQL and existing models. `get_multimodal_embedder` returns a descriptor with
+by SQL and existing models. All embedding descriptors share the native output contract. `get_multimodal_embedder` returns a descriptor with
 dimensions, resource requirements and a closed `MultimodalInputSpec`.
 The descriptor must be serializable and require no model or network I/O.
 
@@ -746,7 +813,7 @@ for FALSE/NULL predicates. Only selected rows undergo conversion and budget
 checks. A non-NULL packed struct protects optional constant NULLs from native
 NULL folding. Missing joint parts are omitted; selected all-empty content is
 an input error, including with `on_error := 'ignore'`. A foldable single text or
-decoded-media NULL is reduced to a typed NULL vector after input, predicate and
+decoded-media NULL is reduced to a typed NULL result after input, predicate and
 model configuration validation. It leaves no model UDF or GPU requirement in the
 execution plan, matching Python. Joint and encoded-media inputs keep nonempty
 content validation. SQL options retain the inline-credential prohibition and
@@ -765,7 +832,7 @@ flowchart LR
     U --> S[Select TRUE rows]
     S --> C[Convert inputs and check budgets]
     C --> E[Existing provider executor]
-    E --> R[Restore rows as FLOAT dimensions]
+    E --> R[Restore rows with the declared output type]
 ```
 
 The existing model/protocol configuration chooses HTTP, native, or service

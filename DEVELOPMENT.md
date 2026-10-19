@@ -48,6 +48,12 @@ required transitive notices are rejected as well.
 
 The [unified embedding design](EMBEDDING_DESIGN.md) tracks the typed input
 contract, provider/protocol boundaries, Context integration and delivery gates.
+Native output changes use `tests/fast/test_embedding_outputs.py` together with
+related text/media, SQL, HTTP and resource-boundary contracts. Run the real
+subprocess cases on `local-fast` with Ray startup forbidden. Named outputs are
+fixture-qualified; this does not qualify a checkpoint or add native multi-output
+support to an existing serving protocol. Python-only output typing requires a
+noneditable package reinstall, without a native rebuild.
 For the persistent native service, see its
 [configuration and ownership contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
 Run `tests/fast/test_embedding_service.py`, `tests/fast/test_native_multimodal.py`

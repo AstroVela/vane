@@ -105,10 +105,6 @@ def _normalize_option_value(value: Any, name: str | None = None) -> Any:
     return value
 
 
-def _embedding_output_type(dimensions: int) -> str:
-    return f"FLOAT[{dimensions}]"
-
-
 def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
     _reject_inline_credentials(options or {})
     # Preserve explicit NULL fields until the closed API validators see them.
@@ -298,13 +294,13 @@ def build_ai_embed_sql_spec(
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,
-        "return_type": _embedding_output_type(resolved_dimensions),
+        "return_type": wrapper._output_spec.sql_type(),
         "input_names": ["selected_input"],
         "input_column": input_name,
         "struct_input": structured,
         "multimodal": multimodal,
         "parts": [{"kind": part.kind, "mime_type": part.mime_type} for part in parts],
-        "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
+        "schema": {"embedding": wrapper._output_spec.sql_type()},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
