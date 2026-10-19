@@ -161,6 +161,36 @@ not identify wheel bytes; runtime admission also checks the exact DuckDB
 SourceID and descriptors. Build and clean verification commands are in
 [DEVELOPMENT.md](DEVELOPMENT.md#building-an-optional-extension-wheel).
 
+### Lazy batches across C++ extension boundaries
+
+Self-contained providers have a private copy of DuckDB's process-global state.
+An external block therefore carries its own process-local
+`shared_ptr<ExternalBlockBackendInterface>` in
+`ExternalBlockDescriptor::materializer`. A producer of new descriptors must
+bind a reader that understands their references. Copying, projecting, slicing
+or queueing a descriptor must preserve that binding alongside `object_ref` and
+`ownership_tokens`. The reader is a service capability; it must not retain the
+query or its input descriptors.
+
+The receiving native process binds Python ref-bundle results before passing
+them into the pipeline. The shared pointer is never part of a task's wire
+format. The backend registry remains available to producers during binding;
+consumers use only the reader already bound to the descriptor. Missing readers,
+mixed reader bindings and rejected descriptors fail before consuming rows.
+The existing `RAY_OBJECT_STORE` backend tag also covers local shared-memory
+ref bundles; its name does not select a runner or initialize Ray.
+
+Ordinary `SinkBatch` and `ExecuteBatch` adapters materialize through this
+capability, including adapters inside a provider and COPY operators created by
+that provider. A successful materialization replaces the input batch with its
+payload, which is reused across `BLOCKED` and `HAVE_MORE_OUTPUT` retries.
+Custom batch callbacks retain their existing dispatch and lazy behavior.
+
+This descriptor layout is part of the C++ extension ABI. Rebuild the base
+engine and every self-contained provider from the same matching source, then
+sign and package the resulting artifacts. An older provider cannot be reused
+by changing its manifest or relaxing source-identity checks.
+
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
 already-verified extension state and does not require a provider entry point on

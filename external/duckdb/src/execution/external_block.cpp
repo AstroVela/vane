@@ -63,20 +63,31 @@ unique_ptr<DataChunk> MaterializeExternalBlock(ClientContext &context, const Laz
 	}
 
 	auto backend_id = chunk.blocks[0].backend;
-	auto backend = GetExternalBlockBackend(backend_id);
+	auto backend = chunk.blocks[0].materializer;
 	if (!backend) {
-		throw InvalidInputException("no external block backend registered for %s",
+		throw InvalidInputException("external block descriptor has no materializer for %s",
 		                            ExternalBlockBackendName(backend_id));
 	}
 	for (auto &block : chunk.blocks) {
 		if (block.backend != backend_id) {
 			throw InvalidInputException("cannot materialize a LazyDataChunk with mixed external block backends");
 		}
+		if (!block.materializer) {
+			throw InvalidInputException("external block descriptor has no materializer for %s",
+			                            ExternalBlockBackendName(block.backend));
+		}
+		if (block.materializer.get() != backend.get()) {
+			throw InvalidInputException("cannot materialize a LazyDataChunk with mixed materializer bindings");
+		}
 		if (!backend->CanMaterialize(block)) {
 			throw InvalidInputException("external block backend cannot materialize this descriptor");
 		}
 	}
-	return backend->Materialize(context, chunk);
+	auto result = backend->Materialize(context, chunk);
+	if (!result) {
+		throw InternalException("external block materializer returned no payload");
+	}
+	return result;
 }
 
 ExternalBlockMaterializeResult MaterializeExternalBlockBarrier(ClientContext &context, const LazyDataChunk &chunk,

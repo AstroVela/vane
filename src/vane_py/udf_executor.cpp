@@ -587,6 +587,15 @@ static unique_ptr<LazyRefDataChunk> ConvertPythonRefBundleResult(const py::handl
 	if (py::len(refs) != py::len(metadata)) {
 		throw InvalidInputException("ref bundle result has mismatched refs and metadata lengths");
 	}
+	// Bind in the receiving native process, never in a consuming extension's
+	// private DuckDB copy. This pointer is not part of the Python wire format.
+	shared_ptr<ExternalBlockBackendInterface> materializer;
+	if (py::len(refs) != 0) {
+		materializer = GetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE);
+		if (!materializer) {
+			throw InvalidInputException("cannot create external block descriptors without a materializer");
+		}
+	}
 
 	auto bundle = make_uniq<LazyRefDataChunk>();
 	bundle->logical_types = expected_types;
@@ -605,6 +614,7 @@ static unique_ptr<LazyRefDataChunk> ConvertPythonRefBundleResult(const py::handl
 	for (py::size_t i = 0; i < py::len(refs); i++) {
 		RefBlockDescriptor block;
 		block.object_ref = MakePythonObjectHolder(py::reinterpret_borrow<py::object>(refs[i]));
+		block.materializer = materializer;
 		if (!py::isinstance<py::dict>(metadata[i])) {
 			throw InvalidInputException("ref bundle metadata entry must be a dict");
 		}
