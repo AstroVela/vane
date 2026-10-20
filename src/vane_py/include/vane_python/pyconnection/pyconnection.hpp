@@ -482,3 +482,6 @@ static bool ModuleIsLoaded() {
 }
 
 } // namespace duckdb
+
+// Keep the connection holder caster identical in every translation unit.
+#include "vane_python/pybind11/conversions/pyconnection_default.hpp"

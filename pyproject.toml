@@ -87,6 +87,12 @@ qwen3_vl = [ # Fixed BF16 / special-token encoding paired with SQR checkpoints
     "safetensors>=0.5,<1",
     "pillow>=11,<13",
 ]
+mlx = [ # EmbeddingGemma 2 BF16 text inference on Apple Silicon Metal
+    "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm==0.7.8; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers==5.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "huggingface-hub>=1.31,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
 cosmos = [
     "torch>=2.7",
@@ -308,6 +314,7 @@ include = [
     "/tests/fast/test_clap.py",
     "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_qwen3_vl.py",
+    "/tests/fast/test_mlx_provider.py",
     "/tests/fast/test_native_multimodal.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
@@ -649,6 +656,7 @@ pythonpath = ["tests", "tests/fast"]
 markers = [
     "external_service: tests that require an externally provisioned service",
     "gpu: tests that require CUDA-capable GPU hardware",
+    "metal: requires Apple Silicon Metal and explicitly enabled local model assets",
     "real_ray: tests that connect to or own a real Ray runtime",
     "ray_cluster_owner: tests that must own a Ray cluster in an isolated pytest process",
     "ray_fault: tests that intentionally kill or restart Ray runtime components",

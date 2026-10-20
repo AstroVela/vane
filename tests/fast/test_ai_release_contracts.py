@@ -15,6 +15,17 @@ import pyarrow as pa
 import pytest
 
 
+def test_mlx_optional_registration_and_safe_dependency_hint():
+    from vane.ai.provider import ProviderImportError, _safe_provider_execution_error, load_provider
+
+    descriptor = load_provider("mlx").get_text_embedder()
+    assert descriptor.get_dimensions() == 768 and descriptor.get_udf_options().num_gpus == 0
+    error = pickle.loads(pickle.dumps(ProviderImportError("mlx")))
+    safe = _safe_provider_execution_error("mlx", descriptor.get_model(), "Embed", error)
+    assert isinstance(safe, ProviderImportError)
+    assert "vane-ai[mlx]" in str(safe)
+
+
 def test_jev_optional_sdk_is_loaded_only_when_preparing_questions(monkeypatch):
     monkeypatch.setitem(sys.modules, "typesafe_sdk", None)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)

@@ -65,7 +65,7 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
 
 
 _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
-    {"anthropic", "cosmos", "embedding_http", "google", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
+    {"anthropic", "cosmos", "embedding_http", "google", "mlx", "openai", "qwen3_vl", "transformers", "typesafe", "vllm"}
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 
@@ -191,6 +191,12 @@ def _load_qwen3_vl(name: str | None = None) -> Provider:
     return Qwen3VLProvider(name)
 
 
+def _load_mlx(name: str | None = None) -> Provider:
+    from vane.ai.providers.mlx import MLXProvider
+
+    return MLXProvider(name)
+
+
 def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.openai import OpenAIProvider
 
@@ -227,6 +233,7 @@ def _load_google(name: str | None = None, **client_options: Any) -> Provider:
 PROVIDERS: dict[str, Callable[..., Provider]] = {
     "transformers": _load_transformers,
     "qwen3_vl": _load_qwen3_vl,
+    "mlx": _load_mlx,
     "openai": _load_openai,
     "vllm": _load_vllm,
     "sglang": _load_sglang,

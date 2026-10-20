@@ -52,6 +52,15 @@ pyelftools are installed separately by package managers and are not copied into
 the Vane source distribution. Optional provider clients are also installed
 separately. Their own distributions govern their licenses.
 
+The optional `mlx` extra installs [MLX](https://github.com/ml-explore/mlx)
+and [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) (MIT), Transformers and
+Hugging Face Hub (Apache-2.0), separately on Apple Silicon. MLX-VLM also
+declares its own audio, image, tokenizer and HTTP dependencies; preserve the
+notices of the resolved wheels when distributing an environment. Vane does not
+vendor these SDKs. The EmbeddingGemma 2 checkpoint is obtained separately under
+the [Gemma terms](https://ai.google.dev/gemma/terms); no weights, tokenizer assets
+or Hugging Face cache are distributed with Vane.
+
 The optional `video_asr` extra installs faster-whisper (MIT) and its dependencies;
 `video_ocr` installs RapidOCR (Apache-2.0) and ONNX Runtime (MIT). These packages
 and model weights are not bundled. Local adapters require explicitly provisioned
