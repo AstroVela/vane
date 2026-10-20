@@ -360,6 +360,15 @@ template on the server; declare supported media formats in `media_mime_types`.
 This declaration is an application contract, not model capability discovery.
 The server enforces its model's combinations, token counts and media limits.
 
+For vLLM HTTP, `http_add_special_tokens=True` or `False` explicitly sends its
+standard `add_special_tokens` request field, for both plain text and multimodal
+formats. Omitting the option retains the server default. Choose it according to
+the checkpoint tokenizer/template contract and use the same setting for queries
+and documents. For example, EmbeddingGemma 2's checkpoint template omits BOS/EOS;
+its multimodal messages require `http_add_special_tokens=True` to match the
+processor's reference inputs. This option is rejected for SGLang and for native
+or shared-memory execution. It does not modify the server template.
+
 SGLang also supports `http_input_format="encode"` for its native HTTP endpoint.
 It carries encoded video and raw audio together, including WAV/MP3 Base64 data
 URLs. This endpoint is separate from `/v1/embeddings`, whose schema still has no

@@ -113,6 +113,7 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     service_id: str
     http_input_format: Literal["text", "multimodal", "encode"]
     http_media_tokens: Mapping[str, str]
+    http_add_special_tokens: bool
     media_mime_types: list[str]
     max_request_bytes: int
 
@@ -167,6 +168,7 @@ _HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
         "timeout",
         "http_input_format",
         "http_media_tokens",
+        "http_add_special_tokens",
         "media_mime_types",
         "max_input_bytes",
         "max_request_bytes",
@@ -395,6 +397,9 @@ def validate_embed_options(
             raise ValueError("http_input_format must be 'text', 'multimodal' or 'encode'")
         if wire_format == "encode" and family != "sglang":
             raise ValueError("http_input_format='encode' requires the SGLang provider")
+        if "http_add_special_tokens" in copied:
+            if family != "vllm" or not isinstance(copied["http_add_special_tokens"], bool):
+                raise ValueError("http_add_special_tokens requires the vLLM HTTP protocol and a bool")
         if "http_media_tokens" in copied:
             tokens = copied["http_media_tokens"]
             if wire_format != "encode" or not isinstance(tokens, Mapping):

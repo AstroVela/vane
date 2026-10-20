@@ -530,3 +530,14 @@ before client creation, including ignore mode. Real-model acceptance uses the
 unchanged SGLang server with audio/video/subtitles and a matching Context catalog;
 CPU HTTP fixtures do not establish model quality. Only related tests are required;
 no native rebuild or Ray suite is needed for these Python-only HTTP changes.
+
+For vLLM HTTP tokenization options, review validation before client creation,
+explicit true/false versus omission, descriptor serialization and every split
+request, including text-only queries under the multimodal format. Complete two
+clean reviews before the noneditable Python wheel install, then run the affected
+`test_ai_embedding_http_runtime.py` and `test_ai_embedding_sglang_encode.py`
+through the installed launcher with Ray startup forbidden. The dependent Context
+preset/local gate checks model-owned tokenization for ingestion and search.
+Compare real token counts and vectors to an independent checkpoint processor;
+protocol fixtures alone do not qualify numerical behavior. Only related checks
+are required; no native rebuild, full/release suite or Ray tests.
