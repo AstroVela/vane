@@ -377,5 +377,13 @@ class MLXImageEmbedder(_MLXEmbedder):
                 image = Image.fromarray(np.ascontiguousarray(value))
                 stack.callback(image.close)
                 pil_images.append([image])
-            encoded = self._processor(images=pil_images, return_tensors="np", padding=True, truncation=False)
+            encoded = self._processor(
+                images=pil_images,
+                # PIL is converted back to HWC arrays by the SDK; heights 1/3
+                # are ambiguous to its channel-axis inference.
+                images_kwargs={"input_data_format": "channels_last"},
+                return_tensors="np",
+                padding=True,
+                truncation=False,
+            )
             return self._infer(self._validate_image_inputs(encoded, len(images)), len(images))

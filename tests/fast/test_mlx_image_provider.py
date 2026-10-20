@@ -238,8 +238,9 @@ def image_sdk(monkeypatch, tmp_path):
         def close(self):
             self.closed = True
 
-    def processor(*, images, return_tensors, padding, truncation):
+    def processor(*, images, images_kwargs, return_tensors, padding, truncation):
         assert return_tensors == "np" and padding is True and truncation is False
+        assert images_kwargs == {"input_data_format": "channels_last"}
         assert all(isinstance(row, list) and len(row) == 1 for row in images)
         assert all(row[0].array.dtype == np.uint8 and not row[0].closed for row in images)
         state.processor_calls.append([row[0].array.copy() for row in images])

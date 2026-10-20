@@ -81,6 +81,61 @@ def cosine(left, right):
     return np.sum(left * right, axis=1) / (np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1))
 
 
+@pytest.mark.parametrize("height", [1, 3])
+def test_real_processor_preserves_ambiguous_hwc_images(height, record_property):
+    import mlx.core as mx
+
+    from vane.ai.provider import load_provider
+
+    # Distinct channel/spatial values expose a channel-axis swap even when all
+    # processor shapes and the final vector remain valid (height=3).
+    pixels = np.arange(height * 5 * 3, dtype=np.uint8).reshape(height, 5, 3) * 5
+    original = pixels.copy()
+    embedder = load_provider("mlx").get_image_embedder().instantiate()
+    try:
+        processor = embedder._processor
+        # Independent layout: explicitly transpose to CHW and declare FIRST.
+        # Do not let the reference infer the same ambiguous HWC layout.
+        expected = processor(
+            images=[[pixels.transpose(2, 0, 1)]],
+            images_kwargs={"input_data_format": "channels_first"},
+            return_tensors="np",
+            padding=True,
+            truncation=False,
+        )
+        captured = []
+
+        def capture(**kwargs):
+            encoded = processor(**kwargs)
+            captured.append(encoded)
+            return encoded
+
+        embedder._processor = capture
+        actual = vectors(embedder.embed_image([pixels]), 1)
+        (encoded,) = captured
+        assert set(encoded) == set(expected) == {"input_ids", "attention_mask", "pixel_values", "image_position_ids"}
+        assert encoded["pixel_values"].shape == (1, 2520, 768)
+        for key in expected:
+            assert encoded[key].dtype == expected[key].dtype
+            np.testing.assert_array_equal(encoded[key], expected[key], err_msg=key)
+        np.testing.assert_array_equal(pixels, original)
+
+        # The real model also consumes these correctly laid-out patches.
+        with mx.stream(mx.gpu):
+            output = embedder._model(**{key: mx.array(value) for key, value in expected.items()})
+            evaluated = output.text_embeds.astype(mx.float32)
+            mx.eval(evaluated)
+            reference = np.array(evaluated, dtype=np.float32, copy=True)
+        reference = (reference / np.linalg.norm(reference.astype(np.float64), axis=1, keepdims=True)).astype(np.float32)
+        similarity = float(cosine(actual, reference).min())
+        assert similarity >= 0.999
+        record_property("input_shape", json.dumps(list(pixels.shape)))
+        record_property("patch_shape", json.dumps(list(encoded["pixel_values"].shape)))
+        record_property("chw_reference_cosine", similarity)
+    finally:
+        embedder.close()
+
+
 @pytest.fixture(scope="module")
 def reference(images):
     # No Vane provider constants, preprocessing or output helpers are used here.
@@ -123,7 +178,13 @@ def reference(images):
                 im = Image.fromarray(value)
                 stack.callback(im.close)
                 pil.append([im])
-            encoded = processor(images=pil, return_tensors="np", padding=True, truncation=False)
+            encoded = processor(
+                images=pil,
+                images_kwargs={"input_data_format": "channels_last"},
+                return_tensors="np",
+                padding=True,
+                truncation=False,
+            )
             assert set(encoded) == {"input_ids", "attention_mask", "pixel_values", "image_position_ids"}
             image_vectors = infer(model, encoded)
         text = tokenizer(
