@@ -79,7 +79,7 @@ InputPart: TypeAlias = TextInput | ImageInput | VideoInput | AudioInput
 
 @dataclass(frozen=True)
 class MultimodalInput:
-    """Ordered optional parts of ONE input, producing ONE vector per row.
+    """Ordered optional parts of ONE input with its declared native outputs.
 
     NULL parts and empty/whitespace-only text are absent. At least one part
     must remain in every row. Extraction failures must be recorded by the

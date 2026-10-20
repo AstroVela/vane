@@ -601,22 +601,6 @@ def _validate_embedding_dimension(value: Any) -> int | None:
     return int(value)
 
 
-def _resolve_embedding_dimension(descriptor: Any, explicit: int | None) -> int:
-    if explicit is not None:
-        return explicit
-    try:
-        resolved = descriptor.get_dimensions()
-    except Exception as exc:
-        model = getattr(descriptor, "get_model", lambda: "unknown")()
-        raise ValueError(
-            f"Cannot determine embedding dimensions for model {model!r} without network or model loading; "
-            "pass dimensions=... explicitly"
-        ) from exc
-    if isinstance(resolved, bool) or not isinstance(resolved, int) or resolved <= 0:
-        raise ValueError("Provider get_dimensions() must return a positive integer")
-    return int(resolved)
-
-
 def _prepare_embed_call(
     provider: Any,
     model: str | None,
@@ -626,7 +610,7 @@ def _prepare_embed_call(
     *,
     relation: bool,
     input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "text",
-) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
+) -> tuple[Any, int | None, UDFOptions, bool, int | None, int, str | None]:
     """Resolve one Embed call without performing network or model I/O."""
 
     if provider is None:
@@ -691,7 +675,21 @@ def _prepare_embed_call(
 
         if not isinstance(descriptor.get_input_spec(), MultimodalInputSpec):
             raise TypeError("Multimodal descriptor must return a MultimodalInputSpec")
-    resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
+    from vane.ai._embedding_outputs import EmbeddingOutputSpec
+
+    output_spec = descriptor.get_output_spec(dimensions=explicit_dimensions)
+    if not isinstance(output_spec, EmbeddingOutputSpec):
+        raise EmbeddingConfigurationError("Embedding descriptor must return an EmbeddingOutputSpec")
+    if output_spec.layout == "named":
+        if explicit_dimensions is not None:
+            raise EmbeddingConfigurationError("Named embedding outputs declare their own dimensions; omit dimensions")
+        if max_chunk_chars is not None:
+            raise EmbeddingConfigurationError("Named embedding outputs do not support chunk averaging")
+        resolved_dimensions = None
+    else:
+        resolved_dimensions = output_spec.outputs[0].dimensions
+        if explicit_dimensions is not None and resolved_dimensions != explicit_dimensions:
+            raise EmbeddingConfigurationError("Embedding output dimensions differ from the requested dimensions")
     descriptor_resources = descriptor.get_udf_options()
     udf_options = UDFOptions(
         actor_number=actor_number if actor_number is not None else 1,
@@ -879,24 +877,33 @@ class _EmbeddingBatch:
         descriptor: Any,
         column: str,
         output_column: str,
-        dimensions: int,
+        dimensions: int | None,
         max_chunk_chars: int | None = None,
         chunk_overlap_chars: int = 200,
         max_retries: int = 3,
         on_error: _OnError = "raise",
         normalize: bool = False,
+        output_spec: Any = None,
     ) -> None:
         _validate_on_error(on_error)
         self._descriptor = descriptor
         self._column = column
         self._output_column = output_column
-        self._dimensions = dimensions
         self._max_chunk_chars = max_chunk_chars
         self._chunk_overlap_chars = chunk_overlap_chars
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
         self._normalize = normalize
-        self._arrow_type = pa.list_(pa.float32(), dimensions)
+        from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
+
+        if output_spec is None:
+            if dimensions is None:
+                raise EmbeddingConfigurationError("Embedding batch requires dimensions or an output specification")
+            output_spec = EmbeddingOutputSpec((EmbeddingOutput("embedding", dimensions, "embedding"),))
+        if not isinstance(output_spec, EmbeddingOutputSpec):
+            raise EmbeddingConfigurationError("Embedding batch requires an EmbeddingOutputSpec")
+        self._output_spec = output_spec
+        self._arrow_type = self._output_spec.arrow_type()
         self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | MultimodalEmbedder | ManagedEmbedder | None = (
             None  # lazy: instantiate on first __call__
         )
@@ -932,7 +939,7 @@ class _EmbeddingBatch:
                 self._embedder.configure_execution(
                     max_retries=self._max_retries,
                     on_error=self._on_error,
-                    validate=self._coerce_embedding,
+                    validate=self._coerce_result,
                 )
             if _provider_is_loop_bound(self._embedder, self._method_name):
                 self._embedder_loop_bound = True
@@ -982,7 +989,23 @@ class _EmbeddingBatch:
         state["_embedder_loop_bound"] = False  # recomputed on next _ensure_embedder()
         return state
 
-    def _coerce_embedding(self, value: Any) -> np.ndarray:
+    def _coerce_result(self, value: Any, *, normalize: bool = False) -> Any:
+        if self._output_spec.layout == "vector":
+            return self._coerce_vector(value, self._output_spec.outputs[0].dimensions, normalize=normalize)
+        if not isinstance(value, Mapping) or set(value) != {output.name for output in self._output_spec.outputs}:
+            raise _ProviderResultError("Provider must return exactly the declared named embedding outputs")
+        result: dict[str, np.ndarray | None] = {}
+        for output in self._output_spec.outputs:
+            raw = value[output.name]
+            if raw is None and output.optional:
+                result[output.name] = None
+            else:
+                result[output.name] = self._coerce_vector(raw, output.dimensions, normalize=normalize)
+        if all(vector is None for vector in result.values()):
+            raise _ProviderResultError("Provider returned no native embedding output for an active input")
+        return result
+
+    def _coerce_vector(self, value: Any, dimensions: int, *, normalize: bool = False) -> np.ndarray:
         try:
             with np.errstate(over="ignore", invalid="ignore"):
                 embedding = np.asarray(value, dtype=np.float32)
@@ -994,20 +1017,20 @@ class _EmbeddingBatch:
             raise _ProviderResultError(
                 f"Provider {provider!r} model {model!r} "
                 f"returned an embedding with shape {embedding.shape}; expected a one-dimensional "
-                f"embedding with length {self._dimensions}"
+                f"embedding with length {dimensions}"
             )
-        if embedding.size != self._dimensions:
+        if embedding.size != dimensions:
             provider, model = _descriptor_identity(self._descriptor)
             raise _ProviderResultError(
                 f"Provider {provider!r} model {model!r} "
-                f"returned an embedding with length {embedding.size}; expected {self._dimensions}"
+                f"returned an embedding with length {embedding.size}; expected {dimensions}"
             )
         if not bool(np.isfinite(embedding).all()):
             provider, model = _descriptor_identity(self._descriptor)
             raise _ProviderResultError(
                 f"Provider {provider!r} model {model!r} returned an embedding containing non-finite components"
             )
-        return embedding
+        return self._coerce_vector(_normalize_embedding(embedding), dimensions) if normalize else embedding
 
     def _coerce_embedding_rows(
         self,
@@ -1015,7 +1038,8 @@ class _EmbeddingBatch:
         *,
         allow_nulls: bool,
         normalize: bool = False,
-    ) -> list[np.ndarray | None]:
+        input_modalities: list[frozenset[str]] | None = None,
+    ) -> list[Any]:
         """Enforce the typed embedding contract for known result rows.
 
         A row-aligned result violation is already attributable to one input,
@@ -1023,15 +1047,20 @@ class _EmbeddingBatch:
         again. ``allow_nulls`` is reserved for rows already nulled by that
         policy or by a failed chunk.
         """
-        embeddings: list[np.ndarray | None] = []
-        for value in values:
+        embeddings: list[Any] = []
+        for index, value in enumerate(values):
             if value is None and allow_nulls:
                 embeddings.append(None)
                 continue
             try:
-                embedding = self._coerce_embedding(value)
-                if normalize:
-                    embedding = self._coerce_embedding(_normalize_embedding(embedding))
+                embedding = self._coerce_result(value, normalize=normalize)
+                if input_modalities is not None:
+                    for output in self._output_spec.outputs:
+                        produced = embedding if self._output_spec.layout == "vector" else embedding[output.name]
+                        if produced is not None and not input_modalities[index].intersection(output.source_modalities):
+                            raise _ProviderResultError(
+                                "Native embedding output has no declared source in its input row"
+                            )
             except _ProviderResultError as exc:
                 if self._on_error == "raise":
                     raise
@@ -1041,7 +1070,7 @@ class _EmbeddingBatch:
             embeddings.append(embedding)
         return embeddings
 
-    def _invoke_embedder(self, texts: list[Any]) -> list[np.ndarray | None]:
+    def _invoke_embedder(self, texts: list[Any]) -> list[Any]:
         capability_error: ProviderCapabilityError | None = None
         provider_error: Exception | None = None
         try:
@@ -1079,10 +1108,17 @@ class _EmbeddingBatch:
                 "embedding calls must preserve row count and order"
             )
         return self._coerce_embedding_rows(
-            values, allow_nulls=isinstance(self._embedder, ManagedEmbedder) and self._on_error == "ignore"
+            values,
+            allow_nulls=isinstance(self._embedder, ManagedEmbedder) and self._on_error == "ignore",
+            input_modalities=[
+                frozenset(part.spec.kind for part in value.parts)
+                if self._method_name == "embed_multimodal"
+                else frozenset({self._method_name.removeprefix("embed_")})
+                for value in texts
+            ],
         )
 
-    def _embed_inputs(self, texts: list[Any]) -> list[np.ndarray | None]:
+    def _embed_inputs(self, texts: list[Any]) -> list[Any]:
         if not texts:
             return []
         try:
@@ -1108,7 +1144,7 @@ class _EmbeddingBatch:
         # The batch error itself is not logged here: each isolated row that
         # actually fails logs its own substitution below (a row that recovers
         # on isolation is not a substitution and must stay silent).
-        isolated: list[np.ndarray | None] = []
+        isolated: list[Any] = []
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
@@ -1160,7 +1196,14 @@ class _EmbeddingBatch:
                 results[row_indices[index]] = value
 
         embeddings = pa.array(
-            [None if value is None else value.tolist() for value in results],
+            [
+                None
+                if value is None
+                else {name: None if vector is None else vector.tolist() for name, vector in value.items()}
+                if self._output_spec.layout == "named"
+                else value.tolist()
+                for value in results
+            ],
             type=self._arrow_type,
         )
         return pa.table({self._output_column: embeddings})
@@ -1670,7 +1713,7 @@ def _prepare_embedding_batch(
     multimodal: bool,
     relation: bool,
     output_column: str = "embedding",
-) -> tuple[_EmbeddingBatch, UDFOptions, str | None, int, str]:
+) -> tuple[_EmbeddingBatch, UDFOptions, str | None, int | None, str]:
     """One descriptor and executor plan for Python and SQL typed inputs."""
     input_kind: Literal["text", "image", "video", "audio", "multimodal"] = "multimodal" if multimodal else parts[0].kind
     descriptor, resolved_dimensions, udf_opts, normalize, chunk_size, overlap, backend = _prepare_embed_call(
@@ -1682,6 +1725,7 @@ def _prepare_embedding_batch(
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
         normalize=normalize,
+        output_spec=descriptor.get_output_spec(dimensions=dimensions),
     )
     wrapper: _EmbeddingBatch
     if multimodal:
@@ -1749,7 +1793,7 @@ def _build_embed_expression(
         if isinstance(input, MultimodalInput)
         else (EmbeddingPartSpec(input_kind),)
     )
-    wrapper, udf_opts, execution_backend, resolved_dimensions, input_name = _prepare_embedding_batch(
+    wrapper, udf_opts, execution_backend, _, input_name = _prepare_embedding_batch(
         provider,
         model,
         dimensions,
@@ -1780,7 +1824,7 @@ def _build_embed_expression(
                 "struct_pack", where.alias("condition"), *(value.alias(name) for name, value in inputs.items())
             )
         }
-    output_type = f"FLOAT[{resolved_dimensions}]"
+    output_type = wrapper._output_spec.sql_type()
     return _build_ai_batch_expression(
         wrapper,
         inputs=inputs,
@@ -1878,7 +1922,10 @@ def embed(
 
     A bare Expression denotes text. Decoded media uses ImageInput, VideoInput
     or AudioInput. Supply mime_type to pass encoded bytes without decoding.
-    MultimodalInput combines optional parts into one vector for each row.
+    MultimodalInput combines optional parts into one logical model input per row.
+    The selected descriptor declares its native output: FLOAT[N] for a single
+    vector, or STRUCT(name FLOAT[N], ...) for named vectors. Independent rows
+    stay independent; Vane neither splits parts nor synthesizes extra vectors.
     With where=, only TRUE rows undergo input conversion and model execution;
     FALSE/NULL rows return NULL while preserving row count and order. Expression
     evaluation and provider/layout configuration still apply to the whole plan.

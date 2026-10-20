@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vane.ai._audio_embedding import AudioClip, AudioInputSpec
     from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
+    from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
     from vane.ai._errors import DiagnosticError, summarize_error
     from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
     from vane.ai.typing import JSONSchema
 
 __all__ = [
+    "EmbeddingOutput",
+    "EmbeddingOutputSpec",
     "EmbeddingContent",
     "EmbeddingPart",
     "EmbeddingPartSpec",
@@ -71,6 +74,8 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "EmbeddingOutput": ("vane.ai._embedding_outputs", "EmbeddingOutput"),
+    "EmbeddingOutputSpec": ("vane.ai._embedding_outputs", "EmbeddingOutputSpec"),
     "EmbeddingContent": ("vane.ai._embedding_content", "EmbeddingContent"),
     "EmbeddingPart": ("vane.ai._embedding_content", "EmbeddingPart"),
     "EmbeddingPartSpec": ("vane.ai._embedding_content", "EmbeddingPartSpec"),
