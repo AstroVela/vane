@@ -265,6 +265,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     s3_session_id: str
     effective_s3_config_identity: str
     use_session_credentials: bool
+    vane_fs_workspaces: tuple[str, ...] = ()
 
     def has_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
@@ -401,6 +402,21 @@ def _worker_snapshot_database_identity(
         seen_distributed_contracts.add(raw_contract)
         distributed_contracts.append(raw_contract)
     distributed_contracts.sort()
+    raw_vane_fs_workspaces = snapshot.get("vane_fs_workspaces", [])
+    if not isinstance(raw_vane_fs_workspaces, list) or any(
+        not isinstance(registration, Mapping) for registration in raw_vane_fs_workspaces
+    ):
+        raise TypeError("query connection snapshot vane_fs_workspaces must be a list of mappings")
+    vane_fs_workspaces = tuple(
+        sorted(
+            json.dumps(
+                {key: value for key, value in registration.items() if key != "snapshots"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for registration in raw_vane_fs_workspaces
+        )
+    )
     has_httpfs = any(name.lower() == "httpfs" for name, _version in extensions) or any(
         name.lower() == "httpfs" for name, _descriptor in dynamic_extensions
     )
@@ -439,6 +455,7 @@ def _worker_snapshot_database_identity(
         s3_session_id,
         s3_config_identity,
         identity_uses_session_credentials,
+        vane_fs_workspaces,
     )
 
 

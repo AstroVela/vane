@@ -45,7 +45,8 @@ struct PyPhysicalPlanWrapper {
 	py::object udf_actor_handles_;   // Resource-unit keyed executor options survive fragment extraction
 	py::object memory_source_refs_;  // Query-owned Ray ObjectRefs for Python in-memory scans
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
-	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins_ = CreateVaneFSQueryPins();
+	string serialized_root_; // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
 
 	PyPhysicalPlanWrapper(const PyPhysicalPlanWrapper &) = default;
 	PyPhysicalPlanWrapper(PyPhysicalPlanWrapper &&) = default;
@@ -72,6 +73,10 @@ struct PyPhysicalPlanWrapper {
 		}
 		ConnectionSnapshotApplyOptions options;
 		options.apply_session_config = apply_session_config;
+		options.vane_fs_query_pins = LookupQueryVaneFSPins(resource_query_id_);
+		if (!options.vane_fs_query_pins) {
+			options.vane_fs_query_pins = vane_fs_query_pins_;
+		}
 		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, options);
 	}
 
@@ -272,6 +277,7 @@ struct PyPhysicalPlanWrapper {
 		result.udf_actor_handles_ = udf_actor_handles_;
 		result.memory_source_refs_ = memory_source_refs_;
 		result.connection_snapshot_ = connection_snapshot_;
+		result.vane_fs_query_pins_ = vane_fs_query_pins_;
 		result.serialized_root_ = serialize_root_for_clone();
 		result.ensure_plan_identity();
 		if (!conn_obj.is_none()) {
@@ -1158,6 +1164,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;
 	snapshot_options.apply_attached_databases = !shares_source_database;
+	snapshot_options.vane_fs_query_pins = vane_fs_query_pins_;
 	if (!shares_source_database && SnapshotHasDynamicExtensions(connection_snapshot_)) {
 		PrepareConnectionSnapshotExtensions(planning_conn, connection_snapshot_);
 	}
@@ -1214,6 +1221,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.udf_registrations_ = udf_registrations_;
 	plan_wrapper.memory_source_refs_ = memory_source_refs_;
 	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
+	plan_wrapper.vane_fs_query_pins_ = vane_fs_query_pins_;
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
 	validate_serialization(py::cast(plan_wrapper));
@@ -4273,6 +4281,7 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	topology_plan.udf_actor_handles_ = plan.udf_actor_handles_;
 	topology_plan.memory_source_refs_ = plan.memory_source_refs_;
 	topology_plan.connection_snapshot_ = plan.connection_snapshot_;
+	topology_plan.vane_fs_query_pins_ = plan.vane_fs_query_pins_;
 	topology_plan.serialized_root_ = plan.serialize_root_for_clone();
 	topology_plan.worker_connection_ = exec_conn;
 	topology_plan.materialize_deferred_root(exec_conn);

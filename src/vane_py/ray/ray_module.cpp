@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vane_python/native_resource_graph.hpp"
+#include "vane_python/vane_fs.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "task.hpp"
@@ -771,7 +772,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // worker admits any task that can deserialize this physical plan.
 		    auto connection = CreateConnectionFromBootstrapSnapshot(
 		        LookupBootstrapSnapshot(snapshot), RunnerTypeFromSnapshot(snapshot), false, true, true);
-		    PrepareConnectionSnapshotExtensions(connection, snapshot);
+		    PrepareConnectionSnapshotExtensions(connection, snapshot, LookupQueryVaneFSPins(query_id));
 		    return connection;
 	    },
 	    py::arg("query_id"));
@@ -786,6 +787,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    // Admission is verification-only for dynamic artifacts. Provider
 		    // discovery and dynamic loading are confined to preparation above.
 		    ValidateConnectionSnapshotExtensions(connection, snapshot, true);
+		    if (snapshot.cast<py::dict>().contains("vane_fs_workspaces")) {
+			    ApplyVaneFSWorkspaces(ExtractPyConnectionWrapper(connection),
+			                          snapshot.cast<py::dict>()["vane_fs_workspaces"], LookupQueryVaneFSPins(query_id));
+		    }
 	    },
 	    py::arg("connection"), py::arg("query_id"));
 
@@ -804,7 +809,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
 		                                          plan.memory_source_refs_, plan.connection_snapshot_,
-		                                          plan.worker_connection_);
+		                                          plan.worker_connection_, plan.vane_fs_query_pins_);
 	    },
 	    py::arg("query_id"), py::arg("plan"));
 
@@ -1230,6 +1235,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
+	    .def("_release_vane_fs_query_pins",
+	         [](PyLogicalPlan &plan) { plan.vane_fs_query_pins_ = CreateVaneFSQueryPins(); })
 	    .def("_memory_source_ref_count_for_test",
 	         [](const PyLogicalPlan &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
 	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none(),

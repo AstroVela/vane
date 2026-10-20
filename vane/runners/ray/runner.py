@@ -27,6 +27,12 @@ _RAY_RUNNERS_LOCK = threading.RLock()
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 
 
+def _release_vane_fs_query_pins(plan: Any) -> None:
+    release = getattr(plan, "_release_vane_fs_query_pins", None)
+    if callable(release):
+        release()
+
+
 def notify_connection_closed(session_id: str) -> None:
     """Close one logical Vane session on every live local RayRunner."""
     session_key = str(session_id).strip()
@@ -156,17 +162,24 @@ class RayRunner(Runner):
             client = self._client_for_session(str(logical_plan.session_id()))
             yield from client.stream_plan(logical_plan)
         finally:
+            _release_vane_fs_query_pins(logical_plan)
             del logical_plan
 
     def run_write(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound logical write plan."""
-        client = self._client_for_session(str(logical_plan.session_id()))
-        return client.run_copy_plan(logical_plan)
+        try:
+            client = self._client_for_session(str(logical_plan.session_id()))
+            return client.run_copy_plan(logical_plan)
+        finally:
+            _release_vane_fs_query_pins(logical_plan)
 
     def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound Python DataSink plan."""
-        client = self._client_for_session(str(logical_plan.session_id()))
-        return client.run_datasink_plan(logical_plan)
+        try:
+            client = self._client_for_session(str(logical_plan.session_id()))
+            return client.run_datasink_plan(logical_plan)
+        finally:
+            _release_vane_fs_query_pins(logical_plan)
 
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
         """Retry cleanup for a committed write without executing the write again."""

@@ -7,8 +7,8 @@ Python provides pybind11 bindings and an optional read-only fsspec adapter.
 
 This is a separately installed experimental component. It supports local
 workspaces, Linux FUSE mounts and native Vane FILE, CSV/Parquet and media reads
-over immutable snapshots. Remote Ray access remains a later stage in the
-[architecture and roadmap](DESIGN.md).
+over immutable snapshots, including same-host Ray workers. Remote access remains
+a later stage in the [architecture and roadmap](DESIGN.md).
 The [performance closeout roadmap](PERFORMANCE_ROADMAP.md) records the fixed
 experiment budget, adoption decisions and delivery criteria for the current work.
 
@@ -350,7 +350,7 @@ Resolve the parent and affected entries together to keep a consistent tree.
 ## Vane queries
 
 With a Vane build that includes the native connector, register an existing
-workspace on an explicitly local connection. The optional `vane-fs` package
+workspace on a local or same-host Ray connection. The optional `vane-fs` package
 owns SQLite; the base Vane wheel does not link it.
 
 ```python
@@ -392,8 +392,8 @@ pins to unrelated active results. Unregistering prevents new opens without
 invalidating open readers.
 `drop_snapshot` fails while either kind of reference remains.
 
-The native connector is read-only and requires native local execution, selected
-with `local` or its `local-fast` alias. It supports explicit file paths, not
+The native connector is read-only and supports `local` (including its
+`local-fast` alias) and same-host `ray` execution. It supports explicit file paths, not
 wildcard expansion or directory listing.
 SQLite write access is required to record/release retention pins. Interrupts
 are checked between 1 MiB read chunks; a SQLite lock wait is bounded by
@@ -405,6 +405,24 @@ Both `recover_owners()` and `drop_snapshot()` perform this retry, without
 unregistering the workspace. A failed retry or rolled-back transaction keeps
 the cleanup pending. An explicit snapshot session `close()` instead raises
 the SQLite error and leaves the session available for another close attempt.
+
+For single-host Ray queries, select `VANE_RUNNER=ray` and call the same
+`register_workspace(connection, database)` API. Install matching Vane and
+`vane-fs` packages in the driver and worker environments. The query snapshot
+carries the absolute database path, workspace ID, timeout and host name;
+each planning/worker connection creates its own native provider and verifies
+the workspace ID before opening any snapshot. A different host is rejected.
+The SQLite database and its retention/owner-lock files must be accessible on
+the same local filesystem. No file data or native pointers travel in the plan.
+
+Binding retains referenced snapshots in the driver plan while it is submitted.
+Worker query replay state keeps both those references and snapshots first
+opened at runtime until query cleanup, including between task attempts.
+Failure and cancellation use the existing query cleanup path. Runner teardown
+explicitly releases driver binding pins, even when Python result cycles retain
+the submitted logical plan. Unexecuted logical/physical plan objects retain
+their binding pins until released. Multi-host storage, a remote read service
+and remote leases remain separate delivery work.
 
 The older fsspec adapter remains available for listing, globbing and clients
 that use Python file objects. Use it on a separate Vane database instance from
@@ -456,7 +474,7 @@ read handles. Explicitly closing the workspace invalidates all its sessions.
 - GC scans retained states and version tables; it is not yet optimized for large
   histories. SQLite checkpointing and page reuse do not guarantee that the main
   database file immediately shrinks on disk.
-- Directory import, SQL COPY writes and remote/Ray access are not
+- Directory import, SQL COPY writes and remote/multi-host access are not
   implemented. Put the database on local storage outside managed file content.
 
 ## Verification
@@ -479,6 +497,10 @@ The main [CI workflow](../.github/workflows/ci.yml) additionally installs both
 packages on Python 3.12 and runs native FILE/media acceptance against the built
 Vane wheel. Those tests cover connection isolation, reader and query lifetimes,
 streaming results, cancellation, range reads, and image/video parity.
+The optional-package CI step also runs `tests/fast/test_vane_fs_ray.py` in
+separate non-Ray and real-Ray processes. Its acceptance covers native snapshot
+CSV/Parquet scans, joins and aggregates, FILE checksums, logical/physical plan
+transport, workspace identity failures and query-owned snapshot retention.
 
 The component root avoids pytest constructing a source-tree `vane_fs` namespace
 over the installed package. The fsspec Vane integration test requires Vane and
