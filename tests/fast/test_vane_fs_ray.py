@@ -77,6 +77,44 @@ def test_snapshot_scan_survives_logical_and_physical_plan_transport(workspace, f
     store.drop_snapshot(frozen)
 
 
+@pytest.mark.parametrize("file_format", ["csv", "parquet"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_preflight_preview_does_not_retain_snapshot_pins(workspace, monkeypatch, file_format, fails):
+    import vane._ray_cxx as helpers
+
+    store, database, frozen = workspace
+    url = vane_fs.snapshot_url(store.id, frozen, f"/table.{file_format}")
+    with vane.connect() as source:
+        vane_fs.register_workspace(source, database)
+        logical = _logical_plan(source, f"SELECT * FROM read_{file_format}('{url}')", "vane-fs-preflight-pins")
+    validate = helpers.validate_plan_serialization_for_submission
+    previews = []
+
+    def preflight(plan):
+        previews.append(plan)
+        validate(plan)
+        if fails:
+            raise ValueError("injected serialization preflight failure")
+
+    monkeypatch.setattr(helpers, "validate_plan_serialization_for_submission", preflight)
+    with vane.connect() as planning:
+        if fails:
+            with pytest.raises(ValueError, match="injected serialization preflight failure") as failure:
+                logical.to_physical_plan(planning)
+            assert failure.value.__traceback__ is not None
+        else:
+            physical = logical.to_physical_plan(planning)
+    logical._release_vane_fs_query_pins()
+    if not fails:
+        with pytest.raises(BlockingIOError, match="pinned"):
+            store.drop_snapshot(frozen)
+        physical._release_vane_fs_query_pins()
+    # The preflight preview and any exception traceback remain alive after
+    # their lifecycle-owned logical/physical counterparts release ownership.
+    assert len(previews) == 1
+    store.drop_snapshot(frozen)
+
+
 @pytest.mark.parametrize("invalid", ["different_workspace", "different_host", "relative_path", "missing_database"])
 def test_workspace_replay_rejects_changed_or_unavailable_storage(workspace, tmp_path, invalid):
     store, database, frozen = workspace
@@ -203,6 +241,63 @@ def test_runner_releases_binding_pins_after_terminal_cleanup(workspace, terminal
     else:
         assert getattr(runner, terminal)(logical) == {"rows": 3}
     store.drop_snapshot(frozen)
+
+
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("file_format", ["csv", "parquet"])
+def test_same_host_ray_failed_preflight_releases_snapshot_pins(workspace, monkeypatch, tmp_path, file_format):
+    import ray
+
+    from vane.runners.ray.runner import _RAY_RUNNERS
+
+    store, database, frozen = workspace
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    url = vane_fs.snapshot_url(store.id, frozen, f"/table.{file_format}")
+
+    def install_failure(actor):
+        import vane._ray_cxx as helpers
+
+        original = helpers.validate_plan_serialization_for_submission
+        actor._vane_fs_original_preflight = original
+
+        def reject(plan):
+            unsupported = vane.ray_cxx._make_non_serializable_physical_plan_for_test(str(plan.idx()))
+            original(unsupported)
+
+        helpers.validate_plan_serialization_for_submission = reject
+
+    def restore_and_inspect(actor):
+        import vane._ray_cxx as helpers
+
+        helpers.validate_plan_serialization_for_submission = actor._vane_fs_original_preflight
+        del actor._vane_fs_original_preflight
+        return (
+            len(actor._plan_lifecycles),
+            len(actor._plan_connections),
+            len(actor.curr_plans),
+            sum(record.error is not None for record in actor._copy_operation_terminal.values()),
+        )
+
+    with vane.connect() as connection:
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        client = next(iter(_RAY_RUNNERS)).query_driver_client
+        assert client is not None
+        driver = client.runner
+        vane_fs.register_workspace(connection, database)
+        ray.get(driver.__ray_call__.remote(install_failure))
+        try:
+            with pytest.raises(Exception, match="serialization preflight failed") as failure:
+                connection.execute(
+                    f"COPY (SELECT * FROM read_{file_format}('{url}')) "
+                    f"TO '{tmp_path / 'result.parquet'}' (FORMAT PARQUET)"
+                ).fetchall()
+        finally:
+            state = ray.get(driver.__ray_call__.remote(restore_and_inspect))
+        assert state[:3] == (0, 0, 0)
+        assert state[3] > 0  # The remote error cache and its tracebacks remain intact.
+        assert failure.value is not None
+        store.drop_snapshot(frozen)
 
 
 @pytest.mark.real_ray

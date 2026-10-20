@@ -1221,10 +1221,12 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.udf_registrations_ = udf_registrations_;
 	plan_wrapper.memory_source_refs_ = memory_source_refs_;
 	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
-	plan_wrapper.vane_fs_query_pins_ = vane_fs_query_pins_;
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
+	// Preflight can retain its temporary Python copy in a traceback. Attach
+	// binding pins only to the returned plan, after validation succeeds.
 	validate_serialization(py::cast(plan_wrapper));
+	plan_wrapper.vane_fs_query_pins_ = vane_fs_query_pins_;
 	return plan_wrapper;
 }
 
