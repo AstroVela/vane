@@ -167,6 +167,16 @@ def test_ctranslate_summary_accepts_only_the_allocation_error(message):
             "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
             " the maximum allowed buffer size of 4294967296 bytes."
         ),
+        "[METAL] Command buffer execution failed: Insufficient Memory",
+        "[METAL] Command buffer execution failed: Insufficient Memory.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        ),
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -187,9 +197,19 @@ def test_mlx_allocation_error_stays_fatal_after_diagnostic_transport(message, en
 
 
 @pytest.mark.parametrize("chain", ["cause", "cleanup"])
-def test_mlx_allocation_failure_in_nested_errors_is_fatal(chain):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+    ],
+)
+def test_mlx_allocation_failure_in_nested_errors_is_fatal(chain, message):
     error = RuntimeError("private provider failure")
-    allocation = RuntimeError("[malloc] Unable to allocate 4096 bytes.")
+    allocation = RuntimeError(message)
     if chain == "cause":
         error.__cause__ = allocation
     else:
@@ -216,6 +236,16 @@ def test_mlx_allocation_failure_in_nested_errors_is_fatal(chain):
             " the maximum allowed buffer size of private-token bytes."
         ),
         "[metal::set_wired_limit] Setting a wired limit larger than the maximum working set size is not allowed.",
+        "private input mentions [METAL] Command buffer execution failed: Insufficient Memory.",
+        "[METAL] Command buffer execution failed: Insufficient Memory. private input",
+        "[METAL] Command buffer execution failed: Insufficient Memory.\nprivate input",
+        "[METAL] Command buffer execution failed: Insufficient Memory (private-token).",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000003:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+        "[METAL] Command buffer execution failed: Timeout.",
+        "[METAL] Command buffer execution failed: Internal Error (0000000e:Internal Error).",
     ],
 )
 def test_mlx_summary_rejects_unrecognized_allocation_messages(message):

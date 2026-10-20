@@ -61,7 +61,9 @@ _MLX_MEMORY = re.compile(
     r"(?:\[malloc\] Unable to allocate [0-9]{1,20} bytes\."
     r"|\[metal::malloc\] Resource limit \([0-9]{1,20}\) exceeded\."
     r"|\[metal::malloc\] Attempting to allocate [0-9]{1,20} bytes which is greater than"
-    r" the maximum allowed buffer size of [0-9]{1,20} bytes\.)"
+    r" the maximum allowed buffer size of [0-9]{1,20} bytes\."
+    r"|\[METAL\] Command buffer execution failed: Insufficient Memory"
+    r"(?: \(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory\))?\.?)"
 )
 _MLX_MEMORY_DETAIL = "MLX memory allocation failed; check model and worker memory budgets"
 _ONNX_MEMORY = re.compile(
@@ -204,8 +206,8 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     if error_type == "RuntimeError":
         if _CPU_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_CPU_MEMORY_DETAIL):
             return _CPU_MEMORY_DETAIL
-        # MLX 0.32.4's metal/allocator.cpp reports allocation failures as
-        # RuntimeError. Preserve their category with fixed text before the
+        # MLX 0.32.4's Metal allocator and command buffers report OOM as
+        # RuntimeError. Preserve the resource category with fixed text before the
         # provider message is discarded; never match arbitrary OOM substrings.
         if _MLX_MEMORY.fullmatch(message) or canonical(_MLX_MEMORY_DETAIL):
             return _MLX_MEMORY_DETAIL

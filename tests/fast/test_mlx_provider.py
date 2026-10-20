@@ -537,6 +537,16 @@ def test_provider_failures_preserve_raise_ignore_and_private_errors(sdk, wrapper
             "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
             " the maximum allowed buffer size of 4294967296 bytes."
         ),
+        "[METAL] Command buffer execution failed: Insufficient Memory",
+        "[METAL] Command buffer execution failed: Insufficient Memory.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        ),
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
     ],
 )
 def test_allocation_failures_are_fatal_without_row_isolation(sdk, wrapper, monkeypatch, message, phase, on_error):
