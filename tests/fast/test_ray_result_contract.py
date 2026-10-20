@@ -1967,7 +1967,11 @@ def test_query_driver_datasink_cleanup_retry_ignores_reused_plan_identity():
 def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-cleanup-retry"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+    logical_plan._release_vane_fs_query_pins = lambda: released_pins.append("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: released_pins.append("physical")
     plan_calls = 0
     teardown_calls = 0
 
@@ -1995,6 +1999,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    assert released_pins == []
     recovered = asyncio.run(
         cls.recover_copy_plan(
             runner,
@@ -2020,6 +2025,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     assert replayed == cleaned
     assert plan_calls == 1
     assert teardown_calls == 2
+    assert released_pins == ["logical", "physical"]
 
 
 def test_query_driver_pending_copy_cleanup_survives_terminal_replay_eviction(monkeypatch):
@@ -2137,12 +2143,22 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+
+    def release_pins(kind):
+        assert runner._test_session_connection.cursors[-1].closed is True
+        released_pins.append(kind)
+
+    logical_plan._release_vane_fs_query_pins = lambda: release_pins("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: release_pins("physical")
     plan_calls = 0
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
+            assert released_pins == []
             plan_calls += 1
             on_execution_started()
             if late_init:
@@ -2188,6 +2204,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
         assert isinstance(recovered.error, ValueError)
         assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
+    assert released_pins == ["logical", "physical"]
 
 
 @pytest.mark.parametrize("late_init", [False, True])

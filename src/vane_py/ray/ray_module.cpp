@@ -984,6 +984,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyPhysicalPlanWrapper::session_id)
 	    .def("session_config", &PyPhysicalPlanWrapper::session_config)
 	    .def("has_explicit_s3_credentials", &PyPhysicalPlanWrapper::has_explicit_s3_credentials)
+	    .def("_release_vane_fs_query_pins",
+	         [](PyPhysicalPlanWrapper &plan) { plan.vane_fs_query_pins_ = CreateVaneFSQueryPins(); })
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
 	    .def("_memory_source_ref_count_for_test",
 	         [](const PyPhysicalPlanWrapper &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })

@@ -207,6 +207,31 @@ def test_runner_releases_binding_pins_after_terminal_cleanup(workspace, terminal
 
 @pytest.mark.real_ray
 @pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("file_format", ["csv", "parquet"])
+@pytest.mark.parametrize("terminal", ["select", "copy"])
+def test_same_host_ray_failed_queries_release_snapshot_pins(workspace, monkeypatch, tmp_path, file_format, terminal):
+    store, database, frozen = workspace
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    url = vane_fs.snapshot_url(store.id, frozen, f"/table.{file_format}")
+    query = (
+        "SELECT CASE WHEN id = 2 THEN error('injected VaneFS query failure') "
+        f"ELSE id END AS id FROM read_{file_format}('{url}')"
+    )
+    if terminal == "copy":
+        query = f"COPY ({query}) TO '{tmp_path / 'result.parquet'}' (FORMAT PARQUET)"
+    with vane.connect() as connection:
+        vane_fs.register_workspace(connection, database)
+        with pytest.raises(Exception, match="injected VaneFS query failure") as failure:
+            connection.execute(query).fetchall()
+        # Keep the exception and connection alive. COPY also retains its error
+        # in the remote driver's outcome cache; neither traceback may pin data
+        # after deterministic teardown, without cache eviction or Python GC.
+        assert failure.value is not None
+        store.drop_snapshot(frozen)
+
+
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
 def test_same_host_ray_queries_native_snapshots(workspace, monkeypatch):
     store, database, frozen = workspace
     monkeypatch.setenv("VANE_RUNNER", "ray")

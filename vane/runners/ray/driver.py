@@ -499,6 +499,15 @@ class _PlanLifecycle:
     _query_connection: Any | None = None
     _startup_future: ConcurrentFuture[Any] | None = field(default=None, repr=False)
     _startup_decision: ConcurrentFuture[bool] = field(default_factory=ConcurrentFuture, repr=False)
+    _vane_fs_plans: list[Any] = field(default_factory=list, repr=False)
+
+    def retain_vane_fs_plan(self, plan: Any) -> None:
+        if not callable(getattr(plan, "_release_vane_fs_query_pins", None)):
+            return
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            self._vane_fs_plans.append(plan)
 
     def _complete_startup_decision_locked(
         self,
@@ -694,6 +703,12 @@ class _PlanLifecycle:
                 raise RuntimeError(f"query plan {self.plan_id} closed before setup reached a terminal state")
             if not self._close_requested:
                 raise RuntimeError(f"query plan {self.plan_id} closed without a close request")
+            # Cached terminal exceptions can retain both plans through their
+            # tracebacks. Release pins only after owned execution has quiesced
+            # and the query connection has closed, including on cleanup retry.
+            for plan in self._vane_fs_plans:
+                plan._release_vane_fs_query_pins()
+            self._vane_fs_plans.clear()
             self._state = "closed"
             self._condition.notify_all()
 
@@ -7139,6 +7154,7 @@ class RayQueryDriverActor:
         lifecycle: _PlanLifecycle,
     ) -> tuple[Any, str, Any]:
         """Prepare a physical plan on an owned worker thread."""
+        lifecycle.retain_vane_fs_plan(plan)
         if os.environ.get("VANE_WORKER") == "1":
             raise RuntimeError(
                 "RayQueryDriverActor.run_plan() called inside a Worker Worker. "
@@ -7173,6 +7189,7 @@ class RayQueryDriverActor:
                 query_connection,
                 session.s3_config,
             )
+            lifecycle.retain_vane_fs_plan(physical_plan)
             physical_plan_id = str(physical_plan.idx())
             if physical_plan_id != plan_id:
                 raise RuntimeError(
@@ -8436,6 +8453,7 @@ class RayQueryDriverActor:
         lifecycle: _PlanLifecycle,
     ) -> tuple[Any, Any]:
         """Build a COPY plan on an owned thread without blocking actor control RPCs."""
+        lifecycle.retain_vane_fs_plan(logical_plan)
         with session.operation_lock:
             query_connection = session.connection.cursor()
             try:
@@ -8463,6 +8481,7 @@ class RayQueryDriverActor:
                 query_connection,
                 session.s3_config,
             )
+            lifecycle.retain_vane_fs_plan(plan)
             physical_plan_id = str(plan.idx())
             if physical_plan_id != plan_id:
                 raise RuntimeError(
