@@ -239,10 +239,13 @@ def main():
                 slow_sql=sql,
             )
         )
-    selected = lambda field: [
-        dict(rank=index, **row)
-        for index, row in enumerate(sorted(field, key=lambda c: c["wall_ns"], reverse=True)[:12])
-    ]
+
+    def selected(field):
+        return [
+            dict(rank=index, **row)
+            for index, row in enumerate(sorted(field, key=lambda c: c["wall_ns"], reverse=True)[:12])
+        ]
+
     report = dict(
         status="PASS",
         started_epoch=started,

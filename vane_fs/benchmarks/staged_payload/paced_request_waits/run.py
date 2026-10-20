@@ -7,7 +7,6 @@ from pathlib import Path
 
 from prepare import digest, save
 
-
 if __name__ == "__main__":
     import sys
 

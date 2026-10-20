@@ -4,7 +4,6 @@
 """Observe only slow active native calls; omit the continuous thread/frequency census."""
 
 import importlib.util
-import struct
 import time
 from pathlib import Path
 

@@ -11,7 +11,6 @@ from pathlib import Path
 
 from prepare import digest, save
 
-
 if __name__ == "__main__":
     here, out = Path(__file__).resolve().parent, Path(sys.argv[1]).resolve()
     parent = here.parent / "paced_range_writeback/analyze.py"

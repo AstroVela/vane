@@ -7,13 +7,13 @@ import argparse
 import hashlib
 import json
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
-import sqlite3
 
 
 def digest(path):
