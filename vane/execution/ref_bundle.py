@@ -170,6 +170,10 @@ def _parse_byte_size(value: str) -> int:
 
 
 def _available_system_memory_bytes() -> int:
+    if sys.platform == "darwin":
+        import psutil
+
+        return int(psutil.virtual_memory().available)
     with open("/proc/meminfo", encoding="utf-8") as meminfo:
         for line in meminfo:
             if not line.startswith("MemAvailable:"):
@@ -185,6 +189,9 @@ def _available_system_memory_bytes() -> int:
 
 
 def _available_local_shm_bytes() -> int:
+    if sys.platform == "darwin":
+        # Darwin POSIX shared memory draws from VM; it has no /dev/shm mount.
+        return _available_system_memory_bytes()
     stat = os.statvfs("/dev/shm")
     return int(stat.f_frsize) * int(stat.f_bavail)
 

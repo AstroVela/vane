@@ -80,6 +80,26 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+For Apple Silicon EmbeddingGemma 2 text inference, install the optional `mlx`
+extra. Run `tests/fast/test_mlx_provider.py` through the installed launcher
+before the base release gate; these contracts need no model SDK or Metal.
+The real checkpoint tests in `tests/ai/test_mlx_text_embedding.py` require
+`VANE_RUN_MLX_TESTS=1`, a complete fixed-revision HF cache, and
+`-m 'metal and external_service'`. They exercise BF16 reference parity,
+padding, retrieval, subprocess actor reuse and teardown. Use the complete
+`mlx-community/embeddinggemma-2-bf16` snapshot at revision
+`1a4ffddb7905d3f63486748deabe091a01fb6201`, with mlx 0.32.4, mlx-vlm 0.7.8
+and transformers 5.18.0. Download it explicitly with Hugging Face Hub before
+setting `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`; workers share `HF_HOME`.
+Inference requires native arm64 macOS and Metal, `dtype="bfloat16"`, one
+`subprocess_actor`, and 768 output dimensions. The document prefix is
+`title: none | text: `; the query prefix is `task: search result | query: `.
+The default 2048-token limit includes prefixes and special tokens; overlength
+inputs fail before inference. Other models, modalities, precisions and backends
+are rejected. Run manual subprocess examples outside the checkout so worker
+imports resolve to the installed package as described below.
+MLX and SQR pin different Transformers versions; use separate environments.
+
 Video clipping regression checks include fractional starts ending exactly at a
 stream's rational endpoint. Duration quantization must not manufacture an
 overrun, and an actual extension by an output clock tick must still fail. After

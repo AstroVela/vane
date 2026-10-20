@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from vane.ai import DiagnosticError, summarize_error
+from vane.ai._errors import _is_resource_error, _raise_if_resource_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
 
 
@@ -155,6 +156,102 @@ def test_cpu_allocator_summary_rejects_unrecognized_messages(message):
 )
 def test_ctranslate_summary_accepts_only_the_allocation_error(message):
     assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        "[metal::malloc] Resource limit (499000) exceeded.",
+        (
+            "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
+            " the maximum allowed buffer size of 4294967296 bytes."
+        ),
+        "[METAL] Command buffer execution failed: Insufficient Memory",
+        "[METAL] Command buffer execution failed: Insufficient Memory.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        ),
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "envelope",
+    ["native_json", "task_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"],
+)
+def test_mlx_allocation_error_stays_fatal_after_diagnostic_transport(message, envelope):
+    error = RuntimeError(message)
+    public = _safe_provider_execution_error("mlx", "private-model", "embedding initialization", error)
+    restored = pickle.loads(pickle.dumps(public))
+    flattened = native_error(restored, envelope)
+    for current in (error, public, restored, flattened):
+        assert summarize_error(current) == (
+            "RuntimeError: MLX memory allocation failed; check model and worker memory budgets"
+        )
+        with pytest.raises(MemoryError, match="Embedding exhausted model or host resources"):
+            _raise_if_resource_error(current)
+
+
+@pytest.mark.parametrize("chain", ["cause", "cleanup"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+    ],
+)
+def test_mlx_allocation_failure_in_nested_errors_is_fatal(chain, message):
+    error = RuntimeError("private provider failure")
+    allocation = RuntimeError(message)
+    if chain == "cause":
+        error.__cause__ = allocation
+    else:
+        error.cleanup_errors = (allocation,)
+    public = pickle.loads(pickle.dumps(DiagnosticError("embedding", error)))
+    assert "private" not in str(public)
+    with pytest.raises(MemoryError, match="resources"):
+        _raise_if_resource_error(public)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "private input mentions [malloc] Unable to allocate 4096 bytes.",
+        "[malloc] Unable to allocate 4096 bytes. private input",
+        "[malloc] Unable to allocate 4096 bytes.\nprivate input",
+        "[malloc] Unable to allocate private-token bytes.",
+        "[malloc] Unable to allocate -1 bytes.",
+        "[malloc] Unable to allocate 100000000000000000000 bytes.",
+        "[metal::malloc] Resource limit (private-token) exceeded.",
+        "[metal::malloc] Resource limit (499000) exceeded. private input",
+        (
+            "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
+            " the maximum allowed buffer size of private-token bytes."
+        ),
+        "[metal::set_wired_limit] Setting a wired limit larger than the maximum working set size is not allowed.",
+        "private input mentions [METAL] Command buffer execution failed: Insufficient Memory.",
+        "[METAL] Command buffer execution failed: Insufficient Memory. private input",
+        "[METAL] Command buffer execution failed: Insufficient Memory.\nprivate input",
+        "[METAL] Command buffer execution failed: Insufficient Memory (private-token).",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000003:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+        "[METAL] Command buffer execution failed: Timeout.",
+        "[METAL] Command buffer execution failed: Internal Error (0000000e:Internal Error).",
+    ],
+)
+def test_mlx_summary_rejects_unrecognized_allocation_messages(message):
+    error = RuntimeError(message)
+    assert summarize_error(error) == "RuntimeError"
+    assert not _is_resource_error(error)
 
 
 @pytest.mark.parametrize("kind", ["Fail", "RuntimeException"])

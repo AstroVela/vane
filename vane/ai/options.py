@@ -154,7 +154,20 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     local_files_only: bool
     revision: str | None
     trust_remote_code: bool
-    dtype: Literal["float32", "float16"]
+    dtype: Literal["float32", "float16", "bfloat16"]
+
+
+_MLX_TEXT_DEFAULTS: dict[str, Any] = {
+    "revision": "1a4ffddb7905d3f63486748deabe091a01fb6201",
+    "input_type": "document",
+    "dtype": "bfloat16",
+    "device": "metal",
+    "local_files_only": True,
+    "trust_remote_code": False,
+    "max_length": 2048,
+    "overlength": "error",
+    "max_concurrency_per_actor": 1,
+}
 
 
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
@@ -236,6 +249,7 @@ _NATIVE_MEDIA_PROMPT_OPTIONS = frozenset(
     }
 )
 _EMBED_PROVIDER_OPTIONS = {
+    "mlx": frozenset(_MLX_TEXT_DEFAULTS),
     "vllm": _NATIVE_EMBED_OPTIONS,
     "sglang": _NATIVE_EMBED_OPTIONS,
     "openai": _EMBED_REMOTE_OPTIONS
@@ -344,6 +358,37 @@ def _require_optional_nonempty_string(options: Mapping[str, Any], name: str) -> 
         raise ValueError(f"Embed option {name!r} must be a non-empty string or None")
 
 
+def _validate_mlx_text_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """The same closed encoding contract for direct factories and public Embed."""
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    copied = dict(options)
+    _reject_sensitive_embed_options(copied)
+    if copied.keys() - _MLX_TEXT_DEFAULTS.keys():
+        raise TypeError("MLX text options accept only the declared model encoding settings")
+    prepared = _MLX_TEXT_DEFAULTS | copied
+    if not _is_hugging_face_commit_sha(prepared["revision"]):
+        raise EmbeddingConfigurationError("MLX revision must be a full 40-character commit SHA")
+    prepared["revision"] = prepared["revision"].lower()
+    for key, choices in {
+        "input_type": ("document", "query"),
+        "dtype": ("bfloat16",),
+        "device": ("metal",),
+        "overlength": ("error",),
+    }.items():
+        if not isinstance(prepared[key], str) or prepared[key] not in choices:
+            raise EmbeddingConfigurationError(f"MLX {key} must be one of: {', '.join(choices)}")
+    if type(prepared["local_files_only"]) is not bool:
+        raise EmbeddingConfigurationError("MLX local_files_only must be a bool")
+    if prepared["trust_remote_code"] is not False:
+        raise EmbeddingConfigurationError("MLX requires trust_remote_code=False")
+    if type(prepared["max_length"]) is not int or not 1 <= prepared["max_length"] <= 2048:
+        raise EmbeddingConfigurationError("MLX max_length must be an integer from 1 to 2048")
+    if type(prepared["max_concurrency_per_actor"]) is not int or prepared["max_concurrency_per_actor"] != 1:
+        raise EmbeddingConfigurationError("MLX requires max_concurrency_per_actor=1")
+    return prepared
+
+
 def validate_embed_options(
     provider_family: str | None,
     options: Mapping[str, Any],
@@ -365,6 +410,20 @@ def validate_embed_options(
         raise TypeError(
             f"Unsupported Embed option(s) for provider {provider_family or 'custom'!r}: " + ", ".join(unknown)
         )
+
+    if family == "mlx":
+        from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+        actor_number = copied.get("actor_number")
+        if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
+            raise EmbeddingConfigurationError("MLX requires actor_number=1")
+        if copied.get("execution_backend") not in (None, "subprocess_actor"):
+            raise EmbeddingConfigurationError("MLX requires execution_backend='subprocess_actor'")
+        if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
+            raise EmbeddingConfigurationError("MLX does not support character chunk averaging")
+        copied.update(_validate_mlx_text_options({k: v for k, v in copied.items() if k in _MLX_TEXT_DEFAULTS}))
+        if actor_number is None:
+            copied.pop("actor_number", None)
 
     if "normalize" in copied and not isinstance(copied["normalize"], bool):
         raise ValueError("Embed option 'normalize' must be a bool")

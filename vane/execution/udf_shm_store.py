@@ -740,7 +740,9 @@ class LocalShmStore:
         if self._live:
             # A returned Arrow view may outlive every worker. Decommit only
             # wholly free pages; keep its live allocation and mapping valid.
-            if self._shm is not None:
+            # Linux can punch out free shared pages. Darwin has no equivalent
+            # MADV_REMOVE: retain the budgeted arena until its last view exits.
+            if self._shm is not None and hasattr(mmap, "MADV_REMOVE"):
                 page = mmap.PAGESIZE
                 for offset, length in self._free:
                     start = (offset + page - 1) // page * page
