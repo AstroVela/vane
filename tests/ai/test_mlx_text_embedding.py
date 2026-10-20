@@ -51,6 +51,7 @@ def min_cosine(a, b):
 def reference():
     # Intentionally independent of provider constants and preprocessing helpers.
     from pathlib import Path
+
     import mlx.core as mx
     from huggingface_hub import snapshot_download
     from mlx_vlm.embedding_loader import load_embedding_model
@@ -144,6 +145,7 @@ def test_real_mlx_query_ranks_expected_documents():
 def local_actor(monkeypatch):
     import psutil
     import ray
+
     import vane
 
     assert not ray.is_initialized()
@@ -173,6 +175,7 @@ def local_actor(monkeypatch):
 
 def public_vectors(provider):
     import pyarrow as pa
+
     import vane
     from vane.ai import TextInput, embed
 

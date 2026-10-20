@@ -87,11 +87,15 @@ class MLXTextEmbedder:
             _translate_missing_provider_dependency("mlx", "transformers"),
             _translate_missing_provider_dependency("mlx", "huggingface_hub"),
         ):
-            import mlx.core as mx
-            from huggingface_hub import snapshot_download
-            from mlx.utils import tree_flatten
-            from mlx_vlm.embedding_loader import load_embedding_model
-            from transformers import AutoTokenizer
+            import mlx.core as mx  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from huggingface_hub import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                snapshot_download,
+            )
+            from mlx.utils import tree_flatten  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from mlx_vlm.embedding_loader import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                load_embedding_model,
+            )
+            from transformers import AutoTokenizer  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         if not mx.metal.is_available():
             raise EmbeddingConfigurationError("MLX requires an available Apple Metal GPU")
@@ -135,7 +139,7 @@ class MLXTextEmbedder:
             try:
                 self.close()
             except Exception as cleanup_error:
-                error.cleanup_errors = (cleanup_error,)
+                setattr(error, "cleanup_errors", (cleanup_error,))
             raise
 
     def _prepare_text_inputs(self, texts: list[str]) -> dict[str, Any]:
