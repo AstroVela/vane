@@ -54,7 +54,11 @@ separately. Their own distributions govern their licenses.
 
 The optional `mlx` extra installs [MLX](https://github.com/ml-explore/mlx)
 and [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) (MIT), Transformers and
-Hugging Face Hub (Apache-2.0), separately on Apple Silicon. MLX-VLM also
+Hugging Face Hub (Apache-2.0), plus Pillow under its
+[PIL/Pillow license](https://github.com/python-pillow/Pillow/blob/main/LICENSE),
+separately on Apple Silicon. The image provider uses the installed SDK's
+NumPy/Pillow processor; no processor source or model assets are vendored.
+Its test shape images are generated locally by the tests. MLX-VLM also
 declares its own audio, image, tokenizer and HTTP dependencies; preserve the
 notices of the resolved wheels when distributing an environment. Vane does not
 vendor these SDKs. The EmbeddingGemma 2 checkpoint is obtained separately under

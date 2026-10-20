@@ -80,8 +80,8 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
-For Apple Silicon EmbeddingGemma 2 text inference, install the optional `mlx`
-extra. Run `tests/fast/test_mlx_provider.py` through the installed launcher
+For Apple Silicon EmbeddingGemma 2 text/image inference, install the optional `mlx`
+extra. Run `tests/fast/test_mlx_provider.py` and `tests/fast/test_mlx_image_provider.py` through the installed launcher
 before the base release gate; these contracts need no model SDK or Metal.
 The real checkpoint tests in `tests/ai/test_mlx_text_embedding.py` require
 `VANE_RUN_MLX_TESTS=1`, a complete fixed-revision HF cache, and
@@ -95,10 +95,29 @@ Inference requires native arm64 macOS and Metal, `dtype="bfloat16"`, one
 `subprocess_actor`, and 768 output dimensions. The document prefix is
 `title: none | text: `; the query prefix is `task: search result | query: `.
 The default 2048-token limit includes prefixes and special tokens; overlength
-inputs fail before inference. Other models, modalities, precisions and backends
-are rejected. Run manual subprocess examples outside the checkout so worker
+inputs fail before inference. Audio, video, joint inputs, other models, precisions
+and backends are rejected. Run manual subprocess examples outside the checkout so worker
 imports resolve to the installed package as described below.
 MLX and SQR pin different Transformers versions; use separate environments.
+
+Image encoding uses the same public `embed(ImageInput(...), provider="mlx")`
+entry point and paired vector space. One decoded RGB `uint8` HWC array is one
+row, with at most 16 Mi pixels. Noncontiguous and read-only arrays are accepted;
+encoded bytes and paths first require the existing ImageFile decoder and the
+`image` extra (`vane-ai[mlx,image]`). Image options omit `input_type`; paired
+text queries retain `input_type="query"`. Workers load the SDK's explicit
+`EmbeddingGemma2Processor` from the fixed local snapshot, with nested singleton
+image batches, NumPy/Pillow preprocessing, no remote code and no truncation.
+The same `max_length` bounds expanded visual tokens before model forward.
+
+Run `tests/ai/test_mlx_image_embedding.py` separately with the text test's
+`VANE_RUN_MLX_TESTS=1` and `-m 'metal and external_service'` settings. Explicit
+opt-in requires the SDKs, full cache and actual Metal; missing prerequisites fail.
+Tests compare the real SDK and provider at cosine >= 0.999, mixed-size batches,
+input reordering, public expression/Relation/SQL output and subprocess model/
+processor reuse and exit. The CPU contracts include malformed processor outputs,
+input budgets, safe diagnostics and fatal allocation failures under both error
+policies. Ordinary CPU installations need none of the optional model SDKs.
 
 Video clipping regression checks include fractional starts ending exactly at a
 stream's rational endpoint. Duration quantization must not manufacture an

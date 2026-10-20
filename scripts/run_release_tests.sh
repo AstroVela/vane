@@ -54,6 +54,7 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_mlx_provider.py"
+  "$project_root/tests/fast/test_mlx_image_provider.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"
   "$project_root/tests/fast/test_ai_image_embedding.py"

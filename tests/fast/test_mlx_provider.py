@@ -178,7 +178,7 @@ def test_direct_factory_rejects_execution_options(key):
         load_provider("mlx").get_text_embedder(options={key: 1})
 
 
-@pytest.mark.parametrize("kind", ["image", "audio", "video", "multimodal", "prompt"])
+@pytest.mark.parametrize("kind", ["audio", "video", "multimodal", "prompt"])
 def test_unsupported_modalities_and_prompt_fail_before_loading(kind):
     provider = load_provider("mlx")
     method = provider.get_prompter if kind == "prompt" else getattr(provider, f"get_{kind}_embedder")
