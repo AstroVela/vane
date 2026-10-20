@@ -420,7 +420,11 @@ Worker query replay state keeps both those references and snapshots first
 opened at runtime until query cleanup, including between task attempts.
 Failure and cancellation use the existing query cleanup path. Runner teardown
 explicitly releases driver binding pins, even when Python result cycles retain
-the submitted logical plan. Unexecuted logical/physical plan objects retain
+the submitted logical plan. If COPY submission and reconciliation time out,
+the client retains its source plan and snapshot pins while the outcome is
+unknown. A confirmed completion of the original RPC, or completed session/client
+cleanup, releases those references. A failed cleanup keeps them for retry;
+waiting again does not resubmit the write. Unexecuted logical/physical plan objects retain
 their binding pins until released. Multi-host storage, a remote read service
 and remote leases remain separate delivery work.
 

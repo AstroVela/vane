@@ -327,6 +327,92 @@ def test_same_host_ray_failed_queries_release_snapshot_pins(workspace, monkeypat
 
 @pytest.mark.real_ray
 @pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("file_format", ["csv", "parquet"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_same_host_pending_copy_retains_snapshot_until_completion(workspace, monkeypatch, tmp_path, file_format, fails):
+    import time
+
+    import ray
+
+    from vane.runners.copy_outcome import CopyOutcomeUnknownError
+    from vane.runners.ray.runner import _RAY_RUNNERS
+
+    store, database, frozen = workspace
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    url = vane_fs.snapshot_url(store.id, frozen, f"/table.{file_format}")
+    with vane.connect() as connection:
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        client = next(iter(_RAY_RUNNERS)).query_driver_client
+        actor = client.runner
+        session_id = next(iter(client._opened_sessions))
+
+        def pause_preparation(remote):
+            import threading
+
+            remote._pending_copy_started = threading.Event()
+            remote._pending_copy_continue = threading.Event()
+            remote._pending_copy_original_prepare = remote._prepare_copy_plan_sync
+
+            def prepare(*args, **kwargs):
+                remote._pending_copy_started.set()
+                if not remote._pending_copy_continue.wait(30):
+                    raise RuntimeError("COPY preparation pause timed out")
+                return remote._pending_copy_original_prepare(*args, **kwargs)
+
+            remote._prepare_copy_plan_sync = prepare
+
+        def pending_state(remote):
+            return remote._pending_copy_started.is_set(), len(remote._plan_connections)
+
+        def resume_preparation(remote):
+            remote._prepare_copy_plan_sync = remote._pending_copy_original_prepare
+            remote._pending_copy_continue.set()
+
+        ray.get(actor.__ray_call__.remote(pause_preparation))
+        vane_fs.register_workspace(connection, database)
+        selected = "CASE WHEN id=2 THEN error('pending COPY execution failure') ELSE id END" if fails else "id"
+        output = tmp_path / "result.parquet"
+        operation_id = None
+        try:
+            with monkeypatch.context() as limits:
+                limits.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.5")
+                limits.setenv("VANE_RAY_COPY_RECONCILIATION_TIMEOUT_S", "0.5")
+                with pytest.raises(CopyOutcomeUnknownError) as error:
+                    connection.execute(
+                        f"COPY (SELECT {selected} AS id FROM read_{file_format}('{url}')) "
+                        f"TO '{output}' (FORMAT PARQUET)"
+                    ).fetchall()
+                operation_id = error.value.operation_id
+            assert ray.get(actor.__ray_call__.remote(pending_state)) == (True, 0)
+            with pytest.raises(BlockingIOError, match="pinned"):
+                store.drop_snapshot(frozen)
+        finally:
+            ray.get(actor.__ray_call__.remote(resume_preparation))
+            if operation_id is not None:
+                recovery = ray.get(
+                    actor.recover_copy_plan.remote(client._owner_id, session_id, operation_id), timeout=30
+                )
+        if fails:
+            assert "pending COPY execution failure" in str(recovery.error)
+        else:
+            assert recovery.error is None and recovery.outcome.write_state == "committed"
+            assert pytest.importorskip("pyarrow.parquet").read_table(output).to_pydict() == {"id": [1, 2, 3]}
+        # Keep the exception traceback and source connection alive. Release
+        # depends on the original RPC acknowledgement, never Python GC.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                store.drop_snapshot(frozen)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        assert not client._pending_vane_fs_copy_plans
+
+
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
 def test_same_host_ray_queries_native_snapshots(workspace, monkeypatch):
     store, database, frozen = workspace
     monkeypatch.setenv("VANE_RUNNER", "ray")

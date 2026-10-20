@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
 from vane.execution.admission_ledger import BoundedReplayMap
+from vane.runners.copy_outcome import CopyOutcomeUnknownError
 from vane.runners.ray.driver import RayQueryDriverClient
 from vane.runners.runner import Runner
 
@@ -167,11 +168,18 @@ class RayRunner(Runner):
 
     def run_write(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound logical write plan."""
+        outcome_unknown = False
         try:
             client = self._client_for_session(str(logical_plan.session_id()))
             return client.run_copy_plan(logical_plan)
+        except CopyOutcomeUnknownError:
+            # The client owns the pending plan until its original RPC settles
+            # or session cleanup confirms that execution has stopped.
+            outcome_unknown = True
+            raise
         finally:
-            _release_vane_fs_query_pins(logical_plan)
+            if not outcome_unknown:
+                _release_vane_fs_query_pins(logical_plan)
 
     def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound Python DataSink plan."""

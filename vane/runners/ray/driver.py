@@ -8767,6 +8767,7 @@ class RayQueryDriverClient:
         self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_closes_in_progress: set[str] = set()
         self._session_condition = threading.Condition()
+        self._pending_vane_fs_copy_plans: dict[tuple[str, str, int], Any] = {}
         self._client_closing = False
         self._client_close_in_progress = False
         try:
@@ -9012,6 +9013,57 @@ class RayQueryDriverClient:
             f"detach={type(cleanup_error).__name__}: {cleanup_error}"
         ) from attach_error
 
+    def _release_pending_vane_fs_copy_plan(self, key: tuple[str, str, int]) -> None:
+        with self._session_condition:
+            plan = self._pending_vane_fs_copy_plans.pop(key, None)
+        if plan is not None:
+            plan._release_vane_fs_query_pins()
+
+    def _release_pending_vane_fs_copy_plans(self, session_id: str | None = None) -> None:
+        with self._session_condition:
+            keys = [key for key in self._pending_vane_fs_copy_plans if session_id is None or key[0] == session_id]
+        for key in keys:
+            self._release_pending_vane_fs_copy_plan(key)
+
+    def _retain_pending_vane_fs_copy_plan(
+        self, session_id: str, operation_id: str, plan: Any, original_ref: Any
+    ) -> None:
+        if not callable(getattr(plan, "_release_vane_fs_query_pins", None)):
+            return
+        key = (session_id, operation_id, id(plan))
+        with self._session_condition:
+            closed = self.runner is None or session_id in self._closed_session_ids
+            if not closed:
+                self._pending_vane_fs_copy_plans[key] = plan
+        if closed:
+            plan._release_vane_fs_query_pins()
+            return
+
+        def completed(future: ConcurrentFuture[Any]) -> None:
+            if future.cancelled():
+                return
+            try:
+                outcome = future.result()
+            except ray.exceptions.RayTaskError:
+                # The actor replied after _await_copy_operation settled its
+                # owned task. Transport errors do not provide this proof.
+                pass
+            except BaseException:
+                return
+            else:
+                try:
+                    self._validate_copy_outcome(outcome, operation_id)
+                except BaseException:
+                    return
+            self._release_pending_vane_fs_copy_plan(key)
+
+        try:
+            original_ref.future().add_done_callback(completed)
+        except BaseException:
+            # Keep ownership until session cleanup if no completion observer
+            # could be installed; never turn an uncertain write into a retry.
+            pass
+
     def _complete_session_close_locally(self, session_key: str) -> None:
         with self._session_condition:
             self._session_closes_in_progress.discard(session_key)
@@ -9020,6 +9072,7 @@ class RayQueryDriverClient:
             self._closed_session_ids[session_key] = True
             self._closing_session_ids.discard(session_key)
             self._session_condition.notify_all()
+        self._release_pending_vane_fs_copy_plans(session_key)
 
     def _complete_client_close_locally(self) -> None:
         with self._session_condition:
@@ -9031,6 +9084,7 @@ class RayQueryDriverClient:
             self._client_closing = False
             self._client_close_in_progress = False
             self._session_condition.notify_all()
+        self._release_pending_vane_fs_copy_plans()
         self._stop_client_heartbeat()
 
     def _ensure_session(self, plan: Any) -> tuple[str, dict[str, str], Any]:
@@ -9525,6 +9579,7 @@ class RayQueryDriverClient:
 
         _t0 = _time.time()
         reconciliation_timeout_s = _copy_reconciliation_timeout_s()
+        future = None
 
         try:
             session_id, _, runner = self._ensure_session(plan)
@@ -9608,6 +9663,8 @@ class RayQueryDriverClient:
                 None,
             )
             if unknown_outcome is not None:
+                if future is not None:
+                    self._retain_pending_vane_fs_copy_plan(session_id, plan_id, plan, future)
                 raise unknown_outcome
             cleanup_failure = next(
                 (

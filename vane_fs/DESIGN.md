@@ -193,6 +193,10 @@ filesystem implementation. The provider shares
 one live immutable session per snapshot across these references, releasing its
 SQLite pin with the final handle. This avoids a durable write pair per file
 while removing expired session-cache entries immediately.
+After an ambiguous COPY submission, the local client retains the source plan
+and its binding pins until the original RPC confirms completion or session/client
+cleanup completes. A timeout, cancelled completion observer, or invalid response
+does not establish completion. Failed cleanup preserves the references for retry.
 If SQLite refuses the final pin deletion, a process-local registry retains its
 token. The next write transaction on the same database, through any connection
 in that process, retries abandoned pins and forgets them only after commit.
