@@ -524,3 +524,39 @@ def test_provider_failures_preserve_raise_ignore_and_private_errors(sdk, wrapper
     sdk.failure = EmbeddingConfigurationError("MLX token budget exceeded")
     with pytest.raises(EmbeddingConfigurationError, match="budget"):
         wrapper(pa.table({"text": ["valid"]}))
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("phase", ["loading", "inference", "evaluation"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        "[metal::malloc] Resource limit (499000) exceeded.",
+        (
+            "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
+            " the maximum allowed buffer size of 4294967296 bytes."
+        ),
+    ],
+)
+def test_allocation_failures_are_fatal_without_row_isolation(sdk, wrapper, monkeypatch, message, phase, on_error):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(None)
+        raise RuntimeError(message)
+
+    if phase == "loading":
+        monkeypatch.setattr(sdk.loader, "load_embedding_model", fail)
+    elif phase == "evaluation":
+        monkeypatch.setattr(sdk.mx, "eval", fail)
+    else:
+        sdk.failure = RuntimeError(message)
+    wrapper._on_error = on_error
+    with pytest.raises(MemoryError, match="Embedding exhausted model or host resources"):
+        wrapper(pa.table({"text": ["one", "two"]}))
+    assert len(sdk.snapshots) == 1
+    assert len(sdk.model_calls) == (0 if phase == "loading" else 1)
+    assert len(calls) == (0 if phase == "inference" else 1)
+    if phase == "loading":
+        assert sdk.clears == 1

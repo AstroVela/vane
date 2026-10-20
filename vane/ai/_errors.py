@@ -57,6 +57,13 @@ _CPU_MEMORY = re.compile(
 )
 _CPU_MEMORY_DETAIL = "CPU memory allocation failed; check model and worker CPU memory budgets"
 _CUDA_MEMORY_DETAIL = "CUDA memory allocation failed; check model and worker GPU memory budgets"
+_MLX_MEMORY = re.compile(
+    r"(?:\[malloc\] Unable to allocate [0-9]{1,20} bytes\."
+    r"|\[metal::malloc\] Resource limit \([0-9]{1,20}\) exceeded\."
+    r"|\[metal::malloc\] Attempting to allocate [0-9]{1,20} bytes which is greater than"
+    r" the maximum allowed buffer size of [0-9]{1,20} bytes\.)"
+)
+_MLX_MEMORY_DETAIL = "MLX memory allocation failed; check model and worker memory budgets"
 _ONNX_MEMORY = re.compile(
     r"\[ONNXRuntimeError\] : (?:1 : FAIL|6 : RUNTIME_EXCEPTION) : "
     r"(?:Non-zero status code returned while running [A-Za-z_][A-Za-z_0-9]{0,127} node\. ?"
@@ -197,6 +204,11 @@ def technical_detail(error_type: str, message: str, *, transported: bool = False
     if error_type == "RuntimeError":
         if _CPU_MEMORY.fullmatch(message.split("\n", 1)[0]) or canonical(_CPU_MEMORY_DETAIL):
             return _CPU_MEMORY_DETAIL
+        # MLX 0.32.4's metal/allocator.cpp reports allocation failures as
+        # RuntimeError. Preserve their category with fixed text before the
+        # provider message is discarded; never match arbitrary OOM substrings.
+        if _MLX_MEMORY.fullmatch(message) or canonical(_MLX_MEMORY_DETAIL):
+            return _MLX_MEMORY_DETAIL
         match = _REMOTE_RESULT_COUNTS.match(message) if transported else _REMOTE_RESULT_COUNTS.fullmatch(message)
         if match:
             return match[0]
@@ -567,7 +579,12 @@ def _is_resource_error(error: BaseException) -> bool:
         ):
             return True
         detail = atom[name.end() + 2 :] if atom.startswith(": ", name.end()) else ""
-        if detail in {_CPU_MEMORY_DETAIL, _CUDA_MEMORY_DETAIL, _ONNX_MEMORY_DETAIL} or _SAFE_MEMORY.fullmatch(detail):
+        if detail in {
+            _CPU_MEMORY_DETAIL,
+            _CUDA_MEMORY_DETAIL,
+            _MLX_MEMORY_DETAIL,
+            _ONNX_MEMORY_DETAIL,
+        } or _SAFE_MEMORY.fullmatch(detail):
             return True
     return False
 
