@@ -236,7 +236,7 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 }
 
 bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
-                                idx_t column) {
+                                idx_t column, optional_ptr<pair<Value, Value>> bounds) {
 	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
 	// Schema mappings, virtual columns and casts require a separate proof. In
 	// particular, comparing file statistics before a lossy cast is not sufficient.
@@ -307,6 +307,9 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 		if (ranges[i - 1].second >= ranges[i].first) {
 			return false;
 		}
+	}
+	if (bounds && !ranges.empty()) {
+		*bounds = {ranges.front().first, ranges.back().second};
 	}
 	return true;
 }

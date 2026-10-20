@@ -40,7 +40,7 @@ from tests.fast.test_execution_performance import (
 )
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
 from tests.fast.test_join_build_filter import shared_join_build_query
-from tests.fast.test_parquet_aggregate_partitioning import disjoint_aggregate_query
+from tests.fast.test_parquet_aggregate_partitioning import broadcast_aggregate_query, disjoint_aggregate_query
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -176,6 +176,46 @@ def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, 
             if mode == "fte_retry":
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+def test_broadcast_probe_groups_preserve_source_assignments_on_retry(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and not lost and upstream:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    sql = broadcast_aggregate_query(tmp_path, join="left")
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(resources(tmp_path)) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert any(edge.distribution.value == "broadcast" for edge in scheduler.spec.graph.exchanges)
+            assert all(edge.distribution.value != "hash" for edge in scheduler.spec.graph.exchanges)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [attempt for attempt in scheduler.history if attempt.task_id == lost[0].task_id]
                 assert len(attempts) == 2
                 assert attempts[0].input_id == attempts[1].input_id
                 assert attempts[0].fence != attempts[1].fence
