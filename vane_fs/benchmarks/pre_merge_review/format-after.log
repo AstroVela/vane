@@ -1,0 +1,9 @@
+==> Checking root repository (--from-ref b7c00df040418a1e252044960503349ebeb4f62c)
+ruff format (check)......................................................[42mPassed[m
+clang-format (check).....................................................[42mPassed[m
+cmake-format (check).....................................................[42mPassed[m
+shfmt (check)........................................(no files to check)[46;30mSkipped[m
+==> Checking external/duckdb (--from-ref b7c00df040418a1e252044960503349ebeb4f62c)
+Checking external/duckdb with DuckDB's own formatter...
+Checking since branch or revision: --relative=external/duckdb
+No changed files found!

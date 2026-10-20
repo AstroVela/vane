@@ -1,0 +1,4 @@
+{
+  "reason": "The fsync-mode Snapshot() uses a NORMAL Transaction; the first fixture incorrectly expected a FULL payload barrier. Replace that expectation with a NORMAL snapshot queue-progress check; native implementation unchanged.",
+  "negative_control_predicate": "Use finished>=1 after releasing the blocked hint; a worker without pausing may finish a second call before the polling thread observes exactly one. The subsequent calls==1 assertion independently detects the missing pause."
+}

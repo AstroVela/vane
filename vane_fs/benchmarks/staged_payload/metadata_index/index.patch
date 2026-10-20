@@ -1,0 +1,22 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -881,6 +881,7 @@
+  PRIMARY KEY(branch,inode)) STRICT;
+ CREATE INDEX IF NOT EXISTS dirent_targets ON dirent_versions(inode,low,high);
+ CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload);
++DROP INDEX IF EXISTS block_versions_high;
+ CREATE TABLE IF NOT EXISTS sync_barrier(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL CHECK(value IN(0,1))) STRICT;
+ INSERT OR IGNORE INTO sync_barrier VALUES(1,0);
+ UPDATE format SET version=1004;
+@@ -1187,8 +1188,9 @@
+ 		             "low BLOB NOT NULL CHECK(length(low)=32),high BLOB NOT NULL CHECK(length(high)=32),writer TEXT "
+ 		             "NOT NULL,deleted INTEGER NOT NULL CHECK(deleted IN (0,1))," +
+ 		             fields + "CHECK(low<high),PRIMARY KEY(" + KeyColumns(table) + ",low)) STRICT, WITHOUT ROWID");
+-		Exec(db, "CREATE INDEX " + std::string(TableName(table)) + "_high ON " + TableName(table) + "(" +
+-		             KeyColumns(table) + ",high)");
++		if (table != BLOCKS)
++			Exec(db, "CREATE INDEX " + std::string(TableName(table)) + "_high ON " + TableName(table) + "(" +
++			             KeyColumns(table) + ",high)");
+ 	}
+ 	uuid = NewId();
+ 	{

@@ -1,0 +1,9 @@
+/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_coalescing/test_coalesce.cpp:43:49: error: ‘SQLITE_CHECKPOINT_NOOP’ was not declared in this scope; did you mean ‘SQLITE_CHECKPOINT_FULL’?
+   43 |         std::pair<int, int> Progress(int mode = SQLITE_CHECKPOINT_NOOP) {
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~~
+      |                                                 SQLITE_CHECKPOINT_FULL
+/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_coalescing/test_coalesce.cpp: In function ‘int __wrap_sqlite3_wal_checkpoint_v2(sqlite3*, const char*, int, int*, int*)’:
+/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_coalescing/test_coalesce.cpp:66:46: error: ‘SQLITE_CHECKPOINT_NOOP’ was not declared in this scope; did you mean ‘SQLITE_CHECKPOINT_FULL’?
+   66 |         if (!worker && committing && mode == SQLITE_CHECKPOINT_NOOP) {
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~
+      |                                              SQLITE_CHECKPOINT_FULL

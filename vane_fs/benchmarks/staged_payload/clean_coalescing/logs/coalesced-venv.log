@@ -1,0 +1,3 @@
+Using CPython 3.12.13 interpreter at: .venv/bin/python
+Creating virtual environment at: vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv
+Activate with: source vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/bin/activate

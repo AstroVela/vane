@@ -1,0 +1,7 @@
+Test project /home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fdatasync/build/python-release
+    Start 4: vane_fs_durability
+1/1 Test #4: vane_fs_durability ...............   Passed    0.25 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   0.26 sec

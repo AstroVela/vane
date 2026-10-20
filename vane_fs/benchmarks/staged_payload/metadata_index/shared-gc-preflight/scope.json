@@ -1,0 +1,1 @@
+{"status":"RETAINED","adoption_eligible":false,"mounts":72,"reason":"GC helper Python aliases loaded the candidate module for the controls and dropped the control index. Corrected module bindings and schema checks require a new comparison; no slow samples removed."}

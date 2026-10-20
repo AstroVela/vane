@@ -1,0 +1,14 @@
+{
+  "status": "PASS",
+  "patch_fuzz": 0,
+  "native_test_and_python_source_files_matched": 35,
+  "modified_source_files": [
+    "src/staging.hpp",
+    "src/workspace.cpp"
+  ],
+  "patch_sha256": "dfed42138d85862ab30c163da50034be8f8ff57ce2764c77d93eed57c755be3d",
+  "patch_stdout": "patching file src/staging.hpp\npatching file src/workspace.cpp\n",
+  "split_sample_analysis_equals_original": true,
+  "analyzer_sha256": "25f359a22d74f891a980ca1e48b3fc9a5f26c992b677dfdcfca84b0e21d37f25",
+  "all_raw_latency_vectors_retained": true
+}

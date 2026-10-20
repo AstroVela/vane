@@ -1,0 +1,100 @@
+{
+  "status": "PASS",
+  "started_epoch": 1792325905.9016004,
+  "commands": [
+    {
+      "label": "regression-before-compile",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/test_prewriteback.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sync_file_range",
+        "-Wl,--wrap=flock",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/test-range-writeback-before"
+      ],
+      "returncode": 0,
+      "started_epoch": 1792325905.9016058,
+      "ended_epoch": 1792325909.1242044,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before-compile.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "regression-before",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/test-range-writeback-before",
+        "/dev/shm/owned-range-writeback-before-7q9zizix"
+      ],
+      "returncode": 1,
+      "started_epoch": 1792325909.124605,
+      "ended_epoch": 1792325909.2893271,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before.log",
+      "log_sha256": "55bda3eaba42acbc742fb607019735339051c88d14e1cac23e5fae0d44711240"
+    }
+  ],
+  "cleanup": {
+    "path": "/dev/shm/owned-range-writeback-before-7q9zizix",
+    "files": {
+      "unlocked.sqlite.stage-checkpoint": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "unlocked.sqlite.stage-fence": {
+        "bytes": 8192,
+        "sha256": "f5d9f1f12b4da59f886f0c3c10c5044fe4269ee614f87e9d5e440a2996ec7dcc"
+      },
+      "unlocked.sqlite-shm": {
+        "bytes": 32768,
+        "sha256": "d201fe66e4f82c062feb52ded004a9d6e06d558110104cd41534a9a8af9c9947"
+      },
+      "unlocked.sqlite-wal": {
+        "bytes": 337872,
+        "sha256": "25355911710f690e426f311b9da18a9f35c9a94049ef2da685c001b267cd2fe0"
+      },
+      "unlocked.sqlite.payload": {
+        "bytes": 67112960,
+        "sha256": "20fa0fba9e3a487f59d500d60973f587e865f6465fda4100ca9f103de7556f48"
+      },
+      "unlocked.sqlite": {
+        "bytes": 4096,
+        "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+      },
+      "unlocked.sqlite.stage-publish": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "unlocked.sqlite.stage-live": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "unlocked.sqlite.stage-init": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "removed": true,
+    "processes_stopped": true,
+    "mount_absent": true
+  },
+  "expected_failure": true,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/regression_before.py": "8c83ae45120ec867ad92aed9261f9aa077247aa738ca2b0aab3faa146cee2c52",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/test_prewriteback.cpp": "62d56d92a747051e6b44667ce2597cefd2e53d8cd1ecb42f7eb3ea31aec0f16e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/build/python-release/libvane_fs.a": "9b018466f34fb2c67142b4b7a4c0ab6ae1c4ad9fef8080c67ed7c18a1f1a51ad",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+  },
+  "binary": {
+    "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/test-range-writeback-before",
+    "sha256": "312e638f1bbfa1e500d50505686c4fa5f6554e038c88d7b0d63ea70b14edd988"
+  },
+  "ended_epoch": 1792325909.6260304
+}

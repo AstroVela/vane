@@ -1,0 +1,55 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -3,15 +3,15 @@
+ 
+ #pragma once
+ 
++#include "staging.hpp"
+ #include "vane_fs/workspace.hpp"
+-#include "staging.hpp"
+-#include <sqlite3.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <filesystem>
+ #include <mutex>
++#include <sqlite3.h>
+ #include <thread>
+ 
+ namespace vane_fs {
+@@ -59,9 +59,18 @@
+ 		if (worker.joinable())
+ 			worker.join();
+ 	}
+-	static int OnCommit(void *context, sqlite3 *, const char *, int frames) {
++	static int OnCommit(void *context, sqlite3 *writer, const char *, int frames) {
+ 		auto &self = *static_cast<Checkpointer *>(context);
+ 		if (self.Bytes(frames) >= START_BYTES) {
++			// Query the current WAL generation after COMMIT. Caching copied frames
++			// across a restart could subtract progress from a different generation.
++			// NOOP performs no backfill/sync and never waits for a checkpoint lock.
++			int log = -1, copied = -1;
++			auto code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &log, &copied);
++			if (code == SQLITE_OK && log >= copied && copied >= 0 && self.Bytes(log - copied) < START_BYTES)
++				return SQLITE_OK;
++			// An unknown/busy status conservatively retains the wake. Never report
++			// a status-query error from this hook after the write has committed.
+ 			{
+ 				std::lock_guard<std::mutex> lock(self.mutex);
+ 				self.requested = true;
+@@ -158,10 +167,10 @@
+ 					std::unique_ptr<Staging::CheckpointGuard> lease;
+ 					{
+ 						Staging::Guard publication(staging);
+-						// Only unpublished external data needs coalesced publication.
+-						// Once CLEAN, promptly backfill inline/namespace commits using
+-						// the original wake policy, even below the uncopied-byte budget.
+-						if (!retry && staging.Pending()) {
++						// Recheck pending work after a coalesced wake, including CLEAN
++						// namespace/inline commits. Another checkpoint may have caught up.
++						// A partial/failed pass keeps retrying without a further commit.
++						if (!retry) {
+ 							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+ 							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
+ 							           Bytes(frames - copied) < START_BYTES;

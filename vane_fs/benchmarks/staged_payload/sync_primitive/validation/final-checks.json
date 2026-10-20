@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "epoch": 1791887708.6536536,
+  "related_only": true,
+  "checks": {
+    "format_changed_sources": "PASS",
+    "ruff_no_fix": "PASS",
+    "whitespace": "PASS",
+    "copyleft": {
+      "source_inventory": "passed",
+      "native_profile": "passed",
+      "installed_notices": []
+    },
+    "new_source_spdx": "PASS",
+    "default_sqlite_library": "PASS"
+  },
+  "native_runtime_source_unchanged": true,
+  "unchanged_optional_root_spdx_failure": "Five historical experimental files; not rerun or modified"
+}

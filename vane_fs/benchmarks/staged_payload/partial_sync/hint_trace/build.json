@@ -1,0 +1,195 @@
+{
+  "status": "PASS",
+  "parent": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z",
+  "commands": [
+    {
+      "label": "baseline-configure",
+      "argv": [
+        "cmake",
+        "-S",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline",
+        "-B",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/build",
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release",
+        "-DVANE_FS_BUILD_PYTHON=OFF",
+        "-DVANE_FS_BUILD_FUSE=OFF",
+        "-DVANE_FS_BUILD_TESTS=OFF",
+        "-DVANE_FS_BUILD_TOOLS=OFF"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713781.8616517,
+      "ended_epoch": 1791713782.6279101
+    },
+    {
+      "label": "baseline-library",
+      "argv": [
+        "cmake",
+        "--build",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/build",
+        "-j",
+        "2"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713782.6285498,
+      "ended_epoch": 1791713793.3216417
+    },
+    {
+      "label": "baseline-mount",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "-I/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/include/fuse3",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/fuse.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/build/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+        "-Wl,-rpath,/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64",
+        "-Wl,--wrap=sync_file_range",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/baseline/build/vane-fs-mount"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713793.3233228,
+      "ended_epoch": 1791713796.5476537
+    },
+    {
+      "label": "updated-configure",
+      "argv": [
+        "cmake",
+        "-S",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated",
+        "-B",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/build",
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release",
+        "-DVANE_FS_BUILD_PYTHON=OFF",
+        "-DVANE_FS_BUILD_FUSE=OFF",
+        "-DVANE_FS_BUILD_TESTS=OFF",
+        "-DVANE_FS_BUILD_TOOLS=OFF"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713796.6066556,
+      "ended_epoch": 1791713797.3732817
+    },
+    {
+      "label": "updated-library",
+      "argv": [
+        "cmake",
+        "--build",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/build",
+        "-j",
+        "2"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713797.374241,
+      "ended_epoch": 1791713808.319632
+    },
+    {
+      "label": "updated-mount",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "-I/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/include/fuse3",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/fuse.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/build/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+        "-Wl,-rpath,/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64",
+        "-Wl,--wrap=sync_file_range",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/hint-trace-20261011T101621Z/diagnostic/updated/build/vane-fs-mount"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791713808.321353,
+      "ended_epoch": 1791713812.1473243
+    }
+  ],
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/block_sync/timeline.cpp": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_sync/trace.hpp": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so": "f1e75247f42d414df611ee554c8399bfe74565f89eed7c4501e2d97c48f21eab",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_sync/hint_trace.cpp": "160203afa4fe4d9e55aa82550cf5a6801c9602ab9125ddc7e7b4b74c006f6f4f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/build/python-release/vane-fs": "01021951fafae09d32fe0af409ea79ddc8be2a143a9a7a0477ff8d0a14e2f490",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/updated/build/python-release/vane-fs": "2c8e768162024ebdfd8c6c30564f7b24e1fd7a0b8148f75b5dfa4def9625f61a"
+  },
+  "source_inputs": {
+    "baseline": {
+      "src/staging.hpp": "60002f5e6e08506923b0ad0c323d0ada557a0ee6a4051c9ceed3c30b4a1f898c",
+      "src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+      "src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "src/payload_trace.hpp": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044",
+      "src/checkpoint.hpp": "518e02cdddcc9eb7162101f9b07088ab1783b442f009b76c5d1b5bcf4c490283",
+      "src/workspace.cpp": "d085da3b26f58faec2f333e0d087d4ba06a3b0db776eb21b634b88041fb6e712",
+      "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+      "include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    "updated": {
+      "src/staging.hpp": "b24064de427bc1ecb1f1cb30bbeece7642b2ce9310cbc232acf80ee0a52d05d4",
+      "src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+      "src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "src/payload_trace.hpp": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044",
+      "src/checkpoint.hpp": "518e02cdddcc9eb7162101f9b07088ab1783b442f009b76c5d1b5bcf4c490283",
+      "src/workspace.cpp": "3a8f9855ca081ec7c1ae75eb14619862c4984ad0833fdbaf89f21e61e6b7a1a8",
+      "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+      "include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    }
+  },
+  "binaries": {
+    "diagnostic/baseline/build/vane-fs-mount": "2158da3b36ba816e7cf3591d67af12239dc5bd9c8619223539a1fcd31c5a1361",
+    "diagnostic/updated/build/vane-fs-mount": "9368b5f10035b8d0fb202daf00417baf047b95ccda3fc8c15e7c66cad48de97a"
+  }
+}

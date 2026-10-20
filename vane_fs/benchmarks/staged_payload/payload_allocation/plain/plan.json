@@ -1,0 +1,84 @@
+{
+  "status": "FROZEN_BEFORE_COMPARISON",
+  "frozen_epoch": 1791958923.9910562,
+  "scope": "ordinary-file allocation hypothesis only; no SQLite/FUSE or component adoption",
+  "medium": "/dev/sda2 ext4   rw,relatime",
+  "mode": "plain",
+  "states": [
+    "fresh",
+    "after_gc"
+  ],
+  "sizes_mib": [
+    64,
+    256
+  ],
+  "orders": [
+    [
+      "delayed",
+      "reserve256k",
+      "reserve1m"
+    ],
+    [
+      "reserve1m",
+      "reserve256k",
+      "delayed"
+    ],
+    [
+      "reserve256k",
+      "reserve1m",
+      "delayed"
+    ],
+    [
+      "delayed",
+      "reserve1m",
+      "reserve256k"
+    ],
+    [
+      "reserve1m",
+      "delayed",
+      "reserve256k"
+    ],
+    [
+      "reserve256k",
+      "delayed",
+      "reserve1m"
+    ]
+  ],
+  "append_bytes": 262144,
+  "buffer_page_offset": 48,
+  "final_barrier": "fdatasync",
+  "allocation": "exact remaining 256 KiB or 1 MiB; KEEP_SIZE; no reservation past final workload EOF",
+  "gc_fixture": "64 MiB initialized; punch middle 16 MiB; truncate last 16 MiB; sync; retain 32 MiB guard",
+  "timing": "open/header initialization, allocation, append, final fdatasync and close; GC fixture outside timing",
+  "screen_gates": {
+    "median_and_aggregate_rate_minimum": 1.1,
+    "paired_wins_minimum": 5,
+    "pooled_p99_ratio_maximum": 1.2
+  },
+  "no_owned_build_or_test_overlap": true,
+  "no_cache_eviction_or_host_setting_changes": true,
+  "all_samples_retained": true,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_allocation/run.py": "3e1974d863a78e18cf057a5506f24d71ced81dec9eace7f4e04fe45be2714c78",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_allocation/probe.cpp": "ebc76b075402dfa00cf8088d234c790015cb2d85a2bb0884473e97fbefdc3efa",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/monitor.py": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/probe-plain": "30c0a2ed5973119095a865db0ebd28705a609eba2981c2fbd0a33894f9f306a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/probe-diagnostic": "d0e47b5d77b2ecea1b48496cdccba1afede3514a1c43781220225e7f43afb4b9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/probe-asan": "f96a7779e4a5c2d3790bcdebdc2413cfd907fea4fb7d869d7484c0e3ce5099fc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "02ff3d6fd90c65062f6693311c7be3d88a385e46de956b86d53abd42632dad7e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/build.json": "3ba33e56ac4df459a7c3c2de30d90f3275713887f8159ac03c858c21b243d028"
+  },
+  "free_bytes_before": 50936008704
+}

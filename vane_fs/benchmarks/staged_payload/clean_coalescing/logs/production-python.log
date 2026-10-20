@@ -1,0 +1,9 @@
+........................................................................ [ 54%]
+............................................................             [100%]
+=============================== warnings summary ===============================
+tests/test_recovery.py::test_connection_inherited_across_fork_is_rejected
+  /home/kaka/astrovela_vane-fs/vane_fs/tests/test_recovery.py:171: DeprecationWarning: This process (pid=2734182) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+132 passed, 1 warning in 69.47s (0:01:09)

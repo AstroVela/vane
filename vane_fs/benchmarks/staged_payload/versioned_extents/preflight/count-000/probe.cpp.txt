@@ -1,0 +1,232 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// Count-only, process-wide interposition: foreground and checkpoint workers.
+// Phase attribution is the phase at call entry; these are not timing samples.
+#define _LARGEFILE64_SOURCE
+#include "vane_fs/workspace.hpp"
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <unistd.h>
+#include <sqlite3.h>
+
+namespace {
+using U = uint64_t;
+constexpr int Phases = 6, Roles = 5;
+std::atomic<int> phase {0};
+struct Counters {
+	std::atomic<U> writes {0}, bytes {0}, write_errors {0}, fsync {0}, fdatasync {0}, sync_errors {0};
+};
+Counters io[Phases][Roles];
+std::atomic<U> vm[Phases][3], steps[Phases][3], checkpoints[Phases][5], checkpoint_errors[Phases];
+constexpr const char *names[] = {"setup", "writes", "barrier", "validation", "close", "inspection"};
+constexpr const char *roles[] = {"wal", "database", "payload", "fence", "other"};
+static void Check(bool value, const char *message) {
+	if (!value)
+		throw std::runtime_error(message);
+}
+static bool Ends(const std::string &path, const char *suffix) {
+	auto length = std::strlen(suffix);
+	return path.size() >= length && path.compare(path.size() - length, length, suffix) == 0;
+}
+static int Role(int fd) {
+	char buffer[4096];
+	auto link = "/proc/self/fd/" + std::to_string(fd);
+	auto size = readlink(link.c_str(), buffer, sizeof(buffer));
+	if (size <= 0)
+		return 4;
+	std::string path(buffer, size_t(size));
+	return Ends(path, "-wal")           ? 0
+	       : Ends(path, ".sqlite")      ? 1
+	       : Ends(path, ".payload")     ? 2
+	       : Ends(path, ".stage-fence") ? 3
+	                                    : 4;
+}
+static int SQLKind(sqlite3_stmt *stmt) {
+	const char *sql = sqlite3_sql(stmt);
+	if (sql && std::strncmp(sql, "INSERT INTO block_versions", std::strlen("INSERT INTO block_versions")) == 0)
+		return 0;
+	if (sql && std::strncmp(sql, "INSERT INTO block_payloads", std::strlen("INSERT INTO block_payloads")) == 0)
+		return 1;
+	return 2;
+}
+static std::string Text(sqlite3 *db, const std::string &sql) {
+	sqlite3_stmt *stmt = nullptr;
+	Check(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK, "Inspection prepare failed");
+	Check(sqlite3_step(stmt) == SQLITE_ROW, "Inspection returned no row");
+	auto text = sqlite3_column_text(stmt, 0);
+	std::string result = text ? reinterpret_cast<const char *>(text) : "";
+	sqlite3_finalize(stmt);
+	return result;
+}
+} // namespace
+extern "C" ssize_t __real_pwrite(int, const void *, size_t, off_t);
+extern "C" ssize_t __real_pwrite64(int, const void *, size_t, off64_t);
+extern "C" int __real_fsync(int);
+extern "C" int __real_fdatasync(int);
+extern "C" int __real_sqlite3_step(sqlite3_stmt *);
+extern "C" int __real_sqlite3_wal_checkpoint_v2(sqlite3 *, const char *, int, int *, int *);
+template <class F>
+static ssize_t CountWrite(int fd, F call) {
+	auto p = phase.load(), saved = errno;
+	auto r = Role(fd);
+	errno = saved;
+	auto result = call();
+	saved = errno;
+	auto &c = io[p][r];
+	++c.writes;
+	if (result >= 0)
+		c.bytes += U(result);
+	else
+		++c.write_errors;
+	errno = saved;
+	return result;
+}
+extern "C" ssize_t __wrap_pwrite(int fd, const void *data, size_t size, off_t offset) {
+	return CountWrite(fd, [&] { return __real_pwrite(fd, data, size, offset); });
+}
+extern "C" ssize_t __wrap_pwrite64(int fd, const void *data, size_t size, off64_t offset) {
+	return CountWrite(fd, [&] { return __real_pwrite64(fd, data, size, offset); });
+}
+static int CountSync(int fd, bool data) {
+	auto p = phase.load(), saved = errno;
+	auto r = Role(fd);
+	errno = saved;
+	auto result = data ? __real_fdatasync(fd) : __real_fsync(fd);
+	saved = errno;
+	auto &c = io[p][r];
+	++(data ? c.fdatasync : c.fsync);
+	if (result)
+		++c.sync_errors;
+	errno = saved;
+	return result;
+}
+extern "C" int __wrap_fsync(int fd) {
+	return CountSync(fd, false);
+}
+extern "C" int __wrap_fdatasync(int fd) {
+	return CountSync(fd, true);
+}
+extern "C" int __wrap_sqlite3_step(sqlite3_stmt *stmt) {
+	auto p = phase.load(), kind = SQLKind(stmt), saved = errno;
+	sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 1);
+	errno = saved;
+	auto result = __real_sqlite3_step(stmt);
+	saved = errno;
+	vm[p][kind] += U(sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 1));
+	++steps[p][kind];
+	errno = saved;
+	return result;
+}
+extern "C" int __wrap_sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *schema, int mode, int *log, int *copied) {
+	auto p = phase.load();
+	auto result = __real_sqlite3_wal_checkpoint_v2(db, schema, mode, log, copied);
+	auto saved = errno;
+	Check(mode >= -1 && mode <= 3, "Unexpected checkpoint mode");
+	++checkpoints[p][mode + 1];
+	if (result != SQLITE_OK && result != SQLITE_BUSY)
+		++checkpoint_errors[p];
+	errno = saved;
+	return result;
+}
+int main(int argc, char **argv) {
+	try {
+		Check(argc == 5, "Expected database, MiB, shape, output JSON");
+		std::string path = argv[1], shape = argv[3];
+		int mib = std::stoi(argv[2]);
+		Check(mib == 4 || mib == 64 || mib == 256, "Unsupported size");
+		Check(shape == "aligned" || shape == "fuse8" || shape == "fuse1", "Unsupported shape");
+		constexpr int64_t MiB = 1048576;
+		std::string tile(8 * MiB, 0);
+		for (size_t i = 0; i < tile.size(); ++i)
+			tile[i] = char((i * 17 + (i / 4096) * 29) % 251 + 1);
+		std::vector<std::string> data;
+		std::vector<int64_t> offsets;
+		int64_t position = 0, total = int64_t(mib) * MiB;
+		while (position < total) {
+			auto batch = std::min<int64_t>(shape == "fuse8" ? 8 * MiB : MiB, total - position);
+			for (int64_t done = 0; done < batch;) {
+				auto amount = std::min<int64_t>(MiB - (shape == "aligned" || done ? 0 : 48), batch - done);
+				offsets.push_back(position + done);
+				auto start = (position + done) % tile.size();
+				auto value = tile.substr(start, size_t(amount));
+				if (value.size() < size_t(amount))
+					value += tile.substr(0, size_t(amount) - value.size());
+				data.push_back(std::move(value));
+				done += amount;
+			}
+			position += batch;
+		}
+		vane_fs::Workspace workspace(path, 5000, vane_fs::Durability::Fsync);
+		auto session = workspace.Checkout();
+		workspace.AcquireMount("main");
+		auto root = session->OpenDirectory("/").inode;
+		auto inode = session->CreateNode(root, "file", false, 0600, true, false, 2).inode;
+		phase = 1;
+		for (size_t i = 0; i < data.size(); ++i)
+			session->WriteInode(inode, data[i], offsets[i]);
+		phase = 2;
+		workspace.Sync();
+		phase = 3;
+		U hash = 14695981039346656037ULL;
+		for (int64_t at = 0; at < total; at += MiB) {
+			auto bytes = session->ReadInode(inode, at, MiB);
+			Check(bytes == tile.substr(size_t(at % tile.size()), MiB), "Full content verification failed");
+			for (unsigned char ch : bytes) {
+				hash ^= ch;
+				hash *= 1099511628211ULL;
+			}
+		}
+		phase = 4;
+		session->CloseFile(inode, 2);
+		session->CloseFile(root);
+		workspace.ReleaseMount("main");
+		session->Close();
+		workspace.Close(); // Joins the worker before reading atomic totals.
+		phase = 5;
+		sqlite3 *db = nullptr;
+		Check(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK, "Inspection open");
+		Check(Text(db, "PRAGMA quick_check") == "ok", "Integrity check failed");
+		auto format = Text(db, "SELECT version FROM format");
+		Check(format == "1004" || format == "1005", "Unexpected storage format");
+		auto versions = Text(db, "SELECT count(*) FROM block_versions");
+		auto payloads = Text(db, "SELECT count(*) FROM block_payloads");
+		auto external = Text(db, "SELECT count(*) FROM block_payloads WHERE length(data)=8");
+		auto coverage = Text(db, "SELECT " + std::string(format == "1005" ? "sum(count)" : "count(*)") +
+		                             " FROM block_versions WHERE deleted=0");
+		Check(std::stoll(coverage) == total / 4096, "Logical extent coverage differs");
+		sqlite3_close(db);
+		std::ofstream output(argv[4]);
+		output << "{\"status\":\"PASS\",\"mib\":" << mib << ",\"shape\":\"" << shape << "\",\"format\":" << format
+		       << ",\"requests\":" << data.size() << ",\"content_fnv1a64\":\"" << hash
+		       << "\",\"content_bytes_verified\":" << total << ",\"versions\":" << versions
+		       << ",\"payloads\":" << payloads << ",\"external_payloads\":" << external
+		       << ",\"logical_blocks\":" << coverage << ",\"phases\":[";
+		for (int p = 0; p < Phases; ++p) {
+			output << (p ? "," : "") << "{\"name\":\"" << names[p] << "\",\"io\":{";
+			for (int r = 0; r < Roles; ++r) {
+				auto &c = io[p][r];
+				output << (r ? "," : "") << '"' << roles[r] << "\":[" << c.writes << ',' << c.bytes << ','
+				       << c.write_errors << ',' << c.fsync << ',' << c.fdatasync << ',' << c.sync_errors << ']';
+			}
+			output << "},\"steps\":[" << steps[p][0] << ',' << steps[p][1] << ',' << steps[p][2] << "],\"vm_steps\":["
+			       << vm[p][0] << ',' << vm[p][1] << ',' << vm[p][2] << "],\"checkpoint_calls\":[";
+			for (int i = 0; i < 5; ++i)
+				output << (i ? "," : "") << checkpoints[p][i];
+			output << "],\"checkpoint_errors\":" << checkpoint_errors[p] << '}';
+		}
+		output << "],\"io_columns\":[\"pwrite_calls\",\"successful_bytes\",\"write_errors\",\"fsync_calls\","
+		          "\"fdatasync_calls\",\"sync_errors\"],\"sql_columns\":[\"insert_versions\",\"insert_payloads\","
+		          "\"other\"],"
+		          "\"checkpoint_columns\":[\"NOOP\",\"PASSIVE\",\"FULL\",\"RESTART\",\"TRUNCATE\"]}\n";
+		Check(bool(output), "Writing result failed");
+	} catch (const std::exception &error) {
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

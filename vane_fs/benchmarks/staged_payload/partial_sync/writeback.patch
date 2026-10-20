@@ -1,0 +1,56 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -601,2 +601,3 @@
+ 		external = PayloadFile::Get(db).Append(bytes);
++        Staging::Get(db).Writeback(external, int64_t(bytes.size()));
+ 	}
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -326,2 +326,3 @@
+ 	void AbandonInherited() {
++        writeback.Close();
+ 		// Do not unlock the parent's shared open-file descriptions after fork.
+@@ -372,2 +373,24 @@
+ 	}
++	void Writeback(int64_t offset, int64_t bytes) {
++        // Submission is a performance hint, never a durability boundary.
++        // Keep this description open through publication so fdatasync observes
++        // errors arising after an asynchronous submission (Linux errseq).
++        if (writeback.fd < 0)
++            writeback.Open(path + ".payload", false);
++        if (offset != writeback_end)
++            writeback_begin = offset;
++        writeback_end = offset + bytes;
++        if (!writeback_supported || writeback_end - writeback_begin < 16 * 1024 * 1024)
++            return;
++        int rc;
++        do {
++            rc = sync_file_range(writeback.fd, writeback_begin, writeback_end - writeback_begin, SYNC_FILE_RANGE_WRITE);
++        } while (rc && errno == EINTR);
++        if (rc) {
++            if (errno != ENOSYS && errno != EOPNOTSUPP && errno != EINVAL)
++                IO("Submitting payload writeback");
++            writeback_supported = false;
++        }
++        writeback_begin = writeback_end;
++    }
+ 	void BeforeFullCommit() {
+@@ -376,2 +399,7 @@
+ 		// Flush the whole file, including bytes appended by other connections.
++        // A writeback hint must never skip this original data barrier.
++        if (writeback.fd >= 0) {
++            Sync(writeback.fd);
++            return;
++        }
+ 		File data;
+@@ -383,2 +411,3 @@
+ 			Save(false);
++        writeback_begin = writeback_end;
+ 	}
+@@ -403,3 +432,5 @@
+ 	std::string path, uuid;
+-	File initialization, liveness, publication, fence;
++	File initialization, liveness, publication, fence, writeback;
++    int64_t writeback_begin = 0, writeback_end = 0;
++    bool writeback_supported = true;
+ 	std::mutex mutex, checkpoint_mutex;

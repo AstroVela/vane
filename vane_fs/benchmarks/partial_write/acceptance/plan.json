@@ -1,0 +1,85 @@
+{
+  "status": "FROZEN_BEFORE_MEASUREMENT",
+  "baseline_revision": "61ca3015360396fec354524e2720aa93f98c5e95",
+  "source_changes": "Preserved partial-write candidate only; production sources unchanged",
+  "native_plain": {
+    "medium": "tmpfs",
+    "mib": 64,
+    "shifts": [
+      0,
+      1,
+      4095
+    ],
+    "pairs": 8,
+    "durability": "strict",
+    "metrics": [
+      "CPU",
+      "wall",
+      "requests",
+      "final_sync",
+      "close"
+    ]
+  },
+  "native_diagnostic": {
+    "medium": "tmpfs",
+    "mib": 16,
+    "shifts": [
+      0,
+      1
+    ],
+    "pairs": 3,
+    "purpose": "SQL step and WAL bytes only; excluded from throughput"
+  },
+  "fuse": {
+    "media": [
+      "tmpfs",
+      "ext4"
+    ],
+    "states": [
+      "fresh",
+      "post_gc"
+    ],
+    "pairs_per_state_medium": 6,
+    "order": "AB,BA repeated 3 times",
+    "durability": "fsync",
+    "buffer_page_offset": 48,
+    "sequential_mib_and_request_mib": [
+      [
+        256,
+        8
+      ],
+      [
+        64,
+        1
+      ]
+    ],
+    "first_workload": "256MiB into a new or independently aged workspace",
+    "read_mib": 64,
+    "random_reads": 4096,
+    "random_overwrites": 512,
+    "small_files": 128,
+    "metadata_operations_each": 128,
+    "checkpoint_start_mib": 16,
+    "checkpoint_admission_mib": 64,
+    "retained_wal_mib": 16
+  },
+  "diagnostic": {
+    "medium": "ext4",
+    "pairs_per_state": 2,
+    "separate_window": true,
+    "trace": [
+      "fsync",
+      "checkpoint",
+      "admission mutex wait",
+      "admission duration"
+    ]
+  },
+  "adoption_gate": {
+    "correctness": "all related tests and all content/schema checks pass",
+    "software": "unaligned native CPU median >=5% lower with improvement in >=6 of 8 pairs per shift; aligned <=5% regression",
+    "plain_fuse": "per medium and state, workload median and aggregate throughput no more than 5% lower; request p99 no more than 20% higher (ignore sub-1ms absolute increase); total lifecycle no more than 5% longer",
+    "insufficient_evidence": "If barriers remain unstable or tests fail gates, preserve candidate without enabling; do not retune or discard slow samples; independent physical storage needed if software win alone is established"
+  },
+  "global_cache_eviction": false,
+  "owned_tests_builds_overlap_measurement": false
+}

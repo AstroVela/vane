@@ -1,0 +1,5 @@
+patching file src/workspace.cpp
+patching file include/vane_fs/workspace.hpp
+patching file CMakeLists.txt
+patching file tests/test_inode_refs.cpp
+patching file tests/test_lookup_validation.cpp

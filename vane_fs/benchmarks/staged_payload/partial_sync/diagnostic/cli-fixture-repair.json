@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "epoch": 1791711711.6167634,
+  "reason": "Diagnostic fixture needed the original unchanged CLI; failure occurred before any mount or workload timer",
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-sync-20261011T093901Z/ext4-diagnostic/vane-partial-owned-fuse-l62_nan0",
+      "removed": true
+    }
+  ]
+}

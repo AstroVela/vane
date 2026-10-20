@@ -1,0 +1,17 @@
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-journal"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-journal"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite.payload"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite.stage-fence"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-wal"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-wal"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-wal"
+LOSS_CAPTURE "/tmp/vane-fs-durability-3582745/model.sqlite-wal"
+LOSS_IMAGE "model.sqlite" bytes=4096 live_exists=1
+LOSS_IMAGE "model.sqlite-wal" bytes=1520312 live_exists=1
+LOSS_IMAGE "model.sqlite-journal" bytes=512 live_exists=0
+LOSS_IMAGE "model.sqlite.payload" bytes=4096 live_exists=1
+LOSS_IMAGE "model.sqlite.stage-fence" bytes=4096 live_exists=1
+Existing payload file for an empty database

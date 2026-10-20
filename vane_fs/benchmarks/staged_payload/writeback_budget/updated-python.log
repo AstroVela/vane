@@ -1,0 +1,12 @@
+.....................................................s.................. [ 46%]
+........................................................................ [ 92%]
+...........                                                              [100%]
+=============================== warnings summary ===============================
+tests/test_recovery.py::test_connection_inherited_across_fork_is_rejected
+  /home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_recovery.py:172: DeprecationWarning: This process (pid=3871971) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] ../home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_recovery.py:123: Isolated external format 1004 has no production v1 migration
+154 passed, 1 skipped, 1 warning in 69.30s (0:01:09)

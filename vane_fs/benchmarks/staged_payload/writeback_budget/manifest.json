@@ -1,0 +1,3305 @@
+{
+  "status": "PASS",
+  "entries": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+      "scope": "dependency",
+      "bytes": 256184,
+      "sha256": "f1e75247f42d414df611ee554c8399bfe74565f89eed7c4501e2d97c48f21eab"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "scope": "dependency",
+      "bytes": 1911656,
+      "sha256": "6d02862badc3057451407c4e219bd11109e8e3933bb8924eef6ba55006a70479"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/block_sync/timeline.cpp",
+      "scope": "dependency",
+      "bytes": 8889,
+      "sha256": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_sync/hint_trace.cpp",
+      "scope": "dependency",
+      "bytes": 819,
+      "sha256": "160203afa4fe4d9e55aa82550cf5a6801c9602ab9125ddc7e7b4b74c006f6f4f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_sync/trace.hpp",
+      "scope": "dependency",
+      "bytes": 636,
+      "sha256": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/README.md",
+      "scope": "published",
+      "bytes": 11717,
+      "sha256": "2065d802b6f5efb8e838f376c7b3e4e11b7a06ebd991adbd9f73f76a6f4c7199"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/analyze_diagnostic.py",
+      "scope": "published",
+      "bytes": 4734,
+      "sha256": "f8033cac847d05f7a2a79268c22cfe2b1b9475bb0f94071d19a1db7b845e3521"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/analyze_sync.py",
+      "scope": "published",
+      "bytes": 5792,
+      "sha256": "3213ac3366eb705d10863219b318a26e644bdbb871644d2e8a521cdffa402882"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/audit.json",
+      "scope": "published",
+      "bytes": 45355,
+      "sha256": "567331f496ebcfda514bc9cf9c4d26b3d3b06611b9a3d9f43d531dc2198d7b89"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/baseline-native.log",
+      "scope": "published",
+      "bytes": 1399,
+      "sha256": "c349ab8e0ab644fc82e3777261874565fdbc822861a72eef6a482cbd0fc76efb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/baseline-normal.log",
+      "scope": "published",
+      "bytes": 25,
+      "sha256": "649e314dfbc83ba9b8a4c320739224acc3781bbbf1228faa972c94291b294283"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/baseline-small.log",
+      "scope": "published",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/budget.patch",
+      "scope": "published",
+      "bytes": 7903,
+      "sha256": "6511cd99d2e9bb416ac6c4c0f010570911f5fb7b47d8f8d010b7d4a8bb923626"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/build.json",
+      "scope": "published",
+      "bytes": 15240,
+      "sha256": "88e312aac84318a4f4c0d002f54a2068f2cd71250ea93c6fd04a5ab62fe36487"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/checks.json",
+      "scope": "published",
+      "bytes": 526,
+      "sha256": "4e13341eba6749564235f6f43ed29bb74565bc374b3c42b3e65aee4dd62b4c22"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/aged-baseline.json",
+      "scope": "published",
+      "bytes": 60420,
+      "sha256": "410823f37f8c1f7e15eebcb8ceffc6ac84a2b39a794fc2b7a6e30cd27b09681a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/aged-updated.json",
+      "scope": "published",
+      "bytes": 60448,
+      "sha256": "f39f9176adc515cd4e7f6b1dcfdc1eaec161c282a3a9e2dc06ccc9a68908f547"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/background-diagnostic.json",
+      "scope": "published",
+      "bytes": 6136,
+      "sha256": "ba08f758630e872903ee958c0a36a332f0be76f0aa893145c0e3fa0106e398c9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/baseline-configure.log",
+      "scope": "published",
+      "bytes": 653,
+      "sha256": "4d550abfcbd9f9f8a2101a118c0c9e3169216ff56dc04d098f4086c1260843dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/baseline-library.log",
+      "scope": "published",
+      "bytes": 115,
+      "sha256": "c0272452a9c70e631058cd919fdd18339f27ea6a42fc726e90d7282cc2c7276d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/build.json",
+      "scope": "published",
+      "bytes": 10217,
+      "sha256": "2b7e32a0f741255f486643de8c865d82c302f0560eeac92399bc7fa034e0581e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/diagnostic-summary.json",
+      "scope": "published",
+      "bytes": 43763,
+      "sha256": "68cd37ca2ae16c29300d1117c50cad858355cd6b13ffb25d56ab356a796376c1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/fresh-baseline.json",
+      "scope": "published",
+      "bytes": 62113,
+      "sha256": "27619f6a96eb1270fa5d7d951c820d5e9b6b1f2f3ca3ecec0d0ebe4859dda50e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/fresh-updated.json",
+      "scope": "published",
+      "bytes": 61909,
+      "sha256": "cd1827d074be9f5edaa91964b6742378c5dfc91e2decf57e0286f6399671dd80"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/plan.json",
+      "scope": "published",
+      "bytes": 1251,
+      "sha256": "3890d5f7d8c70fe7cce1e2f183bec69b9a9d55316969fa873f067f7ccf35caf0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/tests.json",
+      "scope": "published",
+      "bytes": 3903,
+      "sha256": "3a942c582adc9d2061a1453348270674e1ac726c0a8346737c952e178fccada0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/updated-configure.log",
+      "scope": "published",
+      "bytes": 652,
+      "sha256": "5c58e469d6886a1c9eaffceae0a4cb154c6a7ca93ffdf1070a4fc334a0187e92"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/updated-library.log",
+      "scope": "published",
+      "bytes": 115,
+      "sha256": "c0272452a9c70e631058cd919fdd18339f27ea6a42fc726e90d7282cc2c7276d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/diagnostic/windows.json",
+      "scope": "published",
+      "bytes": 23234,
+      "sha256": "232468f9fc5a44ec3748960d8cdb62804f1c9d8b4c1a38420b077d9c49b7a7c6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/empty-logs.json",
+      "scope": "published",
+      "bytes": 3186,
+      "sha256": "10299e203b9417f7570efa292ac569f5dce2290011cb51ea253852ae58b9c362"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/ext4-input-check.json",
+      "scope": "published",
+      "bytes": 78,
+      "sha256": "9b4f73ec62e16714fef584be9dfa0488e42c276055971641d9f626fe06bfdff6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/fixture-correction.json",
+      "scope": "published",
+      "bytes": 495,
+      "sha256": "5179f9c6c24736d0fbe2e73e4634ed33c1eae389092cc4d406b42804668fe0b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/helper-builds.json",
+      "scope": "published",
+      "bytes": 10391,
+      "sha256": "9783a6f5185eaef09f5d4dd274e27c83c0bce12792e345320be37532c310c83e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/initial-fixture-tests.json",
+      "scope": "published",
+      "bytes": 50845,
+      "sha256": "a90c45246d7dc0d6e5e701453ef414a17e398dd737c41cedabbd83bae7887a5f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/initial-helper-build.log",
+      "scope": "published",
+      "bytes": 322,
+      "sha256": "7011cd4cfbfc1be7c7e44b3f4d0a80fe70e12f36b9063078b0cfde373b6a779a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/initial-negative-pause-race.log",
+      "scope": "published",
+      "bytes": 45,
+      "sha256": "f59c97a88ad7fedd8fe4efffe5601d83e9a6af22577353a20df1149f0e99724c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/initial-negative-tests.json",
+      "scope": "published",
+      "bytes": 4742,
+      "sha256": "c3f460ba30e61781d2a73d6a22303484e05d46bad29a674431ca6d5665e18d42"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/initial-snapshot-assumption.log",
+      "scope": "published",
+      "bytes": 25,
+      "sha256": "25050e0f890240121793945b209e8fa28b76455672ee2a316bfaf9815dc267fa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/negative-tests.json",
+      "scope": "published",
+      "bytes": 8853,
+      "sha256": "5620319d03cf41a228cffbaf46622063fb44745524bd10e20fa5bdc100bcaed7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/ext4-aged-baseline.json",
+      "scope": "published",
+      "bytes": 179580,
+      "sha256": "47c48341e10c463afad3db22b82de0834d4e882b5ac223aa5ebf39ced496a22e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/ext4-aged-updated.json",
+      "scope": "published",
+      "bytes": 180469,
+      "sha256": "92e16deb5cc62a4ab3eaad01db93dc3e9f79a57a8c7e9d57946e971413ced68d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/ext4-fresh-baseline.json",
+      "scope": "published",
+      "bytes": 185265,
+      "sha256": "72b025d496f42a92a260141aa969dd5aaa731bc7e13aca1f042fd68720a5a6d3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/ext4-fresh-updated.json",
+      "scope": "published",
+      "bytes": 184737,
+      "sha256": "d88e4cfd36f48c847e495a3ae68ce254b1a75d3a47ef2c6cfb7baa2689ef349f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/plan.json",
+      "scope": "published",
+      "bytes": 3627,
+      "sha256": "d786c24186e68b844dc68af575f8640c2f883a5eaceb7874d9a31d897a7282bd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/summary.json",
+      "scope": "published",
+      "bytes": 136285,
+      "sha256": "970e326abaa9a5906fbd4c913158b6a30f72855bb80382cb868fe95c28a64f6f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/tmpfs-aged-baseline.json",
+      "scope": "published",
+      "bytes": 180092,
+      "sha256": "87bc2d455efbe5db4b02bf3739b1086d4c79d57a213c9b7a87a940713f75d9a6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/tmpfs-aged-updated.json",
+      "scope": "published",
+      "bytes": 180320,
+      "sha256": "0b3dedc964499ab9a1b40bfdab355db6d0e041555059841be78a951cb044c30b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/tmpfs-fresh-baseline.json",
+      "scope": "published",
+      "bytes": 185362,
+      "sha256": "adef3b9e573ef0d382980bee2e15fa403a76d8d273188b59931e14921e7c55d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/tmpfs-fresh-updated.json",
+      "scope": "published",
+      "bytes": 185072,
+      "sha256": "605150d6421c0eab7d3e481917a3b7c098c0295a34d67949fab4575037927154"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/plain/windows.json",
+      "scope": "published",
+      "bytes": 97688,
+      "sha256": "70dc26614b91e23f804571ac27c29c0e86c98f26a7a8387d2a5a4aace0076004"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/pr-before.json",
+      "scope": "published",
+      "bytes": 11028,
+      "sha256": "ba02527f97fdd8ce0903e2579378c8db6a7539ff7c256fdd36e334abb0ca0b6b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/pre-negative-final-tests.json",
+      "scope": "published",
+      "bytes": 110347,
+      "sha256": "62c10c1755ed0315b7b1ed8b723669519bca02251934f6b30345f423b9c3f507"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/prepare.py",
+      "scope": "published",
+      "bytes": 7538,
+      "sha256": "9ce953fc36ec9b56c02964f685ec69796b56a71b8a64f964f4b6aa86046a1442"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/publish.py",
+      "scope": "published",
+      "bytes": 12593,
+      "sha256": "57778590f93801ef879ae4c728e6be3803bdc2bfb61da141525844697805e647"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/reproducer-proof.json",
+      "scope": "published",
+      "bytes": 714,
+      "sha256": "c5db5bc442d6ba601905c103dd4258f2d02c6c23da0720c1a2cc98d0333a7fb3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/run.py",
+      "scope": "published",
+      "bytes": 3314,
+      "sha256": "b86c42f366c06444baaf905d3b33f27f0118a5b31396b427176a81aaa4d0a1e6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-barrier_error.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "f97ca64a43e7b6dcfa712d66624fd2e30bd93e5ed311f30806a29efd31320ecd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-blocked.log",
+      "scope": "published",
+      "bytes": 58,
+      "sha256": "891d3a070ee16985f160ddac2371ca89c5bde9933389bbe7e7c94d5eae1414e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-build.log",
+      "scope": "published",
+      "bytes": 1810,
+      "sha256": "8b14d2e50549b09cc1489527a18f0d7b7a184622713fd99e3306f39771983cec"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-close_blocked.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "1c55c04352daaaa6c666613eb5d8170d13272a7d9fc4700879669e6a15267260"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-close_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "b07c3aee1042bf0d083e13813f32946e0115446978f8aa644cda0f1a90366dab"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-coalesce.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "6981945399dcf5b65011e888614f7405a49fa344c9821ff31987768d4fc67e2a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-configure.log",
+      "scope": "published",
+      "bytes": 638,
+      "sha256": "32b81b924fe392ccb849ac99df6ad19250b471b71ff07d96cd13f505be187d5e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-crash.log",
+      "scope": "published",
+      "bytes": 76,
+      "sha256": "3ee91ed59be96b2e6852569712ae7fbf23095f84d54a0db351025104c1c77e0f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-fence_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "5814806a4a608ee26db243d5157ddb5c400c4017a9a3026c071d2fd091115120"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-fork.log",
+      "scope": "published",
+      "bytes": 55,
+      "sha256": "499a691383a16b830ec1f0c4728af40d258ea6cf4d2c6f289c7d794c9b249325"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-gc.log",
+      "scope": "published",
+      "bytes": 53,
+      "sha256": "509e153d34fa7f83773b6d20cec7cdd2dd2b247ecba608773f725de7816773cf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-interrupt.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "adbad9762db047ee93b8558471fc2018f8c63b1402a6c43495dab55902de4fa9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-invalid.log",
+      "scope": "published",
+      "bytes": 58,
+      "sha256": "2212f380013194bc6d43b9b76777b6852a457c6cc93519c24ca9904456ffdff1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-io_error.log",
+      "scope": "published",
+      "bytes": 59,
+      "sha256": "253665b6b93b60948cca117274bdcf84397667875c3dc15eb475f25fa6d6957c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-no_space.log",
+      "scope": "published",
+      "bytes": 59,
+      "sha256": "38272fc34c6450617ff5a0beeac1590af69108fc75feb5c8d69c18f210a3ef14"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-normal.log",
+      "scope": "published",
+      "bytes": 57,
+      "sha256": "3ea8d842a2b76f9e72146e95da8132a3874edb33301d66aa825a7cb2547f29c8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-normal_snapshot.log",
+      "scope": "published",
+      "bytes": 66,
+      "sha256": "4774f5b3539ce82b4ab97e3ab0dd4ed7e3509097803bca2c31a339b4071c3eb5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-not_supported.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "8a0c64eb0c0339e796afa3cd87abde7e42b5cbd43667d58c6a4bcaf9284bad98"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-pause_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "8e1572d5309df7955a203ae9c0a5a525d2638243923783a3838a8667556c4f19"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-pause_fence.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "09d043551d841d3845d74446189a86ce8196f117c4a4560c09d10b04d813557a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-pause_full.log",
+      "scope": "published",
+      "bytes": 61,
+      "sha256": "e1be23519025fb1d11a238ff496d9a9d53a43fdb2b4ca19b894a153750e80a23"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-pause_wal.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "b72e54167a2f3212fb00f5ab4884628181224d18ca53b6ad64d336ff06a45341"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-post_barrier_error.log",
+      "scope": "published",
+      "bytes": 69,
+      "sha256": "031cbfebb28bc76933f96b9e0798a5ed1251eaa0ffd0d0004efcb82bf618ef34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-small.log",
+      "scope": "published",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-strict.log",
+      "scope": "published",
+      "bytes": 57,
+      "sha256": "2a3b5ca525b54b6a249e98d8167a603a5f195c847cc1a36dacd412ba8587189c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-tests.log",
+      "scope": "published",
+      "bytes": 1386,
+      "sha256": "50348dc86eff27709f785bbd154e7126ab66b8d7905092d7a12c33fe10a543b3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize-unsupported.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "31008cbb60e9cf482168577e819f8139a80867391487eab990770d211c3de529"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/sanitize.json",
+      "scope": "published",
+      "bytes": 389,
+      "sha256": "1d35a9ed39bef12f2fd945502570fd3158c1cd83fd61e82aa5be3b14992c6b4c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/source-identity.json",
+      "scope": "published",
+      "bytes": 12355,
+      "sha256": "89550f55433b3dce680e102950097594188696f7f242a5e28d431400cbf0dd4f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_acknowledged_write_surviv0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 796,
+      "sha256": "c3d081d1311f3f4b97773727a27230899f0838f84950f476038edfc85695f0e5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_acknowledged_write_surviv1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1332,
+      "sha256": "ae8b6b7c00d979f7cbede000f2713adfab3d992e87ed4460da6eab3b7d856167"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_acknowledged_write_surviv2/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 3476,
+      "sha256": "ab77cbc04742539ee7c26d818be95a13e9ae7a639c6e50f37d411f33d529a6e4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_cached_atime_alias_tracks0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1283,
+      "sha256": "c473f4b7ad6ce31a7109d521a8aa9dee414e932a31e505eec4174b50f63bf978"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_cached_atime_alias_tracks1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1316,
+      "sha256": "75e6de198928ce3ddbdc54b71eda734c37232599f789212f721983b91f71abdb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_cached_metadata_observes_0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 10300,
+      "sha256": "f966526e83c34f2b323528c8103afb8463b6bab231620a9726a0223e4fbcbbcd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_directory_listing_is_capt0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 3784,
+      "sha256": "83ac3016b9f404fb348c4d07f32b930df78cb709e8de59a907e5bc5e6eb730dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_directory_lists_belong_to0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 3497,
+      "sha256": "c09b46260d1bea14526aa911183efe1daec815049a1effce08da11eb86caae96"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_directory_pagination_is_s0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 716049,
+      "sha256": "86ed762b85f6791becee6a91c4c4006fa5b0a6313b49177e843b4cb97cfb543b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_directory_pagination_is_s1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 847768,
+      "sha256": "65f0248722022ae0010cad1e475a705dde9cd614302ac35d355754449a980700"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_directory_pagination_is_s2/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 33122,
+      "sha256": "50307cc0ab8441c2f96be2aa43c71406e15c651215cb91cc27b08135a7ba7275"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_failed_final_commit_makes0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1170,
+      "sha256": "6786e67cb78784daf613865f88528674e8267d8699946f1c2046d1b684e0f1d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_barriers_and_r0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 9701,
+      "sha256": "0bad2e3896df37c64664abdd1a33d02671863405851dc479c96bc5c2c28a23e3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_barriers_and_r1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 9701,
+      "sha256": "0bad2e3896df37c64664abdd1a33d02671863405851dc479c96bc5c2c28a23e3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_barriers_and_r2/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 9955,
+      "sha256": "1e5d70d1e5b770e684539d42823526463f716bf82ac3df3e0262f418e9e1b9ce"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_barriers_and_r3/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 9282,
+      "sha256": "94924572b816eecc45c2880175f2a72253e4e92cc64cf0fc061dc48bd5ca9b3b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_barriers_and_r4/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 9282,
+      "sha256": "94924572b816eecc45c2880175f2a72253e4e92cc64cf0fc061dc48bd5ca9b3b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_clean_unmount_0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 18984,
+      "sha256": "ce24a240548b15f551997a136e09ba5d8895cc78555d4afac53c37289c6f0380"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_failed_barrier0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1882,
+      "sha256": "bdf4e68125c01798bb9dc2b59302a0b91d8432fb5eba6d2a9ef8297e206010cc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_fsync_mode_failed_barrier1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1684,
+      "sha256": "17c3143d667acfa6f89473d0ac68424e6f7c1b5a4940b9d14d8d9a7f8ee44c34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_live_handles_observe_othe0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 21281,
+      "sha256": "683c24eef387f8970e740474a07f22ceb281a13ec30a7e1eed120aeb73819611"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_live_handles_observe_othe1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 21497,
+      "sha256": "778fa415258719db2b0853b68cff0e9510e5717186d59ed29b8fdc7e74e34ae5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_live_mount_namespace_meta0/mount-branch-8b06937b8635ab7ea79a8313828d0a3f.log",
+      "scope": "published",
+      "bytes": 5655,
+      "sha256": "30d02e7a3d48dd5be97afbda94d732b2b5f4d25718af395179fe3e265e98c2ba"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_mount_crash_reclaims_orph0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1782,
+      "sha256": "f05a3c1be3b89ccd7b54401bb2ece162ab31a3c4d27519e0a9fbabb8830c488f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_open_handles_survive_unli0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 7404,
+      "sha256": "7cd8565f0451125a421bb6ea4cc34cf0461ee2ce8f5d26a1ec2e6de8f2efd2dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_open_handles_survive_unli1/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 7404,
+      "sha256": "7cd8565f0451125a421bb6ea4cc34cf0461ee2ce8f5d26a1ec2e6de8f2efd2dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_repeated_open_release_doe0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 28260,
+      "sha256": "36553b754f56514fef2f561fd3b86a8dd82bed89125b8f6aa4660478d3174c7c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_snapshot_mount_is_pinned_0/mount-snapshot-4d8afd0fcc65bca2308091b993458f5f.log",
+      "scope": "published",
+      "bytes": 1927,
+      "sha256": "e7d181ce1b201b4d3e5c0573fab539b6d0cfdc179531a03642f35e9fb0cbc768"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_unread_directory_handle_s0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 1227,
+      "sha256": "2927619714f17a816d7cdd74bc6d6f76781ba8168aa1bb064ceb73863af4dd34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_warm_stat_reuses_kernel_m0/mount-branch-main.log",
+      "scope": "published",
+      "bytes": 635,
+      "sha256": "925f95a84e54e9ad05457c37ef4a092cc61628b84f7c006688b8256aea2fbee7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test-logs/test_warm_stat_reuses_kernel_m1/mount-snapshot-cf3184aac1778eb1739d4cfe4284c00b.log",
+      "scope": "published",
+      "bytes": 635,
+      "sha256": "925f95a84e54e9ad05457c37ef4a092cc61628b84f7c006688b8256aea2fbee7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/test_budget.cpp",
+      "scope": "published",
+      "bytes": 16281,
+      "sha256": "08867980f045e1bc02d7b6ff76646e7ebdb50900c81e6688a5c30c74bcb3f168"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/tests.json",
+      "scope": "published",
+      "bytes": 3903,
+      "sha256": "3a942c582adc9d2061a1453348270674e1ac726c0a8346737c952e178fccada0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/tmpfs-input-check.json",
+      "scope": "published",
+      "bytes": 78,
+      "sha256": "9b4f73ec62e16714fef584be9dfa0488e42c276055971641d9f626fe06bfdff6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/unbudgeted-normal.log",
+      "scope": "published",
+      "bytes": 37,
+      "sha256": "6d0dcb9a65125be16b87c11f54d638df54f390f564de3c7b1c3ae2a461c40e02"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/unbudgeted-pause_fence.log",
+      "scope": "published",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/unbudgeted-pause_full.log",
+      "scope": "published",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/unbudgeted-pause_wal.log",
+      "scope": "published",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-barrier_error.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "f97ca64a43e7b6dcfa712d66624fd2e30bd93e5ed311f30806a29efd31320ecd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-blocked.log",
+      "scope": "published",
+      "bytes": 58,
+      "sha256": "891d3a070ee16985f160ddac2371ca89c5bde9933389bbe7e7c94d5eae1414e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-close_blocked.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "1c55c04352daaaa6c666613eb5d8170d13272a7d9fc4700879669e6a15267260"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-close_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "8d0ca1b2813ac1ec35d635fac61fc442e1e49141b2f35fe6e06d4c00fb3b5bcb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-coalesce.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "6981945399dcf5b65011e888614f7405a49fa344c9821ff31987768d4fc67e2a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-crash.log",
+      "scope": "published",
+      "bytes": 76,
+      "sha256": "3ee91ed59be96b2e6852569712ae7fbf23095f84d54a0db351025104c1c77e0f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-fence_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "5814806a4a608ee26db243d5157ddb5c400c4017a9a3026c071d2fd091115120"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-fork.log",
+      "scope": "published",
+      "bytes": 55,
+      "sha256": "499a691383a16b830ec1f0c4728af40d258ea6cf4d2c6f289c7d794c9b249325"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-gc.log",
+      "scope": "published",
+      "bytes": 53,
+      "sha256": "509e153d34fa7f83773b6d20cec7cdd2dd2b247ecba608773f725de7816773cf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-install.log",
+      "scope": "published",
+      "bytes": 528,
+      "sha256": "dcb5580658899020a5921bc5fcec861103b923f3066bdfaa23bf99d583eab1e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-interrupt.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "adbad9762db047ee93b8558471fc2018f8c63b1402a6c43495dab55902de4fa9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-invalid.log",
+      "scope": "published",
+      "bytes": 58,
+      "sha256": "2212f380013194bc6d43b9b76777b6852a457c6cc93519c24ca9904456ffdff1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-io_error.log",
+      "scope": "published",
+      "bytes": 59,
+      "sha256": "253665b6b93b60948cca117274bdcf84397667875c3dc15eb475f25fa6d6957c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-module-identity.log",
+      "scope": "published",
+      "bytes": 167,
+      "sha256": "015b48e4eb9382d80197ff8f01e590d194db3f1554195623ba9215060f82bab6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-native.log",
+      "scope": "published",
+      "bytes": 1398,
+      "sha256": "88a18910891016bf49641b78646500c2c45f1362cd822caacf615ae9b09ebddc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-no_space.log",
+      "scope": "published",
+      "bytes": 59,
+      "sha256": "38272fc34c6450617ff5a0beeac1590af69108fc75feb5c8d69c18f210a3ef14"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-normal.log",
+      "scope": "published",
+      "bytes": 57,
+      "sha256": "3ea8d842a2b76f9e72146e95da8132a3874edb33301d66aa825a7cb2547f29c8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-normal_snapshot.log",
+      "scope": "published",
+      "bytes": 66,
+      "sha256": "4774f5b3539ce82b4ab97e3ab0dd4ed7e3509097803bca2c31a339b4071c3eb5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-not_supported.log",
+      "scope": "published",
+      "bytes": 64,
+      "sha256": "8a0c64eb0c0339e796afa3cd87abde7e42b5cbd43667d58c6a4bcaf9284bad98"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-pause_error.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "8e1572d5309df7955a203ae9c0a5a525d2638243923783a3838a8667556c4f19"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-pause_fence.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "09d043551d841d3845d74446189a86ce8196f117c4a4560c09d10b04d813557a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-pause_full.log",
+      "scope": "published",
+      "bytes": 61,
+      "sha256": "e1be23519025fb1d11a238ff496d9a9d53a43fdb2b4ca19b894a153750e80a23"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-pause_wal.log",
+      "scope": "published",
+      "bytes": 60,
+      "sha256": "b72e54167a2f3212fb00f5ab4884628181224d18ca53b6ad64d336ff06a45341"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-post_barrier_error.log",
+      "scope": "published",
+      "bytes": 69,
+      "sha256": "031cbfebb28bc76933f96b9e0798a5ed1251eaa0ffd0d0004efcb82bf618ef34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-python.log",
+      "scope": "published",
+      "bytes": 1041,
+      "sha256": "287b4352d0a035004a306a1f583fa5451f535edcb7c8e46ad59ff525ccaebabc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-small.log",
+      "scope": "published",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-snapshot_pause.log",
+      "scope": "published",
+      "bytes": 25,
+      "sha256": "25050e0f890240121793945b209e8fa28b76455672ee2a316bfaf9815dc267fa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-strict.log",
+      "scope": "published",
+      "bytes": 57,
+      "sha256": "2a3b5ca525b54b6a249e98d8167a603a5f195c847cc1a36dacd412ba8587189c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-unsupported.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "31008cbb60e9cf482168577e819f8139a80867391487eab990770d211c3de529"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/updated-venv.log",
+      "scope": "published",
+      "bytes": 245,
+      "sha256": "c305e0378cf15d0196fadedb39d4c50cbeb9231ee5740b076ab36eff783e0bfa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/validate.py",
+      "scope": "published",
+      "bytes": 4770,
+      "sha256": "a8f9158a4b84e33afafedda9fa8d0acf7b55f1a501a18d844c4801516263b8d6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/writeback-patch.log",
+      "scope": "published",
+      "bytes": 62,
+      "sha256": "1eed20444a1380f29a6471b91ed12e69056dee22b19e742c024e5345bdaf3c66"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/writeback-plan.json",
+      "scope": "published",
+      "bytes": 2757,
+      "sha256": "ecbf73b2a564b62f84941d4ab2b6a79288f4131e9b420fd176c253a175b6a20a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/writeback_budget/writeback-tests.json",
+      "scope": "published",
+      "bytes": 119144,
+      "sha256": "e101f8b699cfdd492e25c50645863180710c2eb6f6775858884c7156c9af2135"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/CMakeLists.txt",
+      "scope": "dependency",
+      "bytes": 7958,
+      "sha256": "6f8a48d4df6157b94415b5ea015e20e81b64338ca0267ea5756d8bdbb151f1dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/build/python-release/libvane_fs.a",
+      "scope": "dependency",
+      "bytes": 573580,
+      "sha256": "dd34f5c442a904d66116d02d0efc8175959e170c5bf34f11c72ed7850206431e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/build/python-release/vane-fs",
+      "scope": "dependency",
+      "bytes": 1778264,
+      "sha256": "7b41daa04c3028724f04c82cf803e5f14ce52edbb79472f901ce0ed8c2797a5d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/include/vane_fs/reader_abi.h",
+      "scope": "source",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/include/vane_fs/workspace.hpp",
+      "scope": "source",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/pyproject.toml",
+      "scope": "dependency",
+      "bytes": 1075,
+      "sha256": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/python/vane_fs/__init__.py",
+      "scope": "source",
+      "bytes": 788,
+      "sha256": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/python/vane_fs/fsspec.py",
+      "scope": "source",
+      "bytes": 5016,
+      "sha256": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/python/vane_fs/vane.py",
+      "scope": "source",
+      "bytes": 1674,
+      "sha256": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/benchmark.cpp",
+      "scope": "source",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/checkpoint.hpp",
+      "scope": "source",
+      "bytes": 7037,
+      "sha256": "290cafaf0a8919fb499ab33b1597c8c3c13839369063b90c766edb28f623aa5a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/cli.cpp",
+      "scope": "source",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/fuse.cpp",
+      "scope": "source",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/native_reader.cpp",
+      "scope": "source",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/native_reader.hpp",
+      "scope": "source",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/owner_lock.hpp",
+      "scope": "source",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/payload_file.hpp",
+      "scope": "source",
+      "bytes": 6514,
+      "sha256": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/python.cpp",
+      "scope": "source",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/staging.hpp",
+      "scope": "source",
+      "bytes": 17445,
+      "sha256": "446abf43180686cffe49dc6b4c9b85970f16ce1c8f972faed664f273055482ad"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/src/workspace.cpp",
+      "scope": "source",
+      "bytes": 88253,
+      "sha256": "6cd695898ba85e4cf4ff53e5f26d0ec7894c17cb6dd32766f2a87cb4f48ce745"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/conftest.py",
+      "scope": "source",
+      "bytes": 1236,
+      "sha256": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_checkpoint.cpp",
+      "scope": "source",
+      "bytes": 17225,
+      "sha256": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_checkpoint_coalescing.cpp",
+      "scope": "source",
+      "bytes": 5779,
+      "sha256": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_core.cpp",
+      "scope": "source",
+      "bytes": 11821,
+      "sha256": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_crash.cpp",
+      "scope": "source",
+      "bytes": 5099,
+      "sha256": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_durability.cpp",
+      "scope": "source",
+      "bytes": 8554,
+      "sha256": "880e6596d3b184438d09da50ac8cc6294f1742b40457fff20c5fd6f068932540"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_external.py",
+      "scope": "source",
+      "bytes": 6439,
+      "sha256": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_external_faults.cpp",
+      "scope": "source",
+      "bytes": 8968,
+      "sha256": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_fsspec.py",
+      "scope": "source",
+      "bytes": 4409,
+      "sha256": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_fuse.py",
+      "scope": "source",
+      "bytes": 29264,
+      "sha256": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_inline_publication.cpp",
+      "scope": "source",
+      "bytes": 5829,
+      "sha256": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_inode_refs.cpp",
+      "scope": "source",
+      "bytes": 6436,
+      "sha256": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_recovery.py",
+      "scope": "source",
+      "bytes": 7684,
+      "sha256": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_staging.cpp",
+      "scope": "source",
+      "bytes": 15372,
+      "sha256": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_staging.py",
+      "scope": "source",
+      "bytes": 1568,
+      "sha256": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_sync_syscalls.cpp",
+      "scope": "source",
+      "bytes": 4122,
+      "sha256": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_transaction_cache.cpp",
+      "scope": "source",
+      "bytes": 4641,
+      "sha256": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_vane.py",
+      "scope": "source",
+      "bytes": 16918,
+      "sha256": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests/test_workspace.py",
+      "scope": "source",
+      "bytes": 34164,
+      "sha256": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/CMakeLists.txt",
+      "scope": "dependency",
+      "bytes": 7958,
+      "sha256": "6f8a48d4df6157b94415b5ea015e20e81b64338ca0267ea5756d8bdbb151f1dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/build/python-release/libvane_fs.a",
+      "scope": "dependency",
+      "bytes": 563340,
+      "sha256": "afb2e25b749866572866beb0cc24dc0f8f05bc73b2754fb5efda3703bb1ddeaf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/build/python-release/vane-fs",
+      "scope": "dependency",
+      "bytes": 1773440,
+      "sha256": "01021951fafae09d32fe0af409ea79ddc8be2a143a9a7a0477ff8d0a14e2f490"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/include/vane_fs/reader_abi.h",
+      "scope": "source",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/include/vane_fs/workspace.hpp",
+      "scope": "source",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/pyproject.toml",
+      "scope": "dependency",
+      "bytes": 1075,
+      "sha256": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/python/vane_fs/__init__.py",
+      "scope": "source",
+      "bytes": 788,
+      "sha256": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/python/vane_fs/fsspec.py",
+      "scope": "source",
+      "bytes": 5016,
+      "sha256": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/python/vane_fs/vane.py",
+      "scope": "source",
+      "bytes": 1674,
+      "sha256": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/benchmark.cpp",
+      "scope": "source",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/checkpoint.hpp",
+      "scope": "source",
+      "bytes": 7037,
+      "sha256": "290cafaf0a8919fb499ab33b1597c8c3c13839369063b90c766edb28f623aa5a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/cli.cpp",
+      "scope": "source",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/fuse.cpp",
+      "scope": "source",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/native_reader.cpp",
+      "scope": "source",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/native_reader.hpp",
+      "scope": "source",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/owner_lock.hpp",
+      "scope": "source",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/payload_file.hpp",
+      "scope": "source",
+      "bytes": 6514,
+      "sha256": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/python.cpp",
+      "scope": "source",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/staging.hpp",
+      "scope": "source",
+      "bytes": 14155,
+      "sha256": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/src/workspace.cpp",
+      "scope": "source",
+      "bytes": 88106,
+      "sha256": "d085da3b26f58faec2f333e0d087d4ba06a3b0db776eb21b634b88041fb6e712"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/conftest.py",
+      "scope": "source",
+      "bytes": 1236,
+      "sha256": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_checkpoint.cpp",
+      "scope": "source",
+      "bytes": 17225,
+      "sha256": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_checkpoint_coalescing.cpp",
+      "scope": "source",
+      "bytes": 5779,
+      "sha256": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_core.cpp",
+      "scope": "source",
+      "bytes": 11821,
+      "sha256": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_crash.cpp",
+      "scope": "source",
+      "bytes": 5099,
+      "sha256": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_durability.cpp",
+      "scope": "source",
+      "bytes": 8554,
+      "sha256": "880e6596d3b184438d09da50ac8cc6294f1742b40457fff20c5fd6f068932540"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_external.py",
+      "scope": "source",
+      "bytes": 6439,
+      "sha256": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_external_faults.cpp",
+      "scope": "source",
+      "bytes": 8968,
+      "sha256": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_fsspec.py",
+      "scope": "source",
+      "bytes": 4409,
+      "sha256": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_fuse.py",
+      "scope": "source",
+      "bytes": 29264,
+      "sha256": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_inline_publication.cpp",
+      "scope": "source",
+      "bytes": 5829,
+      "sha256": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_inode_refs.cpp",
+      "scope": "source",
+      "bytes": 6436,
+      "sha256": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_recovery.py",
+      "scope": "source",
+      "bytes": 7684,
+      "sha256": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_staging.cpp",
+      "scope": "source",
+      "bytes": 15372,
+      "sha256": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_staging.py",
+      "scope": "source",
+      "bytes": 1568,
+      "sha256": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_sync_syscalls.cpp",
+      "scope": "source",
+      "bytes": 4122,
+      "sha256": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_transaction_cache.cpp",
+      "scope": "source",
+      "bytes": 4641,
+      "sha256": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_vane.py",
+      "scope": "source",
+      "bytes": 16918,
+      "sha256": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests/test_workspace.py",
+      "scope": "source",
+      "bytes": 34164,
+      "sha256": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-budget-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-corrected-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-final-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-native.log",
+      "scope": "local-evidence",
+      "bytes": 1399,
+      "sha256": "c349ab8e0ab644fc82e3777261874565fdbc822861a72eef6a482cbd0fc76efb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-normal.log",
+      "scope": "local-evidence",
+      "bytes": 25,
+      "sha256": "649e314dfbc83ba9b8a4c320739224acc3781bbbf1228faa972c94291b294283"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-small.log",
+      "scope": "local-evidence",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline-writeback-test.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline/build/python-release/vane-fs-mount",
+      "scope": "binary",
+      "bytes": 1810184,
+      "sha256": "cd922e7611d074f72b3ceb3d9ef1c43c01f2616b4b09651400778fab8689ab6a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/baseline/writeback-test",
+      "scope": "binary",
+      "bytes": 1846712,
+      "sha256": "c2a9986b186b992f90953794fb8140f5145d137c9a24816b0b5a36260312e349"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/build.json",
+      "scope": "local-evidence",
+      "bytes": 15240,
+      "sha256": "88e312aac84318a4f4c0d002f54a2068f2cd71250ea93c6fd04a5ab62fe36487"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/checks.json",
+      "scope": "local-evidence",
+      "bytes": 526,
+      "sha256": "4e13341eba6749564235f6f43ed29bb74565bc374b3c42b3e65aee4dd62b4c22"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-input-check.json",
+      "scope": "local-evidence",
+      "bytes": 78,
+      "sha256": "9b4f73ec62e16714fef584be9dfa0488e42c276055971641d9f626fe06bfdff6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-2.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-3.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-4.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-baseline-5.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-2.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-3.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-4.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/aged-fuse-updated-5.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "33eec9b09770b3d728648149b506c85e7ea16df894b3e2c3ed880ad6e8561287"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "245183f1e02d503c7ff4f7855245d98cfeafa17f2f1b2429855f347fd736920b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-2.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "dc4a1b816e104f751723ea1867f6f0aff6605c4ba0ad0d406c0c3f542c34df52"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-3.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "e204dbaa09470c2423d9bd4eb057a87e9d42fe8d40a3660f2840b0ec4ecf5351"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-4.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "26f09524d2955e66c20f545cfef0010887fe968f2a0f2dbd959918dd12adaff8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-baseline-5.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "e15c3b7ca8a9373dfe983524cc7bacebd9c0ff85c5540034f48316ff4d538eac"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "495f55e2595fa9b39af2247a8fcb2aedb494bbe20eb5b9fa19010b5e3f45fc43"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "1c8d841ca3b6becb80a054500dcf80c79e510cb3ab2617687e824bddd713b160"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-2.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "1b3bc0ff0a810454ec403c9bfdaefecd3845b9952a7fb7a3e18eeb2613d50e68"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-3.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "36ab3e4715b35c263c6ab47e348786a494bac07f339c2f36bfb0ec3d14fd49f5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-4.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "45c7e703c8037ca3101ef6d2b0a92d4455f43006cd378ae3719db4c5a0cc2271"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/fuse-updated-5.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "c331e29e0964cdb9d3a461c6fb2599f16fbd2396b03d354c49508fe3043eae80"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/host.jsonl",
+      "scope": "local-evidence",
+      "bytes": 331015,
+      "sha256": "b304efb4bbceffc75bd8424c931f2924059313917f2f0d4ff253f3ed95947a34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/ext4-plain/results.json",
+      "scope": "local-evidence",
+      "bytes": 1251936,
+      "sha256": "84ef1bb970bf82b004d6fcffac3f1034419b91e470e4445b694825075b45d1aa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/fixture-correction.json",
+      "scope": "local-evidence",
+      "bytes": 495,
+      "sha256": "5179f9c6c24736d0fbe2e73e4634ed33c1eae389092cc4d406b42804668fe0b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/helper-builds.json",
+      "scope": "local-evidence",
+      "bytes": 10391,
+      "sha256": "9783a6f5185eaef09f5d4dd274e27c83c0bce12792e345320be37532c310c83e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-fixture-test.cpp",
+      "scope": "local-evidence",
+      "bytes": 16115,
+      "sha256": "e3d137aa81b35dc354ce18bbfb7c6f28e32e5a28cdcd9351702026e7c0b1ddf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-fixture-tests.json",
+      "scope": "local-evidence",
+      "bytes": 50845,
+      "sha256": "a90c45246d7dc0d6e5e701453ef414a17e398dd737c41cedabbd83bae7887a5f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 322,
+      "sha256": "7011cd4cfbfc1be7c7e44b3f4d0a80fe70e12f36b9063078b0cfde373b6a779a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-negative-pause-race.log",
+      "scope": "local-evidence",
+      "bytes": 45,
+      "sha256": "f59c97a88ad7fedd8fe4efffe5601d83e9a6af22577353a20df1149f0e99724c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-negative-tests.json",
+      "scope": "local-evidence",
+      "bytes": 4742,
+      "sha256": "c3f460ba30e61781d2a73d6a22303484e05d46bad29a674431ca6d5665e18d42"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/initial-snapshot-assumption.log",
+      "scope": "local-evidence",
+      "bytes": 25,
+      "sha256": "25050e0f890240121793945b209e8fa28b76455672ee2a316bfaf9815dc267fa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/negative-tests.json",
+      "scope": "local-evidence",
+      "bytes": 8853,
+      "sha256": "5620319d03cf41a228cffbaf46622063fb44745524bd10e20fa5bdc100bcaed7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/plan.json",
+      "scope": "local-evidence",
+      "bytes": 3627,
+      "sha256": "d786c24186e68b844dc68af575f8640c2f883a5eaceb7874d9a31d897a7282bd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/pr-before.json",
+      "scope": "local-evidence",
+      "bytes": 11028,
+      "sha256": "ba02527f97fdd8ce0903e2579378c8db6a7539ff7c256fdd36e334abb0ca0b6b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/pre-negative-correction-fixture.cpp",
+      "scope": "local-evidence",
+      "bytes": 16281,
+      "sha256": "f50848fe662f7b73fe0c87219476b57c9ecbcbd3dbc119726dbf4c25be32e57b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/pre-negative-final-tests.json",
+      "scope": "local-evidence",
+      "bytes": 110347,
+      "sha256": "62c10c1755ed0315b7b1ed8b723669519bca02251934f6b30345f423b9c3f507"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/run_fuse.py",
+      "scope": "local-evidence",
+      "bytes": 8831,
+      "sha256": "6e4ee94b5658ce6cd5e4b4bbfa22d0f5108a7e7146be48331c3c261cf69a433b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-barrier_error.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "f97ca64a43e7b6dcfa712d66624fd2e30bd93e5ed311f30806a29efd31320ecd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-blocked.log",
+      "scope": "local-evidence",
+      "bytes": 58,
+      "sha256": "891d3a070ee16985f160ddac2371ca89c5bde9933389bbe7e7c94d5eae1414e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-build.log",
+      "scope": "local-evidence",
+      "bytes": 1810,
+      "sha256": "8b14d2e50549b09cc1489527a18f0d7b7a184622713fd99e3306f39771983cec"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-close_blocked.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "1c55c04352daaaa6c666613eb5d8170d13272a7d9fc4700879669e6a15267260"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-close_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "b07c3aee1042bf0d083e13813f32946e0115446978f8aa644cda0f1a90366dab"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-coalesce.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "6981945399dcf5b65011e888614f7405a49fa344c9821ff31987768d4fc67e2a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-configure.log",
+      "scope": "local-evidence",
+      "bytes": 638,
+      "sha256": "32b81b924fe392ccb849ac99df6ad19250b471b71ff07d96cd13f505be187d5e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-crash.log",
+      "scope": "local-evidence",
+      "bytes": 76,
+      "sha256": "3ee91ed59be96b2e6852569712ae7fbf23095f84d54a0db351025104c1c77e0f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-fence_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "5814806a4a608ee26db243d5157ddb5c400c4017a9a3026c071d2fd091115120"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-fork.log",
+      "scope": "local-evidence",
+      "bytes": 55,
+      "sha256": "499a691383a16b830ec1f0c4728af40d258ea6cf4d2c6f289c7d794c9b249325"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-gc.log",
+      "scope": "local-evidence",
+      "bytes": 53,
+      "sha256": "509e153d34fa7f83773b6d20cec7cdd2dd2b247ecba608773f725de7816773cf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-interrupt.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "adbad9762db047ee93b8558471fc2018f8c63b1402a6c43495dab55902de4fa9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-invalid.log",
+      "scope": "local-evidence",
+      "bytes": 58,
+      "sha256": "2212f380013194bc6d43b9b76777b6852a457c6cc93519c24ca9904456ffdff1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-io_error.log",
+      "scope": "local-evidence",
+      "bytes": 59,
+      "sha256": "253665b6b93b60948cca117274bdcf84397667875c3dc15eb475f25fa6d6957c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-no_space.log",
+      "scope": "local-evidence",
+      "bytes": 59,
+      "sha256": "38272fc34c6450617ff5a0beeac1590af69108fc75feb5c8d69c18f210a3ef14"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-normal.log",
+      "scope": "local-evidence",
+      "bytes": 57,
+      "sha256": "3ea8d842a2b76f9e72146e95da8132a3874edb33301d66aa825a7cb2547f29c8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-normal_snapshot.log",
+      "scope": "local-evidence",
+      "bytes": 66,
+      "sha256": "4774f5b3539ce82b4ab97e3ab0dd4ed7e3509097803bca2c31a339b4071c3eb5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-not_supported.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "8a0c64eb0c0339e796afa3cd87abde7e42b5cbd43667d58c6a4bcaf9284bad98"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-pause_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "8e1572d5309df7955a203ae9c0a5a525d2638243923783a3838a8667556c4f19"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-pause_fence.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "09d043551d841d3845d74446189a86ce8196f117c4a4560c09d10b04d813557a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-pause_full.log",
+      "scope": "local-evidence",
+      "bytes": 61,
+      "sha256": "e1be23519025fb1d11a238ff496d9a9d53a43fdb2b4ca19b894a153750e80a23"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-pause_wal.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "b72e54167a2f3212fb00f5ab4884628181224d18ca53b6ad64d336ff06a45341"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-post_barrier_error.log",
+      "scope": "local-evidence",
+      "bytes": 69,
+      "sha256": "031cbfebb28bc76933f96b9e0798a5ed1251eaa0ffd0d0004efcb82bf618ef34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-small.log",
+      "scope": "local-evidence",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-strict.log",
+      "scope": "local-evidence",
+      "bytes": 57,
+      "sha256": "2a3b5ca525b54b6a249e98d8167a603a5f195c847cc1a36dacd412ba8587189c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-tests.log",
+      "scope": "local-evidence",
+      "bytes": 1386,
+      "sha256": "50348dc86eff27709f785bbd154e7126ab66b8d7905092d7a12c33fe10a543b3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-unsupported.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "31008cbb60e9cf482168577e819f8139a80867391487eab990770d211c3de529"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize-writeback-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/sanitize.json",
+      "scope": "local-evidence",
+      "bytes": 389,
+      "sha256": "1d35a9ed39bef12f2fd945502570fd3158c1cd83fd61e82aa5be3b14992c6b4c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/source-identity.json",
+      "scope": "local-evidence",
+      "bytes": 12355,
+      "sha256": "89550f55433b3dce680e102950097594188696f7f242a5e28d431400cbf0dd4f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/summary.json",
+      "scope": "local-evidence",
+      "bytes": 136285,
+      "sha256": "970e326abaa9a5906fbd4c913158b6a30f72855bb80382cb868fe95c28a64f6f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_acknowledged_write_surviv0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 796,
+      "sha256": "c3d081d1311f3f4b97773727a27230899f0838f84950f476038edfc85695f0e5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_acknowledged_write_surviv1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1332,
+      "sha256": "ae8b6b7c00d979f7cbede000f2713adfab3d992e87ed4460da6eab3b7d856167"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_acknowledged_write_surviv2/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 3476,
+      "sha256": "ab77cbc04742539ee7c26d818be95a13e9ae7a639c6e50f37d411f33d529a6e4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_cached_atime_alias_tracks0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1283,
+      "sha256": "c473f4b7ad6ce31a7109d521a8aa9dee414e932a31e505eec4174b50f63bf978"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_cached_atime_alias_tracks1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1316,
+      "sha256": "75e6de198928ce3ddbdc54b71eda734c37232599f789212f721983b91f71abdb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_cached_metadata_observes_0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 10300,
+      "sha256": "f966526e83c34f2b323528c8103afb8463b6bab231620a9726a0223e4fbcbbcd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_directory_listing_is_capt0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 3784,
+      "sha256": "83ac3016b9f404fb348c4d07f32b930df78cb709e8de59a907e5bc5e6eb730dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_directory_lists_belong_to0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 3497,
+      "sha256": "c09b46260d1bea14526aa911183efe1daec815049a1effce08da11eb86caae96"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_directory_pagination_is_s0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 716049,
+      "sha256": "86ed762b85f6791becee6a91c4c4006fa5b0a6313b49177e843b4cb97cfb543b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_directory_pagination_is_s1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 847768,
+      "sha256": "65f0248722022ae0010cad1e475a705dde9cd614302ac35d355754449a980700"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_directory_pagination_is_s2/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 33122,
+      "sha256": "50307cc0ab8441c2f96be2aa43c71406e15c651215cb91cc27b08135a7ba7275"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_failed_final_commit_makes0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1170,
+      "sha256": "6786e67cb78784daf613865f88528674e8267d8699946f1c2046d1b684e0f1d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_barriers_and_r0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 9701,
+      "sha256": "0bad2e3896df37c64664abdd1a33d02671863405851dc479c96bc5c2c28a23e3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_barriers_and_r1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 9701,
+      "sha256": "0bad2e3896df37c64664abdd1a33d02671863405851dc479c96bc5c2c28a23e3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_barriers_and_r2/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 9955,
+      "sha256": "1e5d70d1e5b770e684539d42823526463f716bf82ac3df3e0262f418e9e1b9ce"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_barriers_and_r3/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 9282,
+      "sha256": "94924572b816eecc45c2880175f2a72253e4e92cc64cf0fc061dc48bd5ca9b3b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_barriers_and_r4/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 9282,
+      "sha256": "94924572b816eecc45c2880175f2a72253e4e92cc64cf0fc061dc48bd5ca9b3b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_clean_unmount_0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 18984,
+      "sha256": "ce24a240548b15f551997a136e09ba5d8895cc78555d4afac53c37289c6f0380"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_failed_barrier0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1882,
+      "sha256": "bdf4e68125c01798bb9dc2b59302a0b91d8432fb5eba6d2a9ef8297e206010cc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_fsync_mode_failed_barrier1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1684,
+      "sha256": "17c3143d667acfa6f89473d0ac68424e6f7c1b5a4940b9d14d8d9a7f8ee44c34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_live_handles_observe_othe0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 21281,
+      "sha256": "683c24eef387f8970e740474a07f22ceb281a13ec30a7e1eed120aeb73819611"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_live_handles_observe_othe1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 21497,
+      "sha256": "778fa415258719db2b0853b68cff0e9510e5717186d59ed29b8fdc7e74e34ae5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_live_mount_namespace_meta0/mount-branch-8b06937b8635ab7ea79a8313828d0a3f.log",
+      "scope": "local-evidence",
+      "bytes": 5655,
+      "sha256": "30d02e7a3d48dd5be97afbda94d732b2b5f4d25718af395179fe3e265e98c2ba"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_mount_crash_reclaims_orph0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1782,
+      "sha256": "f05a3c1be3b89ccd7b54401bb2ece162ab31a3c4d27519e0a9fbabb8830c488f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_open_handles_survive_unli0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 7404,
+      "sha256": "7cd8565f0451125a421bb6ea4cc34cf0461ee2ce8f5d26a1ec2e6de8f2efd2dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_open_handles_survive_unli1/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 7404,
+      "sha256": "7cd8565f0451125a421bb6ea4cc34cf0461ee2ce8f5d26a1ec2e6de8f2efd2dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_repeated_open_release_doe0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 28260,
+      "sha256": "36553b754f56514fef2f561fd3b86a8dd82bed89125b8f6aa4660478d3174c7c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_snapshot_mount_is_pinned_0/mount-snapshot-4d8afd0fcc65bca2308091b993458f5f.log",
+      "scope": "local-evidence",
+      "bytes": 1927,
+      "sha256": "e7d181ce1b201b4d3e5c0573fab539b6d0cfdc179531a03642f35e9fb0cbc768"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_unread_directory_handle_s0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 1227,
+      "sha256": "2927619714f17a816d7cdd74bc6d6f76781ba8168aa1bb064ceb73863af4dd34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_warm_stat_reuses_kernel_m0/mount-branch-main.log",
+      "scope": "local-evidence",
+      "bytes": 635,
+      "sha256": "925f95a84e54e9ad05457c37ef4a092cc61628b84f7c006688b8256aea2fbee7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/test-logs/test_warm_stat_reuses_kernel_m1/mount-snapshot-cf3184aac1778eb1739d4cfe4284c00b.log",
+      "scope": "local-evidence",
+      "bytes": 635,
+      "sha256": "925f95a84e54e9ad05457c37ef4a092cc61628b84f7c006688b8256aea2fbee7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tests.json",
+      "scope": "local-evidence",
+      "bytes": 3903,
+      "sha256": "3a942c582adc9d2061a1453348270674e1ac726c0a8346737c952e178fccada0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-input-check.json",
+      "scope": "local-evidence",
+      "bytes": 78,
+      "sha256": "9b4f73ec62e16714fef584be9dfa0488e42c276055971641d9f626fe06bfdff6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-2.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-3.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-4.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-baseline-5.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-2.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-3.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-4.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/aged-fuse-updated-5.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "55db7ee89e6195bbfe9b488235b0e40943470c089c9ad693590c906bac6162e3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "865bbc8002265631fddac19c74eee331534fa8baa18cfaedf6446a6bdf40f619"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-2.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "659ea99f88363aa0f5486379071e67b56283896463cf752638e972ec9e2bb47e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-3.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "fb22b9bc79fefeeac35d5696153fca66e444fe65e9a1948d77da58e6038b54b3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-4.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "dd576cc4b4d82b1d85e67234b432248adb8eab612d9e013622ce5dc6d80b38a2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-baseline-5.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "fd94f8adb4efedab4b5e334ee8943414e21c99f1055d2162482b3f150fcb83dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "2a75803207963728b253825e7c7656e79df2625682a88fe52998f482b5e242e4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "365f45ceeaaab2805a11b7ee5e331eb396b8e5cfde942dd2a4ddc6833ea355d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-2.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "5c9b07287ab8349fe10618c52d0c2c5bad8ee8b5b7be3c3894f68109ad970d89"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-3.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "0e5f4c0c32ca06f57a2427f0a7da09768c3c9b9a7265a64a80af862118517f61"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-4.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "d2ab4741892d3b6079e0d8c8cef66839f11db50eab4d46f56bf318a5e4437831"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/fuse-updated-5.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "d5d99a25b02f18db9629a409d0a80e7e4b7497b5e7453e03f7ef382b128eee7e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/host.jsonl",
+      "scope": "local-evidence",
+      "bytes": 276509,
+      "sha256": "b73b876e755e3be6a1503ff3087e1503358282c5291771f4dfd2bc2395534155"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/tmpfs-plain/results.json",
+      "scope": "local-evidence",
+      "bytes": 1233770,
+      "sha256": "9607f3aa33eecdb79f1bbcf3d220dbc840fb4f3545c606a316f6e1d131051f61"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-budget-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-corrected-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-final-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-normal.log",
+      "scope": "local-evidence",
+      "bytes": 37,
+      "sha256": "6d0dcb9a65125be16b87c11f54d638df54f390f564de3c7b1c3ae2a461c40e02"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-pause_fence.log",
+      "scope": "local-evidence",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-pause_full.log",
+      "scope": "local-evidence",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted-pause_wal.log",
+      "scope": "local-evidence",
+      "bytes": 47,
+      "sha256": "e2c5526d2330cb5cfc8add798bac712f7a601f5f455dca4685befc409cb1ff49"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/unbudgeted/writeback-test",
+      "scope": "binary",
+      "bytes": 1851496,
+      "sha256": "a738e0af4bab259691d463a387eb6dda980cf5a13dfec265053a7162e60db1e8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-barrier_error.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "f97ca64a43e7b6dcfa712d66624fd2e30bd93e5ed311f30806a29efd31320ecd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-blocked.log",
+      "scope": "local-evidence",
+      "bytes": 58,
+      "sha256": "891d3a070ee16985f160ddac2371ca89c5bde9933389bbe7e7c94d5eae1414e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-budget-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-close_blocked.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "1c55c04352daaaa6c666613eb5d8170d13272a7d9fc4700879669e6a15267260"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-close_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "8d0ca1b2813ac1ec35d635fac61fc442e1e49141b2f35fe6e06d4c00fb3b5bcb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-coalesce.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "6981945399dcf5b65011e888614f7405a49fa344c9821ff31987768d4fc67e2a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-corrected-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-crash.log",
+      "scope": "local-evidence",
+      "bytes": 76,
+      "sha256": "3ee91ed59be96b2e6852569712ae7fbf23095f84d54a0db351025104c1c77e0f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-fence_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "5814806a4a608ee26db243d5157ddb5c400c4017a9a3026c071d2fd091115120"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-final-helper-build.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-fork.log",
+      "scope": "local-evidence",
+      "bytes": 55,
+      "sha256": "499a691383a16b830ec1f0c4728af40d258ea6cf4d2c6f289c7d794c9b249325"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-gc.log",
+      "scope": "local-evidence",
+      "bytes": 53,
+      "sha256": "509e153d34fa7f83773b6d20cec7cdd2dd2b247ecba608773f725de7816773cf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-install.log",
+      "scope": "local-evidence",
+      "bytes": 528,
+      "sha256": "dcb5580658899020a5921bc5fcec861103b923f3066bdfaa23bf99d583eab1e0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-interrupt.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "adbad9762db047ee93b8558471fc2018f8c63b1402a6c43495dab55902de4fa9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-invalid.log",
+      "scope": "local-evidence",
+      "bytes": 58,
+      "sha256": "2212f380013194bc6d43b9b76777b6852a457c6cc93519c24ca9904456ffdff1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-io_error.log",
+      "scope": "local-evidence",
+      "bytes": 59,
+      "sha256": "253665b6b93b60948cca117274bdcf84397667875c3dc15eb475f25fa6d6957c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-module-identity.log",
+      "scope": "local-evidence",
+      "bytes": 167,
+      "sha256": "015b48e4eb9382d80197ff8f01e590d194db3f1554195623ba9215060f82bab6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-native.log",
+      "scope": "local-evidence",
+      "bytes": 1398,
+      "sha256": "88a18910891016bf49641b78646500c2c45f1362cd822caacf615ae9b09ebddc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-no_space.log",
+      "scope": "local-evidence",
+      "bytes": 59,
+      "sha256": "38272fc34c6450617ff5a0beeac1590af69108fc75feb5c8d69c18f210a3ef14"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-normal.log",
+      "scope": "local-evidence",
+      "bytes": 57,
+      "sha256": "3ea8d842a2b76f9e72146e95da8132a3874edb33301d66aa825a7cb2547f29c8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-normal_snapshot.log",
+      "scope": "local-evidence",
+      "bytes": 66,
+      "sha256": "4774f5b3539ce82b4ab97e3ab0dd4ed7e3509097803bca2c31a339b4071c3eb5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-not_supported.log",
+      "scope": "local-evidence",
+      "bytes": 64,
+      "sha256": "8a0c64eb0c0339e796afa3cd87abde7e42b5cbd43667d58c6a4bcaf9284bad98"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-pause_error.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "8e1572d5309df7955a203ae9c0a5a525d2638243923783a3838a8667556c4f19"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-pause_fence.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "09d043551d841d3845d74446189a86ce8196f117c4a4560c09d10b04d813557a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-pause_full.log",
+      "scope": "local-evidence",
+      "bytes": 61,
+      "sha256": "e1be23519025fb1d11a238ff496d9a9d53a43fdb2b4ca19b894a153750e80a23"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-pause_wal.log",
+      "scope": "local-evidence",
+      "bytes": 60,
+      "sha256": "b72e54167a2f3212fb00f5ab4884628181224d18ca53b6ad64d336ff06a45341"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-post_barrier_error.log",
+      "scope": "local-evidence",
+      "bytes": 69,
+      "sha256": "031cbfebb28bc76933f96b9e0798a5ed1251eaa0ffd0d0004efcb82bf618ef34"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-python.log",
+      "scope": "local-evidence",
+      "bytes": 1041,
+      "sha256": "287b4352d0a035004a306a1f583fa5451f535edcb7c8e46ad59ff525ccaebabc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-small.log",
+      "scope": "local-evidence",
+      "bytes": 56,
+      "sha256": "ced43d5af375107624bdfc672c408c54cd0aa123f37abf18e2942c1b78da8967"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-snapshot_pause.log",
+      "scope": "local-evidence",
+      "bytes": 25,
+      "sha256": "25050e0f890240121793945b209e8fa28b76455672ee2a316bfaf9815dc267fa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-strict.log",
+      "scope": "local-evidence",
+      "bytes": 57,
+      "sha256": "2a3b5ca525b54b6a249e98d8167a603a5f195c847cc1a36dacd412ba8587189c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-unsupported.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "31008cbb60e9cf482168577e819f8139a80867391487eab990770d211c3de529"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-venv.log",
+      "scope": "local-evidence",
+      "bytes": 245,
+      "sha256": "c305e0378cf15d0196fadedb39d4c50cbeb9231ee5740b076ab36eff783e0bfa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated-writeback-test.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/CMakeLists.txt",
+      "scope": "dependency",
+      "bytes": 7958,
+      "sha256": "6f8a48d4df6157b94415b5ea015e20e81b64338ca0267ea5756d8bdbb151f1dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/build/python-release/libvane_fs.a",
+      "scope": "dependency",
+      "bytes": 577338,
+      "sha256": "2afe8ef4699e8d5792c868908798e41bd0ac572b9684c179a1dc1a0e2e9cd024"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/build/python-release/vane-fs",
+      "scope": "dependency",
+      "bytes": 1778304,
+      "sha256": "2163e1d9790293ac494927d90b48e83cff388a6be11d9ca70c6de5c4403ba8d9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/build/python-release/vane-fs-mount",
+      "scope": "binary",
+      "bytes": 1819152,
+      "sha256": "ace9a1f067433e7b93827e3af3fc28c8ce4dd5c0d5f37172b49cc87dd1d5ff2e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/include/vane_fs/reader_abi.h",
+      "scope": "source",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/include/vane_fs/workspace.hpp",
+      "scope": "source",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/pyproject.toml",
+      "scope": "dependency",
+      "bytes": 1075,
+      "sha256": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/python/vane_fs/__init__.py",
+      "scope": "source",
+      "bytes": 788,
+      "sha256": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/python/vane_fs/fsspec.py",
+      "scope": "source",
+      "bytes": 5016,
+      "sha256": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/python/vane_fs/vane.py",
+      "scope": "source",
+      "bytes": 1674,
+      "sha256": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/libvane_fs.a",
+      "scope": "sanitized-binary",
+      "bytes": 19047094,
+      "sha256": "6c1a6a9516fe3ab8de91fa4a6c944be2dba6724b6fcadcc2a9df64ca4acc587d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_checkpoint_coalescing_test",
+      "scope": "sanitized-binary",
+      "bytes": 15899256,
+      "sha256": "60e0f30cd4cdde3a1ea598507c349a4bb282460f28035eb073d46fdfdc8a8a1b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_checkpoint_test",
+      "scope": "sanitized-binary",
+      "bytes": 15781008,
+      "sha256": "3f352b67ee14af7ec404474704e9ebd8ee44b462123a7decd0717a657a1d4c56"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_crash_test",
+      "scope": "sanitized-binary",
+      "bytes": 15169896,
+      "sha256": "45622548a28af40d60f7fa9fa32ac2ecbadb1afd23d99cfe272910fc7dfaa5d6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_durability_test",
+      "scope": "sanitized-binary",
+      "bytes": 15445936,
+      "sha256": "11c77450a049e9c561497fa45539140c90b03ace389ab3b747b881b265175ddb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_external_faults_test",
+      "scope": "sanitized-binary",
+      "bytes": 15148256,
+      "sha256": "7904aa4a78f801b68ea9e06eaa70b8a56644bd44a3e94c0a1922ceb9c4a4e9fc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_inline_publication_test",
+      "scope": "sanitized-binary",
+      "bytes": 15535832,
+      "sha256": "1fb118230f01720ef293429ac1fbd82d8daca92370fcdef44c0d678f8bc2d5b4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_inode_refs_test",
+      "scope": "sanitized-binary",
+      "bytes": 14751384,
+      "sha256": "5c2f390213e4421e02a64adf006c4e9b558729a6f4fac47f1a224ae0538ecd71"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_staging_test",
+      "scope": "sanitized-binary",
+      "bytes": 15759720,
+      "sha256": "218a8049e9a0dea3337c0c9488ceb84afb8b1566986a4441f5e3eeb00fcf2af3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_sync_syscalls_test",
+      "scope": "sanitized-binary",
+      "bytes": 14677536,
+      "sha256": "e2e7dcfe925361049244c4d983bc353c0c6a4d3a3bff10bfcf150877120ed3cf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_test",
+      "scope": "sanitized-binary",
+      "bytes": 15550224,
+      "sha256": "ede4b7a0b3708bf3b666186509ef42a05d031b9b14fd9be8ffc8511da626e2f3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/vane_fs_transaction_cache_test",
+      "scope": "sanitized-binary",
+      "bytes": 14592984,
+      "sha256": "ac62cb79f75cd33c3c298c040da777d4fbacd8052a9c9b93e1a6e1be9b670244"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/sanitize/writeback-test",
+      "scope": "sanitized-binary",
+      "bytes": 15652800,
+      "sha256": "8026450d4aa15e12cdbb9718d8b5bcb0e7d7fcf7d75fd68a068066b2d7038fd4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/benchmark.cpp",
+      "scope": "source",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/checkpoint.hpp",
+      "scope": "source",
+      "bytes": 7037,
+      "sha256": "290cafaf0a8919fb499ab33b1597c8c3c13839369063b90c766edb28f623aa5a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/cli.cpp",
+      "scope": "source",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/fuse.cpp",
+      "scope": "source",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/native_reader.cpp",
+      "scope": "source",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/native_reader.hpp",
+      "scope": "source",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/owner_lock.hpp",
+      "scope": "source",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/payload_file.hpp",
+      "scope": "source",
+      "bytes": 6514,
+      "sha256": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/python.cpp",
+      "scope": "source",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/staging.hpp",
+      "scope": "source",
+      "bytes": 18913,
+      "sha256": "6f312ea4a10b488d67ee8cb5f3a4db9b0c196a9fa8986b1c424ff8db9ffc068e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/src/workspace.cpp",
+      "scope": "source",
+      "bytes": 88399,
+      "sha256": "2b22fb3af55b06c31730f4f64afc796202633760ce27dbc29ddf29631b512b0a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/conftest.py",
+      "scope": "source",
+      "bytes": 1236,
+      "sha256": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_checkpoint.cpp",
+      "scope": "source",
+      "bytes": 17225,
+      "sha256": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_checkpoint_coalescing.cpp",
+      "scope": "source",
+      "bytes": 5779,
+      "sha256": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_core.cpp",
+      "scope": "source",
+      "bytes": 11821,
+      "sha256": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_crash.cpp",
+      "scope": "source",
+      "bytes": 5099,
+      "sha256": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_durability.cpp",
+      "scope": "source",
+      "bytes": 8554,
+      "sha256": "880e6596d3b184438d09da50ac8cc6294f1742b40457fff20c5fd6f068932540"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_external.py",
+      "scope": "source",
+      "bytes": 6439,
+      "sha256": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_external_faults.cpp",
+      "scope": "source",
+      "bytes": 8968,
+      "sha256": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_fsspec.py",
+      "scope": "source",
+      "bytes": 4409,
+      "sha256": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_fuse.py",
+      "scope": "source",
+      "bytes": 29264,
+      "sha256": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_inline_publication.cpp",
+      "scope": "source",
+      "bytes": 5829,
+      "sha256": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_inode_refs.cpp",
+      "scope": "source",
+      "bytes": 6436,
+      "sha256": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_recovery.py",
+      "scope": "source",
+      "bytes": 7684,
+      "sha256": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_staging.cpp",
+      "scope": "source",
+      "bytes": 15372,
+      "sha256": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_staging.py",
+      "scope": "source",
+      "bytes": 1568,
+      "sha256": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_sync_syscalls.cpp",
+      "scope": "source",
+      "bytes": 4122,
+      "sha256": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_transaction_cache.cpp",
+      "scope": "source",
+      "bytes": 4641,
+      "sha256": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_vane.py",
+      "scope": "source",
+      "bytes": 16918,
+      "sha256": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/tests/test_workspace.py",
+      "scope": "source",
+      "bytes": 34164,
+      "sha256": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "scope": "binary",
+      "bytes": 1960904,
+      "sha256": "fc45452661ed31a6f6ebc6dd2f6d9b779be584cb13a07c4339ad74ae0cb6b3f7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/updated/writeback-test",
+      "scope": "binary",
+      "bytes": 1851528,
+      "sha256": "bb2a8058364025121fbd5610bdf5c0e3b530a269c61b60eb8dc3ef1ddd62ead4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/workload.py",
+      "scope": "local-evidence",
+      "bytes": 21594,
+      "sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/writeback-patch.log",
+      "scope": "local-evidence",
+      "bytes": 62,
+      "sha256": "1eed20444a1380f29a6471b91ed12e69056dee22b19e742c024e5345bdaf3c66"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/writeback-tests.json",
+      "scope": "local-evidence",
+      "bytes": 119144,
+      "sha256": "e101f8b699cfdd492e25c50645863180710c2eb6f6775858884c7156c9af2135"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/background-diagnostic.json",
+      "scope": "local-evidence",
+      "bytes": 6136,
+      "sha256": "ba08f758630e872903ee958c0a36a332f0be76f0aa893145c0e3fa0106e398c9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/baseline-configure.log",
+      "scope": "local-evidence",
+      "bytes": 653,
+      "sha256": "4d550abfcbd9f9f8a2101a118c0c9e3169216ff56dc04d098f4086c1260843dc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/baseline-library.log",
+      "scope": "local-evidence",
+      "bytes": 115,
+      "sha256": "c0272452a9c70e631058cd919fdd18339f27ea6a42fc726e90d7282cc2c7276d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/baseline-mount.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/build.json",
+      "scope": "local-evidence",
+      "bytes": 10217,
+      "sha256": "2b7e32a0f741255f486643de8c865d82c302f0560eeac92399bc7fa034e0581e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic-summary.json",
+      "scope": "local-evidence",
+      "bytes": 43763,
+      "sha256": "68cd37ca2ae16c29300d1117c50cad858355cd6b13ffb25d56ab356a796376c1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/build/libvane_fs.a",
+      "scope": "binary",
+      "bytes": 566236,
+      "sha256": "a98f2f8fa8cb9b6501983fcf1b80232aef9c1929da0a077528d8703e363f6936"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/build/vane-fs-mount",
+      "scope": "binary",
+      "bytes": 1842832,
+      "sha256": "2158da3b36ba816e7cf3591d67af12239dc5bd9c8619223539a1fcd31c5a1361"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/include/vane_fs/reader_abi.h",
+      "scope": "instrumented-source",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/include/vane_fs/workspace.hpp",
+      "scope": "instrumented-source",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/benchmark.cpp",
+      "scope": "instrumented-source",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/checkpoint.hpp",
+      "scope": "instrumented-source",
+      "bytes": 7150,
+      "sha256": "518e02cdddcc9eb7162101f9b07088ab1783b442f009b76c5d1b5bcf4c490283"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/cli.cpp",
+      "scope": "instrumented-source",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/fuse.cpp",
+      "scope": "instrumented-source",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/native_reader.cpp",
+      "scope": "instrumented-source",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/native_reader.hpp",
+      "scope": "instrumented-source",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/owner_lock.hpp",
+      "scope": "instrumented-source",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/payload_file.hpp",
+      "scope": "instrumented-source",
+      "bytes": 6514,
+      "sha256": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/payload_trace.hpp",
+      "scope": "instrumented-source",
+      "bytes": 636,
+      "sha256": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/python.cpp",
+      "scope": "instrumented-source",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/staging.hpp",
+      "scope": "instrumented-source",
+      "bytes": 14512,
+      "sha256": "60002f5e6e08506923b0ad0c323d0ada557a0ee6a4051c9ceed3c30b4a1f898c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/baseline/src/workspace.cpp",
+      "scope": "instrumented-source",
+      "bytes": 88106,
+      "sha256": "d085da3b26f58faec2f333e0d087d4ba06a3b0db776eb21b634b88041fb6e712"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/build/libvane_fs.a",
+      "scope": "binary",
+      "bytes": 582012,
+      "sha256": "02af398d7f4a0ea4b83a82d5a9138cd3791a59ad662c4583464083093ba58cf6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/build/vane-fs-mount",
+      "scope": "binary",
+      "bytes": 1847936,
+      "sha256": "9dfa58cf070144c7fd21921e9bf09d24703955d2cd08862ce5366aa1dfbf65a5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/include/vane_fs/reader_abi.h",
+      "scope": "instrumented-source",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/include/vane_fs/workspace.hpp",
+      "scope": "instrumented-source",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/benchmark.cpp",
+      "scope": "instrumented-source",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/checkpoint.hpp",
+      "scope": "instrumented-source",
+      "bytes": 7150,
+      "sha256": "518e02cdddcc9eb7162101f9b07088ab1783b442f009b76c5d1b5bcf4c490283"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/cli.cpp",
+      "scope": "instrumented-source",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/fuse.cpp",
+      "scope": "instrumented-source",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/native_reader.cpp",
+      "scope": "instrumented-source",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/native_reader.hpp",
+      "scope": "instrumented-source",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/owner_lock.hpp",
+      "scope": "instrumented-source",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/payload_file.hpp",
+      "scope": "instrumented-source",
+      "bytes": 6514,
+      "sha256": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/payload_trace.hpp",
+      "scope": "instrumented-source",
+      "bytes": 636,
+      "sha256": "7c28e294cb02689cfe3d00a2531f4f447334a71769f606ff1712cae33a919044"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/python.cpp",
+      "scope": "instrumented-source",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/staging.hpp",
+      "scope": "instrumented-source",
+      "bytes": 19554,
+      "sha256": "6f82a4d29a88efce88181c396ff5ae15391df04421cb8caa7db27c80175dcb96"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/diagnostic/updated/src/workspace.cpp",
+      "scope": "instrumented-source",
+      "bytes": 88399,
+      "sha256": "2b22fb3af55b06c31730f4f64afc796202633760ce27dbc29ddf29631b512b0a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/aged-fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/aged-fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/aged-fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/aged-fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/fuse-baseline-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "458d9dd5355a4e04d3d33d0f921de7b193a8fce16c3efd041aaf06527a0d3717"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/fuse-baseline-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "f06cd7cc37d4bbf0b8991d59dfc57e6d2347da5616be5cf267842a5408c4e1ba"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/fuse-updated-0.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "36dde7696b67097b1936f55dd97e094085517d986638cb83e7b020bd7eb5c146"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/fuse-updated-1.log",
+      "scope": "local-evidence",
+      "bytes": 33,
+      "sha256": "9ced12ecdc585a45742fd6186ae8af2761a57d57deba2cc0a226004636c3d4dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/host.jsonl",
+      "scope": "local-evidence",
+      "bytes": 129796,
+      "sha256": "694f788d5ad3f77e6b381ab35594e58c5e34017ac8bfbfcd4d21167141d2be29"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/results.json",
+      "scope": "local-evidence",
+      "bytes": 423443,
+      "sha256": "0674957108638f167ecb05b5d8ec50c95f31938c20f3543e5b2aa6459d9c9af0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-60gc4a55-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 614254,
+      "sha256": "63baba19dd5875495a9c92f20ababf8c8947e32afb7f49885f88a2d4cffe02db"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-60gc4a55-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1084163,
+      "sha256": "54d85ff272e861c197745eb331b683e079e29fe6f0a05920ff1ce47ec25b8408"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-a26ze67k-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 602399,
+      "sha256": "9084c5975c4c3b4b7bfe6b389669e5ec6836f16bdc06d649e6e8a2d7a2414cb9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-a26ze67k-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1107252,
+      "sha256": "e6723524d714d088659a0f6ed5aed2328c8dcdf5d4f61ef2aeb9ab850c8a05e6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-l485tsjf-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 670885,
+      "sha256": "a85f67d49641e212d67cb96b391faf6f1e4c141bbb2560c2a7f747fde0b1ab12"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-l485tsjf-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1458554,
+      "sha256": "08263d9fc56a94fc7314244300bd7e101aa0bd4566870263fc29f1040d3b9c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-mpozo5fu-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 655657,
+      "sha256": "ba34fc003c8ab64598c49f506a50dcd7f8353b1b3bf1471cd5feff7c7583268f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-aged-mpozo5fu-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1445226,
+      "sha256": "b8a7267cbf3ae0cc23bcb5c4f5fa0c05d23c9288fd758b56764c2f23a80c1ae0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-9b28ob1v-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 405822,
+      "sha256": "7d275a9a5e38e6cf76913fbc506809e24f63cd088db4680e59978c82fdfbc91a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-9b28ob1v-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 929638,
+      "sha256": "e0ffdbf223644a468f7dcec6d971b65bd8ca435dd3dfb3c71c6c9ef333cd6120"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-9zu7o5r9-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 536910,
+      "sha256": "2ccfc24087f6865c19ad2878f60706170b4f9553dcb18e29ec8cce017089578e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-9zu7o5r9-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1253892,
+      "sha256": "5571efabaad734cd4735e5440385dfe7a61db2cec742951d379628acce8c06ee"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-h12498bs-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 412132,
+      "sha256": "89d24d42c1f6e6ff507105956150e064b76cadca09900905a91a0ee85d0f75bc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-h12498bs-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 911097,
+      "sha256": "a682c59446e3c6b030c03297efcc2fa09c7831ac571fd483d1aa0a781657a5ef"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-hij3egzz-timeline.json",
+      "scope": "local-evidence",
+      "bytes": 514527,
+      "sha256": "a2250645b2622ae6c402b8997c55c91725065282e8eaa5e6b40dd15137ed1ef7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/ext4-diagnostic/vane-partial-owned-fuse-hij3egzz-waits.jsonl",
+      "scope": "local-evidence",
+      "bytes": 1207540,
+      "sha256": "a1e62676fb5d1c2a83d852c1919f959d5e1a82c936ac3c361cd3de9a3970ab98"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/plan.json",
+      "scope": "local-evidence",
+      "bytes": 1251,
+      "sha256": "3890d5f7d8c70fe7cce1e2f183bec69b9a9d55316969fa873f067f7ccf35caf0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/run_fuse.py",
+      "scope": "local-evidence",
+      "bytes": 10070,
+      "sha256": "e61d325bf28d9be470d83a72f750fc7f2ee8c76f0e12b29542e070fe1d251268"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/tests.json",
+      "scope": "local-evidence",
+      "bytes": 3903,
+      "sha256": "3a942c582adc9d2061a1453348270674e1ac726c0a8346737c952e178fccada0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/timeline.cpp",
+      "scope": "local-evidence",
+      "bytes": 10051,
+      "sha256": "b8761877c018c28ade8c7ab526f35b67d35f32c6ba71079f7983a1d3d517c706"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/updated-configure.log",
+      "scope": "local-evidence",
+      "bytes": 652,
+      "sha256": "5c58e469d6886a1c9eaffceae0a4cb154c6a7ca93ffdf1070a4fc334a0187e92"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/updated-library.log",
+      "scope": "local-evidence",
+      "bytes": 115,
+      "sha256": "c0272452a9c70e631058cd919fdd18339f27ea6a42fc726e90d7282cc2c7276d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/updated-mount.log",
+      "scope": "local-evidence",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-trace-20261011T171724Z/workload.py",
+      "scope": "local-evidence",
+      "bytes": 21594,
+      "sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+      "scope": "dependency",
+      "bytes": 1713626,
+      "sha256": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+    }
+  ]
+}
