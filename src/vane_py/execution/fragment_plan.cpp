@@ -771,6 +771,13 @@ public:
 	    : context(context), plan(plan), graph(graph), partitions(partitions),
 	      broadcast_limit(
 	          MaxValue<idx_t>(8 * 1024 * 1024, MinValue<idx_t>(64 * 1024 * 1024, worker_operator_bytes / 16))) {
+		// Reserve 128 bytes per bucket for partial/final grouping and probe hash
+		// tables as well as the encoded keys. Keep the conservative domain
+		// without declared memory; larger budgets can reduce collisions.
+		const auto bucket_capacity = broadcast_limit / 128;
+		while (hash_bucket_count <= bucket_capacity / 2) {
+			hash_bucket_count *= 2;
+		}
 	}
 
 	string Finish(DistributedSubtree subtree, const vector<string> &names = {}) {
@@ -950,6 +957,7 @@ private:
 	FragmentGraph &graph;
 	idx_t partitions;
 	idx_t broadcast_limit;
+	idx_t hash_bucket_count = 65536;
 	idx_t next_exchange = 0;
 	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
@@ -1197,12 +1205,12 @@ private:
 			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
 			if (target.hashed) {
 				// HAVING estimates can hide a tiny build. A distinct hash domain
-				// has at most 65536 entries even when that estimate is wrong.
+				// has a budget-bounded size even when that estimate is wrong.
 				// Collisions only retain extra probes; the original join is exact.
-				if (target.input->estimated_cardinality <= 8 * 65536) {
+				if (target.input->estimated_cardinality <= 8 * hash_bucket_count) {
 					continue;
 				}
-				key_bytes = 65536 * 9;
+				key_bytes = hash_bucket_count * 9;
 			} else {
 				// Key replicas can use the same bounded per-query allowance as a
 				// full-build broadcast. Charge all extra edges below as before.
@@ -1249,7 +1257,7 @@ private:
 		}
 		arguments.clear();
 		arguments.push_back(std::move(hash));
-		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(65535)));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(hash_bucket_count - 1)));
 		auto bucket = binder.BindScalarFunction(DEFAULT_SCHEMA, "&", std::move(arguments), error);
 		if (error.HasError()) {
 			throw InternalException("cannot bind join filter bucket: %s", error.Message());
@@ -1325,7 +1333,7 @@ private:
 			auto &owner = *keys.source;
 			auto key_bytes =
 			    double(owner.estimated_cardinality) * (1 + GetTypeIdSize(owner.types[keys.column].InternalType()));
-			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > 8 * 1024 * 1024 ||
+			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > broadcast_limit ||
 			    double(owner.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
 			    EstimatedExchangeBytes(owner) + key_bytes * count >= EstimatedExchangeBytes(op)) {
 				return input;

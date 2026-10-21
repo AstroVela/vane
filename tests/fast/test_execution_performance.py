@@ -1036,6 +1036,120 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
         assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
 
 
+def budgeted_owner_filter_query(connection, path, kind="semi", comparison="="):
+    sql = correlated_owner_queries(connection, path, comparison)[kind]
+    # The owner has only 320 rows, but a 1M-row estimate (a 9 MB key
+    # domain). It cannot be replaced by an independent Parquet scan.
+    return sql.replace("range(65536) where range%31=0", "range(5000000) where range%15625=0").replace(
+        f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality=100000000)"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("kind", ["semi", "anti", "nested", "scalar"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_declared_budget_filters_shared_correlated_owner(tmp_path, partitions, kind, comparison):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute("set disabled_optimizers='deliminator,compressed_materialization'")
+        path = tmp_path / "fact.parquet"
+        sql = budgeted_owner_filter_query(connection, path, kind, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="budgeted-owner-filter",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=256 << 20),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(path).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 4096
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("budget,filtered", [(0, False), (128 << 20, False), (256 << 20, True)])
+def test_shared_correlated_owner_filter_respects_declared_budget(tmp_path, budget, filtered):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("set disabled_optimizers='deliminator,compressed_materialization'")
+        sql = budgeted_owner_filter_query(connection, tmp_path / "fact.parquet")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="owner-filter-budget",
+            options=FragmentCompileOptions(2, worker_operator_bytes=budget),
+        )
+        assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is filtered
+
+
+def budgeted_hash_filter_query(connection, directory, comparison="="):
+    fact, build = directory / "fact.parquet", directory / "build.parquet"
+    connection.execute(
+        "copy (select case when range%8192=0 then null else range-524288 end k, range%17 v "
+        f"from range(1048576)) to '{fact}' (row_group_size 2048)"
+    )
+    connection.execute(
+        "copy (select case when range%8192=0 then null else (range%65536)*3-524288 end k, "
+        f"(range%32=0)::integer v from range(131072)) to '{build}' (row_group_size 2048)"
+    )
+    return (
+        f"select count(*),sum(f.v),sum(b.s) from read_parquet('{fact}', explicit_cardinality=1000000000) f join "
+        f"(select k,sum(v) s from read_parquet('{build}', explicit_cardinality=100000000) "
+        f"group by k having sum(v)>0) b on f.k {comparison} b.k"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_hash_domain_uses_declared_memory_to_reduce_collisions(tmp_path, partitions):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side,compressed_materialization'")
+        sql = budgeted_hash_filter_query(connection, tmp_path)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="budgeted-hash-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=1 << 30)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=1 << 30),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(tmp_path / "fact.parquet").encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(16384, 4096, 128, 2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 4096
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
 @pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])
@@ -1087,11 +1201,21 @@ def test_join_output_filter_estimate_requires_single_key_and_traffic_savings(tmp
 
 
 @pytest.mark.parametrize("domain", ["dense", "empty"])
-def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, domain):
+@pytest.mark.parametrize("budget,bound", [(0, 65536), (256 << 20, 131072)])
+def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, domain, budget, bound):
     with vane.connect(backend="local", config={"threads": 4}) as connection:
-        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain) + " limit 4096"
+        path = tmp_path / "fact.parquet"
+        sql = large_join_key_query(connection, path, domain) + " limit 4096"
+        sql = sql.replace(f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality=100000000)")
         expected = connection.execute(sql).fetchall()
-        spec = submission(connection, sql, partitions=3)
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="bounded-hash-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(3, worker_operator_bytes=budget),
+        )
         limits = DirectExchangeLimits(4096, 1024, 64, 1)
         with InProcessTaskService(connection, spec, limits) as service:
             service.start()
@@ -1099,7 +1223,7 @@ def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, doma
             broadcasts = [e.exchange_id for e in spec.graph.exchanges if e.distribution is Distribution.BROADCAST]
             assert broadcasts
             for edge in broadcasts:
-                assert service.channels[edge].snapshot()["accepted_rows"] <= 65536
+                assert service.channels[edge].snapshot()["accepted_rows"] <= bound
 
 
 @pytest.mark.parametrize("condition", ["multiple", "repeated", "residual"])
