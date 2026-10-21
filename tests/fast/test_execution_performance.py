@@ -309,6 +309,35 @@ def test_one_parquet_file_uses_all_partitions_with_hive_and_row_numbers(tmp_path
         assert Counter(execute_graph(connection, graph)) == expected
 
 
+@pytest.mark.parametrize("partitions", [2, 3, 5])
+@pytest.mark.parametrize("groups", [3, 5])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_parquet_split_rows_balance_odd_groups_across_files(tmp_path, partitions, groups, duplicate):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        paths = []
+        for index in range(partitions * 4):
+            path = tmp_path / f"part{index:02}.parquet"
+            connection.execute(
+                f"copy (select range+{index * groups * 2048} k from range({groups * 2048 - 257})) "
+                f"to '{path}' (row_group_size 2048)"
+            )
+            paths.append(str(path))
+        sql = f"select k from read_parquet({(paths * (2 if duplicate else 1))!r})"
+        graph = compile_sql(connection, sql, partitions=partitions)
+        producer = graph.fragments[0]
+        counts = []
+        for partition in range(partitions):
+            rows = native._execute_fragment_for_test(
+                connection,
+                producer.native_plan,
+                {},
+                {s.source_id: [split.split_id for split in s.splits[partition::partitions]] for s in producer.sources},
+            )
+            counts.append(len(rows))
+        assert max(counts) - min(counts) <= 2048
+        assert Counter(execute_graph(connection, graph)) == Counter(connection.execute(sql).fetchall())
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 def test_sparse_batches_are_coalesced_before_exchange(threads):
     sql = "select range, [range, null] as nested from range(65536) where range % 101=0"

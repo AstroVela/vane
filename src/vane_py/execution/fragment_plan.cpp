@@ -32,6 +32,7 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -393,6 +394,10 @@ SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bin
 
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
+	explicit LogicalValidator(idx_t partitions) : partitions(partitions) {
+	}
+
+	idx_t partitions;
 	vector<SourceSpec> source_dependencies;
 	bool frozen_files = false;
 
@@ -423,6 +428,14 @@ public:
 				// Change only this bound scan's capability, not the shared catalog or
 				// session optimizer settings; native TopN can still be distributed.
 				get.function.late_materialization = false;
+				if (partitions > 1) {
+					// Cost the remaining files when the optimizer requests statistics,
+					// after file pruning, rather than opening every bound footer here.
+					get.function.cardinality = [](ClientContext &context, const FunctionData *data) {
+						return make_uniq<NodeStatistics>(
+						    ParquetScanCardinality(context, data->Cast<MultiFileBindData>()));
+					};
+				}
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
 				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
@@ -1191,7 +1204,9 @@ private:
 				}
 				key_bytes = 65536 * 9;
 			} else {
-				if (!broadcast && key_bytes > 16 * 1024 * 1024) {
+				// Key replicas can use the same bounded per-query allowance as a
+				// full-build broadcast. Charge all extra edges below as before.
+				if (!broadcast && key_bytes > MaxValue<idx_t>(16 * 1024 * 1024, broadcast_limit)) {
 					continue;
 				}
 				if (double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
@@ -1285,7 +1300,7 @@ private:
 	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
 		auto keys = filter.scan;
-		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
+		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= broadcast_limit &&
 		              double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
 		              double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
 		if (!rescan && keys.source && keys.source == filter.owner.source && broadcast_limit > 8 * 1024 * 1024) {
@@ -2158,7 +2173,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		if (!planner.plan || !planner.properties.IsReadOnly() || planner.properties.parameter_count) {
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");
 		}
-		LogicalValidator validator;
+		LogicalValidator validator(partitions);
 		validator.frozen_files = !snapshot_directory.empty();
 		validator.VisitOperator(*planner.plan);
 		CheckTypes(planner.types);
