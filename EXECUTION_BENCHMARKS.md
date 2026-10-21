@@ -2919,3 +2919,76 @@ configurations and identities, raw samples, `comparison.csv`, validation results
 native channel probes, JUnit reports and cleanup manifests. Source files remain
 unchanged. Owned spill/temp data and oracle outputs are removed only after their
 processes stop; schemas, row counts and hashes are retained.
+
+## SF100 direct binary exchange export (2026-10-21)
+
+Internal exchanges need Arrow v1.5 for compact decimal32/decimal64 values, but
+previously inherited binary views for BLOBs and aggregate states, then rebuilt
+those columns as ordinary binary arrays. A separate native binary-view preference
+now lets the exchange exporter produce its target binary layout directly,
+including nested columns. Public Arrow defaults and wire types are unchanged.
+The receiver's owned frame and the merge aggregate's private aligned copies
+remain in place. No query-name rules, SQL rewrites, Local execution fallback,
+new dependency or production resource-default changes are introduced.
+
+The following control covers original Q1/Q9/Q18/Q21 SQL over the same 307 SF100
+Parquet inputs. Baseline pipeline phases bracket candidate Local/pipeline and
+pipeline/Local phases. Three executions per query/mode in each fresh phase,
+excluding the first query-specific execution, leave four steady samples per cell.
+All 72 comparison executions and four Local oracle executions pass schema,
+row-count and value checks at the existing float tolerance (relative 1e-9,
+absolute 1e-6).
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.148 s | 4.471 s | 4.482 s | +0.3% | 1.08× |
+| Q9 | 10.018 s | 16.757 s | 16.755 s | -0.0% | 1.67× |
+| Q18 | 7.145 s | 17.346 s | 17.170 s | -1.0% | 2.40× |
+| Q21 | 12.227 s | 14.854 s | 14.902 s | +0.3% | 1.22× |
+
+The Q18 median reduction is only 1.0%; this shared-host, four-sample control does
+not establish a material improvement. Q1/Q9/Q21 are effectively unchanged.
+Q18 still takes 2.40 times Local. This is a selected four-query control, not a
+new full 22-query score or an update to the preceding eight-query totals.
+
+Local uses 36 native threads and 32 GiB operator memory. Pipeline uses two
+workers with 18 threads / 16 GiB each, 128/256 MiB exchange/staging per worker,
+64 KiB/2048-row frames, 1 MiB/16-slot windows, and the specialized 1 GiB Ray
+object store. Query/file-cache cleanup is unchanged; OS caches are retained.
+No owned builds, tests, native sampling or Doris/HDFS run concurrently with
+comparison queries. Timing includes submission, full collection and successful
+close. CPU diagnostics run separately afterward.
+
+All 816 distinct related tests pass on the clean production binary: 796 across
+analytical/compiler, compact-decimal, Flight and materialized-exchange modules;
+eight bounded-channel aggregate-merge cases; twelve real-Ray cases covering
+aggregate states, wide values, Parquet, early close and FTE retry. New tests
+preserve exact COUNT/SUM/AVG state bytes, including NULLs and repeated values,
+through both transports. Existing tests cover nested BLOB/decimal layouts and
+invalid Arrow data. No full suite, GPU tests or SF100 FTE performance run.
+
+Separate all-native clock sampling with gprofng, using an unstripped binary with
+identical code-section hash, confirms substantial extra aggregate work. For two
+Q18 executions, mean OS CPU use is 230.29 CPU seconds per Local query versus
+476.025 CPU seconds for both pipeline workers (2.067 times). Group-table
+find/create has 161.30 Local versus 270.92 worker inclusive sampled CPU seconds
+across the two executions. Frame measurement has 55.52 inclusive CPU seconds,
+5.94% of sampled worker CPU. Inclusive costs overlap and are not additive or
+query latency. The next priority is native aggregate-state import and merging,
+reducing repeated group-table construction, state initialization and conversion.
+
+Footer ranges cannot safely remove this merge: the 144 lineitem files / 628
+row groups overlap over 99.8543% of their bounded integer key domain. This is
+not a fraction of rows or actual duplicate groups. The conservative complete-group
+proof remains necessary.
+
+Frozen code: `f8bbee0a1caa7d77756de1a8e4e8311605a9a356`; native SHA-256
+`e19748e29f50414a083c0974ec449f093a13f283117b17975aaac2f0ee8059c9`.
+Baseline native SHA-256:
+`275b1c71a2eeb33f18fb0f6338af2f103537fc2684545404ff917c7626a8e3b8`.
+The Python execution implementation is unchanged. Evidence is retained under
+`build/pipeline-sf100-states-clean-20261021/`: frozen identities/configurations,
+raw samples, output counts/hashes, JUnit reports, native CPU reports and cleanup
+manifests. Earlier exploratory data is excluded from this control. Owned spill,
+temp data and oracle outputs are removed after processes stop; source datasets
+and the active Doris/HDFS deployment are preserved.
