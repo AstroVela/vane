@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import pickle
 import sys
 import threading
@@ -15,15 +16,34 @@ import pyarrow as pa
 import pytest
 
 
-def test_mlx_optional_registration_and_safe_dependency_hint():
+@pytest.mark.parametrize("kind", ["text", "image", "audio", "video"])
+def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
     from vane.ai.provider import ProviderImportError, _safe_provider_execution_error, load_provider
 
+    imported = []
+    original_import = builtins.__import__
+
+    def missing_sdk(name, *args, **kwargs):
+        if name.split(".")[0] in {"mlx", "mlx_vlm", "transformers", "huggingface_hub", "PIL"}:
+            imported.append(name)
+            raise ModuleNotFoundError("optional SDK is absent", name=name.split(".")[0])
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_sdk)
     descriptor = load_provider("mlx").get_text_embedder()
-    assert descriptor.get_dimensions() == 768 and descriptor.get_udf_options().num_gpus == 0
-    image = load_provider("mlx").get_image_embedder()
-    assert image.get_dimensions() == 768 and image.get_udf_options().num_gpus == 0
-    assert "input_type" not in image.get_options()
-    assert image.get_output_spec().outputs[0].space == descriptor.get_output_spec().outputs[0].space
+    selected = pickle.loads(pickle.dumps(getattr(load_provider("mlx"), "get_" + kind + "_embedder")()))
+    assert selected.get_dimensions() == 768 and selected.get_udf_options().num_gpus == 0
+    assert ("input_type" in selected.get_options()) == (kind == "text")
+    (output,) = selected.get_output_spec().outputs
+    expected_sources = ("text", "image", "video", "audio") if kind == "text" else (kind,)
+    assert output.source_modalities == expected_sources
+    assert output.space == descriptor.get_output_spec().outputs[0].space
+    assert imported == []
+    monkeypatch.setattr("vane.ai.providers.mlx.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("vane.ai.providers.mlx.platform.machine", lambda: "arm64")
+    with pytest.raises(ProviderImportError, match=r"vane-ai\[mlx\]"):
+        selected.instantiate()
+    assert imported == ["mlx.core"]
     error = pickle.loads(pickle.dumps(ProviderImportError("mlx")))
     safe = _safe_provider_execution_error("mlx", descriptor.get_model(), "Embed", error)
     assert isinstance(safe, ProviderImportError)

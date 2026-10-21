@@ -85,6 +85,14 @@ _REMOTE_RESULT_COUNTS = re.compile(
 _DIAGNOSTIC_HEADER = "[vane.diagnostic.v1:"
 _MAX_DIAGNOSTIC_ITEMS = 64
 _SAFE_ERROR_DETAILS = {
+    **{
+        detail: "EmbeddingConfigurationError"
+        for detail in (
+            "MLX audio requires 161 to 480000 samples; short tails and truncation are unsupported",
+            "MLX audio exceeds max_length after media token expansion",
+            "MLX video exceeds max_length after media token expansion",
+        )
+    },
     "distributed Ray UDF payload requires query_id": "RuntimeError",
     "distributed Ray UDF payload requires pre-registered resource_unit_id": "RuntimeError",
     "vllm remote wait exceeded query deadline": "RuntimeError",
