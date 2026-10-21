@@ -2688,3 +2688,78 @@ three-partition routing, early close and batched-start failures. Only related
 tests run; no full suite or GPU tests run. Owned processes stop before spill,
 temporary data and comparison outputs are removed; row counts, schemas, hashes
 and cleanup manifests are retained.
+
+## Q9 key-domain feasibility and pipelined setup overlap (2026-10-21)
+
+Q9's filtered lineitem/part join produces 3,261,613 rows with 2,930,317
+distinct order keys. An exact necessary-condition filter could retain that
+many of the 15,000,000 orders, removing about 80.5% before their exchange.
+The existing 65,536-bucket hash domain is completely occupied by these keys;
+using it for this input would retain every order.
+
+Native diagnostic probes also evaluate bounded single-hash bitmaps:
+
+| Bitmap payload | Candidate orders retained | Missing true keys |
+| --- | ---: | ---: |
+| 0.5 MiB | 8,997,774 | 0 |
+| 2 MiB | 4,862,551 | 0 |
+| 8 MiB | 3,445,603 | 0 |
+
+These probes build the bitmap from a materialized exact domain, so their
+individual timings exclude upstream query work and transport. They establish
+filter selectivity and correctness, not an end-to-end optimization. Generating
+the exact domain from Parquet takes about 253 ms in the separate local probe.
+
+An isolated native prototype regenerates the filtered probe subtree and
+broadcasts its keys before the other join input's exchange. This avoids a
+cyclic dependency on a probe consumer waiting for the filtered build. However,
+the 64-execution screening control moves Q9's steady pipelined median from
+1.296 s to 1.557 s, about 20% slower. Every result matches the oracle. These
+are sequential screening rounds with three steady samples per mode/version,
+not a paired acceptance comparison. The prototype is removed. Its patch and
+binary identity remain in the investigation artifacts; it is not in the PR.
+A future large-domain filter needs to reuse existing join work and account for
+distribution, filter construction and dependency costs together.
+
+The accepted change instead overlaps independent pipelined setup operations:
+result-service preparation with worker preparation; worker, relay and client
+connections after every endpoint is published; and worker/relay readiness
+probes. Every preparation and connection receipt is still checked. Tasks start
+only after all native endpoints and the client are ready. Existing lifecycle
+locks, late-call fences, reservations, cancellation and channel limits apply.
+The installed native binary is unchanged from the combined partitioning build,
+SHA-256 `0db69f419324ad1c25cba93a1bb3cdcc5d723cf44f0c68822c6ae2310cb9a2f7`.
+
+The acceptance comparison uses baseline/candidate/candidate/baseline order,
+forward then reverse mode order, with eight steady samples per
+query/mode/version. It contains 240 timing executions. A separate 96-execution
+screen is excluded from these medians. Resources and measurement boundaries
+match the preceding two-worker controls: 36 local threads/32 GiB, two workers
+with 18 threads/16 GiB each, 256 MiB staging per worker, unchanged frame/window
+limits and SQL, the same frozen SF10 inputs, and full result collection and
+successful close. First SQL executions are recorded separately and excluded.
+
+| Query | Baseline Local | Candidate Local | Baseline pipelined | Candidate pipelined | Pipelined change | Submission time saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q2 | 0.136 s | 0.135 s | 0.249 s | 0.239 s | -3.9% | 10.1 ms |
+| Q6 | 0.214 s | 0.211 s | 0.289 s | 0.281 s | -2.6% | 7.0 ms |
+| Q9 | 0.854 s | 0.872 s | 1.273 s | 1.276 s | +0.2% | 3.7 ms |
+| Q10 | 0.474 s | 0.482 s | 0.642 s | 0.644 s | +0.2% | 10.0 ms |
+| Q20 | 0.344 s | 0.346 s | 0.574 s | 0.569 s | -0.8% | 8.3 ms |
+| Q21 | 1.193 s | 1.207 s | 1.522 s | 1.522 s | 0.0% | 5.0 ms |
+
+Q2 and Q6 improve in both orders. Q9/Q10/Q20/Q21 do not establish a material
+end-to-end improvement; Q9's large join/exchange gap remains. These are
+shared-host observations without CPU isolation. Local controls vary by up to
+2.1%, and no task-owned build, test or diagnostic runs during measurements.
+
+All 400 timing executions across the rejected native prototype, setup screen
+and setup acceptance controls match the full Local oracle's schemas, row
+counts and values. All 80 related tests pass: 49 real-Ray lifecycle, fault and
+source/retry cases, and 31 result-service unit cases. No full suite or GPU tests
+run. The setup regression also reproduces the serialized preparation
+order on the frozen baseline. Frozen configurations, SQL, Python/native
+identities, patches, drivers, samples and test logs are retained under
+`build/pipelined-q9-filter-20261021/`. Cleanup records the output schemas,
+counts and hashes before removing comparison outputs, after each run's owned
+processes have stopped; source inputs are preserved.

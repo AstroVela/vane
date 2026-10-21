@@ -111,32 +111,51 @@ def test_group_capacity_failure_rolls_back_before_start(capacity):
         assert_idle(connection)
 
 
-@pytest.mark.parametrize("fail_reply", [False, True])
-def test_worker_connections_overlap_and_failed_reply_releases_group(monkeypatch, fail_reply):
+@pytest.mark.parametrize("failure", [None, "prepare", "worker", "relay", "client"])
+def test_worker_connections_overlap_and_failed_reply_releases_group(monkeypatch, failure):
     import ray
 
     from vane.execution import pipelined_runtime
+    from vane.execution.result_consumer import NativeResultConsumer
 
     with vane.Runtime(resources()) as application, application.connect() as connection:
         connection.query("select 1").collect()
         pool = connection.query_runtime.pool
         calls, starts, dispatched = {}, [], []
-        get = pipelined_runtime._get
+        attached = False
+        get, attach = pipelined_runtime._get, NativeResultConsumer.attach
 
-        def connect(index, remote, epoch, query, locations):
-            reference = remote(epoch, query, locations)
+        def dispatch(kind, index, remote, *args):
+            reference = remote(*args)
             dispatched.append(reference)
-            if fail_reply and index == 0:
-                # Remote connections can still be in flight when the first
-                # reply fails. Cleanup must also fence these late calls.
-                reference = ray.put(ray.exceptions.ActorUnavailableError("lost worker connect reply", None))
-            calls[index] = reference
+            if (
+                failure
+                == {"result_prepare": "prepare", "worker_connect": "worker", "result_connect": "relay"}.get(kind, "")
+                and index == 0
+            ):
+                # Dispatch the real call first: cleanup must fence it even if
+                # the caller loses its receipt while other calls are pending.
+                reference = ray.put(ray.exceptions.ActorUnavailableError(f"injected {failure} reply loss", None))
+            calls[kind, index] = reference
             return reference
 
         def wait(reference, *args, **kwargs):
-            if reference in calls.values():
-                assert len(calls) == len(pool.workers), "dispatch every worker connection before waiting"
+            if reference == calls.get(("result_prepare", 0)):
+                assert all(("worker_prepare", i) in calls for i in range(len(pool.workers)))
+            if reference in [r for (kind, _), r in calls.items() if kind == "worker_connect"]:
+                assert all(("worker_connect", i) in calls for i in range(len(pool.workers)))
+                assert ("result_connect", 0) in calls and attached
+            if reference in [r for (kind, _), r in calls.items() if kind == "worker_ready"]:
+                assert all(("worker_ready", i) in calls for i in range(len(pool.workers)))
+                assert ("result_status", 0) in calls
             return get(reference, *args, **kwargs)
+
+        def connect_client(consumer, *args):
+            nonlocal attached
+            attach(consumer, *args)
+            attached = True
+            if failure == "client":
+                raise RuntimeError("injected client attachment failure")
 
         def start(remote, *args):
             starts.append(args)
@@ -144,11 +163,30 @@ def test_worker_connections_overlap_and_failed_reply_releases_group(monkeypatch,
 
         with monkeypatch.context() as patch:
             patch.setattr(pipelined_runtime, "_get", wait)
+            patch.setattr(NativeResultConsumer, "attach", connect_client)
             for index, worker in enumerate(pool.workers):
-                patch.setattr(worker, "connect", SimpleNamespace(remote=partial(connect, index, worker.connect.remote)))
+                for method, kind in [
+                    ("prepare", "worker_prepare"),
+                    ("connect", "worker_connect"),
+                    ("ready", "worker_ready"),
+                ]:
+                    patch.setattr(
+                        worker,
+                        method,
+                        SimpleNamespace(remote=partial(dispatch, kind, index, getattr(worker, method).remote)),
+                    )
                 patch.setattr(worker, "start", SimpleNamespace(remote=partial(start, worker.start.remote)))
-            if fail_reply:
-                with pytest.raises(ray.exceptions.ActorUnavailableError, match="lost worker connect reply"):
+            relay = pool.results.actor
+            for method, kind in [
+                ("prepare", "result_prepare"),
+                ("connect", "result_connect"),
+                ("status", "result_status"),
+            ]:
+                patch.setattr(
+                    relay, method, SimpleNamespace(remote=partial(dispatch, kind, 0, getattr(relay, method).remote))
+                )
+            if failure is not None:
+                with pytest.raises(Exception, match=f"injected {failure}"):
                     connection.query("select range from range(100)")
                 assert starts == []
             else:
@@ -160,7 +198,7 @@ def test_worker_connections_overlap_and_failed_reply_releases_group(monkeypatch,
                 try:
                     ray.get(reference, timeout=5)
                 except ray.exceptions.RayTaskError:
-                    assert fail_reply  # The late connection may observe cancellation.
+                    assert failure is not None  # A late call may observe cancellation.
             assert_idle(connection)
         assert connection.query("select 42").collect().column(0).to_pylist() == [42]
         assert_idle(connection)
