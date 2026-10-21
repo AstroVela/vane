@@ -40,7 +40,7 @@ from tests.fast.test_execution_performance import (
     large_broadcast_query,
     shared_cte_filter_query,
 )
-from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source
+from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source, large_join_key_query
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
 from tests.fast.test_join_build_filter import shared_join_build_query
 from tests.fast.test_parquet_aggregate_partitioning import broadcast_aggregate_query, disjoint_aggregate_query
@@ -214,7 +214,7 @@ def test_shared_join_build_filter_preserves_consumer_retry(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
-@pytest.mark.parametrize("kind", ["owner", "hashed"])
+@pytest.mark.parametrize("kind", ["owner", "hashed", "medium"])
 def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypatch, mode, kind):
     import ray
 
@@ -242,11 +242,12 @@ def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypat
         vane.Runtime(limits) as application,
         application.connect() as connection,
     ):
-        sql = (
-            budgeted_owner_filter_query(local, tmp_path / "fact.parquet", "nested", "is not distinct from")
-            if kind == "owner"
-            else budgeted_hash_filter_query(local, tmp_path)
-        )
+        if kind == "owner":
+            sql = budgeted_owner_filter_query(local, tmp_path / "fact.parquet", "nested", "is not distinct from")
+        elif kind == "hashed":
+            sql = budgeted_hash_filter_query(local, tmp_path)
+        else:
+            sql = large_join_key_query(local, tmp_path / "fact.parquet", "hashed")
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
             scheduler = result.context._reader

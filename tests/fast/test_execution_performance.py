@@ -1150,6 +1150,42 @@ def test_hash_domain_uses_declared_memory_to_reduce_collisions(tmp_path, partiti
         assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
 
 
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("budget", [0, 256 << 20, 1 << 30])
+def test_hash_domain_keeps_useful_filters_for_medium_probes(tmp_path, partitions, budget):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        path = tmp_path / "fact.parquet"
+        sql = large_join_key_query(connection, path, "hashed")
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="medium-probe-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=1 << 30)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(path).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(16384, 4096, 128, 2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 65536
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
 @pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])

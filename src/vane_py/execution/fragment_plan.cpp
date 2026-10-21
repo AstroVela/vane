@@ -775,8 +775,8 @@ public:
 		// tables as well as the encoded keys. Keep the conservative domain
 		// without declared memory; larger budgets can reduce collisions.
 		const auto bucket_capacity = broadcast_limit / 128;
-		while (hash_bucket_count <= bucket_capacity / 2) {
-			hash_bucket_count *= 2;
+		while (max_hash_bucket_count <= bucket_capacity / 2) {
+			max_hash_bucket_count *= 2;
 		}
 	}
 
@@ -843,7 +843,7 @@ public:
 				auto domain = ExchangeFrom(filter.domain_producer, filter.domain->types,
 				                           count == 1 ? "gather" : "broadcast", count);
 				result = SemiFilter(op, std::move(result), filter.column, *filter.domain, std::move(domain),
-				                    filter.keys_only ? 0 : filter.build_column, filter.hashed);
+				                    filter.keys_only ? 0 : filter.build_column, filter.hash_buckets);
 			}
 		}
 		return result;
@@ -957,7 +957,7 @@ private:
 	FragmentGraph &graph;
 	idx_t partitions;
 	idx_t broadcast_limit;
-	idx_t hash_bucket_count = 65536;
+	idx_t max_hash_bucket_count = 65536;
 	idx_t next_exchange = 0;
 	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
@@ -972,7 +972,7 @@ private:
 		PhysicalOperator *domain = nullptr;
 		string domain_producer;
 		bool keys_only = false;
-		bool hashed = false;
+		idx_t hash_buckets = 0;
 	};
 	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
 	unordered_map<const PhysicalOperator *, string> shared_join_builds;
@@ -1202,15 +1202,22 @@ private:
 			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
 			auto probe_bytes = EstimatedExchangeBytes(*target.input);
 			target.keys_only = !broadcast;
-			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
-			if (target.hashed) {
+			if (!broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build)) {
 				// HAVING estimates can hide a tiny build. A distinct hash domain
 				// has a budget-bounded size even when that estimate is wrong.
 				// Collisions only retain extra probes; the original join is exact.
-				if (target.input->estimated_cardinality <= 8 * hash_bucket_count) {
+				target.hash_buckets = 65536;
+				if (target.input->estimated_cardinality <= 8 * target.hash_buckets) {
 					continue;
 				}
-				key_bytes = hash_bucket_count * 9;
+				// Size each filter to its own probe and traffic savings. A larger
+				// worker budget must not disable a useful smaller key domain.
+				while (target.hash_buckets < max_hash_bucket_count &&
+				       16 * target.hash_buckets < target.input->estimated_cardinality &&
+				       EstimatedExchangeBytes(build) + double(target.hash_buckets) * 18 * partitions < probe_bytes) {
+					target.hash_buckets *= 2;
+				}
+				key_bytes = target.hash_buckets * 9;
 			} else {
 				// Key replicas can use the same bounded per-query allowance as a
 				// full-build broadcast. Charge all extra edges below as before.
@@ -1246,7 +1253,7 @@ private:
 		return result;
 	}
 
-	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column) {
+	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column, idx_t buckets) {
 		FunctionBinder binder(context);
 		ErrorData error;
 		vector<unique_ptr<Expression>> arguments;
@@ -1257,7 +1264,7 @@ private:
 		}
 		arguments.clear();
 		arguments.push_back(std::move(hash));
-		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(hash_bucket_count - 1)));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(buckets - 1)));
 		auto bucket = binder.BindScalarFunction(DEFAULT_SCHEMA, "&", std::move(arguments), error);
 		if (error.HasError()) {
 			throw InternalException("cannot bind join filter bucket: %s", error.Message());
@@ -1270,15 +1277,16 @@ private:
 		auto domain = ExchangeFrom(filter.producer, build.types, "hash", partitions, {filter.build_column});
 		vector<unique_ptr<Expression>> expressions;
 		expressions.push_back(
-		    filter.hashed ? HashBucket(build.types[filter.build_column], filter.build_column)
-		                  : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
+		    filter.hash_buckets
+		        ? HashBucket(build.types[filter.build_column], filter.build_column, filter.hash_buckets)
+		        : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
 		auto type = expressions[0]->return_type;
 		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {type}, std::move(expressions),
 		                                                 build.estimated_cardinality);
 		projection.children.push_back(build);
 		Wrap(projection, domain);
 		filter.domain = &projection;
-		if (filter.hashed) {
+		if (filter.hash_buckets) {
 			vector<unique_ptr<Expression>> groups;
 			groups.push_back(make_uniq<BoundReferenceExpression>(type, 0));
 			auto &partial = MakeAggregate(Copy(groups), {});
@@ -1355,13 +1363,13 @@ private:
 	}
 
 	DistributedSubtree SemiFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
-	                              DistributedSubtree domain, idx_t build_key, bool hashed = false) {
+	                              DistributedSubtree domain, idx_t build_key, idx_t hash_buckets = 0) {
 		// NULL-safe equality is only a necessary condition; the original
 		// join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
-		condition.left =
-		    hashed ? HashBucket(op.types[key], key) : make_uniq<BoundReferenceExpression>(op.types[key], key);
+		condition.left = hash_buckets ? HashBucket(op.types[key], key, hash_buckets)
+		                              : make_uniq<BoundReferenceExpression>(op.types[key], key);
 		condition.right = make_uniq<BoundReferenceExpression>(build.types[build_key], build_key);
 		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 		conditions.push_back(std::move(condition));
