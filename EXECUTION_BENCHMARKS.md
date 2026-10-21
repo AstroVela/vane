@@ -2992,3 +2992,80 @@ raw samples, output counts/hashes, JUnit reports, native CPU reports and cleanup
 manifests. Earlier exploratory data is excluded from this control. Owned spill,
 temp data and oracle outputs are removed after processes stop; source datasets
 and the active Doris/HDFS deployment are preserved.
+
+## SF100 native aggregate-state import (2026-10-21)
+
+Final grouped aggregates previously processed exported partial states through
+ordinary sink aggregation: group lookup, empty-state initialization, private
+scratch copying and combine. The radix source then combined the resulting rows
+again. An explicit native state-import callback now lets eligible grouped
+aggregates append complete states directly to owned radix tuples. It hashes the
+group keys for partitioning, validates state sizes and copies into private,
+aligned storage. NULL inputs initialize an empty child state. All duplicate
+keys are combined in the source phase, including with one execution thread.
+
+This path requires every aggregate to support import, consume input columns and
+have no destructor, DISTINCT modifier or aggregate filter. Distributed merge
+wrappers restore the callback through their existing serialization constructor.
+Existing temporary-memory accounting, repartitioning, spill and exchange
+backpressure remain in force. General merge updates retain private scratch
+copies. Original SQL, public Python execution APIs, wire layouts and production
+budgets are unchanged.
+
+The control below compares this import path with the preceding direct-binary
+export revision. All 72 timing executions and four Local oracle executions
+match schema, row count and values (float tolerance relative 1e-9, absolute
+1e-6). Three executions per query/mode in each fresh phase, discarding the first
+query-specific execution, give four steady observations per cell. Baseline
+pipeline phases bracket candidate Local/pipeline and pipeline/Local phases.
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.219 s | 4.490 s | 4.581 s | +2.0% | 1.09× |
+| Q9 | 9.896 s | 16.840 s | 17.107 s | +1.6% | 1.73× |
+| Q18 | 7.257 s | 17.189 s | 16.966 s | -1.3% | 2.34× |
+| Q21 | 12.207 s | 14.877 s | 14.861 s | -0.1% | 1.22× |
+
+The Q18 median falls only 1.3%, while Q1/Q9 medians rise 2.0%/1.6%. Four steady
+observations on a shared host do not establish a material latency improvement
+or resolve these small control differences. Q9 also has a 19.156-second steady
+candidate sample; all scheduled samples are retained. Q18 remains 2.34 times
+Local. These selected-query results do not replace the earlier full 22-query
+score or eight-query totals.
+
+Six separate result-checked CPU diagnostic executions run after timing acceptance:
+two baseline pipeline queries and two candidate queries in each mode. Mean OS
+user-plus-system CPU time for the two pipeline workers falls from 471.655 to
+449.665 CPU seconds per Q18 query (-4.66%). Candidate Local averages 227.465 CPU
+seconds, leaving worker CPU at 1.977 times Local. These totals exclude the
+pipeline coordinator/result service and are not wall time. Diagnostic timings
+are excluded from the table. The evidence supports a modest CPU reduction;
+substantial work remains in the final aggregate merge.
+
+All 594 distinct related tests pass on the frozen installed binary: 489
+analytical/native compiler and Parquet aggregate cases, 93 merge/interval cases,
+and twelve real-Ray cases covering pipeline/FTE states, wide values, early close
+and shared-producer retry. Coverage includes 1/2/4 native threads, 2/3 partitions,
+NULL keys/states, repeated targets and malformed states. Two regressions configure
+32 MB and merge 524,299 repeated input states with one/four threads, assert actual
+spill, validate results, and require empty spill directories after connection
+close. No full suite, GPU tests or SF100 FTE performance run.
+
+Resource settings match the preceding control: Local 36 threads / 32 GiB operator
+memory; two pipeline workers with 18 threads / 16 GiB each, 128/256 MiB
+exchange/staging per worker, 64 KiB/2048-row frames, 1 MiB/16-slot windows and a
+specialized 1 GiB Ray object store. Inputs remain the same 307 SF100 Parquet files.
+OS caches are retained; no owned builds/tests, CPU diagnostics or Doris/HDFS
+services overlap timing windows. Timing includes submission, full collection
+and successful close.
+
+Frozen implementation: `670a59db29c27321555f304ceaa16af14060415e`; native SHA-256
+`3fa6c796cf18ebe4f5e26e39c58804add5efdd1bb6408e6a6172911364af86c4`.
+Baseline is `81624b6f6b` (documentation after `f8bbee0a1c`), native SHA-256
+`e19748e29f50414a083c0974ec449f093a13f283117b17975aaac2f0ee8059c9`.
+The Python execution implementation is unchanged. Evidence is retained under
+`build/pipeline-sf100-state-import-20261021/`: frozen code/native identities,
+configurations, raw samples, output counts/hashes, CPU records, JUnit reports
+and cleanup manifests. Prototype validation is kept separately and is not
+added to the distinct test count. Owned temporary data is cleaned after process
+exit; source datasets and the restored Doris/HDFS deployment are preserved.
