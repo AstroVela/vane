@@ -2763,3 +2763,89 @@ identities, patches, drivers, samples and test logs are retained under
 `build/pipelined-q9-filter-20261021/`. Cleanup records the output schemas,
 counts and hashes before removing comparison outputs, after each run's owned
 processes have stopped; source inputs are preserved.
+
+## SF100 Parquet cardinality and source balance (2026-10-21)
+
+Distributed Parquet scan estimates now use a bound scan's cardinality callback,
+which counts the remaining files' selected row groups when the optimizer requests
+statistics. File pruning runs first; pruned files remain snapshot dependencies.
+Explicit cardinality overrides and repeated file references retain their meaning.
+The Local planner and source SQL are unchanged.
+
+Early key-only broadcasts and independent correlated key scans can use the existing
+per-query worker replication allowance, bounded by worker operator memory and the
+64 MiB ceiling. Existing key-lineage, join-kind, selectivity and traffic checks
+apply. Split assignment gives larger row-group chunks to less-loaded strided
+partition slots, preserving each chunk's contents and deterministic assignments.
+The lineitem partition-count probe changes 252,370,944 / 347,666,958 rows into
+300,408,432 / 299,629,470 rows (50.06% / 49.94%).
+
+The full SF100 comparison below uses original repository SQL over the same 307
+Parquet files (37.5033 GiB). Local has 36 native threads and 32 GiB operator memory;
+pipelined has two workers with 18 threads and 16 GiB each. Exchange/staging budgets
+remain 128/256 MiB per worker, frames 64 KiB/2048 rows, windows 1 MiB/16 slots,
+and the specialized Ray object store 1 GiB. Each mode keeps a persistent connection
+within its phase. Production worker cleanup still clears query/file caches.
+OS caches are retained; this is a shared host without CPU isolation.
+
+Two fresh phase processes use Local→pipelined and pipelined→Local order, with two
+SQL executions per query/mode/phase. Each query's first execution in each phase is
+excluded, leaving two steady samples per cell. Timing covers submission, complete
+collection and successful close. No task-owned build, test, native diagnostic or
+Doris/HDFS service runs during measured windows. All 176 executions match full
+oracle schemas, row counts and values under the existing float tolerance
+(relative 1e-9, absolute 1e-6).
+
+| Query | Local | Pipeline before* | Pipeline now | Now / Local | Change* |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.204 s | 4.515 s | 4.417 s | 1.05× | -2.2% |
+| Q2 | 0.927 s | 3.305 s | 2.938 s | 3.17× | -11.1% |
+| Q3 | 3.759 s | 14.422 s | 5.543 s | 1.47× | -61.6% |
+| Q4 | 2.834 s | 9.963 s | 8.824 s | 3.11× | -11.4% |
+| Q5 | 3.919 s | 26.850 s | 5.915 s | 1.51× | -78.0% |
+| Q6 | 2.025 s | 2.303 s | 2.239 s | 1.11× | -2.8% |
+| Q7 | 4.339 s | 9.067 s | 5.683 s | 1.31× | -37.3% |
+| Q8 | 4.755 s | 34.117 s | 6.513 s | 1.37× | -80.9% |
+| Q9 | 10.392 s | 45.642 s | 16.743 s | 1.61× | -63.3% |
+| Q10 | 4.368 s | 13.271 s | 12.959 s | 2.97× | -2.4% |
+| Q11 | 0.942 s | 1.130 s | 1.141 s | 1.21× | +1.0% |
+| Q12 | 3.039 s | 10.079 s | 9.817 s | 3.23× | -2.6% |
+| Q13 | 6.549 s | 8.849 s | 8.865 s | 1.35× | +0.2% |
+| Q14 | 3.177 s | 4.482 s | 4.420 s | 1.39× | -1.4% |
+| Q15 | 3.221 s | 3.749 s | 3.767 s | 1.17× | +0.5% |
+| Q16 | 1.183 s | 7.889 s | 2.435 s | 2.06× | -69.1% |
+| Q17 | 3.633 s | 38.387 s | 4.054 s | 1.12× | -89.4% |
+| Q18 | 7.070 s | 33.999 s | 18.237 s | 2.58× | -46.4% |
+| Q19 | 3.976 s | 6.388 s | 5.864 s | 1.47× | -8.2% |
+| Q20 | 3.570 s | 6.774 s | 5.222 s | 1.46× | -22.9% |
+| Q21 | 11.844 s | 32.365 s | 28.780 s | 2.43× | -11.1% |
+| Q22 | 1.170 s | 4.299 s | 4.057 s | 3.47× | -5.6% |
+
+*Before values are the earlier same-host SF100 control on `4222d95b`, rather than
+an interleaved A/B experiment. Most baseline cells contain four steady samples;
+Q9 has two and one separately recorded control-RPC timeout. Large changes are
+consistent with the separate native channel diagnostics: Q17's two fact exchanges
+fall from 600,037,902 rows each to 600,982 rows each. These diagnostics are outside
+the acceptance timings. Small latency changes are not established by this sample
+size. Q11 retains the repository's fixed threshold and returns zero rows; this is
+not an official TPC-H score or scale-adjusted parameter qualification.
+
+The sum of query medians is 168.433 s for pipelined and
+90.895 s for Local, a 1.85× ratio. The historical
+pipelined sum is 321.844 s (47.7% lower now).
+No query's current median is faster than Local. Q1/Q6/Q17 are close; Q21, Q18,
+Q10 and Q12 retain large absolute gaps. This round does not establish that
+pipelined beats Local under the same host resource budget.
+
+Code is `e6533bdefae02d9d1d1f44e3707a220a030ee84f`, native SHA-256
+`015287289eae8bfe195ebde518e9644b4864f67c2a8c0964da8dea375ca03bce`. All 1161 distinct related cases pass, including
+17 real-Ray cases for retries, source assignments and cleanup. Tests cover
+NULLs, duplicates, empty files, explicit cardinality, bounded channels and a
+pruned unreadable footer. Only related tests run; no full suite or GPU tests run.
+The affected test modules already belong to the source-package whitelist.
+
+Evidence is retained in `build/pipeline-sf100-20261021/`: frozen identities,
+configurations, raw timing samples, `comparison.csv`, separate channel/CPU probes,
+JUnit reports, validation results and cleanup manifests. Owned processes stop
+before spill, temporary data and oracle outputs are removed; oracle schemas,
+row counts and hashes are retained. Source datasets are preserved.
