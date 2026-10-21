@@ -2617,3 +2617,74 @@ logs and cleanup manifests. Owned processes stop before temporary/spill removal;
 query, result and worker reservations return to zero. Oracle row counts, schemas
 and hashes are retained before deleting comparison outputs. Source inputs are
 preserved, disk guards stay untriggered, and cleanup happens outside timing.
+
+## Reusing proven hash partitions (2026-10-21)
+
+The compiler retains ordered routing columns through unchanged projections,
+row filters, INNER/SEMI probe outputs and proven correlated scopes. A subsequent
+HASH request becomes PASSTHROUGH only when the output schema, native key
+representation, key order and partition count match. Injective compression can
+preserve complete groups while changing HASH; these are separate proofs.
+
+PASSTHROUGH routes producer partition i to consumer partition i. Pipelined
+execution reserves only those routes, and FTE writes and reads only the
+corresponding partition objects. Native channel credit, frame sequences,
+cancellation and stage commit rules are unchanged. Q21 reuses four exchange
+boundaries; Q20 reuses one. Q9 retains its original exchanges, including the
+15-million-row orders input.
+
+The following controls isolate partition reuse on `73e90088f0`; the complete
+Parquet-group optimization above is evaluated separately. Both widths use 36
+native threads and 32 GiB total operator memory. Two workers use 18 threads and
+16 GiB each, with 256 MiB staging capacity per worker. Four workers use nine
+threads and 8 GiB each, with 512 MiB staging capacity per worker so both versions
+can be admitted. Frames remain 64 KiB/2048 rows, channel windows 1 MiB/16 slots,
+and the Ray object store 1 GiB. SQL, inputs, comparison tolerance and measurement
+boundaries match the preceding SF10 controls.
+
+| Query | Two-worker baseline | Two-worker reuse | Four-worker baseline | Four-worker reuse |
+| --- | ---: | ---: | ---: | ---: |
+| Q9 | 1.263 s | 1.276 s | 1.493 s | 1.514 s |
+| Q20 | 0.559 s | 0.556 s | 0.634 s | 0.622 s |
+| Q21 | 1.516 s | 1.504 s | 1.730 s | 1.676 s |
+
+Baseline/candidate/candidate/baseline controls contain 192 two-worker timing
+executions and 48 four-worker executions. First SQL executions are excluded
+from medians: ten steady samples per query/mode/version at two workers, six at
+four workers. All 240 executions match full oracle values, schemas and row
+counts. These are shared-host observations without CPU isolation. Two-worker
+latency changes are below 1% on the targets; four-worker Q21 changes by about
+3.1%. Q9 has no measured improvement.
+
+The deterministic benefit is fewer reserved routes and transport buffers:
+
+| Q21 configuration | Routes, before/after | Maximum worker staging reservation, before/after |
+| --- | ---: | ---: |
+| Two workers/partitions | 59 / 51 | 157.5 / 115.5 MiB |
+| Four workers/partitions | 229 / 181 | 462 / 336 MiB |
+| Eight workers/partitions | 905 / 681 | 1071 / 777 MiB |
+
+These are declared worst-case transport reservations, rather than observed RSS.
+The eight-worker row is a compiled routing/capacity probe, without a latency
+run. With four workers and a fixed 384 MiB staging limit, the baseline rejects
+Q21 before execution; reuse completes three oracle-checked executions. The
+final combined implementation also completes Q21 under that limit. Resource
+admission continues to enforce the configured capacity.
+
+The final combined build preserves the preceding Q10 improvement: a separate
+compatibility screen has pipelined medians 0.652 s for the complete-group parent
+and 0.634 s for the combined build. This 64-execution screen is not another
+interleaved speedup claim. All results match the same local oracle. Combined
+resource demands match the isolated reuse component for Q9/Q20/Q21 at two,
+four and eight partitions.
+
+The integration baseline native SHA-256 is `b6955e3a3b32...`, the isolated reuse
+component is `1729d1fca05a...`, the complete-group parent is `f265a1d4d496...`,
+and the combined build is `0db69f419324...`. Complete identities, configurations,
+drivers, samples and admission probes are retained in
+`build/pipelined-shuffle-20261021/`. Final combined validation passes 1257
+native/compiler/contract cases and 15 real-Ray cases, including FTE retry,
+three-partition routing, early close and batched-start failures. Only related
+tests run; no full suite or GPU tests run. Owned processes stop before spill,
+temporary data and comparison outputs are removed; row counts, schemas, hashes
+and cleanup manifests are retained.
