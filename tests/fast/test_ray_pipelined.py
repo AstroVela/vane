@@ -173,7 +173,11 @@ def test_worker_start_batches_allow_delayed_peer_and_failed_reply(tmp_path, monk
     source = tmp_path / "input.parquet"
     sql = f"select k, sum(v) as total from read_parquet('{source}') group by k order by k"
     with vane.connect(backend="local") as local:
-        local.execute(f"copy (select range % 97 as k, range as v from range(20000)) to '{source}'")
+        # Repeated keys across row groups require a cross-partition merge,
+        # keeping dependent fragments in each worker's start batch.
+        local.execute(
+            f"copy (select range % 97 as k, range as v from range(20000)) to '{source}' (row_group_size 2048)"
+        )
         expected = local.execute(sql).to_arrow_table().to_pylist()
     with vane.Runtime(resources()) as application, application.connect() as connection:
         connection.query("select 1").collect()
