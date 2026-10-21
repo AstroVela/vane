@@ -252,7 +252,8 @@ static void InitializeFunctionPointers(ArrowAppendData &append_data, const Logic
 	case LogicalTypeId::BIT:
 	case LogicalTypeId::BIGNUM:
 	case LogicalTypeId::AGGREGATE_STATE:
-		if ((append_data.options.produce_arrow_string_view || type.id() != LogicalTypeId::VARCHAR) &&
+		if ((type.id() == LogicalTypeId::VARCHAR ? append_data.options.produce_arrow_string_view
+		                                         : append_data.options.produce_arrow_binary_view) &&
 		    append_data.options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			InitializeAppenderForType<ArrowVarcharToStringViewData>(append_data);
 		} else {
