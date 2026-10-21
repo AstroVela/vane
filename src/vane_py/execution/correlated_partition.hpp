@@ -24,6 +24,9 @@ struct CorrelatedKeyFilter {
 // routes it by the common correlation key; an invalid column broadcasts it.
 struct CorrelatedPartition {
 	unordered_map<const PhysicalOperator *, optional_idx> inputs;
+	// Each column retains the exact routing-key representation. Other injective
+	// representations preserve locality but can hash to a different partition.
+	vector<idx_t> output_keys;
 	// Independent inputs joined directly to this delimiter may be filtered by
 	// a superset of its keys, before their partitioning exchange.
 	unordered_map<const PhysicalOperator *, CorrelatedKeyFilter> filters;

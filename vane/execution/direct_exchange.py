@@ -122,10 +122,11 @@ class InProcessTaskService:
                         ]
                 for part in range(producer.partition_count):
                     identity = self.task_id(producer.fragment_id, part)
-                    for channel in targets:
+                    owned_targets = [targets[part]] if edge.distribution is Distribution.PASSTHROUGH else targets
+                    for channel in owned_targets:
                         channel.add_producer(identity)
                     outgoing.setdefault(identity, []).append(
-                        {"channels": targets, "producer": identity, "partitioning": edge.partitioning}
+                        {"channels": owned_targets, "producer": identity, "partitioning": edge.partitioning}
                     )
                 for channel in targets:
                     channel.seal_producers()

@@ -63,6 +63,7 @@ class Distribution(str, Enum):
     GATHER = "gather"
     HASH = "hash"
     BROADCAST = "broadcast"
+    PASSTHROUGH = "passthrough"
 
 
 @dataclass(frozen=True)
@@ -232,7 +233,7 @@ class ExchangeSpec:
         try:
             object.__setattr__(self, "distribution", Distribution(self.distribution))
         except (ValueError, TypeError) as exc:
-            raise ValueError("distribution must be 'gather', 'hash' or 'broadcast'") from exc
+            raise ValueError("distribution must be 'gather', 'hash', 'broadcast' or 'passthrough'") from exc
         if self.distribution is Distribution.HASH:
             object.__setattr__(self, "partitioning", _payload(self.partitioning, "HASH partitioning"))
         elif self.partitioning is not None:
@@ -346,6 +347,11 @@ class FragmentGraph:
                 raise ValueError(f"schema mismatch on exchange {edge.exchange_id}")
             if edge.distribution is Distribution.GATHER and fragments[edge.consumer_fragment_id].partition_count != 1:
                 raise ValueError("GATHER requires exactly one consumer partition")
+            if edge.distribution is Distribution.PASSTHROUGH and (
+                fragments[edge.producer_fragment_id].partition_count
+                != fragments[edge.consumer_fragment_id].partition_count
+            ):
+                raise ValueError("PASSTHROUGH requires equal producer and consumer partition counts")
             connected_inputs.add(consumer)
             connected_outputs.add(producer)
             parents[edge.consumer_fragment_id].add(edge.producer_fragment_id)

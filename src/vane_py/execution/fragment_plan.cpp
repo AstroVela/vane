@@ -706,6 +706,9 @@ struct DistributedSubtree {
 	// Exchanges clear this lineage. A broadcast join preserves the probe scan
 	// and its exact split assignments, including when it duplicates probe rows.
 	optional_ptr<const PhysicalOperator> local_scan;
+	// Ordered columns with the exact native representation used by HASH.
+	// An empty vector means that the output distribution is not proven.
+	vector<idx_t> hash_keys;
 };
 
 double EstimatedExchangeBytes(const PhysicalOperator &op) {
@@ -771,6 +774,7 @@ public:
 			graph.exchanges.push_back(std::move(edge));
 		}
 		auto id = fragment.fragment_id;
+		output_partitioning.emplace(id, std::make_pair(graph.fragments.size(), std::move(subtree.hash_keys)));
 		graph.fragments.push_back(std::move(fragment));
 		return id;
 	}
@@ -789,13 +793,23 @@ public:
 		edge.consumer_port = edge.exchange_id;
 		edge.distribution = distribution;
 		if (distribution == "hash") {
-			edge.partitioning = HashExpression(types, keys);
+			auto found = output_partitioning.find(producer);
+			if (found != output_partitioning.end() && !keys.empty() && found->second.second == keys &&
+			    graph.fragments[found->second.first].partition_count == count &&
+			    graph.fragments[found->second.first].root.types == types) {
+				edge.distribution = "passthrough";
+			} else {
+				edge.partitioning = HashExpression(types, keys);
+			}
 		}
 		edge.producer = producer;
 		DistributedSubtree result;
 		result.fragment.partition_count = count;
 		result.fragment.root.input_port = edge.consumer_port;
 		result.fragment.root.types = std::move(types);
+		if (distribution == "hash") {
+			result.hash_keys = keys;
+		}
 		result.incoming.push_back(std::move(edge));
 		return result;
 	}
@@ -924,6 +938,7 @@ private:
 	idx_t partitions;
 	idx_t broadcast_limit;
 	idx_t next_exchange = 0;
+	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
 	// an ID namespace. Each loaded fragment gets a fresh set of filter objects.
 	DynamicTableFilterSerializationState filter_serialization;
@@ -1406,6 +1421,9 @@ private:
 		auto cte_filters = PlanCTEFilters(root);
 		const bool partitioned = partitions > 1 && PlanCorrelatedPartition(root, partitioning);
 		result.fragment.partition_count = partitioned ? partitions : 1;
+		if (partitioned && !partitioning.output_keys.empty()) {
+			result.hash_keys = {partitioning.output_keys[0]};
+		}
 		auto &node = result.fragment.root;
 		node.types = root.types;
 		node.scoped = true;
@@ -1509,6 +1527,29 @@ private:
 		return node;
 	}
 	void Wrap(PhysicalOperator &op, DistributedSubtree &child) {
+		// Casts and compression can change HASH even when they are injective.
+		// Retain routing only through unchanged references and row filters.
+		if (op.type == PhysicalOperatorType::PROJECTION) {
+			vector<idx_t> output_keys;
+			auto &expressions = op.Cast<PhysicalProjection>().select_list;
+			for (auto key : child.hash_keys) {
+				for (idx_t i = 0; i < expressions.size(); i++) {
+					auto &expression = *expressions[i];
+					if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF &&
+					    expression.Cast<BoundReferenceExpression>().index == key &&
+					    expression.return_type == child.fragment.root.types[key]) {
+						output_keys.push_back(i);
+						break;
+					}
+				}
+			}
+			if (output_keys.size() != child.hash_keys.size()) {
+				output_keys.clear();
+			}
+			child.hash_keys = std::move(output_keys);
+		} else if (op.type != PhysicalOperatorType::FILTER) {
+			child.hash_keys.clear();
+		}
 		auto node = Node(op);
 		node.children.push_back(std::move(child.fragment.root));
 		child.fragment.root = std::move(node);
@@ -1925,6 +1966,19 @@ private:
 			}
 		}
 		join.join_stats.clear();
+		vector<idx_t> output_keys;
+		if (join.join_type == JoinType::INNER || join.join_type == JoinType::SEMI) {
+			for (auto key : left.hash_keys) {
+				auto &columns = join.lhs_output_columns.col_idxs;
+				auto found = std::find(columns.begin(), columns.end(), key);
+				if (found == columns.end()) {
+					output_keys.clear();
+					break;
+				}
+				output_keys.push_back(idx_t(found - columns.begin()));
+			}
+		}
+		left.hash_keys = std::move(output_keys);
 		auto node = Node(join);
 		node.children.push_back(std::move(left.fragment.root));
 		node.children.push_back(std::move(right.fragment.root));

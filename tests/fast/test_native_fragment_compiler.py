@@ -62,6 +62,9 @@ def execute_graph(connection, graph):
                     target[edge.consumer_port] = []
                 for row, partition in zip(rows, ids, strict=True):
                     inputs[partition][edge.consumer_port].append(row)
+            elif edge.distribution is Distribution.PASSTHROUGH:
+                for partition, target in enumerate(inputs):
+                    target[edge.consumer_port] = outputs[edge.producer_fragment_id][partition]
             else:
                 raise AssertionError(f"unexpected exchange {edge.distribution}")
         outputs[fragment_id] = []

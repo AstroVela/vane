@@ -13,6 +13,7 @@ from typing import Any
 
 from vane.execution.direct_exchange import DirectExchangeLimits
 from vane.execution.fte_store import ExchangeStore
+from vane.execution.plan import Distribution
 from vane.execution.query_runtime import QueryResources
 from vane.execution.resource_demand import _capacity
 from vane.execution.submission import RayQuerySpec
@@ -155,7 +156,10 @@ def placement(spec: RayQuerySpec, epochs: list[str], result_epoch: str) -> tuple
         producer, consumer = fragments[edge.producer_fragment_id], fragments[edge.consumer_fragment_id]
         schema = next(port.schema for port in producer.outputs if port.port_id == edge.producer_port)
         for upstream in range(producer.partition_count):
-            for downstream in range(consumer.partition_count):
+            downstreams = (
+                (upstream,) if edge.distribution is Distribution.PASSTHROUGH else range(consumer.partition_count)
+            )
+            for downstream in downstreams:
                 add(
                     edge.exchange_id,
                     task_id(producer.fragment_id, upstream),

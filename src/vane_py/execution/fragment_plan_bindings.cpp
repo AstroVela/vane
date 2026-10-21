@@ -167,7 +167,7 @@ py::dict CompilerCapabilities(DuckDBPyConnection &connection) {
 	result["protocol_version"] = 1;
 	result["type_profile"] = "vane.analytical-types:5";
 	result["connection_profile"] = "vane.builtin-session:1";
-	result["distributions"] = vector<string> {"gather", "hash", "broadcast"};
+	result["distributions"] = vector<string> {"gather", "hash", "broadcast", "passthrough"};
 	result["scans"] = scans;
 	return result;
 }

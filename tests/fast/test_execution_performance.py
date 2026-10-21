@@ -34,6 +34,73 @@ from vane.execution.worker_database import WorkerDatabasePool
 from vane.execution.worker_resources import pipelined_demand
 
 
+def partitioned_join_query(key="p.k", comparison="="):
+    def source(count):
+        return f"select case when range%997=0 then null else range//2 end k, range%13 v from range({count})"
+
+    right_key = "c.k::integer" if "integer" in key else "c.k"
+    return (
+        "select sum(p.av+p.bv+c.v), count(*) from "
+        f"(select a.k, a.v av, b.v bv from ({source(4096)}) a "
+        f"join ({source(8192)}) b on a.k {comparison} b.k) p "
+        f"join ({source(16384)}) c on {key} {comparison} {right_key}"
+    )
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("key,reused", [("p.k", True), ("p.k+1", False), ("p.k::integer", False)])
+def test_hash_partition_reuse_requires_unchanged_key_representation(threads, partitions, comparison, key, reused):
+    config = {"threads": threads, "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization"}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = partitioned_join_query(key, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        edges = [e for e in spec.graph.exchanges if e.distribution is Distribution.PASSTHROUGH]
+        assert bool(edges) is reused
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            for edge in edges:
+                for part in range(partitions):
+                    state = service.channels[f"{edge.exchange_id}/{part}"].snapshot()
+                    assert state["producers"] == 1
+                    assert state["peak_bytes"] <= limits.window_bytes
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("columns,reused", [((0, 1), True), ((1, 0), False)])
+def test_hash_partition_reuse_preserves_composite_key_order(columns, reused):
+    sql = (
+        "select a.k,a.v from (select range//2 k,range%7 v from range(4096)) a "
+        "join (select range//2 k,range%7 v from range(8192)) b on a.k=b.k and a.v=b.v"
+    )
+    config = {"threads": 1, "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization"}
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, 3, columns)
+        assert any(e.distribution is Distribution.PASSTHROUGH for e in graph.exchanges) is reused
+        assert Counter(execute_graph(connection, graph)) == Counter(connection.execute(sql).fetchall())
+
+
+def test_hash_partition_reuse_drops_null_extended_key():
+    def source(count):
+        return f"select case when range%97=0 then null else range end k,range v from range({count})"
+
+    sql = (
+        "select count(*),sum(p.av+p.bv+c.v) from "
+        f"(select a.k,a.v av,b.v bv from ({source(64)}) a right join ({source(256)}) b "
+        f"on a.k=b.k) p join ({source(1024)}) c on p.k is not distinct from c.k"
+    )
+    config = {"threads": 1, "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization"}
+    with vane.connect(backend="local", config=config) as connection:
+        spec = submission(connection, sql, partitions=3)
+        assert all(e.distribution is not Distribution.PASSTHROUGH for e in spec.graph.exchanges)
+        with InProcessTaskService(connection, spec, DirectExchangeLimits(4096, 1024, 32, 1)) as service:
+            service.start()
+            assert collect(service) == connection.execute(sql).fetchall()
+
+
 def profile_fragment_scans(connection, monkeypatch):
     scans = []
     execute = native._execute_fragment_for_test
