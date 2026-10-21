@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
 from vane.execution.admission_ledger import BoundedReplayMap
+from vane.runners.copy_outcome import CopyOutcomeUnknownError
 from vane.runners.ray.driver import RayQueryDriverClient
 from vane.runners.runner import Runner
 
@@ -25,6 +26,12 @@ _RAY_RUNNERS: weakref.WeakSet[RayRunner] = weakref.WeakSet()
 # finalizers, which re-enter notify_connection_closed() on the same thread.
 _RAY_RUNNERS_LOCK = threading.RLock()
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
+
+
+def _release_vane_fs_query_pins(plan: Any) -> None:
+    release = getattr(plan, "_release_vane_fs_query_pins", None)
+    if callable(release):
+        release()
 
 
 def notify_connection_closed(session_id: str) -> None:
@@ -156,17 +163,31 @@ class RayRunner(Runner):
             client = self._client_for_session(str(logical_plan.session_id()))
             yield from client.stream_plan(logical_plan)
         finally:
+            _release_vane_fs_query_pins(logical_plan)
             del logical_plan
 
     def run_write(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound logical write plan."""
-        client = self._client_for_session(str(logical_plan.session_id()))
-        return client.run_copy_plan(logical_plan)
+        outcome_unknown = False
+        try:
+            client = self._client_for_session(str(logical_plan.session_id()))
+            return client.run_copy_plan(logical_plan)
+        except CopyOutcomeUnknownError:
+            # The client owns the pending plan until its original RPC settles
+            # or session cleanup confirms that execution has stopped.
+            outcome_unknown = True
+            raise
+        finally:
+            if not outcome_unknown:
+                _release_vane_fs_query_pins(logical_plan)
 
     def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
         """Execute an already-bound Python DataSink plan."""
-        client = self._client_for_session(str(logical_plan.session_id()))
-        return client.run_datasink_plan(logical_plan)
+        try:
+            client = self._client_for_session(str(logical_plan.session_id()))
+            return client.run_datasink_plan(logical_plan)
+        finally:
+            _release_vane_fs_query_pins(logical_plan)
 
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
         """Retry cleanup for a committed write without executing the write again."""

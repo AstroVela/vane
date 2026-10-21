@@ -398,6 +398,8 @@ jobs:
           python -m pip install './vane_fs[test]' --no-build-isolation
           python -I -c 'import vane, vane_fs, av, numpy, PIL; assert hasattr(vane.DuckDBPyConnection, "_register_vane_fs")'
           scripts/run_installed_pytest.sh "$PWD/vane_fs/tests/test_vane.py" --rootdir="$PWD/vane_fs" --timeout=60
+          scripts/run_installed_pytest.sh tests/fast/test_vane_fs_ray.py -m 'not real_ray' --timeout=60
+          scripts/run_installed_pytest.sh tests/fast/test_vane_fs_ray.py -m real_ray --timeout=180
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'

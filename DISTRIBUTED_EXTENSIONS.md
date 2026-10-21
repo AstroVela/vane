@@ -225,6 +225,17 @@ The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
 This validation occurs before task admission and plan deserialization.
 
+The optional native VaneFS connector adds `vane_fs_workspaces` declarations to
+the same connection snapshot. Each declaration contains an absolute local
+database path, expected workspace ID, timeout, host name and bound snapshot
+IDs. Planning and worker connections reopen their own native providers;
+worker cache identities include the exact declarations. Same-host validation
+and workspace-ID checks precede file access. Driver plans retain binding pins,
+and query replay state owns worker pins across task attempts until cleanup.
+The optional `vane-fs` package must be installed in every participating process.
+This protocol qualifies same-host reads; remote services and multi-host storage
+require their own protocol.
+
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning
 DatabaseInstance, and attached catalogs are recreated only there. The
