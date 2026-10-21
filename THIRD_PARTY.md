@@ -65,6 +65,14 @@ vendor these SDKs. The EmbeddingGemma 2 checkpoint is obtained separately under
 the [Gemma terms](https://ai.google.dev/gemma/terms); no weights, tokenizer assets
 or Hugging Face cache are distributed with Vane.
 
+The optional `litert` extra installs [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
+(`litert-lm-api`, Apache-2.0) and Pillow under its PIL/Pillow license. Its native
+runtime, bundled libraries and their notices remain in the separately installed
+SDK wheel. Preserve that wheel's complete notices when redistributing an
+environment. The adapter requires separately provisioned EmbeddingGemma 2
+LiteRT-LM weights (Apache-2.0); Vane distributes no model assets, SDK source or
+third-party datasets. Test images and audio are authored in the tests.
+
 The optional `video_asr` extra installs faster-whisper (MIT) and its dependencies;
 `video_ocr` installs RapidOCR (Apache-2.0) and ONNX Runtime (MIT). These packages
 and model weights are not bundled. Local adapters require explicitly provisioned

@@ -94,6 +94,10 @@ mlx = [ # EmbeddingGemma 2 BF16 text/image inference on Apple Silicon Metal
     "huggingface-hub>=1.31,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pillow>=10.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inference
+    "litert-lm-api==0.18.0",
+    "pillow>=10.4",
+]
 clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
 cosmos = [
     "torch>=2.7",
@@ -241,6 +245,7 @@ include = [
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
+    "/LITERT_EMBEDDING.md",
     "/GRAVITINO.md",
     "/LOCAL_MODEL_RUNTIME.md",
     "/LOCAL_SERVING_ACCEPTANCE.md",
@@ -317,6 +322,8 @@ include = [
     "/tests/fast/test_qwen3_vl.py",
     "/tests/fast/test_mlx_provider.py",
     "/tests/fast/test_mlx_image_provider.py",
+    "/tests/fast/test_litert_provider.py",
+    "/tests/ai/test_litert_embedding.py",
     "/tests/ai/test_mlx_image_embedding.py",
     "/tests/fast/test_native_multimodal.py",
     "/tests/fast/test_datasink.py",
@@ -380,6 +387,7 @@ include = [
     "/examples/jev_judgments.py",
     "/examples/multimodal_providers.py",
     "/examples/qwen3_vl_sqr.py",
+    "/examples/litert_embedding_search.py",
     "src/**",
     "vane/**",
 
