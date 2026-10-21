@@ -157,9 +157,8 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     dtype: Literal["float32", "float16", "bfloat16"]
 
 
-_MLX_TEXT_DEFAULTS: dict[str, Any] = {
+_MLX_COMMON_DEFAULTS: dict[str, Any] = {
     "revision": "1a4ffddb7905d3f63486748deabe091a01fb6201",
-    "input_type": "document",
     "dtype": "bfloat16",
     "device": "metal",
     "local_files_only": True,
@@ -168,6 +167,7 @@ _MLX_TEXT_DEFAULTS: dict[str, Any] = {
     "overlength": "error",
     "max_concurrency_per_actor": 1,
 }
+_MLX_TEXT_DEFAULTS = _MLX_COMMON_DEFAULTS | {"input_type": "document"}
 
 
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
@@ -358,20 +358,19 @@ def _require_optional_nonempty_string(options: Mapping[str, Any], name: str) -> 
         raise ValueError(f"Embed option {name!r} must be a non-empty string or None")
 
 
-def _validate_mlx_text_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    """The same closed encoding contract for direct factories and public Embed."""
+def _validate_mlx_common_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Shared encoding settings, without a text retrieval role."""
     from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
     copied = dict(options)
     _reject_sensitive_embed_options(copied)
-    if copied.keys() - _MLX_TEXT_DEFAULTS.keys():
-        raise TypeError("MLX text options accept only the declared model encoding settings")
-    prepared = _MLX_TEXT_DEFAULTS | copied
+    if copied.keys() - _MLX_COMMON_DEFAULTS.keys():
+        raise TypeError("MLX image options accept only the declared common model encoding settings")
+    prepared = _MLX_COMMON_DEFAULTS | copied
     if not _is_hugging_face_commit_sha(prepared["revision"]):
         raise EmbeddingConfigurationError("MLX revision must be a full 40-character commit SHA")
     prepared["revision"] = prepared["revision"].lower()
     for key, choices in {
-        "input_type": ("document", "query"),
         "dtype": ("bfloat16",),
         "device": ("metal",),
         "overlength": ("error",),
@@ -389,11 +388,30 @@ def _validate_mlx_text_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return prepared
 
 
+def _validate_mlx_text_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """The unchanged text encoding contract for factories and public Embed."""
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    copied = dict(options)
+    _reject_sensitive_embed_options(copied)
+    if copied.keys() - _MLX_TEXT_DEFAULTS.keys():
+        raise TypeError("MLX text options accept only the declared model encoding settings")
+    role = copied.pop("input_type", "document")
+    if not isinstance(role, str) or role not in ("document", "query"):
+        raise EmbeddingConfigurationError("MLX input_type must be one of: document, query")
+    return _validate_mlx_common_options(copied) | {"input_type": role}
+
+
+def _validate_mlx_image_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_mlx_common_options(options)
+
+
 def validate_embed_options(
     provider_family: str | None,
     options: Mapping[str, Any],
     *,
     relation: bool,
+    _input_kind: Literal["text", "image"] = "text",
 ) -> dict[str, Any]:
     """Validate and copy the closed Embed options for one entry point."""
 
@@ -403,6 +421,8 @@ def validate_embed_options(
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
     if family in {"sglang", "vllm"}:
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
+    if family == "mlx" and _input_kind == "image":
+        allowed = _EMBED_COMMON_OPTIONS | _MLX_COMMON_DEFAULTS.keys()
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
     unknown = sorted(set(copied) - allowed)
@@ -421,7 +441,9 @@ def validate_embed_options(
             raise EmbeddingConfigurationError("MLX requires execution_backend='subprocess_actor'")
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("MLX does not support character chunk averaging")
-        copied.update(_validate_mlx_text_options({k: v for k, v in copied.items() if k in _MLX_TEXT_DEFAULTS}))
+        defaults = _MLX_TEXT_DEFAULTS if _input_kind == "text" else _MLX_COMMON_DEFAULTS
+        validator = _validate_mlx_text_options if _input_kind == "text" else _validate_mlx_image_options
+        copied.update(validator({k: v for k, v in copied.items() if k in defaults}))
         if actor_number is None:
             copied.pop("actor_number", None)
 
@@ -567,6 +589,8 @@ def validate_embed_image_options(
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "mlx":
+        allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -593,7 +617,7 @@ def validate_embed_image_options(
     unknown = sorted(set(options) - allowed)
     if unknown:
         raise TypeError("Unsupported EmbedImage option(s): " + ", ".join(unknown))
-    return validate_embed_options(provider_family, options, relation=relation)
+    return validate_embed_options(provider_family, options, relation=relation, _input_kind="image")
 
 
 def validate_embed_audio_options(

@@ -362,6 +362,20 @@ def test_structured_provider_extras_require_supported_sdk_versions():
     assert sglang.specifier == SpecifierSet("==0.5.17")
 
 
+def test_mlx_image_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
+    apple = {"sys_platform": "darwin", "platform_machine": "arm64"}
+    for package, specifier in (
+        ("mlx", "==0.32.4"),
+        ("mlx-vlm", "==0.7.8"),
+        ("transformers", "==5.18.0"),
+        ("pillow", ">=10.4"),
+    ):
+        requirement = _requirement_for_extra("mlx", package, apple)
+        assert requirement.specifier == SpecifierSet(specifier)
+        assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "linux", "platform_machine": "x86_64"})
+        assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "darwin", "platform_machine": "x86_64"})
+
+
 def test_wheel_or_install_contains_primary_and_third_party_license_files():
     files = {str(path).replace("\\", "/") for path in distribution("vane-ai").files or []}
 

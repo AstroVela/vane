@@ -20,6 +20,10 @@ def test_mlx_optional_registration_and_safe_dependency_hint():
 
     descriptor = load_provider("mlx").get_text_embedder()
     assert descriptor.get_dimensions() == 768 and descriptor.get_udf_options().num_gpus == 0
+    image = load_provider("mlx").get_image_embedder()
+    assert image.get_dimensions() == 768 and image.get_udf_options().num_gpus == 0
+    assert "input_type" not in image.get_options()
+    assert image.get_output_spec().outputs[0].space == descriptor.get_output_spec().outputs[0].space
     error = pickle.loads(pickle.dumps(ProviderImportError("mlx")))
     safe = _safe_provider_execution_error("mlx", descriptor.get_model(), "Embed", error)
     assert isinstance(safe, ProviderImportError)
