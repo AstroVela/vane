@@ -3069,3 +3069,69 @@ configurations, raw samples, output counts/hashes, CPU records, JUnit reports
 and cleanup manifests. Prototype validation is kept separately and is not
 added to the distinct test count. Owned temporary data is cleaned after process
 exit; source datasets and the restored Doris/HDFS deployment are preserved.
+
+## Rejected SF100 final-state copy experiment (2026-10-21)
+
+A final-merge prototype copied the complete native aggregate state into each
+new group, avoiding empty-state initialization and its first combine. An explicit
+copy capability restricted this to self-contained destructor-free merge states;
+repeated groups still combined normally. The prototype was tested and then
+removed because neither query latency nor total worker CPU improved. The PR
+retains the preceding native state-import implementation.
+
+The following is a rejected trial, not a new retained implementation score.
+It compares the prototype with the preceding state-import revision. Original
+Q1/Q9/Q18/Q21 SQL, the same 307 SF100 Parquet inputs and the previous resource
+settings are retained. Baseline pipeline phases bracket candidate Local/pipeline
+and pipeline/Local phases; excluding the first query-specific execution gives
+four steady observations per cell. All 72 timing executions and four Local
+oracle executions match schema, row count and values.
+
+| Query | Local | Pipeline before | Rejected trial | Change | Trial / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.227 s | 4.496 s | 4.549 s | +1.2% | 1.08× |
+| Q9 | 10.002 s | 16.758 s | 16.862 s | +0.6% | 1.69× |
+| Q18 | 7.168 s | 16.717 s | 16.774 s | +0.3% | 2.34× |
+| Q21 | 12.159 s | 14.731 s | 14.808 s | +0.5% | 1.22× |
+
+Q18 remains 2.34 times Local; its median rises 0.3%. Control medians rise
+0.5–1.2%. These small shared-host differences do not establish a gain.
+Six separate Q18 CPU diagnostic executions also match. Mean OS user-plus-system
+CPU for the two pipeline workers rises from 446.160 to 450.805 CPU seconds
+(+1.04%); candidate Local averages 225.575 CPU seconds. Worker CPU excludes the
+coordinator/result service. Diagnostic timings are excluded from the table.
+
+Matched-text gprofng 2.42 native sampling (20 ms, all descendants) adds four
+baseline and two prototype Q18 executions, all result-checked. Across two
+pipeline queries per binary, attributed InitializeStates CPU falls from
+30.14 to 19.80 seconds and CombineStates from 12.18 to 4.56 seconds. New copying
+costs 5.80 sampled CPU seconds under final combine, and exclusive group-lookup
+CPU rises from 143.78 to 150.46 seconds. These are diagnostic samples with
+inclusive overlap, not additive query latency or proof of one compiler cause.
+The intended work was removed, but the overall measurements do not justify
+retaining the additional native path.
+
+The retained regression coverage deliberately constructs colliding long-string
+keys and exercises NULL keys/values, repeated producer states across vectors,
+one/four native threads, ordinary/forced-external execution and spill cleanup.
+The final retained binary is validated separately after removing the prototype;
+prototype test counts are not added to final distinct test totals.
+
+Trial code: `a576611f30f142c76e30554037a6e466e0db92a0`; native SHA-256
+`7ea2f095fd438e62dd55d83ef538fa6d20b1e0b638f17218a95e19e45dacd444`.
+Baseline is `93fa268299` (documentation after `670a59db29`), native SHA-256
+`3fa6c796cf18ebe4f5e26e39c58804add5efdd1bb6408e6a6172911364af86c4`.
+Python execution files, dependency versions, input identities, driver and resource
+capacities match. Only validated per-phase temporary storage paths differ.
+Timing includes submission, complete collection and successful close. OS caches
+are retained; no owned build/test, diagnostic or Doris/HDFS services overlap
+measured windows. The complete-group proof remains conservative; observed
+near-uniqueness does not permit skipping final duplicate-group merging.
+
+Evidence is retained under `build/pipeline-sf100-state-copy-20261021/`: the rejected
+patch and code identity, both measured binaries, raw samples, CPU reports,
+configuration comparison, output hashes/counts, test logs and cleanup manifests.
+Source datasets are preserved and Doris/HDFS is restored with the requested caches
+disabled. The next investigation should reduce repeated final-merge group
+construction and tuple movement; further initialization-only tuning has limited
+observed benefit.

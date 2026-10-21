@@ -254,6 +254,65 @@ def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(tmp_p
 
 
 @pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("external", [False, True])
+def test_merge_aggregate_new_groups_preserve_collisions_and_owned_keys(tmp_path, threads, external):
+    config = {"threads": threads, "temp_directory": str(tmp_path / "spill")}
+    with vane.connect(backend="local", config=config) as connection:
+        keys = "select 'long-key-' || lpad(range::varchar,20,'0') k from range(1000000)"
+        # Match the salt and low hash bits so the second group must compare
+        # against the first before it can be created. New-group rows can then
+        # be out of input order. Long keys also exercise owned tuple heaps.
+        first, second = connection.execute(
+            f"select min(k),max(k) from ({keys}) group by hash(k) & 18446462598732906495::ubigint "
+            "having count(*)>1 limit 1"
+        ).fetchone()
+        third = connection.execute(
+            f"select k from ({keys}) where hash(k)>>48 = hash('{first}')>>48 "
+            f"and k not in ('{first}','{second}') limit 1"
+        ).fetchone()[0]
+        source = (
+            f"select case range%4 when 0 then '{first}' when 1 then '{second}' when 2 then '{third}' end k, "
+            "case when range%11=0 or range%4=3 then null else range%97-48 end v from range(259)"
+        )
+        aggregates = (
+            "sum(v),count(v),count(*),avg(v),min(v),max(v),sum(v::hugeint),avg(v::hugeint),"
+            "sum(v::decimal(15,2)),avg(v::decimal(15,2)),avg(interval '1 microsecond'*v)::varchar"
+        )
+        sql = f"select k,{aggregates} from ({source}) group by k"
+        repeats = 513
+        expected = connection.execute(
+            f"select k,{aggregates} from ({source}) cross join range({repeats}) group by k"
+        ).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        partials = []
+        for partition in range(2):
+            partials.extend(
+                native._execute_fragment_for_test(
+                    connection,
+                    producer.native_plan,
+                    {},
+                    {
+                        source.source_id: [s.split_id for s in source.splits[partition::2]]
+                        for source in producer.sources
+                    },
+                )
+            )
+        order = {first: 0, second: 1, third: 2, None: 3}
+        partials.sort(key=lambda row: order[row[0]])
+        rows = partials * repeats
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        if external:
+            connection.execute("set debug_force_external=true")
+        for _ in range(2):
+            assert Counter(
+                native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            ) == Counter(expected)
+    assert not list((tmp_path / "spill").glob("*"))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
 def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, threads):
     spill = tmp_path / "spill"
     profile = tmp_path / "profile.json"
