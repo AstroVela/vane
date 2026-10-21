@@ -7,13 +7,20 @@ import gc
 import hashlib
 import pickle
 import socket
+from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
 
 import pytest
 
 import vane
 
-vane_fs = pytest.importorskip("vane_fs")
+# Without the optional wheel, the source directory imports as an empty namespace.
+try:
+    version("vane-fs")
+except PackageNotFoundError:
+    pytest.skip("requires the optional vane-fs package", allow_module_level=True)
+
+import vane_fs
 
 
 @pytest.fixture
