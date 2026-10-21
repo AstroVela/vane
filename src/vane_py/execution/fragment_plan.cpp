@@ -28,6 +28,8 @@
 #include "duckdb/function/aggregate/wide_integer.hpp"
 #include "duckdb/function/aggregate/wide_interval.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
+#include "duckdb/function/scalar/compressed_materialization_utils.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 
@@ -701,6 +703,12 @@ struct DistributedSubtree {
 	FragmentSpec fragment;
 	vector<ExchangeSpec> incoming;
 	std::set<const DynamicTableFilterSet *> local_filters;
+	// Exchanges clear this lineage. A broadcast join preserves the probe scan
+	// and its exact split assignments, including when it duplicates probe rows.
+	optional_ptr<const PhysicalOperator> local_scan;
+	// Ordered columns with the exact native representation used by HASH.
+	// An empty vector means that the output distribution is not proven.
+	vector<idx_t> hash_keys;
 };
 
 double EstimatedExchangeBytes(const PhysicalOperator &op) {
@@ -766,6 +774,7 @@ public:
 			graph.exchanges.push_back(std::move(edge));
 		}
 		auto id = fragment.fragment_id;
+		output_partitioning.emplace(id, std::make_pair(graph.fragments.size(), std::move(subtree.hash_keys)));
 		graph.fragments.push_back(std::move(fragment));
 		return id;
 	}
@@ -784,13 +793,23 @@ public:
 		edge.consumer_port = edge.exchange_id;
 		edge.distribution = distribution;
 		if (distribution == "hash") {
-			edge.partitioning = HashExpression(types, keys);
+			auto found = output_partitioning.find(producer);
+			if (found != output_partitioning.end() && !keys.empty() && found->second.second == keys &&
+			    graph.fragments[found->second.first].partition_count == count &&
+			    graph.fragments[found->second.first].root.types == types) {
+				edge.distribution = "passthrough";
+			} else {
+				edge.partitioning = HashExpression(types, keys);
+			}
 		}
 		edge.producer = producer;
 		DistributedSubtree result;
 		result.fragment.partition_count = count;
 		result.fragment.root.input_port = edge.consumer_port;
 		result.fragment.root.types = std::move(types);
+		if (distribution == "hash") {
+			result.hash_keys = keys;
+		}
 		result.incoming.push_back(std::move(edge));
 		return result;
 	}
@@ -830,6 +849,7 @@ public:
 			result.fragment.root = EncodeNode(context, op, result.fragment, partitions, filter_serialization);
 			result.fragment.partition_count = result.fragment.sources.empty() ? 1 : partitions;
 			if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+				result.local_scan = &op;
 				auto &scan = op.Cast<PhysicalTableScan>();
 				if (scan.dynamic_filters) {
 					result.local_filters.insert(scan.dynamic_filters.get());
@@ -918,6 +938,7 @@ private:
 	idx_t partitions;
 	idx_t broadcast_limit;
 	idx_t next_exchange = 0;
+	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
 	// an ID namespace. Each loaded fragment gets a fresh set of filter objects.
 	DynamicTableFilterSerializationState filter_serialization;
@@ -1400,6 +1421,9 @@ private:
 		auto cte_filters = PlanCTEFilters(root);
 		const bool partitioned = partitions > 1 && PlanCorrelatedPartition(root, partitioning);
 		result.fragment.partition_count = partitioned ? partitions : 1;
+		if (partitioned && !partitioning.output_keys.empty()) {
+			result.hash_keys = {partitioning.output_keys[0]};
+		}
 		auto &node = result.fragment.root;
 		node.types = root.types;
 		node.scoped = true;
@@ -1503,6 +1527,29 @@ private:
 		return node;
 	}
 	void Wrap(PhysicalOperator &op, DistributedSubtree &child) {
+		// Casts and compression can change HASH even when they are injective.
+		// Retain routing only through unchanged references and row filters.
+		if (op.type == PhysicalOperatorType::PROJECTION) {
+			vector<idx_t> output_keys;
+			auto &expressions = op.Cast<PhysicalProjection>().select_list;
+			for (auto key : child.hash_keys) {
+				for (idx_t i = 0; i < expressions.size(); i++) {
+					auto &expression = *expressions[i];
+					if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF &&
+					    expression.Cast<BoundReferenceExpression>().index == key &&
+					    expression.return_type == child.fragment.root.types[key]) {
+						output_keys.push_back(i);
+						break;
+					}
+				}
+			}
+			if (output_keys.size() != child.hash_keys.size()) {
+				output_keys.clear();
+			}
+			child.hash_keys = std::move(output_keys);
+		} else if (op.type != PhysicalOperatorType::FILTER) {
+			child.hash_keys.clear();
+		}
 		auto node = Node(op);
 		node.children.push_back(std::move(child.fragment.root));
 		child.fragment.root = std::move(node);
@@ -1598,9 +1645,76 @@ private:
 		}
 		return plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 0);
 	}
+	optional_idx GroupKeyReference(const Expression &expression, vector<const BoundFunctionExpression *> &transforms) {
+		if (expression.GetExpressionType() == ExpressionType::BOUND_REF) {
+			return expression.Cast<BoundReferenceExpression>().index;
+		}
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return optional_idx();
+		}
+		auto &function = expression.Cast<BoundFunctionExpression>();
+		if (function.children.size() != 2 ||
+		    function.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return optional_idx();
+		}
+		auto &input = function.children[0]->return_type;
+		auto &output = function.return_type;
+		if (!input.IsIntegral() || !output.IsIntegral()) {
+			return optional_idx();
+		}
+		auto input_width = GetTypeIdSize(input.InternalType());
+		auto output_width = GetTypeIdSize(output.InternalType());
+		const bool compress = output.IsUnsigned() && output_width <= 8 && input_width > output_width &&
+		                      function.function == CMIntegralCompressFun::GetFunction(input, output);
+		const bool decompress = input.IsUnsigned() && input_width <= 8 && input_width < output_width &&
+		                        function.function == CMIntegralDecompressFun::GetFunction(input, output);
+		if (!compress && !decompress) {
+			return optional_idx();
+		}
+		transforms.push_back(&function);
+		return GroupKeyReference(*function.children[0], transforms);
+	}
+	bool InjectiveGroupKey(pair<Value, Value> bounds, const vector<const BoundFunctionExpression *> &transforms) {
+		// No nonempty split: there are no groups to merge. Otherwise validate
+		// every internal compression against file bounds, not its name or the
+		// optimizer's estimates. Explicit narrowing can wrap and merge keys.
+		if (transforms.empty() || (bounds.first.IsNull() && bounds.second.IsNull())) {
+			return true;
+		}
+		if (!bounds.first.DefaultTryCastAs(LogicalType::HUGEINT) ||
+		    !bounds.second.DefaultTryCastAs(LogicalType::HUGEINT)) {
+			return false;
+		}
+		auto lower = bounds.first.GetValue<hugeint_t>();
+		auto upper = bounds.second.GetValue<hugeint_t>();
+		for (auto i = transforms.size(); i > 0; i--) {
+			auto &function = *transforms[i - 1];
+			auto offset = function.children[1]->Cast<BoundConstantExpression>().value;
+			if (offset.IsNull() || !offset.DefaultTryCastAs(LogicalType::HUGEINT)) {
+				return false;
+			}
+			auto base = offset.GetValue<hugeint_t>();
+			if (GetTypeIdSize(function.children[0]->return_type.InternalType()) >
+			    GetTypeIdSize(function.return_type.InternalType())) {
+				if (lower < base || !Hugeint::TrySubtractInPlace(lower, base) ||
+				    !Hugeint::TrySubtractInPlace(upper, base)) {
+					return false;
+				}
+			} else if (!Hugeint::TryAddInPlace(lower, base) || !Hugeint::TryAddInPlace(upper, base)) {
+				return false;
+			}
+			// Checked endpoint casts prove the entire monotone range fits. Do
+			// not evaluate an overflowing native compression as part of planning.
+			if (!Value::HUGEINT(lower).DefaultTryCastAs(function.return_type) ||
+			    !Value::HUGEINT(upper).DefaultTryCastAs(function.return_type)) {
+				return false;
+			}
+		}
+		return true;
+	}
 	bool CompleteParquetGroups(PhysicalOperator &input, const DistributedSubtree &child,
 	                           const vector<unique_ptr<Expression>> &groups) {
-		if (!child.incoming.empty() || child.fragment.sources.size() != 1) {
+		if (!child.local_scan || child.fragment.sources.size() != 1) {
 			return false;
 		}
 		for (auto &group : groups) {
@@ -1609,23 +1723,33 @@ private:
 			}
 			auto column = group->Cast<BoundReferenceExpression>().index;
 			auto op = &input;
-			// Only unchanged references and row filters preserve the file key.
-			// Stop at joins, exchanges, casts and computed/compressed expressions.
-			while (op->children.size() == 1) {
+			vector<const BoundFunctionExpression *> transforms;
+			while (!op->children.empty()) {
 				if (op->type == PhysicalOperatorType::PROJECTION) {
 					auto &expressions = op->Cast<PhysicalProjection>().select_list;
-					if (column >= expressions.size() ||
-					    expressions[column]->GetExpressionType() != ExpressionType::BOUND_REF) {
+					if (column >= expressions.size()) {
 						break;
 					}
-					column = expressions[column]->Cast<BoundReferenceExpression>().index;
+					auto reference = GroupKeyReference(*expressions[column], transforms);
+					if (!reference.IsValid()) {
+						break;
+					}
+					column = reference.GetIndex();
+				} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+					auto &join = op->Cast<PhysicalHashJoin>();
+					if ((join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT &&
+					     join.join_type != JoinType::SEMI && join.join_type != JoinType::ANTI &&
+					     join.join_type != JoinType::MARK) ||
+					    column >= join.lhs_output_columns.col_idxs.size()) {
+						break;
+					}
+					column = join.lhs_output_columns.col_idxs[column];
 				} else if (op->type != PhysicalOperatorType::FILTER) {
 					break;
 				}
 				op = &op->children[0].get();
 			}
-			if (op->type != PhysicalOperatorType::TABLE_SCAN || column >= op->types.size() ||
-			    op->types[column] != group->return_type) {
+			if (op != child.local_scan.get() || column >= op->types.size() || !op->types[column].IsIntegral()) {
 				continue;
 			}
 			auto &scan = op->Cast<PhysicalTableScan>();
@@ -1641,8 +1765,10 @@ private:
 			for (auto &split : child.fragment.sources[0].splits) {
 				splits.push_back(DecodeFile(split.payload));
 			}
-			if (ParquetSplitRangesDisjoint(context, ParquetBind(scan.bind_data.get()), splits,
-			                               index.GetPrimaryIndex())) {
+			pair<Value, Value> bounds;
+			if (ParquetSplitRangesDisjoint(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
+			                               &bounds) &&
+			    InjectiveGroupKey(std::move(bounds), transforms)) {
 				return true;
 			}
 		}
@@ -1840,6 +1966,19 @@ private:
 			}
 		}
 		join.join_stats.clear();
+		vector<idx_t> output_keys;
+		if (join.join_type == JoinType::INNER || join.join_type == JoinType::SEMI) {
+			for (auto key : left.hash_keys) {
+				auto &columns = join.lhs_output_columns.col_idxs;
+				auto found = std::find(columns.begin(), columns.end(), key);
+				if (found == columns.end()) {
+					output_keys.clear();
+					break;
+				}
+				output_keys.push_back(idx_t(found - columns.begin()));
+			}
+		}
+		left.hash_keys = std::move(output_keys);
 		auto node = Node(join);
 		node.children.push_back(std::move(left.fragment.root));
 		node.children.push_back(std::move(right.fragment.root));

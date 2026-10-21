@@ -163,6 +163,22 @@ def test_duplicate_identities_are_rejected():
         _fragment("root", inputs=("in", "in"))
 
 
+def test_passthrough_requires_equal_partition_counts_and_roundtrips():
+    fragments = (
+        _fragment("scan", partitions=3),
+        _fragment("map", partitions=3, inputs=("in",)),
+        _fragment("root", inputs=("in",)),
+    )
+    edges = (
+        _edge("forward", "scan", "map", distribution=Distribution.PASSTHROUGH),
+        _edge("gather", "map", "root"),
+    )
+    graph = _graph(fragments, edges)
+    assert FragmentGraph.from_dict(graph.to_dict(), expected_engine_identity="engine-test") == graph
+    with pytest.raises(ValueError, match="PASSTHROUGH requires equal"):
+        _graph((fragments[0], replace(fragments[1], partition_count=2), fragments[2]), edges)
+
+
 @pytest.mark.parametrize("field", ["producer_fragment_id", "consumer_fragment_id", "producer_port", "consumer_port"])
 def test_exchanges_must_reference_real_ports(field):
     graph = _graph()

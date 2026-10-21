@@ -349,7 +349,7 @@ def test_correlated_equality_scopes_partition_without_broadcast(tmp_path, left_d
             assert len(consumers) == scopes
             assert all(f.partition_count == 3 for f in consumers)
             assert all(
-                edge.distribution is Distribution.HASH
+                edge.distribution in (Distribution.HASH, Distribution.PASSTHROUGH)
                 for edge in graph.exchanges
                 if edge.consumer_fragment_id != graph.result.fragment_id
             )

@@ -2481,3 +2481,285 @@ query/worker/result reservations return to zero. Owned processes stop
 before temporary/spill cleanup. Oracle schemas, row counts and hashes
 are retained before output deletion, source inputs are preserved and
 disk guards remain untriggered, with about 74 GiB free after cleanup.
+
+
+## Complete Parquet groups through broadcast joins (2026-10-21)
+
+A broadcast join preserves the probe scan's exact Parquet split assignments.
+The planner now retains that scan lineage and proves complete groups through
+probe output references, filters and checked integral compression/decompression.
+When one grouping key has non-null, disjoint ranges across the assigned splits,
+all rows of each group already belong to one partition. The native aggregate,
+HAVING and partial Top-N can finish there before the final global merge.
+Previously, any incoming exchange or internal compression projection discarded
+this proof and introduced a partial-state hash exchange and merge aggregate.
+
+Every exchange clears scan lineage. The proof follows only probe columns of
+INNER, LEFT, SEMI, ANTI and MARK joins; build output columns, FULL/RIGHT joins,
+scoped state, arbitrary casts and computed keys do not establish ownership.
+Internal integral transformations require the builtin function signature and a
+constant offset. Checked endpoint arithmetic against the actual file bounds
+proves every transformation is injective without narrowing overflow. Overlapping
+ranges, NULLs, repeated inputs, missing statistics and schema mappings retain
+the ordinary distributed aggregation. There is no SQL, table or query-number
+special case, cross-query plan cache, or new execution mode.
+
+The initial full comparison identified Q9, Q21 and Q10 as the largest absolute
+pipelined/local gaps. Separate diagnostics show compilation plus scheduler
+preparation at about 103/123/85 ms respectively. Worker preparation is nested
+inside those scheduler waits, with concurrent workers; the durations are not
+summed again. Task timelines and producer-side terminal channel counters show:
+
+- Q9 still hashes 15,000,000 order rows into its first large join, then hashes
+  3,261,613 joined rows toward its next join. Its fragment graph is unchanged.
+- Q21 still has successive correlated build barriers and hash exchanges. Its
+  fragment graph and per-edge row counts are unchanged.
+- Q10 removes a hash exchange carrying **381,105 wide aggregate-state rows**
+  in **2,098 frames** in the diagnostic sample. That edge recorded 4,220
+  blocked publications. The graph shrinks from six fragments to five; only
+  **40 local Top-N rows** need the final gather, followed by the global Top-20.
+  The existing build broadcasts retain the same row counts.
+
+These are channel publication rows and frames, counting each outgoing route
+once, including local routes and broadcast replicas. They are not encoded wire
+bytes; channel current/peak bytes do not measure cumulative traffic. Diagnostic
+runs are excluded from all timing claims.
+
+The frozen baseline is the merged integration tree at `73e90088f0` (identical
+to the previously built `348fb5d789` tree). The non-editable Release binaries are
+identified by SHA-256: baseline
+`b6955e3a3b325d44752e0d1cba79a43d100c2c053e5de1859e7d055eae3f5fd0`,
+candidate
+`f265a1d4d496f02320ef2b4ac138045571c78b9384cc474fdffd551dbe437382`.
+Their DuckDB SourceID prefixes are `ff00fa7d41` and `54dcd9e0af`.
+Installed Python sources are identical between the two environments.
+
+Both use the unchanged SF10 SQL with AS NOT MATERIALIZED Parquet input CTEs:
+local 36 threads/32 GiB; two pipelined workers with 18 CPUs and 16 GiB operator
+memory each; two partitions; 64 KiB/2048-row frames; 1 MiB/16-slot channels;
+128 MiB exchange and 256 MiB staging per worker; a 1 GiB Ray object store.
+Input hashes, driver and declared resources match. Each runtime receives a
+SELECT 1 warmup. The first execution of each SQL is recorded separately, and
+steady medians exclude it. Timings include submission, complete collection and
+successful close, excluding result comparison and diagnostics. OS caches stay
+warm on the shared host; no task-owned build, test or diagnostic overlaps a
+measured run. Cold service startup and SF10 FTE performance are not measured.
+
+The focused acceptance uses baseline/candidate/candidate/baseline order, with
+local/pipelined then pipelined/local mode orders. Each query has eight steady
+samples per runtime/mode, plus its separately recorded first executions:
+
+| Query | Baseline local, s | Baseline pipelined, s | Candidate local, s | Candidate pipelined, s | Pipelined change |
+|---|---:|---:|---:|---:|---:|
+| Q9 | 0.841 | 1.273 | 0.844 | 1.283 | +0.7% |
+| Q21 | 1.163 | 1.518 | 1.174 | 1.503 | -1.0% |
+| Q10 | 0.472 | 0.780 | 0.476 | 0.631 | -19.1% |
+
+Q10 improves in both orders: 0.760 to 0.635 seconds (-16.4%) and 0.787 to
+0.627 seconds (-20.3%). Its combined steady median improves **19.1%** and is
+**1.32 times** its matching local control. Q9/Q21 do not establish a material
+performance improvement from this change.
+
+The complete 22-query comparison uses six steady samples per mode/version,
+plus first executions, with forward and reverse mode order. Those full-matrix
+baseline rounds precede the candidate rounds; the focused interleaved runs
+above support the optimization claim. Full-matrix steady medians are:
+
+| Query | Candidate local, s | Baseline pipelined, s | Candidate pipelined, s | Candidate / local |
+|---|---:|---:|---:|---:|
+| Q1 | 0.457 | 0.565 | 0.563 | 1.23 |
+| Q2 | 0.132 | 0.250 | 0.259 | 1.96 |
+| Q3 | 0.364 | 0.542 | 0.553 | 1.52 |
+| Q4 | 0.276 | 0.508 | 0.505 | 1.83 |
+| Q5 | 0.409 | 0.574 | 0.578 | 1.41 |
+| Q6 | 0.211 | 0.284 | 0.288 | 1.36 |
+| Q7 | 0.404 | 0.621 | 0.632 | 1.57 |
+| Q8 | 0.499 | 0.701 | 0.699 | 1.40 |
+| Q9 | 0.852 | 1.269 | 1.270 | 1.49 |
+| Q10 | 0.470 | 0.773 | 0.624 | 1.33 |
+| Q11 | 0.096 | 0.166 | 0.171 | 1.78 |
+| Q12 | 0.288 | 0.434 | 0.425 | 1.48 |
+| Q13 | 0.533 | 0.759 | 0.753 | 1.41 |
+| Q14 | 0.300 | 0.501 | 0.495 | 1.65 |
+| Q15 | 0.301 | 0.395 | 0.407 | 1.35 |
+| Q16 | 0.157 | 0.329 | 0.318 | 2.03 |
+| Q17 | 0.382 | 0.475 | 0.470 | 1.23 |
+| Q18 | 0.688 | 0.921 | 0.908 | 1.32 |
+| Q19 | 0.418 | 0.654 | 0.663 | 1.59 |
+| Q20 | 0.341 | 0.567 | 0.570 | 1.67 |
+| Q21 | 1.181 | 1.550 | 1.533 | 1.30 |
+| Q22 | 0.143 | 0.246 | 0.244 | 1.71 |
+
+The sum of per-query steady medians is **13.09 to
+12.93 seconds** for pipelined, with candidate local
+**8.90 seconds**: **1.45 times** local.
+This is a sum of medians, not a throughput measurement. All **824 accepted timing
+executions** (704 full-matrix and 120 focused) match the local oracle's schema,
+row counts and values, with floating relative/absolute tolerances 1e-9/1e-6.
+Q11 returns zero rows with the unchanged SF10 threshold. Q9 and Q21 remain the
+largest absolute gaps; improving them requires additional execution work.
+
+Related validation covers complete-group lineage, compression with signed and
+unsigned offsets, duplicate build matches, LEFT/SEMI/ANTI/MARK, empty/NULL builds,
+FULL joins, build-side grouping, lossy/computed keys, overlapping/nullable/repeated
+splits, missing statistics, ordered/DISTINCT/wide aggregates and tiny bounded
+channels. A total of **631 distinct related tests pass**, including ten real-Ray tests
+covering pipelined execution, FTE, worker loss/retry,
+source assignments and complete cleanup. The new plan-shape regression fails on
+the frozen baseline. Only related tests run; no full suite or GPU tests run.
+The sdist includes the three helper modules imported by the curated analytical
+release tests, including the group-proof fixtures.
+
+Evidence is retained under `build/pipelined-gap-20261021/`: frozen identities and
+configurations, raw samples, `comparison.json`, `local-vs-pipelined.csv`, focused
+rounds, separate preparation/timeline/terminal-channel diagnostics, regression
+logs and cleanup manifests. Owned processes stop before temporary/spill removal;
+query, result and worker reservations return to zero. Oracle row counts, schemas
+and hashes are retained before deleting comparison outputs. Source inputs are
+preserved, disk guards stay untriggered, and cleanup happens outside timing.
+
+## Reusing proven hash partitions (2026-10-21)
+
+The compiler retains ordered routing columns through unchanged projections,
+row filters, INNER/SEMI probe outputs and proven correlated scopes. A subsequent
+HASH request becomes PASSTHROUGH only when the output schema, native key
+representation, key order and partition count match. Injective compression can
+preserve complete groups while changing HASH; these are separate proofs.
+
+PASSTHROUGH routes producer partition i to consumer partition i. Pipelined
+execution reserves only those routes, and FTE writes and reads only the
+corresponding partition objects. Native channel credit, frame sequences,
+cancellation and stage commit rules are unchanged. Q21 reuses four exchange
+boundaries; Q20 reuses one. Q9 retains its original exchanges, including the
+15-million-row orders input.
+
+The following controls isolate partition reuse on `73e90088f0`; the complete
+Parquet-group optimization above is evaluated separately. Both widths use 36
+native threads and 32 GiB total operator memory. Two workers use 18 threads and
+16 GiB each, with 256 MiB staging capacity per worker. Four workers use nine
+threads and 8 GiB each, with 512 MiB staging capacity per worker so both versions
+can be admitted. Frames remain 64 KiB/2048 rows, channel windows 1 MiB/16 slots,
+and the Ray object store 1 GiB. SQL, inputs, comparison tolerance and measurement
+boundaries match the preceding SF10 controls.
+
+| Query | Two-worker baseline | Two-worker reuse | Four-worker baseline | Four-worker reuse |
+| --- | ---: | ---: | ---: | ---: |
+| Q9 | 1.263 s | 1.276 s | 1.493 s | 1.514 s |
+| Q20 | 0.559 s | 0.556 s | 0.634 s | 0.622 s |
+| Q21 | 1.516 s | 1.504 s | 1.730 s | 1.676 s |
+
+Baseline/candidate/candidate/baseline controls contain 192 two-worker timing
+executions and 48 four-worker executions. First SQL executions are excluded
+from medians: ten steady samples per query/mode/version at two workers, six at
+four workers. All 240 executions match full oracle values, schemas and row
+counts. These are shared-host observations without CPU isolation. Two-worker
+latency changes are below 1% on the targets; four-worker Q21 changes by about
+3.1%. Q9 has no measured improvement.
+
+The deterministic benefit is fewer reserved routes and transport buffers:
+
+| Q21 configuration | Routes, before/after | Maximum worker staging reservation, before/after |
+| --- | ---: | ---: |
+| Two workers/partitions | 59 / 51 | 157.5 / 115.5 MiB |
+| Four workers/partitions | 229 / 181 | 462 / 336 MiB |
+| Eight workers/partitions | 905 / 681 | 1071 / 777 MiB |
+
+These are declared worst-case transport reservations, rather than observed RSS.
+The eight-worker row is a compiled routing/capacity probe, without a latency
+run. With four workers and a fixed 384 MiB staging limit, the baseline rejects
+Q21 before execution; reuse completes three oracle-checked executions. The
+final combined implementation also completes Q21 under that limit. Resource
+admission continues to enforce the configured capacity.
+
+The final combined build preserves the preceding Q10 improvement: a separate
+compatibility screen has pipelined medians 0.652 s for the complete-group parent
+and 0.634 s for the combined build. This 64-execution screen is not another
+interleaved speedup claim. All results match the same local oracle. Combined
+resource demands match the isolated reuse component for Q9/Q20/Q21 at two,
+four and eight partitions.
+
+The integration baseline native SHA-256 is `b6955e3a3b32...`, the isolated reuse
+component is `1729d1fca05a...`, the complete-group parent is `f265a1d4d496...`,
+and the combined build is `0db69f419324...`. Complete identities, configurations,
+drivers, samples and admission probes are retained in
+`build/pipelined-shuffle-20261021/`. Final combined validation passes 1257
+native/compiler/contract cases and 15 real-Ray cases, including FTE retry,
+three-partition routing, early close and batched-start failures. Only related
+tests run; no full suite or GPU tests run. Owned processes stop before spill,
+temporary data and comparison outputs are removed; row counts, schemas, hashes
+and cleanup manifests are retained.
+
+## Q9 key-domain feasibility and pipelined setup overlap (2026-10-21)
+
+Q9's filtered lineitem/part join produces 3,261,613 rows with 2,930,317
+distinct order keys. An exact necessary-condition filter could retain that
+many of the 15,000,000 orders, removing about 80.5% before their exchange.
+The existing 65,536-bucket hash domain is completely occupied by these keys;
+using it for this input would retain every order.
+
+Native diagnostic probes also evaluate bounded single-hash bitmaps:
+
+| Bitmap payload | Candidate orders retained | Missing true keys |
+| --- | ---: | ---: |
+| 0.5 MiB | 8,997,774 | 0 |
+| 2 MiB | 4,862,551 | 0 |
+| 8 MiB | 3,445,603 | 0 |
+
+These probes build the bitmap from a materialized exact domain, so their
+individual timings exclude upstream query work and transport. They establish
+filter selectivity and correctness, not an end-to-end optimization. Generating
+the exact domain from Parquet takes about 253 ms in the separate local probe.
+
+An isolated native prototype regenerates the filtered probe subtree and
+broadcasts its keys before the other join input's exchange. This avoids a
+cyclic dependency on a probe consumer waiting for the filtered build. However,
+the 64-execution screening control moves Q9's steady pipelined median from
+1.296 s to 1.557 s, about 20% slower. Every result matches the oracle. These
+are sequential screening rounds with three steady samples per mode/version,
+not a paired acceptance comparison. The prototype is removed. Its patch and
+binary identity remain in the investigation artifacts; it is not in the PR.
+A future large-domain filter needs to reuse existing join work and account for
+distribution, filter construction and dependency costs together.
+
+The accepted change instead overlaps independent pipelined setup operations:
+result-service preparation with worker preparation; worker, relay and client
+connections after every endpoint is published; and worker/relay readiness
+probes. Every preparation and connection receipt is still checked. Tasks start
+only after all native endpoints and the client are ready. Existing lifecycle
+locks, late-call fences, reservations, cancellation and channel limits apply.
+The installed native binary is unchanged from the combined partitioning build,
+SHA-256 `0db69f419324ad1c25cba93a1bb3cdcc5d723cf44f0c68822c6ae2310cb9a2f7`.
+
+The acceptance comparison uses baseline/candidate/candidate/baseline order,
+forward then reverse mode order, with eight steady samples per
+query/mode/version. It contains 240 timing executions. A separate 96-execution
+screen is excluded from these medians. Resources and measurement boundaries
+match the preceding two-worker controls: 36 local threads/32 GiB, two workers
+with 18 threads/16 GiB each, 256 MiB staging per worker, unchanged frame/window
+limits and SQL, the same frozen SF10 inputs, and full result collection and
+successful close. First SQL executions are recorded separately and excluded.
+
+| Query | Baseline Local | Candidate Local | Baseline pipelined | Candidate pipelined | Pipelined change | Submission time saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q2 | 0.136 s | 0.135 s | 0.249 s | 0.239 s | -3.9% | 10.1 ms |
+| Q6 | 0.214 s | 0.211 s | 0.289 s | 0.281 s | -2.6% | 7.0 ms |
+| Q9 | 0.854 s | 0.872 s | 1.273 s | 1.276 s | +0.2% | 3.7 ms |
+| Q10 | 0.474 s | 0.482 s | 0.642 s | 0.644 s | +0.2% | 10.0 ms |
+| Q20 | 0.344 s | 0.346 s | 0.574 s | 0.569 s | -0.8% | 8.3 ms |
+| Q21 | 1.193 s | 1.207 s | 1.522 s | 1.522 s | 0.0% | 5.0 ms |
+
+Q2 and Q6 improve in both orders. Q9/Q10/Q20/Q21 do not establish a material
+end-to-end improvement; Q9's large join/exchange gap remains. These are
+shared-host observations without CPU isolation. Local controls vary by up to
+2.1%, and no task-owned build, test or diagnostic runs during measurements.
+
+All 400 timing executions across the rejected native prototype, setup screen
+and setup acceptance controls match the full Local oracle's schemas, row
+counts and values. All 80 related tests pass: 49 real-Ray lifecycle, fault and
+source/retry cases, and 31 result-service unit cases. No full suite or GPU tests
+run. The setup regression also reproduces the serialized preparation
+order on the frozen baseline. Frozen configurations, SQL, Python/native
+identities, patches, drivers, samples and test logs are retained under
+`build/pipelined-q9-filter-20261021/`. Cleanup records the output schemas,
+counts and hashes before removing comparison outputs, after each run's owned
+processes have stopped; source inputs are preserved.

@@ -20,7 +20,10 @@ def disjoint_aggregate_query(directory, variant="disjoint"):
     # Four rows per group, with ranges too wide for native key compression.
     keys = [(i // 4) * 10**15 for i in range(16384)]
     values = [100 if i // 4 % 512 == 0 else 1 for i in range(16384)]
-    if variant == "overlap":
+    if variant.startswith("compressed"):
+        offset = {"compressed": 0, "compressed_negative": -(2**62), "compressed_unsigned": 2**63}[variant]
+        keys = [i // 4 + offset for i in range(16384)]
+    elif variant == "overlap":
         keys[8192] = keys[8191]
     elif variant == "nulls":
         for i in [*range(4), *range(8192, 8196)]:
@@ -31,7 +34,7 @@ def disjoint_aggregate_query(directory, variant="disjoint"):
         keys = [key + 2**63 for key in keys]
     elif variant == "negative":
         keys = [key - 2**62 for key in keys]
-    key_type = pa.uint64() if variant == "unsigned" else pa.int64()
+    key_type = pa.uint64() if variant in {"unsigned", "compressed_unsigned"} else pa.int64()
     table = pa.table({"k": pa.array(keys, type=key_type), "v": values})
     path = directory / "groups.parquet"
     pq.write_table(table, path, row_group_size=2048, write_statistics=variant != "missing_stats")
@@ -50,6 +53,110 @@ def disjoint_aggregate_query(directory, variant="disjoint"):
         f"select k, sum(v::decimal(15,2)) s, count(*) n from ({source}) "
         "group by k having sum(v::decimal(15,2)) > 300 order by k nulls last"
     )
+
+
+def broadcast_aggregate_query(directory, *, join="inner", key="a.k", variant="compressed"):
+    disjoint_aggregate_query(directory, "compressed")
+    path = directory / "groups.parquet"
+    if variant in {"overlap", "nulls", "missing_stats"}:
+        table = pq.read_table(path)
+        keys = table["k"].to_pylist()
+        if variant == "overlap":
+            keys[8192] = keys[0]
+        elif variant == "nulls":
+            for index in [*range(4), *range(8192, 8196)]:
+                keys[index] = None
+        table = table.set_column(0, "k", pa.array(keys, type=pa.int64()))
+        pq.write_table(table, path, row_group_size=2048, write_statistics=variant != "missing_stats")
+    files = f"['{path}', '{path}']" if variant == "repeated" else f"'{path}'"
+    # Duplicate build keys exercise probe fanout. LEFT also retains unmatched
+    # probe rows; grouping a build key must still combine all probe partitions.
+    return (
+        f"select {key} k, sum(a.v) s, count(*) n from read_parquet({files}) a "
+        f"{join} join (values (0), (1), (2), (0), (1), (9999)) b(k) on a.k % 7 = b.k "
+        f"group by {key} having sum(a.v) > 300 order by k nulls last"
+    )
+
+
+@pytest.mark.parametrize("variant", ["compressed", "compressed_negative", "compressed_unsigned"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_complete_parquet_groups_preserve_integral_compression(tmp_path, variant, partitions):
+    sql = disjoint_aggregate_query(tmp_path, variant)
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions)
+        assert execute_graph(connection, graph) == expected
+        assert all(edge.distribution is Distribution.GATHER for edge in graph.exchanges)
+
+
+@pytest.mark.parametrize("join", ["inner", "left", "semi", "anti"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_broadcast_join_preserves_complete_probe_groups(tmp_path, join, partitions):
+    sql = broadcast_aggregate_query(tmp_path, join=join)
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        assert any(edge.distribution is Distribution.BROADCAST for edge in spec.graph.exchanges)
+        assert all(edge.distribution is not Distribution.HASH for edge in spec.graph.exchanges)
+        limits = DirectExchangeLimits(window_bytes=4096, frame_bytes=2048, frame_rows=32, frame_slots=2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert all(channel.snapshot()["peak_bytes"] <= limits.window_bytes for channel in service.channels.values())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"key": "b.k"},
+        {"key": "a.k % 2"},
+        {"key": "a.k::double"},
+        {"join": "full outer"},
+        {"join": "left", "variant": "overlap"},
+        {"join": "left", "variant": "nulls"},
+        {"join": "left", "variant": "missing_stats"},
+        {"join": "left", "variant": "repeated"},
+    ],
+)
+def test_join_groups_require_preserved_key_and_split_evidence(tmp_path, options):
+    sql = broadcast_aggregate_query(tmp_path, **options)
+    if options.get("join") == "full outer":
+        sql = sql.replace("having sum(a.v) > 300", "")
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == expected
+        assert any(edge.distribution is Distribution.HASH for edge in graph.exchanges)
+
+
+@pytest.mark.parametrize("build", ["select range from range(0)", "select * from (values (0), (null)) b(k)"])
+def test_broadcast_mark_preserves_complete_probe_groups(tmp_path, build):
+    disjoint_aggregate_query(tmp_path, "compressed")
+    sql = (
+        f"select k, k in ({build}) m, sum(v) from read_parquet('{tmp_path / 'groups.parquet'}') "
+        "group by k, m having sum(v) > 300 order by k"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == expected
+        assert all(edge.distribution is not Distribution.HASH for edge in graph.exchanges)
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [
+        "sum(a.v::double order by a.v desc), count(distinct a.v)",
+        "min(a.v, 2), sum(a.v::decimal(38,2)), avg(a.v::hugeint)",
+    ],
+)
+def test_broadcast_complete_groups_keep_native_aggregate_semantics(tmp_path, aggregate):
+    sql = broadcast_aggregate_query(tmp_path, join="left").replace("sum(a.v) s, count(*) n", aggregate)
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == expected
+        assert all(edge.distribution is not Distribution.HASH for edge in graph.exchanges)
 
 
 @pytest.mark.parametrize("partitions", [2, 3, 5])

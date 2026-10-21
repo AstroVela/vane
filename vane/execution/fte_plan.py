@@ -15,7 +15,7 @@ from vane.execution.materialized_exchange import (
     fingerprint,
 )
 from vane.execution.pipelined_plan import task_id
-from vane.execution.plan import FragmentSpec
+from vane.execution.plan import Distribution, FragmentSpec
 from vane.execution.submission import RayQuerySpec
 
 
@@ -53,6 +53,10 @@ def bind_task(
         expected_schema = next(p.schema for p in fragment.inputs if p.port_id == edge.consumer_port)
         objects = []
         for attempt in stage.attempts:
+            if edge.distribution is Distribution.PASSTHROUGH and attempt.token.task_id != task_id(
+                producer.fragment_id, partition
+            ):
+                continue
             matching = [o for o in attempt.objects if o.output.identity == (edge.exchange_id, partition)]
             if len(matching) != 1 or matching[0].output.schema != expected_schema:
                 raise ValueError("upstream stage is missing a partition or has a different schema")
@@ -68,7 +72,11 @@ def bind_task(
             schema = next(p.schema for p in fragment.outputs if p.port_id == edge.producer_port)
             outputs.extend(
                 PartitionSpec(edge.exchange_id, part, schema)
-                for part in range(fragments[edge.consumer_fragment_id].partition_count)
+                for part in (
+                    (partition,)
+                    if edge.distribution is Distribution.PASSTHROUGH
+                    else range(fragments[edge.consumer_fragment_id].partition_count)
+                )
             )
     if fragment.fragment_id == spec.graph.result.fragment_id:
         outputs.append(PartitionSpec("result", 0, spec.result_schema))

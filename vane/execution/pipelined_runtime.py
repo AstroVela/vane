@@ -381,8 +381,7 @@ class PipelinedScheduler:
             hashlib.sha256(self.spec.result_schema).hexdigest(),
             secrets.token_urlsafe(32),
         ).encode()
-        location = _get(self.relay.prepare.remote(self.result_id, self.spec.result_schema, ticket), self.context)
-        self.result_endpoint = {"location": location, "ticket": ticket}
+        result_preparation = self.relay.prepare.remote(self.result_id, self.spec.result_schema, ticket)
         for index, worker in enumerate(self.pool.workers):
             owned = [task for task, host in assignments.items() if host == index]
             if not owned:
@@ -406,33 +405,36 @@ class PipelinedScheduler:
                         sequence,
                     )
                 )
+        location = _get(result_preparation, self.context)
+        self.result_endpoint = {"location": location, "ticket": ticket}
         locations = {
             index: _get(reference, self.context) for index, reference in zip(sorted(self.prepared), self.prepare_calls)
         }
-        # Every endpoint is published; workers can connect their inputs in parallel.
+        # Every endpoint is published. Connect worker inputs, the result relay
+        # and the client together, then require all readiness checks before start.
         connections = [
             self.pool.workers[index].connect.remote(self.pool.epochs[index], self.spec.query_id, locations)
             for index in sorted(self.prepared)
         ]
-        for reference in connections:
-            _get(reference, self.context)
         root_route = next(route for route in routes if route["target_worker"] == -1)
         timeout = self.spec.options.execution_timeout + self.spec.options.delivery_timeout
-        _get(
-            self.relay.connect.remote(
-                self.result_id, locations[root_route["source_worker"]], root_route["ticket"], timeout
-            ),
-            self.context,
+        result_connection = self.relay.connect.remote(
+            self.result_id, locations[root_route["source_worker"]], root_route["ticket"], timeout
         )
         self.consumer.attach(self.spec, resources, location, ticket)
+        for reference in connections:
+            _get(reference, self.context)
+        _get(result_connection, self.context)
         self.schema = native.arrow_schema(self.spec.result_schema, list(self.spec.result_names))
         while True:
             self.context.check()
-            ready = [
-                _get(self.pool.workers[index].ready.remote(self.pool.epochs[index], self.spec.query_id), self.context)
+            ready_calls = [
+                self.pool.workers[index].ready.remote(self.pool.epochs[index], self.spec.query_id)
                 for index in sorted(self.prepared)
             ]
-            relay_status = _get(self.relay.status.remote(self.result_id), self.context)
+            relay_probe = self.relay.status.remote(self.result_id)
+            ready = [_get(reference, self.context) for reference in ready_calls]
+            relay_status = _get(relay_probe, self.context)
             error = relay_status["error"] or relay_status["channel"]["error"] or self.consumer.error
             if error:
                 raise RuntimeError(error)

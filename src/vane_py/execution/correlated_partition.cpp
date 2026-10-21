@@ -194,6 +194,13 @@ public:
 		result.inputs.emplace(&owner, optional_idx(owner_column));
 		auto output = Visit(root.join);
 		if (output.valid && output.partitioned) {
+			for (idx_t i = 0; i < output.keys.size(); i++) {
+				auto &key = output.keys[i];
+				if (key && key->GetExpressionClass() == ExpressionClass::BOUND_REF &&
+				    key->return_type == root.types[i]) {
+					result.output_keys.push_back(i);
+				}
+			}
 			CorrelatedKeyFilter filter;
 			FindKeySource(owner, owner_column, key_type, filter.scan);
 			filter.owner.source = &owner;
