@@ -2849,3 +2849,73 @@ configurations, raw timing samples, `comparison.csv`, separate channel/CPU probe
 JUnit reports, validation results and cleanup manifests. Owned processes stop
 before spill, temporary data and oracle outputs are removed; oracle schemas,
 row counts and hashes are retained. Source datasets are preserved.
+
+## SF100 bounded key filters (2026-10-21)
+
+Correlated owner-key filters now use the existing per-query worker replication
+allowance rather than a separate 8 MiB cap. Owners remain shared and are neither
+rescanned nor recomputed. Existing lineage, selectivity and full-traffic checks
+remain in force. HAVING key filters choose a power-of-two hash domain separately
+for each probe, bounded by declared worker memory, probe cardinality and extra
+exchange traffic. The conservative default stays at 65,536 buckets; a 64 MiB
+replication allowance permits up to 524,288 buckets, reserving 128 working bytes
+per bucket. Domain and probe expressions serialize the same chosen mask.
+
+This comparison covers eight affected/control queries with original repository
+SQL over the same 307 SF100 Parquet files (37.5033 GiB). Baseline pipelined phases
+bracket candidate Local→pipelined and pipelined→Local phases. Each fresh phase
+runs two executions per query/mode and excludes the first query-specific one,
+leaving two steady samples per cell. All 96 comparison executions, eight oracle
+executions and two final diagnostic executions pass full schema/row/value checks
+under the existing float tolerance (relative 1e-9, absolute 1e-6).
+
+| Query | Local | Pipeline before | Pipeline now | Now / Local | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.218 s | 4.343 s | 4.405 s | 1.04× | +1.4% |
+| Q6 | 2.052 s | 2.237 s | 2.263 s | 1.10× | +1.2% |
+| Q9 | 9.872 s | 16.733 s | 16.781 s | 1.70× | +0.3% |
+| Q17 | 3.665 s | 4.364 s | 4.260 s | 1.16× | -2.4% |
+| Q18 | 7.349 s | 18.470 s | 17.369 s | 2.36× | -6.0% |
+| Q20 | 3.608 s | 5.585 s | 5.237 s | 1.45× | -6.2% |
+| Q21 | 11.949 s | 28.945 s | 15.328 s | 1.28× | -47.0% |
+| Q22 | 1.227 s | 3.950 s | 2.713 s | 2.21× | -31.3% |
+
+Separate native diagnostics show Q21's two correlated fact exchanges fall from
+979,394,376 to 58,393,804 rows combined (94.0% fewer). Q18's order/fact exchanges
+fall from 13,996,510 / 55,999,985
+to 1,824,198 / 7,316,103 rows,
+but its initial aggregate still exchanges 150,001,994 opaque states.
+This remains Q18's main measured bottleneck. Diagnostic timings are excluded
+from the comparison table.
+
+The selected-query median sums are 84.627 s before,
+68.356 s now and 43.939 s Local. These are eight-query
+sums, not a new 22-query TPC-H score. The full 22-query reference remains in the
+preceding section. Two steady observations do not establish small latency
+changes. This is a shared host with OS caches retained and no CPU isolation.
+
+Local uses 36 native threads and 32 GiB operator memory. Pipelined uses two
+workers × 18 threads / 16 GiB each, 128/256 MiB exchange/staging per worker,
+64 KiB/2048-row frames, 1 MiB/16-slot windows and a specialized 1 GiB Ray object
+store. Production query/file cache cleanup is unchanged. No owned builds, tests,
+native diagnostics or Doris/HDFS run during comparison windows. Final native
+diagnostics run separately afterward. No SF100 FTE timing claim is made.
+
+Frozen code: `d80fba27ad60a131f71b3ae7e9e58e296a67d9dc`; native SHA-256
+`275b1c71a2eeb33f18fb0f6338af2f103537fc2684545404ff917c7626a8e3b8`. Baseline is the retained native binary for the
+previous PR head, SHA-256
+`015287289eae8bfe195ebde518e9644b4864f67c2a8c0964da8dea375ca03bce`,
+using the same Python execution code. Both driver and worker native plan
+identities are enforced by the existing preparation protocol.
+
+All 1196 distinct related tests pass, including 23 real-Ray cases.
+They cover NULLs/duplicates, scalar/semi/anti/nested correlations, low/high memory
+controls, medium-probe filter retention, dense/empty domains, bounded channels,
+early close and shared-producer FTE retries. No full suite or GPU tests run.
+The existing test modules are already included in the source-package allowlist.
+
+Evidence is retained under `build/pipeline-sf100-exchange-20261021/`: frozen
+configurations and identities, raw samples, `comparison.csv`, validation results,
+native channel probes, JUnit reports and cleanup manifests. Source files remain
+unchanged. Owned spill/temp data and oracle outputs are removed only after their
+processes stop; schemas, row counts and hashes are retained.
