@@ -102,6 +102,19 @@ are rejected. Run manual subprocess examples outside the checkout so worker
 imports resolve to the installed package as described below.
 MLX and SQR pin different Transformers versions; use separate environments.
 
+For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
+Install the optional `litert` extra, which pins `litert-lm-api==0.18.0`.
+Run `scripts/run_installed_pytest.sh tests/fast/test_litert_provider.py` before
+the base release gate. These CPU contracts require no model SDK or weights.
+For real CPU SDK parity, multilingual retrieval, image/audio/composed inputs,
+public subprocess execution and teardown, explicitly provision the full
+CPU/GPU artifact documented in that contract and set `VANE_RUN_LITERT_TESTS=1`,
+`VANE_TEST_LITERT_MODEL_PATH` and `VANE_TEST_LITERT_MODEL_SHA256`. Then run
+`scripts/run_installed_pytest.sh tests/ai/test_litert_embedding.py -m external_service`.
+Missing assets or SDKs fail after opt-in; no download or model/backend fallback
+occurs. CPU tests do not qualify Metal, another accelerator, or representative
+multimodal retrieval quality. This is Python-only and needs no native rebuild.
+
 Image encoding uses the same public `embed(ImageInput(...), provider="mlx")`
 entry point and paired vector space. One decoded RGB `uint8` HWC array is one
 row, with at most 16 Mi pixels. Noncontiguous and read-only arrays are accepted;

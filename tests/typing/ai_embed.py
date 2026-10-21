@@ -26,6 +26,19 @@ assert_type(
     vane.Expression,
 )
 assert_type(embed(text, provider="transformers", input_type="query", overlength="error"), vane.Expression)
+assert_type(
+    embed(
+        text,
+        provider="litert",
+        model_path="/models/embedding.litertlm",
+        model_sha256="a" * 64,
+        backend="cpu",
+        num_threads=2,
+        dimensions=256,
+        input_type="query",
+    ),
+    vane.Expression,
+)
 
 image = vane.col("image")
 assert_type(embed(ImageInput(image)), vane.Expression)
@@ -34,6 +47,16 @@ assert_type(embed(relation, ImageInput(image)), vane.Relation)
 assert_type(embed(rel=relation, input=ImageInput(image)), vane.Relation)
 assert_type(relation.embed(ImageInput(image), normalize=True), vane.Relation)
 assert_type(embed(ImageInput(image), dtype="float16"), vane.Expression)
+assert_type(
+    embed(
+        ImageInput(image),
+        provider="litert",
+        model_path="/models/embedding.litertlm",
+        model_sha256="a" * 64,
+        vision_tokens_per_image=70,
+    ),
+    vane.Expression,
+)
 
 frames = vane.col("frames")
 assert_type(embed(VideoInput(frames)), vane.Expression)

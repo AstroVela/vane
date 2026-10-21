@@ -1,25 +1,46 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Connection-local registration of the optional C++ snapshot reader."""
+"""Connection-local registration and same-host Ray replay of the native reader."""
+
+import os
+import socket
 
 from vane_fs import _native
 
 
 def register_workspace(connection, database, *, timeout_ms=5000):
-    """Register an existing database for native reads on a local connection.
+    """Register an existing database for native reads on a local or Ray connection.
 
-    Select native execution with ``local`` or its ``local-fast`` alias.
+    Select ``local`` (or its ``local-fast`` alias) or ``ray`` execution.
 
     Returns its workspace ID. Registration owns an independent connection;
     every query and open reader pins the snapshots it uses. SQLite write
     access is needed for these retention records even though file data is
     read-only. Register separately on each Vane connection, including cursors.
+    Ray workers reopen this absolute database path on the same host; the
+    optional vane-fs package must also be installed in their environment.
     """
     register = getattr(connection, "_register_vane_fs", None)
     if register is None:
         raise TypeError("This Vane connection does not support native VaneFS readers")
-    return register(_native._reader_capsule(database, timeout_ms))
+    database = os.path.realpath(os.fspath(database))
+    return register(_native._reader_capsule(database, timeout_ms), database, timeout_ms, socket.gethostname())
+
+
+def _restore_workspace(connection, registration):
+    if registration["hostname"] != socket.gethostname():
+        raise ValueError("Native VaneFS Ray reads require workers on the same host as the registered workspace")
+    database = registration["database"]
+    if not os.path.isabs(database):
+        raise ValueError("VaneFS replay requires an absolute database path")
+    return connection._register_vane_fs(
+        _native._reader_capsule(database, registration["timeout_ms"]),
+        database,
+        registration["timeout_ms"],
+        registration["hostname"],
+        registration["workspace_id"],
+    )
 
 
 def unregister_workspace(connection, workspace_id):

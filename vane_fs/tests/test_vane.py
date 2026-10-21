@@ -300,7 +300,7 @@ def test_literal_unicode_and_percent_paths(native):
     workspace.drop_snapshot(frozen)
 
 
-def test_registration_validates_provider_and_requires_native_local_execution(native, tmp_path, monkeypatch):
+def test_registration_validates_provider_and_supports_ray(native, tmp_path, monkeypatch):
     workspace, connection, database, _, _ = native
     with pytest.raises(vane.InvalidInputException, match="capsule"):
         connection._register_vane_fs(object())
@@ -316,8 +316,7 @@ def test_registration_validates_provider_and_requires_native_local_execution(nat
     assert not (tmp_path / "missing.sqlite").exists()
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as other:
-        with pytest.raises(vane.InvalidInputException, match="requires runner='local'"):
-            register_workspace(other, database)
+        assert register_workspace(other, database) == workspace.id
     # Re-registering is safe, including for an already registered workspace.
     assert register_workspace(connection, database) == workspace.id
 

@@ -343,6 +343,7 @@ def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
     client._closed_session_ids = driver_module.BoundedReplayMap(capacity=65_536)
     client._session_closes_in_progress = set()
     client._session_condition = threading.Condition()
+    client._pending_vane_fs_copy_plans = {}
     client._client_closing = False
     client._client_close_in_progress = False
 

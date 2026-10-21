@@ -346,6 +346,7 @@ def _initialize_test_query_driver_client(client, opened_sessions=None):
     client._closed_session_ids = driver.BoundedReplayMap(capacity=65_536)
     client._session_closes_in_progress = set()
     client._session_condition = threading.Condition()
+    client._pending_vane_fs_copy_plans = {}
     client._client_closing = False
     client._client_close_in_progress = False
 
@@ -1967,7 +1968,11 @@ def test_query_driver_datasink_cleanup_retry_ignores_reused_plan_identity():
 def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-cleanup-retry"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+    logical_plan._release_vane_fs_query_pins = lambda: released_pins.append("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: released_pins.append("physical")
     plan_calls = 0
     teardown_calls = 0
 
@@ -1995,6 +2000,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    assert released_pins == []
     recovered = asyncio.run(
         cls.recover_copy_plan(
             runner,
@@ -2020,6 +2026,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     assert replayed == cleaned
     assert plan_calls == 1
     assert teardown_calls == 2
+    assert released_pins == ["logical", "physical"]
 
 
 def test_query_driver_pending_copy_cleanup_survives_terminal_replay_eviction(monkeypatch):
@@ -2137,12 +2144,22 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+
+    def release_pins(kind):
+        assert runner._test_session_connection.cursors[-1].closed is True
+        released_pins.append(kind)
+
+    logical_plan._release_vane_fs_query_pins = lambda: release_pins("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: release_pins("physical")
     plan_calls = 0
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
+            assert released_pins == []
             plan_calls += 1
             on_execution_started()
             if late_init:
@@ -2188,6 +2205,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
         assert isinstance(recovered.error, ValueError)
         assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
+    assert released_pins == ["logical", "physical"]
 
 
 @pytest.mark.parametrize("late_init", [False, True])
@@ -2938,6 +2956,140 @@ def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(mo
             },
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "completion", ["committed", "task_error", "transport_error", "cancelled", "invalid", "observer_error"]
+)
+def test_uncertain_copy_retains_native_pins_until_completion_or_confirmed_close(monkeypatch, completion):
+    import gc
+    import weakref
+    from concurrent.futures import Future
+
+    from vane.runners.ray.runner import RayRunner
+
+    plan_id = "copy-pending-native-pins"
+    plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    plan_ref = weakref.ref(plan)
+    released = []
+    plan._release_vane_fs_query_pins = lambda: released.append(plan_id)
+    original = Future()
+
+    class OriginalRef:
+        def future(self):
+            if completion == "observer_error":
+                raise RuntimeError("completion observer unavailable")
+            return original
+
+    reference = OriginalRef()
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=SimpleNamespace(remote=lambda *_: reference),
+        recover_copy_plan=SimpleNamespace(remote=lambda *_: "recover"),
+        close_session=SimpleNamespace(remote=lambda *_: "close"),
+    )
+    close_attempts = 0
+
+    def resolve(ref, **_kwargs):
+        nonlocal close_attempts
+        if ref is reference:
+            raise FutureTimeoutError("COPY response wait timed out")
+        if ref == "recover":
+            raise driver.CopyOutcomeUnknownError(plan_id)
+        assert ref == "close"
+        close_attempts += 1
+        if close_attempts == 1:
+            raise FutureTimeoutError("session cleanup not confirmed")
+
+    client._runtime_is_unavailable_or_replaced = lambda: False
+    runner = object.__new__(RayRunner)
+    runner._client_for_session = lambda _session: client
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    with pytest.raises(driver.CopyOutcomeUnknownError):
+        runner.run_write(plan)
+    del plan
+    gc.collect()
+    assert plan_ref() is not None
+    assert not released
+    assert len(client._pending_vane_fs_copy_plans) == 1
+
+    outcome = driver.CopyPlanOutcome(
+        operation_id=plan_id if completion != "invalid" else "another-operation",
+        result=_committed_copy_result(rows_copied=11),
+        final_progress_snapshot=None,
+    )
+    if completion in {"committed", "invalid"}:
+        original.set_result(outcome)
+    elif completion == "task_error":
+        original.set_exception(driver.ray.exceptions.RayTaskError("copy", "remote task failed", ValueError("failed")))
+    elif completion == "transport_error":
+        original.set_exception(RuntimeError("transport did not confirm completion"))
+    elif completion == "cancelled":
+        original.cancel()
+    if completion in {"committed", "task_error"}:
+        assert released == [plan_id]
+        assert not client._pending_vane_fs_copy_plans
+    else:
+        assert not released
+        with pytest.raises(FutureTimeoutError, match="cleanup not confirmed"):
+            client.close_session(_TEST_SESSION_ID)
+        assert not released
+        assert len(client._pending_vane_fs_copy_plans) == 1
+        client.close_session(_TEST_SESSION_ID)
+        assert released == [plan_id]
+        assert not client._pending_vane_fs_copy_plans
+
+
+@pytest.mark.parametrize("close_client", [False, True])
+def test_pending_copy_pins_follow_session_close_and_client_close_retry(monkeypatch, close_client):
+    from concurrent.futures import Future
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {"session-a": {}, "session-b": {}})
+    client.runner = SimpleNamespace(
+        close_session=SimpleNamespace(remote=lambda *_: None),
+        detach_client=SimpleNamespace(remote=lambda *_: None),
+    )
+    client._runtime_is_unavailable_or_replaced = lambda: False
+    released = []
+    futures = []
+    for session in ("session-a", "session-b"):
+        plan = _FakePhysicalPlanWithoutPlanAttr(session, session_id=session)
+        plan._release_vane_fs_query_pins = lambda session=session: released.append(session)
+        future = Future()
+        futures.append((session, future))
+        client._retain_pending_vane_fs_copy_plan(
+            session, session, plan, SimpleNamespace(future=lambda future=future: future)
+        )
+
+    fail_close = close_client
+
+    def resolve(*_args, **_kwargs):
+        nonlocal fail_close
+        if fail_close:
+            fail_close = False
+            raise FutureTimeoutError("client cleanup not confirmed")
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    if close_client:
+        with pytest.raises(FutureTimeoutError, match="cleanup not confirmed"):
+            client.close()
+        assert not released
+        assert len(client._pending_vane_fs_copy_plans) == 2
+    else:
+        client.close_session("session-a")
+        assert released == ["session-a"]
+        assert len(client._pending_vane_fs_copy_plans) == 1
+    client.close()
+    assert released == ["session-a", "session-b"]
+    assert not client._pending_vane_fs_copy_plans
+    for operation_id, future in futures:
+        future.set_result(driver.CopyPlanOutcome(operation_id, _committed_copy_result(rows_copied=11), None))
+    assert released == ["session-a", "session-b"]
 
 
 def test_ray_query_driver_client_bounds_pending_copy_recovery_without_resubmission(monkeypatch):

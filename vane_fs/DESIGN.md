@@ -26,7 +26,7 @@ single SQLite transaction domain.
 | Workload | Assessment | Proposed boundary |
 | --- | --- | --- |
 | Local agent workspaces, configuration, generated reports | Good initial fit | One database on local storage; serialized writes |
-| CSV and Parquet queries over a stable workspace | Feasible first Vane integration | Explicitly pinned snapshot and local runner |
+| CSV and Parquet queries over a stable workspace | Native query integration | Explicitly pinned snapshot with local or same-host Ray execution |
 | Ordinary shell tools using a mounted directory | Implemented on Linux | FUSE adapter with the documented filesystem subset |
 | Large video datasets and sustained bulk writes | Requires measurement and a different payload strategy | Keep large immutable inputs in existing storage initially |
 | Ray workers on multiple machines | Requires a storage service or exported snapshots | Workers must not open a shared SQLite WAL file over NFS |
@@ -167,7 +167,7 @@ A branch ID identifies mutable state. A cached frontier or mutation counter
 alone is not a durable snapshot: an ordinary write can replace data at the same
 frontier. The `snapshot` operation reserves a point that later writes
 cannot overwrite and rotates the branch writer ID. Vane queries use this
-retained snapshot for their entire execution. Future distributed adapters must
+retained snapshot for their entire execution. Future multi-host adapters must
 preserve that identity across retries and workers.
 
 Keep IDs separate from branch names. Deleting and recreating a name must never
@@ -185,12 +185,18 @@ SQLite state and native allocations. The base Vane adapter retains the capsule
 and consumes no private engine or STL objects from the provider. This keeps
 SQLite optional and preserves the private native-module symbol boundary.
 
-Each query pins a snapshot on its first access until `QueryEnd`, including
-errors and cancellation. Individual file handles independently retain their inode
-snapshot, provider and stateless filesystem implementation. The provider shares
+Native queries pin a snapshot on first access until `QueryEnd`, including
+errors and cancellation. Distributed plans and worker query replay state extend
+those pins across binding, task attempts and query cleanup. Individual file
+handles independently retain their inode snapshot, provider and stateless
+filesystem implementation. The provider shares
 one live immutable session per snapshot across these references, releasing its
 SQLite pin with the final handle. This avoids a durable write pair per file
 while removing expired session-cache entries immediately.
+After an ambiguous COPY submission, the local client retains the source plan
+and its binding pins until the original RPC confirms completion or session/client
+cleanup completes. A timeout, cancelled completion observer, or invalid response
+does not establish completion. Failed cleanup preserves the references for retry.
 If SQLite refuses the final pin deletion, a process-local registry retains its
 token. The next write transaction on the same database, through any connection
 in that process, retries abandoned pins and forgets them only after commit.
@@ -202,8 +208,9 @@ invalidate an open reader. Positional reads preserve the implicit cursor;
 short exact reads fail. Nonblocking virtual opens cannot encounter host FIFOs.
 Reads check cancellation between bounded chunks, with SQLite lock waits still
 limited by the configured busy timeout. The connector accepts explicit paths
-on `local` (also accepted as `local-fast`); it does not serialize SQLite
-connections or callbacks to Ray.
+on `local` (also accepted as `local-fast`) and same-host `ray`. Ray replays
+workspace configuration into each worker connection; SQLite connections and
+native callbacks stay in the process that created them.
 
 ## Transactions and durability
 
@@ -418,7 +425,18 @@ not extend to an external table merely because both use the same branch name.
 | 2 | Diff, conservative direct-parent merge, retirement and GC | Conflicts and stale previews cannot partially publish; retained states survive deletion and GC |
 | 3 | Optional fsspec adapter | Explicit local-runner CSV/Parquet reads from pinned snapshots; ordinary adapter I/O tests and directory semantics |
 | 4 | Linux FUSE and local native FILE connector | Mounted inode lifetime; FILE ranges, connection isolation, query/reader retention, cancellation, image decode and video frames |
-| 5 | Remote service and Ray support | Stable snapshot identity, per-worker setup, leases, retry behavior and multi-node correctness |
+| 5a | Same-host native Ray reads | Absolute-path and workspace identity replay, per-worker native registration, query-owned pins, CSV/Parquet and FILE queries |
+| 5b | Remote service and multi-host Ray support | Remote snapshot identity, remote leases, failure/retry behavior and multi-node correctness |
+
+Stage 5a reopens the existing local SQLite database independently in each
+process. Query snapshots include only registration metadata and immutable
+snapshot IDs. Binding pins belong to the driver plan; worker replay state
+retains runtime pins until query teardown. Worker database cache identities
+include the VaneFS workspace configuration; query-owned snapshot pins do not
+create additional cache entries. Host-name and workspace-ID checks
+reject unsupported locations or replaced databases. Stage 5b still requires a
+separate data-access protocol; sharing a SQLite WAL database over a network
+filesystem does not qualify remote access.
 
 Stage 3 provides read-only Vane query integration. Native write APIs
 target live branches, but SQL COPY publication is a separate acceptance
