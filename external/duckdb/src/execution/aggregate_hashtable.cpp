@@ -547,6 +547,51 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
 	return AddChunk(groups, state.hashes, payload, filter);
 }
 
+void GroupedAggregateHashTable::PrepareGroupChunk(DataChunk &groups, Vector &group_hashes) {
+	if (state.group_chunk.ColumnCount() == 0) {
+		state.group_chunk.InitializeEmpty(layout_ptr->GetTypes());
+	}
+	D_ASSERT(state.group_chunk.ColumnCount() == groups.ColumnCount() + 1);
+	for (idx_t grp_idx = 0; grp_idx < groups.ColumnCount(); grp_idx++) {
+		state.group_chunk.data[grp_idx].Reference(groups.data[grp_idx]);
+	}
+	state.group_chunk.data[groups.ColumnCount()].Reference(group_hashes);
+	state.group_chunk.SetCardinality(groups);
+	TupleDataCollection::ToUnifiedFormat(state.partitioned_append_state.chunk_state, state.group_chunk);
+}
+
+void GroupedAggregateHashTable::AppendAggregateStates(DataChunk &groups, DataChunk &payload) {
+	D_ASSERT(skip_lookups && !enable_hll && !layout_ptr->HasDestructor());
+	D_ASSERT(groups.size() == payload.size());
+	if (groups.size() == 0) {
+		return;
+	}
+	groups.Hash(state.hashes);
+	PrepareGroupChunk(groups, state.hashes);
+	partitioned_data->AppendUnified(state.partitioned_append_state, state.group_chunk,
+	                                *FlatVector::IncrementalSelectionVector(), groups.size());
+	const auto row_locations =
+	    FlatVector::GetData<data_ptr_t>(state.partitioned_append_state.chunk_state.row_locations);
+	const auto &row_sel = state.partitioned_append_state.reverse_partition_sel;
+	state.addresses.Flatten(groups.size());
+	const auto addresses = FlatVector::GetData<data_ptr_t>(state.addresses);
+	idx_t payload_idx = 0;
+	idx_t offset = layout_ptr->GetAggrOffset();
+	for (auto &aggr : layout_ptr->GetAggregates()) {
+		D_ASSERT(aggr.function.HasStateImportCallback() && !aggr.filter && !aggr.IsDistinct());
+		for (idx_t row = 0; row < groups.size(); row++) {
+			addresses[row] = row_locations[row_sel.get_index_unsafe(row)] + offset;
+		}
+		AggregateInputData input(aggr.GetFunctionData(), state.row_state.allocator);
+		aggr.function.GetStateImportCallback()(&payload.data[payload_idx], input, aggr.child_count, state.addresses,
+		                                       groups.size());
+		payload_idx += aggr.child_count;
+		offset += aggr.payload_size;
+	}
+	count += groups.size();
+	sink_count += groups.size();
+}
+
 void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter) {
 	// Now every cell has an entry, update the aggregates
 	auto &aggregates = layout_ptr->GetAggregates();
@@ -676,18 +721,7 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 	const SelectionVector *sel_vector = FlatVector::IncrementalSelectionVector();
 
 	// Make a chunk that references the groups and the hashes and convert to unified format
-	if (state.group_chunk.ColumnCount() == 0) {
-		state.group_chunk.InitializeEmpty(layout_ptr->GetTypes());
-	}
-	D_ASSERT(state.group_chunk.ColumnCount() == layout_ptr->GetTypes().size());
-	for (idx_t grp_idx = 0; grp_idx < groups.ColumnCount(); grp_idx++) {
-		state.group_chunk.data[grp_idx].Reference(groups.data[grp_idx]);
-	}
-	state.group_chunk.data[groups.ColumnCount()].Reference(group_hashes_v);
-	state.group_chunk.SetCardinality(groups);
-
-	// convert all vectors to unified format
-	TupleDataCollection::ToUnifiedFormat(state.partitioned_append_state.chunk_state, state.group_chunk);
+	PrepareGroupChunk(groups, group_hashes_v);
 
 	if (enable_hll) {
 		hll.Update(group_hashes_v, group_hashes_v, groups.size());

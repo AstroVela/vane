@@ -83,6 +83,9 @@ public:
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter);
+	//! Append already aggregated states to owned radix-partitioned tuples.
+	//! This skips local deduplication; the source phase must combine all tuples.
+	void AppendAggregateStates(DataChunk &groups, DataChunk &payload);
 	//! Release temporary input views without discarding groups or cached dictionary addresses.
 	void ResetInput();
 	optional_idx TryAddCompressedGroups(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
@@ -226,6 +229,7 @@ private:
 	void ReinsertTuples(PartitionedTupleData &data);
 
 	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter);
+	void PrepareGroupChunk(DataChunk &groups, Vector &group_hashes);
 
 	//! Does the actual group matching / creation
 	idx_t FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes, Vector &addresses,

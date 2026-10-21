@@ -200,13 +200,18 @@ def test_partial_aggregates_exchange_native_states(expressions):
 
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("nulls", ["none", "mixed", "all"])
-def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(grouped, nulls):
+@pytest.mark.parametrize("threads", [1, 2, 4])
+@pytest.mark.parametrize("external", [False, True])
+def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(tmp_path, grouped, nulls, threads, external):
     sql = (
         "select range k, sum(range) s, count(range) n from range(8) group by k"
         if grouped
         else "select sum(range) s, count(range) n from range(8)"
     )
-    with vane.connect(backend="local", config={"threads": 1}) as connection:
+    config = {"threads": threads, "temp_directory": str(tmp_path / "spill")}
+    with vane.connect(backend="local", config=config) as connection:
+        if external:
+            connection.execute("set debug_force_external=true")
         graph = compile_sql(connection, sql, partitions=2)
         producer = graph.fragments[0]
         partials = native._execute_fragment_for_test(
@@ -221,7 +226,7 @@ def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(group
         # NULL state blobs must be skipped independently for each aggregate.
         rows = []
         sums, counts = Counter(), Counter()
-        for index in range(4099):
+        for index in range(131099 if external else 4099):
             partial = partials[index % len(partials)]
             key = partial[0] if grouped else 0
             sum_state, count_state = partial[-2:]
@@ -248,20 +253,54 @@ def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(group
         assert connection.execute("select 42").fetchall() == [(42,)]
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, threads):
+    spill = tmp_path / "spill"
+    profile = tmp_path / "profile.json"
+    config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(
+            connection, "select range k, sum(range), count(range) from range(8) group by k", partitions=2
+        )
+        producer = graph.fragments[0]
+        partials = native._execute_fragment_for_test(
+            connection,
+            producer.native_plan,
+            {},
+            {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
+        )
+        partials.sort(key=lambda row: row[0])
+        rows = [partials[index % 8] for index in range(524299)]
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        connection.execute("set debug_force_external=true")
+        connection.execute("set enable_profiling='json'")
+        connection.execute(f"set profiling_output='{profile}'")
+        actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+        expected = []
+        for key in range(8):
+            count = len(rows) // 8 + (key < len(rows) % 8)
+            expected.append((key, key * count, count))
+        assert sorted(actual) == expected
+        connection.execute("pragma disable_profiling")
+        assert json.loads(profile.read_text())["system_peak_temp_dir_size"] > 0
+    assert not list(spill.glob("*"))
+
+
 def batched_aggregate_query(groups):
     return (
         "select k, sum(v), count(v), avg(v), min(v), max(v), "
         "sum(v::decimal(15,2)), avg(v::decimal(15,2)), "
         "sum(v::hugeint), avg(v::hugeint), avg(interval '1 microsecond' * v)::varchar, "
         "sum(v) filter(where i % 3=0), count(*) filter(where false) "
-        f"from (select range i, range % {groups} k, "
+        f"from (select range i, case when range % {groups}=0 then null else range % {groups} end k, "
         "case when k % 17=0 or range % 11=0 then null else range % 257-128 end v "
         "from range(65539)) group by k order by k"
     )
 
 
 @pytest.mark.parametrize("groups", [7, 4099])
-@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("threads", [1, 2, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
 def test_merge_aggregate_batches_across_bounded_channels(groups, threads, partitions):
     sql = batched_aggregate_query(groups)
