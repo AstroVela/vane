@@ -56,7 +56,9 @@ def _read_endpoint(path: str) -> tuple[str, bytes]:
     _private(Path(path).parent.stat())
     if Path(path).is_symlink():
         raise EmbeddingConfigurationError("Embedding rendezvous must not be a symbolic link")
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    # A misconfigured FIFO must not block the event loop before fstat rejects it.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
         _private(info)

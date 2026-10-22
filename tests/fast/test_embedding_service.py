@@ -13,6 +13,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -30,6 +31,11 @@ from vane.ai.embedding_service import EmbeddingService
 from vane.ai.provider import load_provider
 
 make_real_video_processor = processor_fixture
+
+# PyZMQ announces its supported Tornado selector bridge on Windows Proactor loops.
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:Proactor event loop does not implement add_reader family of methods required for zmq\.:RuntimeWarning"
+)
 
 pytest.importorskip("zmq")
 import zmq.asyncio
@@ -236,7 +242,7 @@ def test_server_death_times_out_client_and_reclaims_owned_buffers(process):
             (root / "killed").touch()
             proc.kill()
             proc.wait(timeout=5)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(asyncio.TimeoutError):
                 await task
             await until(lambda: removed(names))
             assert not instance._zmq_client.sockets
@@ -1041,6 +1047,20 @@ def test_model_reads_private_snapshot_after_publication(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+def test_borrowed_mapping_exposes_only_requested_bytes(monkeypatch):
+    # Exercise Windows' rounded allocation size on every host.
+    memory = shm.create(4096)
+    try:
+        monkeypatch.setattr(shm, "os", SimpleNamespace(name="nt"))
+        with shm.attach(memory.name, 16) as borrowed:
+            assert len(borrowed) == 16
+            borrowed[:] = b"x" * 16
+        assert bytes(memory.buf[:16]) == b"x" * 16
+        assert bytes(memory.buf[16:]) == bytes(4096 - 16)
+    finally:
+        shm.release(memory)
+
+
 def test_independent_client_exit_does_not_unlink_server_buffer():
     memory = shm.create(16)
     try:
@@ -1164,6 +1184,26 @@ def test_invalid_rendezvous_is_fatal_even_with_ignore(tmp_path, monkeypatch, bad
             await service.aclose()
 
     asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO rendezvous")
+def test_fifo_rendezvous_fails_without_blocking(tmp_path):
+    path = tmp_path / "engine.json"
+    os.mkfifo(path, 0o600)
+    code = """
+import sys
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_zmq import _read_endpoint
+try:
+    _read_endpoint(sys.argv[1])
+except EmbeddingConfigurationError:
+    pass
+else:
+    raise AssertionError("A FIFO must not be accepted as a rendezvous file")
+"""
+    # A separate process makes a blocking open fail within a bounded deadline.
+    result = subprocess.run([sys.executable, "-c", code, str(path)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
 
 
 def test_missing_zmq_does_not_affect_planning_and_cleans_failed_start(tmp_path, monkeypatch):

@@ -744,6 +744,8 @@ module = [
     "typesafe_sdk.*",
     "vllm",
     "vllm.*",
+    "zmq",
+    "zmq.*",
 ]
 ignore_missing_imports = true
 

@@ -44,7 +44,10 @@ def attach(name: str, size: int) -> Iterator[Any]:
         # Windows rounds the mapping size up to allocation granularity.
         if memory.size < size or os.name != "nt" and memory.size != size:
             raise EmbeddingConfigurationError("Embedding shared memory size mismatch")
-        yield memory.buf
+        buffer = memory.buf
+        assert buffer is not None
+        with buffer[:size] as view:
+            yield view
     finally:
         memory.close()
 

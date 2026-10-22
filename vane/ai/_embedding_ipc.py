@@ -126,7 +126,7 @@ def describe(
 
 
 def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
-    """Validate ALL offsets/shapes/dtypes and metadata before mapping any FD."""
+    """Validate all offsets/shapes/dtypes and metadata before allocating a buffer."""
     if type(size) is not int or not 0 <= size <= spec.max_input_bytes or not isinstance(parts, list):
         raise EmbeddingConfigurationError("Invalid embedding buffer size or parts")
     if not 1 <= len(parts) <= spec.max_parts:

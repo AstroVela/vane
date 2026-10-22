@@ -29,6 +29,11 @@ from vane.ai.functions import _EmbedImageBatch, _EmbedMultimodalBatch, _EmbedTex
 from vane.ai.provider import load_provider
 from vane.execution._async_runtime import AsyncRuntime
 
+# PyZMQ announces its supported Tornado selector bridge on Windows Proactor loops.
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:Proactor event loop does not implement add_reader family of methods required for zmq\.:RuntimeWarning"
+)
+
 
 def allocation_error(kind):
     if kind in ("enomem", "enospc"):
