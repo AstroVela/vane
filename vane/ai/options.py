@@ -373,7 +373,7 @@ def _validate_mlx_common_options(options: Mapping[str, Any]) -> dict[str, Any]:
     copied = dict(options)
     _reject_sensitive_embed_options(copied)
     if copied.keys() - _MLX_COMMON_DEFAULTS.keys():
-        raise TypeError("MLX image options accept only the declared common model encoding settings")
+        raise TypeError("MLX media options accept only the declared common model encoding settings")
     prepared = _MLX_COMMON_DEFAULTS | copied
     if not _is_hugging_face_commit_sha(prepared["revision"]):
         raise EmbeddingConfigurationError("MLX revision must be a full 40-character commit SHA")
@@ -414,12 +414,20 @@ def _validate_mlx_image_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return _validate_mlx_common_options(options)
 
 
+def _validate_mlx_audio_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_mlx_common_options(options)
+
+
+def _validate_mlx_video_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_mlx_common_options(options)
+
+
 def validate_embed_options(
     provider_family: str | None,
     options: Mapping[str, Any],
     *,
     relation: bool,
-    _input_kind: Literal["text", "image"] = "text",
+    _input_kind: Literal["text", "image", "audio", "video"] = "text",
 ) -> dict[str, Any]:
     """Validate and copy the closed Embed options for one entry point."""
 
@@ -429,7 +437,7 @@ def validate_embed_options(
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
     if family in {"sglang", "vllm"}:
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
-    if family == "mlx" and _input_kind == "image":
+    if family == "mlx" and _input_kind != "text":
         allowed = _EMBED_COMMON_OPTIONS | _MLX_COMMON_DEFAULTS.keys()
     if family == "litert" and _input_kind == "image":
         allowed = _EMBED_COMMON_OPTIONS | LITERT_COMMON_OPTIONS
@@ -471,7 +479,7 @@ def validate_embed_options(
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("MLX does not support character chunk averaging")
         defaults = _MLX_TEXT_DEFAULTS if _input_kind == "text" else _MLX_COMMON_DEFAULTS
-        validator = _validate_mlx_text_options if _input_kind == "text" else _validate_mlx_image_options
+        validator = _validate_mlx_text_options if _input_kind == "text" else _validate_mlx_common_options
         copied.update(validator({k: v for k, v in copied.items() if k in defaults}))
         if actor_number is None:
             copied.pop("actor_number", None)
@@ -658,6 +666,8 @@ def validate_embed_audio_options(
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
         return validate_embed_options(provider_family, options, relation=relation, _input_kind="image")
+    if provider_family == "mlx":
+        allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -670,7 +680,9 @@ def validate_embed_audio_options(
     unknown = sorted(set(options) - allowed)
     if unknown:
         raise TypeError("Unsupported EmbedAudio option(s): " + ", ".join(unknown))
-    return validate_embed_options(provider_family, options, relation=relation)
+    return validate_embed_options(
+        provider_family, options, relation=relation, _input_kind="audio" if provider_family == "mlx" else "text"
+    )
 
 
 def validate_embed_video_options(
@@ -678,6 +690,8 @@ def validate_embed_video_options(
 ) -> dict[str, Any]:
     """Video providers cannot inherit text chunking or image loading policies."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "mlx":
+        allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -704,7 +718,9 @@ def validate_embed_video_options(
     unknown = sorted(set(options) - allowed)
     if unknown:
         raise TypeError("Unsupported EmbedVideo option(s): " + ", ".join(unknown))
-    return validate_embed_options(provider_family, options, relation=relation)
+    return validate_embed_options(
+        provider_family, options, relation=relation, _input_kind="video" if provider_family == "mlx" else "text"
+    )
 
 
 _PROMPT_SHARED_PROVIDER_OPTIONS = frozenset({"temperature"})

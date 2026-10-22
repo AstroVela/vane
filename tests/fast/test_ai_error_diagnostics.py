@@ -14,6 +14,27 @@ from vane.ai._errors import _is_resource_error, _raise_if_resource_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "MLX audio requires 161 to 480000 samples; short tails and truncation are unsupported",
+        "MLX audio exceeds max_length after media token expansion",
+        "MLX video exceeds max_length after media token expansion",
+    ],
+)
+def test_mlx_static_input_limits_survive_safe_transport_without_exposing_untrusted_text(message):
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    expected = "EmbeddingConfigurationError: " + message
+    assert summarize_error(EmbeddingConfigurationError(message)) == expected
+    diagnostic = pickle.loads(pickle.dumps(DiagnosticError("fixture", EmbeddingConfigurationError(message))))
+    assert diagnostic.summary == expected
+    assert expected in summarize_error(native_error(diagnostic, "native_json"))
+    assert message not in summarize_error(RuntimeError(message))
+    assert message not in summarize_error(EmbeddingConfigurationError(message + " private-input"))
+    assert "private-input" not in summarize_error(EmbeddingConfigurationError(message + " private-input"))
+
+
 def onnx_allocation_error(kind="Fail", *, initialize=False, wrapped=False):
     status = "1 : FAIL" if kind == "Fail" else "6 : RUNTIME_EXCEPTION"
     operation = (
