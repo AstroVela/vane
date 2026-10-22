@@ -189,6 +189,16 @@ artifact self-contained and preserves Vane's private `_native` symbol boundary.
 The staging directory is configurable with
 `VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`.
 
+The Linux native unit suite also builds a signed, self-contained
+`loadable_extension_batch_demo` fixture. Its COPY rewrite recursively plans a
+UDF child from inside a private engine copy. After `scripts/run_native_tests.sh`,
+run its installed-Python regression with
+`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_copy`.
+This covers both local runner names, task and actor execution, empty input,
+multiple batches, nulls and fixed-size vectors while forbidding Ray startup.
+Rebuild optional providers against the changed native SDK; a matching Python
+package version alone does not establish C++ compatibility.
+
 For the independently selectable image, audio, and video operators, see
 [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md).
 

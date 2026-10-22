@@ -101,7 +101,7 @@ private:
 class PhysicalPlanGenerator {
 public:
 	explicit PhysicalPlanGenerator(ClientContext &context);
-	~PhysicalPlanGenerator();
+	virtual ~PhysicalPlanGenerator();
 
 	LogicalDependencyList dependencies;
 	//! Recursive CTEs require at least one ChunkScan, referencing the working_table.
@@ -118,7 +118,9 @@ public:
 	//! Creates and returns the physical plan from the logical operator.
 	//! Performs a verification pass.
 	unique_ptr<PhysicalPlan> Plan(unique_ptr<LogicalOperator> logical);
-	PhysicalOperator &CreatePlan(LogicalOperator &op);
+	//! Extensions can carry a private engine copy. Dispatch through the generator
+	//! that owns this plan so child operators use the host's execution services.
+	virtual PhysicalOperator &CreatePlan(LogicalOperator &op);
 
 	//! Whether or not we can (or should) use a batch-index based operator for executing the given sink
 	static bool UseBatchIndex(ClientContext &context, PhysicalOperator &plan);

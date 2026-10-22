@@ -29,6 +29,58 @@ def loadable_httpfs_extension_path() -> Path:
     return _configured_artifact_path("VANE_TEST_LOADABLE_HTTPFS_EXTENSION_PATH")
 
 
+def _replanned_batch(batch):
+    return batch
+
+
+class _ReplannedActor:
+    def __call__(self, batch):
+        return batch
+
+
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+@pytest.mark.parametrize("backend", ["task", "actor"])
+@pytest.mark.parametrize("rows", [0, 4101])
+def test_private_copy_replanning_preserves_local_udf_execution(monkeypatch, runner, backend, rows):
+    artifact = _configured_artifact_path("VANE_TEST_LOADABLE_BATCH_DEMO_PATH")
+    monkeypatch.setenv("VANE_RUNNER", runner)
+
+    import ray
+
+    def forbid_ray(*_args, **_kwargs):
+        raise AssertionError("local COPY replanning must not initialize Ray")
+
+    monkeypatch.setattr(ray, "init", forbid_ray)
+    with vane.connect(config={"autoinstall_known_extensions": "false", "autoload_known_extensions": "false"}) as con:
+        con.load_extension(str(artifact))
+        source_sql = (
+            "SELECT i::BIGINT AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE 'row-' || i END AS payload, "
+            f"[i::FLOAT, NULL::FLOAT, (i + 1)::FLOAT]::FLOAT[3] AS vector FROM range({rows}) t(i)"
+        )
+        expected = con.sql(source_sql + " ORDER BY id").fetchall()
+        assert (
+            con.execute(f"COPY ({source_sql} ORDER BY id) TO 'unused' (FORMAT batch_demo_replan)").fetchall()
+            == expected
+        )
+        options = {
+            "schema": {"id": vane.sqltypes.BIGINT, "payload": vane.sqltypes.VARCHAR, "vector": "FLOAT[3]"},
+            "batch_size": 137,
+            "cpus": 1,
+            "gpus": 0,
+            "execution_backend": f"subprocess_{backend}",
+        }
+        if backend == "actor":
+            options["actor_number"] = 1
+        con.sql(source_sql).map_batches(
+            _ReplannedActor if backend == "actor" else _replanned_batch, **options
+        ).create_view("copy_input")
+        assert (
+            con.execute("COPY (SELECT * FROM copy_input ORDER BY id) TO 'unused' (FORMAT batch_demo_replan)").fetchall()
+            == expected
+        )
+        assert con.execute("SELECT 1").fetchone() == (1,)
+
+
 def test_staged_tpch_extension_loads_without_static_linkage(loadable_extension_path: Path):
     connection = vane.connect(config={"allow_unsigned_extensions": "true"})
     try:

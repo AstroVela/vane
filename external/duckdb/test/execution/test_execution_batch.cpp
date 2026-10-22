@@ -11,6 +11,7 @@
 #include "duckdb/execution/operator/exchange/physical_local_exchange.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
@@ -1046,6 +1047,70 @@ TEST_CASE("Hash local exchange retains the materialized batch across budget bloc
 }
 
 #ifdef VANE_BATCH_DEMO_PATH
+namespace {
+
+unique_ptr<UDFExecutor> RejectHostUDFExecution(ClientContext &, const Value &, UDFConfig &, shared_ptr<void>) {
+	throw InvalidInputException("host UDF executor factory reached");
+}
+
+struct HostUDFFactoryGuard {
+	HostUDFFactoryGuard() : previous(GetUDFExecutorFactory()) {
+		SetUDFExecutorFactory(RejectHostUDFExecution);
+	}
+	~HostUDFFactoryGuard() {
+		SetUDFExecutorFactory(previous);
+	}
+	udf_executor_factory_t previous;
+};
+
+} // namespace
+
+TEST_CASE("Private COPY planners retain the host UDF executor", "[execution_batch][extension][udf]") {
+	DBConfig config;
+#ifndef VANE_BATCH_DEMO_SIGNED
+	config.options.allow_unsigned_extensions = true;
+#endif
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto loaded = con.Query(string("LOAD '") + VANE_BATCH_DEMO_PATH + "'");
+	INFO((loaded->HasError() ? loaded->GetError() : ""));
+	REQUIRE_FALSE(loaded->HasError());
+	REQUIRE_FALSE(con.Query("SET threads=1")->HasError());
+	HostUDFFactoryGuard guard;
+	void *library = dlopen(VANE_BATCH_DEMO_PATH, RTLD_NOW | RTLD_LOCAL);
+	REQUIRE(library);
+	using HasFactory = bool (*)();
+	auto has_factory = reinterpret_cast<HasFactory>(dlsym(library, "batch_demo_has_private_udf_factory"));
+	REQUIRE(has_factory);
+	const auto private_factory_registered = has_factory();
+	dlclose(library);
+	REQUIRE_FALSE(private_factory_registered);
+	const string input = R"(
+        SELECT udf(i, {'payload_version': 1, 'udf_name': 'private-copy', 'call_mode': 'map',
+                       'execution_backend': 'subprocess_task', 'method_return_type': 'BIGINT',
+                       'function_pickle': 'fixture'::BLOB, 'function_pickle_size_bytes': 7,
+                       'udf_task_input_max_bytes': 134217728,
+                       'udf_output_target_max_bytes': 134217728}) FROM range(4) t(i)
+    )";
+	SECTION("ordinary SQL still executes") {
+		auto result = con.Query("COPY (SELECT 42::BIGINT) TO 'unused' (FORMAT batch_demo_replan)");
+		INFO((result->HasError() ? result->GetError() : ""));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(result->GetValue(0, 0) == Value::BIGINT(42));
+	}
+	SECTION("direct UDF reaches the host factory") {
+		auto result = con.Query(input);
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("UDF replanned inside the private extension reaches the same factory") {
+		auto result = con.Query("COPY (" + input + ") TO 'unused' (FORMAT batch_demo_replan)");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	REQUIRE_FALSE(con.Query("SELECT 1")->HasError());
+}
+
 TEST_CASE("Private dynamic adapters use the bound host reader", "[execution_batch][extension][external_block]") {
 	DBConfig config;
 #ifndef VANE_BATCH_DEMO_SIGNED
