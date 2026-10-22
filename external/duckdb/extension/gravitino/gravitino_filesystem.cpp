@@ -5,8 +5,10 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/distributed/client_state.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
 #include <cstring>
 
 namespace duckdb {
@@ -51,6 +53,50 @@ public:
 	}
 	string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener) override {
 		return Resolve(Context(opener), path);
+	}
+	FileWriteTarget ResolveWriteTarget(const string &path, const CopyInfo &info,
+	                                   optional_ptr<FileOpener> opener) override {
+		auto &context = Context(opener);
+		auto parts = ParsePath(path);
+		auto &catalog = GravitinoCatalog::Get(context, parts.attachment);
+		catalog.RequireMutation(context);
+		if (info.format != "parquet" && info.format != "csv") {
+			throw NotImplementedException("Gravitino Fileset writes support parquet and csv only");
+		}
+		auto enabled = [&](const char *name) {
+			auto found = info.options.find(name);
+			return found != info.options.end() &&
+			       (found->second.empty() || found->second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
+		};
+		auto partitions = info.options.find("partition_by");
+		const bool partitioned = partitions != info.options.end();
+		if (partitioned && (partitions->second.empty() || (partitions->second.size() == 1 &&
+		                                                   partitions->second[0].type().id() == LogicalTypeId::LIST &&
+		                                                   ListValue::GetChildren(partitions->second[0]).empty()))) {
+			throw InvalidInputException("Gravitino PARTITION_BY requires at least one column");
+		}
+		if (!enabled("append") || (!enabled("per_thread_output") && !partitioned) || enabled("overwrite") ||
+		    enabled("overwrite_or_ignore") || enabled("use_tmp_file")) {
+			throw NotImplementedException(
+			    "Gravitino Fileset writes require directory output with APPEND and PER_THREAD_OUTPUT or PARTITION_BY; "
+			    "overwrite and temporary-file publication are unsupported");
+		}
+		if (info.options.count("filename_pattern") || info.options.count("file_extension")) {
+			throw NotImplementedException("Custom Gravitino Fileset output filenames are unsupported");
+		}
+		if (parts.relative.find_first_of("*?[]{}") != string::npos) {
+			throw InvalidInputException("Fileset output paths cannot contain glob patterns");
+		}
+		FileWriteTarget result;
+		string location;
+		result.path = catalog.client.Resolve(context, parts.schema, parts.fileset, parts.relative, nullptr, &location);
+		if (RunnerClientState::Get(context) == "ray" && !StringUtil::StartsWith(result.path, "s3://")) {
+			throw NotImplementedException("Ray Fileset writes require a shared S3 destination; "
+			                              "node-local output is unsupported");
+		}
+		result.requires_rebind = true;
+		result.properties["location_name"] = std::move(location);
+		return result;
 	}
 
 private:

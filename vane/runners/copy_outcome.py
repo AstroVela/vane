@@ -77,10 +77,14 @@ class CopyResultUnavailableError(_CopyError):
         tuple[str, str, tuple[str, ...]],
         dict[str, Any],
     ]:
+        state = self._diagnostic_state()
+        for name in ("base_path", "run_id", "manifest_path"):
+            if hasattr(self, name):
+                state[name] = getattr(self, name)
         return (
             CopyResultUnavailableError,
             (self.operation_id, self.detail, self.cleanup_warnings),
-            self._diagnostic_state(),
+            state,
         )
 
 

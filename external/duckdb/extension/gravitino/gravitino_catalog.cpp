@@ -123,8 +123,7 @@ void GravitinoCatalog::RequireMutation(ClientContext &context) const {
 		throw PermissionException("Gravitino catalog is attached READ_ONLY");
 	}
 	if (!context.transaction.IsAutoCommit()) {
-		throw TransactionException(
-		    "Gravitino metadata writes require auto-commit; remote mutations cannot be rolled back");
+		throw TransactionException("Gravitino writes require auto-commit; remote writes cannot be rolled back");
 	}
 }
 SchemaCatalogEntry &GravitinoCatalog::Schema(const string &name) {

@@ -357,7 +357,7 @@ static string LocalHadoopPath(const string &location) {
 	return path;
 }
 string GravitinoClient::Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
-                                string *root) const {
+                                string *root, string *selected_location) const {
 	if (path.size() > 8192 || path.find('\0') != string::npos || path.find('\\') != string::npos ||
 	    (!path.empty() && path.front() == '/')) {
 		throw InvalidInputException("Fileset paths must be relative paths without NUL or backslashes");
@@ -386,6 +386,9 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 		location_name = default_name ? GravitinoJson::String(properties, "default-location-name") : "unknown";
 	}
 	location = GravitinoJson::String(locations, location_name.c_str());
+	if (selected_location) {
+		*selected_location = location_name;
+	}
 	if (StringUtil::StartsWith(location, "s3a://")) {
 		location.replace(0, 6, "s3://");
 	} else if (StringUtil::CIEquals(location.substr(0, 5), "file:")) {
