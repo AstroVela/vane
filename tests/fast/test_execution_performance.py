@@ -313,13 +313,49 @@ def test_merge_aggregate_new_groups_preserve_collisions_and_owned_keys(tmp_path,
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, threads):
+@pytest.mark.parametrize("memory_limit", ["32MB", "256MB"])
+def test_merge_aggregate_sparse_output_preserves_owned_rows(tmp_path, threads, memory_limit):
+    spill = tmp_path / "spill"
+    config = {"threads": threads, "memory_limit": memory_limit, "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = (
+            "select case when range=0 then null else 'owned-long-key-' || lpad(range::varchar,20,'0') end k, "
+            "sum(range),count(range) from range(16387) group by k"
+        )
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        partials = native._execute_fragment_for_test(
+            connection,
+            producer.native_plan,
+            {},
+            {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
+        )
+        partials.sort(key=lambda row: row[0] or "")
+        # A long duplicate-only tail and sparse new keys exercise empty and
+        # partially selected output vectors before returning to full vectors.
+        rows = partials[:257] * 33 + partials[257:] + partials[::-1] + [partials[0]] * 131099
+        multiplicities = Counter(row[0] for row in rows)
+        expected = [(key, value * multiplicities[key], count * multiplicities[key]) for key, value, count in expected]
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        connection.execute("set debug_force_external=true")
+        for _ in range(2):
+            assert Counter(
+                native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            ) == Counter(expected)
+    assert not list(spill.glob("*"))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("groups", [1, 8])
+def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, threads, groups):
     spill = tmp_path / "spill"
     profile = tmp_path / "profile.json"
     config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
     with vane.connect(backend="local", config=config) as connection:
         graph = compile_sql(
-            connection, "select range k, sum(range), count(range) from range(8) group by k", partitions=2
+            connection, f"select range k, sum(range), count(range) from range({groups}) group by k", partitions=2
         )
         producer = graph.fragments[0]
         partials = native._execute_fragment_for_test(
@@ -329,7 +365,7 @@ def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, thre
             {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
         )
         partials.sort(key=lambda row: row[0])
-        rows = [partials[index % 8] for index in range(524299)]
+        rows = [partials[index % groups] for index in range(524299)]
         edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
         final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
         connection.execute("set debug_force_external=true")
@@ -337,8 +373,8 @@ def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, thre
         connection.execute(f"set profiling_output='{profile}'")
         actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
         expected = []
-        for key in range(8):
-            count = len(rows) // 8 + (key < len(rows) % 8)
+        for key in range(groups):
+            count = len(rows) // groups + (key < len(rows) % groups)
             expected.append((key, key * count, count))
         assert sorted(actual) == expected
         connection.execute("pragma disable_profiling")

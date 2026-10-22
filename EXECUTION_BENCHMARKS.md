@@ -3135,3 +3135,87 @@ Source datasets are preserved and Doris/HDFS is restored with the requested cach
 disabled. The next investigation should reduce repeated final-merge group
 construction and tuple movement; further initialization-only tuning has limited
 observed benefit.
+
+## SF100 final aggregation in owned tuples: rejected follow-up (2026-10-22)
+
+A second experiment removed fresh tuple allocation and group-key copying during
+final merging. It indexed canonical rows directly in owned, imported-state radix
+partitions, combined duplicate states into those rows, and reused the hidden hash
+column as an output marker after matching. Only fully imported, destructor-free
+layouts were eligible. Whole-partition pinning accounted for allocated row/heap
+blocks, metadata, the fixed hash index and workspace; oversized/skewed partitions
+kept streaming compaction. Query memory capped soft reservations, and pin-handle
+slots were reconstructed when rescanning previously unpinned blocks.
+
+**This native implementation is rejected and absent from the final PR diff.**
+The four selected latency medians total 54.746 → 54.711 seconds (-0.064%).
+Q18 improves slightly, but the overall result does not justify adding the extra
+pinning and output path for the current SF100 objective. The preceding accepted
+state-import implementation remains the production engine.
+
+| Query | Local | Pipeline before | Pipeline trial | Change | Trial / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.298 s | 4.646 s | 4.649 s | +0.1% | 1.08× |
+| Q9 | 10.281 s | 17.432 s | 17.269 s | -0.9% | 1.68× |
+| Q18 | 7.483 s | 17.164 s | 16.817 s | -2.0% | 2.25× |
+| Q21 | 12.506 s | 15.504 s | 15.976 s | +3.0% | 1.28× |
+
+Original Q1/Q9/Q18/Q21 SQL reads the same 307 Parquet files / 37.5033 GiB.
+Local uses 36 native threads / 32 GiB; pipeline uses two workers with 18 threads
+and 16 GiB each. Exchange/staging budgets are 128/256 MiB per worker, frames are
+64 KiB / 2048 rows, windows are 1 MiB / 16 slots, and the specialized Ray object
+store is 1 GiB. Baseline pipeline phases bracket candidate Local/pipeline and
+pipeline/Local phases. Each timing phase executes each query/mode three times;
+the first query-specific execution is excluded, leaving four steady samples per
+cell. All scheduled samples remain in the results.
+
+The shared host varied visibly: candidate reverse-order Q9/Q18 samples include
+19.234/18.160 seconds, while the later baseline and Local phases also slow down.
+Other host workloads continued. The +3.0% Q21 latency result is therefore not
+established as a computation regression. Separate, result-checked Q21 controls
+measure 425.360 → 426.140 worker CPU seconds (+0.18%). Q18 controls measure
+449.990 → 441.560 CPU seconds (-1.87%); Local averages 226.545 CPU seconds,
+leaving candidate pipeline CPU at 1.949× Local. These are OS user-plus-system
+deltas summed over the two workers, excluding the coordinator/result service.
+Diagnostic timings are excluded from the table.
+
+A preliminary Q18-only screen ran ten result-checked queries and observed
+16.637 → 16.403 seconds (-1.41%). It is recorded separately from the four-query
+matrix. Two additional Q18 native-profile executions used gprofng at 20 ms with
+all descendants and a symbol library whose machine-code section matches the
+candidate. The new path was active: CombineInPlace accounts for 106.22 inclusive
+and 42.70 exclusive sampled CPU seconds, including 46.40 attributed to hash
+probing. Ordinary lookup attributed to AddChunk is 61.66 seconds, compared with
+64.36 in the preceding baseline profile; the data does not establish a large
+ordinary-path compiler regression. Inclusive samples overlap and are not query
+latency. Hash lookup and memory traversal remain substantial.
+
+All **98 SF100 executions** match schema, row count and values: 72 timing queries,
+four Local oracles, ten preliminary screen queries, six Q18 CPU controls, four
+Q21 CPU controls and two native-profile queries. No SF100 FTE speed claim or
+full 22-query score update is made. Frozen Python files, package versions, SQL,
+input identities and resource capacities match; only validated temporary paths
+differ. Timing includes submission, full collection and successful close. OS
+caches remain enabled. Owned builds/tests, diagnostics and Doris/HDFS do not
+overlap timing windows.
+
+The trial passes **604 distinct related tests**: 103 aggregate-state cases,
+489 compiler/Parquet cases, and twelve real-Ray cases. New regressions cover
+sparse output vectors, long/NULL keys, duplicate-only tails, repeated fragment
+execution and one/four native threads at 32/256 MB. Actual-spill tests now cover
+both one and eight keys with 524,299 states at a configured 32 MB, verify results,
+and require empty spill directories after close. The configured budget is not a
+claim about peak process RSS. These regressions also pass on the retained engine.
+Trial and retained runs are not added together as distinct tests. No full/GPU
+suite was run; the modified test module already belongs to the sdist allowlist.
+
+Trial code: `8e866d890e2754891d20d5a39db2557d3fc287bf`; native SHA-256
+`9b2f154ff15e35151f7c3aa79dde3020acc74dd8feb3f30fff6f109a0a231295`.
+Baseline: `d69804e514`, engine code `670a59db29`, native SHA-256
+`3fa6c796cf18ebe4f5e26e39c58804add5efdd1bb6408e6a6172911364af86c4`.
+Evidence under `build/pipeline-sf100-inplace-finalize-20261022/` retains the
+rejected patch, frozen identities/binaries, configuration audit, raw samples,
+CPU/native profiles, output hashes/counts, JUnit reports and cleanup manifests.
+Only tests and this negative result are retained in the PR. The next performance
+investigation should attribute partial aggregation and exchange work by stage;
+these two final-state experiments have not established a material end-to-end gain.
