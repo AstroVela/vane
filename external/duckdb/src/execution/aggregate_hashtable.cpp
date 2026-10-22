@@ -284,6 +284,10 @@ idx_t GroupedAggregateHashTable::GetHLLUpperBound() const {
 	return LossyNumericCast<idx_t>((1 + HyperLogLog::GetErrorRate()) * static_cast<double>(hll.Count()));
 }
 
+void GroupedAggregateHashTable::MergeHLL(HyperLogLog &target) const {
+	target.Merge(hll);
+}
+
 void GroupedAggregateHashTable::Resize(idx_t size) {
 	D_ASSERT(size >= STANDARD_VECTOR_SIZE);
 	D_ASSERT(IsPowerOfTwo(size));

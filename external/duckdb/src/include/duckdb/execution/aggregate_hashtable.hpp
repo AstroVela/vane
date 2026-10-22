@@ -132,6 +132,8 @@ public:
 	bool HLLEnabled() const;
 	//! Get HLL count
 	idx_t GetHLLUpperBound() const;
+	//! Merge the retained group sketch, including after sampling was disabled.
+	void MergeHLL(HyperLogLog &target) const;
 
 	//! Executes the filter(if any) and update the aggregates
 	void Combine(GroupedAggregateHashTable &other);

@@ -200,12 +200,14 @@ def test_partial_aggregates_exchange_native_states(expressions):
 
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("external", [False, True])
-def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path, threads, external):
+@pytest.mark.parametrize("layout", ["clustered", "interleaved"])
+def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path, threads, external, layout):
     spill = tmp_path / "spill"
     config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
+    group = "range//3" if layout == "clustered" else "range%32771"
     source = (
-        "select range i, case when range%32771=0 then null "
-        "else 'owned-partial-key-' || (range%32771)::varchar end k, "
+        f"select range i, case when ({group})%32771=0 then null "
+        f"else 'owned-partial-key-' || ({group})::varchar end k, "
         "case when range%7=0 then null else range%31-15 end v from range(131099)"
     )
     aggregates = "sum(v), count(v), sum(v) filter(where i%3=0), count(*) filter(where false)"
@@ -222,8 +224,10 @@ def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path
         assignments = {source.source_id: [split.split_id for split in source.splits] for source in producer.sources}
         partials = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
         assert set(row[0] for row in partials) == set(row[0] for row in expected)
-        if threads > 1:
+        if layout == "clustered" and threads > 1:
             assert len(partials) > len(expected)
+        else:
+            assert len(partials) == len(expected)
         edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
         final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
         # Transport/reordering and repeated executions cannot treat each partial
@@ -232,6 +236,40 @@ def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path
             actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
             assert Counter(actual) == Counter(expected)
         assert connection.execute("select 42").fetchall() == [(42,)]
+    assert not list(spill.glob("*"))
+
+
+@pytest.mark.parametrize("layout", ["clustered", "interleaved"])
+def test_partial_aggregates_spill_with_costed_output(tmp_path, layout):
+    key = "range//3" if layout == "clustered" else "range%32771"
+    count = 1572867 if layout == "clustered" else 524299
+    sql = (
+        f"select k, sum(v), count(v) from (select case when ({key})%32771=0 then null "
+        f"else {key} end k, range%31-15 v from range({count})) group by k"
+    )
+    with vane.connect(backend="local", config={"threads": 4, "memory_limit": "128MB"}) as connection:
+        expected = connection.execute(sql).fetchall()
+    spill = tmp_path / "spill"
+    profile = tmp_path / "profile.json"
+    config = {"threads": 4, "memory_limit": "32MB", "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        assignments = {source.source_id: [split.split_id for split in source.splits] for source in producer.sources}
+        connection.execute("set debug_force_external=true")
+        connection.execute("set enable_profiling='json'")
+        connection.execute(f"set profiling_output='{profile}'")
+        partials = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
+        connection.execute("pragma disable_profiling")
+        assert json.loads(profile.read_text())["system_peak_temp_dir_size"] > 0
+        if layout == "clustered":
+            assert len(partials) > len(expected)
+        else:
+            assert len(partials) == len(expected)
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: partials}, {})
+        assert Counter(actual) == Counter(expected)
     assert not list(spill.glob("*"))
 
 
