@@ -58,8 +58,12 @@ For the persistent native service, see its
 [configuration and ownership contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
 Run `tests/fast/test_embedding_service.py`, `tests/fast/test_native_multimodal.py`
 and the affected unified/HTTP embedding tests through the installed launcher.
-The service tests use real Linux sockets, sealed memfd buffers and subprocesses
-with CPU SDK fixtures. Real processor tests require the optional Transformers
+The service tests use real loopback PyZMQ sockets, Python SharedMemory and
+subprocesses with CPU SDK fixtures. Install the `embedding_service` extra for
+these tests; the development `test` group also includes it. The service transport
+targets Windows, macOS and Linux; the public subprocess backend tests still
+require POSIX because the generic UDF launcher passes file descriptors.
+Real processor tests require the optional Transformers
 test dependencies; they do not qualify a GPU checkpoint or throughput.
 
 Create and activate a virtual environment, then reuse a persistent native build directory:

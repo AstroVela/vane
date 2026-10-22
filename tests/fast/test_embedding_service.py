@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Persistent native service: real sockets, memfd, process death and processors."""
+"""Persistent native service: PyZMQ, SharedMemory, process death and processors."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import asyncio
 import json
 import os
 import pickle
-import socket
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +20,8 @@ import pytest
 from tests.fast.test_native_multimodal import install_sdk
 from tests.fast.test_native_multimodal import make_real_video_processor as processor_fixture
 from vane.ai import _embedding_ipc as ipc
+from vane.ai import _embedding_shared_memory as shm
+from vane.ai import _embedding_zmq as transport
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
@@ -29,7 +31,8 @@ from vane.ai.provider import load_provider
 
 make_real_video_processor = processor_fixture
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux memfd and Unix peer credentials")
+pytest.importorskip("zmq")
+import zmq.asyncio
 
 
 def content(kind="text", value="query"):
@@ -45,7 +48,7 @@ def client(root, family="sglang", kind="multimodal", **options):
     descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
         "fixture",
         2,
-        options={"runtime": "service", "service_path": str(root / "engine.sock"), "service_id": "fixture-v1"} | options,
+        options={"runtime": "service", "service_path": str(root / "engine.json"), "service_id": "fixture-v1"} | options,
     )
     return descriptor.instantiate()
 
@@ -79,7 +82,7 @@ def process(tmp_path):
     for proc, root, log in processes:
         (root / "hold").unlink(missing_ok=True)
         if proc.poll() is None:
-            proc.terminate()
+            (root / "stop").touch()
             try:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
@@ -87,7 +90,7 @@ def process(tmp_path):
                 proc.wait(timeout=5)
                 pytest.fail("Embedding fixture failed to drain")
         log.close()
-        assert proc.returncode in (0, -9), (root / "log.txt").read_text()
+        assert proc.returncode == 0 or (root / "killed").exists(), (root / "log.txt").read_text()
 
 
 def state(root):
@@ -110,7 +113,7 @@ def test_service_planning_needs_no_sdk_and_claims_no_gpu(tmp_path, monkeypatch, 
     ).descriptor
     clone = pickle.loads(pickle.dumps(descriptor))
     assert clone.is_async() and clone.get_udf_options().num_gpus == 0
-    assert clone.instantiate()._sockets == set()
+    assert clone.instantiate()._zmq_client is None
 
 
 @pytest.mark.parametrize(
@@ -123,6 +126,7 @@ def test_service_planning_needs_no_sdk_and_claims_no_gpu(tmp_path, monkeypatch, 
         {"timeout": float("nan")},
         {"input_modalities": ["audio"]},
         {"max_input_bytes": 2**40},
+        {"service_transport": "unix"},
     ],
 )
 def test_invalid_service_configuration_fails_without_connecting(tmp_path, options):
@@ -156,7 +160,7 @@ def test_ingest_and_search_clients_share_one_engine(process, family):
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
 def test_cancelled_mapped_input_holds_credit_until_model_finishes(process, family):
-    proc, root = process(family, max_bytes=100, max_inflight=2)
+    proc, root = process(family, max_bytes=200, max_inflight=2)
     (root / "hold").touch()
 
     async def run():
@@ -169,7 +173,7 @@ def test_cancelled_mapped_input_holds_credit_until_model_finishes(process, famil
             await first
         second = asyncio.create_task(instance.embed_multimodal([content("video", video())]))
         await until(lambda: state(root).get("connections") == 2)
-        assert state(root)["bytes"] == 96 and state(root)["calls"] == 1
+        assert state(root)["bytes"] == 192 and state(root)["calls"] == 1
         (root / "hold").unlink()
         np.testing.assert_equal(await second, [[3, 4]])
         await until(lambda: state(root).get("bytes") == state(root).get("inflight") == 0)
@@ -186,7 +190,7 @@ def test_producer_process_death_does_not_release_mapped_credit(process):
     async def run():
         await until(lambda: (root / "ready").exists() or proc.poll() is not None)
         code = "import asyncio,sys; import numpy as np; from vane.ai._video_embedding import VideoClip; from vane.ai.provider import load_provider; d=load_provider('sglang').get_video_embedder('fixture',2,options={'runtime':'service','service_path':sys.argv[1],'service_id':'fixture-v1'}); asyncio.run(d.instantiate().embed_video([VideoClip((np.zeros((4,4,3),np.uint8),),(0.0,),(0,))]))"
-        producer = subprocess.Popen([sys.executable, "-c", code, str(root / "engine.sock")])
+        producer = subprocess.Popen([sys.executable, "-c", code, str(root / "engine.json")])
         try:
             await until(lambda: state(root).get("active") == 1)
             producer.kill()
@@ -208,29 +212,36 @@ def test_producer_process_death_does_not_release_mapped_credit(process):
     asyncio.run(run())
 
 
-def test_server_death_closes_client_and_anonymous_buffer(process):
+def test_server_death_times_out_client_and_reclaims_owned_buffers(process):
     proc, root = process()
     (root / "hold").touch()
 
-    def buffers():
-        return [
-            name
-            for name in Path("/proc/self/fd").iterdir()
-            if name.exists() and "memfd:vane_embedding" in os.readlink(name)
-        ]
+    def removed(names):
+        for name in names:
+            try:
+                with shm.attach(name, 96):
+                    return False
+            except FileNotFoundError:
+                pass
+        return True
 
     async def run():
         await until(lambda: (root / "ready").exists() or proc.poll() is not None)
-        instance = client(root)
+        instance = client(root, timeout=2)
         task = asyncio.create_task(instance.embed_multimodal([content("video", video())]))
-        await until(lambda: state(root).get("active") == 1)
-        assert not buffers()  # Producer already handed off and closed its FD.
-        proc.kill()
-        proc.wait(timeout=5)
-        with pytest.raises(ConnectionError):
-            await asyncio.wait_for(task, 3)
-        assert not buffers() and not instance._sockets
-        await instance.aclose()
+        try:
+            await until(lambda: state(root).get("active") == 1)
+            names = state(root)["buffers"]
+            assert len(names) == 1
+            (root / "killed").touch()
+            proc.kill()
+            proc.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                await task
+            await until(lambda: removed(names))
+            assert not instance._zmq_client.sockets
+        finally:
+            await instance.aclose()
 
     asyncio.run(run())
 
@@ -241,30 +252,27 @@ def test_disconnect_before_publication_releases_reservation(process):
     async def run():
         await until(lambda: (root / "ready").exists() or proc.poll() is not None)
         for disconnect in (True, False):
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.setblocking(False)
-            await asyncio.get_running_loop().sock_connect(sock, str(root / "engine.sock"))
-            parts, _, size = ipc.describe(content("video", video()), ipc.input_spec({}))
-            await ipc.send(
-                sock,
-                {
-                    "version": 1,
-                    "service_id": "fixture-v1",
-                    "family": "sglang",
-                    "model": "fixture",
-                    "dimensions": 2,
-                    "request_id": "0" * 32,
-                    "parts": parts,
-                    "nbytes": size,
-                },
-            )
-            assert (await ipc.control(sock))["state"] == "reserved"
-            if disconnect:
-                sock.close()
-            else:
-                assert "error" in await ipc.control(sock)
-                sock.close()
-            await until(lambda: state(root).get("inflight") == 0)
+            peer = RawClient(root)
+            try:
+                response = await peer.reserve(content("video", video()))
+                name = response["shm_name"]
+                assert response["state"] == "reserved"
+                if disconnect:
+                    peer.close()
+                else:
+                    assert "error" in await peer.receive()
+
+                def removed():
+                    try:
+                        with shm.attach(name, 96):
+                            return False
+                    except FileNotFoundError:
+                        return True
+
+                await until(removed)
+                await until(lambda: state(root).get("inflight") == 0)
+            finally:
+                peer.close()
         assert state(root)["calls"] == 0
 
     asyncio.run(run())
@@ -290,23 +298,14 @@ def test_wire_bounds_rejected_before_mapping(bad):
 
 @pytest.mark.parametrize("times", [(0.0, 0.0), (0.5, 0.5), (0.0, 0.5, 0.5, 1.0)])
 def test_video_transport_preserves_nondecreasing_times(times):
-    import mmap
-
     frames = tuple(np.full((4, 4, 3), i + 10, np.uint8) for i in range(len(times)))
     original = VideoClip(frames, times, tuple(i * 3 for i in range(len(times))))
-    spec = ipc.input_spec({})
-    parts, arrays, size = ipc.describe(content("video", original), spec)
-    assert ipc.validate_layout(parts, size, spec) == size
-    fd = ipc.sealed_buffer(arrays, size)
-    try:
-        with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
-            restored = ipc.restore(parts, memory).parts[0].value
-            assert restored.frame_times == original.frame_times
-            assert restored.frame_indices == original.frame_indices
-            np.testing.assert_equal(restored.frames, original.frames)
-            del restored
-    finally:
-        os.close(fd)
+    parts, arrays, size = ipc.describe(content("video", original), ipc.input_spec({}))
+    assert ipc.validate_layout(parts, size, ipc.input_spec({})) == size
+    restored = ipc.restore(parts, snapshot(arrays, size)).parts[0].value
+    assert restored.frame_times == original.frame_times
+    assert restored.frame_indices == original.frame_indices
+    np.testing.assert_equal(restored.frames, original.frames)
 
 
 @pytest.mark.parametrize(
@@ -336,8 +335,6 @@ def test_invalid_video_timeline_rejected_on_both_sides(times, indices):
 
 @pytest.mark.parametrize("value", ["", " \t\n", "\u3000"])
 def test_text_transport_preserves_blanks_and_charges_admission(value):
-    import mmap
-
     budget = max(1, len(value.encode("utf-8")))
     spec = ipc.input_spec({"max_input_bytes": budget})
     parts, arrays, size = ipc.describe(content("text", value), spec)
@@ -345,16 +342,7 @@ def test_text_transport_preserves_blanks_and_charges_admission(value):
     assert parts == [{"kind": "text", "offset": 0, "nbytes": size}]
     assert len(arrays) == 1 and arrays[0].tobytes() == value.encode("utf-8")
     assert ipc.validate_layout(parts, size, spec) == budget
-    fd = ipc.sealed_buffer(arrays, size)
-    if size:
-        try:
-            with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
-                assert ipc.restore(parts, memory) == content("text", value)
-        finally:
-            os.close(fd)
-    else:
-        assert fd is None
-        assert ipc.restore(parts, None) == content("text", value)
+    assert ipc.restore(parts, snapshot(arrays, size)) == content("text", value)
 
 
 @pytest.mark.parametrize("value", [None, 1, b"", [], {}, " " * 5, "\u3000" * 2])
@@ -384,10 +372,7 @@ def test_text_wire_bounds_rejected_before_mapping(bad):
         ipc.validate_layout(parts, 3, spec)
 
 
-def test_sealed_arrays_preserve_noncontiguous_pixels_and_audio():
-    import fcntl
-    import mmap
-
+def test_shared_arrays_preserve_noncontiguous_pixels_and_audio():
     spec = ipc.input_spec({"input_modalities": ["text", "image", "audio"], "sample_rate": 16000, "max_samples": 8})
     original = EmbeddingContent(
         content("text", "中\x00\t").parts
@@ -397,21 +382,12 @@ def test_sealed_arrays_preserve_noncontiguous_pixels_and_audio():
     )
     parts, arrays, size = ipc.describe(original, spec)
     assert ipc.validate_layout(parts, size, spec) == size
-    fd = ipc.sealed_buffer(arrays, size)
-    try:
-        assert fcntl.fcntl(fd, fcntl.F_GET_SEALS) == ipc.required_seals()
-        with pytest.raises(OSError):
-            os.ftruncate(fd, 1)
-        with mmap.mmap(fd, size, access=mmap.ACCESS_COPY) as memory:
-            restored = ipc.restore(parts, memory)
-            np.testing.assert_equal(restored.parts[1].value, original.parts[1].value)
-            np.testing.assert_equal(restored.parts[2].value.samples, original.parts[2].value.samples)
-            assert restored.parts[2].value.sample_rate == 16000
-            assert restored.parts[0].value == original.parts[0].value
-            assert restored.parts[3].value == ""
-            del restored
-    finally:
-        os.close(fd)
+    restored = ipc.restore(parts, snapshot(arrays, size))
+    np.testing.assert_equal(restored.parts[1].value, original.parts[1].value)
+    np.testing.assert_equal(restored.parts[2].value.samples, original.parts[2].value.samples)
+    assert restored.parts[2].value.sample_rate == 16000
+    assert restored.parts[0].value == original.parts[0].value
+    assert restored.parts[3].value == ""
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
@@ -433,13 +409,13 @@ def test_long_text_uses_input_budget_and_matches_native_processor(tmp_path, monk
         "fixture", 2, options=options
     )
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family=family,
         model="fixture",
         dimensions=2,
         options=options,
-        max_bytes=size,
+        max_bytes=2 * size,
         max_inflight=1,
     )
 
@@ -478,42 +454,23 @@ def test_invalid_utf8_releases_admission_without_model_work(tmp_path, monkeypatc
     sdk = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
-    service = EmbeddingService(
-        path=str(root / "engine.sock"),
-        service_id="fixture-v1",
-        family=family,
-        model="fixture",
-        dimensions=2,
-        options={"gpus_per_actor": 0},
-        max_inflight=1,
-    )
+    service = make_service(root, family=family, max_inflight=1)
 
     async def run():
         await service.start()
-        instance = client(root, family)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        fd = None
-        request_id = "0" * 32
+        instance, peer = client(root, family), RawClient(root, family)
         try:
-            parts = [{"kind": "text", "offset": 0, "nbytes": 1}]
-            await asyncio.get_running_loop().sock_connect(sock, service.path)
-            await ipc.send(sock, instance._reservation(parts, 1, request_id))
-            assert (await ipc.control(sock))["state"] == "reserved"
-            fd = ipc.sealed_buffer([np.array([255], dtype=np.uint8)], 1)
-            await ipc.send(sock, {"request_id": request_id, "state": "published"}, fd)
-            os.close(fd)
-            fd = None
-            assert await ipc.control(sock) == {"request_id": request_id, "error": "configuration"}
+            response = await peer.reserve(content("text", "x"))
+            with shm.attach(response["shm_name"], 1) as memory:
+                memory[0] = 255
+            await peer.publish()
+            assert (await peer.receive())["error"] == "configuration"
             await until(lambda: not service._tasks)
             assert not sdk.calls
             assert service.credits.bytes == service.credits.inflight == 0
             np.testing.assert_equal(await instance.embed_text(["healthy"]), [[3, 4]])
-            assert service.credits.bytes == service.credits.inflight == 0
         finally:
-            if fd is not None:
-                os.close(fd)
-            sock.close()
+            peer.close()
             await instance.aclose()
             await service.aclose()
 
@@ -562,7 +519,7 @@ def test_joint_audio_video_and_text_use_one_native_request(tmp_path, monkeypatch
             root = tmp_path / "private"
             root.mkdir(mode=0o700)
             service = EmbeddingService(
-                path=str(root / "engine.sock"),
+                path=str(root / "engine.json"),
                 service_id="fixture-v1",
                 family=family,
                 model="fixture",
@@ -622,7 +579,7 @@ def test_real_processor_equal_for_direct_and_shared_frames(
     row = EmbeddingContent(content("video", clip).parts + (content().parts if joint else ()))
     kind = "multimodal" if joint else "video"
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family=family,
         model="fixture",
@@ -687,6 +644,7 @@ def test_real_processor_equal_for_direct_and_shared_frames(
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.skipif(os.name != "posix", reason="Generic UDF subprocess launcher requires POSIX file descriptors")
 def test_public_embed_runs_in_real_workers(process, family, backend):
     check_public_embed(process, family, backend)
 
@@ -729,7 +687,7 @@ def check_public_embed(process, family, backend):
             model="fixture",
             dimensions=2,
             runtime="service",
-            service_path=str(root / "engine.sock"),
+            service_path=str(root / "engine.json"),
             service_id="fixture-v1",
             execution_backend=backend,
             where=vane.col("selected"),
@@ -746,7 +704,7 @@ def check_public_embed(process, family, backend):
             model="fixture",
             dimensions=2,
             runtime="service",
-            service_path=str(root / "engine.sock"),
+            service_path=str(root / "engine.json"),
             service_id="fixture-v1",
             execution_backend=backend,
             on_error="ignore",
@@ -774,7 +732,7 @@ def check_public_embed(process, family, backend):
                 model="fixture",
                 dimensions=2,
                 runtime="service",
-                service_path=str(root / "engine.sock"),
+                service_path=str(root / "engine.json"),
                 service_id="fixture-v1",
                 execution_backend=backend,
                 on_error="ignore",
@@ -790,6 +748,7 @@ def check_public_embed(process, family, backend):
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.skipif(os.name != "posix", reason="Generic UDF subprocess launcher requires POSIX file descriptors")
 def test_public_embed_resource_failures_abort_without_retry(process, family, backend):
     check_public_resource_failure(process, family, backend)
 
@@ -836,7 +795,7 @@ def check_public_resource_failure(process, family, backend):
                     model="fixture",
                     dimensions=2,
                     runtime="service",
-                    service_path=str(root / "engine.sock"),
+                    service_path=str(root / "engine.json"),
                     service_id="fixture-v1",
                     execution_backend=backend,
                     on_error="ignore",
@@ -895,7 +854,7 @@ def test_resource_failures_remain_fatal_with_ignore(tmp_path, monkeypatch, failu
 
     state.on_embedding = fail
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family="sglang",
         model="fixture",
@@ -937,7 +896,7 @@ def test_handler_cancellation_joins_processor_before_unmapping(tmp_path, monkeyp
 
         state.on_embedding = wait
         service = EmbeddingService(
-            path=str(root / "engine.sock"),
+            path=str(root / "engine.json"),
             service_id="fixture-v1",
             family="sglang",
             model="fixture",
@@ -954,7 +913,7 @@ def test_handler_cancellation_joins_processor_before_unmapping(tmp_path, monkeyp
             await asyncio.sleep(0)
             handler.cancel()
             await asyncio.sleep(0)
-            assert service.credits.bytes == 96 and not handler.done()
+            assert service.credits.bytes == 192 and not handler.done()
             release.set()
             np.testing.assert_equal(await pending, [[3, 4]])
             assert service.credits.bytes == 0
@@ -972,43 +931,20 @@ def test_repeated_handler_cancellation_returns_admission_credits(tmp_path, monke
     state = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
-    service = EmbeddingService(
-        path=str(root / "engine.sock"),
-        service_id="fixture-v1",
-        family="sglang",
-        model="fixture",
-        dimensions=2,
-        options={"gpus_per_actor": 0},
-        max_inflight=1,
-    )
+    service = make_service(root, max_inflight=1)
 
     async def run():
         await service.start()
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.setblocking(False)
+        peer = RawClient(root)
         locked = False
         try:
             if phase != "release":
                 await service.credits.condition.acquire()
                 locked = True
-            await asyncio.get_running_loop().sock_connect(sock, service.path)
             value = content() if kind == "text" else content("video", video())
-            parts, _, size = ipc.describe(value, service.spec)
-            await ipc.send(
-                sock,
-                {
-                    "version": 1,
-                    "service_id": "fixture-v1",
-                    "family": "sglang",
-                    "model": "fixture",
-                    "dimensions": 2,
-                    "request_id": "0" * 32,
-                    "parts": parts,
-                    "nbytes": size,
-                },
-            )
+            await peer.send_reservation(value)
             if phase == "release":
-                assert (await ipc.control(sock))["state"] == "reserved"
+                assert (await peer.receive())["state"] == "reserved"
                 await service.credits.condition.acquire()
                 locked = True
             else:
@@ -1019,75 +955,309 @@ def test_repeated_handler_cancellation_returns_admission_credits(tmp_path, monke
                     )
                 )
             handler = next(iter(service._tasks))
-            loop = asyncio.get_running_loop()
             if phase == "handoff":
                 service.credits.condition.release()
                 locked = False
-                # First cancel races with completed admission; the second
-                # interrupts joining the cancelled disconnect watcher.
-                loop.call_soon(handler.cancel)
-                loop.call_soon(lambda: loop.call_soon(handler.cancel))
-                await asyncio.wait_for(ipc.control(sock), 3)
-            else:
-                handler.cancel()
-                await asyncio.wait_for(ipc.control(sock), 3)
-                handler.cancel()
-                await asyncio.sleep(0)
-                handler.cancel()
-                await asyncio.sleep(0)
+            handler.cancel()
+            await asyncio.sleep(0)
+            handler.cancel()
+            await asyncio.sleep(0)
+            handler.cancel()
+            if locked:
                 service.credits.condition.release()
                 locked = False
             await until(lambda: not service._tasks)
             assert service.credits.bytes == service.credits.inflight == 0
-            assert not state.calls and not service._connections
+            assert not state.calls and not service._zmq_server.pending
             instance = client(root, timeout=3)
             try:
                 np.testing.assert_equal(await instance.embed_text(["healthy successor"]), [[3, 4]])
                 assert len(state.calls) == 1
-                assert service.credits.bytes == service.credits.inflight == 0
             finally:
                 await instance.aclose()
         finally:
             if locked:
                 service.credits.condition.release()
-            sock.close()
+            peer.close()
             await service.aclose()
 
     asyncio.run(run())
 
 
-def test_unsealed_fd_rejected_without_model_call(process):
+def test_unsigned_request_cannot_reserve_memory(process):
     proc, root = process()
 
     async def run():
         await until(lambda: (root / "ready").exists() or proc.poll() is not None)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        await asyncio.get_running_loop().sock_connect(sock, str(root / "engine.sock"))
-        parts, _, size = ipc.describe(content("video", video()), ipc.input_spec({}))
-        await ipc.send(
-            sock,
-            {
-                "version": 1,
-                "service_id": "fixture-v1",
-                "family": "sglang",
-                "model": "fixture",
-                "dimensions": 2,
-                "request_id": "0" * 32,
-                "parts": parts,
-                "nbytes": size,
-            },
-        )
-        assert (await ipc.control(sock))["state"] == "reserved"
-        fd = os.memfd_create("unsealed-fixture", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        peer = RawClient(root)
         try:
-            os.ftruncate(fd, size)
-            await ipc.send(sock, {"request_id": "0" * 32, "state": "published"}, fd)
-            assert (await ipc.control(sock))["error"] == "configuration"
+            peer.key = b"wrong key"
+            await peer.send_reservation(content())
+            # The service authenticates every request before any allocation.
+            await asyncio.sleep(0.1)
+            assert state(root)["inflight"] == state(root)["calls"] == 0
         finally:
-            os.close(fd)
-            sock.close()
-        await until(lambda: state(root).get("inflight") == 0)
-        assert state(root)["calls"] == 0
+            peer.close()
 
     asyncio.run(run())
+
+
+def test_model_reads_private_snapshot_after_publication(tmp_path, monkeypatch):
+    install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, max_bytes=192, max_inflight=1)
+    original = video()
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def infer(value):
+            entered.set()
+            await finish.wait()
+            np.testing.assert_equal(value.parts[0].value.frames, original.frames)
+            return {"vector": [3, 4]}
+
+        monkeypatch.setattr(service, "_infer", infer)
+        await service.start()
+        peer = RawClient(root)
+        try:
+            response = await peer.reserve(content("video", original))
+            with shm.attach(response["shm_name"], 96) as writer:
+                writer[:] = b"".join(frame.tobytes() for frame in original.frames)
+                await peer.publish()
+                await asyncio.wait_for(entered.wait(), 3)
+                assert service.credits.bytes == 192
+                writer[:] = bytes(96)
+                finish.set()
+                assert (await peer.receive())["vector"] == [3, 4]
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert not service._zmq_server.buffers
+        finally:
+            finish.set()
+            peer.close()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_independent_client_exit_does_not_unlink_server_buffer():
+    memory = shm.create(16)
+    try:
+        code = """
+import sys
+from vane.ai import _embedding_shared_memory as shm
+with shm.attach(sys.argv[1], 16) as memory:
+    memory[:] = b'x' * 16
+"""
+        result = subprocess.run([sys.executable, "-c", code, memory.name], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert "resource_tracker" not in result.stderr
+        with shm.attach(memory.name, 16) as reader:
+            assert bytes(reader[:]) == b"x" * 16
+    finally:
+        shm.release(memory)
+
+
+def test_shutdown_drains_accepted_request_before_closing_engine(tmp_path, monkeypatch):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root)
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def infer(_):
+            entered.set()
+            await finish.wait()
+            return [3, 4]
+
+        sdk.on_embedding = infer
+        await service.start()
+        instance = client(root, timeout=3)
+        pending = asyncio.create_task(instance.embed_text(["query"]))
+        closing = None
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            closing = asyncio.create_task(service.aclose())
+            await asyncio.sleep(0.05)
+            assert not closing.done() and service.credits.bytes == 10
+            assert service.runtime is not None
+            finish.set()
+            np.testing.assert_equal(await pending, [[3, 4]])
+            await closing
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert service.runtime is None and not (root / "engine.json").exists()
+        finally:
+            finish.set()
+            await instance.aclose()
+            if closing is not None:
+                await closing
+            else:
+                await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+def test_empty_request_round_trip_needs_no_shared_memory(tmp_path, monkeypatch, family):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, family, max_bytes=1, max_inflight=1)
+
+    async def infer(_):
+        assert service.credits.bytes == service.credits.inflight == 1
+        assert not service._zmq_server.buffers
+        return [3, 4]
+
+    sdk.on_embedding = infer
+
+    async def run():
+        await service.start()
+        instance = client(root, family)
+        try:
+            np.testing.assert_equal(await instance.embed_text([""]), [[3, 4]])
+            assert service.credits.bytes == service.credits.inflight == 0
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("bad", ["json", "protocol", "remote", "key", "file_permissions", "directory_permissions"])
+def test_invalid_rendezvous_is_fatal_even_with_ignore(tmp_path, monkeypatch, bad):
+    if os.name != "posix" and "permissions" in bad:
+        pytest.skip("POSIX permission bits; Windows uses the user directory ACL")
+    install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root)
+
+    async def run():
+        await service.start()
+        path = root / "engine.json"
+        data = json.loads(path.read_text())
+        if bad == "json":
+            path.write_text("{")
+        elif bad == "file_permissions":
+            path.chmod(0o644)
+        elif bad == "directory_permissions":
+            root.chmod(0o755)
+        else:
+            data[{"protocol": "protocol", "remote": "endpoint", "key": "key"}[bad]] = {
+                "protocol": "unix",
+                "remote": "tcp://example.com:1234",
+                "key": "invalid",
+            }[bad]
+            path.write_text(json.dumps(data))
+        instance = client(root)
+        instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda value: value)
+        try:
+            with pytest.raises(EmbeddingConfigurationError):
+                await instance.embed_text(["query"])
+            assert not service._tasks and service.metrics["accepted"] == 0
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_missing_zmq_does_not_affect_planning_and_cleans_failed_start(tmp_path, monkeypatch):
+    from vane.ai.provider import ProviderImportError
+
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    monkeypatch.setitem(sys.modules, "zmq", None)
+    monkeypatch.setitem(sys.modules, "zmq.asyncio", None)
+    instance = client(root)
+    assert instance._zmq_client is None
+    service = make_service(root)
+
+    async def run():
+        with pytest.raises(ProviderImportError, match="embedding_service"):
+            await service.start()
+        assert not (root / "engine.json").exists()
+        assert service._zmq_server is None and service.runtime is None
+        instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda value: value)
+        with pytest.raises(ProviderImportError, match="embedding_service"):
+            await instance.embed_text(["query"])
+        await instance.aclose()
+
+    asyncio.run(run())
+
+
+class RawClient:
+    def __init__(self, root, family="sglang"):
+        self.endpoint, self.key = transport._read_endpoint(str(root / "engine.json"))
+        self.context = zmq.asyncio.Context()
+        self.socket = self.context.socket(zmq.DEALER)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.request_id = uuid.uuid4().hex
+        self.socket.setsockopt(zmq.IDENTITY, self.request_id.encode("ascii"))
+        self.socket.connect(self.endpoint)
+        self.family = family
+
+    async def send_reservation(self, value):
+        parts, _, size = ipc.describe(value, ipc.input_spec({}))
+        await self.send(
+            {
+                "version": ipc.VERSION,
+                "service_id": "fixture-v1",
+                "family": self.family,
+                "model": "fixture",
+                "dimensions": 2,
+                "request_id": self.request_id,
+                "parts": parts,
+                "nbytes": size,
+            }
+        )
+
+    async def reserve(self, value):
+        await self.send_reservation(value)
+        return await self.receive()
+
+    async def send(self, message):
+        await self.socket.send_multipart(transport._pack(message, self.key, b"request"))
+
+    async def publish(self):
+        await self.send({"request_id": self.request_id, "state": "published"})
+
+    async def receive(self):
+        return transport._unpack(await asyncio.wait_for(self.socket.recv_multipart(), 5), self.key, b"response")
+
+    def close(self):
+        self.socket.close(linger=0)
+        self.context.term()
+
+
+def snapshot(arrays, size):
+    if not size:
+        return None
+    memory = shm.create(size)
+    try:
+        with shm.attach(memory.name, size) as writer:
+            offset = 0
+            for value in arrays:
+                target = np.ndarray(value.shape, dtype=value.dtype, buffer=writer, offset=offset)
+                np.copyto(target, value)
+                del target
+                offset += value.nbytes
+        return bytearray(memory.buf[:size])
+    finally:
+        shm.release(memory)
+
+
+def make_service(root, family="sglang", **options):
+    return EmbeddingService(
+        path=str(root / "engine.json"),
+        service_id="fixture-v1",
+        family=family,
+        model="fixture",
+        dimensions=2,
+        options={"gpus_per_actor": 0},
+        **options,
+    )

@@ -560,7 +560,17 @@ engine in each owning UDF worker; `runtime="http"` remains the separate encoded
 media protocol. There is no transport detection, local-engine startup by a
 service client, or fallback. A service client reserves zero worker GPUs.
 
-Create a private directory (`0700`) and start one process per model configuration:
+Install `vane-ai[embedding_service]` in the service and client environments. The
+transport uses PyZMQ over loopback TCP and Python `SharedMemory` on Windows,
+macOS and Linux. Each native model SDK still determines which systems can host
+its engine; the transport does not make SGLang or vLLM engines portable.
+The generic Vane `subprocess_actor` / `subprocess_task` launcher still uses POSIX
+file-descriptor passing. This service transport replacement does not qualify
+those execution backends on Windows.
+
+Create a private directory (`0700` on POSIX, a user-private ACL on Windows) and
+start one process per model configuration. This POSIX example uses `/tmp`;
+on Windows use an absolute path in a private user directory:
 
 ```bash
 mkdir -m 700 /tmp/my-embedding
@@ -572,7 +582,7 @@ the supported checkpoint):
 
 ```json
 {
-  "path": "/tmp/my-embedding/engine.sock",
+  "path": "/tmp/my-embedding/engine.json",
   "service_id": "retrieval-model-revision-1",
   "family": "sglang",
   "model": "my-supported-embedding-checkpoint",
@@ -604,7 +614,7 @@ from vane.ai import MultimodalInput, TextInput, VideoInput, embed
 
 service = dict(
     provider="sglang", model="my-supported-embedding-checkpoint", dimensions=768,
-    runtime="service", service_path="/tmp/my-embedding/engine.sock",
+    runtime="service", service_path="/tmp/my-embedding/engine.json",
     service_id="retrieval-model-revision-1",
 )
 clip_vector = embed(MultimodalInput([
@@ -628,46 +638,56 @@ argument; model-specific custom processor contracts are not inferred.
 
 ### Transport and lease ownership
 
-The Linux implementation uses an anonymous `memfd`, not a named `/dev/shm`
-segment. After server byte/count admission, the client reserves pages, copies
-contiguous arrays, closes its writable mapping and seals writes/growth/shrinkage.
-Text is UTF-8 bytes in the same buffer as decoded media, so text rows are not
-limited by the separate 1 MiB JSON control-message cap or JSON escaping.
-It passes one FD with `SCM_RIGHTS`; the server checks every descriptor and the
-sealed file's size before mapping. The request ID identifies the lease, owned
-by the connection and the receiving server. Offsets are contiguous, nonoverlapping
-and exactly cover the FD. Frame indices/timestamps and sample rate remain JSON
-metadata; text descriptors contain only offsets and lengths. Video timelines
-keep strictly increasing frame indices and nondecreasing timestamps, including
-repeated timestamps, without dropping frames. Processor requirements such as a
-uniform positive frame interval are checked separately. The configured
-`max_input_bytes` bounds the combined UTF-8 text and decoded-media bytes, and
-admission charges the complete buffer. Empty text still consumes one admission
-byte/slot without allocating a buffer. Invalid UTF-8 fails before model work.
+PyZMQ DEALER/ROUTER sockets carry bounded JSON control messages. After byte/count
+admission, the server allocates a named `SharedMemory` block and returns its name
+and size. The client copies decoded arrays and UTF-8 text into that block, closes
+its mapping and publishes the request. The server takes a private snapshot,
+validates it and gives the snapshot to the native processor. Named shared memory
+has no write seals: the private snapshot keeps later producer writes from
+changing data while the processor reads it. The previous Unix socket/memfd
+protocol has been removed; there is no transport selection or fallback.
+
+Text shares the buffer with decoded media, so the separate 1 MiB JSON control
+limit and JSON escaping do not limit text rows. Offsets must be contiguous,
+nonoverlapping and cover the complete buffer. Frame indices/timestamps and
+sample rate remain metadata; text descriptors contain only offsets and lengths.
+Video timelines preserve strictly increasing frame indices and nondecreasing
+timestamps, including repeated timestamps. Processor-specific timing constraints
+are checked separately. `max_input_bytes` bounds the combined input bytes.
+Service admission charges **twice** that size for the shared block and private
+snapshot; configure `max_bytes` accordingly. Empty text consumes one admission
+byte/slot without allocating a block. Invalid UTF-8 fails before model work.
 Neither side accepts media paths, pickles, arbitrary objects or CUDA handles.
 
-Both peers check `SO_PEERCRED` for the same UID. The socket is `0600` in a private
-directory. This is a trusted same-user, same-host Linux boundary, not a network
-authentication protocol. Ray workers must be placed on the service host with
-access to the socket; arbitrary multi-node scheduling is not supported by this
-transport. `service_id`, family, model and dimensions must match. Choose a new
-service ID when processor/checkpoint options change. Existing socket paths are
-never replaced automatically, including after an ungraceful exit.
+`path` / `service_path` names a private rendezvous JSON file containing a random
+loopback TCP endpoint and a fresh authentication key. HMAC authenticates every
+request and response. On POSIX the file must be owned by the current UID with
+mode `0600` in a private directory; Windows relies on the directory's user-private
+ACL. Keep that file private. This remains a trusted same-user, same-host boundary.
+Ray workers must run on the service host with access to the file and shared
+memory. Remote endpoints and arbitrary multi-node placement are unsupported.
+`service_id`, family, model and dimensions must match. Choose a new service ID
+when processor/checkpoint options change. Existing rendezvous files are never
+replaced automatically: after an ungraceful exit, remove the stale file only
+after confirming its service has stopped.
 
-The producer closes its FD after transfer. A receiver-held FD/mapping remains
-valid if the producer exits. Disconnect before publication releases admission;
-a producer that never publishes is bounded by `publication_timeout`. After
-acquisition, admission ownership is recorded before joining its watcher tasks.
-Repeated handler cancellation cannot skip returning credits, including while
-cleanup is waiting for the admission lock. After mapping, a disconnected/cancelled
-request drains its model coroutine before
-unmapping and returning credits. A stuck model consequently retains credits;
-timeout is not proof that reading stopped. Graceful shutdown drains requests
-then shuts down the engine. Kernel reference counting reclaims anonymous buffers
-after owner death, without a segment scavenger or Python resource tracker.
-Max connections bounds waiting metadata; byte and in-flight limits include
-accepted requests whose clients have gone away. Limits govern service-owned
-ingress, not unrelated memory allocated by same-user applications or GPU KV.
+The server owns each block through request completion. Clients attach without
+resource-tracker ownership, so an independently launched client exiting cannot
+unlink the server's block. Python 3.13+ uses `track=False`; older supported POSIX
+versions attach directly to the existing mapping without registering a tracker.
+Windows releases a block when its last handle closes. POSIX service allocations
+remain registered with Python's resource tracker for cleanup after owner death.
+No cleanup can reclaim a Windows block still held by another live process.
+
+`publication_timeout` bounds both admission waiting and the subsequent wait for
+publication, including clients that disconnect before publishing. Accepted
+requests drain their model coroutine before releasing buffers and credits, even
+after client timeout or repeated handler cancellation. A stuck model retains
+credits because timeout does not prove reading stopped. Graceful shutdown drains
+accepted work before closing the engine and removing the rendezvous file.
+`max_connections` bounds waiting metadata; byte and in-flight limits include
+accepted requests whose clients have gone away. Limits govern ingress buffers,
+not processor allocations, unrelated applications or GPU memory.
 
 Client metrics record queue/admission, copy and request time plus input bytes.
 Service metrics record queue, request/model and cleanup time plus counts. The
@@ -781,7 +801,7 @@ SELECT ai_embed(text, provider := 'openai', model := 'text-embedding-3-small') F
 -- Decoded frames: no encoding or implicit file reads.
 SELECT ai_embed(frames, input_spec := {kind: 'video'},
     provider := 'sglang', model := 'your-supported-checkpoint', dimensions := 768,
-    options := {runtime: 'service', service_path: '/tmp/my-embedding/engine.sock',
+    options := {runtime: 'service', service_path: '/tmp/my-embedding/engine.json',
                 service_id: 'retrieval-model-revision-1'}) FROM clips;
 
 -- Encoded bytes use an explicit MIME type and a protocol supporting it.
