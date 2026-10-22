@@ -548,8 +548,10 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 		throw InternalException("ClientContext::RebindPreparedStatement called but PreparedStatementData did not have "
 		                        "an unbound statement so rebinding cannot be done");
 	}
-	// catalog was modified: rebind the statement before execution
-	auto new_prepared = CreatePreparedStatement(lock, query, prepared->unbound_statement->Copy(), parameters);
+	// Rebinding here is part of execution, so callbacks must prepare resources
+	// for the new plan rather than treating it as schema-only preparation.
+	auto new_prepared = CreatePreparedStatement(lock, query, prepared->unbound_statement->Copy(), parameters,
+	                                            PreparedStatementMode::PREPARE_AND_EXECUTE);
 	D_ASSERT(new_prepared->properties.bound_all_parameters);
 	new_prepared->properties.parameter_count = prepared->properties.parameter_count;
 	prepared = std::move(new_prepared);

@@ -210,7 +210,9 @@ consumer-side registry lookup.
 The Python bridge also installs a database-owned connection callback for UDF
 resource preparation and teardown. Connections created inside an extension use
 that host callback, including actor pool and transport-capacity preparation.
-Schema-only native preparation does not create actor resources.
+Schema-only native preparation does not create actor resources. Native
+Prepare/Execute calls prepare fresh query-owned resources when rebinding for
+execution, including repeated execution of the same prepared statement.
 Rebuild optional providers against the changed native SDK; a matching Python
 package version alone does not establish C++ compatibility.
 

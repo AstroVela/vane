@@ -77,6 +77,8 @@ BoundStatement PlanBatchDemoCopy(Binder &binder, CopyStatement &statement) {
 
 struct BatchDemoQueryData : public TableFunctionData {
 	string query;
+	bool use_prepared = false;
+	idx_t executions = 1;
 };
 
 unique_ptr<FunctionData> BindBatchDemoQuery(ClientContext &context, TableFunctionBindInput &input,
@@ -86,6 +88,16 @@ unique_ptr<FunctionData> BindBatchDemoQuery(ClientContext &context, TableFunctio
 	Connection inner(*context.db);
 	auto data = make_uniq<BatchDemoQueryData>();
 	data->query = input.inputs[0].GetValue<string>();
+	if (input.named_parameters.count("prepared")) {
+		data->use_prepared = input.named_parameters.at("prepared").GetValue<bool>();
+	}
+	if (input.named_parameters.count("executions")) {
+		auto executions = input.named_parameters.at("executions").GetValue<int32_t>();
+		if (executions <= 0) {
+			throw InvalidInputException("batch_demo_query executions must be positive");
+		}
+		data->executions = idx_t(executions);
+	}
 	auto prepared = inner.Prepare(data->query);
 	if (prepared->HasError()) {
 		throw InvalidInputException(prepared->GetError());
@@ -104,12 +116,33 @@ unique_ptr<GlobalTableFunctionState> InitBatchDemoQuery(ClientContext &context, 
 	// Binding may run more than once (for example, for a parameterized query).
 	// Execute only after the outer query has entered its execution scope.
 	Connection inner(*context.db);
-	auto result = inner.Query(input.bind_data->Cast<BatchDemoQueryData>().query);
-	if (result->HasError()) {
-		result->ThrowError();
+	auto &data = input.bind_data->Cast<BatchDemoQueryData>();
+	unique_ptr<PreparedStatement> prepared;
+	if (data.use_prepared) {
+		prepared = inner.Prepare(data.query);
+		if (prepared->HasError()) {
+			throw InvalidInputException(prepared->GetError());
+		}
 	}
 	auto state = make_uniq<BatchDemoQueryState>();
-	state->collection = result->TakeCollection();
+	for (idx_t execution = 0; execution < data.executions; execution++) {
+		unique_ptr<QueryResult> result;
+		if (prepared) {
+			vector<Value> values;
+			result = prepared->Execute(values, false);
+		} else {
+			result = inner.Query(data.query);
+		}
+		if (result->HasError()) {
+			result->ThrowError();
+		}
+		auto collection = result->Cast<MaterializedQueryResult>().TakeCollection();
+		if (state->collection) {
+			state->collection->Combine(*collection);
+		} else {
+			state->collection = std::move(collection);
+		}
+	}
 	state->collection->InitializeScan(state->scan);
 	return std::move(state);
 }
@@ -209,8 +242,11 @@ DUCKDB_CPP_EXTENSION_ENTRY(loadable_extension_batch_demo, loader) {
 	CopyFunction copy("batch_demo_replan");
 	copy.plan = PlanBatchDemoCopy;
 	loader.RegisterFunction(copy);
-	loader.RegisterFunction(TableFunction("batch_demo_query", {LogicalType::VARCHAR}, ReadBatchDemoQuery,
-	                                      BindBatchDemoQuery, InitBatchDemoQuery));
+	TableFunction query("batch_demo_query", {LogicalType::VARCHAR}, ReadBatchDemoQuery, BindBatchDemoQuery,
+	                    InitBatchDemoQuery);
+	query.named_parameters["prepared"] = LogicalType::BOOLEAN;
+	query.named_parameters["executions"] = LogicalType::INTEGER;
+	loader.RegisterFunction(std::move(query));
 }
 
 DUCKDB_EXTENSION_API bool batch_demo_has_private_reader() {

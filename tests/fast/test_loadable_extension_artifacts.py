@@ -63,10 +63,12 @@ def _copy_query(sql):
 def _execute_private(con, sql, entry):
     if entry == "copy":
         return con.execute(_copy_query(sql))
+    if entry == "prepared_connection":
+        return con.execute("SELECT * FROM batch_demo_query(?, prepared := true)", [sql])
     return con.execute("SELECT * FROM batch_demo_query(?)", [sql])
 
 
-@pytest.mark.parametrize("entry", ["copy", "connection"])
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
 @pytest.mark.parametrize("backend", ["task", "actor"])
 @pytest.mark.parametrize("rows", [0, 4101])
 def test_private_extension_preserves_local_udf_execution(private_extension_connection, entry, backend, rows):
@@ -93,7 +95,8 @@ def test_private_extension_preserves_local_udf_execution(private_extension_conne
     assert con.execute("SELECT 1").fetchone() == (1,)
 
 
-def test_private_extension_cached_connections_share_runtime(monkeypatch, tmp_path):
+@pytest.mark.parametrize("entry", ["connection", "prepared_connection"])
+def test_private_extension_cached_connections_share_runtime(monkeypatch, tmp_path, entry):
     artifact = _configured_artifact_path("VANE_TEST_LOADABLE_BATCH_DEMO_PATH")
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     config = {"autoinstall_known_extensions": False, "autoload_known_extensions": False}
@@ -105,7 +108,41 @@ def test_private_extension_cached_connections_share_runtime(monkeypatch, tmp_pat
         ).create_view("runtime_input")
         with vane.connect(path, config=config) as cached, cached.cursor() as sibling:
             for con in (first, cached, sibling):
-                assert _execute_private(con, "SELECT * FROM runtime_input", "connection").fetchall() == [(42,)]
+                assert _execute_private(con, "SELECT * FROM runtime_input", entry).fetchall() == [(42,)]
+
+
+def test_private_extension_prepared_execution_renews_actor_resources(private_extension_connection, monkeypatch):
+    from vane.execution import udf_subprocess
+
+    pools = []
+    create_pool = udf_subprocess.LocalSubprocessActorPool
+
+    def track_pools(*args, **kwargs):
+        pool = create_pool(*args, **kwargs)
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", track_pools)
+    con = private_extension_connection
+    con.sql("SELECT i::BIGINT AS id FROM range(3) t(i)").map_batches(
+        _ReplannedActor,
+        schema={"id": "BIGINT"},
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        cpus=1,
+        gpus=0,
+    ).create_view("prepared_input")
+    relation = con.sql(
+        "SELECT * FROM batch_demo_query(?, prepared := true, executions := 2)",
+        params=["SELECT * FROM prepared_input ORDER BY id"],
+    )
+    assert relation.columns == ["id"]
+    assert pools == [], "schema-only native preparation must not create actor pools"
+    assert relation.fetchall() == [(0,), (1,), (2,)] * 2
+    assert len(pools) == 2, "each execution must prepare fresh query-owned resources"
+    assert all(not pool.cleanup_pending() for pool in pools)
+    assert all(pool.worker_pids() == [] for pool in pools)
+    assert con.execute("SELECT 1").fetchone() == (1,)
 
 
 class _ExtensionInferenceExecutor:
@@ -146,7 +183,7 @@ class _ExtensionInferenceExecutor:
         self.finished = True
 
 
-@pytest.mark.parametrize("entry", ["copy", "connection"])
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
 def test_private_extension_executes_host_inference_factory(private_extension_connection, monkeypatch, entry, engine):
     module = importlib.import_module(f"vane.execution.{engine}")
@@ -167,7 +204,7 @@ def test_private_extension_executes_host_inference_factory(private_extension_con
     assert private_extension_connection.execute("SELECT 1").fetchone() == (1,)
 
 
-@pytest.mark.parametrize("entry", ["copy", "connection"])
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
 def test_private_extension_restores_datasource_callbacks(private_extension_connection, entry):
     import pyarrow as pa
 
@@ -193,7 +230,7 @@ def test_private_extension_restores_datasource_callbacks(private_extension_conne
     assert con.execute(sql).fetchall() == expected
     # The COPY fixture restores bind data and scan callbacks inside its DSO.
     # Also exercise this from a connection created by that private engine.
-    if entry == "connection":
+    if entry in ("connection", "prepared_connection"):
         sql = _copy_query(sql)
     assert _execute_private(con, sql, entry).fetchall() == expected
     after = dict(vane._native._datasource_factory_registry_state_for_test())
