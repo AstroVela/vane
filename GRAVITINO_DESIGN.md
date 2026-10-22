@@ -1,6 +1,8 @@
 # Vane Gravitino 详细设计与 Roadmap
 
-状态：M1/M2 Fileset v1 实现与专项验收完成，尚未发布 provider。更新日期：2026-10-22。
+状态：M1/M2 Fileset v1 实现与专项验收完成，尚未发布 provider。更新日期：2026-10-23。
+
+Runner 命名：当前 main 将原生本地执行统一为 `local`，`local-fast` 保留为兼容别名。本文的本地执行设计使用当前名称；旧基线验收时的名称为 `local-fast`。
 
 M1/M2 设计与验收跟踪：[AstroVela/vane#1060](https://github.com/AstroVela/vane/issues/1060)。
 
@@ -8,7 +10,7 @@ M1/M2 设计与验收跟踪：[AstroVela/vane#1060](https://github.com/AstroVela
 
 当前已实现的行为以 [Gravitino 使用说明](GRAVITINO.md) 为准。本文后续阶段的接口、数据结构、里程碑和验收要求属于目标设计，不能作为已发布能力说明。构建、安装、测试与发布沿用 [DEVELOPMENT.md](DEVELOPMENT.md) 和 [RELEASE.md](RELEASE.md)，本文只规定本功能的实施范围与验收要求。
 
-实施进展：M0 文档已完成；M1 已加入输出绑定、local-fast `write_files`、本地目录准备和精确结果结构。M2 已加入 Ray S3 写入、committed manifest 精确清单、Parquet/CSV 分区与空输入、并发批次、worker 丢失重试、用户中断及提交未知/结果不可用验证。worker 计划无 Gravitino token、attachment 或 GVFS 目标，重试只使用冻结的物理路径。返回值保留通用 COPY 的清理状态与诊断；actor 丢失后的 pending teardown 限制见第 8.5 节。
+实施进展：M0 文档已完成；M1 已加入输出绑定、local `write_files`、本地目录准备和精确结果结构。M2 已加入 Ray S3 写入、committed manifest 精确清单、Parquet/CSV 分区与空输入、并发批次、worker 丢失重试、用户中断及提交未知/结果不可用验证。worker 计划无 Gravitino token、attachment 或 GVFS 目标，重试只使用冻结的物理路径。返回值保留通用 COPY 的清理状态与诊断；actor 丢失后的 pending teardown 限制见第 8.5 节。
 
 真实 Gravitino `1.3.0` 的本地写入、S3 分区写入与 Ray 写读共 12 项已通过固定镜像的 Docker 验收。S3 使用 HTTP 对象存储模拟器，真实 metadata catalog 配置 `disable-filesystem-ops=true`，不代表已完成生产对象存储性能或兼容性验证。可安装 base/provider、COPY/fsspec 回归和基础发布测试的验证记录见第 13 节。M3 及后续阶段尚未实现；认证扩展继续后置。第 2 节能力表保留实施前的调研基线。
 
@@ -21,7 +23,7 @@ M1/M2 设计与验收跟踪：[AstroVela/vane#1060](https://github.com/AstroVela
 5. Iceberg 使用原生格式能力与标准 Iceberg REST Catalog 协议。先验证与 Vane DuckDB fork 匹配的 provider，再谈功能发布。
 6. 继续支持已有静态 Bearer token 和显式存储配置；新增认证方式、凭据托管和自动刷新不进入前几个里程碑。
 
-首个稳定交付目标是：用户能从一个 Fileset 读取数据，在 local-fast 或 Ray 上处理，写入另一个 Fileset，并准确读取这次写入产生的结果。
+首个稳定交付目标是：用户能从一个 Fileset 读取数据，在 local 或 Ray 上处理，写入另一个 Fileset，并准确读取这次写入产生的结果。
 
 ## 2. 调研基线与当前能力
 
@@ -46,7 +48,7 @@ Vane 已有能力如下，不能重复作为新增项目计算工作量：
 | Ray 文件读取 | 已有 coordinator 解析、worker 使用物理路径的路径 | [分布式扩展契约](DISTRIBUTED_EXTENSIONS.md) |
 | RELATIONAL catalog 表扫描 | 当前 Gravitino attach 不支持 | [gravitino_catalog.cpp](external/duckdb/extension/gravitino/gravitino_catalog.cpp) |
 | 认证与存储访问 | 可选静态 Bearer token；存储凭据由 Vane 单独配置 | [GRAVITINO.md](GRAVITINO.md) |
-| 自动化验证 | 有模拟服务、真实 Gravitino、local-fast/Ray 读取与元数据测试 | [test_gravitino.py](tests/fast/test_gravitino.py)、[test_gravitino_live.py](tests/fast/test_gravitino_live.py) |
+| 自动化验证 | 有模拟服务、真实 Gravitino、local/Ray 读取与元数据测试 | [test_gravitino.py](tests/fast/test_gravitino.py)、[test_gravitino_live.py](tests/fast/test_gravitino_live.py) |
 
 现有 Ray 普通 COPY 已具备不可变 attempt 输出、selected-attempt finalization 和提交结果分类。新增 Fileset 写入应接入这些能力，避免再创建一套调度和提交协议。参见 [普通 COPY 写入](DISTRIBUTED_EXTENSIONS.md#ordinary-copy-format-file-writes)、[copy_outcome.py](vane/runners/copy_outcome.py) 和 [committed_copy.py](vane/runners/ray/committed_copy.py)。
 
@@ -71,10 +73,10 @@ Vane 的取舍是优先完成已有原生 Fileset 路径，并把 Ray 故障语�
 首个稳定版本包括：
 
 - 已存在的 FILESET catalog、schema 和 Fileset；已有元数据 API 仍可单独使用。
-- Parquet、CSV 输出；首批存储为 local-fast 的本地文件系统和 S3，Ray 的 S3 共享存储。
+- Parquet、CSV 输出；首批存储为 local 的本地文件系统和 S3，Ray 的 S3 共享存储。
 - 每次写入创建独立输出批次；同一 Fileset 可容纳多次执行的结果。
 - 返回精确文件清单、行数和恢复所需的运行标识。
-- local-fast 与 Ray 使用相同业务接口，保持各自实际支持的故障与可见性语义。
+- local 与 Ray 使用相同业务接口，保持各自实际支持的故障与可见性语义。
 
 第一版不包含 Fileset 根目录覆盖、已有文件替换、原地 append、跨 Fileset 原子操作、跨查询 exactly-once、自动删除历史批次、自动创建 schema/Fileset。MANAGED 和 EXTERNAL Fileset 的数据写入路径相同，删除语义继续由现有元数据 API 和服务端决定。
 
@@ -91,7 +93,7 @@ Vane 的取舍是优先完成已有原生 Fileset 路径，并把 Ray 故障语�
 | I7 | 元数据写入、文件输出发布、Iceberg catalog commit 是三个不同操作，不互相充当成功证明 |
 | I8 | 已提交但结果不可取、提交结果未知都不得触发整次写入自动重跑 |
 | I9 | 关闭或删除 attachment、修改 Fileset 元数据不能成为正在执行任务的隐式重定向机制 |
-| I10 | 所有新增 API 都经过现有 runner；不把 Ray 不支持的操作悄悄转为 local-fast |
+| I10 | 所有新增 API 都经过现有 runner；不把 Ray 不支持的操作悄悄转为 local |
 
 ## 5. 组件结构
 
@@ -101,7 +103,7 @@ flowchart TD
     Bind --> Meta[Gravitino C++ client]
     Meta --> Server[Gravitino metadata API]
     Bind --> Target[冻结的物理目标与 COPY 参数]
-    Target --> Local[local-fast 原生 COPY]
+    Target --> Local[local 原生 COPY]
     Target --> Ray[Ray 通用 COPY 执行]
     Local --> Storage[本地文件系统 / S3]
     Ray --> Tasks[Worker attempt 输出]
@@ -117,7 +119,7 @@ Iceberg 属于另一条格式与 catalog 路径，不能通过把 Fileset 中的
 
 ## 6. 对外 API 设计
 
-以下为 Fileset v1 的目标接口。M1 已实现无分区的 local-fast 路径；启用的能力与限制见使用说明，后续阶段仍需对应验收。
+以下为 Fileset v1 的目标接口。M1 已实现无分区的 local 路径；启用的能力与限制见使用说明，后续阶段仍需对应验收。
 
 ### 6.1 推荐入口：写入独立批次
 
@@ -182,7 +184,7 @@ class GravitinoCatalog:
 | `operation_id` | `str` | 用于定位本次调用和错误的标识；不是跨执行幂等键 |
 | `base_path` | `str` | 恢复或检查工具使用的物理输出基址 |
 | `run_id` | `str \| None` | 通用 COPY 发布协议的标识；没有该协议时为 `None` |
-| `manifest_path` | `str \| None` | 存在持久提交 manifest 时返回；local-fast 不伪造此保证 |
+| `manifest_path` | `str \| None` | 存在持久提交 manifest 时返回；local 不伪造此保证 |
 | `cleanup_state` | `Literal["complete", "pending"]` | COPY runner 的清理状态；不改变数据提交状态 |
 | `cleanup_warnings` | `tuple[str, ...]` | 原有 COPY 协议产生的清理诊断；调用方保留结果后独立处理 |
 
@@ -260,13 +262,13 @@ Fileset 内容写入与现有远端元数据写入一样要求 auto-commit；明
 
 ## 8. 写入、失败和可见性语义
 
-### 8.1 local-fast
+### 8.1 local
 
 每次 helper 调用写入独立目录，使用原生 COPY 的目录输出与文件统计。必须收集本次 COPY 返回的真实文件记录，而不是写完后列目录推测结果。
 
 本地目录在目标、模式与 COPY 格式/源绑定校验之后准备：先创建缺失的输出前缀祖先目录，再由 COPY 创建本次独立运行目录。对象存储前缀不需要创建目录。该准备属于写入执行，不属于 EXPLAIN/PREPARE 等只读绑定。
 
-第一版 local-fast 的保证是成功调用返回精确文件集。它不额外承诺持久 manifest、目录级原子发布或进程崩溃后的自动恢复。中途失败可能留下部分输出；清理范围只能是本次调用拥有的文件，不得删除整个用户前缀。
+第一版 local 的保证是成功调用返回精确文件集。它不额外承诺持久 manifest、目录级原子发布或进程崩溃后的自动恢复。中途失败可能留下部分输出；清理范围只能是本次调用拥有的文件，不得删除整个用户前缀。
 
 如果本地 COPY 已完成但 Python 结果转换失败，也必须报告“已写入但结果不可用”，不能自动再次执行 relation。S3 单文件成功不等于整个批次成功。
 
@@ -291,11 +293,11 @@ Fileset 内容写入与现有远端元数据写入一样要求 auto-commit；明
 | `VALIDATED` | 参数、元数据、模式和计划校验完成，尚无输出 | 失败可修正配置后重新发起 |
 | `WRITING` | 可能已经生成部分文件 | task 级重试按现有 COPY 契约；不自动重新提交整个调用 |
 | `PUBLISHING` | Ray 正在发布 selected files 的结果 | 发布失败需分类，不能一概视为未写入 |
-| `COMMITTED` | Ray 发布成功，或 local-fast COPY 确认完成 | 返回精确结果；两种 backend 的持久恢复能力不同 |
+| `COMMITTED` | Ray 发布成功，或 local COPY 确认完成 | 返回精确结果；两种 backend 的持久恢复能力不同 |
 | `FAILED` | 已知执行未成功完成 | 返回原始原因和可用的运行标识；可能有残留文件 |
 | `UNKNOWN` | 无法确定发布是否成功 | 保留可能已发布的文件，抛出 outcome-unknown 错误 |
 
-复用 [CopyOutcomeUnknownError 与 CopyResultUnavailableError](vane/runners/copy_outcome.py) 的分类，不把它们包装成普通可重试网络错误。local-fast 的结果转换路径若缺少同等表达，应在通用 COPY 层补齐，而不是在 Gravitino helper 中捕获异常后重跑。
+复用 [CopyOutcomeUnknownError 与 CopyResultUnavailableError](vane/runners/copy_outcome.py) 的分类，不把它们包装成普通可重试网络错误。local 的结果转换路径若缺少同等表达，应在通用 COPY 层补齐，而不是在 Gravitino helper 中捕获异常后重跑。
 
 ### 8.4 读者看到什么
 
@@ -378,11 +380,11 @@ Gravitino 的 storage location 不能直接替代 Iceberg 表 metadata、snapsho
 
 ### 10.3 读取阶段
 
-先发布 local-fast 读取，再发布 Ray 读取。每个版本明确其支持矩阵，对未支持的表特性报错。
+先发布 local 读取，再发布 Ray 读取。每个版本明确其支持矩阵，对未支持的表特性报错。
 
 Ray 的 coordinator 解析表并固定 snapshot，生成可序列化 scan splits。workers 使用冻结的物理文件和扫描元数据，不自行取“最新 snapshot”。至少验证投影与过滤正确性、分区裁剪、schema evolution、空表，以及 delete file 的正确处理或显式拒绝；不能静默忽略删除记录。
 
-worker 的存储配置使用 Vane 已支持的显式路径。现有连接快照不运输 `CREATE SECRET` 对象，因此不能把“coordinator 能读”当作“Ray 能读”的证据。若选定 provider 必须让 worker 重新访问 REST 或依赖未运输的 secret，应先完成必要适配，或暂时只发布 local-fast。
+worker 的存储配置使用 Vane 已支持的显式路径。现有连接快照不运输 `CREATE SECRET` 对象，因此不能把“coordinator 能读”当作“Ray 能读”的证据。若选定 provider 必须让 worker 重新访问 REST 或依赖未运输的 secret，应先完成必要适配，或暂时只发布 local。
 
 ### 10.4 写入阶段
 
@@ -460,7 +462,7 @@ Gravitino `1.3.1` 应单独固定版本和镜像 digest 加入兼容性验证，
 
 所有用例使用非 editable 安装后的 base 与匹配的签名测试 provider；测试 provider 使用 CI 测试信任身份，不作为发布产物。测试按非 Ray、共享 Ray、自建多节点 Ray 分进程运行。
 
-以下测试记录来自以 `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` 为基线的开发工作区，包含未纳入本 PR 的其他本地改动。准备 Draft PR 时已将本功能单独整理并同步到 `f54912b6993d8c19c65e2d26e3965e5e24dcfb2e`，适配新的连接锁入口；历史测试记录不代表同步后提交已完整重跑。PR 提交的完整构建与运行验证以该提交的 CI 结果为准。
+以下测试记录来自以 `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` 为基线的开发工作区，包含未纳入本 PR 的其他本地改动。准备 Draft PR 时已将本功能单独整理并同步到 `f54912b6993d8c19c65e2d26e3965e5e24dcfb2e`，适配新的连接锁入口与原生本地 runner 名称；历史测试记录不代表同步后提交已完整重跑。PR 提交的完整构建与运行验证以该提交的 CI 结果为准。
 
 | 验证 | 结果与边界 |
 | --- | --- |
@@ -482,10 +484,10 @@ Gravitino `1.3.1` 应单独固定版本和镜像 digest 加入兼容性验证，
 | 阶段 | 交付物 | 依赖 | 退出条件与发布范围 |
 | --- | --- | --- | --- |
 | M0：固定契约 | 本设计、当前能力矩阵、输出绑定接口草案、故障用例清单 | 无 | 统一 Fileset 批次/结果语义；记录 Iceberg provider 尚待验证 |
-| M1：local-fast Fileset 写入（已完成） | 通用输出解析 hook、native COPY 结果通道、`write_files` 接口；本地/S3 Parquet/CSV | M0 | 写读闭环、READ_ONLY、事务、路径、空输入、rebind、结果错误及真实服务验证通过 |
+| M1：local Fileset 写入（已完成） | 通用输出解析 hook、native COPY 结果通道、`write_files` 接口；本地/S3 Parquet/CSV | M0 | 写读闭环、READ_ONLY、事务、路径、空输入、rebind、结果错误及真实服务验证通过 |
 | M2：Ray 与稳定 Fileset v1（已实现并专项验收） | 物理目标运输、selected files 结果、S3 写入、分区与并发、清理状态和故障恢复说明 | M1 | 当前 FTE 路径的正常执行、worker 丢失重试、发布未知、取消与不重复写测试通过；支持矩阵已固定；发布仍走独立 artifact 流程 |
 | M3：资源发现 | metalake catalog/schema/table 列表和详情；能力标识 | M0；不依赖新认证 | 不要求 FILESET attachment；名称、响应限制、错误类型与真实服务测试通过；只发布 metadata discovery |
-| M4：Iceberg provider 验证与本地读取 | 固定源码/ABI、真实 REST attach、local-fast 表扫描 | M0；M3 只提供发现便利 | provider 可发布、支持特性矩阵与负向测试完成；失败则独立排期适配 |
+| M4：Iceberg provider 验证与本地读取 | 固定源码/ABI、真实 REST attach、local 表扫描 | M0；M3 只提供发现便利 | provider 可发布、支持特性矩阵与负向测试完成；失败则独立排期适配 |
 | M5：Iceberg Ray 读取 | 固定 snapshot、可运输 splits、worker 数据访问 | M4 | 本地/Ray 结果一致，删除语义正确或明确拒绝，worker 无隐式 secret/REST 依赖 |
 | M6：Iceberg 写入 | 已有表 append，随后分别增加 CTAS 与其他 mutation | M5 与写入 provider 验证 | 并发冲突、selected attempts、catalog commit 未知、清理边界均通过 |
 | M7：按需求扩展 | 更多格式、存储、catalog connector 与认证能力 | 具体用户需求和独立设计 | 每项独立能力声明、测试与发布；不反向阻塞 M1–M6 |
@@ -495,7 +497,7 @@ Gravitino `1.3.1` 应单独固定版本和镜像 digest 加入兼容性验证，
 | PR | 范围 | 主要验收 |
 | --- | --- | --- |
 | A | 输出目标解析契约、默认物理文件系统实现、COPY 集成 | 普通 COPY 回归；规划无副作用 |
-| B | Gravitino 写入目标绑定、写权限/路径/rebind 校验 | local-fast 与序列化边界测试；危险模式提前拒绝 |
+| B | Gravitino 写入目标绑定、写权限/路径/rebind 校验 | local 与序列化边界测试；危险模式提前拒绝 |
 | C | COPY 结果通道、`FilesetWriteResult`、Python helper | 一次求值、精确清单、既有返回类型兼容 |
 | D | Ray 端到端与故障测试，必要的通用 COPY 适配 | worker 不调用 Gravitino；重试不产生结果重复 |
 | E | 真实服务与 S3 fixture、支持矩阵、使用示例 | 可安装 artifact 的完整写读闭环；Fileset v1 发布门槛 |

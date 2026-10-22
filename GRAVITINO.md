@@ -91,7 +91,7 @@ and a JSON string in `metadata`. The plural discovery functions return `name`
 with NULL `metadata`; loading details is explicit. `gravitino_files` returns
 the same columns as `list_files`, including a typed `FILE` column. Its
 `recursive` named argument defaults to false.
-On local-fast connections, prepared metadata queries and Fileset scans resolve
+On local connections, prepared metadata queries and Fileset scans resolve
 fresh remote metadata on every execution. Fileset scans also refresh glob
 matches; they do not reuse locations or file lists captured by an earlier
 `PREPARE` or `EXECUTE`.
@@ -118,12 +118,11 @@ are:
 
 | Runner | Absolute local / `file:` locations | Shared S3 locations |
 | --- | --- | --- |
-| `local-fast` | Supported | Supported |
+| `local` (`local-fast` alias) | Supported | Supported |
 | `ray` | Rejected before writing | Supported through the existing FTE COPY protocol |
-| `local` | Unsupported by this helper | Unsupported by this helper |
 
 Use a relation belonging to the catalog's connection. For local files, set
-`VANE_RUNNER=local-fast` before creating that connection:
+`VANE_RUNNER=local` before creating that connection:
 
 ```python
 result = catalog.write_files(
@@ -157,7 +156,7 @@ scan. Ray workers receive the frozen physical destination and storage settings,
 without the Gravitino attachment or bearer token. They do not resolve the
 Fileset again during task retries.
 
-There is no local-fast batch manifest or directory-level atomic publication;
+There is no local batch manifest or directory-level atomic publication;
 `run_id` and `manifest_path` are `None`. Readers that list the directory can see
 partial failed output. Read `result.files` to select a successful batch. Failures
 can leave files belonging to that invocation. A `CopyResultUnavailableError`
@@ -170,7 +169,7 @@ For Ray S3 writes, `run_id` and `manifest_path` identify the durable commit.
 `"complete"` or `"pending"`; `cleanup_warnings` retains the runner's diagnostics.
 After worker loss, the data can commit while teardown remains pending. Closing
 the connection can then report a cleanup error; retain the committed receipt
-and resolve cleanup separately instead of repeating the write. A local-fast
+and resolve cleanup separately instead of repeating the write. A local
 `"complete"` state does not add a durable manifest or atomic publication.
 Cleanup warnings do not turn a committed write into a failed write. If commit-marker publication
 or observation is inconclusive, the existing `CopyOutcomeUnknownError` retains
@@ -207,7 +206,7 @@ Native SQL COPY and the existing Parquet writer also accept GVFS directory
 destinations with `APPEND` plus `PER_THREAD_OUTPUT` or nonempty `PARTITION_BY`.
 Use `WRITE_PARTITION_COLUMNS` to preserve a readable empty partitioned output.
 Fixed-file output, overwrite, custom filenames and temporary-file publication are
-rejected before writing. Prepared local-fast COPY statements resolve fresh
+rejected before writing. Prepared local COPY statements resolve fresh
 Fileset metadata at every execution; EXPLAIN and PREPARE create no output.
 The existing Python writer return types are unchanged.
 

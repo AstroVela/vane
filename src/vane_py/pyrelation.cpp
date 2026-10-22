@@ -2554,8 +2554,8 @@ py::dict DuckDBPyRelation::WriteFileBatch(DuckDBPyConnection &connection, const 
 	auto interrupt_check = connection.CreateQueryInterruptCheck();
 	const auto runner = RunnerClientState::Get(*context);
 	const bool distributed = runner == "ray";
-	if (runner != "local-fast" && !distributed) {
-		throw NotImplementedException("File batch writes require a local-fast or ray connection");
+	if (runner != "local" && !distributed) {
+		throw NotImplementedException("File batch writes require a local or ray connection");
 	}
 	if (!context->transaction.IsAutoCommit()) {
 		throw TransactionException("File batch writes require auto-commit; output files cannot be rolled back");

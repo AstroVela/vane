@@ -211,6 +211,20 @@ def test_read_only_and_transaction_reject_batch(gravitino_connection, gravitino_
     assert set(directory.rglob("*")) == before
 
 
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_batch_supports_native_local_runner_aliases(gravitino_http, monkeypatch, runner):
+    _state, endpoint, directory = gravitino_http
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as connection:
+        load_gravitino(connection)
+        catalog = seed_fileset(connection, endpoint, directory)
+        relation = connection.sql("SELECT 7 AS n")
+        assert relation._get_runner_type() == "local"
+        result = catalog.write_files(relation, "clips", "demo", "native-runner")
+        assert result.rows_written == 1
+        assert connection.read_parquet(list(result.files)).fetchall() == [(7,)]
+
+
 def test_batch_rejects_a_different_connection(gravitino_connection, gravitino_http):
     _state, endpoint, directory = gravitino_http
     catalog = seed_fileset(gravitino_connection, endpoint, directory)

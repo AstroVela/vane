@@ -40,7 +40,7 @@ def _identifier(value: str) -> str:
 class FilesetWriteResult:
     """Exact outputs of one successful Fileset batch, without a row-order guarantee.
 
-    Ray S3 results refer to a committed manifest. A local-fast result does not
+    Ray S3 results refer to a committed manifest. A local result does not
     imply a durable manifest or atomic visibility to directory-listing readers.
     """
 
@@ -197,7 +197,7 @@ class GravitinoCatalog:
     ) -> FilesetWriteResult:
         """Write a new immutable batch and return its exact physical files.
 
-        Requires auto-commit and a writable attachment. Supports local-fast
+        Requires auto-commit and a writable attachment. Supports local
         and Ray with shared S3 storage. Each invocation creates a distinct batch;
         repeating a call does not deduplicate data. Partition columns remain
         in the files. CSV uses UTF-8, commas and a header.
