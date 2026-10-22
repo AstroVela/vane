@@ -205,6 +205,7 @@ class Server:
         self.file_identity: tuple[int, int] | None = None
         self.receiver: asyncio.Task[Any] | None = None
         self.pending: dict[bytes, asyncio.Queue[Any]] = {}
+        self.unpublished: dict[bytes, asyncio.Task[Any]] = {}
         self.peers: dict[bytes, stream.Peer] = {}
         self.buffers: set[str] = set()
 
@@ -279,14 +280,22 @@ class Server:
         if self.peers.get(identity) is peer:
             self._disconnect(identity)
 
-    def _disconnect(self, identity: bytes) -> None:
-        # Locally closing a STREAM pipe need not produce a disconnect event.
-        # Release the application slot now; any queued TCP chunks are ignored.
+    def _forget_peer(self, identity: bytes) -> None:
         peer = self.peers.pop(identity, None)
         if peer is not None:
             peer.decoder.buffer.clear()
             if peer.deadline is not None:
                 peer.deadline.cancel()
+        # Wake admission/publication waits immediately. The handler still owns
+        # cleanup, including a concurrent admission grant. Once a valid publish
+        # has arrived, leave the handler running so accepted inference drains.
+        task = self.unpublished.pop(identity, None)
+        if task is not None:
+            task.cancel()
+
+    def _disconnect(self, identity: bytes) -> None:
+        # Locally closing a STREAM pipe need not produce a disconnect event.
+        self._forget_peer(identity)
         with contextlib.suppress(Exception):
             sending = self.socket.send_multipart([identity, b""], flags=_zmq().DONTWAIT)
             sending.add_done_callback(lambda future: None if future.cancelled() else future.exception())
@@ -299,9 +308,7 @@ class Server:
             peer = self.peers.get(identity)
             if not data:
                 if peer is not None:
-                    self.peers.pop(identity)
-                    if peer.deadline is not None:
-                        peer.deadline.cancel()
+                    self._forget_peer(identity)
                 elif len(self.peers) >= self.owner.max_connections:
                     self._disconnect(identity)
                 else:
@@ -353,6 +360,10 @@ class Server:
                 if identity not in self.pending:
                     raise EmbeddingConfigurationError("Embedding request identity mismatch")
                 self.pending[identity].put_nowait(message)
+                if message == {"request_id": peer.request_id, "state": "published"}:
+                    # Commit before the handler resumes its publication wait:
+                    # EOF in the same receive batch must not cancel this work.
+                    self.unpublished.pop(identity, None)
                 return
             self.owner._hello(message)
             size = message["nbytes"]
@@ -363,6 +374,7 @@ class Server:
             if peer.deadline is not None:
                 peer.deadline.cancel()
             task = asyncio.create_task(self._handle(identity, message, size, queue))
+            self.unpublished[identity] = task
             self.owner._tasks.add(task)
             task.add_done_callback(partial(self._finished, identity=identity, queue=queue))
         except Exception as error:
@@ -379,6 +391,8 @@ class Server:
         # Do not remove a newer request that happens to reuse the routing identity.
         if self.pending.get(identity) is queue:
             self.pending.pop(identity)
+        if self.unpublished.get(identity) is task:
+            self.unpublished.pop(identity)
         if not task.cancelled():
             task.exception()
         peer = self.peers.get(identity)

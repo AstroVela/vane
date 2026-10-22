@@ -284,6 +284,153 @@ def test_disconnect_before_publication_releases_reservation(process):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("kind", ["text", "video"])
+@pytest.mark.parametrize("disconnect", ["eof", "protocol_rejection"])
+def test_unpublished_disconnect_unblocks_successor(tmp_path, monkeypatch, kind, disconnect):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    # Retain the default 30-second publication deadline: a short deadline would
+    # conceal a handler that never learns about the disconnect.
+    service = make_service(root, max_inflight=1, max_connections=1)
+
+    async def run():
+        await service.start()
+        peer, successor = RawClient(root), client(root, timeout=2)
+        try:
+            reserved = await peer.reserve(content("text", "") if kind == "text" else content("video", video()))
+            assert reserved["state"] == "reserved" and service.credits.inflight == 1
+            if disconnect == "eof":
+                peer.close()
+            else:
+                await peer.connection.send(b"invalid signed record")
+            await until(lambda: not service._zmq_server.peers, timeout=2)
+            np.testing.assert_equal(await successor.embed_text(["healthy successor"]), [[3, 4]])
+            assert len(sdk.calls) == 1
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert not service._zmq_server.pending and not service._zmq_server.buffers
+            if reserved["shm_name"] is not None:
+                with pytest.raises(FileNotFoundError), shm.attach(reserved["shm_name"], 96):
+                    pass
+        finally:
+            peer.close()
+            await successor.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("release_before_eof", [False, True])
+def test_disconnect_cancels_admission_wait_without_leaking_credits(tmp_path, monkeypatch, release_before_eof):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, max_inflight=1)
+
+    async def run():
+        await service.start()
+        peer = RawClient(root)
+        locked = False
+        try:
+            await service.credits.condition.acquire()
+            locked = True
+            await peer.send_reservation(content("video", video()))
+            await until(
+                lambda: any(
+                    getattr(task.get_coro(), "__qualname__", "") == "_Credits.acquire" for task in asyncio.all_tasks()
+                )
+            )
+            if release_before_eof:
+                # Race a newly available admission grant against client EOF.
+                service.credits.condition.release()
+                locked = False
+            peer.close()
+            await until(lambda: not service._tasks and not service._zmq_server.peers, timeout=2)
+            assert not sdk.calls and not service._zmq_server.pending
+            assert not service._zmq_server.buffers
+            assert service.credits.bytes == service.credits.inflight == 0
+            if locked:
+                service.credits.condition.release()
+                locked = False
+            successor = client(root, timeout=2)
+            try:
+                np.testing.assert_equal(await successor.embed_text(["healthy successor"]), [[3, 4]])
+            finally:
+                await successor.aclose()
+        finally:
+            if locked:
+                service.credits.condition.release()
+            peer.close()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pause_at", ["publication", "inference"])
+def test_disconnect_preserves_committed_publication_and_inference(tmp_path, monkeypatch, pause_at):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, max_inflight=1)
+
+    async def run():
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        async def infer(_):
+            if pause_at == "inference":
+                entered.set()
+                await resume.wait()
+            return [3, 4]
+
+        sdk.on_embedding = infer
+        await service.start()
+        server = service._zmq_server
+        handle = server._handle
+
+        async def pause_publication(identity, message, size, queue):
+            get = queue.get
+
+            async def paused_get():
+                publication = await get()
+                entered.set()
+                await resume.wait()
+                return publication
+
+            queue.get = paused_get
+            await handle(identity, message, size, queue)
+
+        if pause_at == "publication":
+            monkeypatch.setattr(server, "_handle", pause_publication)
+        peer = RawClient(root)
+        try:
+            value = video()
+            reserved = await peer.reserve(content("video", value))
+            name = reserved["shm_name"]
+            with shm.attach(name, 96) as memory:
+                memory[:] = b"".join(frame.tobytes() for frame in value.frames)
+            await peer.publish()
+            await asyncio.wait_for(entered.wait(), 2)
+            peer.close()
+            await until(lambda: not server.peers, timeout=2)
+            await asyncio.sleep(0)
+            assert service.credits.bytes == 192 and service.credits.inflight == 1
+            assert server.buffers == {name}
+            assert len(sdk.calls) == (1 if pause_at == "inference" else 0)
+            resume.set()
+            await until(lambda: not service._tasks, timeout=2)
+            assert service.metrics["completed"] == 1 and len(sdk.calls) == 1
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert not server.pending and not server.buffers
+            with pytest.raises(FileNotFoundError), shm.attach(name, 96):
+                pass
+        finally:
+            resume.set()
+            peer.close()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("bad", ["size", "offset", "dtype", "shape", "timeline"])
 def test_wire_bounds_rejected_before_mapping(bad):
     spec = ipc.input_spec({})
