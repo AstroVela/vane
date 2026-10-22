@@ -39,6 +39,11 @@ class _CopyError(RuntimeError):
 class CopyResultUnavailableError(_CopyError):
     """A COPY committed, but the runner could not return its result."""
 
+    # Present when the writing backend supplies recovery identifiers.
+    base_path: str
+    run_id: str | None
+    manifest_path: str | None
+
     def __init__(
         self,
         operation_id: str,
