@@ -367,11 +367,12 @@ def test_disconnect_cancels_admission_wait_without_leaking_credits(tmp_path, mon
 
 
 @pytest.mark.parametrize("pause_at", ["publication", "inference"])
-def test_disconnect_preserves_committed_publication_and_inference(tmp_path, monkeypatch, pause_at):
+@pytest.mark.parametrize("interruption", ["eof", "handler_cancel", "shutdown", "timeout"])
+def test_committed_publication_and_inference_keep_resources(tmp_path, monkeypatch, pause_at, interruption):
     sdk = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
-    service = make_service(root, max_inflight=1)
+    service = make_service(root, max_inflight=1, **({"publication_timeout": 0.2} if interruption == "timeout" else {}))
 
     async def run():
         entered, resume = asyncio.Event(), asyncio.Event()
@@ -402,6 +403,7 @@ def test_disconnect_preserves_committed_publication_and_inference(tmp_path, monk
         if pause_at == "publication":
             monkeypatch.setattr(server, "_handle", pause_publication)
         peer = RawClient(root)
+        closing = None
         try:
             value = video()
             reserved = await peer.reserve(content("video", value))
@@ -410,14 +412,28 @@ def test_disconnect_preserves_committed_publication_and_inference(tmp_path, monk
                 memory[:] = b"".join(frame.tobytes() for frame in value.frames)
             await peer.publish()
             await asyncio.wait_for(entered.wait(), 2)
-            peer.close()
-            await until(lambda: not server.peers, timeout=2)
-            await asyncio.sleep(0)
+            if interruption == "eof":
+                peer.close()
+                await until(lambda: not server.peers, timeout=2)
+            elif interruption == "handler_cancel":
+                handler = next(iter(service._tasks))
+                for _ in range(3):
+                    handler.cancel()
+                    await asyncio.sleep(0)
+            elif interruption == "shutdown":
+                closing = asyncio.create_task(service.aclose())
+                await until(lambda: server.receiver is None, timeout=2)
+                assert not closing.done()
+            else:
+                await asyncio.sleep(0.3)
             assert service.credits.bytes == 192 and service.credits.inflight == 1
             assert server.buffers == {name}
             assert len(sdk.calls) == (1 if pause_at == "inference" else 0)
             resume.set()
-            await until(lambda: not service._tasks, timeout=2)
+            if closing is not None:
+                await asyncio.wait_for(closing, 2)
+            else:
+                await until(lambda: not service._tasks, timeout=2)
             assert service.metrics["completed"] == 1 and len(sdk.calls) == 1
             assert service.credits.bytes == service.credits.inflight == 0
             assert not server.pending and not server.buffers
@@ -425,6 +441,141 @@ def test_disconnect_preserves_committed_publication_and_inference(tmp_path, monk
                 pass
         finally:
             resume.set()
+            peer.close()
+            if closing is not None:
+                await closing
+            else:
+                await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["text", "video"])
+@pytest.mark.parametrize("interruption", ["handler_cancel", "shutdown"])
+def test_cancellation_at_publication_commit_runs_inference_once(tmp_path, monkeypatch, kind, interruption):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, max_inflight=1)
+
+    async def run():
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        async def infer(_):
+            entered.set()
+            await resume.wait()
+            return [3, 4]
+
+        sdk.on_embedding = infer
+        await service.start()
+        server = service._zmq_server
+        message = server._message
+        closing = None
+
+        async def cancel_at_commit(identity, remote, value):
+            nonlocal closing
+            await message(identity, remote, value)
+            if value == {"request_id": remote.request_id, "state": "published"}:
+                # Do not yield after enqueueing: the real queue consumer has
+                # not resumed yet, even though the publication has committed.
+                if interruption == "handler_cancel":
+                    next(iter(service._tasks)).cancel()
+                else:
+                    closing = asyncio.create_task(service.aclose())
+
+        monkeypatch.setattr(server, "_message", cancel_at_commit)
+        peer = RawClient(root)
+        try:
+            value = video()
+            reserved = await peer.reserve(content("text", "") if kind == "text" else content("video", value))
+            name = reserved["shm_name"]
+            if name is not None:
+                with shm.attach(name, 96) as memory:
+                    memory[:] = b"".join(frame.tobytes() for frame in value.frames)
+            await peer.publish()
+            await asyncio.wait_for(entered.wait(), 2)
+            handler = next(iter(service._tasks))
+            for _ in range(3):
+                handler.cancel()
+                await asyncio.sleep(0)
+            assert service.credits.inflight == 1
+            assert service.credits.bytes == (1 if kind == "text" else 192)
+            assert len(sdk.calls) == 1 and service.metrics["completed"] == 0
+            if name is not None:
+                assert server.buffers == {name}
+            resume.set()
+            if closing is not None:
+                await asyncio.wait_for(closing, 2)
+            else:
+                await until(lambda: not service._tasks, timeout=2)
+            assert len(sdk.calls) == service.metrics["completed"] == 1
+            assert service.credits.bytes == service.credits.inflight == 0
+            assert not server.pending and not server.buffers
+            if name is not None:
+                with pytest.raises(FileNotFoundError), shm.attach(name, 96):
+                    pass
+        finally:
+            resume.set()
+            peer.close()
+            if closing is not None:
+                await closing
+            else:
+                await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["admission", "cleanup"])
+def test_publication_outside_reservation_wait_is_rejected(tmp_path, monkeypatch, phase):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, max_inflight=1)
+
+    async def run():
+        cancelled = asyncio.Event()
+        await service.start()
+        server = service._zmq_server
+        handle = server._handle
+
+        async def observe_publication_wait(identity, message, size, queue):
+            get = queue.get
+
+            async def observed_get():
+                try:
+                    return await get()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            queue.get = observed_get
+            await handle(identity, message, size, queue)
+
+        monkeypatch.setattr(server, "_handle", observe_publication_wait)
+        peer = RawClient(root)
+        locked = False
+        try:
+            if phase == "cleanup":
+                assert (await peer.reserve(content("video", video())))["state"] == "reserved"
+            await service.credits.condition.acquire()
+            locked = True
+            if phase == "admission":
+                await peer.send_reservation(content("video", video()))
+                await until(lambda: bool(service._tasks), timeout=2)
+            else:
+                next(iter(service._tasks)).cancel()
+                await asyncio.wait_for(cancelled.wait(), 2)
+            await peer.publish()
+            assert (await asyncio.wait_for(peer.receive(), 2))["error"] == "configuration"
+            peer.close()
+            service.credits.condition.release()
+            locked = False
+            await until(lambda: not service._tasks, timeout=2)
+            assert not sdk.calls and not server.pending and not server.buffers
+            assert service.credits.bytes == service.credits.inflight == 0
+        finally:
+            if locked:
+                service.credits.condition.release()
             peer.close()
             await service.aclose()
 

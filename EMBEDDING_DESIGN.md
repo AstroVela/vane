@@ -691,10 +691,12 @@ No cleanup can reclaim a Windows block still held by another live process.
 `publication_timeout` bounds unfinished authentication, the initial control
 request, admission waiting and the subsequent wait for publication from stalled
 clients. Disconnects before a complete valid publication abort those waits and
-release any reservation without waiting for that deadline. A received publication
-remains committed even if EOF arrives before the handler resumes it. Accepted
-requests drain their model coroutine before releasing buffers and credits, even
-after client timeout or repeated handler cancellation. A stuck model retains
+release any reservation without waiting for that deadline. Once a complete valid
+publication commits, its queue handoff and inference drain even if EOF, repeated
+handler cancellation, shutdown or the publication deadline occurs before the
+handler resumes. Publication is accepted only while the reservation is ready;
+starting abort cleanup closes that gate before yielding. Accepted requests retain
+their buffers and credits until the model coroutine finishes. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
 `max_connections` bounds tracked peers and waiting metadata; byte and in-flight

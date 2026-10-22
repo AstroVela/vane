@@ -22,6 +22,7 @@ import secrets
 import stat
 import time
 import uuid
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,13 @@ async def _drain(task: asyncio.Task[Any]) -> None:
             break
 
 
+@dataclass
+class _Publication:
+    queue: asyncio.Queue[Any] = field(default_factory=lambda: asyncio.Queue(maxsize=1))
+    accepting: bool = False
+    committed: bool = False
+
+
 class Client:
     def __init__(self, owner: Any):
         self.owner = owner
@@ -204,7 +212,7 @@ class Server:
         self.file_fd: int | None = None
         self.file_identity: tuple[int, int] | None = None
         self.receiver: asyncio.Task[Any] | None = None
-        self.pending: dict[bytes, asyncio.Queue[Any]] = {}
+        self.pending: dict[bytes, _Publication] = {}
         self.unpublished: dict[bytes, asyncio.Task[Any]] = {}
         self.peers: dict[bytes, stream.Peer] = {}
         self.buffers: set[str] = set()
@@ -357,20 +365,22 @@ class Server:
             if message.get("request_id") != peer.request_id:
                 raise EmbeddingConfigurationError("Embedding request identity mismatch")
             if peer.messages == 2:
-                if identity not in self.pending:
+                publication = self.pending.get(identity)
+                if publication is None or not publication.accepting:
                     raise EmbeddingConfigurationError("Embedding request identity mismatch")
-                self.pending[identity].put_nowait(message)
+                publication.queue.put_nowait(message)
                 if message == {"request_id": peer.request_id, "state": "published"}:
                     # Commit before the handler resumes its publication wait:
-                    # EOF in the same receive batch must not cancel this work.
+                    # neither EOF nor handler cancellation may discard it.
+                    publication.committed = True
                     self.unpublished.pop(identity, None)
                 return
             self.owner._hello(message)
             size = message["nbytes"]
             if len(self.pending) >= self.owner.max_connections:
                 raise MemoryError("Embedding service request limit")
-            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
-            self.pending[identity] = queue
+            publication = self.pending[identity] = _Publication()
+            queue = publication.queue
             if peer.deadline is not None:
                 peer.deadline.cancel()
             task = asyncio.create_task(self._handle(identity, message, size, queue))
@@ -389,7 +399,8 @@ class Server:
         self.owner._tasks.discard(task)
         # A task cancelled before its first step never enters _handle's finally.
         # Do not remove a newer request that happens to reuse the routing identity.
-        if self.pending.get(identity) is queue:
+        publication = self.pending.get(identity)
+        if publication is not None and publication.queue is queue:
             self.pending.pop(identity)
         if self.unpublished.get(identity) is task:
             self.unpublished.pop(identity)
@@ -401,6 +412,7 @@ class Server:
 
     async def _handle(self, identity: bytes, message: dict[str, Any], size: int, queue: asyncio.Queue[Any]) -> None:
         owner = self.owner
+        publication = self.pending[identity]
         reserved = False
         memory: Any = None
         content: Any = None
@@ -421,16 +433,35 @@ class Server:
             if size:
                 memory = shm.create(size)
                 self.buffers.add(memory.name)
-            await self._send(
-                identity,
-                {
-                    "request_id": message["request_id"],
-                    "state": "reserved",
-                    "shm_name": memory.name if memory is not None else None,
-                    "nbytes": size,
-                },
-            )
-            published = await asyncio.wait_for(queue.get(), owner.publication_timeout)
+            receiving = asyncio.create_task(queue.get())
+            publication.accepting = True
+            try:
+                try:
+                    await self._send(
+                        identity,
+                        {
+                            "request_id": message["request_id"],
+                            "state": "reserved",
+                            "shm_name": memory.name if memory is not None else None,
+                            "nbytes": size,
+                        },
+                    )
+                    await asyncio.wait_for(asyncio.shield(receiving), owner.publication_timeout)
+                except (Exception, asyncio.CancelledError):
+                    if not publication.committed:
+                        raise
+                    # A full publication owns the reservation even before get()
+                    # returns. Shield its handoff from cancellation and timeout,
+                    # then proceed to the inference drain without another await.
+                    await _drain(receiving)
+                published = receiving.result()
+            finally:
+                # Close the commit gate before yielding during abort cleanup.
+                # Otherwise a late publication could commit cancelled work.
+                publication.accepting = False
+                if not receiving.done():
+                    receiving.cancel()
+                await _drain(receiving)
             if published != {"request_id": message["request_id"], "state": "published"}:
                 raise EmbeddingConfigurationError("Invalid embedding publication")
             snapshot = bytearray(memory.buf[:size]) if memory is not None else None
