@@ -684,6 +684,10 @@ The server owns each block through request completion. Clients attach without
 resource-tracker ownership, so an independently launched client exiting cannot
 unlink the server's block. Python 3.13+ uses `track=False`; older supported POSIX
 versions attach directly to the existing mapping without registering a tracker.
+Both attachment paths validate Darwin's allocation against the requested length
+rounded up to `mmap.PAGESIZE`, while retaining exact lengths on Linux and the
+existing allocation-granularity allowance on Windows. Clients can access only
+the logical input bytes; page padding is never published as input.
 Windows releases a block when its last handle closes. POSIX service allocations
 remain registered with Python's resource tracker for cleanup after owner death.
 No cleanup can reclaim a Windows block still held by another live process.

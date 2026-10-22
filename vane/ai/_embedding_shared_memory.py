@@ -15,6 +15,16 @@ from typing import Any, Iterator
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
 
+def _validate_allocation_size(actual: int, size: int) -> None:
+    expected = size
+    if sys.platform == "darwin":
+        expected = ((size + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+    # Darwin rounds to pages; Windows may expose a larger mapped region.
+    # Other POSIX hosts retain the exact logical length in the shared object.
+    if actual < expected or (os.name != "nt" and actual != expected):
+        raise EmbeddingConfigurationError("Embedding shared memory size mismatch")
+
+
 @contextlib.contextmanager
 def attach(name: str, size: int) -> Iterator[Any]:
     """Borrow a mapping without letting the client's tracker unlink the owner.
@@ -28,8 +38,7 @@ def attach(name: str, size: int) -> Iterator[Any]:
         posix = shared_memory._posixshmem  # type: ignore[attr-defined]
         fd = posix.shm_open("/" + name, os.O_RDWR, mode=0o600)
         try:
-            if os.fstat(fd).st_size != size:
-                raise EmbeddingConfigurationError("Embedding shared memory size mismatch")
+            _validate_allocation_size(os.fstat(fd).st_size, size)
             mapping = mmap.mmap(fd, size)
         finally:
             os.close(fd)
@@ -41,9 +50,7 @@ def attach(name: str, size: int) -> Iterator[Any]:
     options = {"track": False} if sys.version_info >= (3, 13) else {}
     memory = shared_memory.SharedMemory(name=name, **options)
     try:
-        # Windows rounds the mapping size up to allocation granularity.
-        if memory.size < size or os.name != "nt" and memory.size != size:
-            raise EmbeddingConfigurationError("Embedding shared memory size mismatch")
+        _validate_allocation_size(memory.size, size)
         buffer = memory.buf
         assert buffer is not None
         with buffer[:size] as view:

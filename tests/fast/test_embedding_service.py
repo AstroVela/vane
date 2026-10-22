@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mmap
 import os
 import pickle
 import subprocess
@@ -1354,8 +1355,119 @@ def test_borrowed_mapping_exposes_only_requested_bytes(monkeypatch):
         with shm.attach(memory.name, 16) as borrowed:
             assert len(borrowed) == 16
             borrowed[:] = b"x" * 16
-        assert bytes(memory.buf[:16]) == b"x" * 16
-        assert bytes(memory.buf[16:]) == bytes(4096 - 16)
+        data = bytes(memory.buf)
+        assert data[:16] == b"x" * 16
+        assert data[16:] == bytes(memory.size - 16)
+    finally:
+        shm.release(memory)
+
+
+@pytest.mark.parametrize(
+    "size", sorted({1, 9, 16, 4095, 4096, mmap.PAGESIZE - 1, mmap.PAGESIZE, mmap.PAGESIZE + 1, 2 * mmap.PAGESIZE + 1})
+)
+def test_shared_memory_page_boundary_round_trip(size):
+    memory = shm.create(size)
+    try:
+        with shm.attach(memory.name, size) as writer:
+            assert len(writer) == size
+            writer[:] = b"x" * size
+        data = bytes(memory.buf)
+        assert data[:size] == b"x" * size
+        assert data[size:] == bytes(memory.size - size)
+        with shm.attach(memory.name, size) as reader:
+            assert len(reader) == size
+            assert bytes(reader[:]) == b"x" * size
+    finally:
+        shm.release(memory)
+
+
+@pytest.fixture(params=["fd", "track_false"])
+def posix_attachment_path(request, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX shared-memory attachment branches")
+    shared_memory = shm.shared_memory.SharedMemory
+    attached = []
+
+    def attach_existing(*, name, track):
+        assert track is False
+        options = {"track": False} if sys.version_info >= (3, 13) else {}
+        memory = shared_memory(name=name, **options)
+        attached.append(memory)
+        return memory
+
+    def activate():
+        # Keep allocation native to the host, then exercise both attachment
+        # paths even when the interpreter does not provide track=False.
+        monkeypatch.setattr(
+            shm,
+            "shared_memory",
+            SimpleNamespace(
+                _posixshmem=shm.shared_memory._posixshmem,
+                SharedMemory=attach_existing,
+            ),
+        )
+        monkeypatch.setattr(
+            shm,
+            "sys",
+            SimpleNamespace(
+                platform="darwin",
+                version_info=(3, 12) if request.param == "fd" else (3, 13),
+            ),
+        )
+        monkeypatch.setattr(shm, "mmap", SimpleNamespace(PAGESIZE=16384, mmap=mmap.mmap))
+
+    yield activate
+    for memory in attached:
+        assert memory.buf is None
+
+
+@pytest.mark.parametrize(
+    "size,allocation",
+    [
+        (1, 16384),
+        (9, 16384),
+        (16, 16384),
+        (4095, 16384),
+        (4096, 16384),
+        (16383, 16384),
+        (16384, 16384),
+        (16385, 32768),
+        (32769, 49152),
+    ],
+)
+def test_darwin_shared_memory_rounding(size, allocation, posix_attachment_path):
+    memory = shm.create(allocation)
+    try:
+        posix_attachment_path()
+        with shm.attach(memory.name, size) as writer:
+            assert len(writer) == size
+            writer[:] = b"x" * size
+        data = bytes(memory.buf)
+        assert data[:size] == b"x" * size
+        assert data[size:] == bytes(memory.size - size)
+    finally:
+        shm.release(memory)
+
+
+@pytest.mark.parametrize(
+    "platform,size,allocation",
+    [
+        ("darwin", 16385, 16384),
+        ("darwin", 9, 32768),
+        ("linux", 16385, 16384),
+        ("linux", 9, 16384),
+    ],
+)
+def test_shared_memory_rejects_unexpected_allocation(platform, size, allocation, posix_attachment_path, monkeypatch):
+    memory = shm.create(allocation)
+    try:
+        posix_attachment_path()
+        monkeypatch.setattr(shm.sys, "platform", platform)
+        with (
+            pytest.raises(EmbeddingConfigurationError, match="shared memory size mismatch"),
+            shm.attach(memory.name, size),
+        ):
+            pytest.fail("Invalid allocation was exposed to the producer")
     finally:
         shm.release(memory)
 
