@@ -704,7 +704,10 @@ void RadixPartitionedHashTable::Finalize(ClientContext &context, GlobalSinkState
 			gstate.max_partition_size = MaxValue(gstate.max_partition_size, partition_size);
 
 			gstate.partitions.emplace_back(make_uniq<AggregatePartition>(std::move(partition)));
-			if (single_ht) {
+			// A distributed partial aggregate exports every locally reduced state.
+			// Its downstream merge owns deduplication, including duplicate groups
+			// from abandoned hash tables, native threads and spilled partitions.
+			if (single_ht || op.emit_partial_states) {
 				gstate.finalize_done++;
 				gstate.partitions.back()->progress = 1;
 				gstate.partitions.back()->state = AggregatePartitionState::READY_TO_SCAN;

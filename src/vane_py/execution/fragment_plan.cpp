@@ -1874,6 +1874,9 @@ private:
 			output.push_back(make_uniq<BoundReferenceExpression>(aggregate.return_type, column));
 		}
 		auto &partial = MakeAggregate(Copy(groups), std::move(partials));
+		if (partial.type == PhysicalOperatorType::HASH_GROUP_BY) {
+			partial.Cast<PhysicalHashAggregate>().SetPartialStateOutput();
+		}
 		Wrap(partial, child);
 		child = Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);
 		auto &final = MakeAggregate(std::move(final_groups), std::move(finals));

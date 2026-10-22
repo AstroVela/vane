@@ -198,6 +198,43 @@ def test_partial_aggregates_exchange_native_states(expressions):
         assert execute_graph(connection, graph) == expected
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("external", [False, True])
+def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path, threads, external):
+    spill = tmp_path / "spill"
+    config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
+    source = (
+        "select range i, case when range%32771=0 then null "
+        "else 'owned-partial-key-' || (range%32771)::varchar end k, "
+        "case when range%7=0 then null else range%31-15 end v from range(131099)"
+    )
+    aggregates = "sum(v), count(v), sum(v) filter(where i%3=0), count(*) filter(where false)"
+    sql = f"select k, {aggregates} from ({source}) group by k"
+    with vane.connect(backend="local", config=config) as connection:
+        expected = connection.execute(sql).fetchall()
+        # EXPORT_STATE in ordinary SQL must still emit one row per group.
+        exported = connection.execute(f"select k, sum(v) export_state from ({source}) group by k").fetchall()
+        assert len(exported) == len(expected)
+        if external:
+            connection.execute("set debug_force_external=true")
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        assignments = {source.source_id: [split.split_id for split in source.splits] for source in producer.sources}
+        partials = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
+        assert set(row[0] for row in partials) == set(row[0] for row in expected)
+        if threads > 1:
+            assert len(partials) > len(expected)
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        # Transport/reordering and repeated executions cannot treat each partial
+        # as a complete group, retain input state pointers, or consume the input.
+        for rows in (partials, list(reversed(partials))):
+            actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            assert Counter(actual) == Counter(expected)
+        assert connection.execute("select 42").fetchall() == [(42,)]
+    assert not list(spill.glob("*"))
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("nulls", ["none", "mixed", "all"])
 @pytest.mark.parametrize("threads", [1, 2, 4])
