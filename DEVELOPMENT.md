@@ -56,8 +56,10 @@ support to an existing serving protocol. Python-only output typing requires a
 noneditable package reinstall, without a native rebuild.
 For the persistent native service, see its
 [configuration and ownership contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
-Run `tests/fast/test_embedding_service.py`, `tests/fast/test_native_multimodal.py`
-and the affected unified/HTTP embedding tests through the installed launcher.
+Run `tests/fast/test_embedding_service.py`,
+`tests/fast/test_embedding_service_transport.py`,
+`tests/fast/test_native_multimodal.py` and the affected unified/HTTP embedding
+tests through the installed launcher.
 The service tests use real loopback PyZMQ sockets, Python SharedMemory and
 subprocesses with CPU SDK fixtures. Install the `embedding_service` extra for
 these tests; the development `test` group also includes it. The service transport

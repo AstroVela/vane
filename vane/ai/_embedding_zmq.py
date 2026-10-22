@@ -30,10 +30,11 @@ import numpy as np
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai import _embedding_shared_memory as shm
+from vane.ai import _embedding_stream as stream
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._errors import _is_resource_error
 
-PROTOCOL = "vane-embedding-zmq-1"
+PROTOCOL = "vane-embedding-stream-2"
 MAX_ENDPOINT_BYTES = 4096
 
 
@@ -80,18 +81,19 @@ def _read_endpoint(path: str) -> tuple[str, bytes]:
     return endpoint, bytes.fromhex(key)
 
 
-def _pack(message: Any, key: bytes, direction: bytes) -> list[bytes]:
+def _pack(message: Any, key: bytes, direction: bytes) -> bytes:
     body = ipc.encode(message)
-    return [body, hmac.digest(key, direction + body, hashlib.sha256)]
+    return body + hmac.digest(key, direction + body, hashlib.sha256)
 
 
-def _unpack(frames: list[bytes], key: bytes, direction: bytes) -> Any:
-    if len(frames) != 2 or not 0 < len(frames[0]) <= ipc.MAX_CONTROL_BYTES or len(frames[1]) != 32:
+def _unpack(record: bytes, key: bytes, direction: bytes) -> Any:
+    if not 32 < len(record) <= stream.MAX_RECORD_BYTES:
         raise EmbeddingConfigurationError("Invalid embedding control message")
-    if not hmac.compare_digest(frames[1], hmac.digest(key, direction + frames[0], hashlib.sha256)):
+    body, signature = record[:-32], record[-32:]
+    if not hmac.compare_digest(signature, hmac.digest(key, direction + body, hashlib.sha256)):
         raise EmbeddingConfigurationError("Embedding service authentication failed")
     try:
-        return json.loads(frames[0])
+        return json.loads(body)
     except (ValueError, UnicodeError):
         raise EmbeddingConfigurationError("Invalid embedding control JSON") from None
 
@@ -101,9 +103,12 @@ def _socket(context: Any, kind: Any) -> Any:
     sock = context.socket(kind)
     try:
         sock.setsockopt(zmq.LINGER, 0)
-        sock.setsockopt(zmq.MAXMSGSIZE, ipc.MAX_CONTROL_BYTES)
         sock.setsockopt(zmq.SNDHWM, 8)
         sock.setsockopt(zmq.RCVHWM, 8)
+        # Disabling reconnect destroys STREAM's pipe before its EOF notification
+        # reaches the client. Keep it alive for notification; Connection.receive
+        # fails on EOF and request() closes the socket without replaying input.
+        sock.setsockopt(zmq.RECONNECT_IVL, 60_000)
         return sock
     except BaseException:
         sock.close(linger=0)
@@ -136,15 +141,18 @@ class Client:
         parts, arrays, size = plan
         endpoint, key = _read_endpoint(self.owner.options["service_path"])
         zmq = _zmq()
-        sock = _socket(self.context, zmq.DEALER)
+        sock = _socket(self.context, zmq.STREAM)
         request_id = uuid.uuid4().hex
         self.sockets.add(sock)
         started = time.monotonic()
         try:
-            sock.setsockopt(zmq.IDENTITY, request_id.encode("ascii"))
             sock.connect(endpoint)
-            await sock.send_multipart(_pack(self.owner._reservation(parts, size, request_id), key, b"request"))
-            response = _unpack(await sock.recv_multipart(), key, b"response")
+            connection = stream.Connection(sock, key, request_id)
+            await connection.authenticate()
+            assert connection.key is not None
+            key = connection.key
+            await connection.send(_pack(self.owner._reservation(parts, size, request_id), key, b"request"))
+            response = _unpack(await connection.receive(), key, b"response")
             self.owner._check_response(response, request_id)
             if response.get("state") != "reserved" or response.get("nbytes") != size:
                 raise EmbeddingConfigurationError("Embedding service did not reserve the input")
@@ -167,8 +175,8 @@ class Client:
                         offset += value.nbytes
             self.owner.metrics["copy_seconds"] += time.monotonic() - copied
             self.owner.metrics["input_bytes"] += size
-            await sock.send_multipart(_pack({"request_id": request_id, "state": "published"}, key, b"request"))
-            response = _unpack(await sock.recv_multipart(), key, b"response")
+            await connection.send(_pack({"request_id": request_id, "state": "published"}, key, b"request"))
+            response = _unpack(await connection.receive(), key, b"response")
             self.owner._check_response(response, request_id)
             if response.get("state") != "released":
                 raise EmbeddingConfigurationError("Embedding service omitted consumption acknowledgement")
@@ -197,6 +205,7 @@ class Server:
         self.file_identity: tuple[int, int] | None = None
         self.receiver: asyncio.Task[Any] | None = None
         self.pending: dict[bytes, asyncio.Queue[Any]] = {}
+        self.peers: dict[bytes, stream.Peer] = {}
         self.buffers: set[str] = set()
 
     def prepare(self) -> None:
@@ -208,8 +217,7 @@ class Server:
         self.file_identity = (info.st_dev, info.st_ino)
         zmq = _zmq()
         self.context = zmq.asyncio.Context()
-        self.socket = _socket(self.context, zmq.ROUTER)
-        self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self.socket = _socket(self.context, zmq.STREAM)
         port = self.socket.bind_to_random_port("tcp://127.0.0.1")
         self.endpoint = f"tcp://127.0.0.1:{port}"
 
@@ -231,8 +239,12 @@ class Server:
             task.cancel()
         for task in tasks:
             await _drain(task)
+        for peer in self.peers.values():
+            if peer.deadline is not None:
+                peer.deadline.cancel()
+        self.peers.clear()
         if self.socket is not None:
-            self.socket.close(linger=0)
+            self.socket.close(linger=250)
             self.socket = None
         if self.context is not None:
             self.context.term()
@@ -247,44 +259,119 @@ class Server:
                     os.unlink(self.owner.path)
             self.file_identity = None
 
+    async def _send_bytes(self, identity: bytes, body: bytes) -> None:
+        await self.socket.send_multipart([identity, stream.record(body)], flags=_zmq().DONTWAIT)
+
     async def _send(self, identity: bytes, message: Any) -> None:
-        # Nonblocking ROUTER send prevents an absent/slow client from retaining
-        # buffers or blocking the service dispatcher and other clients.
-        await self.socket.send_multipart([identity, *_pack(message, self.key, b"response")], flags=_zmq().DONTWAIT)
+        peer = self.peers.get(identity)
+        if peer is None or peer.key is None:
+            raise ConnectionError("Embedding service client disconnected")
+        await self._send_bytes(identity, _pack(message, peer.key, b"response"))
+
+    def _deadline(self, identity: bytes, peer: stream.Peer) -> None:
+        if peer.deadline is not None:
+            peer.deadline.cancel()
+        peer.deadline = asyncio.get_running_loop().call_later(
+            self.owner.publication_timeout, self._expire, identity, peer
+        )
+
+    def _expire(self, identity: bytes, peer: stream.Peer) -> None:
+        if self.peers.get(identity) is peer:
+            self._disconnect(identity)
+
+    def _disconnect(self, identity: bytes) -> None:
+        # Locally closing a STREAM pipe need not produce a disconnect event.
+        # Release the application slot now; any queued TCP chunks are ignored.
+        peer = self.peers.pop(identity, None)
+        if peer is not None:
+            peer.decoder.buffer.clear()
+            if peer.deadline is not None:
+                peer.deadline.cancel()
+        with contextlib.suppress(Exception):
+            sending = self.socket.send_multipart([identity, b""], flags=_zmq().DONTWAIT)
+            sending.add_done_callback(lambda future: None if future.cancelled() else future.exception())
 
     async def _receive(self) -> None:
         while True:
-            frames = await self.socket.recv_multipart()
-            if len(frames) != 3 or not re.fullmatch(b"[0-9a-f]{32}", frames[0]):
+            # STREAM creates this fixed pair itself; TCP peers cannot supply a
+            # ZMTP multipart envelope or make libzmq accumulate one atomically.
+            identity, data = await self.socket.recv_multipart()
+            peer = self.peers.get(identity)
+            if not data:
+                if peer is not None:
+                    self.peers.pop(identity)
+                    if peer.deadline is not None:
+                        peer.deadline.cancel()
+                elif len(self.peers) >= self.owner.max_connections:
+                    self._disconnect(identity)
+                else:
+                    peer = self.peers[identity] = stream.Peer()
+                    self._deadline(identity, peer)
+                    try:
+                        await self._send_bytes(identity, peer.challenge)
+                    except Exception:
+                        self._disconnect(identity)
                 continue
-            identity = frames[0]
+            if peer is None:
+                continue
             try:
-                message = _unpack(frames[1:], self.key, b"request")
-                if not isinstance(message, dict) or message.get("request_id") != identity.decode("ascii"):
+                for body in peer.decoder.feed(data):
+                    if peer.key is None:
+                        if len(body) != stream.AUTH_BYTES:
+                            raise EmbeddingConfigurationError("Invalid embedding authentication proof")
+                        nonce, signature = body[:32], body[32:]
+                        if not re.fullmatch(b"[0-9a-f]{32}", nonce) or not hmac.compare_digest(
+                            signature, stream.proof(self.key, b"client", peer.challenge, nonce)
+                        ):
+                            raise EmbeddingConfigurationError("Embedding service authentication failed")
+                        await self._send_bytes(identity, stream.proof(self.key, b"server", peer.challenge, nonce))
+                        peer.key = stream.proof(self.key, b"session", peer.challenge, nonce)
+                        peer.request_id = nonce.decode("ascii")
+                        peer.decoder.limit = stream.MAX_RECORD_BYTES
+                        self._deadline(identity, peer)
+                    else:
+                        peer.messages += 1
+                        if peer.messages > 2:
+                            raise EmbeddingConfigurationError("Unexpected embedding control record")
+                        await self._message(identity, peer, _unpack(body, peer.key, b"request"))
+            except Exception as error:
+                if peer.key is not None and _is_resource_error(error):
+                    with contextlib.suppress(Exception):
+                        await self._send(identity, {"request_id": peer.request_id, "error": "resource"})
+                    peer.messages = 2
+                    self._deadline(identity, peer)
+                else:
+                    self._disconnect(identity)
+
+    async def _message(self, identity: bytes, peer: stream.Peer, message: Any) -> None:
+        try:
+            if not isinstance(message, dict):
+                raise EmbeddingConfigurationError("Invalid embedding control message")
+            if message.get("request_id") != peer.request_id:
+                raise EmbeddingConfigurationError("Embedding request identity mismatch")
+            if peer.messages == 2:
+                if identity not in self.pending:
                     raise EmbeddingConfigurationError("Embedding request identity mismatch")
-                if identity in self.pending:
-                    self.pending[identity].put_nowait(message)
-                    continue
-                self.owner._hello(message)
-                size = message["nbytes"]
-                if len(self.pending) >= self.owner.max_connections:
-                    raise MemoryError("Embedding service request limit")
-                queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
-                self.pending[identity] = queue
-                task = asyncio.create_task(self._handle(identity, message, size, queue))
-                self.owner._tasks.add(task)
-                task.add_done_callback(partial(self._finished, identity=identity, queue=queue))
-            except (Exception, asyncio.CancelledError) as error:
-                if isinstance(error, asyncio.CancelledError):
-                    raise
-                with contextlib.suppress(Exception):
-                    await self._send(
-                        identity,
-                        {
-                            "request_id": identity.decode("ascii"),
-                            "error": "resource" if _is_resource_error(error) else "configuration",
-                        },
-                    )
+                self.pending[identity].put_nowait(message)
+                return
+            self.owner._hello(message)
+            size = message["nbytes"]
+            if len(self.pending) >= self.owner.max_connections:
+                raise MemoryError("Embedding service request limit")
+            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+            self.pending[identity] = queue
+            if peer.deadline is not None:
+                peer.deadline.cancel()
+            task = asyncio.create_task(self._handle(identity, message, size, queue))
+            self.owner._tasks.add(task)
+            task.add_done_callback(partial(self._finished, identity=identity, queue=queue))
+        except Exception as error:
+            peer.messages = 2
+            await self._send(
+                identity,
+                {"request_id": peer.request_id, "error": "resource" if _is_resource_error(error) else "configuration"},
+            )
+            self._deadline(identity, peer)
 
     def _finished(self, task: asyncio.Task[Any], identity: bytes, queue: asyncio.Queue[Any]) -> None:
         self.owner._tasks.discard(task)
@@ -294,6 +381,9 @@ class Server:
             self.pending.pop(identity)
         if not task.cancelled():
             task.exception()
+        peer = self.peers.get(identity)
+        if peer is not None:
+            self._deadline(identity, peer)
 
     async def _handle(self, identity: bytes, message: dict[str, Any], size: int, queue: asyncio.Queue[Any]) -> None:
         owner = self.owner

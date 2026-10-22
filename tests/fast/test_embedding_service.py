@@ -218,7 +218,7 @@ def test_producer_process_death_does_not_release_mapped_credit(process):
     asyncio.run(run())
 
 
-def test_server_death_times_out_client_and_reclaims_owned_buffers(process):
+def test_server_death_fails_client_and_reclaims_owned_buffers(process):
     proc, root = process()
     (root / "hold").touch()
 
@@ -242,7 +242,7 @@ def test_server_death_times_out_client_and_reclaims_owned_buffers(process):
             (root / "killed").touch()
             proc.kill()
             proc.wait(timeout=5)
-            with pytest.raises(asyncio.TimeoutError):
+            with pytest.raises((asyncio.TimeoutError, ConnectionError)):
                 await task
             await until(lambda: removed(names))
             assert not instance._zmq_client.sockets
@@ -998,7 +998,8 @@ def test_unsigned_request_cannot_reserve_memory(process):
         peer = RawClient(root)
         try:
             peer.key = b"wrong key"
-            await peer.send_reservation(content())
+            with pytest.raises(EmbeddingConfigurationError, match="authentication"):
+                await peer.send_reservation(content())
             # The service authenticates every request before any allocation.
             await asyncio.sleep(0.1)
             assert state(root)["inflight"] == state(root)["calls"] == 0
@@ -1234,11 +1235,11 @@ class RawClient:
     def __init__(self, root, family="sglang"):
         self.endpoint, self.key = transport._read_endpoint(str(root / "engine.json"))
         self.context = zmq.asyncio.Context()
-        self.socket = self.context.socket(zmq.DEALER)
+        self.socket = transport._socket(self.context, zmq.STREAM)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.request_id = uuid.uuid4().hex
-        self.socket.setsockopt(zmq.IDENTITY, self.request_id.encode("ascii"))
         self.socket.connect(self.endpoint)
+        self.connection = None
         self.family = family
 
     async def send_reservation(self, value):
@@ -1261,13 +1262,16 @@ class RawClient:
         return await self.receive()
 
     async def send(self, message):
-        await self.socket.send_multipart(transport._pack(message, self.key, b"request"))
+        if self.connection is None:
+            self.connection = transport.stream.Connection(self.socket, self.key, self.request_id)
+            await self.connection.authenticate()
+        await self.connection.send(transport._pack(message, self.connection.key, b"request"))
 
     async def publish(self):
         await self.send({"request_id": self.request_id, "state": "published"})
 
     async def receive(self):
-        return transport._unpack(await asyncio.wait_for(self.socket.recv_multipart(), 5), self.key, b"response")
+        return transport._unpack(await asyncio.wait_for(self.connection.receive(), 5), self.connection.key, b"response")
 
     def close(self):
         self.socket.close(linger=0)

@@ -638,10 +638,15 @@ argument; model-specific custom processor contracts are not inferred.
 
 ### Transport and lease ownership
 
-PyZMQ DEALER/ROUTER sockets carry bounded JSON control messages. After byte/count
-admission, the server allocates a named `SharedMemory` block and returns its name
-and size. The client copies decoded arrays and UTF-8 text into that block, closes
-its mapping and publishes the request. The server takes a private snapshot,
+PyZMQ STREAM sockets carry length-prefixed control records over loopback TCP.
+STREAM delivers bounded TCP chunks without assembling peer-controlled ZMTP
+multipart messages. A four-byte length is checked before buffering the body:
+authentication records are at most 64 bytes, and authenticated records contain
+at most 1 MiB of JSON plus a 32-byte HMAC. Receive high-water marks bound queued
+chunks, and each connection permits only a reservation and its publication.
+After byte/count admission, the server allocates a named `SharedMemory` block and
+returns its name and size. The client copies decoded arrays and UTF-8 text into
+that block, closes its mapping and publishes the request. The server takes a private snapshot,
 validates it and gives the snapshot to the native processor. Named shared memory
 has no write seals: the private snapshot keeps later producer writes from
 changing data while the processor reads it. The previous Unix socket/memfd
@@ -660,10 +665,14 @@ byte/slot without allocating a block. Invalid UTF-8 fails before model work.
 Neither side accepts media paths, pickles, arbitrary objects or CUDA handles.
 
 `path` / `service_path` names a private rendezvous JSON file containing a random
-loopback TCP endpoint and a fresh authentication key. HMAC authenticates every
-request and response. On POSIX the file must be owned by the current UID with
-mode `0600` in a private directory; Windows relies on the directory's user-private
-ACL. Keep that file private. This remains a trusted same-user, same-host boundary.
+loopback TCP endpoint and a fresh authentication key. A bounded mutual HMAC
+challenge-response authenticates each connection before JSON processing. The
+fresh server challenge and client request ID bind the proof and session key to
+that connection; every request and response uses the session key for its HMAC.
+Proofs and signed records cannot be replayed on a different connection. This is
+authentication without encryption. On POSIX the file must be owned by the current
+UID with mode `0600` in a private directory; Windows relies on the directory's
+user-private ACL. Keep that file private. This remains a trusted same-user, same-host boundary.
 Ray workers must run on the service host with access to the file and shared
 memory. Remote endpoints and arbitrary multi-node placement are unsupported.
 `service_id`, family, model and dimensions must match. Choose a new service ID
@@ -679,15 +688,16 @@ Windows releases a block when its last handle closes. POSIX service allocations
 remain registered with Python's resource tracker for cleanup after owner death.
 No cleanup can reclaim a Windows block still held by another live process.
 
-`publication_timeout` bounds both admission waiting and the subsequent wait for
-publication, including clients that disconnect before publishing. Accepted
-requests drain their model coroutine before releasing buffers and credits, even
+`publication_timeout` bounds unfinished authentication, the initial control
+request, admission waiting and the subsequent wait for publication, including
+clients that disconnect before publishing. Accepted requests drain their model
+coroutine before releasing buffers and credits, even
 after client timeout or repeated handler cancellation. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
-`max_connections` bounds waiting metadata; byte and in-flight limits include
-accepted requests whose clients have gone away. Limits govern ingress buffers,
-not processor allocations, unrelated applications or GPU memory.
+`max_connections` bounds tracked peers and waiting metadata; byte and in-flight
+limits include accepted requests whose clients have gone away. Limits govern
+ingress buffers, not processor allocations, unrelated applications or GPU memory.
 
 Client metrics record queue/admission, copy and request time plus input bytes.
 Service metrics record queue, request/model and cleanup time plus counts. The
