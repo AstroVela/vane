@@ -97,10 +97,47 @@ Inference requires native arm64 macOS and Metal, `dtype="bfloat16"`, one
 `subprocess_actor`, and 768 output dimensions. The document prefix is
 `title: none | text: `; the query prefix is `task: search result | query: `.
 The default 2048-token limit includes prefixes and special tokens; overlength
-inputs fail before inference. Joint inputs, other models, precisions and backends
-are rejected. Run manual subprocess examples outside the checkout so worker
+inputs fail before inference. Other models, precisions and backends are rejected. Run manual subprocess examples outside the checkout so worker
 imports resolve to the installed package as described below.
 MLX and SQR pin different Transformers versions; use separate environments.
+
+Ordered joint inputs use `embed(MultimodalInput([...]), provider="mlx")` or the
+provider's `get_multimodal_embedder()` / `embed_multimodal()` contracts. One row
+contains 1–16 ordered text/image/video/audio parts, including repeated media,
+with a combined 64 MiB input budget and one 768-dimensional float32 unit vector.
+It is a document encoding: no `input_type` option. A nonblank text part adds
+`title: none | text: ` once; other text and media remain at their original
+positions without inserted separators. Media-only inputs have no prefix.
+NULL parts and blank text are absent; an empty row fails. Text cannot contain
+the checkpoint's image/video/audio placeholders or begin/end markers, including
+markers formed across text parts. Existing unary text semantics are unchanged.
+
+Joint inference shares one BF16 model, one processor and the existing Metal
+forward/output/close path. Images are nested by input row; clips and independent
+float32 waveforms retain flattened part order. Exact processor keys, expanded
+tokens, complete ordered patch grids, frame counts, original waveform masks and
+per-part media structures are checked before forward. The 2048-token limit
+includes all expanded media, prefixes, special tokens and padding width.
+Joint uses only the fixed revision above. The four unary descriptors retain their
+existing output identities and paired query roles. Start with batch size one,
+one actor and concurrency one; no global model sharing is implied.
+
+Run `test_mlx_multimodal_provider.py` with the four existing fast files. Run
+`tests/ai/test_mlx_multimodal_embedding.py` in its own installed-launcher process,
+with `VANE_RUN_MLX_TESTS=1 -m 'metal and external_service'`, and the five Metal
+files sequentially. The new file compares independent CHW SDK references,
+heterogeneous batches, repeats/order, public relation/expression/SQL actors,
+actual actor OOM injection, cancellation and teardown. Set
+`VANE_MLX_JOINT_FIXTURES` to a retained independently SDK-qualified corpus
+containing `manifest.json` (`frozen_before_implementation`, three `joint` entries
+with source/subtitle hashes and `input_file`) and `joint-sdk-reference.npz`
+(`vectors`, paired text `queries`, `scores`). Each input NPZ retains decoded
+`frames`, `frame_times`, `frame_indices`, mono `audio`, and the exact joint `text`.
+Explicit opt-in fails when required assets are missing. This fixture establishes
+execution and parity for its declared material; report natural-recording quality
+qualification separately. Context uses its existing video/audio/subtitle pipeline;
+it does not add image joint request fields. MLX HTTP/service and cross-request
+batching remain outside this adapter.
 
 For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
 Install the optional `litert` extra, which pins `litert-lm-api==0.18.0`.
