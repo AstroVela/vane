@@ -3219,3 +3219,99 @@ CPU/native profiles, output hashes/counts, JUnit reports and cleanup manifests.
 Only tests and this negative result are retained in the PR. The next performance
 investigation should attribute partial aggregation and exchange work by stage;
 these two final-state experiments have not established a material end-to-end gain.
+
+## SF100 costed partial-state output (2026-10-22)
+
+Grouped partial aggregates previously performed a complete worker-local radix
+merge before exporting states to a distributed consumer that merges those keys
+again. The compiler now explicitly marks eligible grouped exported-state
+operators as permitting repeated groups. Their source can scan existing owned
+partial tuples directly; the consumer still merges every duplicate before SQL
+results and HAVING filters are produced. Ordinary SQL EXPORT_STATE retains one
+row per group. The marker is serialized and validated for a single complete,
+nonempty grouping set and unordered, non-distinct, destructor-free states.
+
+The choice to skip local consolidation uses the existing bounded HLL samples.
+Their sketches are merged across native threads, including overlapping group
+sets, and compared with the state counts from the matching sampling windows.
+Local consolidation remains when the estimate predicts more than a twofold
+reduction in exchange rows. One/two-thread grow strategies without these samples
+retain their existing consolidation. This adds no input sampling pass. It is a
+cost heuristic, not a hard bound on expansion: changing distributions after the
+sampling window can affect its accuracy. Correctness always depends on the final
+consumer merging states, never on an estimated group-completeness assumption.
+
+The final candidate is retained. The selected four-query median sum changes
+**56.921 → 54.990 seconds (-3.4%)**. Q18 improves **7.9%**, with an independent
+worker CPU reduction of **9.1%**. Q1/Q9 changes are small relative to shared-host
+variation. The Q21 latency reduction is observed in this control but has not been
+independently attributed to the new implementation.
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 4.443 s | 4.758 s | 4.784 s | +0.5% | 1.08× |
+| Q9 | 10.680 s | 18.149 s | 18.102 s | -0.3% | 1.69× |
+| Q18 | 7.672 s | 18.041 s | 16.610 s | -7.9% | 2.17× |
+| Q21 | 13.225 s | 15.973 s | 15.494 s | -3.0% | 1.17× |
+
+The table uses original Q1/Q9/Q18/Q21 SQL and the same 307 Parquet inputs /
+37.5033 GiB. Local uses 36 native threads / 32 GiB; pipeline uses two workers
+with 18 native threads and 16 GiB each. Per-worker exchange/staging budgets are
+128/256 MiB, frames are 64 KiB / 2048 rows, windows are 1 MiB / 16 slots, and the
+specialized Ray object store is 1 GiB. Baseline phases bracket Local/pipeline and
+pipeline/Local candidate phases. Three executions per query/mode in each phase,
+excluding each first execution, give four steady observations per table cell.
+All scheduled samples are retained. Timing covers submission, full collection
+and successful close; diagnostic timings are excluded.
+
+The shared host varied: candidate Local Q18 steady samples range from 7.416 to
+8.314 seconds. Unrelated jobs continued. OS caches were retained and owned
+builds/tests, diagnostics and Doris/HDFS did not overlap timing windows. Frozen
+Python files, package versions, SQL, input identities and resource capacities
+match across phases; only validated temporary store paths differ. These selected
+controls do not update the full 22-query score or establish SF100 FTE performance.
+
+Separate Q18 controls average **454.225 → 413.070 worker CPU seconds (-9.06%)**.
+Local averages 231.160 CPU seconds, leaving pipeline at 1.787× Local CPU and
+2.17× Local latency in the table. CPU is OS user-plus-system deltas summed over
+the two pipeline workers, excluding the coordinator/result service. Exchange0
+rows change from 150,001,994 to 150,009,034 / 150,008,973: less than 0.005% growth.
+
+An unconditional prototype exposed why costing is necessary: an interleaved
+32,771-group control emitted 524,299 states. The final policy preserves 32,771
+output rows for that control. Actual-spill validation at a configured 32 MB
+covers both strategies: the interleaved case spills 5,111,808 bytes and consolidates
+locally; the clustered case spills 4,718,592 bytes and exports 524,307 states for
+524,274 final groups. Both match the ordinary SQL oracle and leave empty spill
+directories after close. A configured memory budget is not a peak-RSS guarantee.
+
+**614 distinct related tests pass**: 111 aggregate-state cases, 489 compiler and
+Parquet cases, twelve real-Ray cases, and two additional producer spill cases.
+Coverage includes NULL/filter states, long keys, reordered/repeated inputs,
+ordinary SQL EXPORT_STATE, clustered/interleaved groups, external execution,
+bounded channels, early close and shared-producer retry. The installed-package
+launchers keep Ray in its own process. No full/GPU suite was run. Test binaries
+use the final implementation before its commit-only native version refresh;
+performance controls use the frozen committed binary below.
+
+Final acceptance has **82 result-checked SF100 executions**: 72 timing queries,
+four Local oracles and six CPU controls. Four initial operator-profile queries
+and six superseded unconditional-prototype CPU controls also match, for 92 total.
+The operator probe is absent from the final binary. Its timers are cumulative
+elapsed operator time, including possible lock waits, rather than OS CPU; primary
+fragment0/1 profiles are complete for both workers and repetitions, while one
+noncritical fragment2 profile is absent. These diagnostics identified repeated
+aggregation and exchange work without treating pooled function samples as one
+logical stage.
+
+Candidate code: `a28a36057d48bcb045355adcbfd133c2251ddc48`; native SHA-256
+`4864af76ebd15d71cb5a80033ba32f8a374edd0fe5303df5c7e04d518b959a20`.
+Baseline: `8ed2e3e96a`, engine `670a59db29`, native SHA-256
+`3fa6c796cf18ebe4f5e26e39c58804add5efdd1bb6408e6a6172911364af86c4`.
+Evidence in `build/pipeline-sf100-fragment-cost-20261022/` retains frozen identities
+and binaries, raw samples, operator/CPU diagnostics, row counts, configuration
+and output validation, test reports and cleanup manifests. Owned temporary data,
+oracle files and the duplicate baseline package were removed after the runs
+stopped. Original inputs are preserved; Doris/HDFS is restored with the requested
+file and Parquet page caches disabled. Remaining Q18 exchange traffic and final
+consumer work still leave a substantial Local gap.
