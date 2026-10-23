@@ -53,7 +53,10 @@ The source-pinned Iceberg and Avro qualification builds use the MIT-licensed
 notices are retained in `LICENSES/Iceberg-MIT.txt` and
 `LICENSES/Avro-extension-MIT.txt`; exact revisions are recorded in
 [source provenance](SOURCE_PROVENANCE.md).
-The frozen-scan adapter is Vane-owned Apache-2.0 source retained as a patch.
+The frozen-scan adapter and file assignments are Vane-owned Apache-2.0 source
+retained as ordered patches. The file-assignment patch also changes the
+inherited Iceberg virtual-column catalog entry for count-only scans; it retains
+DuckDB attribution and identifies Vane's modifications as MIT AND Apache-2.0.
 Its self-contained Iceberg artifact links the pinned in-tree Parquet
 implementation and retains DuckDB's source and vendored dependency notices,
 using the same notice input set as the base Vane wheel.

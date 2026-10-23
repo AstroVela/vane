@@ -39,7 +39,7 @@ def _identifier(value: str) -> str:
 
 
 class IcebergCatalog:
-    """A read-only Iceberg REST attachment on a local Vane connection.
+    """A read-only Iceberg REST attachment on a Vane connection.
 
     Load the matching Iceberg provider before :meth:`attach`. The connection
     owns the attachment and the returned relations; this object never closes
@@ -47,12 +47,12 @@ class IcebergCatalog:
     READ_ONLY. A detached or replaced attachment invalidates the wrapper.
 
     Anonymous Gravitino REST with local Parquet storage is qualified in
-    ``GRAVITINO_ICEBERG.md``. Ray execution is not supported yet.
+    ``GRAVITINO_ICEBERG.md``. Ray supports frozen unpartitioned format-v2
+    snapshots with one flat schema and no deletes, using shared local Parquet.
     """
 
     def __init__(self, connection: DuckDBPyConnection, name: str) -> None:
         _identifier(name)
-        self._require_local(connection)
         self.connection = connection
         self.name = name
         row = self._attachment()
@@ -98,7 +98,6 @@ class IcebergCatalog:
             valid = False
         if not valid:
             raise ValueError("endpoint must be an HTTP(S) REST URL without credentials, query or fragment")
-        cls._require_local(connection)
         loaded = connection.execute(
             "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'iceberg'"
         ).fetchone()
@@ -112,7 +111,7 @@ class IcebergCatalog:
         return cls(connection, name)
 
     def table(self, namespace: str, name: str, *, snapshot_id: int | None = None) -> DuckDBPyRelation:
-        """Bind an existing table as a composable native local relation.
+        """Bind an existing table as a composable native relation.
 
         Names are individual native catalog/schema/table identifiers, never SQL
         fragments. ``namespace`` is the schema name exposed by the provider.
@@ -131,13 +130,6 @@ class IcebergCatalog:
         self._check_attachment()
         self.connection.execute(f"DETACH {_identifier(self.name)}")
 
-    @staticmethod
-    def _require_local(connection: DuckDBPyConnection) -> None:
-        # Binding a constant relation reads the connection's captured policy
-        # without executing a Ray plan or consulting the mutable environment.
-        if connection.sql("SELECT 1")._get_runner_type() != "local":
-            raise NotImplementedError("IcebergCatalog requires VANE_RUNNER=local before opening the connection")
-
     def _attachment(self) -> tuple[int, str, bool] | None:
         # Match the engine's ASCII-only identifier comparison. SQL lower() and
         # Python casefold() would conflate distinct non-ASCII catalog names.
@@ -151,7 +143,6 @@ class IcebergCatalog:
         return None
 
     def _check_attachment(self) -> None:
-        self._require_local(self.connection)
         row = self._attachment()
         if row is None or row[0] != self._database_oid or row[1] != "iceberg" or not row[2]:
             raise ValueError("IcebergCatalog attachment has been detached or replaced")

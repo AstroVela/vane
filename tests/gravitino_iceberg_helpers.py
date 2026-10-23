@@ -24,7 +24,7 @@ class IcebergTables:
 
 
 @contextmanager
-def iceberg_tables(endpoint: str, shared_directory: Path):
+def iceberg_tables(endpoint: str, shared_directory: Path, *, file_count: int = 2):
     """Create and remove only this invocation's unique namespace and directory.
 
     The directory must be mounted at the same absolute path in the REST server.
@@ -68,7 +68,11 @@ def iceberg_tables(endpoint: str, shared_directory: Path):
             )
         rows = tuple((index, None if index % 13 == 0 else f"row-{index}.点") for index in range(4101))
         table = catalog.load_table((namespace, "items"))
-        for start, end in ((0, 2050), (2050, len(rows))):
+        if not 1 <= file_count <= len(rows):
+            raise ValueError("file_count must produce nonempty committed files")
+        for ordinal in range(file_count):
+            start = len(rows) * ordinal // file_count
+            end = len(rows) * (ordinal + 1) // file_count
             batch = pa.Table.from_pylist(
                 [{"id": key, "label": value} for key, value in rows[start:end]], schema=arrow_schema
             )

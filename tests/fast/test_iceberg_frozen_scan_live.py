@@ -1,24 +1,27 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""M5a native frozen-snapshot transport against an explicitly provisioned REST service."""
+"""Native frozen-snapshot and per-file transport against an explicitly provisioned REST service."""
 
 from __future__ import annotations
 
-import json
 import os
 import pickle
-import subprocess
-import sys
-import threading
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from urllib.request import urlopen
 
 import pytest
 from gravitino_iceberg_helpers import iceberg_tables
 from iceberg_feature_helpers import populate_iceberg_features
+from iceberg_scan_helpers import (
+    RestForwarder,
+    attach,
+    connection,
+    execute_frozen,
+    freeze,
+    unavailable_metadata,
+)
 
 import vane
 
@@ -33,7 +36,7 @@ def frozen_tables():
         pytest.skip("set VANE_TEST_GRAVITINO_ICEBERG_URL and VANE_TEST_GRAVITINO_ICEBERG_SHARED_DIR")
     if not endpoint or not shared:
         pytest.fail("Iceberg qualification requires both the REST URL and shared directory")
-    with iceberg_tables(endpoint.rstrip("/"), Path(shared)) as tables:
+    with iceberg_tables(endpoint.rstrip("/"), Path(shared), file_count=9) as tables:
         features = populate_iceberg_features(tables)
         create_transport_boundaries(tables)
         yield endpoint.rstrip("/"), tables, features
@@ -78,113 +81,9 @@ def native_only(monkeypatch):
     monkeypatch.setattr(ray, "init", forbidden)
 
 
-def connection(tables):
-    return vane.connect(
-        config={
-            "autoinstall_known_extensions": "false",
-            "autoload_known_extensions": "false",
-            "allow_persistent_secrets": "false",
-            "secret_directory": str(tables.directory / "secrets"),
-        }
-    )
-
-
-def attach(con, endpoint):
-    vane.load_installed_extension("iceberg", connection=con)
-    con.execute(
-        "ATTACH '' AS lake (TYPE iceberg, ENDPOINT $endpoint, AUTHORIZATION_TYPE 'none', READ_ONLY)",
-        {"endpoint": endpoint},
-    )
-
-
-def freeze(con, sql):
-    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(con.sql(sql), "frozen-iceberg-" + uuid.uuid4().hex)
-    return pickle.dumps(logical)
-
-
-def execute_frozen(payload, tables, *, split_batch=None):
-    """Use the existing native worker entry point with an explicit whole-scan assignment."""
-    with connection(tables) as worker:
-        logical = pickle.loads(payload)
-        physical = logical.to_physical_plan(worker)
-        batch_map = physical.scan_split_batch_map()
-        assert len(batch_map) == 1
-        assert all(len(batches) == 1 for batches in batch_map.values())
-        assignment = {
-            str(node): bytes(batches[0]) if split_batch is None else split_batch for node, batches in batch_map.items()
-        }
-        runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
-        try:
-            worker_plan = physical.clone(worker)
-            result = runner.execute_native(worker, worker_plan, scan_split_batch=assignment)
-            assert result.completion_status in {"ok", "empty"}
-            rows = []
-            for part in result.partition_payloads:
-                table = part.to_arrow() if hasattr(part, "to_arrow") else part
-                rows.extend(zip(*(column.to_pylist() for column in table.columns), strict=True))
-            schema = result.result_schema
-            result = worker_plan = physical = logical = None
-            return rows, schema
-        finally:
-            runner.shutdown()
-
-
-class RestForwarder:
-    """Forward to the real service, then close the exact endpoint captured during binding."""
-
-    def __init__(self, endpoint):
-        # Binding can hold the GIL while fetching metadata. The forwarding
-        # server must have its own interpreter, not a thread in this process.
-        self.process = subprocess.Popen(
-            [sys.executable, "-I", str(Path(__file__).parents[1] / "gravitino_iceberg_proxy.py"), endpoint],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.stopped = False
-        timeout = threading.Timer(10, self.process.kill)
-        timeout.start()
-        try:
-            line = self.process.stdout.readline()
-            if not line:
-                raise AssertionError("REST forwarder did not start: " + self.process.stderr.read())
-            self.endpoint = json.loads(line)["endpoint"]
-        except BaseException:
-            self.stop()
-            raise
-        finally:
-            timeout.cancel()
-            timeout.join()
-
-    def stop(self):
-        if not self.stopped:
-            if self.process.poll() is None:
-                self.process.terminate()
-            try:
-                self.process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.communicate(timeout=5)
-                raise AssertionError("REST forwarder failed to stop") from None
-            self.stopped = True
-
-
-@contextmanager
-def unavailable_metadata(tables):
-    moved = []
-    try:
-        for metadata in tables.directory.glob("*/metadata"):
-            hidden = metadata.with_name("frozen-test-hidden-metadata")
-            metadata.rename(hidden)
-            moved.append((metadata, hidden))
-        assert moved
-        yield
-    finally:
-        for metadata, hidden in reversed(moved):
-            hidden.rename(metadata)
-
-
-@pytest.mark.parametrize("query", ["rows", "projection", "filter", "aggregate", "empty"])
+@pytest.mark.parametrize(
+    "query", ["rows", "projection", "filter", "aggregate", "empty", "count", "count_empty", "constant"]
+)
 def test_frozen_plan_executes_after_connection_and_rest_endpoint_close(frozen_tables, query):
     endpoint, tables, _features = frozen_tables
     namespace = f'lake."{tables.namespace}"'
@@ -205,6 +104,9 @@ def test_frozen_plan_executes_after_connection_and_rest_endpoint_close(frozen_ta
             ],
         ),
         "empty": (f"SELECT id, label FROM {namespace}.empty", []),
+        "count": (f"SELECT count(*) FROM {namespace}.items", [(len(tables.rows),)]),
+        "count_empty": (f"SELECT count(*) FROM {namespace}.empty", [(0,)]),
+        "constant": (f"SELECT 7 FROM {namespace}.items", [(7,)] * len(tables.rows)),
     }
     sql, expected = statements[query]
     proxy = RestForwarder(endpoint)
@@ -347,3 +249,77 @@ def test_transport_boundary_rejects_independent_unsupported_metadata(frozen_tabl
         attach(con, endpoint)
         with pytest.raises(ValueError, match=message):
             freeze(con, f'SELECT * FROM lake."{tables.namespace}"."{name}"')
+
+
+def test_file_assignments_cover_exact_snapshot_independently_of_slot_hints(frozen_tables, monkeypatch):
+    endpoint, tables, _features = frozen_tables
+    with connection(tables) as con:
+        attach(con, endpoint)
+        payload = freeze(con, f'SELECT id, label FROM lake."{tables.namespace}".items')
+    batches = None
+    for slots in (1, 2):
+        monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", str(slots))
+        with connection(tables) as worker:
+            logical = pickle.loads(payload)
+            physical = logical.to_physical_plan(worker)
+            batch_map = physical.scan_split_batch_map()
+            assert len(batch_map) == 1
+            planned = [bytes(batch) for batch in next(iter(batch_map.values()))]
+            assert len(planned) == 9
+            if batches is None:
+                batches = planned
+            else:
+                assert batches == planned
+            physical = logical = None
+    # Each assignment is executable on its own. The orphan Parquet file is
+    # deliberately beside committed files and must never enter any split.
+    observed = []
+    with unavailable_metadata(tables):
+        for batch in batches:
+            rows, _schema = execute_frozen(payload, tables, split_batch=batch)
+            assert rows
+            observed.extend(rows)
+        merged, _schema = execute_frozen(
+            payload, tables, split_batch=vane.ray_cxx.merge_scan_split_batches(list(reversed(batches)))
+        )
+    assert sorted(observed) == list(tables.rows)
+    assert sorted(merged) == list(tables.rows)
+
+
+def test_duplicate_file_assignment_fails_before_execution(frozen_tables):
+    endpoint, tables, _features = frozen_tables
+    with connection(tables) as con:
+        attach(con, endpoint)
+        payload = freeze(con, f'SELECT * FROM lake."{tables.namespace}".items')
+    with connection(tables) as worker:
+        physical = pickle.loads(payload).to_physical_plan(worker)
+        batch = bytes(next(iter(physical.scan_split_batch_map().values()))[0])
+        physical = None
+    with pytest.raises((ValueError, vane.Error), match="[Dd]uplicate"):
+        duplicate = vane.ray_cxx.merge_scan_split_batches([batch, batch])
+        execute_frozen(payload, tables, split_batch=duplicate)
+
+
+@pytest.mark.parametrize("tamper", ["codec", "split_id", "remote_path"])
+def test_file_assignment_rejects_mismatched_codec_identity_and_path(frozen_tables, tamper):
+    endpoint, tables, _features = frozen_tables
+    with connection(tables) as con:
+        attach(con, endpoint)
+        payload = freeze(con, f'SELECT * FROM lake."{tables.namespace}".items')
+    with connection(tables) as worker:
+        physical = pickle.loads(payload).to_physical_plan(worker)
+        batch = bytes(next(iter(physical.scan_split_batch_map().values()))[0])
+        physical = None
+    if tamper == "codec":
+        original, replacement, message = b"vane.iceberg.frozen-file-scan", b"vane.iceberg.frozen-file-scax", "codec"
+    elif tamper == "split_id":
+        original, replacement, message = b"file-0", b"file-x", "invalid file identity"
+    else:
+        committed = tables.catalog.load_table((tables.namespace, "items")).scan().plan_files()
+        original = next(task.file.file_path.encode() for task in committed if task.file.file_path.encode() in batch)
+        assert original.startswith(b"file:///")
+        replacement, message = b"https://" + original[len(b"file:///") :], "local data-file paths"
+    assert len(original) == len(replacement)
+    assert batch.count(original) == 1
+    with pytest.raises((ValueError, vane.Error), match=message):
+        execute_frozen(payload, tables, split_batch=batch.replace(original, replacement))

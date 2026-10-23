@@ -7,9 +7,11 @@ publication remains [#619](https://github.com/AstroVela/vane/issues/619).
 M4a established the provider qualification. M4b adds the local Python interface
 below, tracked in [#1066](https://github.com/AstroVela/vane/issues/1066).
 M5a adds the narrow frozen-snapshot transport described below, tracked in
-[#1068](https://github.com/AstroVela/vane/issues/1068).
+[#1068](https://github.com/AstroVela/vane/issues/1068). M5b adds file assignments
+and the narrow Ray path, tracked in
+[#1073](https://github.com/AstroVela/vane/issues/1073).
 M3's general Iceberg capability flags remain conservative; this record covers
-the explicitly qualified local provider, service and feature combinations.
+the explicitly qualified provider, service, runner and feature combinations.
 
 ## Fixed inputs
 
@@ -75,7 +77,8 @@ environment, and incremental Release build. Prepare the additional SDK with
 the [qualification profile instructions](packages/vane-iceberg-provider/README.md).
 Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
-Then apply `iceberg-vane-frozen-scan.patch` from the same directory. The SDK
+Then apply `iceberg-vane-frozen-scan.patch` and `iceberg-vane-file-scan.patch`
+from the same directory, in that order. The SDK
 instructions give the ordered commands and each patch is independently retained.
 
 Export these source overrides for **every** configure/build command, including
@@ -190,10 +193,11 @@ engine's ASCII case-insensitivity and preserves distinct non-ASCII names.
 `detach()` leaves the caller's connection open. Relations depend on their
 connection and attachment lifetime, following Vane's native relation contract.
 
-The helper checks the connection's captured runner policy, independently of
-later environment changes. Ray connections fail before provider or REST access
-with `NotImplementedError`; no runner switch or materialization fallback occurs.
-Iceberg-owned distributed transport and scan splits remain M5.
+Relations retain the connection's captured runner policy, independently of
+later environment changes. Attachment and metadata inspection run on the
+coordinator for either runner. M4b and M5a restricted this helper to local
+connections; M5b admits Ray connections for the narrower table semantics
+[qualified below](#file-assignments-and-ray-m5b).
 
 ### Additional real-service feature matrix
 
@@ -255,10 +259,10 @@ against the fixed source without waiting for upstream changes.
 
 ## Frozen snapshot transport (M5a)
 
-This stage adds bind serialization and an independently owned worker bind to
-the source-pinned provider. It keeps `IcebergCatalog`'s public local-runner
-guard. Native worker execution is exercised directly with Ray initialization
-forbidden; a successful round-trip does not qualify real Ray scheduling.
+This stage added bind serialization and an independently owned worker bind to
+the source-pinned provider. At M5a, `IcebergCatalog` kept its public local-runner
+guard. Native worker execution was exercised directly with Ray initialization
+forbidden; real Ray scheduling is qualified separately in M5b below.
 
 The transport accepts format-v2, unpartitioned, committed Parquet tables whose
 metadata contains exactly one flat, field-ID-mapped schema. Data-file paths
@@ -303,7 +307,8 @@ revision is `8ef29bee9d5d1ada3d7d5efe77302a296ff6576a`; the Iceberg/Avro
 source pins, SDK profile and service identity are unchanged. Both providers
 must be rebuilt for that engine identity. The additional frozen-scan patch has SHA-256
 `b6f1ff2b097c176744b0bd1c9dd0721ac567247b0fece83e82f5666f28988be9`.
-The existing local compatibility patch is unchanged. Apply both in order.
+The existing local compatibility patch is unchanged. M5a applied these two in
+order; M5b adds a third patch after them.
 
 The provider explicitly serializes field IDs and constant defaults: the
 generic reader-bind serializer does not include its schema or mapping mode.
@@ -356,14 +361,99 @@ These were the initial M4b-engine results. Requalification for the synchronized
 engine above, including the complete base gate, is recorded in
 [#1069](https://github.com/AstroVela/vane/pull/1069).
 
+## File assignments and Ray (M5b)
+
+M5b keeps M5a's frozen bind format and table guards. It uses the existing scan
+callback and FTE scheduler APIs; no engine or runner-specific scan path is
+introduced. Fault injection exposed and fixes one shared FTE dependency bug:
+when a replacement worker already has the fragment cached, the new attempt
+must clear the original worker's registration dependency instead of awaiting
+its dead actor's ObjectRef. A separate scheduler regression covers both
+pending and cached replacement registration. The patch `packages/vane-iceberg-provider/patches/iceberg-vane-file-scan.patch`
+applies after the unchanged M4a and M5a patches. Its SHA-256 is
+`784c3f5f082f2b454b31be3848d9b219a751ae03aed68180f01b3251e27b9988`. The engine, Iceberg, Avro and SDK identities remain those recorded
+for M5a above. Rebuild and repackage the signed Iceberg provider; a previously
+built whole-scan provider does not implement this protocol.
+
+Each committed data-file entry produces one split, with canonical ID `file-N`
+where `N` is its ordinal in the frozen file list. IDs and assignments are
+independent of worker-slot and target-split-count hints. Planning fully expands
+the selected manifests, excludes neighboring uncommitted files and rejects
+duplicate data paths. Row groups and file-size balancing remain future work;
+unknown byte/cardinality estimates do not justify truncating or prebatching
+the file list.
+
+The new codec is `vane.iceberg.frozen-file-scan`, version `1`. Its versioned
+payload contains the table UUID, snapshot-presence flag/ID, schema ID, file
+ordinal and one absolute local path. Worker application validates the codec
+through the shared scan envelope and validates every payload's version,
+identity, ID, path and trailing bytes. It rejects duplicate ordinals or paths
+within an assignment. Decoding first builds temporary owned state, then
+atomically installs only the assigned subset in ordinal order. Missing
+assignments fail and explicit empty assignments clear all files. The old
+whole-scan codec is a different capability and cannot be mixed with this one.
+Retries use the original frozen identity and file assignments.
+
+`IcebergCatalog.attach()` and `.table()` now admit Ray connections. Loading
+and validating the matching signed provider, READ_ONLY enforcement, identifier
+quoting and attachment-lifetime checks are the same as the local interface.
+Catalog operations stay on the coordinator; workers restore provider state
+and frozen scans without replaying REST attachments. The connection's runner
+policy is preserved, with no implicit runner switch.
+
+The Ray matrix is deliberately narrower than the local matrix:
+
+| Feature | Ray scope |
+| --- | --- |
+| Table and storage | Committed, unpartitioned format-v2 Parquet; one flat field-ID schema; absolute local paths shared by every worker |
+| Reads | Rows, projection, tested filters, BIGINT aggregation, empty-table schema, explicit snapshot ID |
+| Scheduling | One independently schedulable split per committed file; more files than configured worker slots |
+| Frozen replay | Original connection and captured REST endpoint closed; newer independent append and unavailable metadata/manifests do not change the selected rows |
+| Recovery | Real production worker actors, disjoint assignments, worker loss and replacement attempt, cancellation and query/session cleanup |
+| Provider replay | Exact signed Iceberg/Avro dependency closure; mismatched Iceberg digest rejected before fragment publication |
+| Extended table semantics | Partitions, evolution, nested fields and position/equality deletes remain explicit transport errors; qualified local reads keep working |
+
+Ray's existing result-type policy still applies. For example, `sum(BIGINT)`
+returns HUGEINT by default; use a checked BIGINT cast for a result known to fit,
+or configure Vane's existing lossless Arrow conversion. This milestone does not
+change result-type conversion.
+
+The independent fixture uses nine committed files totaling 4101 rows, NULL and
+Unicode values, an empty table and an adjacent uncommitted Parquet file. The
+native assignment tests compare individual and merged splits against
+PyIceberg. The real-Ray suite exercises the public relation API and two
+production `RayWorkerActor` processes on one host through the existing FTE
+protocol. The controlled worker-loss case leaves the source stream open,
+kills its first actor, finishes the replacement attempt and checks exact rows
+without duplicate output. Cancellation checks terminal task state, released
+fragment ownership and closed session snapshot databases. This is shared-path,
+same-host qualification, not qualification of a remote storage deployment.
+
+Reproduce after the ordered provider build and signed-wheel installation:
+
+```bash
+export VANE_TEST_GRAVITINO_ICEBERG_URL=http://127.0.0.1:9001/iceberg
+export VANE_TEST_GRAVITINO_ICEBERG_SHARED_DIR=/absolute/shared/test-warehouse
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_frozen_scan_live.py \
+  tests/fast/test_iceberg_catalog_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_ray_scan_live.py \
+  -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+scripts/run_release_tests.sh
+```
+
+The Ray suite uses the repository cluster fixture and normal object-store
+sizing. It creates and kills only its owned actors. Service namespaces and
+warehouses remain unique per fixture and are removed after the tests.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
 | --- | --- |
 | M5a: frozen transport | Native restored execution, stable snapshot, detached worker bind and explicit unsupported-state guards |
-| M5b: file assignments and Ray | Independently assign committed files; real multi-worker Ray results, retries, cancellation and exact provider replay; enable the public Ray path only after these pass |
+| M5b: file assignments and Ray | Per-file assignments, same-host real worker execution, recovery, cancellation and exact provider replay; public Ray API for the narrow matrix above |
 | M5c: table semantics | Extend transport to partitions, evolution and position/equality deletes with independent reference results and correct sequence/field-ID semantics |
-| Later optional work | Object-store qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
+| Later optional work | Remote shared-storage qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
-This fixture does not qualify v1/v3 tables, production object stores, distributed
-reads, catalog writes, authentication extensions, credential vending or refresh.
+The current fixture does not qualify v1/v3 tables, remote storage, catalog
+writes, authentication extensions, credential vending or refresh.

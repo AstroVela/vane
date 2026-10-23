@@ -86,17 +86,17 @@ def test_attach_uses_local_connection_policy_after_environment_changes(local_con
         IcebergCatalog.attach(local_connection, "lake", endpoint="http://127.0.0.1:1/iceberg")
 
 
-def test_ray_connection_is_rejected_before_provider_access_even_if_environment_changes(monkeypatch):
+def test_ray_catalog_metadata_and_missing_provider_do_not_start_a_cluster(monkeypatch):
     import ray
 
     def forbid_ray(*_args, **_kwargs):
-        raise AssertionError("unsupported Iceberg attachment must not initialize Ray")
+        raise AssertionError("Iceberg metadata and provider validation must not initialize Ray")
 
     monkeypatch.setattr(ray, "init", forbid_ray)
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    with vane.connect() as con:
+    with vane.connect(config={"autoinstall_known_extensions": "false", "autoload_known_extensions": "false"}) as con:
         monkeypatch.setenv("VANE_RUNNER", "local")
-        with pytest.raises(NotImplementedError, match="VANE_RUNNER=local"):
+        with pytest.raises(RuntimeError, match="load the matching Iceberg provider"):
             IcebergCatalog.attach(con, "lake", endpoint="http://127.0.0.1:1/iceberg")
-        with pytest.raises(NotImplementedError, match="VANE_RUNNER=local"):
+        with pytest.raises(ValueError, match="existing READ_ONLY Iceberg"):
             IcebergCatalog(con, "lake")

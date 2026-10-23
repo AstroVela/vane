@@ -116,6 +116,13 @@ The subsequent Vane-owned
 `packages/vane-iceberg-provider/patches/iceberg-vane-frozen-scan.patch` adds
 versioned frozen-snapshot transport against the same revision. Its new source
 files carry Apache-2.0 SPDX headers; the inherited Iceberg source remains MIT.
+The third Vane-owned patch, `iceberg-vane-file-scan.patch` in the same directory,
+adds per-file assignment planning and validation to that Apache-2.0 source.
+It also exposes the standard empty projection in Iceberg's inherited virtual
+column catalog entry so count-only scans do not request v3 row lineage. That
+file retains the pinned DuckDB copyright with MIT AND Apache-2.0 modification
+attribution. The patch changes neither the upstream revision nor the two
+preceding patches.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins
