@@ -110,6 +110,12 @@ files are copied unchanged to `LICENSES/Iceberg-MIT.txt` and
 fetched. Vane's compatibility diff is retained in
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` and applies to
 the fixed Iceberg revision; it does not require an upstream merge.
+The subsequent Vane-owned
+`packages/vane-iceberg-provider/patches/iceberg-vane-frozen-scan.patch` adds
+versioned frozen-snapshot transport against the same revision. Its new source
+files carry Apache-2.0 SPDX headers; the inherited Iceberg source remains MIT.
+The self-contained loadable provider also links the pinned in-tree Parquet
+implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins
 `duckdb/vcpkg-duckdb-ports@f13de79b66345fe31d3f9c119517613023d194a8`, whose
 Avro C port builds `duckdb/duckdb-avro-c@8af400279c445a81b8552a7670d8c1ebd92ba34a`.

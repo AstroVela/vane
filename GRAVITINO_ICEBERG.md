@@ -6,6 +6,8 @@ through Gravitino's Iceberg REST service. The tracking issue is
 publication remains [#619](https://github.com/AstroVela/vane/issues/619).
 M4a established the provider qualification. M4b adds the local Python interface
 below, tracked in [#1066](https://github.com/AstroVela/vane/issues/1066).
+M5a adds the narrow frozen-snapshot transport described below, tracked in
+[#1068](https://github.com/AstroVela/vane/issues/1068).
 M3's general Iceberg capability flags remain conservative; this record covers
 the explicitly qualified local provider, service and feature combinations.
 
@@ -49,7 +51,7 @@ an isolated secret directory.
 
 On Linux x86-64, Python 3.12.3 and PyArrow 25.0.0, both native artifacts compile
 and load through the signed test-provider resolver. All six real-service
-acceptance cases pass. This result qualifies the following narrow matrix:
+acceptance cases passed at M4a. Its historical result qualifies the following narrow matrix:
 
 | Operation or feature | Result |
 | --- | --- |
@@ -59,7 +61,7 @@ acceptance cases pass. This result qualifies the following narrow matrix:
 | Projection, tested numeric filters and aggregation | Passed |
 | Empty table | Preserves BIGINT/VARCHAR schema with zero rows |
 | READ_ONLY attachment | INSERT rejected and independently observed snapshot unchanged |
-| Scan-plan serialization | Explicitly rejected by the unimplemented Iceberg callback |
+| Scan-plan serialization at M4a | Explicitly rejected; M5a's separate scope is described below |
 | Other formats, table features, platforms and runners | Unqualified |
 
 The plan factory exposes the native serialization error through its existing
@@ -73,6 +75,8 @@ environment, and incremental Release build. Prepare the additional SDK with
 the [qualification profile instructions](packages/vane-iceberg-provider/README.md).
 Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
+Then apply `iceberg-vane-frozen-scan.patch` from the same directory. The SDK
+instructions give the ordered commands and each patch is independently retained.
 
 Export these source overrides for **every** configure/build command, including
 CMake's automatic regeneration. `CMAKE_PREFIX_PATH` identifies the extra SDK;
@@ -248,6 +252,111 @@ freeze a snapshot per execution, serialize the relevant Iceberg state, assign
 scan splits, and preserve field IDs and deletion semantics on workers. Each
 unsupported feature must fail explicitly. Vane can implement these adapters
 against the fixed source without waiting for upstream changes.
+
+## Frozen snapshot transport (M5a)
+
+This stage adds bind serialization and an independently owned worker bind to
+the source-pinned provider. It keeps `IcebergCatalog`'s public local-runner
+guard. Native worker execution is exercised directly with Ray initialization
+forbidden; a successful round-trip does not qualify real Ray scheduling.
+
+The transport accepts format-v2, unpartitioned, committed Parquet tables whose
+metadata contains exactly one flat, field-ID-mapped schema. Data-file paths
+must be absolute local paths or `file:///` URIs. Partitioned tables, schema
+evolution/name mappings, nested fields, delete manifests, uncommitted writes,
+alternate Parquet schemas, encryption and row-lineage virtual columns are
+outside this stage. Their qualified M4b local reads continue to use the live
+Iceberg reader. Transport rejects unsupported state explicitly rather than
+silently substituting a directory glob or rereading metadata.
+
+Binding selects a snapshot once. Serialization freezes its table UUID,
+snapshot-presence flag and ID, schema ID, output schema, field IDs/defaults,
+reader options and exact manifest-selected file paths. Restoring that state
+does not replay the catalog attachment, request newer metadata, open manifests
+or retain a client context, table entry or mutable coordinator cache. It uses
+the existing Parquet reader for file decoding while preserving Iceberg field
+mapping. The independently loaded provider and its Avro dependency still pass
+the existing exact engine/provider identity checks.
+
+The native bind format has version `1`. Physical translation constructs a
+separate worker bind containing only owned schema/options and snapshot
+identity, with an empty file list and an unassigned role. It selects those
+members explicitly; `FunctionData::Copy()` cannot serve as a worker-state
+fallback. The detached reader is marked separately from the live Iceberg
+reader so live-catalog optimizer hooks cannot reinterpret its file list.
+
+M5a uses the existing distributed scan callbacks to assign the complete
+snapshot as one work item. This is the minimum executable transport path,
+before file-level partitioning. Its codec is
+`vane.iceberg.frozen-whole-scan`, version `1`, with canonical split ID
+`snapshot`. An assignment carries its own version, frozen identity and file
+paths. Decoding checks identity, version, split count/ID, path policy and
+trailing bytes before replacing the worker's file list. A missing assignment
+fails; an explicit empty assignment clears files and produces no rows. An
+empty table retains its schema and uses the framework's explicit empty split.
+
+M5a is based on M4b commit `0606e2a038b4007a04bf34541e76af0462cff113`.
+The engine identities and upstream source pins remain those in the fixed-input
+table. The additional frozen-scan patch has SHA-256
+`b6f1ff2b097c176744b0bd1c9dd0721ac567247b0fece83e82f5666f28988be9`.
+The existing local compatibility patch is unchanged. Apply both in order.
+
+The provider explicitly serializes field IDs and constant defaults: the
+generic reader-bind serializer does not include its schema or mapping mode.
+Before freezing paths it fully enumerates the selected manifests, since the
+pinned Iceberg list's `GetAllFiles()` alone returns only materialized entries.
+The loadable artifact links Parquet internally to preserve Vane's private
+native-module symbol boundary; the engine itself requires no change.
+
+### Acceptance and reproduction
+
+The M5a tests use the fixed real-service and independent SDK inputs above.
+They close the original Vane connection and the forwarding REST endpoint,
+then temporarily move all fixture metadata directories out of their original
+locations while leaving data files accessible. A restored worker must still
+return the independently verified rows, projection, filters and aggregation,
+and preserve the empty schema. A separate independently committed append
+must not appear in the frozen result. Nonempty foreign-table assignments are rejected,
+explicit empty assignments clear nonempty workers, and missing assignments
+fail before execution. Existing partition/evolution/delete fixtures must
+continue to read locally while their transport fails explicitly.
+Independent v1 and nested-schema metadata fixtures also exercise the admission
+guards. The native task API reports positional `col_N` result names for all
+sources; this stage checks empty-result arity and BIGINT/VARCHAR types there.
+The existing M4b suite separately verifies public Relation column names.
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_gravitino_iceberg_live.py tests/fast/test_iceberg_catalog_live.py tests/fast/test_iceberg_frozen_scan_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+scripts/run_release_tests.sh
+```
+
+The same two opt-in service variables used above are required. This test
+module's forwarding endpoint contacts the real provisioned Gravitino service;
+it does not synthesize catalog responses. Stopping that endpoint tests the
+address captured by the plan. A separate qualification run must stop the
+actual owned service and restore in a fresh process before claiming that
+stronger acceptance condition.
+
+On 2026-10-23, the 46 real-service cases (15 M5a, 6 provider and 25 local API)
+passed on the fixed Linux/Python/SDK profile. The 20 local catalog contracts
+and two affected generic native transport contracts also passed. A separate
+run stopped the actual test-owned Gravitino container after all source Vane
+connections closed and an independent append committed. A fresh Python process
+then hid the fixture metadata directories and passed six restored queries:
+all rows, projection, filter, aggregation, empty-table types and an explicit
+old snapshot. The test-owned fixture files and stopped service were removed
+after the run. The
+standard base release gate remains required and is reported with the change.
+
+### Remaining roadmap
+
+| Stage | Delivery gate |
+| --- | --- |
+| M5a: frozen transport | Native restored execution, stable snapshot, detached worker bind and explicit unsupported-state guards |
+| M5b: file assignments and Ray | Independently assign committed files; real multi-worker Ray results, retries, cancellation and exact provider replay; enable the public Ray path only after these pass |
+| M5c: table semantics | Extend transport to partitions, evolution and position/equality deletes with independent reference results and correct sequence/field-ID semantics |
+| Later optional work | Object-store qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 This fixture does not qualify v1/v3 tables, production object stores, distributed
 reads, catalog writes, authentication extensions, credential vending or refresh.

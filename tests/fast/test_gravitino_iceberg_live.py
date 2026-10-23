@@ -108,10 +108,8 @@ def test_read_only_attachment_rejects_insert_without_a_new_snapshot(local_iceber
     assert observed.scan().to_arrow().num_rows == len(tables.rows)
 
 
-def test_scan_plan_transport_rejects_unimplemented_iceberg_serialization(local_iceberg):
+def test_scan_plan_transport_serializes_qualified_snapshot(local_iceberg):
     con, _tables, namespace = local_iceberg
     relation = con.sql(f"SELECT id, label FROM {namespace}.items")
-    # The plan factory transports native errors in its existing ValueError JSON
-    # envelope; the underlying Iceberg error must remain explicit.
-    with pytest.raises(ValueError, match="IcebergScan serialization not implemented"):
-        vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "iceberg-qualification")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "iceberg-qualification")
+    assert plan is not None

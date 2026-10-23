@@ -24,7 +24,23 @@ git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-local.patch"
 git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-local.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-frozen-scan.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-frozen-scan.patch"
 ```
+
+The second patch adds M5a's versioned frozen-snapshot transport on top of the
+same source pin. It supports only unpartitioned format-v2 local Parquet with
+one flat schema and no delete manifests. The loadable Iceberg artifact links
+the pinned Parquet implementation so it remains self-contained; no external
+Parquet provider or `_native` private-symbol import is required. Rebuild both
+Iceberg and Avro whenever the engine identity changes. The native whole-scan
+assignment is a transport qualification, not public Ray support; see
+[the transport contract and roadmap](../../GRAVITINO_ICEBERG.md#frozen-snapshot-transport-m5a).
+Provider-wheel packaging must retain the DuckDB and vendored dependency notice
+inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's
+dependencies, together with the pinned Iceberg/Avro and SDK notices.
 
 From the repository root, using the baseline-matched vcpkg tool checkout:
 
