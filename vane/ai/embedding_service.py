@@ -155,27 +155,24 @@ class EmbeddingService:
             raise
 
     async def aclose(self) -> None:
-        if self._closing is None:
-            self._closing = asyncio.create_task(self._close())
+        closing = self._closing
+        if closing is None or closing.done() and (closing.cancelled() or closing.exception() is not None):
+            closing = self._closing = asyncio.create_task(self._close())
         while True:
             try:
-                await asyncio.shield(self._closing)
+                await asyncio.shield(closing)
                 return
             except asyncio.CancelledError:
-                if self._closing.cancelled():
+                if closing.cancelled():
                     raise
 
     async def _close(self) -> None:
-        try:
-            if self._zmq_server is not None:
-                await self._zmq_server.aclose()
-        finally:
+        if self._zmq_server is not None:
+            await self._zmq_server.aclose()
             self._zmq_server = None
-            if self.runtime is not None:
-                try:
-                    await self.runtime.aclose()
-                finally:
-                    self.runtime = None
+        if self.runtime is not None:
+            await self.runtime.aclose()
+            self.runtime = None
 
     def _hello(self, message: Any) -> int:
         fields = {"version", "service_id", "family", "model", "dimensions", "request_id", "parts", "nbytes"}

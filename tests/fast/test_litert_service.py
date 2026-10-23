@@ -264,12 +264,13 @@ def test_query_role_cannot_be_used_for_media(tmp_path, options, sdk, monkeypatch
     asyncio.run(scenario())
 
 
-def test_gpu_initialization_failure_does_not_try_cpu(tmp_path, options, sdk):
-    sdk.failure = RuntimeError("authored GPU initialization failure")
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_gpu_initialization_failure_does_not_try_cpu(tmp_path, options, sdk, failure):
+    sdk.failure = failure("authored GPU initialization failure")
 
     async def scenario():
         instance = service(tmp_path, options | {"backend": "gpu"})
-        with pytest.raises(RuntimeError, match="authored GPU"):
+        with pytest.raises(failure, match="authored GPU"):
             await instance.start()
         assert instance.runtime is None and not (tmp_path / "service/engine.json").exists()
         await instance.aclose()
@@ -318,6 +319,66 @@ def test_close_drains_committed_cancelled_inference(tmp_path, options, sdk, monk
 
     asyncio.run(scenario())
     assert len([event for event in sdk.events if event[0] == "close"]) == 1
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, asyncio.CancelledError])
+def test_failed_sdk_close_retries_on_the_original_live_thread(tmp_path, options, sdk, monkeypatch, failure):
+    events = []
+    entered, release = threading.Event(), threading.Event()
+    original = sdk.EmbeddingEngine
+
+    class Engine(original):
+        def __init__(self, *args, **kwargs):
+            events.append(("load", threading.get_ident()))
+            super().__init__(*args, **kwargs)
+            self.attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            events.append(("close", threading.get_ident()))
+            if self.attempts == 1:
+                raise failure("authored SDK shutdown failure")
+            entered.set()
+            assert release.wait(8)
+            super().close()
+
+    monkeypatch.setattr(sdk, "EmbeddingEngine", Engine)
+
+    async def scenario():
+        instance = service(tmp_path, options)
+        await instance.start()
+        runtime = instance.runtime
+        pending = []
+        try:
+            with pytest.raises(failure):
+                await instance.aclose()
+            assert instance.runtime is runtime
+            assert any(thread.name.startswith("vane-litert-service") for thread in threading.enumerate())
+            with pytest.raises(RuntimeError, match="already started"):
+                await instance.start()
+            pending = [asyncio.create_task(instance.aclose()) for _ in range(3)]
+            assert await asyncio.to_thread(entered.wait, 5)
+            pending[0].cancel()
+            await asyncio.sleep(0.02)
+            assert all(not task.done() for task in pending)
+            release.set()
+            await asyncio.gather(*pending)
+            assert instance.runtime is None
+            await instance.aclose()
+            assert [event[0] for event in events] == ["load", "close", "close"]
+        finally:
+            release.set()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            # The native owner is retained here even if the service loses it.
+            native = runtime.initialization.result()
+            if not native._closed:
+                await asyncio.to_thread(native.close)
+            runtime.executor.shutdown(wait=True)
+
+    asyncio.run(scenario())
+    assert len({thread for _, thread in events}) == 1
+    assert not any(thread.name.startswith("vane-litert-service") for thread in threading.enumerate())
 
 
 def test_cancelled_startup_joins_the_single_sdk_thread(tmp_path, options, sdk, monkeypatch):

@@ -735,6 +735,10 @@ starting abort cleanup closes that gate before yielding. Accepted requests retai
 their buffers and credits until the model coroutine finishes. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
+Transport and runtime references are released only after their cleanup succeeds.
+A failed close retains unfinished resources for a later `aclose()` attempt;
+concurrent callers share the active attempt. Engine cleanup waits for successful
+transport drain, and LiteRT keeps its SDK thread alive until engine close succeeds.
 After receiving a complete terminal response, the client sends its signed
 receipt and waits for server EOF before returning or reporting the error.
 The server then returns the connection slot without waiting for client EOF.

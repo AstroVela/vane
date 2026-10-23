@@ -58,6 +58,9 @@ serialize on that thread while the network loop remains responsive. Committed
 requests drain through cancellation and service shutdown before buffers,
 credits and the engine are released. A client never starts a local engine or
 replays a request after uncertain completion.
+If shutdown fails, the service retains the runtime and its SDK thread. A later
+`aclose()` retries cleanup on that same thread; concurrent callers share the
+active attempt. Cleanup must succeed before the service can restart.
 
 | Model identifier | Native inputs |
 | --- | --- |

@@ -118,8 +118,8 @@ async def _drain(future: asyncio.Future[Any]) -> Any:
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            if future.cancelled():
-                raise
+            if future.done():
+                return future.result()
 
 
 class LiteRTServiceRuntime:
@@ -144,17 +144,17 @@ class LiteRTServiceRuntime:
         return (await _drain(future))[0]
 
     async def _close(self) -> None:
-        try:
-            if self.initialization is not None:
-                try:
-                    runtime = await _drain(self.initialization)
-                except Exception:
-                    return  # Startup owns the original initialization error.
+        if self.initialization is not None:
+            try:
+                runtime = await _drain(self.initialization)
+            except BaseException:
+                pass  # Startup owns the original initialization error.
+            else:
                 await _drain(asyncio.get_running_loop().run_in_executor(self.executor, runtime.close))
-        finally:
-            self.executor.shutdown(wait=True)
+        self.executor.shutdown(wait=True)
 
     async def aclose(self) -> None:
-        if self.closing is None:
-            self.closing = asyncio.create_task(self._close())
-        await _drain(self.closing)
+        closing = self.closing
+        if closing is None or closing.done() and (closing.cancelled() or closing.exception() is not None):
+            closing = self.closing = asyncio.create_task(self._close())
+        await _drain(closing)
