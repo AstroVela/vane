@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 
-@pytest.mark.parametrize("kind", ["text", "image", "audio", "video"])
+@pytest.mark.parametrize("kind", ["text", "image", "audio", "video", "multimodal"])
 def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
     from vane.ai.provider import ProviderImportError, _safe_provider_execution_error, load_provider
 
@@ -35,7 +35,7 @@ def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
     assert selected.get_dimensions() == 768 and selected.get_udf_options().num_gpus == 0
     assert ("input_type" in selected.get_options()) == (kind == "text")
     (output,) = selected.get_output_spec().outputs
-    expected_sources = ("text", "image", "video", "audio") if kind == "text" else (kind,)
+    expected_sources = ("text", "image", "video", "audio") if kind in {"text", "multimodal"} else (kind,)
     assert output.source_modalities == expected_sources
     assert output.space == descriptor.get_output_spec().outputs[0].space
     assert imported == []
