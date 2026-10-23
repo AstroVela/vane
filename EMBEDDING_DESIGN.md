@@ -643,7 +643,11 @@ STREAM delivers bounded TCP chunks without assembling peer-controlled ZMTP
 multipart messages. A four-byte length is checked before buffering the body:
 authentication records are at most 64 bytes, and authenticated records contain
 at most 1 MiB of JSON plus a 32-byte HMAC. Receive high-water marks bound queued
-chunks, and each connection permits only a reservation and its publication.
+chunks, and each connection permits only a reservation, its publication and a
+signed receipt after the terminal response. A terminal error before publication
+also requires that receipt; it never permits another reservation.
+This completion handshake uses rendezvous protocol `vane-embedding-stream-3`;
+install matching service/client packages and restart the service when upgrading.
 After byte/count admission, the server allocates a named `SharedMemory` block and
 returns its name and size. The client copies decoded arrays and UTF-8 text into
 that block, closes its mapping and publishes the request. The server takes a private snapshot,
@@ -703,6 +707,11 @@ starting abort cleanup closes that gate before yielding. Accepted requests retai
 their buffers and credits until the model coroutine finishes. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
+After receiving a complete terminal response, the client sends its signed
+receipt and waits for server EOF before returning or reporting the error.
+The server then returns the connection slot without waiting for client EOF.
+This receipt also prevents STREAM close from discarding a queued terminal
+response. A missing receipt expires within `publication_timeout`.
 `max_connections` bounds tracked peers and waiting metadata; byte and in-flight
 limits include accepted requests whose clients have gone away. Limits govern
 ingress buffers, not processor allocations, unrelated applications or GPU memory.

@@ -58,7 +58,7 @@ def frame(body):
 
 
 def proof(key, purpose, challenge, nonce):
-    return hmac.digest(key, b"vane-embedding-stream-2/" + purpose + challenge + nonce, hashlib.sha256)
+    return hmac.digest(key, b"vane-embedding-stream-3/" + purpose + challenge + nonce, hashlib.sha256)
 
 
 @contextlib.asynccontextmanager
@@ -352,6 +352,210 @@ def test_fragmented_authenticated_request_round_trip(tmp_path, monkeypatch):
                     assert service.credits.bytes == 0 and len(sdk.calls) == 1
                 finally:
                     await owner.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome", ["success", "configuration", "resource", "execution"])
+def test_terminal_receipt_reclaims_slot_without_losing_response(tmp_path, monkeypatch, outcome):
+    async def run():
+        async with service_fixture(tmp_path, monkeypatch, max_connections=1, max_inflight=1) as (
+            service,
+            root,
+            sdk,
+        ):
+            expected = [0.123456789012345] * 16384
+            original_infer = service._infer
+
+            async def infer(_):
+                if outcome == "resource":
+                    raise MemoryError("fixture allocation")
+                if outcome == "execution":
+                    raise RuntimeError("fixture inference")
+                return {"vector": expected}
+
+            with monkeypatch.context() as patch:
+                patch.setattr(service, "_infer", infer)
+                async with tcp_peer(root, authenticate=True) as (reader, writer, _, request_id, key):
+                    owner = client(root)
+                    try:
+                        parts, _, size = ipc.describe(content("text", ""), owner.spec)
+                        message = owner._reservation(parts, size, request_id)
+                        if outcome == "configuration":
+                            message["service_id"] = "wrong-service"
+                        writer.write(frame(transport._pack(message, key, b"request")))
+                        await writer.drain()
+                        response = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
+                        if outcome != "configuration":
+                            assert response["state"] == "reserved"
+                            writer.write(
+                                frame(
+                                    transport._pack({"request_id": request_id, "state": "published"}, key, b"request")
+                                )
+                            )
+                            await writer.drain()
+                            response = transport._unpack(
+                                await asyncio.wait_for(read_record(reader), 2), key, b"response"
+                            )
+                        if outcome == "success":
+                            # This exceeds a TCP/STREAM chunk; closing right
+                            # after enqueueing it could discard part or all.
+                            assert response["vector"] == expected
+                        else:
+                            assert response["error"] == outcome
+                        assert len(service._zmq_server.peers) == 1
+                        assert service.credits.bytes == service.credits.inflight == 0
+                        writer.write(
+                            frame(transport._pack({"request_id": request_id, "state": "received"}, key, b"request"))
+                        )
+                        await writer.drain()
+                        assert await asyncio.wait_for(reader.read(1), 2) == b""
+                        # Keep the TCP writer open across the next request.
+                        assert not service._zmq_server.peers
+                        patch.setattr(service, "_infer", original_infer)
+                        await healthy_request(root)
+                    finally:
+                        await owner.aclose()
+
+    asyncio.run(run())
+
+
+def test_missing_terminal_receipt_expires_and_returns_slot(tmp_path, monkeypatch):
+    async def run():
+        async with service_fixture(
+            tmp_path, monkeypatch, max_connections=1, max_inflight=1, publication_timeout=0.2
+        ) as (service, root, sdk):
+            async with tcp_peer(root, authenticate=True) as (reader, writer, _, request_id, key):
+                owner = client(root)
+                try:
+                    parts, _, size = ipc.describe(content("text", ""), owner.spec)
+                    message = owner._reservation(parts, size, request_id)
+                    message["service_id"] = "wrong-service"
+                    writer.write(frame(transport._pack(message, key, b"request")))
+                    await writer.drain()
+                    response = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
+                    assert response["error"] == "configuration"
+                    assert await asyncio.wait_for(reader.read(1), 2) == b""
+                    assert not service._zmq_server.peers and not sdk.calls
+                    await healthy_request(root)
+                finally:
+                    await owner.aclose()
+
+    asyncio.run(run())
+
+
+def test_terminal_receipt_waits_for_unpublished_cleanup(tmp_path, monkeypatch):
+    async def run():
+        async with service_fixture(tmp_path, monkeypatch, max_connections=1, max_inflight=1) as (
+            service,
+            root,
+            sdk,
+        ):
+            async with tcp_peer(root, authenticate=True) as (reader, writer, _, request_id, key):
+                owner = client(root)
+                locked = False
+                try:
+                    parts, _, size = ipc.describe(content("text", "input"), owner.spec)
+                    writer.write(frame(transport._pack(owner._reservation(parts, size, request_id), key, b"request")))
+                    await writer.drain()
+                    reserved = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
+                    assert reserved["state"] == "reserved"
+                    await service.credits.condition.acquire()
+                    locked = True
+                    # A mismatched publication is rejected by the receiver
+                    # while the handler still owns the unpublished input.
+                    writer.write(frame(transport._pack({"request_id": "wrong", "state": "published"}, key, b"request")))
+                    await writer.drain()
+                    response = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
+                    assert response["error"] == "configuration"
+                    handler = next(iter(service._tasks))
+                    writer.write(
+                        frame(transport._pack({"request_id": request_id, "state": "received"}, key, b"request"))
+                    )
+                    await writer.drain()
+                    await until(handler.cancelling)
+                    assert service._zmq_server.peers
+                    assert service._zmq_server.pending
+                    assert service.credits.inflight == 1 and not sdk.calls
+                    service.credits.condition.release()
+                    locked = False
+                    assert await asyncio.wait_for(reader.read(1), 2) == b""
+                    assert not service._zmq_server.peers and not service._zmq_server.pending
+                    assert not service._zmq_server.buffers
+                    assert service.credits.bytes == service.credits.inflight == 0
+                    await healthy_request(root)
+                finally:
+                    if locked:
+                        service.credits.condition.release()
+                    await owner.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", ["identity", "state", "signature"])
+def test_invalid_terminal_receipt_cannot_start_another_request(tmp_path, monkeypatch, invalid):
+    async def run():
+        async with service_fixture(tmp_path, monkeypatch, max_connections=1, max_inflight=1) as (
+            service,
+            root,
+            sdk,
+        ):
+            async with tcp_peer(root, authenticate=True) as (reader, writer, _, request_id, key):
+                owner = client(root)
+                try:
+                    parts, _, size = ipc.describe(content("text", ""), owner.spec)
+                    message = owner._reservation(parts, size, request_id)
+                    message["service_id"] = "wrong-service"
+                    writer.write(frame(transport._pack(message, key, b"request")))
+                    await writer.drain()
+                    response = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
+                    assert response["error"] == "configuration"
+                    receipt = {"request_id": request_id, "state": "received"}
+                    if invalid == "identity":
+                        receipt["request_id"] = uuid.uuid4().hex
+                    elif invalid == "state":
+                        receipt["state"] = "published"
+                    body = transport._pack(receipt, b"wrong key" if invalid == "signature" else key, b"request")
+                    writer.write(frame(body))
+                    await writer.drain()
+                    assert await asyncio.wait_for(reader.read(1), 2) == b""
+                    assert not service._zmq_server.peers and not sdk.calls
+                    await healthy_request(root)
+                finally:
+                    await owner.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("error", ["resource", "configuration"])
+def test_receipt_send_failure_preserves_fatal_response(tmp_path, monkeypatch, error):
+    async def run():
+        async with service_fixture(tmp_path, monkeypatch) as (service, root, sdk):
+            instance = client(root, **({"service_id": "wrong-service"} if error == "configuration" else {}))
+            instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda value: value)
+            send = stream.Connection.send
+
+            async def fail_receipt(connection, body):
+                if connection.key is not None:
+                    message = transport._unpack(body, connection.key, b"request")
+                    if message.get("state") == "received":
+                        raise ConnectionError("receipt transport failed")
+                await send(connection, body)
+
+            async def fail_inference(_):
+                raise MemoryError("fixture allocation")
+
+            monkeypatch.setattr(stream.Connection, "send", fail_receipt)
+            sdk.on_embedding = fail_inference
+            try:
+                expected = MemoryError if error == "resource" else EmbeddingConfigurationError
+                with pytest.raises(expected):
+                    await instance.embed_text(["query"])
+                await until(lambda: not service._zmq_server.peers)
+                assert service.credits.bytes == service.credits.inflight == 0
+                assert len(sdk.calls) == (1 if error == "resource" else 0)
+            finally:
+                await instance.aclose()
 
     asyncio.run(run())
 

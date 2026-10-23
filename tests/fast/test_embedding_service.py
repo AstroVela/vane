@@ -166,6 +166,49 @@ def test_ingest_and_search_clients_share_one_engine(process, family):
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
+def test_serial_requests_reclaim_connection_before_client_eof(process, monkeypatch, family):
+    proc, root = process(family, max_connections=1, max_inflight=1)
+
+    async def run():
+        await until(lambda: (root / "ready").exists() or proc.poll() is not None)
+        assert proc.poll() is None
+        instance = client(root, family, timeout=3, max_concurrency_per_actor=1)
+        close = zmq.asyncio.Socket.close
+        held = []
+
+        def delay_client_eof(socket, *args, **kwargs):
+            # Keep completed client sockets open to force the successor to
+            # arrive before EOF, independently of libzmq's scheduling.
+            held.append((socket, args, kwargs))
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(zmq.asyncio.Socket, "close", delay_client_eof)
+                for index in range(20):
+                    if index == 1:
+                        (root / "memory_error").touch()
+                        try:
+                            with pytest.raises(MemoryError, match="resources"):
+                                await instance.embed_text(["allocation failure"])
+                        finally:
+                            (root / "memory_error").unlink()
+                    else:
+                        np.testing.assert_equal(await instance.embed_text([f"serial request {index}"]), [[3, 4]])
+                    # Keep at most one completed client open across calls.
+                    while len(held) > 1:
+                        socket, args, kwargs = held.pop(0)
+                        close(socket, *args, **kwargs)
+            await until(lambda: state(root).get("calls") == 20 and state(root).get("inflight") == 0)
+            assert state(root)["engines"] == 1
+        finally:
+            for socket, args, kwargs in held:
+                close(socket, *args, **kwargs)
+            await instance.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
 def test_cancelled_mapped_input_holds_credit_until_model_finishes(process, family):
     proc, root = process(family, max_bytes=200, max_inflight=2)
     (root / "hold").touch()
@@ -1558,7 +1601,9 @@ def test_empty_request_round_trip_needs_no_shared_memory(tmp_path, monkeypatch, 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("bad", ["json", "protocol", "remote", "key", "file_permissions", "directory_permissions"])
+@pytest.mark.parametrize(
+    "bad", ["json", "protocol", "legacy_protocol", "remote", "key", "file_permissions", "directory_permissions"]
+)
 def test_invalid_rendezvous_is_fatal_even_with_ignore(tmp_path, monkeypatch, bad):
     if os.name != "posix" and "permissions" in bad:
         pytest.skip("POSIX permission bits; Windows uses the user directory ACL")
@@ -1578,8 +1623,9 @@ def test_invalid_rendezvous_is_fatal_even_with_ignore(tmp_path, monkeypatch, bad
         elif bad == "directory_permissions":
             root.chmod(0o755)
         else:
-            data[{"protocol": "protocol", "remote": "endpoint", "key": "key"}[bad]] = {
+            data[{"protocol": "protocol", "legacy_protocol": "protocol", "remote": "endpoint", "key": "key"}[bad]] = {
                 "protocol": "unix",
+                "legacy_protocol": "vane-embedding-stream-2",
                 "remote": "tcp://example.com:1234",
                 "key": "invalid",
             }[bad]

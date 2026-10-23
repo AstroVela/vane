@@ -35,7 +35,7 @@ from vane.ai import _embedding_stream as stream
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._errors import _is_resource_error
 
-PROTOCOL = "vane-embedding-stream-2"
+PROTOCOL = "vane-embedding-stream-3"
 MAX_ENDPOINT_BYTES = 4096
 
 
@@ -145,6 +145,24 @@ class Client:
             sock.close(linger=0)
         self.context.term()
 
+    async def _acknowledge(self, connection: stream.Connection, response: Any, request_id: str) -> None:
+        if not isinstance(response, dict) or response.get("request_id") != request_id:
+            raise EmbeddingConfigurationError("Embedding service response identity mismatch")
+        assert connection.key is not None
+        try:
+            await connection.send(_pack({"request_id": request_id, "state": "received"}, connection.key, b"request"))
+            try:
+                await connection.receive()
+            except ConnectionError:
+                # The server closes only after receiving the signed receipt.
+                # Its slot is available before the client returns or raises.
+                return
+            raise EmbeddingConfigurationError("Unexpected embedding response after completion")
+        finally:
+            # A failed receipt must not turn an authenticated fatal resource
+            # or configuration error into an ignorable transport failure.
+            self.owner._check_response(response, request_id)
+
     async def request(self, plan: Any) -> np.ndarray:
         parts, arrays, size = plan
         endpoint, key = _read_endpoint(self.owner.options["service_path"])
@@ -161,6 +179,8 @@ class Client:
             key = connection.key
             await connection.send(_pack(self.owner._reservation(parts, size, request_id), key, b"request"))
             response = _unpack(await connection.receive(), key, b"response")
+            if isinstance(response, dict) and "error" in response:
+                await self._acknowledge(connection, response, request_id)
             self.owner._check_response(response, request_id)
             if response.get("state") != "reserved" or response.get("nbytes") != size:
                 raise EmbeddingConfigurationError("Embedding service did not reserve the input")
@@ -185,6 +205,7 @@ class Client:
             self.owner.metrics["input_bytes"] += size
             await connection.send(_pack({"request_id": request_id, "state": "published"}, key, b"request"))
             response = _unpack(await connection.receive(), key, b"response")
+            await self._acknowledge(connection, response, request_id)
             self.owner._check_response(response, request_id)
             if response.get("state") != "released":
                 raise EmbeddingConfigurationError("Embedding service omitted consumption acknowledgement")
@@ -277,6 +298,19 @@ class Server:
             raise ConnectionError("Embedding service client disconnected")
         await self._send_bytes(identity, _pack(message, peer.key, b"response"))
 
+    async def _send_terminal(self, identity: bytes, message: Any) -> None:
+        peer = self.peers.get(identity)
+        if peer is None or peer.awaiting_receipt:
+            raise ConnectionError("Embedding service client disconnected or completed")
+        peer.awaiting_receipt = True
+        peer.messages = 2
+        self._deadline(identity, peer)
+        try:
+            await self._send(identity, message)
+        except BaseException:
+            self._disconnect(identity)
+            raise
+
     def _deadline(self, identity: bytes, peer: stream.Peer) -> None:
         if peer.deadline is not None:
             peer.deadline.cancel()
@@ -346,15 +380,27 @@ class Server:
                         self._deadline(identity, peer)
                     else:
                         peer.messages += 1
+                        if peer.awaiting_receipt:
+                            receipt = _unpack(body, peer.key, b"request")
+                            if peer.messages != 3 or receipt != {"request_id": peer.request_id, "state": "received"}:
+                                raise EmbeddingConfigurationError("Invalid embedding completion receipt")
+                            # STREAM close drops queued output. A receipt proves
+                            # the terminal response arrived before closing and
+                            # returning the slot; no client EOF is required.
+                            peer.receipt_received = True
+                            task = self.unpublished.pop(identity, None)
+                            if task is not None:
+                                task.cancel()
+                            if identity not in self.pending:
+                                self._disconnect(identity)
+                            break
                         if peer.messages > 2:
                             raise EmbeddingConfigurationError("Unexpected embedding control record")
                         await self._message(identity, peer, _unpack(body, peer.key, b"request"))
             except Exception as error:
-                if peer.key is not None and _is_resource_error(error):
+                if peer.key is not None and not peer.awaiting_receipt and _is_resource_error(error):
                     with contextlib.suppress(Exception):
-                        await self._send(identity, {"request_id": peer.request_id, "error": "resource"})
-                    peer.messages = 2
-                    self._deadline(identity, peer)
+                        await self._send_terminal(identity, {"request_id": peer.request_id, "error": "resource"})
                 else:
                     self._disconnect(identity)
 
@@ -386,16 +432,14 @@ class Server:
             task = asyncio.create_task(self._handle(identity, message, size, queue))
             self.unpublished[identity] = task
             self.owner._tasks.add(task)
-            task.add_done_callback(partial(self._finished, identity=identity, queue=queue))
+            task.add_done_callback(partial(self._finished, identity=identity, queue=queue, peer=peer))
         except Exception as error:
-            peer.messages = 2
-            await self._send(
+            await self._send_terminal(
                 identity,
                 {"request_id": peer.request_id, "error": "resource" if _is_resource_error(error) else "configuration"},
             )
-            self._deadline(identity, peer)
 
-    def _finished(self, task: asyncio.Task[Any], identity: bytes, queue: asyncio.Queue[Any]) -> None:
+    def _finished(self, task: asyncio.Task[Any], identity: bytes, queue: asyncio.Queue[Any], peer: stream.Peer) -> None:
         self.owner._tasks.discard(task)
         # A task cancelled before its first step never enters _handle's finally.
         # Do not remove a newer request that happens to reuse the routing identity.
@@ -406,9 +450,8 @@ class Server:
             self.unpublished.pop(identity)
         if not task.cancelled():
             task.exception()
-        peer = self.peers.get(identity)
-        if peer is not None:
-            self._deadline(identity, peer)
+        if self.peers.get(identity) is peer and (peer.receipt_received or not peer.awaiting_receipt):
+            self._disconnect(identity)
 
     async def _handle(self, identity: bytes, message: dict[str, Any], size: int, queue: asyncio.Queue[Any]) -> None:
         owner = self.owner
@@ -499,4 +542,4 @@ class Server:
                 owner.metrics["cleanup_seconds"] += time.monotonic() - cleaned
                 self.pending.pop(identity, None)
         with contextlib.suppress(Exception):
-            await self._send(identity, {"request_id": message["request_id"], "state": "released", **response})
+            await self._send_terminal(identity, {"request_id": message["request_id"], "state": "released", **response})

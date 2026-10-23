@@ -24,7 +24,7 @@ AUTH_BYTES = 64
 
 
 def proof(key: bytes, purpose: bytes, challenge: bytes, nonce: bytes) -> bytes:
-    return hmac.digest(key, b"vane-embedding-stream-2/" + purpose + challenge + nonce, hashlib.sha256)
+    return hmac.digest(key, b"vane-embedding-stream-3/" + purpose + challenge + nonce, hashlib.sha256)
 
 
 def record(body: bytes) -> bytes:
@@ -118,3 +118,5 @@ class Peer:
         self.deadline: Any = None
         self.messages = 0
         self.request_id: str | None = None
+        self.awaiting_receipt = False
+        self.receipt_received = False
