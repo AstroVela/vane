@@ -30,7 +30,9 @@ commits under `external/duckdb`.
 
 Vane's engine customizations are retained as normal commits after that subtree
 snapshot. They include binding supplied SQL parameters on query relations for
-distributed plan transport; those engine changes retain DuckDB's MIT license.
+distributed plan transport and taking pending-query progress snapshots under
+the client context lock so query cleanup cannot invalidate progress readers.
+Those engine changes retain DuckDB's MIT license.
 The former `AstroVela/duckdb` history maps to Vane as follows:
 
 | Former fork commit | Parent | Corresponding Vane commit |

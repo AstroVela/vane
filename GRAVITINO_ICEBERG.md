@@ -295,9 +295,13 @@ trailing bytes before replacing the worker's file list. A missing assignment
 fails; an explicit empty assignment clears files and produces no rows. An
 empty table retains its schema and uses the framework's explicit empty split.
 
-M5a is based on M4b commit `0606e2a038b4007a04bf34541e76af0462cff113`.
-The engine identities and upstream source pins remain those in the fixed-input
-table. The additional frozen-scan patch has SHA-256
+M5a retains M4b commit `0606e2a038b4007a04bf34541e76af0462cff113` and
+integrates upstream main `8ef29bee9d5d1ada3d7d5efe77302a296ff6576a`.
+The table above records the historical M4a/M4b engine. M5a's current engine
+tree SourceID is `aaa05c82f52d494cf53b3199fe8b2711395aae4d` and its fork
+revision is `8ef29bee9d5d1ada3d7d5efe77302a296ff6576a`; the Iceberg/Avro
+source pins, SDK profile and service identity are unchanged. Both providers
+must be rebuilt for that engine identity. The additional frozen-scan patch has SHA-256
 `b6f1ff2b097c176744b0bd1c9dd0721ac567247b0fece83e82f5666f28988be9`.
 The existing local compatibility patch is unchanged. Apply both in order.
 

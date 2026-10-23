@@ -18,9 +18,10 @@ source/relink delivery checks. Original upstream notices remain intact.
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
-The query-relation parameter binding changes under `external/duckdb` remain MIT
-licensed. Connection runner dispatch, interruption, and result ownership changes in the
-inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
+The query-relation parameter binding and pending-query progress snapshot changes
+under `external/duckdb` remain MIT licensed. Connection runner dispatch,
+interruption, and result ownership changes in the inherited Python client retain
+their `MIT AND Apache-2.0` file-level notices.
 
 ## Vendored native dependencies
 
