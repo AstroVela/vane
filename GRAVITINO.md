@@ -1,4 +1,4 @@
-# Gravitino catalog and Filesets
+# Gravitino catalog, Filesets, and discovery
 
 The optional `gravitino` C++ extension connects Vane to Apache Gravitino 1.3
 FILESET catalogs. It uses DuckDB's `StorageExtension`, `Catalog`, and
@@ -35,6 +35,103 @@ in the development workflow.
 
 For an explicitly static development build, add `gravitino` to `BUILD_EXTENSIONS`
 and use `connection.execute("LOAD gravitino")`.
+
+## Browse a metalake
+
+`GravitinoMetalake` discovers catalogs, schemas, and tables through the native
+connector. It uses a separate READ_ONLY `gravitino_metalake` attachment and does
+not require a FILESET catalog to be attached. This is the M3 metadata API;
+[design issue #1062](https://github.com/AstroVela/vane/issues/1062) records its scope.
+It can be used independently of the Fileset write work in #1061.
+
+```python
+import os
+import vane
+from vane.catalog import GravitinoMetalake
+
+with vane.connect() as connection:
+    vane.load_installed_extension("gravitino", connection=connection)
+    with GravitinoMetalake.connect(
+        connection,
+        endpoint=os.environ["GRAVITINO_URL"],
+        metalake="production",
+        token=os.environ.get("GRAVITINO_TOKEN", ""),
+    ) as metadata:
+        catalogs = metadata.list_catalogs()
+        schemas = metadata.list_schemas("iceberg")
+        tables = metadata.list_tables("iceberg", "analytics")
+        table = metadata.load_table("iceberg", "analytics", "orders")
+        print(table.identifier.namespace, table.identifier.name)
+        print(table.provider, table.format, table.capabilities.table_read)
+```
+
+The API includes `list_catalogs`, `load_catalog`, `list_schemas`, `load_schema`,
+`list_tables`, and `load_table`. Lists return `GravitinoIdentifier` objects with
+an immutable `namespace` tuple and `name`; dots, Unicode, and escaped characters
+remain part of their individual names. Catalog, schema, and table namespaces
+have one, two, and three parent components respectively. Lists follow one REST
+listing operation and do not recursively traverse child schemas or load every
+listed object's details. Catalog/schema lists use one request; table lists also
+load their parent catalog to validate its relational type.
+
+Detail loads return `GravitinoResource` with `identifier`, `kind`, canonical
+uppercase `catalog_type`, `provider`, available `format`, `capabilities`, and a
+metadata dictionary. Schema/table details load the parent catalog explicitly
+to obtain provider information. Descriptions are observations, without a pinned
+snapshot or automatic storage configuration. Editing the local dictionary does
+not change the server. Lists and prepared executions bind fresh metadata;
+there is no cross-execution cache.
+
+Capabilities describe metadata access and **relational table execution through
+Gravitino**, separately from the existing Fileset I/O API:
+
+| State | Meaning |
+| --- | --- |
+| `supported` | Metadata was successfully loaded through this connector. |
+| `unsupported` | Relational table execution is not provided for this catalog/provider. |
+| `unverified` | An execution provider still needs qualification; this includes Iceberg and unknown providers. |
+
+M3 exposes `metadata_read="supported"` on successfully loaded descriptions.
+`table_read` and `table_write` remain `unverified` for Iceberg, and `unsupported`
+for FILESET/non-table catalogs and the explicitly metadata-only Hive, generic,
+PostgreSQL and MySQL routes. Discovery does not execute table reads or writes,
+create a remote resource, or import credentials from catalog properties.
+Fileset operations continue to use `GravitinoCatalog` below.
+
+`connect` verifies the metalake and creates a uniquely named local attachment.
+Use the context manager or `close()` to detach it; a successful close is
+idempotent. The attachment also follows DuckDB's underlying database lifetime.
+The Python handle always uses its supplied connection. For native SQL clients:
+
+```sql
+ATTACH 'production' AS discovery
+    (TYPE gravitino_metalake, READ_ONLY, ENDPOINT $endpoint, TOKEN $token);
+SELECT namespace, name FROM gravitino_metalake_catalogs('discovery');
+SELECT * FROM gravitino_metalake_table('discovery', 'iceberg', 'analytics', 'orders');
+DETACH discovery;
+```
+
+Bind token values as parameters. Tokens remain private to the native client and
+are removed from public attachment options. Credential-like keys in returned
+`properties` maps are replaced with `[REDACTED]` **before** metadata enters a
+result or serialized plan. This includes password, secret, token, credential,
+access-key, private-key and authorization keys, including case/punctuation
+variants. Other server-supplied metadata is observational data, not trusted
+connection configuration.
+
+The existing HTTP response/timeout limits apply (`max_response_bytes` defaults
+to 2 MiB and allows at most 16 MiB). Each list is limited to 4096 identifiers;
+identifiers allow at most 1024 UTF-8 bytes per component. Response names and
+namespaces must match the requested parent. Duplicate identifiers, unsupported
+continuation tokens, incomplete lists, and metadata nesting beyond 64 levels
+fail explicitly. Missing resources raise `CatalogException`; HTTP/transport or
+malformed-response failures remain errors rather than empty lists.
+
+Both native local execution (`local`, with `local-fast` as an alias) and Ray
+are covered. Ray transports frozen, redacted metadata rows; workers do not
+replay the discovery attachment, receive its token, or query Gravitino.
+Matching base/provider artifacts are required on every worker. Authentication
+extensions and credential vending/refresh remain outside M3.
 
 ## Register and read resources
 
@@ -276,8 +373,8 @@ actual native file reads. Run non-Ray and Ray tests in separate processes:
 
 ```bash
 export VANE_TEST_GRAVITINO=provider # use static for a static development build
-scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'not real_ray'
-scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'real_ray and not ray_cluster_owner'
+scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'not real_ray'
+scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'real_ray and not ray_cluster_owner'
 scripts/run_installed_pytest.sh tests/fast/test_gravitino_write.py -m 'real_ray and ray_cluster_owner'
 ```
 

@@ -82,7 +82,11 @@ static void InitializeCurl() {
 void GravitinoConfig::Validate() {
 	InitializeCurl();
 	GravitinoClient::Identifier(metalake);
-	GravitinoClient::Identifier(catalog);
+	if (scope == GravitinoScope::CATALOG) {
+		GravitinoClient::Identifier(catalog);
+	} else if (!catalog.empty() || !location_name.empty()) {
+		throw InvalidInputException("Metalake discovery does not select a catalog or storage location");
+	}
 	if (endpoint.empty() || endpoint.size() > 8192 || endpoint.find('\0') != string::npos || token.size() > 16384 ||
 	    token.find_first_of("\r\n") != string::npos || token.find('\0') != string::npos) {
 		throw InvalidInputException("Invalid Gravitino endpoint or bearer token");
@@ -207,6 +211,9 @@ static void SetCurlOption(CURL *curl, CURLoption option, T value) {
 }
 GravitinoResponse GravitinoClient::Request(ClientContext &context, const string &method, const string &suffix,
                                            const string &body, long allowed_error_status) const {
+	if (config.scope == GravitinoScope::METALAKE && method != "GET") {
+		throw PermissionException("Gravitino metalake discovery is read-only");
+	}
 	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 		throw PermissionException("Gravitino requires enable_external_access");
 	}
@@ -221,8 +228,11 @@ GravitinoResponse GravitinoClient::Request(ClientContext &context, const string 
 	if (!curl) {
 		throw OutOfMemoryException("Could not allocate Gravitino HTTP client");
 	}
-	string url =
-	    config.endpoint + "/api/metalakes/" + Encode(config.metalake) + "/catalogs/" + Encode(config.catalog) + suffix;
+	string url = config.endpoint + "/api/metalakes/" + Encode(config.metalake);
+	if (config.scope == GravitinoScope::CATALOG) {
+		url += "/catalogs/" + Encode(config.catalog);
+	}
+	url += suffix;
 	GravitinoTransfer transfer {context, config.max_response_bytes};
 	curl_slist *headers = nullptr;
 	std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_owner(nullptr, curl_slist_free_all);
@@ -313,6 +323,16 @@ GravitinoResponse GravitinoClient::Request(ClientContext &context, const string 
 }
 GravitinoJson GravitinoClient::Get(ClientContext &context, const string &suffix) const {
 	return GravitinoJson(Request(context, "GET", suffix).body);
+}
+GravitinoJson GravitinoClient::GetDiscovery(ClientContext &context, const string &suffix) const {
+	if (config.scope != GravitinoScope::METALAKE) {
+		throw InvalidInputException("Discovery requires a Gravitino metalake attachment");
+	}
+	auto response = Request(context, "GET", suffix, "", 404);
+	if (response.status == 404) {
+		throw CatalogException("Gravitino discovery resource was not found");
+	}
+	return GravitinoJson(response.body);
 }
 vector<string> GravitinoClient::List(ClientContext &context, const string &suffix) const {
 	auto response = Get(context, suffix);

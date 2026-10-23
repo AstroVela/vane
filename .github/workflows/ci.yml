@@ -273,8 +273,8 @@ jobs:
             --license-file external/duckdb/LICENSE \
             --license-file LICENSES/vcpkg-binary-dependencies.txt
           python -m pip install --no-deps "$RUNNER_TEMP"/gravitino/wheels/*.whl
-          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'not real_ray'
-          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'real_ray and not ray_cluster_owner'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'not real_ray'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'real_ray and not ray_cluster_owner'
           scripts/run_installed_pytest.sh tests/fast/test_gravitino_write.py -m 'real_ray and ray_cluster_owner'
 
       - name: Upload the signed Gravitino test provider

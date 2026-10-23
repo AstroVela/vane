@@ -20,7 +20,7 @@ import vane
 from tests.fast.test_gravitino import gravitino_http as gravitino_http
 from tests.fast.test_gravitino import load_gravitino
 from tests.fast.test_gravitino_write import configure_s3, read_literal_batch
-from vane.catalog import GravitinoCatalog
+from vane.catalog import GravitinoCatalog, GravitinoIdentifier, GravitinoMetalake
 
 pytestmark = pytest.mark.external_service
 
@@ -138,6 +138,94 @@ def test_live_gravitino_s3_partitioned_batch(request, monkeypatch, live_gravitin
             assert result.files
             assert read_literal_batch(connection, result) == expected
             assert bool(result.manifest_path) == (runner == "ray")
+
+
+@pytest.fixture
+def live_discovery_catalog(live_gravitino):
+    endpoint, metalake, _directory, api = live_gravitino
+    base = f"/metalakes/{metalake}/catalogs/metadata"
+    # The server owns this uniquely named temporary dataset. Vane queries its
+    # REST metadata only; this does not qualify Vane's Lance execution support.
+    api(
+        "POST",
+        f"/metalakes/{metalake}/catalogs",
+        {
+            "name": "metadata",
+            "type": "RELATIONAL",
+            "provider": "lakehouse-generic",
+            "properties": {"location": f"/tmp/{metalake}_discovery"},
+        },
+    )
+    api("POST", base + "/schemas", {"name": "analytics", "properties": {}})
+    created = False
+    try:
+        api(
+            "POST",
+            base + "/schemas/analytics/tables",
+            {
+                "name": "items",
+                "columns": [{"name": "id", "type": "long", "nullable": True}],
+                "properties": {"format": "lance"},
+            },
+        )
+        created = True
+        yield endpoint, metalake, api
+    finally:
+        if created:
+            # The fixture's managed table owns its temporary dataset.
+            api("DELETE", base + "/schemas/analytics/tables/items")
+
+
+@pytest.mark.parametrize("runner", ["local", pytest.param("ray", marks=pytest.mark.real_ray)])
+def test_live_metalake_discovery_without_fileset_attachment(request, monkeypatch, live_discovery_catalog, runner):
+    if runner == "ray":
+        request.getfixturevalue("ray_local")
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    endpoint, metalake, _api = live_discovery_catalog
+    with vane.connect() as connection:
+        load_gravitino(connection)
+        with GravitinoMetalake.connect(connection, endpoint=endpoint, metalake=metalake) as discovery:
+            assert set(discovery.list_catalogs()) == {
+                GravitinoIdentifier((metalake,), "media"),
+                GravitinoIdentifier((metalake,), "metadata"),
+            }
+            catalog = discovery.load_catalog("metadata")
+            assert catalog.catalog_type == "RELATIONAL"
+            assert catalog.provider == "lakehouse-generic"
+            assert catalog.capabilities.metadata_read == "supported"
+            assert catalog.capabilities.table_read == catalog.capabilities.table_write == "unsupported"
+            assert discovery.list_schemas("metadata") == [GravitinoIdentifier((metalake, "metadata"), "analytics")]
+            schema = discovery.load_schema("metadata", "analytics")
+            assert schema.identifier == GravitinoIdentifier((metalake, "metadata"), "analytics")
+            assert discovery.list_tables("metadata", "analytics") == [
+                GravitinoIdentifier((metalake, "metadata", "analytics"), "items")
+            ]
+            table = discovery.load_table("metadata", "analytics", "items")
+            assert table.identifier == GravitinoIdentifier((metalake, "metadata", "analytics"), "items")
+            assert table.provider == "lakehouse-generic"
+            assert table.format == "lance"
+            assert table.metadata["columns"][0]["name"] == "id"
+            assert connection.execute("SELECT count(*) FROM duckdb_databases() WHERE type='gravitino'").fetchone() == (
+                0,
+            )
+
+
+def test_live_discovery_preserves_fileset_only_attach_and_missing_resource_errors(live_discovery_catalog):
+    endpoint, metalake, _api = live_discovery_catalog
+    with vane.connect() as connection:
+        load_gravitino(connection)
+        with GravitinoMetalake.connect(connection, endpoint=endpoint, metalake=metalake) as discovery:
+            with pytest.raises(vane.NotImplementedException, match="FILESET"):
+                GravitinoCatalog.attach(
+                    connection, "relational", endpoint=endpoint, metalake=metalake, catalog="metadata"
+                )
+            fileset = GravitinoCatalog.attach(
+                connection, "media", endpoint=endpoint, metalake=metalake, catalog="media"
+            )
+            assert fileset.metadata()["name"] == "media"
+            assert discovery.load_catalog("media").catalog_type == "FILESET"
+            with pytest.raises(vane.CatalogException, match="not found"):
+                discovery.load_table("metadata", "analytics", "missing")
 
 
 def test_live_gravitino_metadata_crud(live_gravitino):

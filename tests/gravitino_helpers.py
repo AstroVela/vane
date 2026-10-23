@@ -51,6 +51,8 @@ def serve_gravitino(state, ready):
                 if fault == "not-dropped":
                     return self.respond(200, {"code": 0, "dropped": False})
             path = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
+            if discovery := state.get("discovery"):
+                return self.discovery_request(path, discovery)
             if path[:6] != ["prefix", "api", "metalakes", "lake", "catalogs", "media"]:
                 return self.respond(404, {"code": 1001})
             path = path[6:]
@@ -113,6 +115,93 @@ def serve_gravitino(state, ready):
                 if key[1] != data["name"]:
                     state["filesets"][(schema, data["name"])] = state["filesets"].pop(key)
             self.respond(200, {"code": 0, "fileset": data})
+
+        def discovery_request(self, path, config):
+            if self.command != "GET":
+                return self.respond(405, {"code": 1001})
+            if path[:4] != ["prefix", "api", "metalakes", config["metalake"]]:
+                return self.respond(404, {"code": 1001})
+            if len(path) == 4:
+                return self.discovery_response({"code": 0, "metalake": {"name": config["metalake"]}})
+            if path[4] != "catalogs":
+                return self.respond(404, {"code": 1001})
+            if len(path) == 5:
+                return self.discovery_response(
+                    {
+                        "code": 0,
+                        "identifiers": [
+                            {"namespace": [config["metalake"]], "name": name} for name in config["catalogs"]
+                        ],
+                    }
+                )
+            catalog = path[5]
+            if catalog not in config["catalogs"]:
+                return self.respond(404, {"code": 1001})
+            if len(path) == 6:
+                return self.discovery_response({"code": 0, "catalog": config["catalogs"][catalog]})
+            if path[6] != "schemas":
+                return self.respond(404, {"code": 1001})
+            schemas = config["schemas"].get(catalog, {})
+            parent = [config["metalake"], catalog]
+            if len(path) == 7:
+                return self.discovery_response(
+                    {"code": 0, "identifiers": [{"namespace": parent, "name": name} for name in schemas]}
+                )
+            schema = path[7]
+            if schema not in schemas:
+                return self.respond(404, {"code": 1001})
+            if len(path) == 8:
+                return self.discovery_response({"code": 0, "schema": schemas[schema]})
+            if path[8] != "tables":
+                return self.respond(404, {"code": 1001})
+            tables = config["tables"].get((catalog, schema), {})
+            if len(path) == 9:
+                return self.discovery_response(
+                    {"code": 0, "identifiers": [{"namespace": parent + [schema], "name": name} for name in tables]}
+                )
+            if len(path) == 10 and path[9] in tables:
+                return self.discovery_response({"code": 0, "table": tables[path[9]]})
+            return self.respond(404, {"code": 1001})
+
+        def discovery_response(self, body):
+            fault = state.get("discovery_fault")
+            body = copy.deepcopy(body)
+            if fault == "not-found":
+                return self.respond(404, {"code": 1001})
+            if fault == "forbidden":
+                return self.respond(403, {"code": 1001})
+            key = "identifiers" if "identifiers" in body else None
+            if key:
+                namespace = body[key][0]["namespace"] if body[key] else []
+                if fault == "missing-list":
+                    del body[key]
+                elif fault == "bad-list":
+                    body[key] = {}
+                elif fault == "too-many":
+                    body[key] = [{"namespace": namespace, "name": f"name{i}"} for i in range(4097)]
+                elif fault == "duplicate" and body[key]:
+                    body[key].append(body[key][0])
+                elif fault == "bad-entry":
+                    body[key] = [123]
+                elif fault == "bad-name":
+                    body[key] = [{"namespace": namespace, "name": "../wrong"}]
+                elif fault == "bad-namespace":
+                    body[key][0]["namespace"] = ["different", "catalog"]
+                elif fault == "pagination":
+                    body["nextPageToken"] = "another-page"
+                elif fault == "has-more":
+                    body["hasMore"] = True
+            for kind in ("metalake", "catalog", "schema", "table"):
+                if kind in body:
+                    if fault == "wrong-resource":
+                        body[kind]["name"] = "not-the-requested-resource"
+                    elif fault == "missing-resource-name":
+                        del body[kind]["name"]
+                    elif fault == "missing-provider" and kind == "catalog":
+                        del body[kind]["provider"]
+                    elif fault == "bad-properties":
+                        body[kind]["properties"] = ["not-an-object"]
+            return self.respond(200, body)
 
         def object_request(self):
             state["object_requests"].append((self.command, self.headers.get("Authorization")))
