@@ -332,7 +332,10 @@ include = [
     "/tests/mlx_metal_reference.py",
     "/tests/ai/test_mlx_text_embedding.py",
     "/tests/fast/test_litert_provider.py",
+    "/tests/fast/test_litert_service.py",
     "/tests/ai/test_litert_embedding.py",
+    "/tests/ai/test_litert_embedding_service.py",
+    "/tests/ai/litert_service_process.py",
     "/tests/ai/test_mlx_image_embedding.py",
     "/tests/ai/test_mlx_audio_embedding.py",
     "/tests/ai/test_mlx_video_embedding.py",
@@ -399,6 +402,7 @@ include = [
     "/examples/multimodal_providers.py",
     "/examples/qwen3_vl_sqr.py",
     "/examples/litert_embedding_search.py",
+    "/examples/litert_service.json",
     "src/**",
     "vane/**",
 

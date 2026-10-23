@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from typing import Any, Literal, TypeAlias, TypedDict
 from urllib.parse import parse_qsl, urlsplit
 
-from vane.ai._litert_options import LITERT_COMMON_OPTIONS, LITERT_TEXT_OPTIONS, validate_litert_options
+from vane.ai._litert_options import LITERT_TEXT_OPTIONS, litert_option_names, validate_litert_options
 from vane.ai._redaction import is_sensitive_option_key
 
 VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
@@ -439,8 +439,10 @@ def validate_embed_options(
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
     if family == "mlx" and _input_kind != "text":
         allowed = _EMBED_COMMON_OPTIONS | _MLX_COMMON_DEFAULTS.keys()
-    if family == "litert" and _input_kind == "image":
-        allowed = _EMBED_COMMON_OPTIONS | LITERT_COMMON_OPTIONS
+    if family == "litert":
+        allowed = _EMBED_COMMON_OPTIONS | litert_option_names(
+            text=_input_kind == "text", service=copied.get("runtime") == "service"
+        )
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
     unknown = sorted(set(copied) - allowed)
@@ -453,16 +455,20 @@ def validate_embed_options(
         from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
         actor_number = copied.get("actor_number")
-        if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
-            raise EmbeddingConfigurationError("LiteRT requires actor_number=1")
-        if copied.get("execution_backend") not in (None, "subprocess_actor"):
-            raise EmbeddingConfigurationError("LiteRT requires execution_backend='subprocess_actor'")
+        service = copied.get("runtime") == "service"
+        if not service:
+            if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
+                raise EmbeddingConfigurationError("LiteRT requires actor_number=1")
+            if copied.get("execution_backend") not in (None, "subprocess_actor"):
+                raise EmbeddingConfigurationError("LiteRT requires execution_backend='subprocess_actor'")
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("LiteRT does not support character chunk averaging")
-        names = LITERT_TEXT_OPTIONS if _input_kind == "text" else LITERT_COMMON_OPTIONS
+        names = litert_option_names(text=_input_kind == "text", service=service)
         copied.update(
             validate_litert_options(
-                {key: value for key, value in copied.items() if key in names}, text=_input_kind == "text"
+                {key: value for key, value in copied.items() if key in names},
+                text=_input_kind == "text",
+                service=service,
             )
         )
         if actor_number is None:
@@ -627,7 +633,7 @@ def validate_embed_image_options(
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
-        allowed |= LITERT_COMMON_OPTIONS
+        allowed |= litert_option_names(text=False, service=options.get("runtime") == "service")
     if provider_family == "mlx":
         allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":

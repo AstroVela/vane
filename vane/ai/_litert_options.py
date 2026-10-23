@@ -31,22 +31,54 @@ LITERT_COMMON_OPTIONS = frozenset(
     }
 )
 LITERT_TEXT_OPTIONS = LITERT_COMMON_OPTIONS | {"input_type"}
+LITERT_SERVICE_OPTIONS = frozenset(
+    {
+        "runtime",
+        "service_path",
+        "service_id",
+        "model_sha256",
+        "max_length",
+        "vision_tokens_per_image",
+        "max_input_bytes",
+        "timeout",
+        "max_concurrency_per_actor",
+    }
+)
 
 
-def validate_litert_options(options: Any, *, text: bool) -> dict[str, Any]:
+def litert_option_names(*, text: bool, service: bool) -> frozenset[str]:
+    names = LITERT_SERVICE_OPTIONS if service else LITERT_COMMON_OPTIONS
+    return names | {"input_type"} if text else names
+
+
+def validate_litert_model(model: str | None, dimensions: int | None, kind: str) -> tuple[str, int]:
+    selected = LITERT_DEFAULT_MODEL if model is None else model
+    width = 768 if dimensions is None else dimensions
+    if selected not in LITERT_MODELS:
+        raise EmbeddingConfigurationError("LiteRT requires one of the declared EmbeddingGemma 2 LiteRT-LM models")
+    if type(width) is not int or width not in LITERT_DIMENSIONS:
+        raise EmbeddingConfigurationError("LiteRT dimensions must be 128, 256, 512 or 768")
+    if kind != "multimodal" and kind not in LITERT_MODELS[selected]:
+        raise EmbeddingConfigurationError("Selected LiteRT model does not support this input modality")
+    return selected, width
+
+
+def validate_litert_options(options: Any, *, text: bool, service: bool = False) -> dict[str, Any]:
     copied = dict(options)
-    allowed = LITERT_TEXT_OPTIONS if text else LITERT_COMMON_OPTIONS
+    allowed = litert_option_names(text=text, service=service)
     if copied.keys() - allowed:
         raise TypeError("LiteRT options accept only the declared local model encoding settings")
-    prepared = {
-        "backend": "cpu",
-        "cache_dir": None,
-        "num_threads": 2,
-        "max_length": 2048,
-        "max_input_bytes": 16 * 1024**2,
-        "vision_tokens_per_image": 70,
-    } | copied
-    for name in ("model_path", "cache_dir"):
+    defaults = {"runtime": "service"} if service else {"backend": "cpu", "cache_dir": None, "num_threads": 2}
+    prepared = (
+        defaults
+        | {
+            "max_length": 2048,
+            "max_input_bytes": 16 * 1024**2,
+            "vision_tokens_per_image": 70,
+        }
+        | copied
+    )
+    for name in ("service_path",) if service else ("model_path", "cache_dir"):
         value = prepared.get(name)
         if name == "cache_dir" and value is None:
             continue
@@ -64,9 +96,26 @@ def validate_litert_options(options: Any, *, text: bool) -> dict[str, Any]:
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
         raise EmbeddingConfigurationError("LiteRT model_sha256 requires the model file's 64-character SHA-256")
     prepared["model_sha256"] = digest.lower()
-    if not isinstance(prepared["backend"], str) or prepared["backend"] not in {"cpu", "gpu"}:
+    if service:
+        if prepared["runtime"] != "service":
+            raise EmbeddingConfigurationError("LiteRT service requires runtime='service'")
+        identity = prepared.get("service_id")
+        if (
+            not isinstance(identity, str)
+            or not 1 <= len(identity) <= 128
+            or re.fullmatch(r"[A-Za-z0-9_.-]+", identity) is None
+        ):
+            raise EmbeddingConfigurationError(
+                "LiteRT service_id requires 1 to 128 ASCII letters, digits, '-', '_' or '.'"
+            )
+    elif not isinstance(prepared["backend"], str) or prepared["backend"] not in {"cpu", "gpu"}:
         raise EmbeddingConfigurationError("LiteRT backend must be cpu or gpu")
-    for name, minimum, maximum in (("num_threads", 1, 256), ("max_input_bytes", 1, 64 * 1024**2)):
+    bounds = (
+        (("max_input_bytes", 1, 64 * 1024**2),)
+        if service
+        else (("num_threads", 1, 256), ("max_input_bytes", 1, 64 * 1024**2))
+    )
+    for name, minimum, maximum in bounds:
         value = prepared[name]
         if type(value) is not int or not minimum <= value <= maximum:
             raise EmbeddingConfigurationError(f"LiteRT {name} must be an integer from {minimum} to {maximum}")
