@@ -313,9 +313,9 @@ class GravitinoMetalake:
     def _query(self, operation: str, *args: str) -> list[tuple[Any, ...]]:
         self._check_open()
         parameters = ", ".join("?" for _ in range(len(args) + 1))
-        return self.connection.execute(
+        return self.connection.sql(
             f"SELECT * FROM gravitino_metalake_{operation}({parameters})",
-            [self._name, *(_text(value) for value in args)],
+            params=[self._name, *(_text(value) for value in args)],
         ).fetchall()
 
     def _list(self, operation: str, *args: str) -> list[GravitinoIdentifier]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from urllib.parse import quote
 
@@ -82,7 +83,9 @@ def test_catalog_listing_is_independent_and_does_not_load_each_catalog(discovery
         GravitinoIdentifier(("lake",), "iceberg"),
         GravitinoIdentifier(("lake",), "postgres.db"),
     ]
-    assert requests_since(state, before) == [("GET", "/prefix/api/metalakes/lake/catalogs?details=false", None)]
+    requests = requests_since(state, before)
+    assert 1 <= len(requests) <= 2  # Native preparation can rebind this fresh source.
+    assert set(requests) == {("GET", "/prefix/api/metalakes/lake/catalogs?details=false", None)}
     attached = discovery.connection.execute("SELECT type FROM duckdb_databases() WHERE NOT internal").fetchall()
     assert ("gravitino",) not in attached
     assert ("gravitino_metalake",) in attached
@@ -103,7 +106,7 @@ def test_full_identifier_limit_survives_multiple_native_chunks(discovery, discov
     assert len(result) == 4096
     assert len(set(result)) == 4096
     assert result[-1] == GravitinoIdentifier(("lake",), "catalog4095")
-    assert len(requests_since(state, before)) == 1
+    assert 1 <= len(requests_since(state, before)) <= 2
 
 
 def test_details_expose_provider_format_and_separate_execution_capabilities(discovery):
@@ -127,13 +130,18 @@ def test_schema_and_table_lists_preserve_whole_identifiers(discovery, discovery_
     state, _endpoint, _directory = discovery_http
     before = len(state["requests"])
     assert discovery.list_schemas("iceberg") == [GravitinoIdentifier(("lake", "iceberg"), "schema.点")]
-    assert len(requests_since(state, before)) == 1
+    assert 1 <= len(requests_since(state, before)) <= 2
     assert discovery.load_schema("iceberg", "schema.点").metadata["properties"] == {"owner": "unit"}
     before = len(state["requests"])
     assert discovery.list_tables("iceberg", "schema.点") == [
         GravitinoIdentifier(("lake", "iceberg", "schema.点"), "table.name")
     ]
-    assert len(requests_since(state, before)) == 2  # Parent kind check, then one list; no per-table fan-out.
+    requests = requests_since(state, before)
+    assert 2 <= len(requests) <= 4
+    assert {path for _method, path, _body in requests} == {
+        "/prefix/api/metalakes/lake/catalogs/iceberg",
+        "/prefix/api/metalakes/lake/catalogs/iceberg/schemas/" + quote("schema.点", safe="") + "/tables",
+    }
     table = discovery.load_table("iceberg", "schema.点", "table.name")
     assert table.identifier == GravitinoIdentifier(("lake", "iceberg", "schema.点"), "table.name")
     assert table.kind == "table"
@@ -148,6 +156,14 @@ def test_unknown_provider_stays_unverified(discovery, discovery_http):
     config["catalogs"]["iceberg"]["provider"] = "future-provider"
     state["discovery"] = config
     assert discovery.load_catalog("iceberg").capabilities.table_read == "unverified"
+
+
+def test_concurrent_discovery_results_remain_owned_by_each_relation(discovery):
+    names = ["iceberg", "postgres.db"] * 4
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(discovery.load_catalog, names))
+    assert [result.identifier.name for result in results] == names
+    assert all(result.metadata["name"] == name for result, name in zip(results, names, strict=True))
 
 
 def test_credential_properties_are_redacted_without_hiding_schema_fields(discovery, discovery_http):
@@ -167,14 +183,14 @@ def test_failed_connect_leaves_no_native_attachment(discovery_http):
     state, endpoint, _directory = discovery_http
     with vane.connect() as connection:
         load_gravitino(connection)
-        before = connection.execute("SELECT database_name FROM duckdb_databases()").fetchall()
+        before = set(connection.execute("SELECT database_name FROM duckdb_databases()").fetchall())
         with pytest.raises(vane.CatalogException, match="not found"):
             GravitinoMetalake.connect(connection, endpoint=endpoint, metalake="missing", token="fixture-token")
-        assert connection.execute("SELECT database_name FROM duckdb_databases()").fetchall() == before
+        assert set(connection.execute("SELECT database_name FROM duckdb_databases()").fetchall()) == before
         state["discovery_fault"] = "wrong-resource"
         with pytest.raises(vane.IOException, match="metalake"):
             GravitinoMetalake.connect(connection, endpoint=endpoint, metalake="lake", token="fixture-token")
-        assert connection.execute("SELECT database_name FROM duckdb_databases()").fetchall() == before
+        assert set(connection.execute("SELECT database_name FROM duckdb_databases()").fetchall()) == before
 
 
 def test_empty_lists_and_closed_handle(discovery, discovery_http):
@@ -392,6 +408,7 @@ def test_serialized_discovery_contains_only_redacted_rows(discovery, discovery_h
     assert b"fixture-token" not in payload
     assert b"catalog-secret" not in payload
     assert b"table-secret" not in payload
+    assert _endpoint.encode() not in payload
     assert b"[REDACTED]" in payload
     transported = pickle.loads(payload)
     discovery.close()
@@ -405,7 +422,13 @@ def test_serialized_discovery_contains_only_redacted_rows(discovery, discovery_h
 
 @pytest.mark.real_ray
 @pytest.mark.parametrize(
-    "operation,args", [("list_catalogs", ()), ("load_table", ("iceberg", "schema.点", "table.name"))]
+    "operation,args",
+    [
+        ("list_catalogs", ()),
+        ("list_schemas", ("iceberg",)),
+        ("list_schemas", ("postgres.db",)),
+        ("load_table", ("iceberg", "schema.点", "table.name")),
+    ],
 )
 def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
     ray_local, discovery_http, monkeypatch, operation, args
@@ -422,6 +445,7 @@ def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
         assert b"fixture-token" not in payload
         assert b"catalog-secret" not in payload
         assert b"table-secret" not in payload
+        assert endpoint.encode() not in payload
         assert plan.__getstate__()[3]["attached_databases"] == []
         calls.append(plan.idx())
         state["fault"] = "invalid-json"
@@ -435,5 +459,8 @@ def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
         assert len(calls) == 1
         if operation == "list_catalogs":
             assert len(result) == 3
+        elif operation == "list_schemas":
+            expected = [GravitinoIdentifier(("lake", "iceberg"), "schema.点")] if args == ("iceberg",) else []
+            assert result == expected
         else:
             assert result.metadata["properties"]["access_token"] == "[REDACTED]"
