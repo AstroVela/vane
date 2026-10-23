@@ -194,6 +194,11 @@ For the Gravitino Catalog and Fileset connector, see
 [Gravitino integration](GRAVITINO.md). It uses the same optional artifact and
 provider-wheel workflow below.
 
+The separate [Gravitino Iceberg qualification](GRAVITINO_ICEBERG.md) uses the
+source-pinned Iceberg/Avro pair, its optional SDK profile, and explicit real REST
+acceptance. It carries Vane compatibility patches independently of upstream
+merges; consult its scope before claiming table or runner support.
+
 For `native_media`, first prepare its separate SDK and shared libraries using
 [the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
