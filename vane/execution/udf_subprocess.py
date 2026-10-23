@@ -1677,6 +1677,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 pass
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            if attribute == "_sock":
+                # The startup thread owns this descriptor until its READY
+                # read returns. Closing it here can leave a concurrent timed
+                # recv waiting on a retired descriptor on macOS. Shutdown
+                # wakes that reader; startup cleanup performs the close.
+                continue
             try:
                 sock.close()
             except BaseException as exc:

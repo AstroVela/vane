@@ -6,7 +6,6 @@
 import asyncio
 import errno
 import pickle
-import socket
 import sys
 
 import numpy as np
@@ -14,12 +13,14 @@ import pyarrow as pa
 import pytest
 
 from tests.fast.test_ai_error_diagnostics import native_error, onnx_allocation_error
-from tests.fast.test_embedding_service import client, content
+from tests.fast.test_embedding_service import client, content, until
 from tests.fast.test_image_modes import MODES, pixels_for
 from tests.fast.test_native_multimodal import install_sdk
 from tests.fast.test_native_multimodal import make_real_video_processor as make_real_video_processor
 from vane.ai import DiagnosticError
 from vane.ai import _embedding_ipc as ipc
+from vane.ai import _embedding_shared_memory as shm
+from vane.ai import _embedding_zmq as service_transport
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._errors import _is_resource_error
@@ -27,6 +28,11 @@ from vane.ai.embedding_service import EmbeddingService
 from vane.ai.functions import _EmbedImageBatch, _EmbedMultimodalBatch, _EmbedTextBatch
 from vane.ai.provider import load_provider
 from vane.execution._async_runtime import AsyncRuntime
+
+# PyZMQ announces its supported Tornado selector bridge on Windows Proactor loops.
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:Proactor event loop does not implement add_reader family of methods required for zmq\.:RuntimeWarning"
+)
 
 
 def allocation_error(kind):
@@ -130,7 +136,6 @@ def test_native_allocation_failure_precedes_ignore_and_retry(monkeypatch, family
     assert len(sdk.engines) == 1 and sdk.engines[0].closed == 1
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux embedding service")
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
 @pytest.mark.parametrize("kind,transport", [(k, t) for k in ("enomem", "enospc") for t in ("cause", "diagnostic")])
 def test_service_wrapped_allocation_returns_fatal_category(tmp_path, monkeypatch, family, kind, transport):
@@ -143,7 +148,7 @@ def test_service_wrapped_allocation_returns_fatal_category(tmp_path, monkeypatch
 
     sdk.on_embedding = fail
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family=family,
         model="fixture",
@@ -171,57 +176,59 @@ def test_service_wrapped_allocation_returns_fatal_category(tmp_path, monkeypatch
     asyncio.run(run())
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux embedding service")
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
-@pytest.mark.parametrize("phase", ["socket", "setblocking", "connect", "buffer", "result"])
+@pytest.mark.parametrize("phase", ["socket", "configure", "connect", "allocation", "buffer", "result"])
 def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, monkeypatch, family, phase):
+    import zmq.asyncio
+
     sdk = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family=family,
         model="fixture",
         dimensions=2,
         options={"gpus_per_actor": 0},
         max_inflight=1,
+        publication_timeout=0.2,
     )
 
     async def run():
         await service.start()
         instance = client(root, family)
         instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda v: v)
+        instance._zmq_client = service_transport.Client(instance)
         sockets = []
+        original_socket = zmq.asyncio.Context.socket
 
         def fail(*args, **kwargs):
             raise wrap(OSError(errno.ENOMEM, "private socket allocation"), "diagnostic")
 
-        class AllocatingSocket(socket.socket):
-            def setblocking(self, flag):
-                sockets.append(self)
-                fail()
+        def socket(context, *args, **kwargs):
+            value = original_socket(context, *args, **kwargs)
+            sockets.append(value)
+            return value
 
         try:
             with monkeypatch.context() as patch:
-                if phase == "socket":
-                    patch.setattr(socket, "socket", fail)
-                elif phase == "setblocking":
-                    patch.setattr(socket, "socket", AllocatingSocket)
+                patch.setattr(zmq.asyncio.Context, "socket", fail if phase == "socket" else socket)
+                if phase == "configure":
+                    patch.setattr(zmq.asyncio.Socket, "setsockopt", fail)
                 elif phase == "connect":
-
-                    async def connect(*args):
-                        fail()
-
-                    patch.setattr(asyncio.get_running_loop(), "sock_connect", connect)
+                    patch.setattr(zmq.asyncio.Socket, "connect", fail)
+                elif phase == "allocation":
+                    patch.setattr(shm, "create", fail)
                 elif phase == "buffer":
-                    patch.setattr(ipc, "sealed_buffer", fail)
-                else:
+                    patch.setattr(shm, "attach", fail)
+                elif phase == "result":
                     instance._validate_vector = fail
                 with pytest.raises(MemoryError, match="resources"):
                     await instance.embed_text(["query"])
-            assert not instance._sockets
-            assert all(sock.fileno() == -1 for sock in sockets)
+            assert not instance._zmq_client.sockets
+            assert all(sock.closed for sock in sockets)
+            await until(lambda: not service._tasks and service.credits.inflight == 0)
             instance._validate_vector = lambda v: v
             np.testing.assert_array_equal(await instance.embed_text(["healthy"]), [[3, 4]])
             assert service.credits.bytes == service.credits.inflight == 0
