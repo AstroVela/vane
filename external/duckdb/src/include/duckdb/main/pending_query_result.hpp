@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -42,6 +48,9 @@ public:
 	//! The error message can be obtained by calling GetError() on the PendingQueryResult.
 	DUCKDB_API PendingExecutionResult ExecuteTask();
 	DUCKDB_API PendingExecutionResult CheckPulse();
+	//! Snapshot progress while the context lock keeps this query's executor alive.
+	//! Returns no snapshots after query cleanup has retired the active result.
+	DUCKDB_API vector<PipelineProgressSnapshot> GetPipelinesProgressSnapshots();
 	//! Halt execution of the thread until a Task is ready to be executed (use with caution)
 	void WaitForTask();
 
