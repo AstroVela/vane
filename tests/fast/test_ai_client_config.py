@@ -392,6 +392,42 @@ def test_anthropic_auth_token_isolated_from_worker_api_key(monkeypatch):
     assert state["headers"]["Authorization"] == "Bearer application-token"
 
 
+@pytest.mark.parametrize(
+    "settings,expected_auth",
+    [
+        (
+            {"api_key": "application-key"},
+            ({"x-api-key": "application-key"}, {"authorization": "Bearer application-key"}),
+        ),
+        ({"auth_token": "application-token"}, ({"authorization": "Bearer application-token"},)),
+    ],
+)
+def test_anthropic_requests_use_only_captured_application_credentials(monkeypatch, settings, expected_auth):
+    pytest.importorskip("anthropic")
+
+    async def request(payload):
+        runtime = pickle.loads(payload).instantiate()
+        try:
+            assert await runtime.prompt(("hello",)) == "ok"
+        finally:
+            await runtime.aclose()
+
+    with _model_server() as (endpoint, requests):
+        payload = pickle.dumps(_descriptor("anthropic", "prompt", base_url=endpoint, **settings))
+        for key, value in WORKER_ENV.items():
+            monkeypatch.setenv(key, value)
+        before = dict(os.environ)
+        asyncio.run(request(payload))
+        assert dict(os.environ) == before
+
+    assert len(requests) == 1
+    path, headers, _ = requests[0]
+    assert path == "/v1/messages"
+    headers = {key.lower(): value for key, value in headers.items()}
+    assert {key: headers[key] for key in ("authorization", "x-api-key") if key in headers} in expected_auth
+    assert "worker" not in repr(headers)
+
+
 def test_concurrent_sdk_construction_keeps_credentials_and_organization_isolated(monkeypatch):
     pytest.importorskip("openai")
     payloads = [
@@ -674,8 +710,12 @@ def _run_existing_cluster_case(monkeypatch, conflicting_workers):
                     assert headers["x-goog-api-key"] == "application-google-key"
                     assert "projects/" not in path
                 elif "messages" in path:
-                    assert headers["x-api-key"] == "application-anthropic-key"
-                    assert "authorization" not in headers
+                    # SDK 2.x sends API keys as Bearer tokens; older SDKs use
+                    # x-api-key. Both must carry only the application key.
+                    assert {key: headers[key] for key in ("authorization", "x-api-key") if key in headers} in (
+                        {"x-api-key": "application-anthropic-key"},
+                        {"authorization": "Bearer application-anthropic-key"},
+                    )
                 else:
                     if headers["authorization"].startswith("Bearer account-"):
                         account = headers["authorization"].split("-")[1]
