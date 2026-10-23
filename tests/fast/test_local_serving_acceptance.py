@@ -43,7 +43,11 @@ def test_execution_deadline_accepts_model_entry_observed_after_completion(monkey
         def recover():
             # Mirror CUDA's explicit prewarm without requiring GPU hardware.
             scenario.model.prewarm()
-            return scenario.query()
+            # Give recovery the normal fixture budget while the gated request
+            # retains the one-second deadline exercised above.
+            with monkeypatch.context() as recovery:
+                recovery.setattr(scenario.runtime, "_execution_timeout", 30)
+                return scenario.query()
 
         monkeypatch.setattr(scenario, "recover", recover)
         scenario.execution_expiry()
