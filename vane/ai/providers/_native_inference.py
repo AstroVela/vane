@@ -901,21 +901,9 @@ class InferenceEmbeddingProviderMixin(Provider):
         prepared = dict(options or {})
         runtime = prepared.get("runtime", "native")
         if runtime == "service":
-            from vane.ai.providers._embedding_service import (
-                ServiceAudioDescriptor,
-                ServiceImageDescriptor,
-                ServiceMultimodalDescriptor,
-                ServiceTextDescriptor,
-                ServiceVideoDescriptor,
-            )
+            from vane.ai.providers._embedding_service import service_descriptor
 
-            return {
-                "text": ServiceTextDescriptor,
-                "image": ServiceImageDescriptor,
-                "video": ServiceVideoDescriptor,
-                "audio": ServiceAudioDescriptor,
-                "multimodal": ServiceMultimodalDescriptor,
-            }[kind](model or "", dimensions, prepared, self.name, self._native_family)
+            return service_descriptor(kind, model or "", dimensions, prepared, self.name, self._native_family)
         if runtime == "http":
             from vane.ai.providers._embedding_http import (
                 HTTPImageEmbedderDescriptor,

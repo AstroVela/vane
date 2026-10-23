@@ -139,6 +139,27 @@ class ServiceMultimodalDescriptor(_ServiceDescriptor, MultimodalEmbedderDescript
         return ipc.input_spec(self.options)
 
 
+def service_descriptor(
+    kind: str,
+    model: str,
+    dimensions: int | None,
+    options: dict[str, Any],
+    provider_name: str,
+    family: str,
+) -> _ServiceDescriptor:
+    """One descriptor selection path for providers using the public service."""
+    factory = {
+        "text": ServiceTextDescriptor,
+        "image": ServiceImageDescriptor,
+        "video": ServiceVideoDescriptor,
+        "audio": ServiceAudioDescriptor,
+        "multimodal": ServiceMultimodalDescriptor,
+    }.get(kind)
+    if factory is None:
+        raise EmbeddingConfigurationError("Unsupported embedding service input kind")
+    return factory(model, dimensions, options, provider_name, family)
+
+
 class ServiceEmbedder(ManagedEmbedder):
     def __init__(self, descriptor: _ServiceDescriptor):
         self.descriptor = descriptor

@@ -1557,12 +1557,12 @@ def test_shutdown_drains_accepted_request_before_closing_engine(tmp_path, monkey
             closing = asyncio.create_task(service.aclose())
             await asyncio.sleep(0.05)
             assert not closing.done() and service.credits.bytes == 10
-            assert service.runtime is not None
+            assert service.backend.runtime is not None
             finish.set()
             np.testing.assert_equal(await pending, [[3, 4]])
             await closing
             assert service.credits.bytes == service.credits.inflight == 0
-            assert service.runtime is None and not (root / "engine.json").exists()
+            assert service.backend.runtime is None and not (root / "engine.json").exists()
         finally:
             finish.set()
             await instance.aclose()
@@ -1678,7 +1678,7 @@ def test_missing_zmq_does_not_affect_planning_and_cleans_failed_start(tmp_path, 
         with pytest.raises(ProviderImportError, match="embedding_service"):
             await service.start()
         assert not (root / "engine.json").exists()
-        assert service._zmq_server is None and service.runtime is None
+        assert service._zmq_server is None and service.backend.runtime is None
         instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda value: value)
         with pytest.raises(ProviderImportError, match="embedding_service"):
             await instance.embed_text(["query"])

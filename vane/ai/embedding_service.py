@@ -78,10 +78,7 @@ class EmbeddingService:
         publication_timeout: float = 30,
     ):
         from vane.ai.providers._embedding_service import ServiceMultimodalDescriptor
-        from vane.ai.providers._native_inference import NativeMultimodalEmbedderDescriptor
-
-        if family not in {"sglang", "vllm"}:
-            raise EmbeddingConfigurationError("Embedding service family must be sglang or vllm")
+        from vane.ai.providers._embedding_service_backend import create_service_backend
         for name, value, maximum in (
             ("max_bytes", max_bytes, 2**40),
             ("max_inflight", max_inflight, 1024),
@@ -103,13 +100,13 @@ class EmbeddingService:
             family,
             family,
         )
-        self.descriptor = NativeMultimodalEmbedderDescriptor(model, dimensions, dict(options or {}), family, family)
-        self.spec = self.descriptor.get_input_spec()
+        self.backend = create_service_backend(family, model, dimensions, dict(options or {}))
+        self.descriptor = self.backend.descriptor
+        self.spec = self.backend.get_input_spec()
         self.path, self.identity = path, service_id
         self._zmq_server: Any = None
         self.credits = _Credits(max_bytes, max_inflight)
         self.max_connections, self.publication_timeout = max_connections, publication_timeout
-        self.runtime: Any = None
         self._tasks: set[asyncio.Task[None]] = set()
         self.metrics = {
             "accepted": 0,
@@ -122,13 +119,12 @@ class EmbeddingService:
     async def start(self) -> None:
         from vane.ai._embedding_zmq import Server
 
-        if self.runtime is not None or self._zmq_server is not None:
+        if self._zmq_server is not None:
             raise RuntimeError("Embedding service is already started")
         self._zmq_server = Server(self)
         try:
             self._zmq_server.prepare()
-            self.runtime = self.descriptor.instantiate()
-            self.runtime._ensure_engine()
+            await self.backend.start()
             self._zmq_server.listen()
         except BaseException:
             await self.aclose()
@@ -138,9 +134,7 @@ class EmbeddingService:
         if self._zmq_server is not None:
             await self._zmq_server.aclose()
             self._zmq_server = None
-        if self.runtime is not None:
-            await self.runtime.aclose()
-            self.runtime = None
+        await self.backend.aclose()
 
     def _hello(self, message: Any) -> int:
         fields = {"version", "service_id", "family", "model", "dimensions", "request_id", "parts", "nbytes"}
@@ -162,7 +156,7 @@ class EmbeddingService:
 
     async def _infer(self, content: EmbeddingContent) -> dict[str, Any]:
         try:
-            vector = np.asarray(await self.runtime._embed_content(content), dtype=np.float32)
+            vector = np.asarray(await self.backend.embed(content), dtype=np.float32)
             if vector.shape != (self.descriptor.dimensions,) or not np.isfinite(vector).all():
                 raise ValueError("Invalid embedding result")
             return {"vector": vector.tolist()}
