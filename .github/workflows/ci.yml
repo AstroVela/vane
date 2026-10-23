@@ -280,6 +280,7 @@ jobs:
           extension_wheels=(dist/extension-wheels/*.whl)
           test "${#extension_wheels[@]}" -eq 1
           python -I scripts/verify_extension_wheel.py \
+            --constraint "$PIP_CONSTRAINT" \
             --base-wheel "${base_wheels[0]}" \
             --extension-wheel "${extension_wheels[0]}" \
             --extension-name loadable_extension_demo \
