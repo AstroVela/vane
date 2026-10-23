@@ -295,7 +295,10 @@ with vane.connect(config={'threads':1}) as con:
         assert normalized.schema.equals(table.schema)
         assert (normalized.column(0).chunk(0).storage.values.buffers()[1].address ==
                 table.column(0).chunk(0).storage.values.buffers()[1].address)
-    column = table.column(0).combine_chunks()
+    # Inspect the exported row without an unrelated Arrow concatenation copy
+    # competing for the image conversion's bounded address space.
+    assert table.num_rows == 1 and table.column(0).num_chunks == 1
+    column = table.column(0).chunk(0)
     array = (column.to_numpy_ndarray() if form == 'fixed' else
              column.storage.field('data').values.to_numpy().reshape(1,2160,3840,4))
     assert array.dtype == (np.float32 if form == "generic" else np.uint8) and array.shape == (1,2160,3840,4)
