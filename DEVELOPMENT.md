@@ -359,6 +359,11 @@ implementing either contract.
 See [Python source execution](DATASOURCE_EXECUTION.md) for the native readiness,
 decoder admission, and cancellation contracts and their focused regression checks.
 
+The main CI workflow applies [.github/ci-constraints.txt](.github/ci-constraints.txt)
+to both pip and uv installations. Set `PIP_CONSTRAINT` and `UV_CONSTRAINT` to
+that file's absolute path when reproducing CI dependency resolution locally.
+Update the file to advance CI's Ray version; dependency cache keys include it.
+
 The required release gate covers the supported base installation and does not
 need model downloads, cloud credentials, GPUs, or external services:
 
