@@ -17,6 +17,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PIP_CONSTRAINT: ${{ github.workspace }}/.github/ci-constraints.txt
+  UV_CONSTRAINT: ${{ github.workspace }}/.github/ci-constraints.txt
+
 jobs:
   changes:
     name: Classify changes
@@ -90,7 +94,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            .github/ci-constraints.txt
 
       - name: Build and validate source package
         run: |
@@ -158,7 +164,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            .github/ci-constraints.txt
 
       - name: Restore vcpkg binary cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -631,7 +639,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/uv
-          key: fast-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml') }}
+          key: fast-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml', '.github/ci-constraints.txt') }}
 
       - name: Install the wheel and CPU test dependencies
         run: |
@@ -1019,7 +1027,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/uv
-          key: ai-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml') }}
+          key: ai-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml', '.github/ci-constraints.txt') }}
 
       - name: Install the wheel and AI test dependencies
         run: |

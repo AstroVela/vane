@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep every CI installer on the same stable Ray maintenance release.
+ray==2.58.1
