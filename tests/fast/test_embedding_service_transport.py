@@ -468,12 +468,13 @@ def test_terminal_receipt_waits_for_unpublished_cleanup(tmp_path, monkeypatch):
                     await writer.drain()
                     response = transport._unpack(await asyncio.wait_for(read_record(reader), 2), key, b"response")
                     assert response["error"] == "configuration"
-                    handler = next(iter(service._tasks))
+                    peer = next(iter(service._zmq_server.peers.values()))
                     writer.write(
                         frame(transport._pack({"request_id": request_id, "state": "received"}, key, b"request"))
                     )
                     await writer.drain()
-                    await until(handler.cancelling)
+                    # Receipt handling cancels the unpublished task before yielding.
+                    await until(lambda: peer.receipt_received)
                     assert service._zmq_server.peers
                     assert service._zmq_server.pending
                     assert service.credits.inflight == 1 and not sdk.calls
