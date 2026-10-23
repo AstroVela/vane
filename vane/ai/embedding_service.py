@@ -107,6 +107,7 @@ class EmbeddingService:
         self.spec = self.backend.get_input_spec()
         self.path, self.identity = path, service_id
         self._zmq_server: Any = None
+        self._closing_task: asyncio.Task[None] | None = None
         self.credits = _Credits(max_bytes, max_inflight)
         self.max_connections, self.publication_timeout = max_connections, publication_timeout
         self._tasks: set[asyncio.Task[None]] = set()
@@ -123,16 +124,30 @@ class EmbeddingService:
 
         if self._zmq_server is not None:
             raise RuntimeError("Embedding service is already started")
+        if self._closing_task is not None:
+            if not self._closing_task.done():
+                raise RuntimeError("Embedding service is still closing")
+            self._closing_task = None
         self._zmq_server = Server(self)
         try:
             self._zmq_server.prepare()
             await self.backend.start()
             self._zmq_server.listen()
-        except BaseException:
-            await self.aclose()
+        except BaseException as error:
+            try:
+                await self.aclose()
+            except BaseException as cleanup_error:
+                setattr(error, "cleanup_errors", (*getattr(error, "cleanup_errors", ()), cleanup_error))
             raise
 
     async def aclose(self) -> None:
+        from vane.ai.providers._embedding_service_backend import owned_result
+
+        if self._closing_task is None or (self._closing_task.done() and self._closing_task.exception() is not None):
+            self._closing_task = asyncio.create_task(self._close())
+        await owned_result(self._closing_task)
+
+    async def _close(self) -> None:
         if self._zmq_server is not None:
             await self._zmq_server.aclose()
             self._zmq_server = None
@@ -179,7 +194,12 @@ class EmbeddingService:
         except EmbeddingConfigurationError:
             return {"error": "configuration"}
         except Exception as error:
-            return {"error": "resource" if _is_resource_error(error) else "execution"}
+            return self._resource_context({"error": "resource" if _is_resource_error(error) else "execution"})
+
+    def _resource_context(self, response: dict[str, Any]) -> dict[str, Any]:
+        if response.get("error") == "resource" and self.backend.restart_required:
+            response["restart_required"] = True
+        return response
 
 
 async def _run(config: dict[str, Any]) -> None:
@@ -191,8 +211,8 @@ async def _run(config: dict[str, Any]) -> None:
             loop.add_signal_handler(signum, stopped.set)
         except NotImplementedError:  # Windows event loops have no Unix signal handlers.
             signal.signal(signum, lambda *_: loop.call_soon_threadsafe(stopped.set))
+    await service.start()
     try:
-        await service.start()
         await stopped.wait()
     finally:
         await service.aclose()

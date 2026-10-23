@@ -9,15 +9,35 @@ after the transport has exclusively reserved its rendezvous path.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+import asyncio
+from typing import Any, Protocol, TypeVar
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
+_Result = TypeVar("_Result")
+
+
+async def owned_result(future: asyncio.Future[_Result]) -> _Result:
+    """Join actual owned work before propagating even repeated cancellation."""
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    result = future.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
 
 class ServiceBackend(Protocol):
     descriptor: Any
+    restart_required: bool
 
     def get_input_spec(self) -> MultimodalInputSpec: ...
 
@@ -32,6 +52,8 @@ class ServiceBackend(Protocol):
 
 class NativeServiceBackend:
     """Delegate SGLang/vLLM encoding and teardown to their existing runtime."""
+
+    restart_required = False
 
     def __init__(self, family: str, model: str, dimensions: int, options: dict[str, Any]):
         from vane.ai.providers._native_inference import NativeMultimodalEmbedderDescriptor
@@ -67,4 +89,8 @@ class NativeServiceBackend:
 def create_service_backend(family: str, model: str, dimensions: int, options: dict[str, Any]) -> ServiceBackend:
     if family in {"sglang", "vllm"}:
         return NativeServiceBackend(family, model, dimensions, options)
-    raise EmbeddingConfigurationError("Embedding service family must be sglang or vllm")
+    if family == "mlx":
+        from vane.ai.providers._mlx_service import MLXServiceBackend
+
+        return MLXServiceBackend(model, dimensions, options)
+    raise EmbeddingConfigurationError("Embedding service family must be sglang, vllm or mlx")

@@ -438,7 +438,12 @@ class Server:
         except Exception as error:
             await self._send_terminal(
                 identity,
-                {"request_id": peer.request_id, "error": "resource" if _is_resource_error(error) else "configuration"},
+                self.owner._resource_context(
+                    {
+                        "request_id": peer.request_id,
+                        "error": "resource" if _is_resource_error(error) else "configuration",
+                    }
+                ),
             )
 
     def _finished(self, task: asyncio.Task[Any], identity: bytes, queue: asyncio.Queue[Any], peer: stream.Peer) -> None:

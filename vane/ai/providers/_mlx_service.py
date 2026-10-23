@@ -9,14 +9,19 @@ the base installation; model SDK imports belong exclusively to backend start.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._errors import _is_resource_error
 from vane.ai._video_embedding import VideoClip
 from vane.ai.options import _validate_mlx_service_options
+from vane.ai.providers._embedding_service_backend import owned_result
 from vane.ai.providers._mlx_media import (
     MAX_IMAGE_PIXELS,
     MIN_AUDIO_SAMPLES,
@@ -133,3 +138,118 @@ def preflight(contents: list[EmbeddingContent], spec: MultimodalInputSpec, encod
         else:
             {"image": validate_image, "audio": validate_audio, "video": validate_video}[part.spec.kind](value)
     return [EmbeddingContent(tuple(_normalized_part(part) for part in row.parts)) for row in contents]
+
+
+def _create_core(options: dict[str, Any]) -> Any:
+    # Called only on the backend owner thread, after endpoint reservation.
+    from vane.ai.providers.mlx import _MLXModelCore
+
+    return _MLXModelCore(options)
+
+
+class MLXServiceBackend:
+    """One model owner and one submission at a time; transport owns admission."""
+
+    def __init__(self, model: str, dimensions: int, options: dict[str, Any]):
+        from vane.ai.providers.mlx import MLXMultimodalEmbedderDescriptor
+
+        self.descriptor = MLXMultimodalEmbedderDescriptor(model, dimensions, options=options)
+        self._options = self.descriptor.get_options()
+        self.contract = model_contract(self._options)
+        self.state = "CREATED"
+        self.restart_required = False
+        self._core: Any = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._lock = asyncio.Lock()
+        self._closing: asyncio.Task[None] | None = None
+
+    def get_input_spec(self) -> MultimodalInputSpec:
+        return self.descriptor.get_input_spec()
+
+    def _check_resource_state(self) -> None:
+        if self.restart_required:
+            raise MemoryError("MLX model resources are unavailable; explicitly restart the embedding service")
+
+    def validate_request(self, context: ipc.RequestContext, parts: list[dict[str, Any]]) -> None:
+        validate_request(context, self.contract, parts)
+        self._check_resource_state()
+
+    async def _submit(self, operation: Callable[[], Any]) -> Any:
+        assert self._executor is not None
+        owner = asyncio.get_running_loop().run_in_executor(self._executor, operation)
+        return await owned_result(owner)
+
+    def _load(self) -> None:
+        # Assign inside actual work: cancellation of the waiter must never
+        # orphan a successfully constructed model before its owner can close it.
+        self._core = _create_core(self._options)
+
+    async def start(self) -> None:
+        if self.state != "CREATED":
+            raise RuntimeError("MLX service backend can start only once")
+        self.state = "STARTING"
+        try:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-mlx-service")
+            async with self._lock:
+                await self._submit(self._load)
+            if self._closing is not None:
+                raise RuntimeError("MLX embedding backend closed during startup")
+            self.state = "READY"
+        except BaseException as error:
+            self.state = "FAILED"
+            self.restart_required = _is_resource_error(error)
+            raise
+
+    def _encode(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
+        assert self._core is not None
+        return self._core.encode(content, context.encoding)
+
+    async def embed(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
+        if context.model_contract != self.contract or context.encoding == "default":
+            raise EmbeddingConfigurationError("MLX service encoding/model contract mismatch")
+        self._check_resource_state()
+        if self.state != "READY":
+            raise RuntimeError("MLX embedding backend is not accepting work")
+        async with self._lock:
+            self._check_resource_state()
+            if self.state not in {"READY", "DRAINING"}:
+                raise RuntimeError("MLX embedding backend is not ready")
+            try:
+                # The lock covers submission AND actual completion. Neither
+                # cancelled waiters nor queued requests create executor queues.
+                return await self._submit(lambda: self._encode(content, context))
+            except BaseException as error:
+                if _is_resource_error(error):
+                    self.restart_required = True
+                    self.state = "FAILED"
+                raise
+
+    def _close_core(self) -> None:
+        if self._core is not None:
+            try:
+                self._core.close()
+            finally:
+                self._core = None
+
+    async def _close(self) -> None:
+        self.state = "DRAINING"
+        try:
+            async with self._lock:
+                if self._executor is not None:
+                    await self._submit(self._close_core)
+            self.state = "CLOSED"
+        except BaseException as error:
+            self.state = "FAILED"
+            self.restart_required |= _is_resource_error(error)
+            raise
+        finally:
+            # Owned work has joined, including a failed close. No queued model
+            # work exists here; join the idle owner thread before dropping it.
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+
+    async def aclose(self) -> None:
+        if self._closing is None:
+            self._closing = asyncio.create_task(self._close())
+        await owned_result(self._closing)

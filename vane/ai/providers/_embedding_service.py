@@ -296,6 +296,8 @@ class ServiceEmbedder(ManagedEmbedder):
         if response.get("error") == "configuration":
             raise EmbeddingConfigurationError("Embedding service rejected input or model/service configuration")
         if response.get("error") == "resource":
+            if response.get("restart_required") is True:
+                raise MemoryError("Embedding service exhausted model or host resources; restart the embedding service")
             raise MemoryError("Embedding service exhausted model or host resources")
         if "error" in response:
             raise RuntimeError("Embedding service request failed")
