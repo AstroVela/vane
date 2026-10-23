@@ -1,9 +1,9 @@
 # Gravitino catalog, Filesets, and discovery
 
-The optional `gravitino` C++ extension connects Vane to Apache Gravitino 1.3
-FILESET catalogs. It uses DuckDB's `StorageExtension`, `Catalog`, and
-`FileSystem` interfaces. Python's `vane.catalog.GravitinoCatalog` is a wrapper
-around those native operations; it does not read data through a Python SDK.
+The optional `gravitino` C++ extension provides Apache Gravitino 1.3 FILESET
+I/O and metalake metadata discovery for Vane. It uses DuckDB's `StorageExtension`, `Catalog`, and
+`FileSystem` interfaces. Python's `vane.catalog.GravitinoCatalog` and `GravitinoMetalake` wrap
+those native operations; it does not read data through a Python SDK.
 
 For the implementation plan and later metadata discovery and Iceberg work, see
 the [Gravitino design and roadmap](GRAVITINO_DESIGN.md). The capabilities below
@@ -42,7 +42,7 @@ and use `connection.execute("LOAD gravitino")`.
 connector. It uses a separate READ_ONLY `gravitino_metalake` attachment and does
 not require a FILESET catalog to be attached. This is the M3 metadata API;
 [design issue #1062](https://github.com/AstroVela/vane/issues/1062) records its scope.
-It can be used independently of the Fileset write work in #1061.
+It can be used independently of the [Fileset write work in #1061](https://github.com/AstroVela/vane/pull/1061).
 
 ```python
 import os
@@ -71,8 +71,10 @@ an immutable `namespace` tuple and `name`; dots, Unicode, and escaped characters
 remain part of their individual names. Catalog, schema, and table namespaces
 have one, two, and three parent components respectively. Lists follow one REST
 listing operation and do not recursively traverse child schemas or load every
-listed object's details. Catalog/schema lists use one request; table lists also
-load their parent catalog to validate its relational type.
+listed object's details. Catalog/schema lists use only their list endpoint;
+table lists also load their parent catalog to validate its relational type.
+Native statement preparation/rebinding can repeat these GETs. Requests do not
+fan out per listed object or per Ray worker.
 
 Detail loads return `GravitinoResource` with `identifier`, `kind`, canonical
 uppercase `catalog_type`, `provider`, available `format`, `capabilities`, and a
@@ -132,6 +134,12 @@ are covered. Ray transports frozen, redacted metadata rows; workers do not
 replay the discovery attachment, receive its token, or query Gravitino.
 Matching base/provider artifacts are required on every worker. Authentication
 extensions and credential vending/refresh remain outside M3.
+
+M3 acceptance uses the existing pinned Gravitino 1.3.0 image. Its relational
+fixture creates an empty Lance table in server-owned temporary storage through
+the [generic catalog](https://gravitino.apache.org/docs/1.3.0/lakehouse-generic-catalog/).
+Vane accesses the REST descriptions; table-format execution requires its own
+provider qualification. Later server versions need separate compatibility tests.
 
 ## Register and read resources
 
