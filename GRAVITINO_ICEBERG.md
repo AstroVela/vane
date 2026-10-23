@@ -352,6 +352,9 @@ all rows, projection, filter, aggregation, empty-table types and an explicit
 old snapshot. The test-owned fixture files and stopped service were removed
 after the run. The
 standard base release gate remains required and is reported with the change.
+These were the initial M4b-engine results. Requalification for the synchronized
+engine above, including the complete base gate, is recorded in
+[#1069](https://github.com/AstroVela/vane/pull/1069).
 
 ### Remaining roadmap
 
