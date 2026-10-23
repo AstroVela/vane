@@ -121,6 +121,30 @@ An absent value does not explain whether extraction failed. Context records that
 state separately. A part declared in the plan must be supported even if its
 column happens to be all NULL. Optional data does not waive capability checking.
 
+The Apple Silicon `mlx` provider supports four independent decoded input kinds
+for `mlx-community/embeddinggemma-2-bf16` at revision
+`1a4ffddb7905d3f63486748deabe091a01fb6201`. Each produces one normalized
+768-dimensional vector in the paired checkpoint space. Descriptor construction
+needs no SDK/model access; a subprocess actor loads BF16 weights on Metal with
+`num_gpus=0`, since Vane GPU resources identify CUDA devices. Text retains its
+explicit document/query roles. Image, audio and video options carry no text role.
+
+Audio accepts mono float32/float64 `(samples, 1)` PCM at 16 kHz, 161–480000
+samples, at most 4 MiB and finite values in `[-1, 1]`. Video accepts 1–12 RGB
+uint8 HWC frames with equal H/W per clip, at most 16 Mi pixels per frame and
+64 MiB per clip. Indices strictly increase; finite nonnegative times are
+nondecreasing. The SDK does no further frame sampling and receives no injected
+timestamp tokens. Audio masks, video grids and full expanded token budgets are
+validated before model forward, with truncation disabled. Unsupported short
+audio tails fail; valid silence remains an audio input.
+
+Context selects separate text/image/video/sound profiles, preserves source
+locators and saves the actual PNG/PCM used for retrieval. Text queries pair with
+audio/video, and image queries pair with video. This adapter supplies no joint
+encoding, ASR, OCR or Analyze model, and adds no query schema. Model failures
+follow the existing fatal/publication semantics. See [MLX qualification](DEVELOPMENT.md#incremental-package-build)
+for fixed dependencies, real SDK/Metal tests and input decoding extras.
+
 ## 4. Cardinality, fusion and vector identity
 
 ```mermaid

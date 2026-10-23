@@ -452,3 +452,32 @@ def test_default_ray_transports_ordered_nested_images(ray_local, provider, monke
             (3, None),
             (4, (8, 9, 1.25)),
         ]
+
+
+def test_mlx_video_null_and_explain_do_not_load_models(monkeypatch):
+    from vane.ai.providers.mlx import MLXVideoEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("NULL/planning instantiated the MLX video model")
+
+    monkeypatch.setattr(MLXVideoEmbedderDescriptor, "instantiate", forbidden)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+        query = "SELECT ai_embed(NULL, input_spec => {kind: 'video'}, provider => 'mlx')"
+        assert conn.sql(query).fetchall() == [(None,)]
+        conn.sql("EXPLAIN " + query).fetchall()
+
+
+@pytest.mark.parametrize("policy", ["raise", "ignore"])
+def test_mlx_video_frame_budget_fails_before_instantiation(monkeypatch, policy):
+    from vane.ai.provider import load_provider
+    from vane.ai.providers.mlx import MLXVideoEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("over-budget frames instantiated the MLX video model")
+
+    monkeypatch.setattr(MLXVideoEmbedderDescriptor, "instantiate", forbidden)
+    wrapper = _EmbedVideoBatch(load_provider("mlx").get_video_embedder(), "frames", "embedding", 768, on_error=policy)
+    values = clip_array([[dict(frame_index=i, frame_time=float(i), data=clip()[0]["data"]) for i in range(13)]])
+    with pytest.raises(EmbeddingConfigurationError, match="1 to 12"):
+        drive(wrapper, values)

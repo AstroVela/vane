@@ -363,7 +363,7 @@ def test_structured_provider_extras_require_supported_sdk_versions():
     assert sglang.specifier == SpecifierSet("==0.5.17")
 
 
-def test_mlx_image_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
+def test_mlx_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
     apple = {"sys_platform": "darwin", "platform_machine": "arm64"}
     for package, specifier in (
         ("mlx", "==0.32.4"),
@@ -375,6 +375,24 @@ def test_mlx_image_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
         assert requirement.specifier == SpecifierSet(specifier)
         assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "linux", "platform_machine": "x86_64"})
         assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "darwin", "platform_machine": "x86_64"})
+
+
+def test_mlx_release_and_sdist_include_all_modality_contracts_and_reference_helpers():
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    included = set(config["tool"]["scikit-build"]["sdist"]["include"])
+    release = (REPOSITORY_ROOT / "scripts/run_release_tests.sh").read_text()
+    for name in ("provider", "image_provider", "audio_provider", "video_provider"):
+        file = "tests/fast/test_mlx_" + name + ".py"
+        assert "/" + file in included
+        assert '"$project_root/' + file + '"' in release
+    for kind in ("text", "image", "audio", "video"):
+        assert f"/tests/ai/test_mlx_{kind}_embedding.py" in included
+    assert {"/tests/mlx_sdk_fixture.py", "/tests/mlx_metal_reference.py"} <= included
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():

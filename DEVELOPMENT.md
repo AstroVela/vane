@@ -86,9 +86,11 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
-For Apple Silicon EmbeddingGemma 2 text/image inference, install the optional `mlx`
-extra. Run `tests/fast/test_mlx_provider.py` and `tests/fast/test_mlx_image_provider.py` through the installed launcher
-before the base release gate; these contracts need no model SDK or Metal.
+For Apple Silicon EmbeddingGemma 2 text/image/audio/video inference, install the
+optional `mlx` extra. Run `tests/fast/test_mlx_provider.py`,
+`test_mlx_image_provider.py`, `test_mlx_audio_provider.py` and
+`test_mlx_video_provider.py` through the installed launcher before the base
+release gate; these contracts need no model SDK or Metal.
 The real checkpoint tests in `tests/ai/test_mlx_text_embedding.py` require
 `VANE_RUN_MLX_TESTS=1`, a complete fixed-revision HF cache, and
 `-m 'metal and external_service'`. They exercise BF16 reference parity,
@@ -101,8 +103,8 @@ Inference requires native arm64 macOS and Metal, `dtype="bfloat16"`, one
 `subprocess_actor`, and 768 output dimensions. The document prefix is
 `title: none | text: `; the query prefix is `task: search result | query: `.
 The default 2048-token limit includes prefixes and special tokens; overlength
-inputs fail before inference. Audio, video, joint inputs, other models, precisions
-and backends are rejected. Run manual subprocess examples outside the checkout so worker
+inputs fail before inference. Joint inputs, other models, precisions and backends
+are rejected. Run manual subprocess examples outside the checkout so worker
 imports resolve to the installed package as described below.
 MLX and SQR pin different Transformers versions; use separate environments.
 
@@ -137,6 +139,39 @@ input reordering, public expression/Relation/SQL output and subprocess model/
 processor reuse and exit. The CPU contracts include malformed processor outputs,
 input budgets, safe diagnostics and fatal allocation failures under both error
 policies. Ordinary CPU installations need none of the optional model SDKs.
+
+Audio uses `embed(AudioInput(...), provider="mlx")` with decoded mono
+float32/float64 PCM shaped `(samples, 1)`, sample rate 16000, 161–480000 samples,
+at most 4 MiB per clip and finite values in `[-1, 1]`. Decode/resample files
+upstream with the existing AudioFile API and `vane-ai[mlx,audio]`.
+The SDK receives independent nested waveforms with both text and audio
+truncation disabled. The provider validates the complete padded mel length,
+every valid/padding mask bit and twice-subsampled audio token count before
+forward. Valid silence is encoded; unsupported short tails and long clips fail.
+
+Video uses `embed(VideoInput(...), provider="mlx")` with 1–12 already sampled
+RGB `uint8` HWC frames, equal H/W within each clip, at most 16 Mi pixels per
+frame and 64 MiB per clip. Frame indices are nonnegative strictly increasing
+integers; finite nonnegative timestamps may repeat but cannot decrease.
+The processor receives one four-dimensional array per clip with explicit HWC
+layout, `do_sample_frames=False` and timestamps disabled. Complete frame counts,
+patch grids/padding and expanded tokens are checked before inference. Encoded
+media requires upstream decoding; install `vane-ai[mlx,image,audio,video]` for
+the corresponding file APIs. Image queries use the paired video vector space.
+
+Run `tests/ai/test_mlx_audio_embedding.py` and `test_mlx_video_embedding.py` in
+separate installed-launcher processes using the text/image opt-in settings.
+Set `VANE_MLX_AV_FIXTURES` to the externally retained, independently SDK-qualified
+audio/video corpus directory with its frozen `manifest.json`. Missing SDKs,
+Metal, checkpoint or required corpus after opt-in fail explicitly. The four
+modality suites run sequentially, covering SDK parity at cosine >= 0.999,
+boundaries, public expression/Relation/SQL APIs and owned worker cleanup.
+Do not install the CLAP extra alongside MLX: their Transformers requirements
+conflict. Context sound/visual selection and clip policy remain upstream work.
+Each descriptor owns its actor's full checkpoint and processor. Four modality
+profiles can therefore create several model copies; they do not share one
+global model or a Metal memory reservation. Start with small batches and run
+the four qualification suites sequentially, joining all workers between them.
 
 Video clipping regression checks include fractional starts ending exactly at a
 stream's rational endpoint. Duration quantization must not manufacture an
@@ -194,6 +229,16 @@ Loadable artifacts require `EXTENSION_STATIC_BUILD=ON`. This keeps each
 artifact self-contained and preserves Vane's private `_native` symbol boundary.
 The staging directory is configurable with
 `VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`.
+
+The Linux native unit suite also builds a signed, self-contained
+`loadable_extension_batch_demo` fixture. Its COPY rewrite recursively plans a
+UDF child from inside a private engine copy. After `scripts/run_native_tests.sh`,
+run its installed-Python regression with
+`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_copy`.
+This covers both local runner names, task and actor execution, empty input,
+multiple batches, nulls and fixed-size vectors while forbidding Ray startup.
+Rebuild optional providers against the changed native SDK; a matching Python
+package version alone does not establish C++ compatibility.
 
 For the independently selectable image, audio, and video operators, see
 [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md).

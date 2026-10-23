@@ -245,6 +245,13 @@ jobs:
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
 
+      - name: Exercise private extension child planning with local UDFs
+        if: matrix.python-version == '3.12'
+        env:
+          VANE_TEST_LOADABLE_BATCH_DEMO_PATH: ${{ github.workspace }}/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension
+        run: |
+          scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_copy
+
       - name: Exercise the native Gravitino provider
         if: matrix.python-version == '3.12'
         env:

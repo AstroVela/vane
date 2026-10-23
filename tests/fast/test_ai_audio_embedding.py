@@ -258,3 +258,39 @@ def test_clap_rejects_unsupported_configuration(options):
     for factory in (TransformersProvider().get_audio_embedder, TransformersProvider().get_text_embedder):
         with pytest.raises((ValueError, TypeError)):
             factory(CLAP_MODEL, options=options)
+
+
+def test_mlx_audio_null_and_explain_do_not_load_models(monkeypatch):
+    from vane.ai.providers.mlx import MLXAudioEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("NULL/planning instantiated the MLX audio model")
+
+    monkeypatch.setattr(MLXAudioEmbedderDescriptor, "instantiate", forbidden)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+        query = "SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'mlx')"
+        assert conn.sql(query).fetchall() == [(None,)]
+        conn.sql("EXPLAIN " + query).fetchall()
+
+
+@pytest.mark.parametrize("policy", ["raise", "ignore"])
+def test_mlx_audio_rate_and_channel_errors_precede_instantiation(monkeypatch, policy):
+    from vane.ai.provider import load_provider
+    from vane.ai.providers.mlx import MLXAudioEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid PCM instantiated the MLX audio model")
+
+    monkeypatch.setattr(MLXAudioEmbedderDescriptor, "instantiate", forbidden)
+    descriptor = load_provider("mlx").get_audio_embedder()
+    for value in (audio(rate=48000, shape=(321, 1)), audio(rate=16000, shape=(321, 2))):
+        wrapper = _EmbedAudioBatch(descriptor, "audio", "embedding", 768, on_error=policy)
+        loop = asyncio.new_event_loop()
+        wrapper.bind_async_runtime(loop.run_until_complete)
+        try:
+            with pytest.raises(EmbeddingConfigurationError):
+                wrapper(pa.table({"audio": array([value])}))
+        finally:
+            wrapper.close()
+            loop.close()

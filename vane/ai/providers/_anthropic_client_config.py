@@ -46,6 +46,8 @@ def create_anthropic_client(factory: Any, snapshot: dict[str, Any], options: dic
         max_retries=0,
         **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
     )
+    # SDK 2.x rejects two non-None credentials, including empty strings. Older
+    # SDKs may fill the unused field from worker state, so restore both fields.
     client.api_key = config["api_key"]
     client.auth_token = config["auth_token"]
     client._custom_headers = {}

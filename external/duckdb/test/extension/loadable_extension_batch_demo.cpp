@@ -4,11 +4,41 @@
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
 
 using namespace duckdb;
 
 namespace {
+
+// Model COPY extensions that bind their input and recursively plan it from
+// their self-contained DSO. Return the input rows to keep the fixture stateless.
+class BatchDemoLogicalCopy : public LogicalExtensionOperator {
+public:
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		return planner.CreatePlan(*children[0]);
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+};
+
+BoundStatement PlanBatchDemoCopy(Binder &binder, CopyStatement &statement) {
+	auto input = binder.Bind(*statement.info->select_statement->Copy());
+	auto copy = make_uniq<BatchDemoLogicalCopy>();
+	copy->children.push_back(std::move(input.plan));
+	input.plan = std::move(copy);
+	return input;
+}
 
 void Observe(DataChunk &chunk, vector<int64_t> &values) {
 	for (idx_t row = 0; row < chunk.size(); row++) {
@@ -97,11 +127,17 @@ extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(loadable_extension_batch_demo, loader) {
 	// A real loadable artifact, deliberately without a private reader registration.
-	(void)loader;
+	CopyFunction copy("batch_demo_replan");
+	copy.plan = PlanBatchDemoCopy;
+	loader.RegisterFunction(copy);
 }
 
 DUCKDB_EXTENSION_API bool batch_demo_has_private_reader() {
 	return GetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE) != nullptr;
+}
+
+DUCKDB_EXTENSION_API bool batch_demo_has_private_udf_factory() {
+	return GetUDFExecutorFactory() != nullptr;
 }
 
 // Test-only factories put the operator vtable and inherited adapters in this DSO.
