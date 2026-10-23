@@ -4,8 +4,10 @@ M4a tracks an independently built Iceberg provider and native local reads
 through Gravitino's Iceberg REST service. The tracking issue is
 [#1064](https://github.com/AstroVela/vane/issues/1064); production wheel
 publication remains [#619](https://github.com/AstroVela/vane/issues/619).
-This qualification does not introduce a stable Python table-read API or change
-M3's general Iceberg capability flags.
+M4a established the provider qualification. M4b adds the local Python interface
+below, tracked in [#1066](https://github.com/AstroVela/vane/issues/1066).
+M3's general Iceberg capability flags remain conservative; this record covers
+the explicitly qualified local provider, service and feature combinations.
 
 ## Fixed inputs
 
@@ -124,6 +126,110 @@ The pinned PyIceberg client is configured with its existing `noop` auth mode
 and an explicit URI, independently of home-directory catalog configuration.
 This fixture configuration does not add a Vane authentication method.
 
+## Local Python read interface (M4b)
+
+Set `VANE_RUNNER=local` before opening the connection. Load the matching
+installed provider explicitly, then attach an existing catalog:
+
+```python
+import os
+
+import vane
+from vane.catalog import IcebergCatalog
+
+os.environ["VANE_RUNNER"] = "local"
+with vane.connect() as connection:
+    vane.load_installed_extension("iceberg", connection=connection)
+    catalog = IcebergCatalog.attach(
+        connection,
+        "lake",
+        endpoint="http://127.0.0.1:9001/iceberg",
+        warehouse="",
+    )
+    rows = catalog.table("analytics", "events").filter("id >= 100").project("id, label").limit(10).fetchall()
+    catalog.detach()
+```
+
+`endpoint` is the explicit Iceberg REST HTTP(S) URL, including its service
+prefix. Embedded credentials, URL queries/fragments, whitespace and control
+characters are rejected before native access. It is separate from Gravitino's
+metadata endpoint. `warehouse` is passed as the native ATTACH path and REST
+warehouse routing parameter; `""` selects the server default used by this
+fixture. Named warehouse/multi-catalog routing remains service-specific and
+unqualified here.
+
+Attachments always use `READ_ONLY` and `AUTHORIZATION_TYPE 'none'`. The helper
+does not download extensions, create a remote catalog, import storage settings
+from metadata, or add authentication. Missing loaded providers fail with a
+clear error. General provider publication remains #619.
+
+`table(namespace, name, *, snapshot_id=None)` returns an ordinary native
+`DuckDBPyRelation`. Each name is one quoted identifier: `namespace` is the
+native provider's schema name, not an arbitrary SQL fragment. Namespace arrays,
+ambiguous dotted namespace components and cross-catalog name resolution are not
+newly qualified. Projection, filtering and aggregation keep native Iceberg
+manifest, field-ID and deletion semantics. No PyIceberg runtime dependency or
+Parquet-glob fallback is introduced.
+
+An omitted snapshot ID delegates selection to the native transaction. An
+explicit positive signed 64-bit integer selects that exact snapshot through
+native `AT (VERSION => ...)`; a missing snapshot fails instead of reading the
+latest version. Booleans, strings, zero, negative and overflowing IDs are
+rejected. Timestamp-based selection and snapshot/schema-evolution combinations
+are not part of this interface's qualified matrix.
+
+`IcebergCatalog(connection, name)` wraps an existing READ_ONLY Iceberg
+attachment. It rejects writable, missing and other catalog types. Wrappers
+retain the native attachment identity; detaching or replacing that attachment
+invalidates them even when an alias is reused. Identifier matching follows the
+engine's ASCII case-insensitivity and preserves distinct non-ASCII names.
+`detach()` leaves the caller's connection open. Relations depend on their
+connection and attachment lifetime, following Vane's native relation contract.
+
+The helper checks the connection's captured runner policy, independently of
+later environment changes. Ray connections fail before provider or REST access
+with `NotImplementedError`; no runner switch or materialization fallback occurs.
+Iceberg-owned distributed transport and scan splits remain M5.
+
+### Additional real-service feature matrix
+
+The M4b fixture uses the same source pins, SDK, engine identities, service image
+and test-client versions listed above. It adds independently committed v2
+Parquet tables and compares exact rows through the public API:
+
+| Feature | Qualified combination |
+| --- | --- |
+| Snapshot ID | First/latest append snapshots, pre-delete snapshots, explicit rejection of a missing ID |
+| Identity partitions | Optional string partition, Unicode and NULL values; full and filtered results |
+| Schema evolution | Rename, drop, add nullable columns, reuse an old column name with a new field ID, INTEGER to BIGINT promotion |
+| Position deletes | Parquet delete file with spec field IDs and 64-bit row positions; deleted row excluded |
+| Equality deletes | One nullable string equality field; NULL matching; later same-value appends survive the older delete sequence |
+| Delete-aware execution | Full rows, projected IDs, NULL filter, count/sum and pre-delete snapshot reads |
+| Attachment ownership | READ_ONLY enforcement, wrapping, quoted/Unicode aliases, detach/replacement invalidation |
+
+PyIceberg independently reads the partitioned, evolved and position-delete
+tables. Its pinned reader does not support equality-delete scans; that fixture
+is validated by reading the SDK-produced manifest entries and Parquet field
+IDs, then comparing Vane's rows with the expected values and sequence ordering
+from the independently authored inputs. Test delete manifests are emitted with
+the pinned SDK's v2 Avro writer and committed through its REST client, retaining
+the previous manifests and asserting the parent snapshot. Production Vane
+never authors metadata JSON or commit requests in this interface.
+
+Delete formats and sequence applicability follow the
+[Apache Iceberg specification](https://iceberg.apache.org/spec/#delete-formats).
+Partition pruning efficiency, transform/spec evolution, nested evolution,
+multi-column/partitioned equality deletes, deletion vectors, other format
+versions, cloud storage, other platforms and other REST services are unqualified.
+
+Run the API contracts before the base gate, using the service settings above:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+scripts/run_installed_pytest.sh tests/fast/test_gravitino_iceberg_live.py tests/fast/test_iceberg_catalog_live.py -m external_service
+scripts/run_release_tests.sh
+```
+
 ## Compatibility changes and next milestones
 
 The pristine Iceberg build fails in its MERGE planner because Vane's logical
@@ -136,8 +242,8 @@ Upstream `IcebergScanSerialize` and `IcebergScanDeserialize` explicitly throw
 directly. Ray requires an Iceberg-owned transport and split protocol; inherited
 Parquet callbacks cannot establish that contract for Iceberg bind state.
 
-M4b should qualify the stable local read interface and its feature matrix,
-including time travel, partitions, schema evolution and delete files. M5 must
+M4b qualifies the local read interface and the explicit feature matrix above.
+M5 must
 freeze a snapshot per execution, serialize the relevant Iceberg state, assign
 scan splits, and preserve field IDs and deletion semantics on workers. Each
 unsupported feature must fail explicitly. Vane can implement these adapters

@@ -159,7 +159,9 @@ for table operations.
 ## Validation
 
 Iceberg provider compatibility and native local REST reads have a separate
-[M4a qualification record](GRAVITINO_ICEBERG.md). They use an independently
+[qualification record and Python read interface](GRAVITINO_ICEBERG.md).
+`vane.catalog.IcebergCatalog` attaches a READ_ONLY catalog and returns native
+local relations, optionally at an explicit snapshot ID. It uses an independently
 built Iceberg/Avro provider pair and the service's Iceberg REST endpoint; the
 Fileset catalog attachment and metadata tests below do not qualify that path.
 
