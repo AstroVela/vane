@@ -32,6 +32,7 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -393,6 +394,10 @@ SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bin
 
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
+	explicit LogicalValidator(idx_t partitions) : partitions(partitions) {
+	}
+
+	idx_t partitions;
 	vector<SourceSpec> source_dependencies;
 	bool frozen_files = false;
 
@@ -423,6 +428,14 @@ public:
 				// Change only this bound scan's capability, not the shared catalog or
 				// session optimizer settings; native TopN can still be distributed.
 				get.function.late_materialization = false;
+				if (partitions > 1) {
+					// Cost the remaining files when the optimizer requests statistics,
+					// after file pruning, rather than opening every bound footer here.
+					get.function.cardinality = [](ClientContext &context, const FunctionData *data) {
+						return make_uniq<NodeStatistics>(
+						    ParquetScanCardinality(context, data->Cast<MultiFileBindData>()));
+					};
+				}
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
 				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
@@ -758,6 +771,13 @@ public:
 	    : context(context), plan(plan), graph(graph), partitions(partitions),
 	      broadcast_limit(
 	          MaxValue<idx_t>(8 * 1024 * 1024, MinValue<idx_t>(64 * 1024 * 1024, worker_operator_bytes / 16))) {
+		// Reserve 128 bytes per bucket for partial/final grouping and probe hash
+		// tables as well as the encoded keys. Keep the conservative domain
+		// without declared memory; larger budgets can reduce collisions.
+		const auto bucket_capacity = broadcast_limit / 128;
+		while (max_hash_bucket_count <= bucket_capacity / 2) {
+			max_hash_bucket_count *= 2;
+		}
 	}
 
 	string Finish(DistributedSubtree subtree, const vector<string> &names = {}) {
@@ -823,7 +843,7 @@ public:
 				auto domain = ExchangeFrom(filter.domain_producer, filter.domain->types,
 				                           count == 1 ? "gather" : "broadcast", count);
 				result = SemiFilter(op, std::move(result), filter.column, *filter.domain, std::move(domain),
-				                    filter.keys_only ? 0 : filter.build_column, filter.hashed);
+				                    filter.keys_only ? 0 : filter.build_column, filter.hash_buckets);
 			}
 		}
 		return result;
@@ -937,6 +957,7 @@ private:
 	FragmentGraph &graph;
 	idx_t partitions;
 	idx_t broadcast_limit;
+	idx_t max_hash_bucket_count = 65536;
 	idx_t next_exchange = 0;
 	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
@@ -951,7 +972,7 @@ private:
 		PhysicalOperator *domain = nullptr;
 		string domain_producer;
 		bool keys_only = false;
-		bool hashed = false;
+		idx_t hash_buckets = 0;
 	};
 	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
 	unordered_map<const PhysicalOperator *, string> shared_join_builds;
@@ -1181,17 +1202,26 @@ private:
 			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
 			auto probe_bytes = EstimatedExchangeBytes(*target.input);
 			target.keys_only = !broadcast;
-			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
-			if (target.hashed) {
+			if (!broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build)) {
 				// HAVING estimates can hide a tiny build. A distinct hash domain
-				// has at most 65536 entries even when that estimate is wrong.
+				// has a budget-bounded size even when that estimate is wrong.
 				// Collisions only retain extra probes; the original join is exact.
-				if (target.input->estimated_cardinality <= 8 * 65536) {
+				target.hash_buckets = 65536;
+				if (target.input->estimated_cardinality <= 8 * target.hash_buckets) {
 					continue;
 				}
-				key_bytes = 65536 * 9;
+				// Size each filter to its own probe and traffic savings. A larger
+				// worker budget must not disable a useful smaller key domain.
+				while (target.hash_buckets < max_hash_bucket_count &&
+				       16 * target.hash_buckets < target.input->estimated_cardinality &&
+				       EstimatedExchangeBytes(build) + double(target.hash_buckets) * 18 * partitions < probe_bytes) {
+					target.hash_buckets *= 2;
+				}
+				key_bytes = target.hash_buckets * 9;
 			} else {
-				if (!broadcast && key_bytes > 16 * 1024 * 1024) {
+				// Key replicas can use the same bounded per-query allowance as a
+				// full-build broadcast. Charge all extra edges below as before.
+				if (!broadcast && key_bytes > MaxValue<idx_t>(16 * 1024 * 1024, broadcast_limit)) {
 					continue;
 				}
 				if (double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
@@ -1223,7 +1253,7 @@ private:
 		return result;
 	}
 
-	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column) {
+	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column, idx_t buckets) {
 		FunctionBinder binder(context);
 		ErrorData error;
 		vector<unique_ptr<Expression>> arguments;
@@ -1234,7 +1264,7 @@ private:
 		}
 		arguments.clear();
 		arguments.push_back(std::move(hash));
-		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(65535)));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(buckets - 1)));
 		auto bucket = binder.BindScalarFunction(DEFAULT_SCHEMA, "&", std::move(arguments), error);
 		if (error.HasError()) {
 			throw InternalException("cannot bind join filter bucket: %s", error.Message());
@@ -1247,15 +1277,16 @@ private:
 		auto domain = ExchangeFrom(filter.producer, build.types, "hash", partitions, {filter.build_column});
 		vector<unique_ptr<Expression>> expressions;
 		expressions.push_back(
-		    filter.hashed ? HashBucket(build.types[filter.build_column], filter.build_column)
-		                  : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
+		    filter.hash_buckets
+		        ? HashBucket(build.types[filter.build_column], filter.build_column, filter.hash_buckets)
+		        : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
 		auto type = expressions[0]->return_type;
 		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {type}, std::move(expressions),
 		                                                 build.estimated_cardinality);
 		projection.children.push_back(build);
 		Wrap(projection, domain);
 		filter.domain = &projection;
-		if (filter.hashed) {
+		if (filter.hash_buckets) {
 			vector<unique_ptr<Expression>> groups;
 			groups.push_back(make_uniq<BoundReferenceExpression>(type, 0));
 			auto &partial = MakeAggregate(Copy(groups), {});
@@ -1285,7 +1316,7 @@ private:
 	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
 		auto keys = filter.scan;
-		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
+		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= broadcast_limit &&
 		              double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
 		              double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
 		if (!rescan && keys.source && keys.source == filter.owner.source && broadcast_limit > 8 * 1024 * 1024) {
@@ -1310,7 +1341,7 @@ private:
 			auto &owner = *keys.source;
 			auto key_bytes =
 			    double(owner.estimated_cardinality) * (1 + GetTypeIdSize(owner.types[keys.column].InternalType()));
-			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > 8 * 1024 * 1024 ||
+			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > broadcast_limit ||
 			    double(owner.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
 			    EstimatedExchangeBytes(owner) + key_bytes * count >= EstimatedExchangeBytes(op)) {
 				return input;
@@ -1332,13 +1363,13 @@ private:
 	}
 
 	DistributedSubtree SemiFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
-	                              DistributedSubtree domain, idx_t build_key, bool hashed = false) {
+	                              DistributedSubtree domain, idx_t build_key, idx_t hash_buckets = 0) {
 		// NULL-safe equality is only a necessary condition; the original
 		// join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
-		condition.left =
-		    hashed ? HashBucket(op.types[key], key) : make_uniq<BoundReferenceExpression>(op.types[key], key);
+		condition.left = hash_buckets ? HashBucket(op.types[key], key, hash_buckets)
+		                              : make_uniq<BoundReferenceExpression>(op.types[key], key);
 		condition.right = make_uniq<BoundReferenceExpression>(build.types[build_key], build_key);
 		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 		conditions.push_back(std::move(condition));
@@ -1843,6 +1874,9 @@ private:
 			output.push_back(make_uniq<BoundReferenceExpression>(aggregate.return_type, column));
 		}
 		auto &partial = MakeAggregate(Copy(groups), std::move(partials));
+		if (partial.type == PhysicalOperatorType::HASH_GROUP_BY) {
+			partial.Cast<PhysicalHashAggregate>().SetPartialStateOutput();
+		}
 		Wrap(partial, child);
 		child = Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);
 		auto &final = MakeAggregate(std::move(final_groups), std::move(finals));
@@ -2158,7 +2192,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		if (!planner.plan || !planner.properties.IsReadOnly() || planner.properties.parameter_count) {
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");
 		}
-		LogicalValidator validator;
+		LogicalValidator validator(partitions);
 		validator.frozen_files = !snapshot_directory.empty();
 		validator.VisitOperator(*planner.plan);
 		CheckTypes(planner.types);

@@ -198,15 +198,95 @@ def test_partial_aggregates_exchange_native_states(expressions):
         assert execute_graph(connection, graph) == expected
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("layout", ["clustered", "interleaved"])
+def test_partial_aggregates_preserve_duplicate_states_until_final_merge(tmp_path, threads, external, layout):
+    spill = tmp_path / "spill"
+    config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
+    group = "range//3" if layout == "clustered" else "range%32771"
+    source = (
+        f"select range i, case when ({group})%32771=0 then null "
+        f"else 'owned-partial-key-' || ({group})::varchar end k, "
+        "case when range%7=0 then null else range%31-15 end v from range(131099)"
+    )
+    aggregates = "sum(v), count(v), sum(v) filter(where i%3=0), count(*) filter(where false)"
+    sql = f"select k, {aggregates} from ({source}) group by k"
+    with vane.connect(backend="local", config=config) as connection:
+        expected = connection.execute(sql).fetchall()
+        # EXPORT_STATE in ordinary SQL must still emit one row per group.
+        exported = connection.execute(f"select k, sum(v) export_state from ({source}) group by k").fetchall()
+        assert len(exported) == len(expected)
+        if external:
+            connection.execute("set debug_force_external=true")
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        assignments = {source.source_id: [split.split_id for split in source.splits] for source in producer.sources}
+        partials = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
+        assert set(row[0] for row in partials) == set(row[0] for row in expected)
+        if layout == "clustered" and threads > 1:
+            assert len(partials) > len(expected)
+        else:
+            assert len(partials) == len(expected)
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        # Transport/reordering and repeated executions cannot treat each partial
+        # as a complete group, retain input state pointers, or consume the input.
+        for rows in (partials, list(reversed(partials))):
+            actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            assert Counter(actual) == Counter(expected)
+        assert connection.execute("select 42").fetchall() == [(42,)]
+    assert not list(spill.glob("*"))
+
+
+@pytest.mark.parametrize("layout", ["clustered", "interleaved"])
+def test_partial_aggregates_spill_with_costed_output(tmp_path, layout):
+    key = "range//3" if layout == "clustered" else "range%32771"
+    count = 1572867 if layout == "clustered" else 524299
+    sql = (
+        f"select k, sum(v), count(v) from (select case when ({key})%32771=0 then null "
+        f"else {key} end k, range%31-15 v from range({count})) group by k"
+    )
+    with vane.connect(backend="local", config={"threads": 4, "memory_limit": "128MB"}) as connection:
+        expected = connection.execute(sql).fetchall()
+    spill = tmp_path / "spill"
+    profile = tmp_path / "profile.json"
+    config = {"threads": 4, "memory_limit": "32MB", "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        assignments = {source.source_id: [split.split_id for split in source.splits] for source in producer.sources}
+        connection.execute("set debug_force_external=true")
+        connection.execute("set enable_profiling='json'")
+        connection.execute(f"set profiling_output='{profile}'")
+        partials = native._execute_fragment_for_test(connection, producer.native_plan, {}, assignments)
+        connection.execute("pragma disable_profiling")
+        assert json.loads(profile.read_text())["system_peak_temp_dir_size"] > 0
+        if layout == "clustered":
+            assert len(partials) > len(expected)
+        else:
+            assert len(partials) == len(expected)
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: partials}, {})
+        assert Counter(actual) == Counter(expected)
+    assert not list(spill.glob("*"))
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("nulls", ["none", "mixed", "all"])
-def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(grouped, nulls):
+@pytest.mark.parametrize("threads", [1, 2, 4])
+@pytest.mark.parametrize("external", [False, True])
+def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(tmp_path, grouped, nulls, threads, external):
     sql = (
         "select range k, sum(range) s, count(range) n from range(8) group by k"
         if grouped
         else "select sum(range) s, count(range) n from range(8)"
     )
-    with vane.connect(backend="local", config={"threads": 1}) as connection:
+    config = {"threads": threads, "temp_directory": str(tmp_path / "spill")}
+    with vane.connect(backend="local", config=config) as connection:
+        if external:
+            connection.execute("set debug_force_external=true")
         graph = compile_sql(connection, sql, partitions=2)
         producer = graph.fragments[0]
         partials = native._execute_fragment_for_test(
@@ -221,7 +301,7 @@ def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(group
         # NULL state blobs must be skipped independently for each aggregate.
         rows = []
         sums, counts = Counter(), Counter()
-        for index in range(4099):
+        for index in range(131099 if external else 4099):
             partial = partials[index % len(partials)]
             key = partial[0] if grouped else 0
             sum_state, count_state = partial[-2:]
@@ -248,20 +328,149 @@ def test_merge_aggregate_batches_preserve_repeated_targets_and_null_states(group
         assert connection.execute("select 42").fetchall() == [(42,)]
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("external", [False, True])
+def test_merge_aggregate_new_groups_preserve_collisions_and_owned_keys(tmp_path, threads, external):
+    config = {"threads": threads, "temp_directory": str(tmp_path / "spill")}
+    with vane.connect(backend="local", config=config) as connection:
+        keys = "select 'long-key-' || lpad(range::varchar,20,'0') k from range(1000000)"
+        # Match the salt and low hash bits so the second group must compare
+        # against the first before it can be created. New-group rows can then
+        # be out of input order. Long keys also exercise owned tuple heaps.
+        first, second = connection.execute(
+            f"select min(k),max(k) from ({keys}) group by hash(k) & 18446462598732906495::ubigint "
+            "having count(*)>1 limit 1"
+        ).fetchone()
+        third = connection.execute(
+            f"select k from ({keys}) where hash(k)>>48 = hash('{first}')>>48 "
+            f"and k not in ('{first}','{second}') limit 1"
+        ).fetchone()[0]
+        source = (
+            f"select case range%4 when 0 then '{first}' when 1 then '{second}' when 2 then '{third}' end k, "
+            "case when range%11=0 or range%4=3 then null else range%97-48 end v from range(259)"
+        )
+        aggregates = (
+            "sum(v),count(v),count(*),avg(v),min(v),max(v),sum(v::hugeint),avg(v::hugeint),"
+            "sum(v::decimal(15,2)),avg(v::decimal(15,2)),avg(interval '1 microsecond'*v)::varchar"
+        )
+        sql = f"select k,{aggregates} from ({source}) group by k"
+        repeats = 513
+        expected = connection.execute(
+            f"select k,{aggregates} from ({source}) cross join range({repeats}) group by k"
+        ).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        partials = []
+        for partition in range(2):
+            partials.extend(
+                native._execute_fragment_for_test(
+                    connection,
+                    producer.native_plan,
+                    {},
+                    {
+                        source.source_id: [s.split_id for s in source.splits[partition::2]]
+                        for source in producer.sources
+                    },
+                )
+            )
+        order = {first: 0, second: 1, third: 2, None: 3}
+        partials.sort(key=lambda row: order[row[0]])
+        rows = partials * repeats
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        if external:
+            connection.execute("set debug_force_external=true")
+        for _ in range(2):
+            assert Counter(
+                native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            ) == Counter(expected)
+    assert not list((tmp_path / "spill").glob("*"))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("memory_limit", ["32MB", "256MB"])
+def test_merge_aggregate_sparse_output_preserves_owned_rows(tmp_path, threads, memory_limit):
+    spill = tmp_path / "spill"
+    config = {"threads": threads, "memory_limit": memory_limit, "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        sql = (
+            "select case when range=0 then null else 'owned-long-key-' || lpad(range::varchar,20,'0') end k, "
+            "sum(range),count(range) from range(16387) group by k"
+        )
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions=2)
+        producer = graph.fragments[0]
+        partials = native._execute_fragment_for_test(
+            connection,
+            producer.native_plan,
+            {},
+            {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
+        )
+        partials.sort(key=lambda row: row[0] or "")
+        # A long duplicate-only tail and sparse new keys exercise empty and
+        # partially selected output vectors before returning to full vectors.
+        rows = partials[:257] * 33 + partials[257:] + partials[::-1] + [partials[0]] * 131099
+        multiplicities = Counter(row[0] for row in rows)
+        expected = [(key, value * multiplicities[key], count * multiplicities[key]) for key, value, count in expected]
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        connection.execute("set debug_force_external=true")
+        for _ in range(2):
+            assert Counter(
+                native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+            ) == Counter(expected)
+    assert not list(spill.glob("*"))
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("groups", [1, 8])
+def test_merge_aggregate_state_import_spills_and_releases_storage(tmp_path, threads, groups):
+    spill = tmp_path / "spill"
+    profile = tmp_path / "profile.json"
+    config = {"threads": threads, "memory_limit": "32MB", "temp_directory": str(spill)}
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(
+            connection, f"select range k, sum(range), count(range) from range({groups}) group by k", partitions=2
+        )
+        producer = graph.fragments[0]
+        partials = native._execute_fragment_for_test(
+            connection,
+            producer.native_plan,
+            {},
+            {source.source_id: [split.split_id for split in source.splits] for source in producer.sources},
+        )
+        partials.sort(key=lambda row: row[0])
+        rows = [partials[index % groups] for index in range(524299)]
+        edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer.fragment_id)
+        final = next(fragment for fragment in graph.fragments if fragment.fragment_id == edge.consumer_fragment_id)
+        connection.execute("set debug_force_external=true")
+        connection.execute("set enable_profiling='json'")
+        connection.execute(f"set profiling_output='{profile}'")
+        actual = native._execute_fragment_for_test(connection, final.native_plan, {edge.consumer_port: rows}, {})
+        expected = []
+        for key in range(groups):
+            count = len(rows) // groups + (key < len(rows) % groups)
+            expected.append((key, key * count, count))
+        assert sorted(actual) == expected
+        connection.execute("pragma disable_profiling")
+        assert json.loads(profile.read_text())["system_peak_temp_dir_size"] > 0
+    assert not list(spill.glob("*"))
+
+
 def batched_aggregate_query(groups):
     return (
         "select k, sum(v), count(v), avg(v), min(v), max(v), "
         "sum(v::decimal(15,2)), avg(v::decimal(15,2)), "
         "sum(v::hugeint), avg(v::hugeint), avg(interval '1 microsecond' * v)::varchar, "
         "sum(v) filter(where i % 3=0), count(*) filter(where false) "
-        f"from (select range i, range % {groups} k, "
+        f"from (select range i, case when range % {groups}=0 then null else range % {groups} end k, "
         "case when k % 17=0 or range % 11=0 then null else range % 257-128 end v "
         "from range(65539)) group by k order by k"
     )
 
 
 @pytest.mark.parametrize("groups", [7, 4099])
-@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("threads", [1, 2, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
 def test_merge_aggregate_batches_across_bounded_channels(groups, threads, partitions):
     sql = batched_aggregate_query(groups)
@@ -307,6 +516,35 @@ def test_one_parquet_file_uses_all_partitions_with_hive_and_row_numbers(tmp_path
         assert min(counts) > 0
         assert sum(counts) == sum(expected.values())
         assert Counter(execute_graph(connection, graph)) == expected
+
+
+@pytest.mark.parametrize("partitions", [2, 3, 5])
+@pytest.mark.parametrize("groups", [3, 5])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_parquet_split_rows_balance_odd_groups_across_files(tmp_path, partitions, groups, duplicate):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        paths = []
+        for index in range(partitions * 4):
+            path = tmp_path / f"part{index:02}.parquet"
+            connection.execute(
+                f"copy (select range+{index * groups * 2048} k from range({groups * 2048 - 257})) "
+                f"to '{path}' (row_group_size 2048)"
+            )
+            paths.append(str(path))
+        sql = f"select k from read_parquet({(paths * (2 if duplicate else 1))!r})"
+        graph = compile_sql(connection, sql, partitions=partitions)
+        producer = graph.fragments[0]
+        counts = []
+        for partition in range(partitions):
+            rows = native._execute_fragment_for_test(
+                connection,
+                producer.native_plan,
+                {},
+                {s.source_id: [split.split_id for split in s.splits[partition::partitions]] for s in producer.sources},
+            )
+            counts.append(len(rows))
+        assert max(counts) - min(counts) <= 2048
+        assert Counter(execute_graph(connection, graph)) == Counter(connection.execute(sql).fetchall())
 
 
 @pytest.mark.parametrize("threads", [1, 4])
@@ -1007,6 +1245,156 @@ def test_correlated_owner_keys_filter_before_exchange(tmp_path, threads, partiti
         assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
 
 
+def budgeted_owner_filter_query(connection, path, kind="semi", comparison="="):
+    sql = correlated_owner_queries(connection, path, comparison)[kind]
+    # The owner has only 320 rows, but a 1M-row estimate (a 9 MB key
+    # domain). It cannot be replaced by an independent Parquet scan.
+    return sql.replace("range(65536) where range%31=0", "range(5000000) where range%15625=0").replace(
+        f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality=100000000)"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("kind", ["semi", "anti", "nested", "scalar"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_declared_budget_filters_shared_correlated_owner(tmp_path, partitions, kind, comparison):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute("set disabled_optimizers='deliminator,compressed_materialization'")
+        path = tmp_path / "fact.parquet"
+        sql = budgeted_owner_filter_query(connection, path, kind, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="budgeted-owner-filter",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=256 << 20),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(path).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 4096
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert sum(s.function_name == "range" for f in spec.graph.fragments for s in f.sources) == 1
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("budget,filtered", [(0, False), (128 << 20, False), (256 << 20, True)])
+def test_shared_correlated_owner_filter_respects_declared_budget(tmp_path, budget, filtered):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("set disabled_optimizers='deliminator,compressed_materialization'")
+        sql = budgeted_owner_filter_query(connection, tmp_path / "fact.parquet")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="owner-filter-budget",
+            options=FragmentCompileOptions(2, worker_operator_bytes=budget),
+        )
+        assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is filtered
+
+
+def budgeted_hash_filter_query(connection, directory, comparison="="):
+    fact, build = directory / "fact.parquet", directory / "build.parquet"
+    connection.execute(
+        "copy (select case when range%8192=0 then null else range-524288 end k, range%17 v "
+        f"from range(1048576)) to '{fact}' (row_group_size 2048)"
+    )
+    connection.execute(
+        "copy (select case when range%8192=0 then null else (range%65536)*3-524288 end k, "
+        f"(range%32=0)::integer v from range(131072)) to '{build}' (row_group_size 2048)"
+    )
+    return (
+        f"select count(*),sum(f.v),sum(b.s) from read_parquet('{fact}', explicit_cardinality=1000000000) f join "
+        f"(select k,sum(v) s from read_parquet('{build}', explicit_cardinality=100000000) "
+        f"group by k having sum(v)>0) b on f.k {comparison} b.k"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_hash_domain_uses_declared_memory_to_reduce_collisions(tmp_path, partitions):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side,compressed_materialization'")
+        sql = budgeted_hash_filter_query(connection, tmp_path)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="budgeted-hash-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=1 << 30)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=1 << 30),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(tmp_path / "fact.parquet").encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(16384, 4096, 128, 2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 4096
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("budget", [0, 256 << 20, 1 << 30])
+def test_hash_domain_keeps_useful_filters_for_medium_probes(tmp_path, partitions, budget):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        path = tmp_path / "fact.parquet"
+        sql = large_join_key_query(connection, path, "hashed")
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="medium-probe-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=1 << 30)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        facts = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(path).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in facts}
+        limits = DirectExchangeLimits(16384, 4096, 128, 2)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 65536
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [2, 3])
 @pytest.mark.parametrize("domain", ["exact", "hashed", "estimated", "compressed", "join_estimate"])
@@ -1058,11 +1446,21 @@ def test_join_output_filter_estimate_requires_single_key_and_traffic_savings(tmp
 
 
 @pytest.mark.parametrize("domain", ["dense", "empty"])
-def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, domain):
+@pytest.mark.parametrize("budget,bound", [(0, 65536), (256 << 20, 131072)])
+def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, domain, budget, bound):
     with vane.connect(backend="local", config={"threads": 4}) as connection:
-        sql = large_join_key_query(connection, tmp_path / "fact.parquet", domain) + " limit 4096"
+        path = tmp_path / "fact.parquet"
+        sql = large_join_key_query(connection, path, domain) + " limit 4096"
+        sql = sql.replace(f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality=100000000)")
         expected = connection.execute(sql).fetchall()
-        spec = submission(connection, sql, partitions=3)
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="bounded-hash-domain",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(3, worker_operator_bytes=budget),
+        )
         limits = DirectExchangeLimits(4096, 1024, 64, 1)
         with InProcessTaskService(connection, spec, limits) as service:
             service.start()
@@ -1070,7 +1468,7 @@ def test_hashed_key_domain_is_bounded_and_preserves_exact_matches(tmp_path, doma
             broadcasts = [e.exchange_id for e in spec.graph.exchanges if e.distribution is Distribution.BROADCAST]
             assert broadcasts
             for edge in broadcasts:
-                assert service.channels[edge].snapshot()["accepted_rows"] <= 65536
+                assert service.channels[edge].snapshot()["accepted_rows"] <= bound
 
 
 @pytest.mark.parametrize("condition", ["multiple", "repeated", "residual"])

@@ -129,7 +129,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayo
 		return arrow::utf8();
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::AGGREGATE_STATE:
-		return layout == ArrowLayout::NATIVE_COMPACT ? arrow::binary_view() : arrow::binary();
+		return arrow::binary();
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
 	case LogicalTypeId::HUGEINT:
@@ -195,23 +195,6 @@ std::shared_ptr<arrow::ArrayData> NormalizeArray(const std::shared_ptr<arrow::Ar
                                                  const std::shared_ptr<arrow::DataType> &type) {
 	if (data->type->Equals(type)) {
 		return data;
-	}
-	if (data->type->id() == arrow::Type::BINARY_VIEW) {
-		// The native v1.5 exporter also emits binary views. Keep the established
-		// BLOB/aggregate-state wire layout, including inside nested columns.
-		arrow::BinaryViewArray values(data);
-		arrow::BinaryBuilder builder;
-		CheckArrow(builder.Reserve(values.length()));
-		for (int64_t row = 0; row < values.length(); row++) {
-			if (values.IsNull(row)) {
-				builder.UnsafeAppendNull();
-			} else {
-				CheckArrow(builder.Append(values.GetView(row)));
-			}
-		}
-		std::shared_ptr<arrow::Array> result;
-		CheckArrow(builder.Finish(&result));
-		return result->data();
 	}
 	if (type->id() == arrow::Type::DECIMAL256) {
 		// The native exporter owns a signed 128-bit buffer. Its decimal128(38)
@@ -289,6 +272,10 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 		}
 	}
 	ClientProperties properties;
+	// Export the binary wire layout directly, including nested BLOBs and
+	// aggregate states. Compact decimals still need Arrow v1.5, independently
+	// of binary views, which would otherwise copy every state a second time.
+	properties.produce_arrow_binary_view = false;
 	if (compact_decimals) {
 		properties.arrow_output_version = ArrowFormatVersion::V1_5;
 	}

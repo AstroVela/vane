@@ -34,11 +34,13 @@ from tests.fast.test_analytical_fragment_compiler import (
 from tests.fast.test_execution_performance import (
     batched_aggregate_query,
     budgeted_correlated_scan_query,
+    budgeted_hash_filter_query,
+    budgeted_owner_filter_query,
     interval_average_queries,
     large_broadcast_query,
     shared_cte_filter_query,
 )
-from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source
+from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source, large_join_key_query
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
 from tests.fast.test_join_build_filter import shared_join_build_query
 from tests.fast.test_parquet_aggregate_partitioning import broadcast_aggregate_query, disjoint_aggregate_query
@@ -202,6 +204,57 @@ def test_shared_join_build_filter_preserves_consumer_retry(tmp_path, monkeypatch
             producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
             assert len(producers) > len(set(producers))
             assert sum(len(f.sources) for f in scheduler.spec.graph.fragments) == 3
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+@pytest.mark.parametrize("kind", ["owner", "hashed", "medium"])
+def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypatch, mode, kind):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
+        shared = {p for p in producers if producers.count(p) > 1}
+        if admitted and not lost and shared.intersection(upstream):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    budget = (256 if kind == "owner" else 1024) << 20
+    limits = resources(tmp_path, operator_memory_bytes=budget, task_contexts_per_worker=64, io_concurrency=256)
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        if kind == "owner":
+            sql = budgeted_owner_filter_query(local, tmp_path / "fact.parquet", "nested", "is not distinct from")
+        elif kind == "hashed":
+            sql = budgeted_hash_filter_query(local, tmp_path)
+        else:
+            sql = large_join_key_query(local, tmp_path / "fact.parquet", "hashed")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
+            assert len(producers) > len(set(producers))
+            assert any(e.distribution is Distribution.BROADCAST for e in scheduler.spec.graph.exchanges)
             if mode == "fte_retry":
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]

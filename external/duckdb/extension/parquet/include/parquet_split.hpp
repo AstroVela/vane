@@ -15,6 +15,10 @@ struct MultiFileBindData;
 // into independently readable, disjoint ranges. Repeated references stay repeated.
 DUCKDB_API vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindData &bind, idx_t partitions);
 
+// Distributed planning already reads the bound file footers to assign splits.
+// Cost joins from their row counts, respecting explicit cardinality overrides.
+DUCKDB_API idx_t ParquetScanCardinality(ClientContext &context, const MultiFileBindData &bind);
+
 // True only when the given integral column has known, non-null, disjoint ranges
 // across these exact splits. Every group containing this key is then complete
 // within one split, regardless of which worker receives it.
