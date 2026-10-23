@@ -107,7 +107,7 @@ from vane.execution.udf_shm_store import (
     LocalShmStoreCapacityError,
     ParentShmPeer,
 )
-from vane.execution.udf_stream_backpressure import StreamCapacity, StreamReadWindow
+from vane.execution.udf_stream_backpressure import STREAM_BUFFER_BLOCKS, StreamCapacity, StreamReadWindow
 from vane.execution.udf_threading import subprocess_actor_thread_env
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
@@ -3997,6 +3997,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     """Subprocess UDF executor with an optional worker pool."""
 
     def __init__(self, payload: dict[str, Any], options: dict[str, Any] | None = None) -> None:
+        self._stream_buffer_blocks = payload.get("stream_buffer_blocks", STREAM_BUFFER_BLOCKS)
+        if type(self._stream_buffer_blocks) is not int or self._stream_buffer_blocks <= 0:
+            raise ValueError("stream output block capacity must be a positive integer")
         options = dict(options or {})
         session_config = _normalize_session_config_option(options)
         self._worker_metrics = options.get("local_worker_metrics")
@@ -4680,7 +4683,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             output_fn = fn
 
             def run_streaming(worker: _SingleSubprocessExecutor) -> Any | None:
-                stream = LocalStreamAdapter()
+                stream = LocalStreamAdapter(max_blocks=self._stream_buffer_blocks)
                 stream_token = _active_local_stream.set(stream)
 
                 def publish(result: Any) -> None:
@@ -5099,6 +5102,15 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         return None
 
     def take_ready_result(self, capacity: dict[str, Any] | None = None) -> Any | None:
+        acquired = self._take_ready_result_with_release(capacity)
+        if acquired is None:
+            return None
+        result, consumed = acquired
+        consumed()
+        return result
+
+    def _take_ready_result_with_release(self, capacity: dict[str, Any] | None = None) -> Any | None:
+        """Transfer one output while allowing a composed consumer to retain its permit."""
         self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
@@ -5120,12 +5132,24 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             stream = self._result_streams[index] if self._result_streams else None
             if self._result_streams:
                 del self._result_streams[index]
-        if stream is not None:
-            stream.consumed()
-        if admission is not None:
-            admission.release()
-        transition_local_shm_output(result, "downstream_input")
-        return result
+        consumed_lock = threading.Lock()
+        released = False
+
+        def consumed() -> None:
+            nonlocal released
+            with consumed_lock:
+                if released:
+                    return
+                released = True
+            try:
+                if stream is not None:
+                    stream.consumed()
+            finally:
+                if admission is not None:
+                    admission.release()
+            transition_local_shm_output(result, "downstream_input")
+
+        return result, consumed
 
     def finished_submitting(self) -> None:
         self._finished_submitting = True

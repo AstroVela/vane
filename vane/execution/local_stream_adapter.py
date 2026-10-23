@@ -21,7 +21,10 @@ class LocalStreamAdapter:
     Cancellation wakes this wait independently of DATA delivery.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_blocks: int = STREAM_BUFFER_BLOCKS) -> None:
+        if type(max_blocks) is not int or max_blocks <= 0:
+            raise ValueError("stream output block capacity must be a positive integer")
+        self._max_blocks = max_blocks
         self._condition = threading.Condition()
         self._outstanding = 0
         self._closed = False
@@ -42,7 +45,7 @@ class LocalStreamAdapter:
                     scope.raise_if_cancelled("local output stream")
                     if self._closed:
                         raise RuntimeError("local output stream is closed")
-                    if self._outstanding < STREAM_BUFFER_BLOCKS:
+                    if self._outstanding < self._max_blocks:
                         self._outstanding += 1
                         return
                 # CPU suspension/resumption can call admission wakeups. Do
@@ -50,7 +53,7 @@ class LocalStreamAdapter:
                 with wait_context():
                     with self._condition:
                         self._condition.wait_for(
-                            lambda: self._closed or scope.is_set() or self._outstanding < STREAM_BUFFER_BLOCKS
+                            lambda: self._closed or scope.is_set() or self._outstanding < self._max_blocks
                         )
         finally:
             unregister()

@@ -24,6 +24,7 @@ __all__ = [
     "PythonUDFType",
     "vectorized",
     "no_retries",
+    "zip_map_batches",
 ]
 
 
@@ -50,6 +51,22 @@ def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., t
 
 
 _Function = typing.TypeVar("_Function", bound=typing.Callable[..., typing.Any])
+
+
+def zip_map_batches(
+    relation: typing.Any,
+    left: typing.Callable[..., typing.Any],
+    right: typing.Callable[..., typing.Any],
+    **options: typing.Any,
+) -> typing.Any:
+    """Run colocated streaming batch UDFs and align their ordered output keys.
+
+    See ``vane.execution.udf_zip.zip_map_batches`` for schema, budget and
+    alignment arguments. Both branches use Vane task workers and output permits.
+    """
+    from vane.execution.udf_zip import zip_map_batches as bind_zip
+
+    return bind_zip(relation, left, right, **options)
 
 
 def no_retries(function: _Function) -> _Function:

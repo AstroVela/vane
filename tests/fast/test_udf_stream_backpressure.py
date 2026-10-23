@@ -81,3 +81,31 @@ def test_cancellation_wakes_full_stream_without_a_consumer():
                 producer.result(timeout=5)
         finally:
             stream.close()
+
+
+@pytest.mark.parametrize("capacity", [0, -1, True, 1.5])
+def test_stream_rejects_invalid_block_capacity(capacity):
+    with pytest.raises(ValueError, match="positive integer"):
+        LocalStreamAdapter(max_blocks=capacity)
+
+
+def test_one_block_stream_retains_credit_until_paired_consumer_releases_it():
+    stream = LocalStreamAdapter(max_blocks=1)
+    scope = ExecutionCancellationScope("zip", 1)
+    stream.reserve(scope, nullcontext)
+    waiting = threading.Event()
+
+    def wait_context():
+        waiting.set()
+        return nullcontext()
+
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        producer = threads.submit(stream.reserve, scope, wait_context)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not producer.done()
+            stream.consumed()
+            producer.result(timeout=5)
+        finally:
+            scope.cancel()
+            stream.close()

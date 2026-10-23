@@ -34,6 +34,7 @@ __all__: list[str] = [
     "PythonUDFType",
     "vectorized",
     "no_retries",
+    "zip_map_batches",
 ]
 
 def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., typing.Any]: ...
@@ -41,3 +42,9 @@ def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., t
 _Function = typing.TypeVar("_Function", bound=typing.Callable[..., typing.Any])
 
 def no_retries(function: _Function) -> _Function: ...
+def zip_map_batches(
+    relation: typing.Any,
+    left: typing.Callable[..., typing.Any],
+    right: typing.Callable[..., typing.Any],
+    **options: typing.Any,
+) -> typing.Any: ...

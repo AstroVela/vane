@@ -21,6 +21,64 @@ The [integrated stage acceptance record](LOCAL_SERVING_ACCEPTANCE.md#integrated-
 identifies the merged CPU/CUDA and streaming version, its validation evidence,
 and the unresolved historical startup incident.
 
+## Parallel streaming batch functions
+
+`vane.udf.zip_map_batches` runs two generator batch functions for each input
+row in separate Vane task processes. It aligns their ordered single-row blocks
+by identical, non-null keys, then calls a merge function on each pair. It uses
+the ordinary Arrow batch interface; use explicit output schemas for both
+branches and the merged result. Branches must emit the same strictly increasing
+key sequence. Missing, duplicate, extra or mismatched keys fail the invocation.
+It does not perform a relational join or collect all outputs before merging.
+
+```python
+from vane.udf import zip_map_batches
+
+clips = zip_map_batches(
+    videos, visual_clips, audio_clips,
+    left_schema=visual_schema, right_schema=audio_schema, schema=clip_schema,
+    on=("video_id", "clip_index"), merge=merge_clip,
+    cpus=(1, 1), memory_bytes=(1024**3, 1024**3),
+    max_buffer_bytes=256 * 1024**2, timeout=60,
+)
+```
+
+The execution unit reserves the **sum** of both branches' CPU and memory;
+branches are colocated under that reservation. The coordinator is a regular
+streaming task and launches both branches through Vane's subprocess executor,
+including its admission, output transport and cancellation scopes. The outer
+task backend follows the selected runner; branch processes run on that task's
+node. There is no resident actor pool or independently scheduled distributed
+branch graph. This helper is for CPU Arrow batch functions, not GPU models or
+descriptor-bound FILE/media input handles; pass immutable references or bytes.
+
+```mermaid
+flowchart LR
+    I[One input row] --> L[Left streaming task]
+    I --> R[Right streaming task]
+    L --> P[One retained block per branch]
+    R --> P
+    P --> K[Validate ordered keys and byte budget]
+    K --> M[Merge pair]
+    M --> O[Streaming output]
+    O -. consumption returns both permits .-> P
+```
+
+Both branch permits remain owned until the merged output has been yielded to
+the outer transport. A fast branch cannot start another output iteration while
+its prior block waits for its pair. The byte limit applies to each retained
+block, their combined materialized inputs and the merged output. It is separate
+from the declared process memory reservation. The timeout bounds each pair's
+admission/output wait and excludes time paused at the downstream yield.
+No automatic retries are allowed: decoding or model side effects must not repeat
+after partial streaming output. Failures and consumer closure cancel both
+branches before returning held permits and closing their executors.
+
+Validation proceeds from ownership/alignment unit tests to real local branch
+barriers, slow-side backpressure, downstream-first-output progress and joined
+failure cleanup, then the dependent media pipeline. GPU throughput qualification
+remains a separate step.
+
 ## Selecting local execution
 
 `vane.configure(runner="local")`, `vane.set_runner_local()`, and

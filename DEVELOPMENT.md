@@ -86,6 +86,15 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+For ordered parallel streaming UDF composition, see
+[bounded branch alignment](LOCAL_MODEL_RUNTIME.md#parallel-streaming-batch-functions).
+After two clean reviews, run only the affected stream adapter, subprocess
+ownership and `test_udf_zip*.py` tests for Python-only changes to this path.
+Keep local tests separate with Ray startup forbidden. Real branch barriers must
+prove concurrent execution, first-pair downstream progress and one retained
+block per branch. Exercise key/end mismatches, timeouts, consumer cancellation
+and resource failure, checking both worker trees and output leases are reclaimed.
+
 For Apple Silicon EmbeddingGemma 2 text/image/audio/video inference, install the
 optional `mlx` extra. Run `tests/fast/test_mlx_provider.py`,
 `test_mlx_image_provider.py`, `test_mlx_audio_provider.py` and
