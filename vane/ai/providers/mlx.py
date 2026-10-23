@@ -859,7 +859,7 @@ class _MLXModelCore(MLXMultimodalEmbedder, MLXVideoEmbedder, MLXAudioEmbedder, M
         if kind not in {"text", "image", "video", "audio"} or len(content.parts) != 1:
             raise EmbeddingConfigurationError("MLX unary encoding requires exactly one matching part")
         part = content.parts[0]
-        if part.spec != EmbeddingPartSpec(kind):
+        if part.spec.kind != kind or part.spec.mime_type is not None:
             raise EmbeddingConfigurationError("MLX request encoding does not match its input part")
         if kind == "text":
             return self.embed_text([part.value], input_type="query" if encoding == "text_query" else "document")[0]

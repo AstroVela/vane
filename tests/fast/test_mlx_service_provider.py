@@ -236,6 +236,19 @@ def test_joint_omission_repeats_timelines_and_array_bytes_survive_transport():
         preflight([content(("text", " \t"), ("image", None))], spec, "multimodal")
 
 
+def test_integer_timestamps_keep_exact_values_beyond_float_precision():
+    image = np.zeros((3, 5, 3), np.uint8)
+    timestamp = 2**53 + 1
+    video = VideoClip((image, image), (timestamp, np.int64(timestamp + 2)), (1, 3))
+    spec = descriptor("video").get_transport_input_spec()
+    (normalized,) = preflight([content(("video", video))], spec, "video")
+    parts, arrays, size = ipc.describe(normalized, spec)
+    ipc.validate_layout(parts, size, spec)
+    restored = ipc.restore(parts, bytearray(b"".join(value.tobytes() for value in arrays)))
+    assert restored.parts[0].value.frame_times == (timestamp, timestamp + 2)
+    assert all(type(value) is int for value in restored.parts[0].value.frame_times)
+
+
 @pytest.mark.parametrize(
     "change",
     [

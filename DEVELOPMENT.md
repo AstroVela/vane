@@ -142,8 +142,8 @@ with source/subtitle hashes and `input_file`) and `joint-sdk-reference.npz`
 Explicit opt-in fails when required assets are missing. This fixture establishes
 execution and parity for its declared material; report natural-recording quality
 qualification separately. Context uses its existing video/audio/subtitle pipeline;
-it does not add image joint request fields. MLX HTTP/service and cross-request
-batching remain outside this adapter.
+it does not add image joint request fields. MLX HTTP and cross-request batching
+remain outside this adapter. Explicit service execution is described below.
 
 For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
 Install the optional `litert` extra, which pins `litert-lm-api==0.18.0`.

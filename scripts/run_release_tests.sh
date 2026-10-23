@@ -58,6 +58,8 @@ release_tests=(
   "$project_root/tests/fast/test_mlx_audio_provider.py"
   "$project_root/tests/fast/test_mlx_video_provider.py"
   "$project_root/tests/fast/test_mlx_multimodal_provider.py"
+  "$project_root/tests/fast/test_embedding_service_backend.py"
+  "$project_root/tests/fast/test_mlx_service_provider.py"
   "$project_root/tests/fast/test_litert_provider.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"

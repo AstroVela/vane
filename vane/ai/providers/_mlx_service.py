@@ -12,15 +12,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
+
+import numpy as np
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_outputs import EmbeddingDescriptor
 from vane.ai._errors import _is_resource_error
 from vane.ai._video_embedding import VideoClip
 from vane.ai.options import _validate_mlx_service_options
+from vane.ai.protocols import VideoEmbedderDescriptor
 from vane.ai.providers._embedding_service_backend import owned_result
 from vane.ai.providers._mlx_media import (
     MAX_IMAGE_PIXELS,
@@ -58,7 +62,7 @@ def describe_service(
         "audio": mlx.MLXAudioEmbedderDescriptor,
         "multimodal": mlx.MLXMultimodalEmbedderDescriptor,
     }[kind]
-    native = factory(model, dimensions, options=native_options)
+    native = cast(EmbeddingDescriptor[Any], factory(model, dimensions, options=native_options))
     encoding = (
         "text_query"
         if kind == "text" and prepared["input_type"] == "query"
@@ -70,7 +74,7 @@ def describe_service(
         mlx.MLXMultimodalEmbedderDescriptor().get_input_spec(),
         native.get_output_spec(),
         ipc.RequestContext(encoding, contract),
-        kind == "video" and native.supports_image_queries(),
+        isinstance(native, VideoEmbedderDescriptor) and native.supports_image_queries(),
     )
     return native.get_model(), native.get_dimensions(), prepared, metadata
 
@@ -96,7 +100,12 @@ def _normalized_part(part: EmbeddingPart) -> EmbeddingPart:
     value = part.value
     if part.spec.kind == "video":
         value = VideoClip(
-            tuple(value.frames), tuple(float(t) for t in value.frame_times), tuple(int(i) for i in value.frame_indices)
+            tuple(value.frames),
+            tuple(
+                int(t) if isinstance(t, np.integer) else float(t) if isinstance(t, np.floating) else t
+                for t in value.frame_times
+            ),
+            tuple(int(i) for i in value.frame_indices),
         )
     elif part.spec.kind == "audio":
         value = AudioClip(value.samples, int(value.sample_rate))
@@ -135,8 +144,12 @@ def preflight(contents: list[EmbeddingContent], spec: MultimodalInputSpec, encod
                 value.encode("utf-8")
             except UnicodeError:
                 raise EmbeddingConfigurationError("MLX text requires valid UTF-8") from None
+        elif part.spec.kind == "image":
+            validate_image(value)
+        elif part.spec.kind == "audio":
+            validate_audio(value)
         else:
-            {"image": validate_image, "audio": validate_audio, "video": validate_video}[part.spec.kind](value)
+            validate_video(value)
     return [EmbeddingContent(tuple(_normalized_part(part) for part in row.parts)) for row in contents]
 
 

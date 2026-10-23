@@ -583,8 +583,8 @@ vLLM's internal multimodal SHM cache does not implement this external ingress.
 
 ### Explicit service configuration
 
-Milestone 4 implements `runtime="service"` for the registered `sglang` and
-`vllm` providers. The existing default `runtime="native"` still constructs an
+The common service implements `runtime="service"` for `sglang`, `vllm` and `mlx`.
+The existing default `runtime="native"` still constructs an
 engine in each owning UDF worker; `runtime="http"` remains the separate encoded
 media protocol. There is no transport detection, local-engine startup by a
 service client, or fallback. A service client reserves zero worker GPUs.
@@ -596,6 +596,28 @@ its engine; the transport does not make SGLang or vLLM engines portable.
 The generic Vane `subprocess_actor` / `subprocess_task` launcher still uses POSIX
 file-descriptor passing. This service transport replacement does not qualify
 those execution backends on Windows.
+
+MLX uses the same descriptors, client, admission, cancellation and transport.
+The model-owner process additionally installs `vane-ai[mlx]` on Apple Silicon;
+clients need no MLX, Transformers or PyTorch SDK. One owner thread loads one
+full-media core and serializes text document/query, image, audio, video and
+ordered joint encodings. Native MLX retains its existing worker-owned lifecycle.
+Text roles are immutable request values, with the original unary tokenizer and
+prefixes. Media specifications and output spaces come from native descriptors.
+
+Request version 2 carries explicit encoding and a checked MLX model contract
+(encoding version, revision, BF16 dtype, max_length, overlength). Contracts and
+layouts are checked before shared-memory allocation. SGLang/vLLM retain default
+encoding and a null contract. Restart all clients and the service when upgrading;
+the authenticated stream framing remains `vane-embedding-stream-3`.
+
+MLX loading settings belong in the service JSON. Clients accept connection and
+expected encoding settings; they cannot override device or loading flags.
+Inference stays serial while asyncio handles communication. Cancellation joins
+actual owner work before returning input credits or closing the model. A Metal
+resource failure disables further inference and requires an explicit restart.
+Transport byte limits cover ingress and private snapshots, not total Metal memory.
+There is no MLX HTTP runtime, automatic model fallback or dynamic request batching.
 
 Create a private directory (`0700` on POSIX, a user-private ACL on Windows) and
 start one process per model configuration. This POSIX example uses `/tmp`;
