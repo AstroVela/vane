@@ -40,8 +40,8 @@ def create_anthropic_client(factory: Any, snapshot: dict[str, Any], options: dic
             "Anthropic api_key or auth_token was not configured on the application before creating the provider/descriptor"
         )
     client = factory(
-        api_key=config["api_key"] or "",
-        auth_token=config["auth_token"] or "",
+        api_key=config["api_key"],
+        auth_token=config["auth_token"],
         base_url=options.get("base_url") or config["base_url"],
         max_retries=0,
         **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),

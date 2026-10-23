@@ -3060,6 +3060,30 @@ def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_
     assert payload.task_stats["queue_wait_ms"] >= 0
 
 
+@pytest.mark.parametrize("with_progress", [False, True])
+def test_execute_native_failure_preserves_error_after_executor_cleanup(monkeypatch, with_progress):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_NATIVE_PROGRESS_INTERVAL_MS", "1")
+
+    def fail(table):
+        time.sleep(0.03)
+        raise ValueError("native progress failure sentinel")
+
+    with vane.connect() as con:
+        relation = con.sql("SELECT 7::BIGINT AS x").map_batches(
+            fail, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(con)
+        progress = []
+        with pytest.raises(Exception, match="native progress failure sentinel"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con, plan, native_progress_callback=progress.append if with_progress else None
+            )
+        if with_progress:
+            assert progress
+        assert con.sql("SELECT 42").fetchone() == (42,)
+
+
 def test_execute_native_streaming_udf_emits_determinate_live_progress(tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
     monkeypatch.setenv("VANE_NATIVE_PROGRESS_INTERVAL_MS", "10")

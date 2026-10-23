@@ -674,8 +674,13 @@ def _run_existing_cluster_case(monkeypatch, conflicting_workers):
                     assert headers["x-goog-api-key"] == "application-google-key"
                     assert "projects/" not in path
                 elif "messages" in path:
-                    assert headers["x-api-key"] == "application-anthropic-key"
-                    assert "authorization" not in headers
+                    # SDK versions use either API-key or Bearer headers. Both
+                    # must carry only the application's captured credential.
+                    authentication = {key: headers[key] for key in ("x-api-key", "authorization") if key in headers}
+                    assert authentication in (
+                        {"x-api-key": "application-anthropic-key"},
+                        {"authorization": "Bearer application-anthropic-key"},
+                    )
                 else:
                     if headers["authorization"].startswith("Bearer account-"):
                         account = headers["authorization"].split("-")[1]

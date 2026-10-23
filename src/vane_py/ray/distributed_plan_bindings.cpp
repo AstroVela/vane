@@ -3853,15 +3853,16 @@ struct PyPhysicalPlanWrapperRunner {
 					native_execution_started(conn_obj);
 				}
 
-				auto &executor = context.GetExecutor();
-				stable_pipeline_snapshots = executor.GetPipelinesProgressSnapshots();
+				stable_pipeline_snapshots = pending->GetPipelinesProgressSnapshots();
 				if (stable_pipeline_snapshots.empty()) {
 					throw InternalException("native executor produced no pipeline topology after initialization");
 				}
 				auto last_native_progress = std::chrono::steady_clock::now();
 				bool native_progress_callback_failed = false;
 				auto emit_native_progress = [&](bool force) {
-					auto snapshots = executor.GetPipelinesProgressSnapshots();
+					// ExecuteTask retires the executor on failure. Snapshot through
+					// the pending result so cleanup cannot race the progress thread.
+					auto snapshots = pending->GetPipelinesProgressSnapshots();
 					if (!snapshots.empty()) {
 						stable_pipeline_snapshots = snapshots;
 					}

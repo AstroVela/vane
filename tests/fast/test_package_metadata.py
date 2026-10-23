@@ -328,8 +328,9 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
-    assert "vllm" in _requirements_for_extra("vllm")
-    assert "sglang" in _requirements_for_extra("sglang")
+    linux = {"sys_platform": "linux", "platform_system": "Linux", "platform_machine": "x86_64"}
+    assert _requirement_for_extra("vllm", "vllm", linux).marker is not None
+    assert _requirement_for_extra("sglang", "sglang", linux).marker is not None
 
 
 def test_datasink_extras_require_supported_sdk_versions():
