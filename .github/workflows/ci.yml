@@ -17,10 +17,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PIP_CONSTRAINT: ${{ github.workspace }}/.github/ci-constraints.txt
-  UV_CONSTRAINT: ${{ github.workspace }}/.github/ci-constraints.txt
-
 jobs:
   changes:
     name: Classify changes
@@ -94,9 +90,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            .github/ci-constraints.txt
+          cache-dependency-path: pyproject.toml
 
       - name: Build and validate source package
         run: |
@@ -164,9 +158,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            .github/ci-constraints.txt
+          cache-dependency-path: pyproject.toml
 
       - name: Restore vcpkg binary cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -280,7 +272,6 @@ jobs:
           extension_wheels=(dist/extension-wheels/*.whl)
           test "${#extension_wheels[@]}" -eq 1
           python -I scripts/verify_extension_wheel.py \
-            --constraint "$PIP_CONSTRAINT" \
             --base-wheel "${base_wheels[0]}" \
             --extension-wheel "${extension_wheels[0]}" \
             --extension-name loadable_extension_demo \
@@ -640,7 +631,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/uv
-          key: fast-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml', '.github/ci-constraints.txt') }}
+          key: fast-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml') }}
 
       - name: Install the wheel and CPU test dependencies
         run: |
@@ -1028,7 +1019,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/uv
-          key: ai-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml', '.github/ci-constraints.txt') }}
+          key: ai-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml') }}
 
       - name: Install the wheel and AI test dependencies
         run: |

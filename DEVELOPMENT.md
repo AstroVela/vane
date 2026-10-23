@@ -220,13 +220,6 @@ implementing either contract.
 
 ## Python tests
 
-The main CI workflow applies [.github/ci-constraints.txt](.github/ci-constraints.txt)
-to both pip and uv installations. Set `PIP_CONSTRAINT` and `UV_CONSTRAINT` to
-that file's absolute path when reproducing CI dependency resolution locally.
-The isolated `scripts/verify_extension_wheel.py` installer requires an explicit
-`--constraint` path because it ignores pip environment settings.
-Update the file to advance CI's Ray version; dependency cache keys include it.
-
 The required release gate covers the supported base installation and does not
 need model downloads, cloud credentials, GPUs, or external services:
 
