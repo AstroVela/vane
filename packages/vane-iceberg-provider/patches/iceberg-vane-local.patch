@@ -1,0 +1,39 @@
+SPDX-FileCopyrightText: 2026 Vane contributors
+SPDX-License-Identifier: Apache-2.0
+
+Vane compatibility changes for duckdb/duckdb-iceberg at
+45163a28e0ed6a2071a82a1bf1dd432d0216cf9c.
+Upstream file context remains MIT; see LICENSES/Iceberg-MIT.txt.
+Pass the existing ClientContext required by Vane logical write targets.
+
+diff --git a/src/execution/operator/merge_into/iceberg_merge_into.cpp b/src/execution/operator/merge_into/iceberg_merge_into.cpp
+index a7136aed..82333832 100644
+--- a/src/execution/operator/merge_into/iceberg_merge_into.cpp
++++ b/src/execution/operator/merge_into/iceberg_merge_into.cpp
+@@ -114,7 +114,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
+ 
+ 	switch (action.action_type) {
+ 	case MergeActionType::MERGE_UPDATE: {
+-		LogicalUpdate update(op.table);
++		LogicalUpdate update(context, op.table);
+ 		for (auto &def : op.bound_defaults) {
+ 			update.bound_defaults.push_back(def->Copy());
+ 		}
+@@ -151,7 +151,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
+ 		break;
+ 	}
+ 	case MergeActionType::MERGE_DELETE: {
+-		LogicalDelete delete_op(op.table, 0);
++		LogicalDelete delete_op(context, op.table, 0);
+ 
+ 		// we only push 2 columns for positional deletes
+ 		idx_t column_offset = 0;
+@@ -170,7 +170,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
+ 		break;
+ 	}
+ 	case MergeActionType::MERGE_INSERT: {
+-		LogicalInsert insert_op(op.table, 0);
++		LogicalInsert insert_op(context, op.table, 0);
+ 		insert_op.bound_constraints = std::move(bound_constraints);
+ 		for (auto &def : op.bound_defaults) {
+ 			insert_op.bound_defaults.push_back(def->Copy());
