@@ -4501,20 +4501,16 @@ def test_clean_verifier_rejects_a_dependency_with_a_narrower_platform_policy(tmp
 
 
 @pytest.mark.parametrize("inherited_runner", [None, "", "ray"])
-@pytest.mark.parametrize("use_constraint", [False, True])
 def test_clean_verifier_isolates_its_environment_and_uses_default_runner(
     tmp_path,
     monkeypatch,
     synthetic_descriptor_factory,
     inherited_runner,
-    use_constraint,
 ):
     base_wheel = _write_minimal_base_wheel(tmp_path)
     extension_wheel = _build_sample_wheel(tmp_path).path
     commands: list[list[str]] = []
     environments: list[dict[str, str] | None] = []
-    constraint = tmp_path / "constraints.txt"
-    constraint.write_text("ray==2.58.1\n", encoding="utf-8")
 
     poisoned_variables = {
         "PYTHONHOME",
@@ -4528,7 +4524,6 @@ def test_clean_verifier_isolates_its_environment_and_uses_default_runner(
     for variable in poisoned_variables:
         monkeypatch.setenv(variable, f"poisoned-{variable.casefold()}")
     monkeypatch.setenv("PIP_CONFIG_FILE", str(tmp_path / "hostile-pip.conf"))
-    monkeypatch.setenv("PIP_CONSTRAINT", str(tmp_path / "hostile-constraints.txt"))
     if inherited_runner is None:
         monkeypatch.delenv("VANE_RUNNER", raising=False)
     else:
@@ -4544,17 +4539,12 @@ def test_clean_verifier_isolates_its_environment_and_uses_default_runner(
         extension_wheel=extension_wheel,
         extension_name="sample",
         trust_identity=TEST_TRUST_IDENTITY,
-        constraint=constraint if use_constraint else None,
     )
 
     assert len(commands) == 4
     assert commands[0][0] == sys.executable
     assert commands[0][1:6] == ["-I", "-m", "venv", "--clear", "--copies"]
     assert commands[1][1:4] == ["-m", "pip", "--isolated"]
-    if use_constraint:
-        assert commands[1][6:8] == ["--constraint", str(constraint.resolve())]
-    else:
-        assert "--constraint" not in commands[1]
     assert commands[2][1:5] == ["-m", "pip", "--isolated", "check"]
     for environment in environments:
         assert environment is not None

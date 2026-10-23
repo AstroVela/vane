@@ -948,7 +948,6 @@ def verify_extension_wheel(
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
     runtime_source: str | Path | None = None,
-    constraint: str | Path | None = None,
 ) -> None:
     """Verify clean installation, metadata discovery, and local artifact loading."""
     if isinstance(dependency_wheels, (str, os.PathLike)):
@@ -966,7 +965,6 @@ def verify_extension_wheel(
 
     resolved_base_wheel = Path(base_wheel).expanduser().resolve(strict=True)
     resolved_extension_wheel = Path(extension_wheel).expanduser().resolve(strict=True)
-    resolved_constraint = Path(constraint).expanduser().resolve(strict=True) if constraint is not None else None
     resolved_dependency_wheels = tuple(
         Path(dependency_wheel).expanduser().resolve(strict=True) for dependency_wheel in unresolved_dependency_wheels
     )
@@ -1042,7 +1040,6 @@ def verify_extension_wheel(
                 dependency_wheels=tuple(dependency_snapshots),
                 dependency_layouts=tuple(dependency_layouts),
                 dependency_trust_identities=dependency_trust_identities,
-                constraint=resolved_constraint,
             )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
@@ -1058,7 +1055,6 @@ def _verify_extension_wheel_snapshots(
     dependency_wheels: tuple[ArchiveSnapshot, ...],
     dependency_layouts: tuple[_ExtensionWheelLayout, ...],
     dependency_trust_identities: Iterable[str],
-    constraint: Path | None,
 ) -> None:
     resolved_base_wheel = base_wheel
     resolved_extension_wheel = extension_wheel
@@ -1112,7 +1108,6 @@ def _verify_extension_wheel_snapshots(
                 python,
                 "--disable-pip-version-check",
                 "install",
-                *(("--constraint", str(constraint)) if constraint is not None else ()),
                 str(resolved_base_wheel.path),
                 *(str(dependency_wheel.path) for dependency_wheel in resolved_dependency_wheels),
                 str(resolved_extension_wheel.path),
@@ -1231,7 +1226,6 @@ def main() -> int:
     """Run clean-install verification for one extension wheel."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-source", type=Path)
-    parser.add_argument("--constraint", type=Path, help="Dependency constraints for the clean installation")
     parser.add_argument("--base-wheel", required=True, type=Path)
     parser.add_argument("--extension-wheel", required=True, type=Path)
     parser.add_argument("--extension-name", required=True)
@@ -1258,7 +1252,6 @@ def main() -> int:
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
         runtime_source=arguments.runtime_source,
-        constraint=arguments.constraint,
     )
     return 0
 
