@@ -39,7 +39,7 @@ async def main():
     state.on_embedding = embedding
     config = json.loads((root / "config.json").read_text())
     service = EmbeddingService(
-        path=str(root / "engine.sock"),
+        path=str(root / "engine.json"),
         service_id="fixture-v1",
         family=family,
         model="fixture",
@@ -48,18 +48,22 @@ async def main():
         **config,
     )
     stopped = asyncio.Event()
-    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
+    except NotImplementedError:
+        pass  # The test-owned stop file also supports Windows.
     await service.start()
     try:
         (root / "ready").touch()
-        while not stopped.is_set():
+        while not stopped.is_set() and not (root / "stop").exists():
             data = {
                 "bytes": service.credits.bytes,
                 "inflight": service.credits.inflight,
                 "active": active,
                 "engines": len(state.engines),
                 "calls": len(state.calls),
-                "connections": len(service._connections),
+                "connections": len(service._zmq_server.pending),
+                "buffers": list(service._zmq_server.buffers),
             }
             temporary = root / "state.tmp"
             temporary.write_text(json.dumps(data))

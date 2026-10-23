@@ -1,23 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Linux local embedding IPC: bounded JSON and sealed, anonymous CPU buffers.
-
-No pickle, paths to media, resource tracker, named segments or CUDA handles cross
-this boundary. The receiver owns a duplicated FD once SCM_RIGHTS is received.
-"""
+"""Bounded JSON metadata and typed CPU buffer layouts for embedding IPC."""
 
 from __future__ import annotations
 
-import array
-import asyncio
 import json
 import math
-import os
-import socket
-import struct
-import sys
-import weakref
 from typing import Any
 
 import numpy as np
@@ -29,22 +18,6 @@ from vane.ai._video_embedding import VideoClip, VideoInputSpec
 
 VERSION = 1
 MAX_CONTROL_BYTES = 1024**2
-
-
-class ReceivedFD:
-    """Close also when cancellation discards a completed receive result."""
-
-    def __init__(self, value: int):
-        self.value = value
-        self._close = weakref.finalize(self, os.close, value)
-
-    def close(self) -> None:
-        self._close()
-
-
-def require_linux() -> None:
-    if sys.platform != "linux":
-        raise EmbeddingConfigurationError("Embedding service requires Linux Unix sockets and memfd")
 
 
 def input_spec(options: dict[str, Any]) -> MultimodalInputSpec:
@@ -153,7 +126,7 @@ def describe(
 
 
 def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
-    """Validate ALL offsets/shapes/dtypes and metadata before mapping any FD."""
+    """Validate all offsets/shapes/dtypes and metadata before allocating a buffer."""
     if type(size) is not int or not 0 <= size <= spec.max_input_bytes or not isinstance(parts, list):
         raise EmbeddingConfigurationError("Invalid embedding buffer size or parts")
     if not 1 <= len(parts) <= spec.max_parts:
@@ -264,113 +237,8 @@ def restore(parts: list[dict[str, Any]], memory: Any) -> EmbeddingContent:
     return EmbeddingContent(tuple(values))
 
 
-def sealed_buffer(arrays: list[np.ndarray[Any, Any]], size: int) -> int | None:
-    if not size:
-        return None
-    import fcntl
-    import mmap
-
-    fd = os.memfd_create("vane_embedding", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    try:
-        # Avoid SIGBUS on first write if the backing store cannot reserve pages.
-        os.posix_fallocate(fd, 0, size)
-        with mmap.mmap(fd, size, access=mmap.ACCESS_WRITE) as memory:
-            offset = 0
-            for value in arrays:
-                target = np.ndarray(value.shape, dtype=value.dtype, buffer=memory, offset=offset)
-                np.copyto(target, value)
-                del target
-                offset += value.nbytes
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, required_seals())
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def required_seals() -> int:
-    import fcntl
-
-    return fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
-
-
 def encode(value: Any) -> bytes:
     data = json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8")
     if len(data) > MAX_CONTROL_BYTES:
         raise EmbeddingConfigurationError("Embedding control message exceeds 1 MiB")
     return data
-
-
-def check_peer(sock: socket.socket) -> None:
-    _, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    if uid != os.getuid():
-        raise EmbeddingConfigurationError("Embedding service requires the same Linux UID")
-
-
-async def _ready(sock: socket.socket, *, write: bool = False) -> None:
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[None] = loop.create_future()
-    add, remove = (loop.add_writer, loop.remove_writer) if write else (loop.add_reader, loop.remove_reader)
-    add(sock.fileno(), lambda: None if future.done() else future.set_result(None))
-    try:
-        await future
-    finally:
-        remove(sock.fileno())
-
-
-async def send(sock: socket.socket, value: Any, fd: int | None = None) -> None:
-    data = encode(value)
-    ancillary = [] if fd is None else [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
-    while True:
-        try:
-            sock.sendmsg([b"E"], ancillary)
-            break
-        except BlockingIOError:
-            await _ready(sock, write=True)
-    await asyncio.get_running_loop().sock_sendall(sock, struct.pack("!I", len(data)) + data)
-
-
-async def receive(sock: socket.socket) -> tuple[Any, ReceivedFD | None]:
-    fds: list[int] = []
-    try:
-        while True:
-            try:
-                marker, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(4 * 8), socket.MSG_CMSG_CLOEXEC)
-                break
-            except BlockingIOError:
-                await _ready(sock)
-        for level, kind, data in ancillary:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                values = array.array("i")
-                values.frombytes(data[: len(data) - len(data) % values.itemsize])
-                fds.extend(values)
-        if not marker:
-            raise ConnectionError("Embedding peer disconnected")
-        if marker != b"E" or flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC) or len(fds) > 1:
-            raise EmbeddingConfigurationError("Invalid embedding IPC header")
-
-        async def exact(size: int) -> bytes:
-            data = bytearray()
-            while len(data) < size:
-                chunk = await asyncio.get_running_loop().sock_recv(sock, size - len(data))
-                if not chunk:
-                    raise ConnectionError("Embedding peer disconnected")
-                data.extend(chunk)
-            return bytes(data)
-
-        size = struct.unpack("!I", await exact(4))[0]
-        if not 0 < size <= MAX_CONTROL_BYTES:
-            raise EmbeddingConfigurationError("Embedding control message exceeds budget")
-        value = json.loads(await exact(size))
-        return value, ReceivedFD(fds.pop()) if fds else None
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-async def control(sock: socket.socket) -> Any:
-    value, fd = await receive(sock)
-    if fd is not None:
-        fd.close()
-        raise EmbeddingConfigurationError("Unexpected embedding buffer")
-    return value

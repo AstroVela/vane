@@ -6,18 +6,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import math
-import os
-import socket
-import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-
-import numpy as np
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
@@ -35,6 +29,7 @@ from vane.ai.protocols import (
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
 )
+from vane.ai.provider import ProviderImportError
 from vane.ai.typing import UDFOptions
 from vane.execution._async_dispatch import map_async_ordered
 
@@ -48,7 +43,6 @@ class _ServiceDescriptor:
     family: str
 
     def __post_init__(self) -> None:
-        ipc.require_linux()
         self.options = copy.deepcopy(self.options)
         if self.options.keys() - _SERVICE_EMBED_OPTIONS or self.options.get("runtime") != "service":
             raise EmbeddingConfigurationError("Embedding service requires explicit service options")
@@ -61,8 +55,8 @@ class _ServiceDescriptor:
         ):
             raise EmbeddingConfigurationError("Embedding service requires model and bounded positive dimensions")
         path, identity = self.options.get("service_path"), self.options.get("service_id")
-        if not isinstance(path, str) or not path.startswith("/") or "\x00" in path or len(os.fsencode(path)) > 107:
-            raise EmbeddingConfigurationError("service_path must be an absolute Linux Unix socket path")
+        if not isinstance(path, str) or not Path(path).is_absolute() or "\x00" in path:
+            raise EmbeddingConfigurationError("service_path must be an absolute local path")
         if (
             not isinstance(identity, str)
             or not 1 <= len(identity) <= 128
@@ -152,15 +146,13 @@ class ServiceEmbedder(ManagedEmbedder):
         self.options = descriptor.get_options()
         self.closed = False
         self.metrics = {"queue_seconds": 0.0, "copy_seconds": 0.0, "request_seconds": 0.0, "input_bytes": 0}
-        self._sockets: set[socket.socket] = set()
+        self._zmq_client: Any = None
 
     async def aclose(self) -> None:
         self.closed = True
-        # Closing producer connections does not close server mappings or return
-        # their credits. The server drains every accepted model request first.
-        for sock in tuple(self._sockets):
-            with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
+        if self._zmq_client is not None:
+            self._zmq_client.close()
+            self._zmq_client = None
 
     async def embed_text(self, values: list[str]) -> list[Any]:
         return await self._single("text", values)
@@ -193,7 +185,7 @@ class ServiceEmbedder(ManagedEmbedder):
             try:
                 result = await asyncio.wait_for(self._request(plan), self.options["timeout"])
                 return getattr(self, "_validate_vector", lambda value: value)(result)
-            except (EmbeddingConfigurationError, MemoryError):
+            except (EmbeddingConfigurationError, MemoryError, ProviderImportError):
                 raise
             except Exception as error:
                 _raise_if_resource_error(error)
@@ -207,46 +199,11 @@ class ServiceEmbedder(ManagedEmbedder):
     async def _request(self, plan: Any) -> Any:
         if self.closed:
             raise RuntimeError("Embedding service client is closed")
-        parts, arrays, size = plan
-        request_id = uuid.uuid4().hex
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        started = time.monotonic()
-        try:
-            sock.setblocking(False)
-            self._sockets.add(sock)
-            await asyncio.get_running_loop().sock_connect(sock, self.options["service_path"])
-            ipc.check_peer(sock)
-            await ipc.send(sock, self._reservation(parts, size, request_id))
-            response = await ipc.control(sock)
-            self._check_response(response, request_id)
-            if response.get("state") != "reserved":
-                raise EmbeddingConfigurationError("Embedding service did not reserve the request")
-            self.metrics["queue_seconds"] += time.monotonic() - started
-            copied = time.monotonic()
-            fd = ipc.sealed_buffer(arrays, size)
-            self.metrics["copy_seconds"] += time.monotonic() - copied
-            try:
-                await ipc.send(sock, {"request_id": request_id, "state": "published"}, fd)
-            finally:
-                if fd is not None:
-                    os.close(fd)
-            self.metrics["input_bytes"] += size
-            response = await ipc.control(sock)
-            self._check_response(response, request_id)
-            if response.get("state") != "released":
-                raise EmbeddingConfigurationError("Embedding service omitted consumption acknowledgement")
-            values = response.get("vector")
-            if not isinstance(values, list) or any(type(value) not in (int, float) for value in values):
-                raise ValueError("Embedding service returned an invalid vector")
-            with np.errstate(over="ignore", invalid="ignore"):
-                vector = np.asarray(values, dtype=np.float32)
-            if vector.shape != (self.descriptor.dimensions,) or not np.isfinite(vector).all():
-                raise ValueError("Embedding service returned an invalid vector")
-            return vector
-        finally:
-            self.metrics["request_seconds"] += time.monotonic() - started
-            self._sockets.discard(sock)
-            sock.close()
+        from vane.ai._embedding_zmq import Client
+
+        if self._zmq_client is None:
+            self._zmq_client = Client(self)
+        return await self._zmq_client.request(plan)
 
     @staticmethod
     def _check_response(response: Any, request_id: str) -> None:
