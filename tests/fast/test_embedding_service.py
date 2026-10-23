@@ -432,7 +432,7 @@ def test_committed_publication_and_inference_keep_resources(tmp_path, monkeypatc
         server = service._zmq_server
         handle = server._handle
 
-        async def pause_publication(identity, message, size, queue):
+        async def pause_publication(identity, message, size, queue, request_context):
             get = queue.get
 
             async def paused_get():
@@ -442,7 +442,7 @@ def test_committed_publication_and_inference_keep_resources(tmp_path, monkeypatc
                 return publication
 
             queue.get = paused_get
-            await handle(identity, message, size, queue)
+            await handle(identity, message, size, queue, request_context)
 
         if pause_at == "publication":
             monkeypatch.setattr(server, "_handle", pause_publication)
@@ -582,7 +582,7 @@ def test_publication_outside_reservation_wait_is_rejected(tmp_path, monkeypatch,
         server = service._zmq_server
         handle = server._handle
 
-        async def observe_publication_wait(identity, message, size, queue):
+        async def observe_publication_wait(identity, message, size, queue, request_context):
             get = queue.get
 
             async def observed_get():
@@ -593,7 +593,7 @@ def test_publication_outside_reservation_wait_is_rejected(tmp_path, monkeypatch,
                     raise
 
             queue.get = observed_get
-            await handle(identity, message, size, queue)
+            await handle(identity, message, size, queue, request_context)
 
         monkeypatch.setattr(server, "_handle", observe_publication_wait)
         peer = RawClient(root)
@@ -1361,7 +1361,9 @@ def test_model_reads_private_snapshot_after_publication(tmp_path, monkeypatch):
     async def run():
         entered, finish = asyncio.Event(), asyncio.Event()
 
-        async def infer(value):
+        async def infer(value, request_context):
+            assert request_context.encoding == "default" and request_context.model_contract is None
+            assert len(request_context.request_id) == 32
             entered.set()
             await finish.wait()
             np.testing.assert_equal(value.parts[0].value.frames, original.frames)
@@ -1710,6 +1712,8 @@ class RawClient:
                 "request_id": self.request_id,
                 "parts": parts,
                 "nbytes": size,
+                "encoding": "default",
+                "model_contract": None,
             }
         )
 

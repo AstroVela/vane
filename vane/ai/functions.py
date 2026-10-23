@@ -64,6 +64,7 @@ from vane.ai.options import (
     normalize_prompt_options,
     validate_embed_audio_options,
     validate_embed_image_options,
+    validate_embed_multimodal_options,
     validate_embed_options,
     validate_embed_video_options,
 )
@@ -642,7 +643,7 @@ def _prepare_embed_call(
         "image": validate_embed_image_options,
         "video": validate_embed_video_options,
         "audio": validate_embed_audio_options,
-        "multimodal": validate_embed_image_options,
+        "multimodal": validate_embed_multimodal_options,
     }[input_kind]
     prepared = validator(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)

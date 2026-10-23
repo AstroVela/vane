@@ -79,6 +79,7 @@ class EmbeddingService:
     ):
         from vane.ai.providers._embedding_service import ServiceMultimodalDescriptor
         from vane.ai.providers._embedding_service_backend import create_service_backend
+
         for name, value, maximum in (
             ("max_bytes", max_bytes, 2**40),
             ("max_inflight", max_inflight, 1024),
@@ -101,6 +102,7 @@ class EmbeddingService:
             family,
         )
         self.backend = create_service_backend(family, model, dimensions, dict(options or {}))
+        self.family = family
         self.descriptor = self.backend.descriptor
         self.spec = self.backend.get_input_spec()
         self.path, self.identity = path, service_id
@@ -136,28 +138,42 @@ class EmbeddingService:
             self._zmq_server = None
         await self.backend.aclose()
 
-    def _hello(self, message: Any) -> int:
-        fields = {"version", "service_id", "family", "model", "dimensions", "request_id", "parts", "nbytes"}
+    def _hello(self, message: Any) -> ipc.RequestContext:
+        fields = {
+            "version",
+            "service_id",
+            "family",
+            "model",
+            "dimensions",
+            "request_id",
+            "parts",
+            "nbytes",
+            "encoding",
+            "model_contract",
+        }
         if not isinstance(message, dict) or set(message) != fields:
             raise EmbeddingConfigurationError("Invalid embedding reservation")
         expected = {
             "version": ipc.VERSION,
             "service_id": self.identity,
-            "family": self.descriptor.family,
-            "model": self.descriptor.model,
-            "dimensions": self.descriptor.dimensions,
+            "family": self.family,
+            "model": self.descriptor.get_model(),
+            "dimensions": self.descriptor.get_dimensions(),
         }
         if any(type(message[key]) is not type(value) or message[key] != value for key, value in expected.items()):
             raise EmbeddingConfigurationError("Embedding service/model identity mismatch")
         identity = message["request_id"]
         if not isinstance(identity, str) or len(identity) != 32 or any(c not in "0123456789abcdef" for c in identity):
             raise EmbeddingConfigurationError("Invalid embedding request identity")
-        return ipc.validate_layout(message["parts"], message["nbytes"], self.spec)
+        ipc.validate_layout(message["parts"], message["nbytes"], self.spec)
+        context = ipc.RequestContext.from_wire(message)
+        self.backend.validate_request(context, message["parts"])
+        return context
 
-    async def _infer(self, content: EmbeddingContent) -> dict[str, Any]:
+    async def _infer(self, content: EmbeddingContent, context: ipc.RequestContext) -> dict[str, Any]:
         try:
-            vector = np.asarray(await self.backend.embed(content), dtype=np.float32)
-            if vector.shape != (self.descriptor.dimensions,) or not np.isfinite(vector).all():
+            vector = np.asarray(await self.backend.embed(content, context), dtype=np.float32)
+            if vector.shape != (self.descriptor.get_dimensions(),) or not np.isfinite(vector).all():
                 raise ValueError("Invalid embedding result")
             return {"vector": vector.tolist()}
         except EmbeddingConfigurationError:

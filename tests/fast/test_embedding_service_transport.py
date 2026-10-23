@@ -367,7 +367,9 @@ def test_terminal_receipt_reclaims_slot_without_losing_response(tmp_path, monkey
             expected = [0.123456789012345] * 16384
             original_infer = service._infer
 
-            async def infer(_):
+            async def infer(_, request_context):
+                assert request_context.encoding == "default" and request_context.model_contract is None
+                assert len(request_context.request_id) == 32
                 if outcome == "resource":
                     raise MemoryError("fixture allocation")
                 if outcome == "execution":

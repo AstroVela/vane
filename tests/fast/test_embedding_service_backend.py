@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from tests.fast.test_native_multimodal import install_sdk
+from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai.providers._embedding_service_backend import create_service_backend
@@ -27,8 +28,8 @@ def test_native_backend_owns_one_original_engine(monkeypatch, family):
 
     async def run():
         await backend.start()
-        np.testing.assert_array_equal(await backend.embed(row), [3, 4])
-        np.testing.assert_array_equal(await backend.embed(row), [3, 4])
+        np.testing.assert_array_equal(await backend.embed(row, ipc.RequestContext()), [3, 4])
+        np.testing.assert_array_equal(await backend.embed(row, ipc.RequestContext()), [3, 4])
         with pytest.raises(RuntimeError, match="already started"):
             await backend.start()
         await backend.aclose()

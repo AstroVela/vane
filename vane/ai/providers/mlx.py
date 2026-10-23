@@ -192,30 +192,56 @@ class MLXProvider(Provider):
     def name(self) -> str:
         return "mlx"
 
+    def _descriptor(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        prepared = dict(options or {})
+        runtime = prepared.pop("runtime", "native")
+        if runtime == "service":
+            from vane.ai.providers._embedding_service import service_descriptor
+
+            return service_descriptor(
+                kind,
+                MODEL_ID if model is None else model,
+                dimensions,
+                prepared | {"runtime": "service"},
+                self.name,
+                "mlx",
+            )
+        if runtime != "native":
+            raise EmbeddingConfigurationError("MLX runtime must be native or service")
+        return {
+            "text": MLXTextEmbedderDescriptor,
+            "image": MLXImageEmbedderDescriptor,
+            "video": MLXVideoEmbedderDescriptor,
+            "audio": MLXAudioEmbedderDescriptor,
+            "multimodal": MLXMultimodalEmbedderDescriptor,
+        }[kind](model, dimensions, options=prepared)
+
     def get_text_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXTextEmbedderDescriptor:
-        return MLXTextEmbedderDescriptor(model, dimensions, options=options)
+    ) -> TextEmbedderDescriptor:
+        return self._descriptor("text", model, dimensions, options)
 
     def get_image_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXImageEmbedderDescriptor:
-        return MLXImageEmbedderDescriptor(model, dimensions, options=options)
+    ) -> ImageEmbedderDescriptor:
+        return self._descriptor("image", model, dimensions, options)
 
     def get_audio_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXAudioEmbedderDescriptor:
-        return MLXAudioEmbedderDescriptor(model, dimensions, options=options)
+    ) -> AudioEmbedderDescriptor:
+        return self._descriptor("audio", model, dimensions, options)
 
     def get_video_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXVideoEmbedderDescriptor:
-        return MLXVideoEmbedderDescriptor(model, dimensions, options=options)
+    ) -> VideoEmbedderDescriptor:
+        return self._descriptor("video", model, dimensions, options)
 
     def get_multimodal_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXMultimodalEmbedderDescriptor:
-        return MLXMultimodalEmbedderDescriptor(model, dimensions, options=options)
+    ) -> MultimodalEmbedderDescriptor:
+        return self._descriptor("multimodal", model, dimensions, options)
 
 
 class _MLXEmbedder:

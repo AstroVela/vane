@@ -89,7 +89,6 @@ def test_joint_metadata_pickle_options_specs_and_cpu_dispatch():
         {"input_type": "query"},
         {"input_type": "document"},
         {"runtime": "http"},
-        {"runtime": "native"},
         {"runtime": "service"},
         {"base_url": "http://127.0.0.1"},
         {"http_input_format": "multimodal"},

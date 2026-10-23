@@ -9,14 +9,15 @@ import asyncio
 import copy
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_outputs import EmbeddingDescriptor, EmbeddingOutputSpec
 from vane.ai._embedding_requests import ManagedEmbedder
 from vane.ai._errors import _raise_if_resource_error
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
@@ -34,17 +35,33 @@ from vane.ai.typing import UDFOptions
 from vane.execution._async_dispatch import map_async_ordered
 
 
+@dataclass(frozen=True)
+class _ServiceMetadata:
+    input_spec: MultimodalInputSpec
+    output_spec: EmbeddingOutputSpec
+    context: ipc.RequestContext
+    image_queries: bool = False
+
+
 @dataclass
-class _ServiceDescriptor:
+class _ServiceDescriptor(EmbeddingDescriptor[Any]):
+    input_kind: ClassVar[str] = "multimodal"
     model: str
     dimensions: int | None
     options: dict[str, Any]
     provider_name: str
     family: str
+    metadata: _ServiceMetadata | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.options = copy.deepcopy(self.options)
-        if self.options.keys() - _SERVICE_EMBED_OPTIONS or self.options.get("runtime") != "service":
+        if self.family == "mlx":
+            from vane.ai.providers._mlx_service import describe_service
+
+            self.model, self.dimensions, self.options, self.metadata = describe_service(
+                self.input_kind, self.model, self.dimensions, self.options
+            )
+        elif self.options.keys() - _SERVICE_EMBED_OPTIONS or self.options.get("runtime") != "service":
             raise EmbeddingConfigurationError("Embedding service requires explicit service options")
         if (
             not isinstance(self.model, str)
@@ -70,7 +87,17 @@ class _ServiceDescriptor:
             raise EmbeddingConfigurationError("Embedding service timeout must be finite and positive")
         if type(concurrency) is not int or not 1 <= concurrency <= 1024:
             raise EmbeddingConfigurationError("Embedding service concurrency must be between 1 and 1024")
-        ipc.input_spec(self.options)
+        self.get_transport_input_spec()
+
+    def get_transport_input_spec(self) -> MultimodalInputSpec:
+        return self.metadata.input_spec if self.metadata is not None else ipc.input_spec(self.options)
+
+    def get_output_spec(self, *, dimensions: int | None = None) -> EmbeddingOutputSpec:
+        if self.metadata is None:
+            return super().get_output_spec(dimensions=dimensions)
+        if dimensions is not None and (type(dimensions) is not int or dimensions != self.dimensions):
+            raise EmbeddingConfigurationError("MLX EmbeddingGemma 2 requires dimensions=768")
+        return self.metadata.output_spec
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -96,39 +123,50 @@ class _ServiceDescriptor:
 
 
 class ServiceTextDescriptor(_ServiceDescriptor, TextEmbedderDescriptor):
+    input_kind = "text"
+
     def __post_init__(self) -> None:
         super().__post_init__()
-        ipc.input_spec(self.options).validate_layout((EmbeddingPartSpec("text"),))
+        self.get_transport_input_spec().validate_layout((EmbeddingPartSpec("text"),))
 
     def supports_chunking(self) -> bool:
         return False
 
 
 class ServiceImageDescriptor(_ServiceDescriptor, ImageEmbedderDescriptor):
+    input_kind = "image"
+
     def __post_init__(self) -> None:
         super().__post_init__()
-        ipc.input_spec(self.options).validate_layout((EmbeddingPartSpec("image"),))
+        self.get_transport_input_spec().validate_layout((EmbeddingPartSpec("image"),))
 
 
 class ServiceVideoDescriptor(_ServiceDescriptor, VideoEmbedderDescriptor):
+    input_kind = "video"
+
     def __post_init__(self) -> None:
         super().__post_init__()
         self.get_input_spec()
 
     def get_input_spec(self) -> VideoInputSpec:
-        spec = ipc.input_spec(self.options).video
+        spec = self.get_transport_input_spec().video
         if spec is None:
             raise EmbeddingConfigurationError("Video requires video in input_modalities")
         return spec
 
+    def supports_image_queries(self) -> bool:
+        return self.metadata is not None and self.metadata.image_queries
+
 
 class ServiceAudioDescriptor(_ServiceDescriptor, AudioEmbedderDescriptor):
+    input_kind = "audio"
+
     def __post_init__(self) -> None:
         super().__post_init__()
         self.get_input_spec()
 
     def get_input_spec(self) -> AudioInputSpec:
-        spec = ipc.input_spec(self.options).audio
+        spec = self.get_transport_input_spec().audio
         if spec is None:
             raise EmbeddingConfigurationError("Audio requires audio in input_modalities")
         return spec
@@ -136,7 +174,7 @@ class ServiceAudioDescriptor(_ServiceDescriptor, AudioEmbedderDescriptor):
 
 class ServiceMultimodalDescriptor(_ServiceDescriptor, MultimodalEmbedderDescriptor):
     def get_input_spec(self) -> MultimodalInputSpec:
-        return ipc.input_spec(self.options)
+        return self.get_transport_input_spec()
 
 
 def service_descriptor(
@@ -163,7 +201,7 @@ def service_descriptor(
 class ServiceEmbedder(ManagedEmbedder):
     def __init__(self, descriptor: _ServiceDescriptor):
         self.descriptor = descriptor
-        self.spec = ipc.input_spec(descriptor.options)
+        self.spec = descriptor.get_transport_input_spec()
         self.options = descriptor.get_options()
         self.closed = False
         self.metrics = {"queue_seconds": 0.0, "copy_seconds": 0.0, "request_seconds": 0.0, "input_bytes": 0}
@@ -188,23 +226,47 @@ class ServiceEmbedder(ManagedEmbedder):
         return await self._single("audio", values)
 
     async def _single(self, kind: Modality, values: list[Any]) -> list[Any]:
-        return await self.embed_multimodal(
-            [EmbeddingContent((EmbeddingPart(EmbeddingPartSpec(kind), value),)) for value in values]
+        if self.descriptor.metadata is not None and not isinstance(values, list):
+            raise EmbeddingConfigurationError("MLX embedding methods require a list of input values")
+        context = self._context()
+        encoding = (
+            context.encoding
+            if kind == "text" and context.encoding.startswith("text_")
+            else "text_document"
+            if kind == "text"
+            else kind
+        )
+        return await self._embed_contents(
+            [EmbeddingContent((EmbeddingPart(EmbeddingPartSpec(kind), value),)) for value in values], encoding
         )
 
     async def embed_multimodal(self, contents: list[EmbeddingContent]) -> list[Any]:
+        return await self._embed_contents(contents, "multimodal")
+
+    def _context(self, encoding: str | None = None) -> ipc.RequestContext:
+        metadata = self.descriptor.metadata
+        if metadata is None:
+            return ipc.RequestContext()
+        return ipc.RequestContext(encoding or metadata.context.encoding, metadata.context.model_contract)
+
+    async def _embed_contents(self, contents: list[EmbeddingContent], encoding: str) -> list[Any]:
         from vane.ai.functions import _log_substituted_failure
 
+        context = self._context(encoding)
+        if self.descriptor.metadata is not None:
+            from vane.ai.providers._mlx_service import preflight
+
+            contents = preflight(contents, self.spec, context.encoding)
         # Entire batch validation precedes any connection/model work, even when
         # on_error='ignore'. No replay/retry after uncertain service completion.
         plans = [ipc.describe(content, self.spec) for content in contents]
         for parts, _, size in plans:
-            ipc.encode(self._reservation(parts, size, "0" * 32))
+            ipc.encode(self._reservation(parts, size, "0" * 32, context))
 
         async def invoke(plan: Any, check_stopped: Callable[[], None]) -> Any:
             check_stopped()
             try:
-                result = await asyncio.wait_for(self._request(plan), self.options["timeout"])
+                result = await asyncio.wait_for(self._request((plan, context)), self.options["timeout"])
                 return getattr(self, "_validate_vector", lambda value: value)(result)
             except (EmbeddingConfigurationError, MemoryError, ProviderImportError):
                 raise
@@ -224,7 +286,8 @@ class ServiceEmbedder(ManagedEmbedder):
 
         if self._zmq_client is None:
             self._zmq_client = Client(self)
-        return await self._zmq_client.request(plan)
+        body, context = plan
+        return await self._zmq_client.request(body, context)
 
     @staticmethod
     def _check_response(response: Any, request_id: str) -> None:
@@ -237,7 +300,10 @@ class ServiceEmbedder(ManagedEmbedder):
         if "error" in response:
             raise RuntimeError("Embedding service request failed")
 
-    def _reservation(self, parts: Any, size: int, request_id: str) -> dict[str, Any]:
+    def _reservation(
+        self, parts: Any, size: int, request_id: str, context: ipc.RequestContext | None = None
+    ) -> dict[str, Any]:
+        context = context or self._context()
         return {
             "version": ipc.VERSION,
             "service_id": self.options["service_id"],
@@ -247,4 +313,6 @@ class ServiceEmbedder(ManagedEmbedder):
             "request_id": request_id,
             "parts": parts,
             "nbytes": size,
+            "encoding": context.encoding,
+            "model_contract": context.model_contract.to_wire() if context.model_contract is not None else None,
         }

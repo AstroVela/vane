@@ -163,7 +163,7 @@ class Client:
             # or configuration error into an ignorable transport failure.
             self.owner._check_response(response, request_id)
 
-    async def request(self, plan: Any) -> np.ndarray:
+    async def request(self, plan: Any, request_context: ipc.RequestContext) -> np.ndarray:
         parts, arrays, size = plan
         endpoint, key = _read_endpoint(self.owner.options["service_path"])
         zmq = _zmq()
@@ -177,7 +177,9 @@ class Client:
             await connection.authenticate()
             assert connection.key is not None
             key = connection.key
-            await connection.send(_pack(self.owner._reservation(parts, size, request_id), key, b"request"))
+            await connection.send(
+                _pack(self.owner._reservation(parts, size, request_id, request_context), key, b"request")
+            )
             response = _unpack(await connection.receive(), key, b"response")
             if isinstance(response, dict) and "error" in response:
                 await self._acknowledge(connection, response, request_id)
@@ -421,7 +423,7 @@ class Server:
                     publication.committed = True
                     self.unpublished.pop(identity, None)
                 return
-            self.owner._hello(message)
+            request_context = self.owner._hello(message)
             size = message["nbytes"]
             if len(self.pending) >= self.owner.max_connections:
                 raise MemoryError("Embedding service request limit")
@@ -429,7 +431,7 @@ class Server:
             queue = publication.queue
             if peer.deadline is not None:
                 peer.deadline.cancel()
-            task = asyncio.create_task(self._handle(identity, message, size, queue))
+            task = asyncio.create_task(self._handle(identity, message, size, queue, request_context))
             self.unpublished[identity] = task
             self.owner._tasks.add(task)
             task.add_done_callback(partial(self._finished, identity=identity, queue=queue, peer=peer))
@@ -453,7 +455,14 @@ class Server:
         if self.peers.get(identity) is peer and (peer.receipt_received or not peer.awaiting_receipt):
             self._disconnect(identity)
 
-    async def _handle(self, identity: bytes, message: dict[str, Any], size: int, queue: asyncio.Queue[Any]) -> None:
+    async def _handle(
+        self,
+        identity: bytes,
+        message: dict[str, Any],
+        size: int,
+        queue: asyncio.Queue[Any],
+        request_context: ipc.RequestContext,
+    ) -> None:
         owner = self.owner
         publication = self.pending[identity]
         reserved = False
@@ -512,7 +521,7 @@ class Server:
             ipc.describe(content, owner.spec)
             owner.metrics["accepted"] += 1
             started = time.monotonic()
-            inference = asyncio.create_task(owner._infer(content))
+            inference = asyncio.create_task(owner._infer(content, request_context))
             await _drain(inference)
             response = inference.result()
             owner.metrics["inference_seconds"] += time.monotonic() - started
