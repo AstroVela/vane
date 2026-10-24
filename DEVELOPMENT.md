@@ -271,9 +271,26 @@ The Linux native unit suite also builds a signed, self-contained
 `loadable_extension_batch_demo` fixture. Its COPY rewrite recursively plans a
 UDF child from inside a private engine copy. After `scripts/run_native_tests.sh`,
 run its installed-Python regression with
-`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_copy`.
-This covers both local runner names, task and actor execution, empty input,
-multiple batches, nulls and fixed-size vectors while forbidding Ray startup.
+`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_extension`.
+This covers COPY rewrites and connections created by the private engine, both
+local runner names, task and actor execution, empty input, multiple batches,
+nulls and fixed-size vectors while forbidding Ray startup. It also checks host
+vLLM/SGLang factory dispatch without loading models and restores DataSource bind
+data through the private engine's deserializer and scan callbacks.
+
+Executor factories and DataSource callbacks belong to `DatabaseInstance`.
+Python installs them once before exposing a connection, including cached databases,
+and all connections to that database share them. Native embedders must register
+their callbacks on the database they execute against. Do not add library-local
+runtime registries: self-contained extensions have their own copy of that static
+storage. External block readers travel with their descriptors and do not need a
+consumer-side registry lookup.
+The Python bridge also installs a database-owned connection callback for UDF
+resource preparation and teardown. Connections created inside an extension use
+that host callback, including actor pool and transport-capacity preparation.
+Schema-only native preparation does not create actor resources. Native
+Prepare/Execute calls prepare fresh query-owned resources when rebinding for
+execution, including repeated execution of the same prepared statement.
 Rebuild optional providers against the changed native SDK; a matching Python
 package version alone does not establish C++ compatibility.
 

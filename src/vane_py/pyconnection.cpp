@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/execution/distributed/client_state.hpp"
+#include "duckdb/execution/execution_runtime.hpp"
 #include "vane_python/query_parameters.hpp"
 #include "vane_python/vane_fs.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
@@ -19,6 +20,8 @@
 #include "vane_python/ai_sql_functions.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/udf_executor.hpp"
+#include "vane_python/vllm_executor.hpp"
 
 #include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -3675,6 +3678,15 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 		auto lock = DuckDBPyConnection::LockConnection(res->py_connection_lock);
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
+		// Install before exposing this connection, including when the database
+		// comes from the instance cache. Preserve any later per-database
+		// registrations instead of resetting them whenever a connection opens.
+		std::call_once(database->instance->GetExecutionRuntime().initialization, [&] {
+			RegisterUDFExecutorFactory(*database->instance);
+			RegisterVLLMExecutorFactory(*database->instance);
+			RegisterDataSourceCallbacks(*database->instance);
+			RegisterPythonUDFConnectionCallbacks(*database->instance);
+		});
 		res->con.SetDatabase(std::move(database));
 		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
 		RunnerClientState::Initialize(*res->con.GetConnection().context, runner_type);

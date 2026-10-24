@@ -607,7 +607,7 @@ static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state) {
 		return;
 	}
 
-	auto factory = GetUDFExecutorFactory();
+	auto factory = GetUDFExecutorFactory(context.client);
 	if (!factory) {
 		throw InvalidInputException("UDF executor factory is not registered");
 	}

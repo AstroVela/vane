@@ -12,7 +12,10 @@
 
 namespace duckdb {
 
-void RegisterUDFExecutorFactory();
+class DatabaseInstance;
+
+void RegisterUDFExecutorFactory(DatabaseInstance &db);
+void RegisterUDFExternalBlockBackend();
 void ShutdownUDFExecutorDispatcher();
 void WakeUDFExecutorSlotsForTesting();
 void PauseUDFDispatcherWaitForTesting();

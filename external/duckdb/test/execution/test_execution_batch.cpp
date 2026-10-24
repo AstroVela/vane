@@ -12,6 +12,8 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
+#include "duckdb/execution/vllm_executor.hpp"
+#include "duckdb/function/table/datasource_scan.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
@@ -1046,26 +1048,51 @@ TEST_CASE("Hash local exchange retains the materialized batch across budget bloc
 	REQUIRE(output.rows == 3);
 }
 
-#ifdef VANE_BATCH_DEMO_PATH
 namespace {
 
 unique_ptr<UDFExecutor> RejectHostUDFExecution(ClientContext &, const Value &, UDFConfig &, shared_ptr<void>) {
 	throw InvalidInputException("host UDF executor factory reached");
 }
 
-struct HostUDFFactoryGuard {
-	HostUDFFactoryGuard() : previous(GetUDFExecutorFactory()) {
-		SetUDFExecutorFactory(RejectHostUDFExecution);
-	}
-	~HostUDFFactoryGuard() {
-		SetUDFExecutorFactory(previous);
-	}
-	udf_executor_factory_t previous;
-};
+unique_ptr<VLLMExecutor> RejectHostInferenceExecution(ClientContext &, const string &, const Value &, VLLMConfig &) {
+	throw InvalidInputException("host inference executor factory reached");
+}
+
+unique_ptr<DataSourceStream> RejectHostSourceExecution(const char *, idx_t, ClientContext *) {
+	throw InvalidInputException("host datasource stream factory reached");
+}
 
 } // namespace
 
-TEST_CASE("Private COPY planners retain the host UDF executor", "[execution_batch][extension][udf]") {
+TEST_CASE("Runtime registration is shared by connections and isolated between databases",
+          "[execution_batch][execution_runtime]") {
+	DuckDB first;
+	Connection con(first);
+	Connection sibling(first);
+	DuckDB second;
+	Connection other(second);
+	SetUDFExecutorFactory(*first.instance, RejectHostUDFExecution);
+	RegisterEngineExecutorFactory(*first.instance, "vllm", RejectHostInferenceExecution);
+	RegisterEngineExecutorFactory(*second.instance, "sglang", RejectHostInferenceExecution);
+	DataSourceCallbacks callbacks;
+	callbacks.produce_stream = RejectHostSourceExecution;
+	DataSourceScanFunction::SetCallbacks(*first.instance, callbacks);
+	for (auto context : {con.context, sibling.context}) {
+		REQUIRE(GetUDFExecutorFactory(*context) == RejectHostUDFExecution);
+		REQUIRE(GetEngineExecutorFactory(*context, "vllm") == RejectHostInferenceExecution);
+		REQUIRE(GetEngineExecutorFactory(*context, "sglang") == nullptr);
+		REQUIRE(DataSourceScanFunction::GetCallbacks(*context).produce_stream == RejectHostSourceExecution);
+	}
+	REQUIRE(GetUDFExecutorFactory(*other.context) == nullptr);
+	REQUIRE(GetEngineExecutorFactory(*other.context, "vllm") == nullptr);
+	REQUIRE(GetEngineExecutorFactory(*other.context, "sglang") == RejectHostInferenceExecution);
+	REQUIRE(DataSourceScanFunction::GetCallbacks(*other.context).produce_stream == nullptr);
+	SetUDFExecutorFactory(*first.instance, nullptr);
+	REQUIRE(GetUDFExecutorFactory(*sibling.context) == nullptr);
+}
+
+#ifdef VANE_BATCH_DEMO_PATH
+TEST_CASE("Private extension planners retain the host UDF executor", "[execution_batch][extension][udf]") {
 	DBConfig config;
 #ifndef VANE_BATCH_DEMO_SIGNED
 	config.options.allow_unsigned_extensions = true;
@@ -1076,15 +1103,7 @@ TEST_CASE("Private COPY planners retain the host UDF executor", "[execution_batc
 	INFO((loaded->HasError() ? loaded->GetError() : ""));
 	REQUIRE_FALSE(loaded->HasError());
 	REQUIRE_FALSE(con.Query("SET threads=1")->HasError());
-	HostUDFFactoryGuard guard;
-	void *library = dlopen(VANE_BATCH_DEMO_PATH, RTLD_NOW | RTLD_LOCAL);
-	REQUIRE(library);
-	using HasFactory = bool (*)();
-	auto has_factory = reinterpret_cast<HasFactory>(dlsym(library, "batch_demo_has_private_udf_factory"));
-	REQUIRE(has_factory);
-	const auto private_factory_registered = has_factory();
-	dlclose(library);
-	REQUIRE_FALSE(private_factory_registered);
+	SetUDFExecutorFactory(*db.instance, RejectHostUDFExecution);
 	const string input = R"(
         SELECT udf(i, {'payload_version': 1, 'udf_name': 'private-copy', 'call_mode': 'map',
                        'execution_backend': 'subprocess_task', 'method_return_type': 'BIGINT',
@@ -1105,6 +1124,26 @@ TEST_CASE("Private COPY planners retain the host UDF executor", "[execution_batc
 	}
 	SECTION("UDF replanned inside the private extension reaches the same factory") {
 		auto result = con.Query("COPY (" + input + ") TO 'unused' (FORMAT batch_demo_replan)");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("a new connection inside the private extension reaches the same factory") {
+		auto result = con.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("loading the same extension in another database does not inherit the host runtime") {
+		DBConfig other_config;
+#ifndef VANE_BATCH_DEMO_SIGNED
+		other_config.options.allow_unsigned_extensions = true;
+#endif
+		DuckDB other_db(nullptr, &other_config);
+		Connection other(other_db);
+		REQUIRE_FALSE(other.Query(string("LOAD '") + VANE_BATCH_DEMO_PATH + "'")->HasError());
+		auto result = other.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("UDF executor factory is not registered"));
+		result = con.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
 		REQUIRE(result->HasError());
 		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
 	}

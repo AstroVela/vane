@@ -14,7 +14,9 @@
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_objects.hpp"
 
@@ -284,6 +286,20 @@ void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object 
 
 class PythonUDFActorResourceState : public ClientContextState {
 public:
+	void EnableAutomaticPreparation() {
+		automatic_preparation = true;
+	}
+
+	void QueryBegin(ClientContext &) override {
+		if (automatic_preparation && scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+			preparation_cancelled = false;
+			preparation_generation++;
+			startup_cancellation.reset();
+		}
+	}
+
 	void EnableLocalRuntimeInputPolicy() {
 		local_runtime_input_policy = true;
 	}
@@ -343,8 +359,10 @@ public:
 	}
 
 	RebindQueryInfo OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
-	                                  PreparedStatementMode) override {
-		if (!Enabled()) {
+	                                  PreparedStatementMode mode) override {
+		// Schema discovery through Connection::Prepare must not start actors.
+		// Explicit Python execution scopes retain their existing preparation policy.
+		if (!Enabled() || (scope_depth == 0 && mode != PreparedStatementMode::PREPARE_AND_EXECUTE)) {
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
 		PrepareOnce(context, prepared);
@@ -397,6 +415,9 @@ public:
 			query.attr("query_finished")();
 		}
 		ShutdownResources(false, capture_errors);
+		if (scope_depth == 0) {
+			startup_cancellation.reset();
+		}
 	}
 
 	~PythonUDFActorResourceState() override {
@@ -443,7 +464,7 @@ private:
 	}
 
 	bool Enabled() const {
-		return scope_depth > 0;
+		return scope_depth > 0 || automatic_preparation;
 	}
 
 	void PrepareOnce(ClientContext &context, PreparedStatementData &prepared) {
@@ -634,6 +655,7 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	bool automatic_preparation = false;
 	idx_t preparation_generation = 0;
 	bool preparation_cancelled = false;
 	shared_ptr<void> startup_cancellation;
@@ -644,6 +666,24 @@ private:
 	vector<pybind11::object> resources;
 	vector<string> cleanup_warnings;
 };
+
+namespace {
+
+class PythonUDFConnectionCallback : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		// This callback is held by the host database. Its vtable stays in the
+		// Python bridge even when a private engine constructs the connection.
+		auto state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
+		state->EnableAutomaticPreparation();
+	}
+};
+
+} // namespace
+
+void RegisterPythonUDFConnectionCallbacks(DatabaseInstance &db) {
+	ExtensionCallback::Register(db.config, make_shared_ptr<PythonUDFConnectionCallback>());
+}
 
 ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context,
                                                                                  pybind11::object local_query) {
