@@ -1,0 +1,371 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Frozen identity-partition constants for Vane; apply after iceberg-vane-file-scan.patch.
+# Upstream source: duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c (MIT).
+
+diff --git a/src/planning/vane_iceberg_frozen_scan.cpp b/src/planning/vane_iceberg_frozen_scan.cpp
+--- a/src/planning/vane_iceberg_frozen_scan.cpp
++++ b/src/planning/vane_iceberg_frozen_scan.cpp
+@@ -17,8 +17,8 @@
+ namespace duckdb {
+ namespace {
+ 
+-static constexpr uint32_t FROZEN_BIND_VERSION = 1;
+-static constexpr uint32_t FROZEN_ASSIGNMENT_VERSION = 1;
++static constexpr uint32_t FROZEN_BIND_VERSION = 2;
++static constexpr uint32_t FROZEN_ASSIGNMENT_VERSION = 2;
+ static string FileSplitID(uint64_t ordinal) {
+ 	return "file-" + std::to_string(ordinal);
+ }
+@@ -33,11 +33,44 @@
+ 	FrozenRole role = FrozenRole::SNAPSHOT;
+ };
+ 
++// Each file owns the values selected from its own manifest partition spec.
++// Neither catalog objects nor directory-derived partition values enter a bind.
++struct FrozenDataFile {
++	string path;
++	int32_t partition_spec_id = 0;
++	vector<int32_t> source_ids;
++	vector<Value> constants;
++
++	void Serialize(Serializer &serializer) const {
++		serializer.WriteProperty(1, "path", path);
++		serializer.WriteProperty(2, "partition_spec_id", partition_spec_id);
++		serializer.WriteProperty(3, "partition_source_ids", source_ids);
++		serializer.WriteProperty(4, "partition_constants", constants);
++	}
++	static FrozenDataFile Deserialize(Deserializer &deserializer) {
++		FrozenDataFile file;
++		file.path = deserializer.ReadProperty<string>(1, "path");
++		file.partition_spec_id = deserializer.ReadProperty<int32_t>(2, "partition_spec_id");
++		file.source_ids = deserializer.ReadProperty<vector<int32_t>>(3, "partition_source_ids");
++		file.constants = deserializer.ReadProperty<vector<Value>>(4, "partition_constants");
++		return file;
++	}
++};
++
++static vector<OpenFileInfo> FilePaths(const vector<FrozenDataFile> &files) {
++	vector<OpenFileInfo> paths;
++	for (auto &file : files) {
++		paths.emplace_back(file.path);
++	}
++	return paths;
++}
++
+ struct FrozenIcebergFileList : public SimpleMultiFileList {
+-	FrozenIcebergFileList(FrozenIdentity identity, vector<OpenFileInfo> files)
+-	    : SimpleMultiFileList(std::move(files)), identity(std::move(identity)) {
++	FrozenIcebergFileList(FrozenIdentity identity, vector<FrozenDataFile> files)
++	    : SimpleMultiFileList(FilePaths(files)), identity(std::move(identity)), data_files(std::move(files)) {
+ 	}
+ 	FrozenIdentity identity;
++	const vector<FrozenDataFile> data_files;
+ };
+ 
+ static void ValidatePath(const string &path) {
+@@ -64,8 +97,10 @@
+ 		throw NotImplementedException("Frozen Iceberg transport does not support uncommitted transaction data");
+ 	}
+ 	for (auto &spec : metadata.partition_specs) {
+-		if (!spec.second.fields.empty()) {
+-			throw NotImplementedException("Frozen Iceberg transport does not yet support partitioned tables");
++		for (auto &field : spec.second.fields) {
++			if (field.transform != IcebergTransformType::IDENTITY) {
++				throw NotImplementedException("Frozen Iceberg transport currently supports identity partitions only");
++			}
+ 		}
+ 	}
+ 	if (files.HasDeleteManifestsForTransport()) {
+@@ -155,17 +190,83 @@
+ 	return reader;
+ }
+ 
+-static vector<OpenFileInfo> FrozenFiles(const MultiFileBindData &bind) {
+-	// Iceberg's GetAllFiles returns only entries already materialized. Fully
+-	// expand the selected manifests first; an untouched live bind may otherwise
+-	// serialize zero files even for a nonempty snapshot.
++static void ValidateFile(const FrozenDataFile &file, const MultiFileReaderBindData &reader) {
++	ValidatePath(file.path);
++	if (file.partition_spec_id < 0 || file.source_ids.size() != file.constants.size()) {
++		throw SerializationException("Invalid frozen Iceberg partition state");
++	}
++	set<int32_t> seen;
++	for (idx_t index = 0; index < file.source_ids.size(); index++) {
++		auto id = file.source_ids[index];
++		if (id <= 0 || !seen.insert(id).second) {
++			throw SerializationException("Frozen Iceberg partition contains invalid or duplicate source fields");
++		}
++		optional_ptr<const MultiFileColumnDefinition> column;
++		for (auto &candidate : reader.schema) {
++			if (candidate.identifier.GetValue<int32_t>() == id) {
++				column = &candidate;
++				break;
++			}
++		}
++		if (!column || column->type != file.constants[index].type()) {
++			throw SerializationException("Frozen Iceberg partition constant does not match the frozen field schema");
++		}
++	}
++}
++
++static vector<FrozenDataFile> FrozenFiles(const MultiFileBindData &bind) {
++	if (auto frozen = dynamic_cast<const FrozenIcebergFileList *>(bind.file_list.get())) {
++		return frozen->data_files;
++	}
++	// Iceberg's GetAllFiles only returns materialized entries. Enumerate every
++	// selected file before looking up its manifest/spec by the same ordinal.
+ 	auto count = bind.file_list->GetTotalFileCount();
+-	auto files = bind.file_list->GetAllFiles();
+-	if (files.size() != count) {
++	auto paths = bind.file_list->GetAllFiles();
++	if (paths.size() != count) {
+ 		throw SerializationException("Frozen Iceberg file enumeration is incomplete");
+ 	}
+-	for (auto &file : files) {
+-		ValidatePath(file.path);
++	auto &live = bind.file_list->Cast<IcebergMultiFileList>();
++	vector<FrozenDataFile> files;
++	for (idx_t index = 0; index < paths.size(); index++) {
++		FrozenDataFile file;
++		file.path = paths[index].path;
++		auto entry = live.GetManifestEntry(index);
++		auto &manifest = live.GetManifestFileForEntry(entry, IcebergManifestContentType::DATA);
++		auto spec = live.GetMetadata().partition_specs.find(manifest.partition_spec_id);
++		if (spec == live.GetMetadata().partition_specs.end() || manifest.partition_spec_id != spec->second.spec_id) {
++			throw SerializationException("Frozen Iceberg file references an unknown partition spec");
++		}
++		file.partition_spec_id = spec->second.spec_id;
++		auto &data = entry.entry.data_file;
++		for (auto &field : spec->second.fields) {
++			if (field.transform != IcebergTransformType::IDENTITY) {
++				throw NotImplementedException("Frozen Iceberg transport currently supports identity partitions only");
++			}
++			optional_ptr<const MultiFileColumnDefinition> column;
++			for (auto &candidate : bind.reader_bind.schema) {
++				if (static_cast<uint64_t>(candidate.identifier.GetValue<int32_t>()) == field.source_id) {
++					column = &candidate;
++					break;
++				}
++			}
++			if (!column) {
++				throw SerializationException("Frozen Iceberg partition references an unknown source field");
++			}
++			for (auto &value : data.partition_info) {
++				if (value.field_id != field.partition_field_id) {
++					continue;
++				}
++				file.source_ids.push_back(column->identifier.GetValue<int32_t>());
++				file.constants.push_back(
++				    value.value.IsNull() ? Value(column->type)
++				                         : IcebergMultiFileReader::TransformPartitionValue(value.value, column->type));
++				// The pinned manifest decoder can materialize the same field
++				// more than once when historical specs reuse its field ID.
++				break;
++			}
++		}
++		ValidateFile(file, bind.reader_bind);
++		files.push_back(std::move(file));
+ 	}
+ 	return files;
+ }
+@@ -195,22 +296,12 @@
+ 	       left.snapshot_id == right.snapshot_id && left.schema_id == right.schema_id;
+ }
+ 
+-static void WriteFiles(Serializer &serializer, field_id_t id, const vector<OpenFileInfo> &files) {
+-	vector<string> paths;
+-	for (auto &file : files) {
+-		paths.push_back(file.path);
+-	}
+-	serializer.WriteProperty(id, "data_files", paths);
+-}
+-
+-static vector<OpenFileInfo> ReadFiles(Deserializer &deserializer, field_id_t id) {
+-	auto paths = deserializer.ReadProperty<vector<string>>(id, "data_files");
+-	vector<OpenFileInfo> result;
+-	for (auto &path : paths) {
+-		ValidatePath(path);
+-		result.emplace_back(std::move(path));
+-	}
+-	return result;
++static void WriteFiles(Serializer &serializer, field_id_t id, const vector<FrozenDataFile> &files) {
++	serializer.WriteProperty(id, "data_files", files);
++}
++
++static vector<FrozenDataFile> ReadFiles(Deserializer &deserializer, field_id_t id) {
++	return deserializer.ReadProperty<vector<FrozenDataFile>>(id, "data_files");
+ }
+ 
+ struct FrozenIcebergReader : public MultiFileReader {
+@@ -243,6 +334,43 @@
+ 		}
+ 		return MultiFileReader::InitializeGlobalState(context, options, bind, files, columns, ids);
+ 	}
++	ReaderInitializeType InitializeReader(MultiFileReaderData &reader_data, const MultiFileBindData &bind,
++	                                      const vector<MultiFileColumnDefinition> &columns,
++	                                      const vector<ColumnIndex> &ids, optional_ptr<TableFilterSet> filters,
++	                                      ClientContext &context, MultiFileGlobalState &gstate) override {
++		MultiFileReader::FinalizeBind(reader_data, bind.file_options, bind.reader_bind, columns, ids, context,
++		                              gstate.multi_file_reader_state.get());
++		auto &list = gstate.file_list.Cast<FrozenIcebergFileList>();
++		auto file_index = reader_data.reader->file_list_idx.GetIndex();
++		if (file_index >= list.data_files.size()) {
++			throw SerializationException("Frozen Iceberg reader has no assigned file state");
++		}
++		auto &file = list.data_files[file_index];
++		set<int32_t> physical_ids;
++		for (auto &column : reader_data.reader->GetColumns()) {
++			if (!column.identifier.IsNull()) {
++				physical_ids.insert(column.identifier.GetValue<int32_t>());
++			}
++		}
++		for (idx_t output = 0; output < ids.size(); output++) {
++			if (ids[output].IsVirtualColumn()) {
++				continue;
++			}
++			auto &column = columns[ids[output].GetPrimaryIndex()];
++			auto source_id = column.identifier.GetValue<int32_t>();
++			if (physical_ids.count(source_id)) {
++				continue;
++			}
++			for (idx_t constant = 0; constant < file.source_ids.size(); constant++) {
++				if (file.source_ids[constant] == source_id) {
++					reader_data.constant_map.Add(MultiFileGlobalIndex(output), file.constants[constant]);
++					break;
++				}
++			}
++		}
++		return CreateMapping(context, reader_data, columns, ids, filters, gstate.file_list, bind.reader_bind,
++		                     bind.virtual_columns);
++	}
+ 	unique_ptr<Expression> GetVirtualColumnExpression(ClientContext &context, MultiFileReaderData &reader,
+ 	                                                  const vector<MultiFileColumnDefinition> &columns, idx_t &column,
+ 	                                                  const LogicalType &type, MultiFileLocalIndex local,
+@@ -255,7 +383,7 @@
+ 	}
+ };
+ 
+-static unique_ptr<MultiFileBindData> RestoreBind(FrozenIdentity identity, vector<OpenFileInfo> files,
++static unique_ptr<MultiFileBindData> RestoreBind(FrozenIdentity identity, vector<FrozenDataFile> files,
+                                                  vector<LogicalType> types, vector<string> names,
+                                                  vector<string> table_columns, MultiFileReaderBindData reader_bind,
+                                                  ParquetOptionsSerialization parquet_options, idx_t row_groups,
+@@ -270,6 +398,9 @@
+ 	    !parquet_options.parquet_options.schema.empty() || parquet_options.parquet_options.encryption_config) {
+ 		throw NotImplementedException(
+ 		    "Frozen Iceberg transport does not support alternate Parquet schemas or encryption");
++	}
++	for (auto &file : files) {
++		ValidateFile(file, reader_bind);
+ 	}
+ 	auto result = make_uniq<MultiFileBindData>();
+ 	result->multi_file_reader = make_uniq<FrozenIcebergReader>();
+@@ -324,7 +455,7 @@
+ 		serializer.WriteProperty(1, "assignment_version", FROZEN_ASSIGNMENT_VERSION);
+ 		serializer.WriteObject(2, "identity", [&](Serializer &object) { WriteIdentity(object, identity); });
+ 		serializer.WriteProperty<uint64_t>(3, "file_ordinal", ordinal);
+-		serializer.WriteProperty(4, "data_file", path);
++		serializer.WriteProperty(4, "data_file", files[ordinal]);
+ 		serializer.End();
+ 		DistributedScanSplit split;
+ 		split.split_id = FileSplitID(ordinal);
+@@ -341,7 +472,7 @@
+ 	auto &bind = bind_data->Cast<MultiFileBindData>();
+ 	auto &list = bind.file_list->Cast<FrozenIcebergFileList>();
+ 	auto identity = list.identity;
+-	map<uint64_t, OpenFileInfo> assigned_files;
++	map<uint64_t, FrozenDataFile> assigned_files;
+ 	set<string> paths;
+ 	// Decode into owned temporary state. Neither partial failures nor an empty
+ 	// assignment may expose old coordinator/attempt files as a fallback.
+@@ -363,21 +494,21 @@
+ 			throw SerializationException("Frozen Iceberg assignment does not match the worker snapshot");
+ 		}
+ 		auto ordinal = deserializer.ReadProperty<uint64_t>(3, "file_ordinal");
+-		auto path = deserializer.ReadProperty<string>(4, "data_file");
++		auto file = deserializer.ReadProperty<FrozenDataFile>(4, "data_file");
+ 		deserializer.End();
+ 		if (stream.GetPosition() != payload.size()) {
+ 			throw SerializationException("Frozen Iceberg assignment has trailing bytes");
+ 		}
+-		ValidatePath(path);
++		ValidateFile(file, bind.reader_bind);
+ 		if (!identity.has_snapshot || split.split_id != FileSplitID(ordinal)) {
+ 			throw SerializationException("Frozen Iceberg assignment has an invalid file identity");
+ 		}
+-		if (!paths.insert(path).second || assigned_files.count(ordinal)) {
++		if (!paths.insert(file.path).second || assigned_files.count(ordinal)) {
+ 			throw SerializationException("Frozen Iceberg assignment contains duplicate files");
+ 		}
+-		assigned_files.emplace(ordinal, OpenFileInfo(std::move(path)));
+-	}
+-	vector<OpenFileInfo> files;
++		assigned_files.emplace(ordinal, std::move(file));
++	}
++	vector<FrozenDataFile> files;
+ 	for (auto &entry : assigned_files) {
+ 		files.push_back(std::move(entry.second));
+ 	}
+@@ -449,7 +580,7 @@
+ TableFunctionDistributedScanCallbacks VaneIcebergFrozenScanCallbacks() {
+ 	TableFunctionDistributedScanCallbacks result;
+ 	result.protocol_version = 1;
+-	result.split_codec = {"vane.iceberg.frozen-file-scan", 1};
++	result.split_codec = {"vane.iceberg.frozen-file-scan", 2};
+ 	result.plan_splits = PlanFileSplits;
+ 	result.create_worker_bind = CreateWorkerBind;
+ 	result.apply_splits = ApplyFileSplits;
+diff --git a/src/planning/iceberg_multi_file_reader.cpp b/src/planning/iceberg_multi_file_reader.cpp
+--- a/src/planning/iceberg_multi_file_reader.cpp
++++ b/src/planning/iceberg_multi_file_reader.cpp
+@@ -1,3 +1,8 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ #include "planning/iceberg_multi_file_reader.hpp"
+ 
+ #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+@@ -139,7 +144,7 @@
+ 	return TransformPartitionValueFromBlob(blob, type);
+ }
+ 
+-static Value TransformPartitionValue(const Value &value, const LogicalType &type) {
++Value IcebergMultiFileReader::TransformPartitionValue(const Value &value, const LogicalType &type) {
+ 	D_ASSERT(!value.type().IsNested());
+ 	// DECIMAL partition values are already decoded as proper DuckDB DECIMALs by the Avro reader.
+ 	// The blob round-trip below misinterprets the little-endian internal representation as
+@@ -260,7 +265,8 @@
+ 			continue;
+ 		}
+ 		auto global_idx = MultiFileGlobalIndex(i);
+-		reader_data.constant_map.Add(global_idx, TransformPartitionValue(*partition_value, global_column.type));
++		reader_data.constant_map.Add(
++		    global_idx, IcebergMultiFileReader::TransformPartitionValue(*partition_value, global_column.type));
+ 	}
+ }
+ 
+diff --git a/src/include/planning/iceberg_multi_file_reader.hpp b/src/include/planning/iceberg_multi_file_reader.hpp
+--- a/src/include/planning/iceberg_multi_file_reader.hpp
++++ b/src/include/planning/iceberg_multi_file_reader.hpp
+@@ -1,3 +1,8 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ //===----------------------------------------------------------------------===//
+ //                         DuckDB
+ //
+@@ -40,6 +45,8 @@
+ public:
+ 	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &table);
+ 	static vector<PartitionStatistics> IcebergGetPartitionStats(ClientContext &context, GetPartitionStatsInput &input);
++	// Decode manifest identity values identically for live and frozen readers.
++	static Value TransformPartitionValue(const Value &value, const LogicalType &type);
+ 
+ public:
+ 	shared_ptr<MultiFileList> CreateFileList(ClientContext &context, const vector<string> &paths,
