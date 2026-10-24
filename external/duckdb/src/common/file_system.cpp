@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/file_system.hpp"
 
 #include "duckdb/common/checksum.hpp"
@@ -915,6 +921,12 @@ bool FileSystem::IsRemoteFile(const string &path, string &extension) {
 		}
 	}
 	return false;
+}
+
+FileWriteTarget FileSystem::ResolveWriteTarget(const string &path, const CopyInfo &, optional_ptr<FileOpener>) {
+	FileWriteTarget result;
+	result.path = path;
+	return result;
 }
 
 string FileSystem::CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener) {

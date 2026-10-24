@@ -5,6 +5,10 @@ FILESET catalogs. It uses DuckDB's `StorageExtension`, `Catalog`, and
 `FileSystem` interfaces. Python's `vane.catalog.GravitinoCatalog` is a wrapper
 around those native operations; it does not read data through a Python SDK.
 
+For the implementation plan and later metadata discovery and Iceberg work, see
+the [Gravitino design and roadmap](GRAVITINO_DESIGN.md). The capabilities below
+describe the current implementation, including Fileset batch writes.
+
 ## Build and load
 
 Build a matching loadable artifact using the [development workflow](DEVELOPMENT.md):
@@ -21,7 +25,13 @@ Package and sign the artifact using the existing
 including `LICENSES/vcpkg-binary-dependencies.txt` for the linked native
 dependencies. Install the matching provider on the coordinator and every Ray
 worker, then call `vane.load_installed_extension("gravitino", connection=connection)`.
-This PR adds source and packaging support; it does not publish a provider wheel.
+These source changes do not publish a provider wheel.
+
+Batch writes add `FileSystem::ResolveWriteTarget`, which changes the native
+filesystem ABI. Rebuild the base and all optional native providers against the
+same engine sources. A matching Python package version alone does not establish
+native compatibility; retain the engine and artifact identity checks described
+in the development workflow.
 
 For an explicitly static development build, add `gravitino` to `BUILD_EXTENSIONS`
 and use `connection.execute("LOAD gravitino")`.
@@ -81,7 +91,7 @@ and a JSON string in `metadata`. The plural discovery functions return `name`
 with NULL `metadata`; loading details is explicit. `gravitino_files` returns
 the same columns as `list_files`, including a typed `FILE` column. Its
 `recursive` named argument defaults to false.
-On local-fast connections, prepared metadata queries and Fileset scans resolve
+On local connections, prepared metadata queries and Fileset scans resolve
 fresh remote metadata on every execution. Fileset scans also refresh glob
 matches; they do not reuse locations or file lists captured by an earlier
 `PREPARE` or `EXECUTE`.
@@ -97,6 +107,108 @@ are `setProperty` and `removeProperty` for all three resources,
 `updateComment` for catalogs and Filesets, and `rename` for Filesets.
 Gravitino 1.3 does not support changing schema comments.
 Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
+
+## Fileset batch writes
+
+`GravitinoCatalog.write_files` writes Parquet or CSV through native COPY and
+returns a frozen `FilesetWriteResult` containing the exact output files, row
+count, byte count, selected location, operation ID and physical output base.
+Storage access uses the connection's existing settings. Supported combinations
+are:
+
+| Runner | Absolute local / `file:` locations | Shared S3 locations |
+| --- | --- | --- |
+| `local` (`local-fast` alias) | Supported | Supported |
+| `ray` | Rejected before writing | Supported through the existing FTE COPY protocol |
+
+Use a relation belonging to the catalog's connection. For local files, set
+`VANE_RUNNER=local` before creating that connection:
+
+```python
+result = catalog.write_files(
+    connection.sql("SELECT i, 'example' AS label FROM range(10) AS t(i)"),
+    "videos",
+    "training",
+    "exports",
+    format="parquet",
+    compression="zstd",
+)
+rows = connection.read_parquet(list(result.files)).order("i").fetchall()
+```
+
+Each invocation creates a distinct batch directory below the requested relative
+prefix, including when the prefix is empty. It does not replace previous output
+or deduplicate repeated calls. CSV uses UTF-8, commas and a header. Supply
+`partition_by=["column_name", ...]` for native Hive-style partition directories.
+Partition columns remain in every file. Empty input produces a zero-row output
+at the batch root, including with partitioning; CSV preserves column names,
+while Parquet also preserves types. When reading partitioned files, use
+`hive_partitioning=False` to preserve the stored partition values, including a
+literal `__HIVE_DEFAULT_PARTITION__` string. CSV empty-input types must be
+supplied to the reader explicitly when needed.
+
+The attachment must be writable and the connection must be in auto-commit mode.
+Output paths cannot contain glob patterns, dot segments, backslashes or percent
+escapes. Location selection follows the attachment and Fileset rules below.
+The physical target is resolved once per invocation. Output files and statistics
+come from that COPY execution or its committed manifest, not a later directory
+scan. Ray workers receive the frozen physical destination and storage settings,
+without the Gravitino attachment or bearer token. They do not resolve the
+Fileset again during task retries.
+
+There is no local batch manifest or directory-level atomic publication;
+`run_id` and `manifest_path` are `None`. Readers that list the directory can see
+partial failed output. Read `result.files` to select a successful batch. Failures
+can leave files belonging to that invocation. A `CopyResultUnavailableError`
+means COPY completed but its result could not be returned; it has
+`safe_to_retry=False` and includes the operation ID and output base. Do not rerun
+the write automatically in that case.
+
+For Ray S3 writes, `run_id` and `manifest_path` identify the durable commit.
+`files` contains only attempts selected by that commit. `cleanup_state` is
+`"complete"` or `"pending"`; `cleanup_warnings` retains the runner's diagnostics.
+After worker loss, the data can commit while teardown remains pending. Closing
+the connection can then report a cleanup error; retain the committed receipt
+and resolve cleanup separately instead of repeating the write. A local
+`"complete"` state does not add a durable manifest or atomic publication.
+Cleanup warnings do not turn a committed write into a failed write. If commit-marker publication
+or observation is inconclusive, the existing `CopyOutcomeUnknownError` retains
+the available recovery identifiers and prohibits automatic resubmission.
+For an error that includes `base_path` and `run_id`, inspect the original run
+using the same storage-configured connection:
+
+```python
+from vane.runners.ray.committed_copy import inspect_copy_direct_write_run
+
+status = inspect_copy_direct_write_run(error.base_path, error.run_id, conn=connection)
+if status["state"] == "COMMITTED":
+    files = [entry["final_path"] for entry in status["files"]]
+```
+
+Inspection is read-only. `UNCOMMITTED` does not prove that an earlier publication
+cannot complete. Stop the original write and resolve its state before deciding
+whether to retry. Explicit force-abort is an operator decision that can discard
+a run; it is not an automatic recovery step.
+
+Cancellation is reconciled with commit. An interruption observed before the
+terminal outcome can produce an interruption/unknown-outcome error, or return
+the committed receipt if publication won the race. Task retry requires live
+execution capacity; loss of every Ray worker is not an automatic cluster
+recovery guarantee.
+
+`result.files` contains literal physical filenames. Some format readers expand
+glob syntax in their string inputs. For registered roots containing glob
+metacharacters, use a literal file-opening API such as
+`vane.open_file(path, "rb", connection=connection)` with your format reader.
+Passing those names to a glob-expanding reader can select a different file set.
+
+Native SQL COPY and the existing Parquet writer also accept GVFS directory
+destinations with `APPEND` plus `PER_THREAD_OUTPUT` or nonempty `PARTITION_BY`.
+Use `WRITE_PARTITION_COLUMNS` to preserve a readable empty partitioned output.
+Fixed-file output, overwrite, custom filenames and temporary-file publication are
+rejected before writing. Prepared local COPY statements resolve fresh
+Fileset metadata at every execution; EXPLAIN and PREPARE create no output.
+The existing Python writer return types are unchanged.
 
 ## Execution and storage contracts
 
@@ -140,8 +252,9 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
   connection snapshot does not replay the attachment or transport its token.
 - Native `gvfs://fileset/<attachment>/<schema>/<fileset>/<path>` opens work on
   the attached connection, including `vane.open_file(..., connection=...)`.
-  The first path component is the local attachment alias. Content writes through
-  this filesystem are unsupported.
+  The first path component is the local attachment alias. Raw filesystem write
+  handles remain unsupported; COPY resolves validated destinations to physical
+  paths before selecting its storage strategy.
 - Configure attachments before enabling `configure_local_runtime()` on the
   local-runtime branch. Runtime query admission does not permit metadata writes;
   setup and management happen outside its read-only query phase.
@@ -152,7 +265,7 @@ ATTACH accepts `TOKEN` (optional bearer authentication), `TIMEOUT_MS` (default
 overall transport timeout, capped response bodies and headers, no redirects,
 and no compressed response decoding. Discovery is capped at 4096 identifiers.
 
-Relational table scans/writes, remote catalog creation/deletion, and file uploads
+Relational table scans/writes and remote catalog creation/deletion
 are outside this Fileset integration. Use the appropriate Lance/Iceberg connector
 for table operations.
 
@@ -163,8 +276,9 @@ actual native file reads. Run non-Ray and Ray tests in separate processes:
 
 ```bash
 export VANE_TEST_GRAVITINO=provider # use static for a static development build
-scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m 'not real_ray'
-scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m real_ray
+scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'not real_ray'
+scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py -m 'real_ray and not ray_cluster_owner'
+scripts/run_installed_pytest.sh tests/fast/test_gravitino_write.py -m 'real_ray and ray_cluster_owner'
 ```
 
 CI also runs `tests/fast/test_gravitino_live.py` against the real
@@ -173,7 +287,11 @@ installs the matching base wheel and signed provider from the native build,
 waits for service readiness, then runs local and Ray tests in separate
 processes. It checks catalog/schema/Fileset metadata mutations, the server's
 rejection of schema comment changes, EXTERNAL file retention, and native file
-reads through registered locations. The container is removed on success or
+reads and batch writes through registered local and S3 locations. S3 acceptance
+uses the HTTP object-store fixture alongside a real catalog configured with
+`disable-filesystem-ops=true`, so Gravitino manages metadata and Vane accesses
+storage. See the [Fileset catalog properties](https://gravitino.apache.org/docs/1.3.1/fileset-catalog/).
+This does not replace qualification against a production object store. The container is removed on success or
 failure, with server logs printed on failure.
 
 To run these acceptance tests against an explicitly provisioned Gravitino 1.3
