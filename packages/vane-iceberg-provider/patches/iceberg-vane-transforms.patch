@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Frozen transformed-partition reads for Vane; apply after iceberg-vane-partitions.patch.
+# Upstream source: duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c (MIT).
+
+diff --git a/src/planning/vane_iceberg_frozen_scan.cpp b/src/planning/vane_iceberg_frozen_scan.cpp
+--- a/src/planning/vane_iceberg_frozen_scan.cpp
++++ b/src/planning/vane_iceberg_frozen_scan.cpp
+@@ -98,8 +98,18 @@
+ 	}
+ 	for (auto &spec : metadata.partition_specs) {
+ 		for (auto &field : spec.second.fields) {
+-			if (field.transform != IcebergTransformType::IDENTITY) {
+-				throw NotImplementedException("Frozen Iceberg transport currently supports identity partitions only");
++			switch (field.transform) {
++			case IcebergTransformType::IDENTITY:
++			case IcebergTransformType::BUCKET:
++			case IcebergTransformType::TRUNCATE:
++			case IcebergTransformType::YEAR:
++			case IcebergTransformType::MONTH:
++			case IcebergTransformType::DAY:
++			case IcebergTransformType::HOUR:
++			case IcebergTransformType::VOID:
++				break;
++			default:
++				throw NotImplementedException("Frozen Iceberg transport does not support this partition transform");
+ 			}
+ 		}
+ 	}
+@@ -240,7 +250,9 @@
+ 		auto &data = entry.entry.data_file;
+ 		for (auto &field : spec->second.fields) {
+ 			if (field.transform != IcebergTransformType::IDENTITY) {
+-				throw NotImplementedException("Frozen Iceberg transport currently supports identity partitions only");
++				// A transformed value cannot reconstruct its source column.
++				// Keep original-value filtering in the normal Parquet reader.
++				continue;
+ 			}
+ 			optional_ptr<const MultiFileColumnDefinition> column;
+ 			for (auto &candidate : bind.reader_bind.schema) {

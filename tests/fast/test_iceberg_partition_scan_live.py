@@ -223,12 +223,15 @@ def test_later_independent_partition_append_does_not_change_frozen_rows(partitio
             proxy.stop()
 
 
-def test_transformed_partition_still_fails_explicitly(partition_tables):
+def test_empty_transformed_partition_roundtrips(partition_tables):
     endpoint, tables, _features = partition_tables
     with connection(tables) as con:
         attach(con, endpoint)
-        with pytest.raises(ValueError, match="identity partitions only"):
-            freeze(con, f'SELECT * FROM lake."{tables.namespace}".partition_bucket')
+        payload = freeze(con, f'SELECT * FROM lake."{tables.namespace}".partition_bucket')
+    with unavailable_metadata(tables):
+        rows, schema = execute_frozen(payload, tables)
+    assert rows == []
+    assert schema["types"] == ["BIGINT", "VARCHAR", "VARCHAR"]
 
 
 @pytest.mark.parametrize("tamper", ["source_field", "constant_type", "assignment_version", "duplicate_source"])

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Identity-partition fixtures committed by PyIceberg, independently of Vane."""
+"""Partition fixtures committed by PyIceberg, independently of Vane."""
 
 from __future__ import annotations
 
@@ -23,15 +23,28 @@ def append_partition_rows(tables, name, rows, *, omit_partition_columns, rename_
     from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
     from pyiceberg.partitioning import partition_record_value
     from pyiceberg.schema import Schema
+    from pyiceberg.transforms import IdentityTransform
     from pyiceberg.typedef import Record
 
     table = tables.catalog.load_table((tables.namespace, name))
     spec, schema = table.spec(), table.schema()
     fields = [schema.find_field(field.source_id) for field in spec.fields]
+    transforms = [
+        field.transform.transform(source.field_type) for field, source in zip(spec.fields, fields, strict=True)
+    ]
+    omitted = {
+        field.source_id
+        for field in spec.fields
+        if omit_partition_columns and isinstance(field.transform, IdentityTransform)
+    }
     grouped = defaultdict(list)
     for row in rows:
-        grouped[tuple(row[field.name] for field in fields)].append(row)
-    physical = Schema(*(field for field in schema.fields if not omit_partition_columns or field not in fields))
+        values = tuple(
+            transform(partition_record_value(partition_field=field, value=row[source.name], schema=schema))
+            for field, source, transform in zip(spec.fields, fields, transforms, strict=True)
+        )
+        grouped[values].append(row)
+    physical = Schema(*(field for field in schema.fields if field.field_id not in omitted))
     arrow_schema = schema_to_pyarrow(physical)
     directory = tables.directory / name / "region=deliberately-wrong"
     directory.mkdir(exist_ok=True, mode=0o777)
@@ -49,12 +62,7 @@ def append_partition_rows(tables, name, rows, *, omit_partition_columns, rename_
                         ["physical_" + field.name if field in fields else field.name for field in physical.fields]
                     )
                 pq.write_table(payload, path)
-                partition = Record(
-                    *(
-                        partition_record_value(partition_field=field, value=value, schema=schema)
-                        for field, value in zip(spec.fields, values, strict=True)
-                    )
-                )
+                partition = Record(*values)
                 data_file = DataFile.from_args(
                     content=DataFileContent.DATA,
                     file_path=path.as_uri().replace("%3D", "="),

@@ -11,7 +11,9 @@ M5a adds the narrow frozen-snapshot transport described below, tracked in
 and the narrow Ray path, tracked in
 [#1073](https://github.com/AstroVela/vane/issues/1073). M5c1 adds identity
 partition transport, tracked in
-[#1075](https://github.com/AstroVela/vane/issues/1075).
+[#1075](https://github.com/AstroVela/vane/issues/1075). M5c2a adds known
+transformed-partition reads, tracked in
+[#1077](https://github.com/AstroVela/vane/issues/1077).
 M3's general Iceberg capability flags remain conservative; this record covers
 the explicitly qualified provider, service, runner and feature combinations.
 
@@ -79,8 +81,9 @@ environment, and incremental Release build. Prepare the additional SDK with
 the [qualification profile instructions](packages/vane-iceberg-provider/README.md).
 Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
-Then apply `iceberg-vane-frozen-scan.patch`, `iceberg-vane-file-scan.patch` and
-`iceberg-vane-partitions.patch` from the same directory, in that order. The SDK
+Then apply `iceberg-vane-frozen-scan.patch`, `iceberg-vane-file-scan.patch`,
+`iceberg-vane-partitions.patch` and `iceberg-vane-transforms.patch` from the
+same directory, in that order. The SDK
 instructions give the ordered commands and each patch is independently retained.
 
 Export these source overrides for **every** configure/build command, including
@@ -520,10 +523,79 @@ scripts/run_installed_pytest.sh tests/fast/test_iceberg_partition_ray_live.py \
 scripts/run_release_tests.sh
 ```
 
-Identity partition support completes only this first M5c delivery. Nested
-fields, schema evolution/name mappings, non-identity transforms, delete
-manifests, writes, remote storage and authentication remain outside this
-transport's qualified matrix, with the existing explicit guards.
+Identity partition support completes only this first M5c delivery. M5c2a below
+extends the transformed-partition matrix. Nested fields, schema evolution/name
+mappings, delete manifests, writes, remote storage and authentication retain
+the existing boundaries.
+
+## Transformed partition reads (M5c2a)
+
+The fifth ordered patch, `iceberg-vane-transforms.patch`, admits the partition
+transforms already understood by the pinned provider: `year`, `month`, `day`,
+`hour`, `bucket[N]`, `truncate[W]` and `void`, alongside identity. Its SHA-256
+is `cef38197067271d2e5c4d5f9da880cb184d2ec916fb795d366e43f78c4d0f789`.
+The four earlier patches, source/SDK pins, engine identities and dependency
+closure are unchanged. Only the Vane-owned frozen adapter is modified; no
+additional Local/Ray runner implementation is introduced.
+
+The coordinator still resolves each selected file through its own manifest's
+partition spec. It freezes only identity fields as source-column constants.
+A day, bucket, truncated prefix or void result cannot reconstruct the source
+value and never enters that constant map. Physical fields continue to resolve
+by field ID; omitted identity fields retain M5c1's typed recovery behavior,
+including a source that also has a bucket transform in the same spec.
+
+The frozen bind, assignment and file-split codec stay at version **2** because
+their owned data structure is unchanged. Worker binds stay split-free, received
+assignments retain atomic validation, and retries replay the original file
+selection without REST or manifest access. Exact signed provider identity is
+still required. No persisted-state compatibility with a different provider
+digest is implied by the unchanged codec version.
+
+This delivery qualifies correct reads and original-value row predicates. It
+does not introduce transformed partition-pruning state in worker binds or claim
+new pruning performance. Restored scans retain normal Parquet field mapping and
+row filtering. Unknown transform names follow the pinned provider's explicit
+parser rejection. General schema evolution/name mapping and delete manifests
+remain rejected by the frozen adapter.
+
+| Feature | M5c2a qualification |
+| --- | --- |
+| Time | Year/month/day/hour of timestamps, day of dates, NULL, microseconds, leap-day/month/year/hour boundaries and times before 1970 |
+| Bucket | Multiple bucket counts over integer, Unicode string and decimal source columns |
+| Truncate | Negative integer and decimal boundaries; Unicode prefixes and NULL values |
+| Void | Non-null original date values remain readable despite NULL partition records |
+| Mixed specs | Omitted identity source also bucket-partitioned; time-transform and bucket-parameter changes in three historical specs, including old snapshots |
+| Files | Opaque paths under a misleading partition directory, committed files exceeding worker slots, adjacent uncommitted Parquet and empty tables |
+| Native/local | Detached frozen execution, projections, original-value filters, counts, empty assignments, public catalog relations and independent append |
+| Real Ray | Public relations, frozen replay after append/closed REST, two production workers with disjoint files, replacement without duplicate rows and cancellation/session cleanup |
+
+The SDK fixture writer now applies the SDK transform to its native partition
+representation before committing each record. It continues to omit only identity
+source columns and uses physical field IDs when renaming stored columns. SDK
+scans independently verify all current and initial-snapshot rows before Vane
+binds them. Filtered native references apply independent PyArrow predicates to
+the committed SDK scan, avoiding the pinned SDK's nullable partition-filter
+evaluation error while retaining the complete NULL cases. The nine
+nonempty tables have 3 to 27 committed files for one/two worker slots; the
+mixed historical-spec table has 27 files across three commits. The same-host,
+absolute shared-local-path boundary from M5b remains in force.
+
+Run the affected installed suites in separate native and real-Ray processes:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_transform_scan_live.py \
+  tests/fast/test_iceberg_partition_scan_live.py tests/fast/test_iceberg_frozen_scan_live.py \
+  tests/fast/test_iceberg_catalog_live.py tests/fast/test_gravitino_iceberg_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_transform_ray_live.py \
+  tests/fast/test_iceberg_partition_ray_live.py tests/fast/test_iceberg_ray_scan_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+```
+
+The user explicitly requested affected tests only for this delivery; a complete
+base release-gate result is not part of this qualification. Formatting, source
+headers, the five ordered patches, license inventory, archive contents and the
+untouched original workspace are checked separately.
 
 ### Remaining roadmap
 
@@ -532,7 +604,8 @@ transport's qualified matrix, with the existing explicit guards.
 | M5a: frozen transport | Native restored execution, stable snapshot, detached worker bind and explicit unsupported-state guards |
 | M5b: file assignments and Ray | Per-file assignments, same-host real worker execution, recovery, cancellation and exact provider replay; public Ray API for the narrow matrix above |
 | M5c1: identity partitions | Owned per-file constants, omitted-column recovery, historical identity specs, real Ray replay and lifecycle checks as above |
-| M5c2: broader table semantics | Extend transformed partitions and schema evolution with independent reference results, field-ID/type/default semantics and old-snapshot coverage |
+| M5c2a: transformed partitions | Known time/bucket/truncate/void specs, original-value reads, mixed historical specs and real-Ray lifecycle checks above |
+| M5c2b: schema evolution | Field-ID mapping for column add/drop/rename/reorder, supported type/default semantics and old-snapshot coverage |
 | M5c3: deletes | Freeze position/equality delete state with correct file/sequence/partition applicability, NULL matching and retry semantics |
 | Later optional work | Remote shared-storage qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
 

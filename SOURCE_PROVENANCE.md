@@ -129,6 +129,11 @@ and reuse the pinned value decoder; those source/header files retain DuckDB
 attribution and identify Vane's modifications as MIT AND Apache-2.0. No extension
 or SDK revision changes, copied upstream implementation, or new dependencies
 are introduced.
+The fifth patch, `iceberg-vane-transforms.patch`, extends known partition-spec
+admission in that Vane-owned Apache-2.0 adapter and freezes source constants
+only for identity transforms. It leaves all four predecessor patches and the
+version-2 wire structure unchanged, without modifying inherited source or
+introducing dependencies or additional license grants.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

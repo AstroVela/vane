@@ -36,6 +36,10 @@ git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-partitions.patch"
 git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-partitions.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-transforms.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-transforms.patch"
 ```
 
 The second patch adds M5a's versioned frozen-snapshot transport on top of the
@@ -48,8 +52,11 @@ M5a's whole-snapshot assignment with M5b's independently schedulable file
 assignments. The fourth patch adds M5c1's owned identity partition constants,
 including NULLs and per-file historical partition specs. It shares the pinned
 Iceberg decoder with the live reader and bumps the frozen bind/file codec to
-version 2. Keep all four patches in this order; the first three are unchanged.
-See [the partition qualification and roadmap](../../GRAVITINO_ICEBERG.md#identity-partition-transport-m5c1)
+version 2. The fifth patch admits M5c2a's known transformed partition specs while
+freezing only identity constants. Non-identity values never substitute source
+column values. The wire structure stays at version 2. Keep all five patches in
+this order; the four predecessor patches are unchanged.
+See [the partition qualification and roadmap](../../GRAVITINO_ICEBERG.md#transformed-partition-reads-m5c2a)
 for the supported table semantics and shared-filesystem boundary.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's
