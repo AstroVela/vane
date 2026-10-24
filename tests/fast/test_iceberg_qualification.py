@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import platform
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -160,3 +162,35 @@ def test_host_services_receive_eof_and_exit_when_the_test_shard_raises(tmp_path,
         ):
             raise RuntimeError("test shard failed")
     assert (tmp_path / "closed").is_file()
+
+
+@pytest.mark.skipif(
+    sys.version_info[:2] != (3, 12) or sys.platform != "linux" or platform.machine() != "x86_64",
+    reason="the qualification CLI targets Linux x86-64 Python 3.12",
+)
+@pytest.mark.parametrize("command", ["prepare", "run"])
+def test_stages_preserve_verified_source_build_provenance_in_pipeline_report(tmp_path, monkeypatch, command):
+    directory = tmp_path / "qualification"
+    arguments = ["qualify_iceberg.py", command, "--directory", str(directory)]
+    if command == "prepare":
+        arguments.extend(
+            [
+                "--base-wheel",
+                "base.whl",
+                "--avro-artifact",
+                "avro.duckdb_extension",
+                "--iceberg-artifact",
+                "iceberg.duckdb_extension",
+            ]
+        )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        arguments,
+    )
+    monkeypatch.setattr(qualification, "prepare", lambda *_a, **_k: {"input_mode": "source_build"})
+    monkeypatch.setattr(qualification, "qualify", lambda *_a, **_k: {"input_mode": "source_build"})
+    qualification.main()
+    report = json.loads((directory / "pipeline.json").read_text())
+    assert report["status"] == "complete"
+    assert report["input_mode"] == "source_build"

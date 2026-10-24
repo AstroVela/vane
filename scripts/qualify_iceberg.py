@@ -515,6 +515,7 @@ def qualify(directory, args):
             record["status"] = "failed"
         write_json(output / "qualification.json", record)
     print(f"Qualification passed: {record['passed']} cases; report: {output / 'qualification.json'}")
+    return record
 
 
 def main():
@@ -551,7 +552,8 @@ def main():
         pipeline = {"status": "running", "command": "run", "phase": "qualification", "checkout": checkout()}
         write_json(directory / "pipeline.json", pipeline)
         try:
-            qualify(directory, args)
+            result = qualify(directory, args)
+            pipeline["input_mode"] = result["input_mode"]
             pipeline["status"] = "complete"
         finally:
             if pipeline["status"] != "complete":
@@ -584,7 +586,8 @@ def main():
         if args.command != "build":
             pipeline["phase"] = "prepare"
             write_json(directory / "pipeline.json", pipeline)
-            prepare(directory, inputs, args, run)
+            bundle = prepare(directory, inputs, args, run)
+            pipeline["input_mode"] = bundle["input_mode"]
         if args.command == "all":
             pipeline["phase"] = "qualification"
             write_json(directory / "pipeline.json", pipeline)
