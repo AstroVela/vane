@@ -243,6 +243,32 @@ Query parity alone does not validate video encoding. Record model/dependency
 identities and sampling settings; CPU fixtures do not establish model quality.
 See the [provider example](examples/qwen3_vl_sqr.py) for its fixed contract.
 
+## Faster-Whisper speech extraction
+
+`vane.ai.media_models.FasterWhisperASR` enables Faster-Whisper's local Silero
+VAD by default. No detected speech returns an empty content list; extraction
+errors still raise. The SDK restores detected speech to the original audio
+positions before Vane rebases segments to the asset timeline. Original sound
+samples and other embedding inputs are not filtered by this ASR option.
+`vad_speech_pad_ms=800` retains context before and after detected speech so a
+quiet word onset is less likely to be cut off; configure a nonnegative integer
+number of milliseconds explicitly when tuning for a recording.
+Use `vad_filter=False` to explicitly transcribe without VAD. Context passes this
+option through `transcription.options`; it needs no separate pipeline.
+
+Run the affected `tests/fast/test_ai_media_models.py` through
+`scripts/run_installed_pytest.sh`. Complete two clean reviews before installing
+the Python-only wheel noneditably; no native rebuild is needed. For the real
+CUDA controls, provision a local Faster-Whisper checkpoint and a short, mono
+16 kHz PCM WAV with known spoken text, then set
+`VANE_RUN_FASTER_WHISPER_TESTS=1`, `VANE_FASTER_WHISPER_MODEL`,
+`VANE_FASTER_WHISPER_SPEECH_WAV`, and `VANE_FASTER_WHISPER_EXPECTED_TEXT`.
+Run `scripts/run_installed_pytest.sh tests/ai/test_faster_whisper_asr.py -m 'gpu and external_service'`
+with CUDA dependencies and devices available. These controls check exact
+silence, short speech, padding/time rebasing and unchanged sound samples;
+they do not certify general ASR accuracy. Only related checks are required;
+no full/release suite, Ray tests or serving-engine restart is needed.
+
 ## Building a loadable extension artifact
 
 For the Gravitino Catalog and Fileset connector, see
