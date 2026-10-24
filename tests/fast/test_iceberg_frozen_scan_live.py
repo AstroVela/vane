@@ -203,7 +203,6 @@ def test_assignment_from_another_table_cannot_replace_frozen_identity(frozen_tab
 @pytest.mark.parametrize(
     ("name", "message"),
     [
-        ("partitioned", "partitioned tables"),
         ("evolved", "schema evolution"),
         ("position_deletes", "delete manifests"),
         ("equality_deletes", "delete manifests"),
@@ -323,3 +322,13 @@ def test_file_assignment_rejects_mismatched_codec_identity_and_path(frozen_table
     assert batch.count(original) == 1
     with pytest.raises((ValueError, vane.Error), match=message):
         execute_frozen(payload, tables, split_batch=batch.replace(original, replacement))
+
+
+def test_identity_partitioned_live_reader_roundtrips_as_frozen_state(frozen_tables):
+    endpoint, tables, features = frozen_tables
+    with connection(tables) as con:
+        attach(con, endpoint)
+        payload = freeze(con, f'SELECT id, label, region FROM lake."{tables.namespace}".partitioned')
+    with unavailable_metadata(tables):
+        observed, _schema = execute_frozen(payload, tables)
+    assert sorted(observed) == list(features["partitioned"].rows)

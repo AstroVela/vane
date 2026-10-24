@@ -32,6 +32,10 @@ git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-file-scan.patch"
 git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-file-scan.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-partitions.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-partitions.patch"
 ```
 
 The second patch adds M5a's versioned frozen-snapshot transport on top of the
@@ -41,8 +45,11 @@ the pinned Parquet implementation so it remains self-contained; no external
 Parquet provider or `_native` private-symbol import is required. Rebuild both
 Iceberg and Avro whenever the engine identity changes. The third patch replaces
 M5a's whole-snapshot assignment with M5b's independently schedulable file
-assignments. Keep all three patches in this order; the earlier two are unchanged.
-See [the Ray qualification and roadmap](../../GRAVITINO_ICEBERG.md#file-assignments-and-ray-m5b)
+assignments. The fourth patch adds M5c1's owned identity partition constants,
+including NULLs and per-file historical partition specs. It shares the pinned
+Iceberg decoder with the live reader and bumps the frozen bind/file codec to
+version 2. Keep all four patches in this order; the first three are unchanged.
+See [the partition qualification and roadmap](../../GRAVITINO_ICEBERG.md#identity-partition-transport-m5c1)
 for the supported table semantics and shared-filesystem boundary.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's

@@ -9,7 +9,9 @@ below, tracked in [#1066](https://github.com/AstroVela/vane/issues/1066).
 M5a adds the narrow frozen-snapshot transport described below, tracked in
 [#1068](https://github.com/AstroVela/vane/issues/1068). M5b adds file assignments
 and the narrow Ray path, tracked in
-[#1073](https://github.com/AstroVela/vane/issues/1073).
+[#1073](https://github.com/AstroVela/vane/issues/1073). M5c1 adds identity
+partition transport, tracked in
+[#1075](https://github.com/AstroVela/vane/issues/1075).
 M3's general Iceberg capability flags remain conservative; this record covers
 the explicitly qualified provider, service, runner and feature combinations.
 
@@ -77,8 +79,8 @@ environment, and incremental Release build. Prepare the additional SDK with
 the [qualification profile instructions](packages/vane-iceberg-provider/README.md).
 Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
-Then apply `iceberg-vane-frozen-scan.patch` and `iceberg-vane-file-scan.patch`
-from the same directory, in that order. The SDK
+Then apply `iceberg-vane-frozen-scan.patch`, `iceberg-vane-file-scan.patch` and
+`iceberg-vane-partitions.patch` from the same directory, in that order. The SDK
 instructions give the ordered commands and each patch is independently retained.
 
 Export these source overrides for **every** configure/build command, including
@@ -446,13 +448,92 @@ The Ray suite uses the repository cluster fixture and normal object-store
 sizing. It creates and kills only its owned actors. Service namespaces and
 warehouses remain unique per fixture and are removed after the tests.
 
+## Identity partition transport (M5c1)
+
+This first M5c delivery adds identity-partitioned format-v2 local Parquet to
+both native frozen execution and the public Ray relation interface. It keeps
+M5b's coordinator/worker boundary and per-file scheduling. The source/SDK/engine
+pins above are unchanged. Apply the fourth patch
+`packages/vane-iceberg-provider/patches/iceberg-vane-partitions.patch` after the
+three immutable earlier patches. Its SHA-256 is `58ab2d9fa4980f7917839c3dc9b9da5971eb3acf1468eb373205f89636347c48`.
+The inherited reader shares its existing value decoder with the frozen
+adapter, preserving the live local path and exact attribution.
+
+The important case is a migrated file that omits an identity partition column.
+Iceberg's [column projection rules](https://iceberg.apache.org/spec/#column-projection)
+select physical fields by ID and recover a missing identity field from its
+manifest partition record. Directory layout and physical field names do not
+supply that value. A present physical field wins; NULL in a manifest remains a
+typed NULL. The remaining schema-default behavior continues to use the native
+field-ID mapper.
+
+The frozen bind format, assignment payload and `vane.iceberg.frozen-file-scan`
+codec now use version **2**. A frozen file owns its absolute path, selected
+partition-spec ID, source field IDs and typed identity values. The coordinator
+fully enumerates the selected files and resolves each file's own manifest/spec.
+Historical unpartitioned and identity specs may coexist in one snapshot,
+including spec renaming and explicit older-snapshot selection. This does not
+qualify general schema evolution or transformed partition specs.
+
+No partition constant enters the split-free worker bind. Worker application
+decodes all assigned file state into temporary owned storage, checks versions,
+snapshot identity, paths, file IDs, nonnegative spec IDs, unique known source
+field IDs, matching vector lengths and exact value types, then atomically
+replaces its assignment. Empty assignments clear both files and constants.
+Version-1 frozen binds/assignments are explicitly incompatible and rejected;
+rebuild and repackage the matching signed provider rather than mixing stages.
+
+Reader initialization uses the assigned file's own constants only for source
+field IDs absent from that Parquet schema. The existing native mapper applies
+constant filters and field projection. This also handles partition-only
+projections, count-only scans and no-match/empty results. Restoring a plan or
+retrying a task cannot reopen REST, JSON metadata or manifests to recover
+partition state.
+
+| Feature | M5c1 qualification |
+| --- | --- |
+| Identity values | NULL and Unicode strings; date, decimal and microsecond timestamp values, including pre-epoch and negative values |
+| Physical columns | Present under different physical names but matching field IDs; omitted identity fields recovered from manifest records |
+| Path layout | Opaque files inside a deliberately misleading partition directory; adjacent uncommitted Parquet excluded |
+| Partition specs | Mixed historical unpartitioned/identity specs and renamed partition fields, each resolved per file |
+| Reads | All rows, partition-only projections, NULL/constant/mixed predicates, counts, typed aggregates, empty tables and explicit old snapshots |
+| Frozen execution | Source connection and captured REST endpoint closed; metadata directories unavailable; a later independent partition append leaves the frozen result unchanged |
+| Real Ray | Public relations, two production worker processes with disjoint files, worker loss/replacement, selected-attempt output and cancellation/query/session cleanup |
+| Admission | Malformed IDs/types/versions rejected; exact signed Iceberg/Avro replay and the existing unpartitioned/native protocols retained |
+
+The fixture writer uses PyIceberg's snapshot transaction API and PyArrow
+Parquet files with explicit field IDs. The same independent SDK scans verify
+the committed rows before Vane binds anything. Nine-file tables exceed the
+configured one/two worker slots; the mixed-spec table retains seven files.
+Native and real-Ray suites share the fixture and FTE helpers while retaining
+separate pytest processes. The local M4b partition/schema/delete matrix and
+M5a/M5b unpartitioned transport and Ray regressions remain required.
+
+Reproduce with the service and signed provider setup described above:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_partition_scan_live.py \
+  tests/fast/test_iceberg_frozen_scan_live.py tests/fast/test_iceberg_catalog_live.py \
+  tests/fast/test_gravitino_iceberg_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_partition_ray_live.py \
+  tests/fast/test_iceberg_ray_scan_live.py -m external_service
+scripts/run_release_tests.sh
+```
+
+Identity partition support completes only this first M5c delivery. Nested
+fields, schema evolution/name mappings, non-identity transforms, delete
+manifests, writes, remote storage and authentication remain outside this
+transport's qualified matrix, with the existing explicit guards.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
 | --- | --- |
 | M5a: frozen transport | Native restored execution, stable snapshot, detached worker bind and explicit unsupported-state guards |
 | M5b: file assignments and Ray | Per-file assignments, same-host real worker execution, recovery, cancellation and exact provider replay; public Ray API for the narrow matrix above |
-| M5c: table semantics | Extend transport to partitions, evolution and position/equality deletes with independent reference results and correct sequence/field-ID semantics |
+| M5c1: identity partitions | Owned per-file constants, omitted-column recovery, historical identity specs, real Ray replay and lifecycle checks as above |
+| M5c2: broader table semantics | Extend transformed partitions and schema evolution with independent reference results, field-ID/type/default semantics and old-snapshot coverage |
+| M5c3: deletes | Freeze position/equality delete state with correct file/sequence/partition applicability, NULL matching and retry semantics |
 | Later optional work | Remote shared-storage qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 The current fixture does not qualify v1/v3 tables, remote storage, catalog

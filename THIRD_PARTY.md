@@ -57,6 +57,9 @@ The frozen-scan adapter and file assignments are Vane-owned Apache-2.0 source
 retained as ordered patches. The file-assignment patch also changes the
 inherited Iceberg virtual-column catalog entry for count-only scans; it retains
 DuckDB attribution and identifies Vane's modifications as MIT AND Apache-2.0.
+The identity-partition patch also exposes the inherited reader's value decoder
+for reuse by the owned adapter, with the same attribution and combined terms.
+The first three patches and all pinned SDK notices remain unchanged.
 Its self-contained Iceberg artifact links the pinned in-tree Parquet
 implementation and retains DuckDB's source and vendored dependency notices,
 using the same notice input set as the base Vane wheel.

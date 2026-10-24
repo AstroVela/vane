@@ -123,6 +123,12 @@ column catalog entry so count-only scans do not request v3 row lineage. That
 file retains the pinned DuckDB copyright with MIT AND Apache-2.0 modification
 attribution. The patch changes neither the upstream revision nor the two
 preceding patches.
+The fourth patch, `iceberg-vane-partitions.patch`, adds version-2 owned identity
+partition state to the Vane adapter. Its small inherited-reader changes expose
+and reuse the pinned value decoder; those source/header files retain DuckDB
+attribution and identify Vane's modifications as MIT AND Apache-2.0. No extension
+or SDK revision changes, copied upstream implementation, or new dependencies
+are introduced.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

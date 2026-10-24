@@ -47,8 +47,9 @@ class IcebergCatalog:
     READ_ONLY. A detached or replaced attachment invalidates the wrapper.
 
     Anonymous Gravitino REST with local Parquet storage is qualified in
-    ``GRAVITINO_ICEBERG.md``. Ray supports frozen unpartitioned format-v2
-    snapshots with one flat schema and no deletes, using shared local Parquet.
+    ``GRAVITINO_ICEBERG.md``. Ray supports frozen format-v2 snapshots
+    with unpartitioned or identity-partitioned data, one flat schema and no
+    deletes, using shared local Parquet.
     """
 
     def __init__(self, connection: DuckDBPyConnection, name: str) -> None:
