@@ -40,19 +40,26 @@ def frozen_physical(endpoint, tables, *, table_name="items", columns="id, label"
 
 
 @contextmanager
-def native_workers(count):
+def native_workers(count, *, nodes=None):
     actors, workers = [], []
     query_id = "iceberg-ray-" + uuid.uuid4().hex
     try:
         for index in range(count):
-            actor = RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 30, 1 << 60)
+            options = {"num_cpus": 0}
+            node_id = ray.get_runtime_context().get_node_id()
+            if nodes is not None:
+                from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+                node_id = nodes[index]
+                options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(node_id, soft=False)
+            actor = RayWorkerActor.options(**options).remote(1, 0, 1 << 30, 1 << 60)
             actors.append(actor)
             workers.append(
                 handles.RayWorkerActorHandle(
                     actor,
                     memory_capacity_bytes=1 << 60,
                     worker_id=f"{query_id}-{index}",
-                    node_id=ray.get_runtime_context().get_node_id(),
+                    node_id=node_id,
                 )
             )
         yield query_id, actors, workers

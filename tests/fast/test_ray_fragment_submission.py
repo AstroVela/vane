@@ -10307,7 +10307,8 @@ def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
     assert kill_calls == []
 
 
-def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch):
+@pytest.mark.parametrize("transient_prepare", [False, True], ids=["direct-prepare", "unavailable-then-prepare"])
+def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch, transient_prepare):
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -10317,7 +10318,14 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
     quiescence_started = threading.Event()
 
     class _DeferredPrepare:
+        unavailable_sent = False
+
         def remote(self):
+            if transient_prepare and not self.unavailable_sent:
+                self.unavailable_sent = True
+                unavailable = Future()
+                unavailable.set_exception(ray.exceptions.ActorUnavailableError("node unavailable", b"\0" * 16))
+                return SimpleNamespace(future=lambda: unavailable)
             quiescence_started.set()
             return SimpleNamespace(future=lambda: quiescence)
 

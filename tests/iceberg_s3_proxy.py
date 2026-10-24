@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 
-def main(endpoint, audit, control):
+def main(endpoint, audit, control, host="127.0.0.1", port="0"):
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -56,6 +56,7 @@ def main(endpoint, audit, control):
                         self.wfile.write(body)
             finally:
                 event = {
+                    "client": self.client_address[0],
                     "method": self.command,
                     "path": path,
                     "status": status,
@@ -72,8 +73,8 @@ def main(endpoint, audit, control):
         def log_message(self, *_args):
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        print(json.dumps({"endpoint": f"http://127.0.0.1:{server.server_port}"}), flush=True)
+    with ThreadingHTTPServer((host, int(port)), Handler) as server:
+        print(json.dumps({"endpoint": f"http://{host}:{server.server_port}"}), flush=True)
         server.serve_forever()
 
 

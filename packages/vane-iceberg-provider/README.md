@@ -84,6 +84,9 @@ patches are unchanged.
 See [the delete qualification and roadmap](../../GRAVITINO_ICEBERG.md#position-and-equality-deletes-m5c3)
 for the supported table semantics, and [S3 qualification](../../GRAVITINO_ICEBERG.md#anonymous-s3minio-m5d1)
 for the local/single-node Ray storage boundary.
+The [isolated-node gate](../../GRAVITINO_ICEBERG.md#isolated-ray-nodes-m5d2)
+extends qualification to separate driver/head and worker containers using the
+same matched wheels, without shared dataset mounts or another provider patch.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's
 dependencies, together with the pinned Iceberg/Avro and SDK notices.

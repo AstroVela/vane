@@ -513,11 +513,30 @@ class FteWorkerLifecycleMixin:
         prepare_method = getattr(self.actor_handle, "prepare_shutdown", None)
         if prepare_method is None:
             raise RuntimeError("Ray worker actor does not expose prepare_shutdown")
-        resolve_object_refs_blocking(
-            prepare_method.remote(),
-            timeout=30,
-            honor_query_deadline=False,
-        )
+        deadline = time.monotonic() + 30
+        timeout = 30.0
+        while True:
+            try:
+                resolve_object_refs_blocking(
+                    prepare_method.remote(),
+                    timeout=timeout,
+                    honor_query_deadline=False,
+                )
+                return
+            except ray.exceptions.ActorUnavailableError as error:
+                # A lost node can be temporarily unavailable before Ray reports
+                # terminal actor death. Retry this idempotent prepare barrier
+                # within its original deadline; unavailability alone never
+                # authorizes a replacement's storage side effects.
+                if isinstance(error, ray.exceptions.RayTaskError):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.1, remaining))
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise
 
     def finish_shutdown(self) -> None:
         """Stop the prepared worker service and terminate the Ray actor."""

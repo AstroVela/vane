@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-def main(endpoint):
+def main(endpoint, host="127.0.0.1", port="0"):
     parsed = urlsplit(endpoint)
     upstream = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -35,10 +35,10 @@ def main(endpoint):
         def log_message(self, *_args):
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        print(json.dumps({"endpoint": f"http://127.0.0.1:{server.server_port}{parsed.path}"}), flush=True)
+    with ThreadingHTTPServer((host, int(port)), Handler) as server:
+        print(json.dumps({"endpoint": f"http://{host}:{server.server_port}{parsed.path}"}), flush=True)
         server.serve_forever()
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:])

@@ -895,6 +895,116 @@ the user's validation scope remains related tests only. Verify all eight
 ordered patches against the source pin and compiled bytes, license/SPDX,
 formatting, archive contents and the untouched original checkout.
 
+## Isolated Ray nodes (M5d2)
+
+M5d2 exercises the M5d1 anonymous S3 reader with a driver/head container and
+two worker containers on one Docker host. The head advertises zero CPUs so
+native scan actors run on the two worker nodes. Every container has its own
+filesystem and mount namespace; no checkout, virtual environment, dataset,
+Docker socket or host directory is mounted into it. Gravitino, MinIO and the
+object/REST forwarding services also have separate containers. MinIO's private
+storage is an owned tmpfs. Only object storage carries the Iceberg dataset.
+
+This gate also fixes a node-loss recovery gap in the Python runner. Ray can
+report `ActorUnavailableError` before it confirms that a lost node's actor has
+died. The failed-worker prepare barrier now retries that transport response
+within its existing 30-second total deadline. Only a successful fence/drain
+acknowledgement or confirmed actor death permits retries; application errors,
+timeouts, persistent unavailability and failures originating inside a live
+actor still fail closed. The scheduler's quiescence criterion is unchanged.
+
+The engine identity, eight ordered Iceberg patches, frozen codec 3 and callback
+protocol 1 stay unchanged. The installed runtime is the noneditable
+`vane-ai==0.3.0.dev79` base and its exact signed test-only Iceberg/Avro closure.
+Qualification helpers are copied into each container separately; they never
+replace installed Vane. This Python-only runner fix needs no native rebuild.
+
+The acceptance matrix checks:
+
+- Three distinct Ray NodeIDs/IPs and two distinct worker mount namespaces;
+  a driver-only filesystem canary is absent on both workers.
+- Exact provider descriptors and artifact hashes on every worker, and no
+  fixture writer credentials in worker environments or frozen payloads.
+- Public rows, projection, filters, aggregates and old snapshots for the seven
+  M5d1 table shapes, with data/delete range requests observed from worker IPs.
+- Frozen execution after its REST endpoint is stopped and metadata object
+  access is denied; an independent later delete/append commit does not change
+  the captured result.
+- Hard node affinity and disjoint assignments on both workers, retaining
+  position/equality deletes and identity partition constants.
+- Actor failure and whole-worker-container failure, retry on the surviving
+  node, selected-attempt ownership, query/session cleanup and node rejoin.
+- Missing data/delete objects fail; removing Iceberg from one worker fails
+  provider admission there. Offline reinstall of the exact wheel and a fresh
+  Ray node restore reads without extension downloads.
+
+The object forwarder now records client IPs and accepts an explicit bind
+address/port for container networking; its default remains loopback with an
+ephemeral port. The REST forwarder has the same optional binding controls.
+The shared real-Ray test helper accepts explicit node affinity while retaining
+the existing single-node default.
+
+### Reproduce the isolated-node gate
+
+Use a source checkout and the installed launcher from [DEVELOPMENT.md](DEVELOPMENT.md).
+Prepare the M5d1 base, Iceberg and Avro wheels through the existing build and
+test-provider workflow. The host needs the independent SDK requirements in
+`packages/vane-iceberg-provider/requirements-test.txt` and permission to use
+Docker. The three service images pinned in M5d1 must already be present;
+tests use `--pull=never` and fail explicitly if inputs are missing.
+
+Create a temporary build context with `Dockerfile` and
+`runtime-requirements.txt` from `tests/iceberg_multinode/`, a `wheels/` directory
+containing exactly the matched base/Iceberg/Avro wheels, and a
+`runtime-wheels/` directory containing the fixed runtime dependencies:
+
+```bash
+python -m pip download --only-binary=:all: \
+  -r tests/iceberg_multinode/runtime-requirements.txt \
+  --dest /absolute/path/to/build-context/runtime-wheels
+docker build --pull=false --tag vane-iceberg-multinode:qualification \
+  /absolute/path/to/build-context
+export VANE_TEST_ICEBERG_MULTINODE_IMAGE="$(docker image inspect \
+  --format '{{.Id}}' vane-iceberg-multinode:qualification)"
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_s3_multinode_live.py \
+  -m 'external_service and real_ray and ray_cluster_owner'
+```
+
+The runtime image uses
+`python:3.12-slim-trixie@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704`.
+It installs ordinary wheels offline and verifies `pip check` plus executable
+permission on Ray's GCS binary. Preserve executable modes when preparing any
+test-only reconstructed wheel cache. This run reconstructed its dependency
+cache from installed files with RECORD hash verification, retaining notices,
+metadata and executable modes; those cache wheels are not production artifacts.
+The fixture SDK and writer credentials remain on the host, outside that image.
+The profile pins security fixes in certifi 2026.10.19
+([advisory](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)), filelock 4.2.1
+([advisory](https://github.com/advisories/GHSA-v4x8-3wr5-3wq8)) and urllib3 2.8.0
+([chunk parsing](https://github.com/advisories/GHSA-vxq7-64xx-v4gw),
+[proxy TLS](https://github.com/advisories/GHSA-8988-9cw3-xx77)).
+
+`VANE_TEST_ICEBERG_DOCKER_COMMAND` optionally selects a command prefix, such as
+`sudo -n docker` after separately authorizing sudo. Tests never request or store
+a sudo password. `VANE_TEST_ICEBERG_MULTINODE_DIAGNOSTICS` selects an external
+directory for sanitized topology, probe results, object-request audits, service
+logs and cleanup evidence. Service logs are private files. Without an explicit
+immutable runtime image, the suite skips before starting Docker or importing
+the optional SDK.
+
+Each test invocation owns a random Docker label/network and its exact
+container IDs. Cleanup verifies ownership and removes only those resources,
+including after a failed startup. Ray sizes its object store normally within
+each container's 4 GiB memory limit and 2 GiB shared-memory limit; the harness
+sets no object-store capacity override. Readiness, fault and cleanup waits are
+bounded. This gate does not use a process-wide `ray stop` on the host.
+
+The qualified boundary is Linux x86-64 with homogeneous containers on one
+Docker host. Physical multi-host deployments, mixed operating systems,
+transport security and representative throughput remain unqualified. Private
+S3, authentication, credential vending/refresh, catalog writes and production
+provider publication keep their separate gates.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
@@ -906,9 +1016,9 @@ formatting, archive contents and the untouched original checkout.
 | M5c2b: schema evolution | Field-ID mapping for column add/drop/rename/reorder, supported type/default semantics and old-snapshot coverage |
 | M5c3: deletes | Committed v2 position/equality descriptors, exact applicability, hidden field-ID mapping, NULL-safe matching and native/real-Ray lifecycle coverage above |
 | M5d1: anonymous S3 | Canonical S3 data/delete locators, explicit connection-setting replay, real MinIO and local/single-node Ray qualification above |
-| M5d2: isolated nodes | Driver and multiple Ray nodes sharing only object storage; reachable endpoints, provider deployment, retry and cleanup without dataset mounts |
+| M5d2: isolated nodes | Driver/head plus two isolated Ray workers, S3-only dataset sharing, exact provider deployment, retry/rejoin and cleanup without dataset mounts as above |
 | Later optional work | Production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 The current fixture does not qualify v1/v3 tables, other remote filesystems,
-multi-node deployment, catalog writes, authentication extensions, private S3,
+physical multi-host deployment, catalog writes, authentication extensions, private S3,
 credential vending or refresh.
