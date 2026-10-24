@@ -46,6 +46,37 @@ reproduced without alteration.
 
 The direct native build dependencies are Apache Arrow (including Flight), cURL, gflags, glog, gRPC, OpenSSL, and their transitive dependencies. Their individual terms and notices are reproduced in the generated bundle.
 
+## Optional Iceberg qualification providers
+
+The source-pinned Iceberg and Avro qualification builds use the MIT-licensed
+`duckdb/duckdb-iceberg` and `duckdb/duckdb-avro` projects. Their unchanged
+notices are retained in `LICENSES/Iceberg-MIT.txt` and
+`LICENSES/Avro-extension-MIT.txt`; exact revisions are recorded in
+[source provenance](SOURCE_PROVENANCE.md).
+The frozen-scan adapter and file assignments are Vane-owned Apache-2.0 source
+retained as ordered patches. The file-assignment patch also changes the
+inherited Iceberg virtual-column catalog entry for count-only scans; it retains
+DuckDB attribution and identifies Vane's modifications as MIT AND Apache-2.0.
+The identity-partition patch also exposes the inherited reader's value decoder
+for reuse by the owned adapter, with the same attribution and combined terms.
+The first three patches and all pinned SDK notices remain unchanged.
+Its self-contained Iceberg artifact links the pinned in-tree Parquet
+implementation and retains DuckDB's source and vendored dependency notices,
+using the same notice input set as the base Vane wheel.
+
+`packages/vane-iceberg-provider/vcpkg.json` defines a separate optional SDK
+profile at Vane's existing builtin baseline. Its DuckDB Avro C registry is
+pinned independently. `LICENSES/iceberg-native-dependencies.txt` preserves that
+SDK's dependency notices, including Avro C and AWS SDK (Apache-2.0), Roaring
+(Apache-2.0 alternative), liblzma (0BSD), and their transitive libraries.
+GPL/LGPL wording in XZ's retained notice describes other utilities and build
+scripts; the provider wheels contain the linked 0BSD library and the notices.
+The SDK itself and its command-line tools are not wheel contents.
+
+PyIceberg is an independently installed Apache-2.0 test-fixture writer. Its
+code and native dependencies are governed by its own distribution; Vane does
+not vendor the Python SDK or its generated Iceberg tables.
+
 ## Runtime dependencies
 
 Python runtime dependencies such as Ray, PyArrow, NumPy, Cloudpickle, and
