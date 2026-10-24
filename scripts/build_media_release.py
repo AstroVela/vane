@@ -29,7 +29,7 @@ from vane_packaging.artifact_limits import MAX_EXTENSION_ARTIFACT_BYTES
 from vane_packaging.media_release import prepare_release
 from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_sources import export_sdist, read_source_archive, read_source_file
-from vane_packaging.media_version import runtime_format
+from vane_packaging.media_version import provider_release_number, runtime_format
 
 PLATFORM = "manylinux_2_28_x86_64"
 LICENSE_EXPRESSION = (
@@ -199,6 +199,8 @@ def package(inputs: Path, unsigned: Path, signed: Path, base: Path, output: Path
             str(signed / "native_media.duckdb_extension"),
             "--extension-name",
             "native_media",
+            "--release-number",
+            str(provider_release_number(ROOT)),
             "--platform-tag",
             PLATFORM,
             "--trust-identity",
