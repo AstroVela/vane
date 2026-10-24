@@ -2474,6 +2474,37 @@ def test_fte_start_attempt_with_worker_owns_mutation_locks():
     assert partition.running_attempt is not None
 
 
+@pytest.mark.parametrize("already_registered", [False, True])
+def test_fte_replacement_uses_selected_workers_registration_dependency(already_registered):
+    stale_dependency = object()
+    selected_dependency = None if already_registered else object()
+    frozen_plan = {"snapshot": "frozen-plan"}
+
+    class _ReplacementWorker(_FakeLiveWorker):
+        def ensure_fragment_registered(self, _query_id, _fragment_id, plan):
+            assert plan is frozen_plan
+            return selected_dependency
+
+    worker = _ReplacementWorker("worker-with-frozen-plan")
+    stage = FteFragmentExecution(
+        "query-replaced-registration",
+        0,
+        fragment_id="query-replaced-registration:node:1",
+        worker=worker,
+        fragment_plan=frozen_plan,
+        fragment_registration_result=stale_dependency,
+        task_memory_bytes=1,
+    )
+    # Both a recovered partition and later file partitions may select a
+    # worker whose registration is already complete. Neither may inherit the
+    # original worker's registration dependency from the stable descriptor.
+    for index in range(2):
+        scheduled = stage.start_attempt_with_worker(stage.add_partition(index))
+        assert scheduled.request["fragment_registration_result"] is selected_dependency
+        assert scheduled.descriptor.fragment_registration_result is stale_dependency
+        assert scheduled.request["fragment_plan"] is None
+
+
 def test_fte_two_query_fragment_callbacks_do_not_cross_state_locks():
     callback_barrier = threading.Barrier(2)
     callback_lock_ownership = {}

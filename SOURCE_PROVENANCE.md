@@ -102,6 +102,36 @@ DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`.
 
 The imported DuckDB tree contains upstream benchmark generators with additional terms, including TPC-H, TPC-DS, and TPC-E material. They are not part of Vane release artifacts. The sdist allowlist and artifact checker enforce this boundary.
 
+The optional Iceberg qualification build fetches
+[`duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c`](https://github.com/duckdb/duckdb-iceberg/tree/45163a28e0ed6a2071a82a1bf1dd432d0216cf9c)
+and its independently built dependency
+[`duckdb/duckdb-avro@f9d590297485f0318f480372c70bdd852826e258`](https://github.com/duckdb/duckdb-avro/tree/f9d590297485f0318f480372c70bdd852826e258).
+These are the existing engine extension configuration pins. Their MIT license
+files are copied unchanged to `LICENSES/Iceberg-MIT.txt` and
+`LICENSES/Avro-extension-MIT.txt`; implementation source remains externally
+fetched. Vane's compatibility diff is retained in
+`packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` and applies to
+the fixed Iceberg revision; it does not require an upstream merge.
+The subsequent Vane-owned
+`packages/vane-iceberg-provider/patches/iceberg-vane-frozen-scan.patch` adds
+versioned frozen-snapshot transport against the same revision. Its new source
+files carry Apache-2.0 SPDX headers; the inherited Iceberg source remains MIT.
+The third Vane-owned patch, `iceberg-vane-file-scan.patch` in the same directory,
+adds per-file assignment planning and validation to that Apache-2.0 source.
+It also exposes the standard empty projection in Iceberg's inherited virtual
+column catalog entry so count-only scans do not request v3 row lineage. That
+file retains the pinned DuckDB copyright with MIT AND Apache-2.0 modification
+attribution. The patch changes neither the upstream revision nor the two
+preceding patches.
+The self-contained loadable provider also links the pinned in-tree Parquet
+implementation, under DuckDB's existing source and dependency notices.
+The separate SDK manifest pins
+`duckdb/vcpkg-duckdb-ports@f13de79b66345fe31d3f9c119517613023d194a8`, whose
+Avro C port builds `duckdb/duckdb-avro-c@8af400279c445a81b8552a7670d8c1ebd92ba34a`.
+`LICENSES/iceberg-native-dependencies.txt` records the resulting native
+dependency notices. Qualification artifacts use the existing test signing and
+provider descriptor workflow; production publication remains separate.
+
 When importing code:
 
 1. Record the upstream repository, immutable revision, and source path in the pull request.
