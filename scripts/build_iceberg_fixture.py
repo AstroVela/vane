@@ -156,6 +156,19 @@ def build_inputs(directory, args, run, environment):
             str(ROOT),
         ]
     )
+    # The base wheel's default target excludes loadable providers. Build and
+    # stage them explicitly even when an incremental directory has old files.
+    run(
+        [
+            "cmake",
+            "--build",
+            str(native),
+            "--target",
+            "vane_loadable_extensions",
+            "--parallel",
+            str(args.jobs),
+        ]
+    )
     wheels = list(base_dist.glob("vane_ai-*.whl"))
     if len(wheels) != 1:
         raise ValueError("build must produce exactly one base wheel")
