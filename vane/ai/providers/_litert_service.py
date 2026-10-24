@@ -49,7 +49,7 @@ class _LiteRTServiceDescriptor(_ServiceDescriptor):
     def get_request_options(self) -> dict[str, Any]:
         return encoding_identity(self.options) | {"input_type": self.options.get("input_type", "document")}
 
-    def get_service_spec(self) -> MultimodalInputSpec:
+    def get_transport_input_spec(self) -> MultimodalInputSpec:
         kinds = LITERT_MODELS[self.model] if self.kind == "multimodal" else (self.kind,)
         limit = self.options["max_input_bytes"]
         return MultimodalInputSpec(
@@ -86,7 +86,7 @@ class LiteRTServiceAudioDescriptor(_LiteRTServiceDescriptor, AudioEmbedderDescri
     kind: Literal["text", "image", "audio", "multimodal"] = "audio"
 
     def get_input_spec(self) -> AudioInputSpec:
-        spec = self.get_service_spec().audio
+        spec = self.get_transport_input_spec().audio
         assert spec is not None
         return spec
 
@@ -95,7 +95,7 @@ class LiteRTServiceMultimodalDescriptor(_LiteRTServiceDescriptor, MultimodalEmbe
     kind: Literal["text", "image", "audio", "multimodal"] = "multimodal"
 
     def get_input_spec(self) -> MultimodalInputSpec:
-        return self.get_service_spec()
+        return self.get_transport_input_spec()
 
 
 class LiteRTServiceEmbedder(ServiceEmbedder):

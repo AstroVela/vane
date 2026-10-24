@@ -337,6 +337,12 @@ def test_provider_extras_match_provider_import_errors():
     assert "sglang" not in _requirements_for_extra("sglang", darwin)
     assert _requirement_for_extra("vllm", "vllm", linux).marker is not None
     assert _requirement_for_extra("sglang", "sglang", linux).marker is not None
+    # These optional runtimes are published only for Linux x86_64.
+    assert "vllm" in _requirements_for_extra("vllm", linux)
+    assert "sglang" in _requirements_for_extra("sglang", linux)
+    darwin = {"sys_platform": "darwin", "platform_system": "Darwin", "platform_machine": "arm64"}
+    assert "vllm" not in _requirements_for_extra("vllm", darwin)
+    assert "sglang" not in _requirements_for_extra("sglang", darwin)
 
 
 def test_datasink_extras_require_supported_sdk_versions():
@@ -383,6 +389,13 @@ def test_mlx_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
         assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "darwin", "platform_machine": "x86_64"})
 
 
+def test_embedding_service_extra_keeps_model_sdks_optional():
+    packages = _requirements_for_extra("embedding_service", {"sys_platform": "darwin", "platform_machine": "arm64"})
+    assert "pyzmq" in packages
+    assert not packages & {"mlx", "mlx-vlm", "transformers", "torch", "sglang", "vllm"}
+    assert _requirement_for_extra("embedding_service", "pyzmq").specifier == SpecifierSet(">=26.2,<28")
+
+
 def test_mlx_release_and_sdist_include_all_modality_contracts_and_reference_helpers():
     try:
         import tomllib
@@ -399,6 +412,14 @@ def test_mlx_release_and_sdist_include_all_modality_contracts_and_reference_help
     for kind in ("text", "image", "audio", "video", "multimodal"):
         assert f"/tests/ai/test_mlx_{kind}_embedding.py" in included
     assert {"/tests/mlx_sdk_fixture.py", "/tests/mlx_metal_reference.py"} <= included
+    for file in ("test_embedding_service_backend.py", "test_mlx_service_provider.py"):
+        assert "/tests/fast/" + file in included
+        assert '"$project_root/tests/fast/' + file + '"' in release
+    assert {
+        "/tests/fast/test_mlx_service_runtime.py",
+        "/tests/mlx_service_fixture.py",
+        "/tests/ai/test_mlx_service_embedding.py",
+    } <= included
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():

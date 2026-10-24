@@ -192,30 +192,56 @@ class MLXProvider(Provider):
     def name(self) -> str:
         return "mlx"
 
+    def _descriptor(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        prepared = dict(options or {})
+        runtime = prepared.pop("runtime", "native")
+        if runtime == "service":
+            from vane.ai.providers._embedding_service import service_descriptor
+
+            return service_descriptor(
+                kind,
+                MODEL_ID if model is None else model,
+                dimensions,
+                prepared | {"runtime": "service"},
+                self.name,
+                "mlx",
+            )
+        if runtime != "native":
+            raise EmbeddingConfigurationError("MLX runtime must be native or service")
+        return {
+            "text": MLXTextEmbedderDescriptor,
+            "image": MLXImageEmbedderDescriptor,
+            "video": MLXVideoEmbedderDescriptor,
+            "audio": MLXAudioEmbedderDescriptor,
+            "multimodal": MLXMultimodalEmbedderDescriptor,
+        }[kind](model, dimensions, options=prepared)
+
     def get_text_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXTextEmbedderDescriptor:
-        return MLXTextEmbedderDescriptor(model, dimensions, options=options)
+    ) -> TextEmbedderDescriptor:
+        return self._descriptor("text", model, dimensions, options)
 
     def get_image_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXImageEmbedderDescriptor:
-        return MLXImageEmbedderDescriptor(model, dimensions, options=options)
+    ) -> ImageEmbedderDescriptor:
+        return self._descriptor("image", model, dimensions, options)
 
     def get_audio_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXAudioEmbedderDescriptor:
-        return MLXAudioEmbedderDescriptor(model, dimensions, options=options)
+    ) -> AudioEmbedderDescriptor:
+        return self._descriptor("audio", model, dimensions, options)
 
     def get_video_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXVideoEmbedderDescriptor:
-        return MLXVideoEmbedderDescriptor(model, dimensions, options=options)
+    ) -> VideoEmbedderDescriptor:
+        return self._descriptor("video", model, dimensions, options)
 
     def get_multimodal_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> MLXMultimodalEmbedderDescriptor:
-        return MLXMultimodalEmbedderDescriptor(model, dimensions, options=options)
+    ) -> MultimodalEmbedderDescriptor:
+        return self._descriptor("multimodal", model, dimensions, options)
 
 
 class _MLXEmbedder:
@@ -367,8 +393,11 @@ class _MLXEmbedder:
 
 
 class MLXTextEmbedder(_MLXEmbedder):
-    def _prepare_text_inputs(self, texts: list[str]) -> dict[str, Any]:
-        prefix = "task: search result | query: " if self._options["input_type"] == "query" else "title: none | text: "
+    def _prepare_text_inputs(self, texts: list[str], *, input_type: str | None = None) -> dict[str, Any]:
+        role = self._options.get("input_type", "document") if input_type is None else input_type
+        if not isinstance(role, str) or role not in {"query", "document"}:
+            raise EmbeddingConfigurationError("MLX input_type must be one of: document, query")
+        prefix = "task: search result | query: " if role == "query" else "title: none | text: "
         rows = []
         for text in texts:
             row = self._tokenizer(prefix + text, truncation=False, padding=False)
@@ -392,14 +421,14 @@ class MLXTextEmbedder(_MLXEmbedder):
             raise EmbeddingConfigurationError("MLX tokenizer must return aligned integer input IDs and attention masks")
         return {"input_ids": ids, "attention_mask": mask}
 
-    def embed_text(self, texts: list[str]) -> list[np.ndarray]:
+    def embed_text(self, texts: list[str], *, input_type: str | None = None) -> list[np.ndarray]:
         if self._closed:
             raise RuntimeError("MLX embedder is closed")
         if not isinstance(texts, list) or any(not isinstance(text, str) for text in texts):
             raise EmbeddingConfigurationError("MLX embed_text requires a list of strings")
         if not texts:
             return []
-        return self._infer(self._prepare_text_inputs(texts), len(texts))
+        return self._infer(self._prepare_text_inputs(texts, input_type=input_type), len(texts))
 
 
 class _MLXMediaEmbedder(_MLXEmbedder):
@@ -806,3 +835,32 @@ class MLXMultimodalEmbedder(_MLXMediaEmbedder):
         if not plan.rows:
             return []
         return self._infer(self._prepare_multimodal_inputs(plan), len(plan.rows))
+
+
+class _MLXModelCore(MLXMultimodalEmbedder, MLXVideoEmbedder, MLXAudioEmbedder, MLXTextEmbedder):
+    """One explicit full-media owner with the existing unary and joint operations.
+
+    All operations share the inherited model, processor, forward and close path.
+    Native descriptors retain their narrower loading and dependency boundaries.
+    The service exclusively owns this core; operations neither construct nor
+    close another embedder. All calls must run on its owning execution thread.
+    """
+
+    def _load_processor(self, snapshot: Path, config: dict[str, Any], weights: dict[str, Any]) -> None:
+        MLXMultimodalEmbedder._load_processor(self, snapshot, config, weights)
+        # Keep the original unary AutoTokenizer. Joint rendering continues to
+        # use processor.tokenizer; sharing weights need not change text tokens.
+        _MLXEmbedder._load_processor(self, snapshot, config, weights)
+
+    def encode(self, content: EmbeddingContent, encoding: str) -> np.ndarray:
+        if encoding == "multimodal":
+            return self.embed_multimodal([content])[0]
+        kind = "text" if encoding in {"text_document", "text_query"} else encoding
+        if kind not in {"text", "image", "video", "audio"} or len(content.parts) != 1:
+            raise EmbeddingConfigurationError("MLX unary encoding requires exactly one matching part")
+        part = content.parts[0]
+        if part.spec.kind != kind or part.spec.mime_type is not None:
+            raise EmbeddingConfigurationError("MLX request encoding does not match its input part")
+        if kind == "text":
+            return self.embed_text([part.value], input_type="query" if encoding == "text_query" else "document")[0]
+        return getattr(self, "embed_" + kind)([part.value])[0]

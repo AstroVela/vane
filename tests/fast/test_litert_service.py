@@ -272,7 +272,7 @@ def test_gpu_initialization_failure_does_not_try_cpu(tmp_path, options, sdk, fai
         instance = service(tmp_path, options | {"backend": "gpu"})
         with pytest.raises(failure, match="authored GPU"):
             await instance.start()
-        assert instance.runtime is None and not (tmp_path / "service/engine.json").exists()
+        assert instance.backend.runtime is None and not (tmp_path / "service/engine.json").exists()
         await instance.aclose()
 
     asyncio.run(scenario())
@@ -347,12 +347,12 @@ def test_failed_sdk_close_retries_on_the_original_live_thread(tmp_path, options,
     async def scenario():
         instance = service(tmp_path, options)
         await instance.start()
-        runtime = instance.runtime
+        runtime = instance.backend.runtime
         pending = []
         try:
             with pytest.raises(failure):
                 await instance.aclose()
-            assert instance.runtime is runtime
+            assert instance.backend.runtime is runtime
             assert any(thread.name.startswith("vane-litert-service") for thread in threading.enumerate())
             with pytest.raises(RuntimeError, match="already started"):
                 await instance.start()
@@ -363,7 +363,7 @@ def test_failed_sdk_close_retries_on_the_original_live_thread(tmp_path, options,
             assert all(not task.done() for task in pending)
             release.set()
             await asyncio.gather(*pending)
-            assert instance.runtime is None
+            assert instance.backend.runtime is None
             await instance.aclose()
             assert [event[0] for event in events] == ["load", "close", "close"]
         finally:
@@ -406,7 +406,7 @@ def test_cancelled_startup_joins_the_single_sdk_thread(tmp_path, options, sdk, m
             with pytest.raises(asyncio.CancelledError):
                 await starting
             await instance.aclose()
-        assert instance.runtime is None and not (tmp_path / "service/engine.json").exists()
+        assert instance.backend.runtime is None and not (tmp_path / "service/engine.json").exists()
 
     asyncio.run(scenario())
     assert len([event for event in sdk.events if event[0] == "close"]) == 1
@@ -440,7 +440,7 @@ def test_close_during_initialization_cannot_publish_an_endpoint(tmp_path, option
                 await starting
             if closing is not None:
                 await closing
-        assert instance.runtime is None and not (tmp_path / "service/engine.json").exists()
+        assert instance.backend.runtime is None and not (tmp_path / "service/engine.json").exists()
 
     asyncio.run(scenario())
     assert len([event for event in sdk.events if event[0] == "close"]) == 1
