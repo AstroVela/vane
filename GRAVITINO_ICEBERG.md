@@ -13,7 +13,9 @@ and the narrow Ray path, tracked in
 partition transport, tracked in
 [#1075](https://github.com/AstroVela/vane/issues/1075). M5c2a adds known
 transformed-partition reads, tracked in
-[#1077](https://github.com/AstroVela/vane/issues/1077).
+[#1077](https://github.com/AstroVela/vane/issues/1077). M5c2b adds supported
+flat schema evolution, tracked in
+[#1079](https://github.com/AstroVela/vane/issues/1079).
 M3's general Iceberg capability flags remain conservative; this record covers
 the explicitly qualified provider, service, runner and feature combinations.
 
@@ -82,7 +84,8 @@ the [qualification profile instructions](packages/vane-iceberg-provider/README.m
 Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
 Then apply `iceberg-vane-frozen-scan.patch`, `iceberg-vane-file-scan.patch`,
-`iceberg-vane-partitions.patch` and `iceberg-vane-transforms.patch` from the
+`iceberg-vane-partitions.patch`, `iceberg-vane-transforms.patch` and
+`iceberg-vane-schema.patch` from the
 same directory, in that order. The SDK
 instructions give the ordered commands and each patch is independently retained.
 
@@ -558,8 +561,8 @@ This delivery qualifies correct reads and original-value row predicates. It
 does not introduce transformed partition-pruning state in worker binds or claim
 new pruning performance. Restored scans retain normal Parquet field mapping and
 row filtering. Unknown transform names follow the pinned provider's explicit
-parser rejection. General schema evolution/name mapping and delete manifests
-remain rejected by the frozen adapter.
+parser rejection. M5c2b below extends flat schema evolution; explicit name
+mappings and delete manifests remain rejected by the frozen adapter.
 
 | Feature | M5c2a qualification |
 | --- | --- |
@@ -598,6 +601,92 @@ The user explicitly requested affected tests only for this delivery; a complete
 base release-gate result is not part of this qualification. Formatting, source
 headers, the five ordered patches, license inventory, archive contents and the
 untouched original workspace are checked separately.
+
+## Flat schema evolution (M5c2b)
+
+The sixth ordered patch, `iceberg-vane-schema.patch`, admits retained flat schema
+history while preserving the selected schema's names, order, field IDs, types
+and typed NULL defaults. Its SHA-256 is
+`f19ce28ed74c747af977969c9e3e5c20b9708ddb72604501a338b479e6e3336e`.
+The five predecessor patches, source/SDK pins and engine identities are
+unchanged. The frozen bind/assignment/file codec remains version **2**: schema
+IDs and field/default vectors were already owned serialized state. Restored
+default types are now checked against their frozen target fields.
+
+Schema selection follows the bound catalog entry. Explicit old snapshots retain
+their historical schema. A metadata-only schema update uses the new schema even
+when its data snapshot is unchanged; assignment identity includes both snapshot
+and selected schema IDs. Workers reject a different schema's assignment for the
+same table/snapshot rather than interpreting its fields in another order.
+
+Reads continue to follow Iceberg's [field-ID projection rules](https://iceberg.apache.org/spec/#column-projection).
+Rename/reorder preserve IDs. Dropping and re-adding a name creates a distinct
+field: old physical columns and partition values must not populate the new
+field. Missing optional fields use typed NULL for this format-v2 profile.
+The pinned Gravitino service rejects non-null initial defaults in v2; these
+require v3 and remain outside this delivery. Native field/default mapping is
+reused, without adding runner-specific schema interpretation.
+
+The inherited manifest decoder now preserves decoding types for legacy
+partition sources removed from the selected schema. It consults retained
+schema history and widens compatible historical types before decoding those
+values; a nonempty Avro partition struct must not be projected to SQL NULL.
+File and manifest filter lookup also skips absent legacy sources conservatively
+instead of indexing a missing selected field. This prevents old partition
+statistics from filtering a newly added field that reuses the old name.
+The frozen adapter omits those historical-only constants from assignments,
+requiring their IDs to exist in retained schema history; selected fields still
+receive only their own identity constants.
+
+| Feature | M5c2b qualification |
+| --- | --- |
+| Field evolution | Add/drop/rename/reorder, two reused column names with fresh IDs, Unicode, NULL and boolean fields |
+| Promotions | `int` to `long`, `float` to `double`, decimal precision 8 to 12 to 18 with scale 2 unchanged; mixed old/new physical files |
+| Identity sources | Omitted integer/float/decimal fields across promotion, including an integer source also bucket-partitioned |
+| Transformed sources | Bucket/truncate fields across rename and valid promotion, with original source-value reads |
+| Dropped partition source | Historical identity spec, source deletion, new field reusing the name, and explicit old-schema reads |
+| Schema-only updates | Changed names/order/new nullable field with the same data snapshot; old/current schema assignment mismatch rejected |
+| NULL defaults | Old files missing added fields, explicit NULL and non-null values in new files, malformed typed-NULL defaults rejected |
+| Empty/lifecycle | Evolved empty table, explicit empty assignment, disjoint mixed-schema subsets, independent schema change/append after freeze, real-Ray worker replacement and cancellation |
+
+PyIceberg authors the schema changes and Parquet/manifest commits. Independent
+reference scans cover current and initial/intermediate snapshot schemas before
+Vane binds them. The pinned SDK's omitted identity FLOAT-to-DOUBLE scan loses
+precision for new DOUBLE values. That fixture therefore uses a separate
+physical-column control table with identical input rows, field IDs and schema
+history. Reference selection verifies snapshot schema IDs, row counts and row
+IDs before using that table. Values beyond float32 precision remain in the
+fixture and in dedicated native/Ray predicate checks. No expected value is
+derived from Vane's output. Arrow predicates use explicitly typed decimal
+thresholds and SQL NULL semantics.
+
+Seven nonempty tables have 3 to 27 committed files, alongside an evolved empty
+table. Physical paths are opaque under a misleading directory, with uncommitted
+orphans excluded. Metadata and the captured REST endpoint are unavailable during
+detached native/Ray replay. A later independent schema update plus append must
+leave the frozen rows, field order and target types unchanged.
+
+Run only the affected installed suites, keeping native and real-Ray execution
+in separate pytest processes:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_schema_scan_live.py \
+  tests/fast/test_iceberg_transform_scan_live.py tests/fast/test_iceberg_partition_scan_live.py \
+  tests/fast/test_iceberg_frozen_scan_live.py tests/fast/test_iceberg_catalog_live.py \
+  tests/fast/test_gravitino_iceberg_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_schema_ray_live.py \
+  tests/fast/test_iceberg_transform_ray_live.py tests/fast/test_iceberg_partition_ray_live.py \
+  tests/fast/test_iceberg_ray_scan_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+```
+
+The full base release gate is excluded by the user's validation scope. Keep the
+six-patch, SPDX/license, archive and original-workspace checks. Qualification
+remains same-host shared absolute local paths, committed format-v2 flat Parquet
+schemas and history, and no delete manifests. Nested history and explicit name
+mappings retain explicit guards. Remote storage, v3/non-null defaults,
+authentication and writes remain separate. Ray's existing Arrow result-type
+policy remains in force.
 
 ### Remaining roadmap
 

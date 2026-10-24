@@ -137,6 +137,14 @@ the same source from hiding a valid identity constant. That file retains the
 DuckDB and Vane attribution and MIT AND Apache-2.0 terms introduced by the fourth
 patch. All four predecessor patches and the version-2 wire structure stay
 unchanged, without new dependencies or additional license grants.
+The sixth patch, `iceberg-vane-schema.patch`, extends the Vane-owned adapter to
+freeze selected flat schemas across evolution and validate typed NULL defaults.
+Its inherited manifest decoder retains legacy partition types from schema
+history after a source is dropped; inherited file/manifest filtering ignores
+sources absent from the selected schema. Both files retain pinned DuckDB
+attribution and identify Vane modifications as MIT AND Apache-2.0. The five
+predecessor patches, SDK and extension pins, dependency roles and wire version
+are unchanged.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

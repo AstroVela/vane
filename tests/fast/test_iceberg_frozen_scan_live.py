@@ -203,7 +203,6 @@ def test_assignment_from_another_table_cannot_replace_frozen_identity(frozen_tab
 @pytest.mark.parametrize(
     ("name", "message"),
     [
-        ("evolved", "schema evolution"),
         ("position_deletes", "delete manifests"),
         ("equality_deletes", "delete manifests"),
     ],
@@ -216,6 +215,17 @@ def test_unsupported_transport_remains_a_valid_native_local_read(frozen_tables, 
         assert sorted(con.sql(sql).fetchall()) == sorted(features[name].rows)
         with pytest.raises(ValueError, match=message):
             freeze(con, sql)
+
+
+def test_existing_flat_evolution_freezes_and_restores(frozen_tables):
+    endpoint, tables, features = frozen_tables
+    with connection(tables) as con:
+        attach(con, endpoint)
+        payload = freeze(con, f'SELECT * FROM lake."{tables.namespace}".evolved')
+    with unavailable_metadata(tables):
+        rows, schema = execute_frozen(payload, tables)
+    assert sorted(rows) == list(features["evolved"].rows)
+    assert schema["types"] == ["BIGINT", "VARCHAR", "VARCHAR", "VARCHAR"]
 
 
 def test_frozen_worker_requires_explicit_assignment(frozen_tables):
