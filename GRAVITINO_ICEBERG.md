@@ -1092,8 +1092,51 @@ Provision the native system prerequisites and Docker access on that runner.
 The workflow uploads only structured reports and JUnit, excluding fixture
 credentials and service logs. It requires neither publishing credentials nor
 release signing keys. Its source-build CI execution requires that runner to be
-available; local prebuilt-input qualification does not qualify a fresh native
-build or physical multi-host deployment.
+available. Local prebuilt-input qualification and source-build qualification
+have separate evidence; physical multi-host deployment remains unqualified.
+
+### Source build qualification
+
+The Linux x86-64 source-build gate has also passed with the noneditable
+`vane-ai==0.3.0.dev82` base and its matching test-only Avro/Iceberg wheels.
+Both release-only SDK installations and the native build directory started
+empty. `VCPKG_BINARY_SOURCES=clear` and `CCACHE_DISABLE=1` disabled native
+binary and compiler caches. The base SDK's 91 packages and optional SDK's 25
+packages were built from source; their 180 static archives, package status,
+source pins, patches and resulting native inputs were hashed for the audit.
+The build configuration contains neither the earlier SDK nor native paths.
+
+This run found and fixed a missing build step: the base wheel's default target
+excludes loadable providers. The recipe now explicitly builds
+`vane_loadable_extensions` after the base wheel, so an incremental directory's
+existing artifacts cannot conceal missing or stale provider outputs. After
+that fix, the run continued with only the SDKs and native objects generated in
+this source-build attempt. Fresh pinned extension clones and all eight ordered
+patches supplied the provider sources.
+
+The captured new wheel closure was installed offline into the driver and
+immutable Ray image. All 115 related cases passed without skips: 81 pipeline/
+worker contracts, 26 isolated-node cases, six single-node Ray S3 regressions and
+two native detached-delete regressions. The pipeline contracts include two
+regressions preserving verified source-build provenance through separate
+`prepare` and `run` invocations. Nine owned containers and both networks were
+removed. The production Python/C++ code, engine identity, provider patches,
+frozen codec 3 and generic callback protocol 1 are unchanged by this gate.
+
+For a cold source run, use the same entry point with cache policy made explicit:
+
+```bash
+VCPKG_BINARY_SOURCES=clear CCACHE_DISABLE=1 \
+  python -I scripts/qualify_iceberg.py all \
+  --directory /absolute/path/to/fresh-iceberg-qualification \
+  --pull-services
+```
+
+`build-provenance.json` binds the source profile to the native input hashes;
+`bundle.json` retains it when those exact inputs are passed to `prepare`.
+The successful `prepare` and `run` pipeline reports preserve the verified
+`source_build` input mode. Preserve the phase logs and SDK inventories alongside
+the per-run qualification reports when auditing a cold build.
 
 ### Remaining roadmap
 
@@ -1107,7 +1150,7 @@ build or physical multi-host deployment.
 | M5c3: deletes | Committed v2 position/equality descriptors, exact applicability, hidden field-ID mapping, NULL-safe matching and native/real-Ray lifecycle coverage above |
 | M5d1: anonymous S3 | Canonical S3 data/delete locators, explicit connection-setting replay, real MinIO and local/single-node Ray qualification above |
 | M5d2: isolated nodes | Driver/head plus two isolated Ray workers, S3-only dataset sharing, exact provider deployment, retry/rejoin and cleanup without dataset mounts as above |
-| M5d3: repeatable qualification | Repository build/prepare/run entry point, offline wheel/image installation, related-test shards, hashed inputs/reports and a manually dispatched dedicated-runner workflow |
+| M5d3: repeatable qualification | Repository build/prepare/run entry point, qualified source-built SDK/base/provider closure, offline wheel/image installation, related-test shards, hashed inputs/reports and a manually dispatched dedicated-runner workflow |
 | Later optional work | Production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 The current fixture does not qualify v1/v3 tables, other remote filesystems,
