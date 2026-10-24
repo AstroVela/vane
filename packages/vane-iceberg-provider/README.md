@@ -87,6 +87,9 @@ for the local/single-node Ray storage boundary.
 The [isolated-node gate](../../GRAVITINO_ICEBERG.md#isolated-ray-nodes-m5d2)
 extends qualification to separate driver/head and worker containers using the
 same matched wheels, without shared dataset mounts or another provider patch.
+Use the [repeatable qualification pipeline](../../GRAVITINO_ICEBERG.md#repeatable-qualification-m5d3)
+to build or package these inputs, prepare an offline runtime image and run the
+related acceptance shards with a hashed bundle and per-run reports.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's
 dependencies, together with the pinned Iceberg/Avro and SDK notices.

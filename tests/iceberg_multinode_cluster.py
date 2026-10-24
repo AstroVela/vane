@@ -131,7 +131,8 @@ class IcebergMultinodeCluster:
     def published(self, role, port):
         return "http://" + self.docker("port", self.containers[role], str(port) + "/tcp")
 
-    def start(self):
+    def start_services(self):
+        """Start only the owned object store/catalog for host-runner regressions."""
         import pyarrow.fs as pafs
 
         self.network_id = self.docker("network", "create", "--label", self.label, self.network)
@@ -221,6 +222,9 @@ class IcebergMultinodeCluster:
         config_path.write_text(json.dumps(self.config))
         config_path.chmod(0o600)
         self.sdk_config = config_path
+
+    def start(self):
+        self.start_services()
         proxy_code = (
             "from pathlib import Path; import sys; sys.path.insert(0,'/opt/qualification/helpers'); "
             "from iceberg_s3_proxy import main; "

@@ -1005,6 +1005,96 @@ transport security and representative throughput remain unqualified. Private
 S3, authentication, credential vending/refresh, catalog writes and production
 provider publication keep their separate gates.
 
+## Repeatable qualification (M5d3)
+
+`scripts/qualify_iceberg.py` joins the source build, test-provider packaging,
+offline Python installation, runtime image and the four related test shards.
+Use Linux x86-64 and Python 3.12 with the native prerequisites and Python build
+tools from [DEVELOPMENT.md](DEVELOPMENT.md). The launcher also needs `pip`,
+`build` and `packaging`. Docker must be usable without an interactive password
+prompt. A dedicated host with at least 24 GiB RAM and 100 GiB free disk is
+recommended for a fresh source/SDK build.
+
+Start with a fresh private output directory:
+
+```bash
+python -I scripts/qualify_iceberg.py all \
+  --directory /absolute/path/to/iceberg-qualification \
+  --pull-services
+```
+
+The source recipe reads Iceberg/Avro/httpfs commits from DuckDB's pinned
+extension configs, clones them into the output directory and applies the eight
+ordered Iceberg patches to its own clone. It reuses the normal base SDK
+bootstrap, separate Iceberg SDK profile, license checks and noneditable wheel
+build. `--jobs` bounds native build concurrency (default 2). Existing matching
+SDKs can be selected with `--vcpkg-root`, `--base-sdk`, `--iceberg-sdk` and
+`--triplet`; SDK paths name installation roots containing the triplet directory.
+An existing vcpkg checkout with a different baseline fails before source changes.
+`--native-build-directory` selects an incremental native build directory.
+
+For already built inputs, use the same pipeline with an explicit complete set:
+
+```bash
+python -I scripts/qualify_iceberg.py all \
+  --directory /absolute/path/to/iceberg-qualification \
+  --base-wheel /absolute/path/to/vane_ai-VERSION-cp312-cp312-linux_x86_64.whl \
+  --avro-artifact /absolute/path/to/avro.duckdb_extension \
+  --iceberg-artifact /absolute/path/to/iceberg.duckdb_extension
+```
+
+The existing test signer and wheel builder package Avro first and declare its
+exact wheel as Iceberg's dependency. An isolated environment loads the complete
+closure and checks artifact hashes, matching Vane/engine identities and the Ray
+executable before Docker construction. A second environment verifies that the
+independent SDK/test dependencies install offline. The resulting image is
+probed without network access and selected by immutable image ID. These are
+private test fixtures, not production provider releases.
+
+Preparation downloads ordinary binary wheels by default. `--wheelhouse` selects
+a cache containing exactly one compatible wheel for each runtime pin;
+`--test-wheelhouse` selects the independent SDK/test cache. The launcher does
+not reconstruct packages from an installed environment. Python package
+installation in the prepared driver and Ray image uses `--no-index`.
+Source/SDK preparation and the Docker OS package layer may still need network
+access. `--pull-services` explicitly fetches only the three digest-pinned
+service images; otherwise all must already be local. `--docker-command
+'sudo -n docker'` supports a separately authorized Docker command prefix.
+
+`build` stops after native inputs, `prepare` packages an explicit prebuilt set,
+and `run` repeats a prepared bundle without rebuilding or downloading:
+
+```bash
+python -I scripts/qualify_iceberg.py run \
+  --directory /absolute/path/to/iceberg-qualification
+```
+
+`bundle.json` records the wheel/input inventory, SHA-256 hashes, source pins,
+patches, exact provider descriptors and runtime/service images. Replay rejects
+changed inputs or recipes before starting services. Every run uses a fresh
+driver environment and results directory. Four separate installed-package
+processes run pipeline and worker lifecycle/failure contracts, all 26 isolated-node cases,
+six existing single-node Ray S3 regressions and two native detached-delete
+regressions. Failed, skipped, empty or duplicate JUnit results fail acceptance.
+Host regressions reuse only the fixture's object store/catalog; they add no
+dataset mounts. The helper closes its owned services on stdin EOF or SIGTERM.
+
+`latest-run.json` points to `runs/<id>/qualification.json`, with per-shard JUnit
+reports, result counts and cleanup evidence. `pipeline.json` records the phase,
+source-build/prebuilt mode and success/failure, including preparation failures.
+Diagnostics, SDK control files and service logs remain private in the output
+directory. Resource cleanup verifies the fixture label and exact IDs; images
+and qualification inputs remain available for replay.
+
+The manually dispatched `.github/workflows/iceberg-qualification.yml` runs this
+same entry point on a dedicated `[self-hosted, linux, x64, vane-iceberg]` runner.
+Provision the native system prerequisites and Docker access on that runner.
+The workflow uploads only structured reports and JUnit, excluding fixture
+credentials and service logs. It requires neither publishing credentials nor
+release signing keys. Its source-build CI execution requires that runner to be
+available; local prebuilt-input qualification does not qualify a fresh native
+build or physical multi-host deployment.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
@@ -1017,6 +1107,7 @@ provider publication keep their separate gates.
 | M5c3: deletes | Committed v2 position/equality descriptors, exact applicability, hidden field-ID mapping, NULL-safe matching and native/real-Ray lifecycle coverage above |
 | M5d1: anonymous S3 | Canonical S3 data/delete locators, explicit connection-setting replay, real MinIO and local/single-node Ray qualification above |
 | M5d2: isolated nodes | Driver/head plus two isolated Ray workers, S3-only dataset sharing, exact provider deployment, retry/rejoin and cleanup without dataset mounts as above |
+| M5d3: repeatable qualification | Repository build/prepare/run entry point, offline wheel/image installation, related-test shards, hashed inputs/reports and a manually dispatched dedicated-runner workflow |
 | Later optional work | Production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 The current fixture does not qualify v1/v3 tables, other remote filesystems,

@@ -1,0 +1,60 @@
+name: Gravitino Iceberg qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iceberg-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  isolated-nodes:
+    # Dedicated Linux x86-64 host with Docker, >=24 GiB RAM and >=100 GiB free
+    # disk. The complete native/SDK build is unsuitable for a small hosted runner.
+    runs-on: [self-hosted, linux, x64, vane-iceberg]
+    timeout-minutes: 240
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/iceberg-vcpkg-cache
+      VCPKG_DISABLE_METRICS: '1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Prepare the isolated build environment
+        run: |
+          python -m venv "$RUNNER_TEMP/iceberg-tools-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "$RUNNER_TEMP/iceberg-tools-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/iceberg-tools-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python" -m pip install \
+            build packaging 'cmake>=3.29' ninja 'pybind11[global]>=3.0.0' \
+            'scikit-build-core>=0.11.4' 'setuptools-scm>=9.2.0' pyelftools patchelf
+      - name: Build the pinned inputs and run only the Iceberg qualification
+        run: |
+          python -I scripts/qualify_iceberg.py all \
+            --directory "$RUNNER_TEMP/iceberg-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --pull-services
+      - name: Summarize related test shards
+        if: always()
+        run: |
+          python scripts/summarize_junit.py --label 'Gravitino Iceberg' \
+            "$RUNNER_TEMP"/iceberg-"$GITHUB_RUN_ID"-"$GITHUB_RUN_ATTEMPT"/runs/*/reports \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain reports without fixture credentials or service logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: iceberg-qualification-report
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/iceberg-${{ github.run_id }}-${{ github.run_attempt }}/bundle.json
+            ${{ runner.temp }}/iceberg-${{ github.run_id }}-${{ github.run_attempt }}/build-provenance.json
+            ${{ runner.temp }}/iceberg-${{ github.run_id }}-${{ github.run_attempt }}/pipeline.json
+            ${{ runner.temp }}/iceberg-${{ github.run_id }}-${{ github.run_attempt }}/runs/*/qualification.json
+            ${{ runner.temp }}/iceberg-${{ github.run_id }}-${{ github.run_attempt }}/runs/*/reports/*.xml
