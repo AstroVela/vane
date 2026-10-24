@@ -471,6 +471,10 @@ def test_public_admission_bounds_waiters_without_an_executor_backlog(fake_core, 
         pending = asyncio.create_task(client.embed_text(["one", "two", "three"]))
         try:
             await asyncio.wait_for(admitted.wait(), 5)
+            # Admission and executor submission can precede the owner thread's
+            # first instruction. Observe actual forward entry before asserting
+            # its active count, independently of the host scheduler.
+            await entered(fake_core.entered)
             assert service.credits.inflight == 2 and len(service._zmq_server.buffers) == 2
             assert len(fake_core.submissions) == 2 and fake_core.active == 1
             # Control traffic and contract refusal still progress while the
