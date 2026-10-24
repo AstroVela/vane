@@ -44,6 +44,10 @@ git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-schema.patch"
 git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-schema.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-deletes.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-deletes.patch"
 ```
 
 The second patch adds M5a's versioned frozen-snapshot transport on top of the
@@ -62,9 +66,14 @@ column values. The wire structure stays at version 2. Keep all five patches in
 this order when reproducing M5c2a. The sixth patch admits M5c2b's flat schema
 history and fixes legacy partition decoding/filter lookups after a source is
 dropped. Names, order, field IDs, target types and typed NULL defaults remain
-owned version-2 state. Keep all six patches in order for the current build;
-the five predecessor patches are unchanged.
-See [the schema qualification and roadmap](../../GRAVITINO_ICEBERG.md#flat-schema-evolution-m5c2b)
+owned version-2 state. The seventh patch freezes applicable committed v2
+Parquet position/equality delete-file descriptors, retaining required equality
+fields through pruning and correcting local delete applicability/NULL matching.
+Workers read only those immutable files and retain decoded state per assignment.
+The added state requires frozen bind/assignment/file codec version 3; the
+generic distributed callback protocol stays at version 1. Keep all seven
+patches in order for the current build; the six predecessor patches are unchanged.
+See [the delete qualification and roadmap](../../GRAVITINO_ICEBERG.md#position-and-equality-deletes-m5c3)
 for the supported table semantics and shared-filesystem boundary.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's

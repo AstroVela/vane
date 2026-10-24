@@ -15,7 +15,9 @@ from urllib.parse import unquote, urlsplit
 from iceberg_feature_helpers import IcebergFeature
 
 
-def append_partition_rows(tables, name, rows, *, omit_partition_columns, rename_partition_columns=False):
+def append_partition_rows(
+    tables, name, rows, *, omit_partition_columns, rename_partition_columns=False, row_group_size=None
+):
     """Write opaque paths and commit typed partition records through the SDK."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -61,7 +63,7 @@ def append_partition_rows(tables, name, rows, *, omit_partition_columns, rename_
                     payload = payload.rename_columns(
                         ["physical_" + field.name if field in fields else field.name for field in physical.fields]
                     )
-                pq.write_table(payload, path)
+                pq.write_table(payload, path, row_group_size=row_group_size)
                 partition = Record(*values)
                 data_file = DataFile.from_args(
                     content=DataFileContent.DATA,

@@ -145,6 +145,15 @@ sources absent from the selected schema. Both files retain pinned DuckDB
 attribution and identify Vane modifications as MIT AND Apache-2.0. The five
 predecessor patches, SDK and extension pins, dependency roles and wire version
 are unchanged.
+The seventh patch, `iceberg-vane-deletes.patch`, freezes committed v2 Parquet
+delete-file descriptors and applicability state, with frozen bind/assignment/file
+codec version 3 and unchanged generic callback protocol 1. Its inherited reader,
+optimizer, file-list and positional/equality-delete changes preserve pinned
+DuckDB attribution and MIT AND Apache-2.0 terms. The delete scanner and the
+frozen reader's equality-column preservation follow the pinned upstream reader
+and optimizer contracts; those implementation files carry the same combined
+terms and attribution. The new portable-state header remains Vane-owned
+Apache-2.0. All six predecessor patches and source/SDK pins are unchanged.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

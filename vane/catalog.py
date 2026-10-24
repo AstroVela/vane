@@ -49,7 +49,8 @@ class IcebergCatalog:
     Anonymous Gravitino REST with local Parquet storage is qualified in
     ``GRAVITINO_ICEBERG.md``. Ray supports frozen format-v2 snapshots
     with unpartitioned, identity or transformed partitions and supported flat
-    schema evolution, without deletes, using shared local Parquet.
+    schema evolution and committed v2 position/equality deletes, using shared
+    local Parquet for both data and delete files.
     """
 
     def __init__(self, connection: DuckDBPyConnection, name: str) -> None:

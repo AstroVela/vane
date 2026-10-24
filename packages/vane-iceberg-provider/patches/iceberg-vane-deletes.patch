@@ -1,0 +1,1478 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Frozen v2 position/equality deletes for Vane; apply after iceberg-vane-schema.patch.
+# Upstream source: duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c (MIT).
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,3 +1,8 @@
++# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++# SPDX-FileCopyrightText: 2026 Vane contributors
++# SPDX-License-Identifier: MIT AND Apache-2.0
++# Modified by Vane contributors.
++
+ cmake_minimum_required(VERSION 3.5...3.29)
+ 
+ # Set extension name here
+@@ -100,6 +105,7 @@
+ 	src/planning/iceberg_multi_file_list.cpp
+ 	src/planning/iceberg_multi_file_reader.cpp
+ 	src/planning/vane_iceberg_frozen_scan.cpp
++	src/planning/vane_iceberg_delete_state.cpp
+ 	src/planning/iceberg_optimizer.cpp
+ 	src/planning/metadata_io/avro/avro_scan.cpp
+ 	src/planning/metadata_io/avro/iceberg_avro_multi_file_list.cpp
+diff --git a/src/core/deletes/iceberg_equality_delete.cpp b/src/core/deletes/iceberg_equality_delete.cpp
+--- a/src/core/deletes/iceberg_equality_delete.cpp
++++ b/src/core/deletes/iceberg_equality_delete.cpp
+@@ -1,3 +1,8 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ #include "core/deletes/iceberg_equality_delete.hpp"
+ 
+ #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+@@ -135,8 +140,11 @@
+ 			auto bound_ref = make_uniq<BoundReferenceExpression>(col.type, result_column_id);
+ 			if (!constant.IsNull()) {
+ 				//! Create a COMPARE_NOT_EQUAL expression
++				if (constant.type() != col.type) {
++					constant = constant.DefaultCastAs(col.type);
++				}
+ 				equality_filter =
+-				    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL, std::move(bound_ref),
++				    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_DISTINCT_FROM, std::move(bound_ref),
+ 				                                         make_uniq<BoundConstantExpression>(constant));
+ 			} else {
+ 				//! Construct an OPERATOR_IS_NOT_NULL expression instead
+diff --git a/src/core/deletes/iceberg_positional_delete.cpp b/src/core/deletes/iceberg_positional_delete.cpp
+--- a/src/core/deletes/iceberg_positional_delete.cpp
++++ b/src/core/deletes/iceberg_positional_delete.cpp
+@@ -1,5 +1,11 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ #include "core/deletes/iceberg_positional_delete.hpp"
+ #include "planning/iceberg_multi_file_list.hpp"
++#include "duckdb/common/multi_file/multi_file_reader.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -26,15 +32,38 @@
+ 	return reinterpret_cast<IcebergPositionalDeleteData &>(*it->second);
+ }
+ 
+-void IcebergMultiFileList::ScanPositionalDeleteFile(const BoundIcebergManifestEntry &bound_entry,
+-                                                    DataChunk &result) const {
+-	//! FIXME: might want to check the 'columns' of the 'reader' to check, field-ids are:
+-	auto names = FlatVector::GetData<string_t>(result.data[0]);  //! 2147483546
+-	auto row_ids = FlatVector::GetData<int64_t>(result.data[1]); //! 2147483545
++void IcebergMultiFileList::ScanPositionalDeleteFile(const BoundIcebergManifestEntry &bound_entry, DataChunk &result,
++                                                    const vector<MultiFileColumnDefinition> &columns) const {
++	idx_t path_index = DConstants::INVALID_INDEX;
++	idx_t position_index = DConstants::INVALID_INDEX;
++	for (idx_t index = 0; index < columns.size(); index++) {
++		if (columns[index].identifier.IsNull()) {
++			continue;
++		}
++		auto id = columns[index].GetIdentifierFieldId();
++		if (id == MultiFileReader::DELETE_FILE_PATH_FIELD_ID) {
++			path_index = index;
++		} else if (id == MultiFileReader::DELETE_POS_FIELD_ID) {
++			position_index = index;
++		}
++	}
++	if (path_index >= result.ColumnCount() || position_index >= result.ColumnCount() ||
++	    result.data[path_index].GetType() != LogicalType::VARCHAR ||
++	    result.data[position_index].GetType() != LogicalType::BIGINT) {
++		throw InvalidInputException("Iceberg position delete requires field-ID-mapped string paths and long positions");
++	}
++	auto names = FlatVector::GetData<string_t>(result.data[path_index]);
++	auto row_ids = FlatVector::GetData<int64_t>(result.data[position_index]);
+ 
+ 	auto count = result.size();
+ 	if (count == 0) {
+ 		return;
++	}
++	for (idx_t i = 0; i < count; i++) {
++		if (!FlatVector::Validity(result.data[path_index]).RowIsValid(i) ||
++		    !FlatVector::Validity(result.data[position_index]).RowIsValid(i) || row_ids[i] < 0) {
++			throw InvalidInputException("Iceberg position delete requires a path and nonnegative position");
++		}
+ 	}
+ 	reference<string_t> current_file_path = names[0];
+ 	auto initial_key = current_file_path.get().GetString();
+@@ -52,7 +81,7 @@
+ 		if (!deletes) {
+ 			continue;
+ 		}
+-		deletes->AddRow(row_id);
++		deletes->AddRow(row_id, bound_entry, name.GetString());
+ 	}
+ }
+ 
+diff --git a/src/include/core/deletes/iceberg_positional_delete.hpp b/src/include/core/deletes/iceberg_positional_delete.hpp
+--- a/src/include/core/deletes/iceberg_positional_delete.hpp
++++ b/src/include/core/deletes/iceberg_positional_delete.hpp
+@@ -1,3 +1,8 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ #pragma once
+ 
+ #include "duckdb/common/multi_file/multi_file_data.hpp"
+@@ -17,12 +22,18 @@
+ 	void AddRow(int64_t row_id) {
+ 		invalid_rows.insert(row_id);
+ 	}
++	void AddRow(int64_t row_id, const BoundIcebergManifestEntry &entry, const string &path) {
++		invalid_rows.insert(row_id);
++		scoped_rows[path][&entry.entry].insert(row_id);
++	}
+ 	unique_ptr<DeleteFilter> ToFilter() const override;
+ 	void ToSet(set<idx_t> &out) const override;
+ 
+ public:
+ 	//! Store invalid rows here before finalizing into a SelectionVector
+ 	unordered_set<int64_t> invalid_rows;
++	//! Preserve the exact target path and the delete's provenance for read applicability.
++	map<string, map<const IcebergManifestEntry *, unordered_set<int64_t>>> scoped_rows;
+ };
+ 
+ struct IcebergPositionalDeleteFilter : public DeleteFilter {
+diff --git a/src/include/planning/iceberg_multi_file_list.hpp b/src/include/planning/iceberg_multi_file_list.hpp
+--- a/src/include/planning/iceberg_multi_file_list.hpp
++++ b/src/include/planning/iceberg_multi_file_list.hpp
+@@ -1,3 +1,8 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ //===----------------------------------------------------------------------===//
+ //                         DuckDB
+ //
+@@ -123,7 +128,9 @@
+ 
+ 	void Bind(vector<LogicalType> &return_types, vector<string> &names);
+ 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters) const;
+-	unique_ptr<DeleteFilter> GetPositionalDeletesForFile(const string &file_path) const;
++	unique_ptr<DeleteFilter>
++	GetPositionalDeletesForFile(const string &file_path,
++	                            optional_ptr<const BoundIcebergManifestEntry> data_entry = nullptr) const;
+ 	void ProcessDeletes(const vector<MultiFileColumnDefinition> &global_columns,
+ 	                    const vector<ColumnIndex> &global_column_ids, const vector<idx_t> &projection_ids) const;
+ 	vector<reference<const IcebergEqualityDeleteRow>>
+@@ -182,7 +189,8 @@
+ 	                     const vector<ColumnIndex> &global_column_ids, const vector<idx_t> &projection_ids) const;
+ 	void ScanDeleteFile(const BoundIcebergManifestEntry &entry, const vector<MultiFileColumnDefinition> &global_columns,
+ 	                    const vector<ColumnIndex> &global_column_ids, const vector<idx_t> &projection_ids) const;
+-	void ScanPositionalDeleteFile(const BoundIcebergManifestEntry &manifest_entry, DataChunk &result) const;
++	void ScanPositionalDeleteFile(const BoundIcebergManifestEntry &manifest_entry, DataChunk &result,
++	                              const vector<MultiFileColumnDefinition> &columns) const;
+ 	void ScanEqualityDeleteFile(const BoundIcebergManifestEntry &manifest_entry, DataChunk &result,
+ 	                            vector<MultiFileColumnDefinition> &columns,
+ 	                            const vector<MultiFileColumnDefinition> &global_columns,
+diff --git a/src/include/planning/vane_iceberg_delete_state.hpp b/src/include/planning/vane_iceberg_delete_state.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/include/planning/vane_iceberg_delete_state.hpp
+@@ -0,0 +1,79 @@
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "duckdb/common/multi_file/multi_file_data.hpp"
++
++namespace duckdb {
++
++struct IcebergMultiFileList;
++struct IcebergTableMetadata;
++struct IcebergDataFile;
++
++struct VaneIcebergPartition {
++	int32_t spec_id = 0;
++	bool unpartitioned = true;
++	vector<int32_t> field_ids;
++	vector<Value> values;
++
++	void Serialize(Serializer &serializer) const;
++	static VaneIcebergPartition Deserialize(Deserializer &deserializer);
++	void Validate() const;
++	bool Equals(const VaneIcebergPartition &other) const;
++};
++
++struct VaneIcebergDeleteColumn {
++	VaneIcebergDeleteColumn() = default;
++	VaneIcebergDeleteColumn(int32_t field_id, LogicalType type) : field_id(field_id), type(std::move(type)) {
++	}
++	int32_t field_id = 0;
++	LogicalType type;
++
++	void Serialize(Serializer &serializer) const;
++	static VaneIcebergDeleteColumn Deserialize(Deserializer &deserializer);
++	void Validate() const;
++};
++
++struct VaneIcebergDeleteFile {
++	string path;
++	uint8_t content = 0;
++	int64_t sequence_number = 0;
++	int64_t record_count = 0;
++	int64_t file_size = 0;
++	VaneIcebergPartition partition;
++	string referenced_data_file;
++	vector<int32_t> equality_ids;
++
++	void Serialize(Serializer &serializer) const;
++	static VaneIcebergDeleteFile Deserialize(Deserializer &deserializer);
++	void Validate(const vector<VaneIcebergDeleteColumn> &columns) const;
++	bool Equals(const VaneIcebergDeleteFile &other) const;
++	bool AppliesTo(const string &data_path, int64_t data_sequence, const VaneIcebergPartition &data_partition) const;
++};
++
++struct VaneIcebergParsedDeletes {
++	vector<string> data_paths;
++	vector<int64_t> positions;
++	vector<vector<Value>> equality_rows;
++	unordered_map<hash_t, vector<idx_t>> equality_buckets;
++};
++
++struct VaneIcebergPositionFilter : public DeleteFilter {
++	unordered_set<int64_t> positions;
++	idx_t Filter(row_t start, idx_t count, SelectionVector &selection) override;
++};
++
++hash_t VaneIcebergEqualityHash(const vector<Value> &values);
++void VaneValidateIcebergPath(const string &path);
++VaneIcebergPartition VaneFreezeIcebergPartition(const IcebergTableMetadata &metadata, int32_t spec_id,
++                                                const IcebergDataFile &file);
++vector<VaneIcebergDeleteFile> VaneFreezeIcebergDeleteFiles(const IcebergMultiFileList &live);
++vector<VaneIcebergDeleteColumn>
++VaneFreezeIcebergDeleteColumns(const IcebergMultiFileList &live,
++                               const vector<MultiFileColumnDefinition> &selected_columns);
++shared_ptr<const VaneIcebergParsedDeletes> VaneReadIcebergDeletes(ClientContext &context,
++                                                                  const VaneIcebergDeleteFile &file,
++                                                                  const vector<VaneIcebergDeleteColumn> &columns);
++
++} // namespace duckdb
+diff --git a/src/include/planning/vane_iceberg_frozen_scan.hpp b/src/include/planning/vane_iceberg_frozen_scan.hpp
+--- a/src/include/planning/vane_iceberg_frozen_scan.hpp
++++ b/src/include/planning/vane_iceberg_frozen_scan.hpp
+@@ -8,11 +8,13 @@
+ namespace duckdb {
+ 
+ class MultiFileList;
++class LogicalOperator;
+ 
+ void VaneIcebergScanSerialize(Serializer &serializer, optional_ptr<FunctionData> bind_data,
+                               const TableFunction &function);
+ unique_ptr<FunctionData> VaneIcebergScanDeserialize(Deserializer &deserializer, TableFunction &function);
+ TableFunctionDistributedScanCallbacks VaneIcebergFrozenScanCallbacks();
+ bool VaneIsFrozenIcebergList(const MultiFileList &files);
++void VanePrepareFrozenIcebergDeletes(ClientContext &context, unique_ptr<LogicalOperator> &plan);
+ 
+ } // namespace duckdb
+diff --git a/src/planning/iceberg_multi_file_list.cpp b/src/planning/iceberg_multi_file_list.cpp
+--- a/src/planning/iceberg_multi_file_list.cpp
++++ b/src/planning/iceberg_multi_file_list.cpp
+@@ -4,6 +4,7 @@
+ // Modified by Vane contributors.
+ 
+ #include "planning/iceberg_multi_file_list.hpp"
++#include "planning/vane_iceberg_delete_state.hpp"
+ 
+ #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+ #include "duckdb/common/exception.hpp"
+@@ -1007,13 +1008,18 @@
+ 					//! delete file.
+ 					continue;
+ 				}
+-				D_ASSERT(file.partition_info.size() == data_file.partition_info.size());
++				bool matches = file.partition_info.size() == data_file.partition_info.size();
+ 				for (idx_t i = 0; i < file.partition_info.size(); i++) {
+-					if (file.partition_info[i] != data_file.partition_info[i]) {
++					if (!matches || file.partition_info[i].field_id != data_file.partition_info[i].field_id ||
++					    !Value::NotDistinctFrom(file.partition_info[i].value, data_file.partition_info[i].value)) {
+ 						//! Same partition spec id, but the partitioning information doesn't match, delete file doesn't
+ 						//! apply.
+-						continue;
++						matches = false;
++						break;
+ 					}
++				}
++				if (!matches) {
++					continue;
+ 				}
+ 			}
+ 			result.insert(result.end(), file.rows.begin(), file.rows.end());
+@@ -1358,7 +1364,7 @@
+ 			result.Reset();
+ 			delete_scan_function.function(context, function_input, result);
+ 			result.Flatten();
+-			ScanPositionalDeleteFile(bound_manifest_entry, result);
++			ScanPositionalDeleteFile(bound_manifest_entry, result, multi_file_local_state.reader->columns);
+ 		} while (result.size() != 0);
+ 	} else if (data_file.content == IcebergManifestEntryContentType::EQUALITY_DELETES) {
+ 		do {
+@@ -1372,10 +1378,50 @@
+ 	}
+ }
+ 
+-unique_ptr<DeleteFilter> IcebergMultiFileList::GetPositionalDeletesForFile(const string &file_path) const {
++unique_ptr<DeleteFilter>
++IcebergMultiFileList::GetPositionalDeletesForFile(const string &file_path,
++                                                  optional_ptr<const BoundIcebergManifestEntry> data_entry) const {
+ 	lock_guard<mutex> guard(shared_state->delete_lock);
+ 	auto it = shared_state->positional_delete_data.find(file_path);
+ 	if (it != shared_state->positional_delete_data.end()) {
++		if (data_entry && it->second->type == IcebergDeleteType::POSITIONAL_DELETE) {
++			auto &data = static_cast<const IcebergPositionalDeleteData &>(*it->second);
++			auto filter = make_uniq<VaneIcebergPositionFilter>();
++			auto scoped = data.scoped_rows.find(file_path);
++			if (scoped == data.scoped_rows.end()) {
++				return std::move(filter);
++			}
++			auto &manifest = GetManifestFileForEntry(*data_entry, IcebergManifestContentType::DATA);
++			auto sequence = data_entry->entry.GetSequenceNumber(manifest);
++			auto partition =
++			    VaneFreezeIcebergPartition(GetMetadata(), manifest.partition_spec_id, data_entry->entry.data_file);
++			set<const IcebergManifestEntry *> seen;
++			for (auto &entry : data.entries) {
++				if (!seen.insert(&entry.entry).second) {
++					continue;
++				}
++				auto rows = scoped->second.find(&entry.entry);
++				if (rows == scoped->second.end()) {
++					continue;
++				}
++				auto &delete_manifest = GetManifestFileForEntry(entry, IcebergManifestContentType::DELETE);
++				VaneIcebergDeleteFile deleted;
++				deleted.content = 1;
++				deleted.sequence_number = entry.entry.GetSequenceNumber(delete_manifest);
++				deleted.partition =
++				    VaneFreezeIcebergPartition(GetMetadata(), delete_manifest.partition_spec_id, entry.entry.data_file);
++				deleted.referenced_data_file = entry.entry.data_file.referenced_data_file;
++				if (deleted.AppliesTo(file_path, sequence, partition)) {
++					for (auto row : rows->second) {
++						if (row < 0 || row >= data_entry->entry.data_file.record_count) {
++							throw InvalidInputException("Iceberg position delete exceeds the data-file record count");
++						}
++					}
++					filter->positions.insert(rows->second.begin(), rows->second.end());
++				}
++			}
++			return std::move(filter);
++		}
+ 		// There is delete data for this file, return it
+ 		return it->second->ToFilter();
+ 	}
+diff --git a/src/planning/iceberg_multi_file_reader.cpp b/src/planning/iceberg_multi_file_reader.cpp
+--- a/src/planning/iceberg_multi_file_reader.cpp
++++ b/src/planning/iceberg_multi_file_reader.cpp
+@@ -304,7 +304,7 @@
+ 	auto bound_manifest_entry = multi_file_list.GetManifestEntry(file_id);
+ 	const auto &file_path = bound_manifest_entry.entry.data_file.file_path;
+ 	multi_file_list.ProcessDeletes(global_columns, global_column_ids, gstate.projection_ids);
+-	reader.deletion_filter = multi_file_list.GetPositionalDeletesForFile(file_path);
++	reader.deletion_filter = multi_file_list.GetPositionalDeletesForFile(file_path, &bound_manifest_entry);
+ 
+ 	auto &local_columns = reader_data.reader->columns;
+ 	auto &metadata = multi_file_list.GetMetadata();
+diff --git a/src/planning/iceberg_optimizer.cpp b/src/planning/iceberg_optimizer.cpp
+--- a/src/planning/iceberg_optimizer.cpp
++++ b/src/planning/iceberg_optimizer.cpp
+@@ -1,4 +1,10 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors.
++
+ #include "planning/iceberg_optimizer.hpp"
++#include "planning/vane_iceberg_frozen_scan.hpp"
+ 
+ #include "iceberg_logging.hpp"
+ #include "duckdb/planner/logical_operator.hpp"
+@@ -75,9 +81,17 @@
+ 				}
+ 			}
+ 			if (schema_idx == DConstants::INVALID_INDEX) {
++				for (idx_t index = 0; index < mfbd.reader_bind.schema.size(); index++) {
++					if (mfbd.reader_bind.schema[index].GetIdentifierFieldId() == fid) {
++						schema_idx = index;
++						col_type = mfbd.reader_bind.schema[index].type;
++						break;
++					}
++				}
++			}
++			if (schema_idx == DConstants::INVALID_INDEX) {
+ 				// column was deleted and exists most likely in an old schemas
+-				// TODO: if the type of the equality delete column was evolved, then grabbing just any schema could be a
+-				// problem
++				// Retained flat history also determines the promoted hidden-column type.
+ 				auto table = iceberg_list.GetTable();
+ 				D_ASSERT(table);
+ 				auto col_info = table->table_info.table_metadata.FindColumnByFieldId(fid);
+@@ -86,20 +100,42 @@
+ 					    "column %d must apply equality deletes, but no schema has a column with that field id", fid);
+ 				}
+ 				DUCKDB_LOG(context, IcebergLogType, "Detected deleted column with equality delete: %s", col_info->name);
+-				schema_idx = col_info->id;
++				schema_idx = mfbd.types.size();
+ 				col_type = col_info->type;
++				if (!col_type.IsNested()) {
++					for (auto &historical : iceberg_list.GetMetadata().GetSchemas()) {
++						for (auto &column : historical.second->columns) {
++							if (column->id != fid) {
++								continue;
++							}
++							LogicalType common;
++							if (!LogicalType::TryGetMaxLogicalTypeUnchecked(col_type, column->type, common)) {
++								throw InvalidConfigurationException(
++								    "Incompatible historical equality delete field types");
++							}
++							col_type = std::move(common);
++						}
++					}
++				}
+ 
+ 				// modify the returned types of the get to add a column
+ 				get.returned_types.push_back(col_type);
+ 
+ 				// modify the multi file reader bind data to add the extra column
+ 				mfbd.types.push_back(col_type);
+-				mfbd.names.push_back(col_info->name);
++				auto hidden_name = "__vane_delete_field_" + std::to_string(fid);
++				mfbd.names.push_back(hidden_name);
++				get.names.push_back(hidden_name);
+ 
+ 				auto new_col = col_info->GetMultiFileColumnDefinition();
++				new_col.name = hidden_name;
++				new_col.type = col_type;
+ 				if (!new_col.default_expression) {
+ 					// set default expression to null.
+ 					new_col.default_expression = make_uniq<ConstantExpression>(Value(col_type));
++				} else if (new_col.GetDefaultValue().type() != col_type) {
++					new_col.default_expression =
++					    make_uniq<ConstantExpression>(new_col.GetDefaultValue().DefaultCastAs(col_type));
+ 				}
+ 				new_col.identifier = col_info->id;
+ 				mfbd.columns.push_back(new_col);
+@@ -144,6 +180,7 @@
+ }
+ 
+ void IcebergOptimizer::PreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
++	VanePrepareFrozenIcebergDeletes(input.context, plan);
+ 	GuaranteeEqualityDeleteColumnsOptimizer guarantee_equality_delete_columns_optimizer(input.context);
+ 	if (plan->children.size() == 0) {
+ 		return;
+diff --git a/src/planning/vane_iceberg_delete_state.cpp b/src/planning/vane_iceberg_delete_state.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/planning/vane_iceberg_delete_state.cpp
+@@ -0,0 +1,426 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors; delete scanning follows the pinned Iceberg reader's initialization contract.
++
++#include "planning/vane_iceberg_delete_state.hpp"
++
++#include "duckdb/common/limits.hpp"
++#include "duckdb/common/multi_file/multi_file_states.hpp"
++#include "duckdb/common/multi_file/multi_file_reader.hpp"
++#include "duckdb/common/types/hash.hpp"
++#include "duckdb/common/serializer/deserializer.hpp"
++#include "duckdb/common/serializer/serializer.hpp"
++#include "duckdb/parser/tableref/table_function_ref.hpp"
++#include "function/iceberg_functions.hpp"
++#include "planning/iceberg_multi_file_list.hpp"
++#include "planning/metadata_io/deletes/iceberg_deletes_file_reader.hpp"
++
++namespace duckdb {
++
++idx_t VaneIcebergPositionFilter::Filter(row_t start, idx_t count, SelectionVector &selection) {
++	selection.Initialize(STANDARD_VECTOR_SIZE);
++	idx_t result = 0;
++	for (idx_t index = 0; index < count; index++) {
++		if (!positions.count(start + index)) {
++			selection.set_index(result++, index);
++		}
++	}
++	return result;
++}
++
++hash_t VaneIcebergEqualityHash(const vector<Value> &values) {
++	hash_t result = 0;
++	for (auto &value : values) {
++		result = CombineHash(MurmurHash64(result), value.Hash());
++	}
++	return result;
++}
++
++void VaneValidateIcebergPath(const string &path) {
++	const bool absolute = StringUtil::StartsWith(path, "/") || StringUtil::StartsWith(path, "\\\\") ||
++	                      (path.size() >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'));
++	if (path.empty() || path.find('\0') != string::npos || (!StringUtil::StartsWith(path, "file:///") && !absolute)) {
++		throw NotImplementedException("Frozen Iceberg transport requires absolute local file paths");
++	}
++	if (path.find("://") != string::npos && !StringUtil::StartsWith(path, "file:///")) {
++		throw NotImplementedException("Frozen Iceberg transport currently supports local files only");
++	}
++}
++
++void VaneIcebergPartition::Serialize(Serializer &serializer) const {
++	serializer.WriteProperty(1, "spec_id", spec_id);
++	serializer.WriteProperty(2, "unpartitioned", unpartitioned);
++	serializer.WriteProperty(3, "field_ids", field_ids);
++	serializer.WriteProperty(4, "values", values);
++}
++
++VaneIcebergPartition VaneIcebergPartition::Deserialize(Deserializer &deserializer) {
++	VaneIcebergPartition result;
++	result.spec_id = deserializer.ReadProperty<int32_t>(1, "spec_id");
++	result.unpartitioned = deserializer.ReadProperty<bool>(2, "unpartitioned");
++	result.field_ids = deserializer.ReadProperty<vector<int32_t>>(3, "field_ids");
++	result.values = deserializer.ReadProperty<vector<Value>>(4, "values");
++	result.Validate();
++	return result;
++}
++
++void VaneIcebergPartition::Validate() const {
++	if (spec_id < 0 || field_ids.size() != values.size()) {
++		throw SerializationException("Invalid frozen Iceberg delete partition");
++	}
++	set<int32_t> seen;
++	for (idx_t index = 0; index < field_ids.size(); index++) {
++		if (field_ids[index] <= 0 || !seen.insert(field_ids[index]).second || values[index].type().IsNested() ||
++		    (unpartitioned && !values[index].IsNull())) {
++			throw SerializationException("Invalid frozen Iceberg delete partition field");
++		}
++	}
++	if (!unpartitioned && field_ids.empty()) {
++		throw SerializationException("Partitioned frozen Iceberg state requires partition fields");
++	}
++}
++
++bool VaneIcebergPartition::Equals(const VaneIcebergPartition &other) const {
++	if (spec_id != other.spec_id || unpartitioned != other.unpartitioned || field_ids != other.field_ids ||
++	    values.size() != other.values.size()) {
++		return false;
++	}
++	for (idx_t index = 0; index < values.size(); index++) {
++		if (values[index].type() != other.values[index].type() ||
++		    !Value::NotDistinctFrom(values[index], other.values[index])) {
++			return false;
++		}
++	}
++	return true;
++}
++
++void VaneIcebergDeleteColumn::Serialize(Serializer &serializer) const {
++	serializer.WriteProperty(1, "field_id", field_id);
++	serializer.WriteProperty(2, "type", type);
++}
++
++VaneIcebergDeleteColumn VaneIcebergDeleteColumn::Deserialize(Deserializer &deserializer) {
++	VaneIcebergDeleteColumn result;
++	result.field_id = deserializer.ReadProperty<int32_t>(1, "field_id");
++	result.type = deserializer.ReadProperty<LogicalType>(2, "type");
++	result.Validate();
++	return result;
++}
++
++void VaneIcebergDeleteColumn::Validate() const {
++	if (field_id <= 0) {
++		throw SerializationException("Frozen Iceberg equality delete requires positive field IDs");
++	}
++	switch (type.id()) {
++	case LogicalTypeId::BOOLEAN:
++	case LogicalTypeId::INTEGER:
++	case LogicalTypeId::BIGINT:
++	case LogicalTypeId::DECIMAL:
++	case LogicalTypeId::VARCHAR:
++	case LogicalTypeId::BLOB:
++	case LogicalTypeId::UUID:
++	case LogicalTypeId::DATE:
++	case LogicalTypeId::TIME:
++	case LogicalTypeId::TIMESTAMP:
++	case LogicalTypeId::TIMESTAMP_TZ:
++		return;
++	default:
++		throw NotImplementedException("Frozen Iceberg equality delete does not support field type %s", type);
++	}
++}
++
++void VaneIcebergDeleteFile::Serialize(Serializer &serializer) const {
++	serializer.WriteProperty(1, "path", path);
++	serializer.WriteProperty(2, "content", content);
++	serializer.WriteProperty(3, "sequence_number", sequence_number);
++	serializer.WriteProperty(4, "record_count", record_count);
++	serializer.WriteProperty(5, "file_size", file_size);
++	serializer.WriteProperty(6, "partition", partition);
++	serializer.WriteProperty(7, "referenced_data_file", referenced_data_file);
++	serializer.WriteProperty(8, "equality_ids", equality_ids);
++}
++
++VaneIcebergDeleteFile VaneIcebergDeleteFile::Deserialize(Deserializer &deserializer) {
++	VaneIcebergDeleteFile result;
++	result.path = deserializer.ReadProperty<string>(1, "path");
++	result.content = deserializer.ReadProperty<uint8_t>(2, "content");
++	result.sequence_number = deserializer.ReadProperty<int64_t>(3, "sequence_number");
++	result.record_count = deserializer.ReadProperty<int64_t>(4, "record_count");
++	result.file_size = deserializer.ReadProperty<int64_t>(5, "file_size");
++	result.partition = deserializer.ReadProperty<VaneIcebergPartition>(6, "partition");
++	result.referenced_data_file = deserializer.ReadProperty<string>(7, "referenced_data_file");
++	result.equality_ids = deserializer.ReadProperty<vector<int32_t>>(8, "equality_ids");
++	return result;
++}
++
++void VaneIcebergDeleteFile::Validate(const vector<VaneIcebergDeleteColumn> &columns) const {
++	VaneValidateIcebergPath(path);
++	partition.Validate();
++	if (sequence_number < 0 || record_count < 0 || file_size <= 0 || (content != 1 && content != 2)) {
++		throw SerializationException("Invalid frozen Iceberg delete file");
++	}
++	if (!referenced_data_file.empty()) {
++		VaneValidateIcebergPath(referenced_data_file);
++	}
++	if ((content == 1 && !equality_ids.empty()) ||
++	    (content == 2 && (equality_ids.empty() || !referenced_data_file.empty()))) {
++		throw SerializationException("Invalid frozen Iceberg delete file fields");
++	}
++	set<int32_t> seen;
++	for (auto id : equality_ids) {
++		bool found = false;
++		for (auto &column : columns) {
++			found = found || column.field_id == id;
++		}
++		if (!found || !seen.insert(id).second) {
++			throw SerializationException("Frozen Iceberg equality delete references an unknown or duplicate field");
++		}
++	}
++}
++
++bool VaneIcebergDeleteFile::Equals(const VaneIcebergDeleteFile &other) const {
++	return path == other.path && content == other.content && sequence_number == other.sequence_number &&
++	       record_count == other.record_count && file_size == other.file_size && partition.Equals(other.partition) &&
++	       referenced_data_file == other.referenced_data_file && equality_ids == other.equality_ids;
++}
++
++bool VaneIcebergDeleteFile::AppliesTo(const string &data_path, int64_t data_sequence,
++                                      const VaneIcebergPartition &data_partition) const {
++	if (content == 1) {
++		return data_sequence <= sequence_number && partition.Equals(data_partition) &&
++		       (referenced_data_file.empty() || referenced_data_file == data_path);
++	}
++	return content == 2 && data_sequence < sequence_number &&
++	       (partition.unpartitioned || partition.Equals(data_partition));
++}
++
++VaneIcebergPartition VaneFreezeIcebergPartition(const IcebergTableMetadata &metadata, int32_t spec_id,
++                                                const IcebergDataFile &file) {
++	auto spec = metadata.partition_specs.find(spec_id);
++	if (spec == metadata.partition_specs.end()) {
++		throw SerializationException("Frozen Iceberg file references an unknown partition spec");
++	}
++	VaneIcebergPartition result;
++	result.spec_id = spec_id;
++	result.unpartitioned = spec->second.IsUnpartitioned();
++	for (auto &field : spec->second.fields) {
++		if (field.partition_field_id == 0 || field.partition_field_id > NumericLimits<int32_t>::Maximum()) {
++			throw SerializationException("Invalid frozen Iceberg partition field ID");
++		}
++		bool found = false;
++		for (auto &value : file.partition_info) {
++			if (value.field_id == field.partition_field_id) {
++				result.field_ids.push_back(static_cast<int32_t>(field.partition_field_id));
++				result.values.push_back(value.value);
++				found = true;
++				break;
++			}
++		}
++		if (!found) {
++			if (field.transform != IcebergTransformType::VOID) {
++				throw SerializationException("Frozen Iceberg partition value is missing");
++			}
++			result.field_ids.push_back(static_cast<int32_t>(field.partition_field_id));
++			result.values.emplace_back();
++		}
++	}
++	result.Validate();
++	return result;
++}
++
++vector<VaneIcebergDeleteFile> VaneFreezeIcebergDeleteFiles(const IcebergMultiFileList &live) {
++	vector<VaneIcebergDeleteFile> result;
++	set<string> seen;
++	for (auto &entry : live.GetDeleteManifestEntries()) {
++		auto &data = entry.entry.data_file;
++		if (!StringUtil::CIEquals(data.file_format, "parquet") ||
++		    (data.content != IcebergManifestEntryContentType::POSITION_DELETES &&
++		     data.content != IcebergManifestEntryContentType::EQUALITY_DELETES)) {
++			throw NotImplementedException(
++			    "Frozen Iceberg transport requires Parquet position or equality delete files");
++		}
++		if (!seen.insert(data.file_path).second) {
++			throw SerializationException("Frozen Iceberg snapshot contains duplicate delete-file paths");
++		}
++		auto &manifest = live.GetManifestFileForEntry(entry, IcebergManifestContentType::DELETE);
++		VaneIcebergDeleteFile file;
++		file.path = data.file_path;
++		VaneValidateIcebergPath(file.path);
++		file.content = static_cast<uint8_t>(data.content);
++		file.sequence_number = entry.entry.GetSequenceNumber(manifest);
++		file.record_count = data.record_count;
++		file.file_size = data.file_size_in_bytes;
++		file.partition = VaneFreezeIcebergPartition(live.GetMetadata(), manifest.partition_spec_id, data);
++		file.referenced_data_file = data.referenced_data_file;
++		file.equality_ids = data.equality_ids;
++		result.push_back(std::move(file));
++	}
++	return result;
++}
++
++vector<VaneIcebergDeleteColumn>
++VaneFreezeIcebergDeleteColumns(const IcebergMultiFileList &live,
++                               const vector<MultiFileColumnDefinition> &selected_columns) {
++	map<int32_t, LogicalType> types;
++	for (auto &file : VaneFreezeIcebergDeleteFiles(live)) {
++		for (auto id : file.equality_ids) {
++			if (types.count(id)) {
++				continue;
++			}
++			LogicalType type = LogicalType::INVALID;
++			for (auto &column : selected_columns) {
++				if (!column.identifier.IsNull() && column.GetIdentifierFieldId() == id) {
++					type = column.type;
++					break;
++				}
++			}
++			if (type.id() == LogicalTypeId::INVALID) {
++				for (auto &schema : live.GetMetadata().GetSchemas()) {
++					for (auto &column : schema.second->columns) {
++						if (column->id != id) {
++							continue;
++						}
++						if (type.id() == LogicalTypeId::INVALID) {
++							type = column->type;
++						} else {
++							LogicalType common;
++							if (!LogicalType::TryGetMaxLogicalTypeUnchecked(type, column->type, common)) {
++								throw SerializationException("Incompatible historical equality delete field types");
++							}
++							type = std::move(common);
++						}
++					}
++				}
++			}
++			VaneIcebergDeleteColumn column {id, type};
++			column.Validate();
++			types.emplace(id, std::move(type));
++		}
++	}
++	vector<VaneIcebergDeleteColumn> result;
++	for (auto &entry : types) {
++		result.push_back({entry.first, entry.second});
++	}
++	return result;
++}
++
++shared_ptr<const VaneIcebergParsedDeletes> VaneReadIcebergDeletes(ClientContext &context,
++                                                                  const VaneIcebergDeleteFile &file,
++                                                                  const vector<VaneIcebergDeleteColumn> &columns) {
++	file.Validate(columns);
++	auto functions = IcebergFunctions::GetIcebergDeletesScanFunction(context);
++	auto function = functions.functions[0];
++	OpenFileInfo open(file.path);
++	function.function_info = make_shared_ptr<IcebergDeleteScanInfo>(open);
++	vector<Value> arguments {Value(file.path)};
++	named_parameter_map_t parameters;
++	vector<LogicalType> input_types, types;
++	vector<string> input_names, names;
++	TableFunctionRef ref;
++	TableFunctionBindInput bind_input(arguments, parameters, input_types, input_names, nullptr, nullptr, function, ref);
++	auto bind = function.bind(context, bind_input, types, names);
++	vector<column_t> ids;
++	for (idx_t index = 0; index < types.size(); index++) {
++		ids.push_back(index);
++	}
++	TableFunctionInitInput input(bind.get(), ids, {}, nullptr);
++	auto global = function.init_global(context, input);
++	ThreadContext thread(context);
++	ExecutionContext execution(context, thread, nullptr);
++	auto local = function.init_local(execution, input, global.get());
++	auto &reader = local->Cast<MultiFileLocalState>();
++	if (!reader.reader) {
++		throw InvalidInputException("Frozen Iceberg delete file has no Parquet reader");
++	}
++	map<int32_t, idx_t> physical;
++	for (idx_t index = 0; index < reader.reader->columns.size(); index++) {
++		auto &column = reader.reader->columns[index];
++		if (!column.identifier.IsNull() && !physical.emplace(column.GetIdentifierFieldId(), index).second) {
++			throw InvalidInputException("Frozen Iceberg delete file has duplicate field IDs");
++		}
++	}
++	vector<idx_t> selected;
++	vector<LogicalType> target_types;
++	vector<int32_t> required = file.content == 1 ? vector<int32_t> {MultiFileReader::DELETE_FILE_PATH_FIELD_ID,
++	                                                                MultiFileReader::DELETE_POS_FIELD_ID}
++	                                             : file.equality_ids;
++	for (auto id : required) {
++		auto found = physical.find(id);
++		if (found == physical.end()) {
++			throw InvalidInputException("Frozen Iceberg delete file is missing required field ID %d", id);
++		}
++		selected.push_back(found->second);
++		if (file.content == 1) {
++			auto type = id == MultiFileReader::DELETE_FILE_PATH_FIELD_ID ? LogicalType::VARCHAR : LogicalType::BIGINT;
++			if (types[found->second] != type) {
++				throw InvalidInputException("Frozen Iceberg position delete field has an invalid type");
++			}
++			target_types.push_back(type);
++		} else {
++			for (auto &column : columns) {
++				if (column.field_id == id) {
++					auto &source = types[found->second];
++					auto &target = column.type;
++					bool promotion = source.id() == LogicalTypeId::INTEGER && target.id() == LogicalTypeId::BIGINT;
++					if (source.id() == LogicalTypeId::DECIMAL && target.id() == LogicalTypeId::DECIMAL) {
++						promotion = DecimalType::GetScale(source) == DecimalType::GetScale(target) &&
++						            DecimalType::GetWidth(source) <= DecimalType::GetWidth(target);
++					}
++					if (source != target && !promotion) {
++						throw InvalidInputException(
++						    "Frozen Iceberg equality delete physical type does not match its field schema");
++					}
++					target_types.push_back(column.type);
++					break;
++				}
++			}
++		}
++	}
++	auto parsed = make_shared_ptr<VaneIcebergParsedDeletes>();
++	DataChunk chunk;
++	chunk.Initialize(context, types);
++	idx_t count = 0;
++	while (true) {
++		chunk.Reset();
++		TableFunctionInput function_input(bind.get(), local.get(), global.get());
++		function.function(context, function_input, chunk);
++		if (chunk.size() == 0) {
++			break;
++		}
++		for (idx_t row = 0; row < chunk.size(); row++) {
++			if (file.content == 1) {
++				auto path = chunk.GetValue(selected[0], row);
++				auto position = chunk.GetValue(selected[1], row);
++				if (path.IsNull() || position.IsNull() || position.GetValue<int64_t>() < 0) {
++					throw InvalidInputException(
++					    "Frozen Iceberg position delete requires a path and nonnegative position");
++				}
++				auto raw_path = path.GetValue<string>();
++				VaneValidateIcebergPath(raw_path);
++				if (!file.referenced_data_file.empty() && raw_path != file.referenced_data_file) {
++					throw InvalidInputException(
++					    "Frozen Iceberg position delete does not match its referenced data file");
++				}
++				parsed->data_paths.push_back(std::move(raw_path));
++				parsed->positions.push_back(position.GetValue<int64_t>());
++			} else {
++				vector<Value> values;
++				for (idx_t column = 0; column < selected.size(); column++) {
++					auto value = chunk.GetValue(selected[column], row);
++					values.push_back(value.IsNull() ? Value(target_types[column])
++					                                : value.DefaultCastAs(target_types[column]));
++				}
++				parsed->equality_buckets[VaneIcebergEqualityHash(values)].push_back(parsed->equality_rows.size());
++				parsed->equality_rows.push_back(std::move(values));
++			}
++		}
++		count += chunk.size();
++	}
++	if (count != static_cast<uint64_t>(file.record_count)) {
++		throw InvalidInputException("Frozen Iceberg delete record count does not match its manifest");
++	}
++	return parsed;
++}
++
++} // namespace duckdb
+diff --git a/src/planning/vane_iceberg_frozen_scan.cpp b/src/planning/vane_iceberg_frozen_scan.cpp
+--- a/src/planning/vane_iceberg_frozen_scan.cpp
++++ b/src/planning/vane_iceberg_frozen_scan.cpp
+@@ -1,10 +1,13 @@
++// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+ // SPDX-FileCopyrightText: 2026 Vane contributors
+-// SPDX-License-Identifier: Apache-2.0
++// SPDX-License-Identifier: MIT AND Apache-2.0
++// Modified by Vane contributors; equality projection preserves the pinned Iceberg optimizer's contract.
+ 
+ #include "planning/vane_iceberg_frozen_scan.hpp"
+ 
+ #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+ #include "planning/iceberg_multi_file_reader.hpp"
++#include "planning/vane_iceberg_delete_state.hpp"
+ #include "parquet_multi_file_info.hpp"
+ 
+ #include "duckdb/common/limits.hpp"
+@@ -14,12 +17,16 @@
+ #include "duckdb/common/serializer/memory_stream.hpp"
+ #include "duckdb/function/distributed_table_function.hpp"
+ #include "duckdb/parser/expression/constant_expression.hpp"
++#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
++#include "duckdb/function/function_binder.hpp"
++#include "duckdb/planner/operator/logical_filter.hpp"
++#include "duckdb/planner/operator/logical_get.hpp"
+ 
+ namespace duckdb {
+ namespace {
+ 
+-static constexpr uint32_t FROZEN_BIND_VERSION = 2;
+-static constexpr uint32_t FROZEN_ASSIGNMENT_VERSION = 2;
++static constexpr uint32_t FROZEN_BIND_VERSION = 3;
++static constexpr uint32_t FROZEN_ASSIGNMENT_VERSION = 3;
+ static string FileSplitID(uint64_t ordinal) {
+ 	return "file-" + std::to_string(ordinal);
+ }
+@@ -41,12 +48,20 @@
+ 	int32_t partition_spec_id = 0;
+ 	vector<int32_t> source_ids;
+ 	vector<Value> constants;
++	int64_t sequence_number = 0;
++	int64_t record_count = 0;
++	VaneIcebergPartition partition;
++	vector<VaneIcebergDeleteFile> deletes;
+ 
+ 	void Serialize(Serializer &serializer) const {
+ 		serializer.WriteProperty(1, "path", path);
+ 		serializer.WriteProperty(2, "partition_spec_id", partition_spec_id);
+ 		serializer.WriteProperty(3, "partition_source_ids", source_ids);
+ 		serializer.WriteProperty(4, "partition_constants", constants);
++		serializer.WriteProperty(5, "sequence_number", sequence_number);
++		serializer.WriteProperty(6, "record_count", record_count);
++		serializer.WriteProperty(7, "partition", partition);
++		serializer.WriteProperty(8, "delete_files", deletes);
+ 	}
+ 	static FrozenDataFile Deserialize(Deserializer &deserializer) {
+ 		FrozenDataFile file;
+@@ -54,6 +69,10 @@
+ 		file.partition_spec_id = deserializer.ReadProperty<int32_t>(2, "partition_spec_id");
+ 		file.source_ids = deserializer.ReadProperty<vector<int32_t>>(3, "partition_source_ids");
+ 		file.constants = deserializer.ReadProperty<vector<Value>>(4, "partition_constants");
++		file.sequence_number = deserializer.ReadProperty<int64_t>(5, "sequence_number");
++		file.record_count = deserializer.ReadProperty<int64_t>(6, "record_count");
++		file.partition = deserializer.ReadProperty<VaneIcebergPartition>(7, "partition");
++		file.deletes = deserializer.ReadProperty<vector<VaneIcebergDeleteFile>>(8, "delete_files");
+ 		return file;
+ 	}
+ };
+@@ -67,22 +86,35 @@
+ }
+ 
+ struct FrozenIcebergFileList : public SimpleMultiFileList {
+-	FrozenIcebergFileList(FrozenIdentity identity, vector<FrozenDataFile> files)
+-	    : SimpleMultiFileList(FilePaths(files)), identity(std::move(identity)), data_files(std::move(files)) {
++	FrozenIcebergFileList(FrozenIdentity identity, vector<FrozenDataFile> files,
++	                      vector<VaneIcebergDeleteColumn> delete_columns)
++	    : SimpleMultiFileList(FilePaths(files)), identity(std::move(identity)), data_files(std::move(files)),
++	      delete_columns(std::move(delete_columns)) {
+ 	}
+ 	FrozenIdentity identity;
+ 	const vector<FrozenDataFile> data_files;
++	const vector<VaneIcebergDeleteColumn> delete_columns;
++	mutable mutex delete_lock;
++	mutable map<string, pair<VaneIcebergDeleteFile, shared_ptr<const VaneIcebergParsedDeletes>>> parsed_deletes;
++
++	shared_ptr<const VaneIcebergParsedDeletes> ReadDeletes(ClientContext &context,
++	                                                       const VaneIcebergDeleteFile &file) const {
++		lock_guard<mutex> guard(delete_lock);
++		auto found = parsed_deletes.find(file.path);
++		if (found != parsed_deletes.end()) {
++			if (!file.Equals(found->second.first)) {
++				throw SerializationException("Frozen Iceberg delete-file identity changed within an assignment");
++			}
++			return found->second.second;
++		}
++		auto result = VaneReadIcebergDeletes(context, file, delete_columns);
++		parsed_deletes.emplace(file.path, std::make_pair(file, result));
++		return result;
++	}
+ };
+ 
+ static void ValidatePath(const string &path) {
+-	const bool absolute = StringUtil::StartsWith(path, "/") || StringUtil::StartsWith(path, "\\\\") ||
+-	                      (path.size() >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'));
+-	if (path.empty() || path.find('\0') != string::npos || (!StringUtil::StartsWith(path, "file:///") && !absolute)) {
+-		throw NotImplementedException("Frozen Iceberg transport requires absolute local data-file paths");
+-	}
+-	if (path.find("://") != string::npos && !StringUtil::StartsWith(path, "file:///")) {
+-		throw NotImplementedException("Frozen Iceberg transport currently supports local data files only");
+-	}
++	VaneValidateIcebergPath(path);
+ }
+ 
+ static FrozenIdentity FreezeIdentity(const MultiFileBindData &bind) {
+@@ -114,9 +146,6 @@
+ 			}
+ 		}
+ 	}
+-	if (files.HasDeleteManifestsForTransport()) {
+-		throw NotImplementedException("Frozen Iceberg transport does not yet support delete manifests");
+-	}
+ 	if (!metadata.mappings.empty()) {
+ 		throw NotImplementedException("Frozen Iceberg transport does not yet support name mappings");
+ 	}
+@@ -214,9 +243,35 @@
+ 	return reader;
+ }
+ 
+-static void ValidateFile(const FrozenDataFile &file, const MultiFileReaderBindData &reader) {
++static vector<VaneIcebergDeleteColumn> FrozenDeleteColumns(const MultiFileBindData &bind) {
++	if (auto frozen = dynamic_cast<const FrozenIcebergFileList *>(bind.file_list.get())) {
++		return frozen->delete_columns;
++	}
++	return VaneFreezeIcebergDeleteColumns(bind.file_list->Cast<IcebergMultiFileList>(), bind.reader_bind.schema);
++}
++
++static void ValidateDeleteColumns(const vector<VaneIcebergDeleteColumn> &columns,
++                                  const MultiFileReaderBindData &reader) {
++	set<int32_t> seen;
++	for (auto &column : columns) {
++		column.Validate();
++		if (!seen.insert(column.field_id).second) {
++			throw SerializationException("Frozen Iceberg equality schema has duplicate field IDs");
++		}
++		for (auto &selected : reader.schema) {
++			if (selected.GetIdentifierFieldId() == column.field_id && selected.type != column.type) {
++				throw SerializationException("Frozen Iceberg equality field type does not match the selected schema");
++			}
++		}
++	}
++}
++
++static void ValidateFile(const FrozenDataFile &file, const MultiFileReaderBindData &reader,
++                         const vector<VaneIcebergDeleteColumn> &delete_columns) {
+ 	ValidatePath(file.path);
+-	if (file.partition_spec_id < 0 || file.source_ids.size() != file.constants.size()) {
++	file.partition.Validate();
++	if (file.partition_spec_id < 0 || file.partition.spec_id != file.partition_spec_id || file.sequence_number < 0 ||
++	    file.record_count < 0 || file.source_ids.size() != file.constants.size()) {
+ 		throw SerializationException("Invalid frozen Iceberg partition state");
+ 	}
+ 	set<int32_t> seen;
+@@ -232,8 +287,39 @@
+ 				break;
+ 			}
+ 		}
+-		if (!column || column->type != file.constants[index].type()) {
++		bool matches = column && column->type == file.constants[index].type();
++		for (auto &deleted : delete_columns) {
++			matches = matches || (deleted.field_id == id && deleted.type == file.constants[index].type());
++		}
++		if (!matches) {
+ 			throw SerializationException("Frozen Iceberg partition constant does not match the frozen field schema");
++		}
++	}
++	set<string> delete_paths;
++	for (auto &deleted : file.deletes) {
++		deleted.Validate(delete_columns);
++		if (!delete_paths.insert(deleted.path).second ||
++		    !deleted.AppliesTo(file.path, file.sequence_number, file.partition)) {
++			throw SerializationException("Frozen Iceberg delete does not apply to its assigned data file");
++		}
++	}
++}
++
++static void ValidateFiles(const vector<FrozenDataFile> &files, const MultiFileReaderBindData &reader,
++                          const vector<VaneIcebergDeleteColumn> &columns) {
++	map<string, VaneIcebergDeleteFile> deletes;
++	set<string> paths;
++	for (auto &file : files) {
++		ValidateFile(file, reader, columns);
++		if (!paths.insert(file.path).second) {
++			throw SerializationException("Frozen Iceberg snapshot contains duplicate data-file paths");
++		}
++		for (auto &deleted : file.deletes) {
++			auto found = deletes.find(deleted.path);
++			if (found != deletes.end() && !found->second.Equals(deleted)) {
++				throw SerializationException("Frozen Iceberg assignment contains conflicting delete-file identities");
++			}
++			deletes.emplace(deleted.path, deleted);
+ 		}
+ 	}
+ }
+@@ -250,6 +336,11 @@
+ 		throw SerializationException("Frozen Iceberg file enumeration is incomplete");
+ 	}
+ 	auto &live = bind.file_list->Cast<IcebergMultiFileList>();
++	auto delete_columns = FrozenDeleteColumns(bind);
++	auto deletes = VaneFreezeIcebergDeleteFiles(live);
++	for (auto &deleted : deletes) {
++		deleted.Validate(delete_columns);
++	}
+ 	vector<FrozenDataFile> files;
+ 	for (idx_t index = 0; index < paths.size(); index++) {
+ 		FrozenDataFile file;
+@@ -262,6 +353,14 @@
+ 		}
+ 		file.partition_spec_id = spec->second.spec_id;
+ 		auto &data = entry.entry.data_file;
++		file.sequence_number = entry.entry.GetSequenceNumber(manifest);
++		file.record_count = data.record_count;
++		file.partition = VaneFreezeIcebergPartition(live.GetMetadata(), file.partition_spec_id, data);
++		for (auto &deleted : deletes) {
++			if (deleted.AppliesTo(file.path, file.sequence_number, file.partition)) {
++				file.deletes.push_back(deleted);
++			}
++		}
+ 		for (auto &field : spec->second.fields) {
+ 			if (field.transform != IcebergTransformType::IDENTITY) {
+ 				// A transformed value cannot reconstruct its source column.
+@@ -275,7 +374,16 @@
+ 					break;
+ 				}
+ 			}
++			optional_ptr<const VaneIcebergDeleteColumn> deleted_column;
+ 			if (!column) {
++				for (auto &candidate : delete_columns) {
++					if (static_cast<uint64_t>(candidate.field_id) == field.source_id) {
++						deleted_column = &candidate;
++						break;
++					}
++				}
++			}
++			if (!column && !deleted_column) {
+ 				// Old specs remain valid after their source is dropped. Only
+ 				// recover constants that belong to the selected reader schema.
+ 				if (field.source_id > 0 && field.source_id <= NumericLimits<int32_t>::Maximum() &&
+@@ -288,16 +396,17 @@
+ 				if (value.field_id != field.partition_field_id) {
+ 					continue;
+ 				}
+-				file.source_ids.push_back(column->identifier.GetValue<int32_t>());
+-				file.constants.push_back(
+-				    value.value.IsNull() ? Value(column->type)
+-				                         : IcebergMultiFileReader::TransformPartitionValue(value.value, column->type));
++				auto type = column ? column->type : deleted_column->type;
++				file.source_ids.push_back(static_cast<int32_t>(field.source_id));
++				file.constants.push_back(value.value.IsNull()
++				                             ? Value(type)
++				                             : IcebergMultiFileReader::TransformPartitionValue(value.value, type));
+ 				// The pinned manifest decoder can materialize the same field
+ 				// more than once when historical specs reuse its field ID.
+ 				break;
+ 			}
+ 		}
+-		ValidateFile(file, bind.reader_bind);
++		ValidateFile(file, bind.reader_bind, delete_columns);
+ 		files.push_back(std::move(file));
+ 	}
+ 	return files;
+@@ -336,6 +445,12 @@
+ 	return deserializer.ReadProperty<vector<FrozenDataFile>>(id, "data_files");
+ }
+ 
++struct FrozenDeleteReaderState : public MultiFileReaderGlobalState {
++	FrozenDeleteReaderState(const FrozenIcebergFileList &files) : MultiFileReaderGlobalState({}, &files) {
++	}
++	map<int32_t, idx_t> output_ids;
++};
++
+ struct FrozenIcebergReader : public MultiFileReader {
+ 	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &) {
+ 		return make_uniq<FrozenIcebergReader>();
+@@ -364,7 +479,17 @@
+ 		if (frozen.identity.role == FrozenRole::UNASSIGNED_WORKER) {
+ 			throw InvalidInputException("Frozen Iceberg worker requires an explicit scan assignment");
+ 		}
+-		return MultiFileReader::InitializeGlobalState(context, options, bind, files, columns, ids);
++		auto result = make_uniq<FrozenDeleteReaderState>(frozen);
++		for (idx_t output = 0; output < ids.size(); output++) {
++			if (!ids[output].IsVirtualColumn()) {
++				auto index = ids[output].GetPrimaryIndex();
++				if (index >= bind.schema.size()) {
++					throw SerializationException("Frozen Iceberg reader references an unknown output column");
++				}
++				result->output_ids.emplace(bind.schema[index].GetIdentifierFieldId(), output);
++			}
++		}
++		return std::move(result);
+ 	}
+ 	ReaderInitializeType InitializeReader(MultiFileReaderData &reader_data, const MultiFileBindData &bind,
+ 	                                      const vector<MultiFileColumnDefinition> &columns,
+@@ -378,6 +503,25 @@
+ 			throw SerializationException("Frozen Iceberg reader has no assigned file state");
+ 		}
+ 		auto &file = list.data_files[file_index];
++		auto position_filter = make_uniq<VaneIcebergPositionFilter>();
++		for (auto &deleted : file.deletes) {
++			if (deleted.content != 1) {
++				continue;
++			}
++			auto parsed = list.ReadDeletes(context, deleted);
++			for (idx_t row = 0; row < parsed->positions.size(); row++) {
++				if (parsed->data_paths[row] == file.path) {
++					if (parsed->positions[row] >= file.record_count) {
++						throw InvalidInputException(
++						    "Frozen Iceberg position delete exceeds the data-file record count");
++					}
++					position_filter->positions.insert(parsed->positions[row]);
++				}
++			}
++		}
++		if (!position_filter->positions.empty()) {
++			reader_data.reader->deletion_filter = std::move(position_filter);
++		}
+ 		set<int32_t> physical_ids;
+ 		for (auto &column : reader_data.reader->GetColumns()) {
+ 			if (!column.identifier.IsNull()) {
+@@ -402,6 +546,73 @@
+ 		}
+ 		return CreateMapping(context, reader_data, columns, ids, filters, gstate.file_list, bind.reader_bind,
+ 		                     bind.virtual_columns);
++	}
++	void FinalizeChunk(ClientContext &context, const MultiFileBindData &bind, BaseFileReader &reader,
++	                   const MultiFileReaderData &reader_data, DataChunk &input, DataChunk &output,
++	                   ExpressionExecutor &executor, optional_ptr<MultiFileReaderGlobalState> state) override {
++		MultiFileReader::FinalizeChunk(context, bind, reader, reader_data, input, output, executor, state);
++		auto &list = bind.file_list->Cast<FrozenIcebergFileList>();
++		auto &file = list.data_files[reader.file_list_idx.GetIndex()];
++		auto &mapping = state->Cast<FrozenDeleteReaderState>().output_ids;
++		struct EqualityGroup {
++			vector<idx_t> columns;
++			shared_ptr<const VaneIcebergParsedDeletes> parsed;
++		};
++		vector<EqualityGroup> groups;
++		for (auto &deleted : file.deletes) {
++			if (deleted.content != 2) {
++				continue;
++			}
++			EqualityGroup group;
++			group.parsed = list.ReadDeletes(context, deleted);
++			for (auto id : deleted.equality_ids) {
++				auto found = mapping.find(id);
++				if (found == mapping.end() || found->second >= output.ColumnCount()) {
++					throw SerializationException("Frozen Iceberg equality delete column was not projected");
++				}
++				group.columns.push_back(found->second);
++			}
++			groups.push_back(std::move(group));
++		}
++		if (groups.empty()) {
++			return;
++		}
++		SelectionVector selection(STANDARD_VECTOR_SIZE);
++		idx_t count = 0;
++		for (idx_t row = 0; row < output.size(); row++) {
++			bool removed = false;
++			for (auto &group : groups) {
++				vector<Value> key;
++				for (auto column : group.columns) {
++					key.push_back(output.GetValue(column, row));
++				}
++				auto bucket = group.parsed->equality_buckets.find(VaneIcebergEqualityHash(key));
++				if (bucket == group.parsed->equality_buckets.end()) {
++					continue;
++				}
++				for (auto deleted_row : bucket->second) {
++					auto &values = group.parsed->equality_rows[deleted_row];
++					bool matches = true;
++					for (idx_t column = 0; column < key.size(); column++) {
++						if (!Value::NotDistinctFrom(key[column], values[column])) {
++							matches = false;
++							break;
++						}
++					}
++					if (matches) {
++						removed = true;
++						break;
++					}
++				}
++				if (removed) {
++					break;
++				}
++			}
++			if (!removed) {
++				selection.set_index(count++, row);
++			}
++		}
++		output.Slice(selection, count);
+ 	}
+ 	unique_ptr<Expression> GetVirtualColumnExpression(ClientContext &context, MultiFileReaderData &reader,
+ 	                                                  const vector<MultiFileColumnDefinition> &columns, idx_t &column,
+@@ -419,7 +630,7 @@
+                                                  vector<LogicalType> types, vector<string> names,
+                                                  vector<string> table_columns, MultiFileReaderBindData reader_bind,
+                                                  ParquetOptionsSerialization parquet_options, idx_t row_groups,
+-                                                 idx_t cardinality) {
++                                                 idx_t cardinality, vector<VaneIcebergDeleteColumn> delete_columns) {
+ 	if (identity.role == FrozenRole::UNASSIGNED_WORKER && !files.empty()) {
+ 		throw SerializationException("Frozen Iceberg worker bind cannot retain coordinator files");
+ 	}
+@@ -431,12 +642,12 @@
+ 		throw NotImplementedException(
+ 		    "Frozen Iceberg transport does not support alternate Parquet schemas or encryption");
+ 	}
+-	for (auto &file : files) {
+-		ValidateFile(file, reader_bind);
+-	}
++	ValidateDeleteColumns(delete_columns, reader_bind);
++	ValidateFiles(files, reader_bind, delete_columns);
+ 	auto result = make_uniq<MultiFileBindData>();
+ 	result->multi_file_reader = make_uniq<FrozenIcebergReader>();
+-	result->file_list = make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files));
++	result->file_list =
++	    make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files), std::move(delete_columns));
+ 	result->interface = make_uniq<ParquetMultiFileInfo>();
+ 	ParquetMultiFileInfo::DeserializeBindData(*result, std::move(parquet_options), row_groups, cardinality);
+ 	result->types = std::move(types);
+@@ -463,7 +674,7 @@
+ 	// Select owned format/schema state only. No source context, catalog, cache,
+ 	// initial reader or coordinator file collection enters this worker bind.
+ 	return RestoreBind(std::move(identity), {}, source.types, source.names, source.table_columns, source.reader_bind,
+-	                   std::move(options), groups, cardinality);
++	                   std::move(options), groups, cardinality, FrozenDeleteColumns(source));
+ }
+ 
+ static vector<DistributedScanSplit> PlanFileSplits(const TableFunctionDistributedScanPlanningInput &input) {
+@@ -531,7 +742,7 @@
+ 		if (stream.GetPosition() != payload.size()) {
+ 			throw SerializationException("Frozen Iceberg assignment has trailing bytes");
+ 		}
+-		ValidateFile(file, bind.reader_bind);
++		ValidateFile(file, bind.reader_bind, list.delete_columns);
+ 		if (!identity.has_snapshot || split.split_id != FileSplitID(ordinal)) {
+ 			throw SerializationException("Frozen Iceberg assignment has an invalid file identity");
+ 		}
+@@ -544,14 +755,90 @@
+ 	for (auto &entry : assigned_files) {
+ 		files.push_back(std::move(entry.second));
+ 	}
++	ValidateFiles(files, bind.reader_bind, list.delete_columns);
+ 	identity.role = FrozenRole::ASSIGNED_WORKER;
+-	bind.file_list = make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files));
++	bind.file_list = make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files), list.delete_columns);
+ }
+ 
+ } // namespace
+ 
+ bool VaneIsFrozenIcebergList(const MultiFileList &files) {
+ 	return dynamic_cast<const FrozenIcebergFileList *>(&files) != nullptr;
++}
++
++void VanePrepareFrozenIcebergDeletes(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
++	for (auto &child : plan->children) {
++		VanePrepareFrozenIcebergDeletes(context, child);
++	}
++	if (plan->type != LogicalOperatorType::LOGICAL_GET) {
++		return;
++	}
++	auto &get = plan->Cast<LogicalGet>();
++	if (get.function.get_multi_file_reader != FrozenIcebergReader::CreateInstance || !get.bind_data) {
++		return;
++	}
++	auto &bind = get.bind_data->Cast<MultiFileBindData>();
++	auto &list = bind.file_list->Cast<FrozenIcebergFileList>();
++	if (list.delete_columns.empty()) {
++		return;
++	}
++	vector<unique_ptr<Expression>> arguments;
++	for (auto &deleted : list.delete_columns) {
++		idx_t index = DConstants::INVALID_INDEX;
++		for (idx_t current = 0; current < bind.reader_bind.schema.size(); current++) {
++			if (bind.reader_bind.schema[current].GetIdentifierFieldId() == deleted.field_id) {
++				index = current;
++				break;
++			}
++		}
++		if (index == DConstants::INVALID_INDEX) {
++			index = bind.types.size();
++			auto name = "__vane_delete_field_" + std::to_string(deleted.field_id);
++			MultiFileColumnDefinition column(name, deleted.type);
++			column.identifier = Value::INTEGER(deleted.field_id);
++			column.default_expression = make_uniq<ConstantExpression>(Value(deleted.type));
++			bind.types.push_back(deleted.type);
++			bind.names.push_back(name);
++			bind.table_columns.push_back(name);
++			bind.columns.push_back(column);
++			bind.reader_bind.schema.push_back(column);
++			get.returned_types.push_back(deleted.type);
++			get.names.push_back(name);
++		}
++		idx_t local = DConstants::INVALID_INDEX;
++		for (idx_t current = 0; current < get.GetColumnIds().size(); current++) {
++			auto &id = get.GetColumnIds()[current];
++			if (!id.IsVirtualColumn() && id.GetPrimaryIndex() == index) {
++				local = current;
++				break;
++			}
++		}
++		if (local == DConstants::INVALID_INDEX) {
++			local = get.GetColumnIds().size();
++			get.AddColumnId(index);
++		}
++		if (!get.projection_ids.empty() &&
++		    std::find(get.projection_ids.begin(), get.projection_ids.end(), local) == get.projection_ids.end()) {
++			get.projection_ids.push_back(local);
++		}
++		arguments.push_back(make_uniq<BoundColumnRefExpression>(deleted.type, ColumnBinding(get.table_index, local)));
++	}
++	// Keep required fields through normal pruning, including count(*) and
++	// projections that do not mention a delete column. This pure-true volatile
++	// guard is the provider's existing equality-delete projection contract.
++	auto &catalog = Catalog::GetSystemCatalog(context);
++	auto &entry =
++	    catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "iceberg_verify_equality_deletes");
++	vector<LogicalType> types;
++	for (auto &argument : arguments) {
++		types.push_back(argument->return_type);
++	}
++	auto function = entry.functions.GetFunctionByArguments(context, types);
++	FunctionBinder binder(context);
++	auto filter = make_uniq<LogicalFilter>();
++	filter->expressions.push_back(binder.BindScalarFunction(function, std::move(arguments)));
++	filter->children.push_back(std::move(plan));
++	plan = std::move(filter);
+ }
+ 
+ void VaneIcebergScanSerialize(Serializer &serializer, optional_ptr<FunctionData> data, const TableFunction &) {
+@@ -577,6 +864,7 @@
+ 	serializer.WriteProperty(1008, "parquet_options", options);
+ 	serializer.WriteProperty(1009, "initial_row_groups", groups);
+ 	serializer.WriteProperty(1010, "initial_cardinality", cardinality);
++	serializer.WriteProperty(1011, "delete_columns", FrozenDeleteColumns(bind));
+ }
+ 
+ unique_ptr<FunctionData> VaneIcebergScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+@@ -600,19 +888,20 @@
+ 	auto options = deserializer.ReadProperty<ParquetOptionsSerialization>(1008, "parquet_options");
+ 	auto groups = deserializer.ReadProperty<idx_t>(1009, "initial_row_groups");
+ 	auto cardinality = deserializer.ReadProperty<idx_t>(1010, "initial_cardinality");
++	auto delete_columns = deserializer.ReadProperty<vector<VaneIcebergDeleteColumn>>(1011, "delete_columns");
+ 	// LogicalGet owns this function copy. Mark it as the detached reader before
+ 	// reoptimization so live-catalog optimizers cannot interpret the frozen list
+ 	// as an IcebergMultiFileList or retain an old IcebergScanInfo.
+ 	function.get_multi_file_reader = FrozenIcebergReader::CreateInstance;
+ 	function.function_info.reset();
+ 	return RestoreBind(std::move(identity), std::move(files), std::move(types), std::move(names), std::move(columns),
+-	                   std::move(reader), std::move(options), groups, cardinality);
++	                   std::move(reader), std::move(options), groups, cardinality, std::move(delete_columns));
+ }
+ 
+ TableFunctionDistributedScanCallbacks VaneIcebergFrozenScanCallbacks() {
+ 	TableFunctionDistributedScanCallbacks result;
+ 	result.protocol_version = 1;
+-	result.split_codec = {"vane.iceberg.frozen-file-scan", 2};
++	result.split_codec = {"vane.iceberg.frozen-file-scan", 3};
+ 	result.plan_splits = PlanFileSplits;
+ 	result.create_worker_bind = CreateWorkerBind;
+ 	result.apply_splits = ApplyFileSplits;

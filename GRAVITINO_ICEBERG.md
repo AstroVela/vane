@@ -16,6 +16,8 @@ transformed-partition reads, tracked in
 [#1077](https://github.com/AstroVela/vane/issues/1077). M5c2b adds supported
 flat schema evolution, tracked in
 [#1079](https://github.com/AstroVela/vane/issues/1079).
+M5c3 adds committed v2 position/equality delete reads, tracked in
+[#1081](https://github.com/AstroVela/vane/issues/1081).
 M3's general Iceberg capability flags remain conservative; this record covers
 the explicitly qualified provider, service, runner and feature combinations.
 
@@ -190,8 +192,8 @@ An omitted snapshot ID delegates selection to the native transaction. An
 explicit positive signed 64-bit integer selects that exact snapshot through
 native `AT (VERSION => ...)`; a missing snapshot fails instead of reading the
 latest version. Booleans, strings, zero, negative and overflowing IDs are
-rejected. Timestamp-based selection and snapshot/schema-evolution combinations
-are not part of this interface's qualified matrix.
+rejected. Timestamp-based selection remains unqualified. Snapshot/schema
+evolution combinations are covered by M5c2b and M5c3 below.
 
 `IcebergCatalog(connection, name)` wraps an existing READ_ONLY Iceberg
 attachment. It rejects writable, missing and other catalog types. Wrappers
@@ -688,6 +690,101 @@ mappings retain explicit guards. Remote storage, v3/non-null defaults,
 authentication and writes remain separate. Ray's existing Arrow result-type
 policy remains in force.
 
+## Position and equality deletes (M5c3)
+
+The seventh ordered patch, `iceberg-vane-deletes.patch`, freezes committed v2
+Parquet delete-file descriptors with each independently assignable data file.
+Its SHA-256 is
+`4863d1f57d116882698539bb0a911e968584b2cadd5345b2624ed7a6df4cf56a`.
+All six predecessor patches, provider/SDK pins and engine identities are
+unchanged. This stage follows Iceberg's [scan planning](https://iceberg.apache.org/spec/#scan-planning)
+and [delete formats](https://iceberg.apache.org/spec/#delete-formats).
+
+The coordinator captures the selected snapshot's data sequence, record count
+and complete partition key for each data file, plus only the delete files that
+apply to it. A descriptor owns its exact path, content, data sequence, record
+count/size, spec/partition tuple, optional referenced data file and equality
+field IDs. File paths are compared exactly and case-sensitively. Workers
+require both the selected data and delete files to remain accessible at the
+same absolute local paths, following Iceberg's immutable-file contract. They
+never reread catalog metadata/manifests or discover newer delete files. A
+missing file fails explicitly rather than returning undeleted rows.
+
+| Delete kind | Applicability and execution |
+| --- | --- |
+| Position | Matching partition spec/values, data sequence less than or equal to delete sequence, optional referenced file match, then exact target path and zero-based row position |
+| Equality | Data sequence strictly less than delete sequence, matching spec/partition or an unpartitioned global delete, and NULL-safe equality of every selected field ID in a delete row |
+| Multiple files/rows | Union of applicable deletes, duplicate positions/keys allowed; removed manifest entries and uncommitted files do not enter the frozen state |
+| Evolution | Historical specs retain their own keys; dropped equality fields remain hidden scan inputs; reused names have distinct IDs; added fields missing from old files read as NULL |
+| Type promotion | Old equality values use the selected field type, including INTEGER to BIGINT and same-scale decimal precision widening; a later dropped field keeps its widest retained type |
+
+Frozen bind, assignment and file codec versions are now **3**. Earlier versions
+are rejected; the generic distributed callback protocol stays at **1**. Worker
+binds retain the equality field-ID/type declarations but no coordinator files
+or decoded delete cache. Assignment decoding validates all file state before
+installing it, including nonnegative sequences/counts, partition consistency,
+applicability, known unique equality IDs and conflicting delete identities.
+Explicit empty assignments clear all files. Physical delete fields are resolved
+by Parquet field IDs and checked for compatible types; positions must be
+nonnegative and below the referenced data file's record count. Delete record
+counts must agree with the manifest.
+
+Each worker assignment decodes a selected delete file once into owned immutable
+cached data. Position filters use original Parquet row positions across vector
+and row-group boundaries. Equality rows use hash buckets followed by exact
+NULL-safe tuple comparisons. A provider optimizer guard preserves required
+fields through projection and count pruning without exposing dropped fields in
+the public relation. Replacement attempts rebuild their own state from the same
+descriptors. No generic Local/Ray scheduler or protocol implementation changes
+are needed.
+
+The live local reader receives the corresponding fixes: NULL-safe equality and
+partition comparison, whole-file partition rejection, hidden-field indexes
+that are column positions rather than field IDs, promoted delete constants,
+position field-ID decoding, exact target paths and sequence/partition-scoped
+position filters. Existing write/delete-authoring behavior is not qualified by
+these read-path changes.
+
+Ten independent fixture tables cover large multi-row-group positions, duplicate
+positions and case-distinct paths, older/equal/newer sequence boundaries,
+nullable and multi-column equality keys, NULL partition isolation, global
+deletes and spec evolution, dropped/reused/added equality fields, INTEGER/decimal
+promotion with date/boolean keys, all-deleted output and removal of active delete
+manifests. Current and pre-delete/intermediate snapshots are compared separately.
+PyIceberg writes Parquet/Avro and commits through the real REST service; fixture
+checks verify the emitted field IDs, content, partitions and data/file sequences.
+The pinned SDK cannot execute equality-delete scans. A separate reference
+evaluator therefore reads its manifests and Parquet through Arrow and applies
+the specification's predicates. An additional SDK scan checks the supported
+position-delete fixture. No expected result comes from Vane.
+
+Related installed tests cover public local/Ray rows, projection, filters,
+aggregation and old snapshots; closed-REST/unavailable-metadata replay; later
+independent delete/append commits; disjoint assignments; worker replacement;
+cancellation and query/session cleanup. Negative cases include missing delete
+files, invalid positions, malformed owned delete descriptors, stale wire
+versions and an invalid later assignment before any data file is opened.
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_delete_scan_live.py \
+  tests/fast/test_iceberg_schema_scan_live.py tests/fast/test_iceberg_transform_scan_live.py \
+  tests/fast/test_iceberg_partition_scan_live.py tests/fast/test_iceberg_frozen_scan_live.py \
+  tests/fast/test_iceberg_catalog_live.py tests/fast/test_gravitino_iceberg_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_delete_ray_live.py \
+  tests/fast/test_iceberg_schema_ray_live.py tests/fast/test_iceberg_transform_ray_live.py \
+  tests/fast/test_iceberg_partition_ray_live.py tests/fast/test_iceberg_ray_scan_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_catalog.py
+```
+
+The user's validation scope remains affected tests only, in separate native and
+real-Ray pytest processes with normal object-store sizing. Verify the seven
+ordered patches against compiled sources, source/SDK notices and SPDX, formatting,
+source archive and untouched original workspace. Qualification remains Linux
+x86-64, same-host shared absolute local paths and committed v2 flat Parquet
+schemas/history. Nested/name mappings, Puffin/deletion vectors/v3, remote
+storage, authentication, writes and production provider delivery remain separate.
+Ray's existing Arrow result-type policy still applies.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
@@ -697,7 +794,7 @@ policy remains in force.
 | M5c1: identity partitions | Owned per-file constants, omitted-column recovery, historical identity specs, real Ray replay and lifecycle checks as above |
 | M5c2a: transformed partitions | Known time/bucket/truncate/void specs, original-value reads, mixed historical specs and real-Ray lifecycle checks above |
 | M5c2b: schema evolution | Field-ID mapping for column add/drop/rename/reorder, supported type/default semantics and old-snapshot coverage |
-| M5c3: deletes | Freeze position/equality delete state with correct file/sequence/partition applicability, NULL matching and retry semantics |
+| M5c3: deletes | Committed v2 position/equality descriptors, exact applicability, hidden field-ID mapping, NULL-safe matching and native/real-Ray lifecycle coverage above |
 | Later optional work | Remote shared-storage qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
 The current fixture does not qualify v1/v3 tables, remote storage, catalog

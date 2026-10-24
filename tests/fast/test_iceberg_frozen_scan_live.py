@@ -200,21 +200,17 @@ def test_assignment_from_another_table_cannot_replace_frozen_identity(frozen_tab
             execute_frozen(payload, tables, split_batch=foreign_batch)
 
 
-@pytest.mark.parametrize(
-    ("name", "message"),
-    [
-        ("position_deletes", "delete manifests"),
-        ("equality_deletes", "delete manifests"),
-    ],
-)
-def test_unsupported_transport_remains_a_valid_native_local_read(frozen_tables, name, message):
+@pytest.mark.parametrize("name", ["position_deletes", "equality_deletes"])
+def test_delete_transport_matches_the_existing_native_local_read(frozen_tables, name):
     endpoint, tables, features = frozen_tables
     with connection(tables) as con:
         attach(con, endpoint)
         sql = f'SELECT * FROM lake."{tables.namespace}"."{name}"'
         assert sorted(con.sql(sql).fetchall()) == sorted(features[name].rows)
-        with pytest.raises(ValueError, match=message):
-            freeze(con, sql)
+        payload = freeze(con, sql)
+    with unavailable_metadata(tables):
+        rows, _schema = execute_frozen(payload, tables)
+    assert sorted(rows) == sorted(features[name].rows)
 
 
 def test_existing_flat_evolution_freezes_and_restores(frozen_tables):
@@ -327,7 +323,7 @@ def test_file_assignment_rejects_mismatched_codec_identity_and_path(frozen_table
         committed = tables.catalog.load_table((tables.namespace, "items")).scan().plan_files()
         original = next(task.file.file_path.encode() for task in committed if task.file.file_path.encode() in batch)
         assert original.startswith(b"file:///")
-        replacement, message = b"https://" + original[len(b"file:///") :], "local data-file paths"
+        replacement, message = b"https://" + original[len(b"file:///") :], "local file paths"
     assert len(original) == len(replacement)
     assert batch.count(original) == 1
     with pytest.raises((ValueError, vane.Error), match=message):

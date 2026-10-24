@@ -174,9 +174,16 @@ def test_physical_field_id_wins_over_a_different_partition_constant(partition_ta
         batch = next(batch for batch in batches if "east.点".encode() in batch)
         physical = None
     original, replacement = "east.点".encode(), b"FAKE...."
-    assert len(original) == len(replacement) and batch.count(original) == 1
+    # v3 also retains the raw manifest partition tuple. Change only the
+    # source-ID/constant vector, leaving that independent identity intact.
+    marker = b"\x03\x00\x01\x03\x04\x00\x01"
+    assert batch.count(marker) == 1 and len(original) == len(replacement)
+    start = batch.index(marker)
+    index = batch.index(original, start)
+    assert index - start < 64
+    tampered = batch[:index] + replacement + batch[index + len(original) :]
     with unavailable_metadata(tables):
-        observed, _schema = execute_frozen(payload, tables, split_batch=batch.replace(original, replacement))
+        observed, _schema = execute_frozen(payload, tables, split_batch=tampered)
     assert observed and {row[2] for row in observed} == {"east.点"}
 
 
@@ -260,10 +267,13 @@ def test_partition_assignment_rejects_malformed_owned_constants(partition_tables
     elif tamper == "constant_type":
         # Value.type (100), LogicalType.id (100): VARCHAR 25 -> BLOB 26.
         # Use an ASCII value so BLOB parsing succeeds before schema validation.
-        original, replacement = b"\x64\x00\x64\x00\x19\xff\xff", b"\x64\x00\x64\x00\x1a\xff\xff"
+        # Locate the source-ID/constant pair; v3 also owns a raw partition
+        # tuple containing the same string type later in the file state.
+        original = b"\x03\x00\x01\x03\x04\x00\x01\x64\x00\x64\x00\x19\xff\xff"
+        replacement = b"\x03\x00\x01\x03\x04\x00\x01\x64\x00\x64\x00\x1a\xff\xff"
         message = "does not match the frozen field schema"
     elif tamper == "assignment_version":
-        original, replacement = b"\x01\x00\x02\x02\x00\x01\x00", b"\x01\x00\x01\x02\x00\x01\x00"
+        original, replacement = b"\x01\x00\x03\x02\x00\x01\x00", b"\x01\x00\x02\x02\x00\x01\x00"
         message = "Unsupported frozen Iceberg assignment version"
     else:
         # Three typed source IDs: DATE 2, DECIMAL 3, TIMESTAMP 4 -> 2, 2, 4.
@@ -279,8 +289,8 @@ def test_partition_bind_rejects_the_previous_wire_version(partition_tables):
     with connection(tables) as con:
         attach(con, endpoint)
         payload = freeze(con, f'SELECT * FROM lake."{tables.namespace}".partition_omitted')
-    # Frozen bind property 1000/version 2, followed by property 1001/identity.
-    original, replacement = b"\xe8\x03\x02\xe9\x03\x01\x00", b"\xe8\x03\x01\xe9\x03\x01\x00"
+    # Frozen bind property 1000/version 3, followed by property 1001/identity.
+    original, replacement = b"\xe8\x03\x03\xe9\x03\x01\x00", b"\xe8\x03\x02\xe9\x03\x01\x00"
     assert payload.count(original) == 1
     with pytest.raises((ValueError, vane.Error), match="Unsupported frozen Iceberg bind version"):
         execute_frozen(payload.replace(original, replacement), tables)

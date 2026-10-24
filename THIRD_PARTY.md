@@ -67,6 +67,12 @@ The schema-evolution patch also preserves historical partition decoding and
 conservative filtering after a source is dropped. Its inherited manifest and
 file-list sources retain DuckDB/Vane attribution and MIT AND Apache-2.0 terms;
 the five predecessor patches and all source/SDK grants remain unchanged.
+The delete-state patch also changes the inherited reader, optimizer, file-list
+and delete implementations. Its scanner initialization and equality-column
+preservation follow the pinned reader/optimizer contracts. These implementation
+files retain DuckDB/Vane attribution and MIT AND Apache-2.0 terms; the new
+portable-state header is Vane-owned Apache-2.0. All six predecessor patches and
+the source/SDK license grants remain unchanged.
 Its self-contained Iceberg artifact links the pinned in-tree Parquet
 implementation and retains DuckDB's source and vendored dependency notices,
 using the same notice input set as the base Vane wheel.
