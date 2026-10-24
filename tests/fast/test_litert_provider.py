@@ -34,8 +34,7 @@ def options(tmp_path):
     return {"model_path": str(model), "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest()}
 
 
-@pytest.fixture
-def sdk(monkeypatch):
+def install_sdk(monkeypatch):
     module = ModuleType("litert_lm")
     module.events = []
     module.native_dimensions = 768
@@ -104,6 +103,11 @@ def sdk(monkeypatch):
     module.InputOverflowStrategy = SimpleNamespace(ERROR="error")
     monkeypatch.setitem(sys.modules, "litert_lm", module)
     return module
+
+
+@pytest.fixture
+def sdk(monkeypatch):
+    return install_sdk(monkeypatch)
 
 
 def descriptor(options, kind="text", model=None, dimensions=None):

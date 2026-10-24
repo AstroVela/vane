@@ -146,6 +146,18 @@ it does not add image joint request fields. MLX HTTP/service and cross-request
 batching remain outside this adapter.
 
 For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
+For the persistent LiteRT service, run `tests/fast/test_litert_service.py`
+alongside the service transport tests. It exercises real PyZMQ and shared
+memory with an authored CPU SDK fixture, including fixed encoding identities,
+per-request query/document roles, one SDK-owning thread and cancellation drain.
+Complete two consecutive clean reviews before building/installing the wheel.
+The opt-in `tests/ai/test_litert_embedding_service.py` uses the real checkpoint,
+public APIs and separate service/client processes. It requires the existing
+LiteRT model environment variables and the `embedding_service` extra. GPU cases
+also require `VANE_RUN_LITERT_GPU_TESTS=1` and `-m 'external_service and gpu'`;
+missing prerequisites after opt-in fail without CPU fallback. Run the Context
+service acceptance separately with Ray startup forbidden. No native source is
+changed by this adapter; platform simulation does not qualify a real Mac/Windows host.
 Install the optional `litert` extra, which pins `litert-lm-api==0.18.0`.
 Run `scripts/run_installed_pytest.sh tests/fast/test_litert_provider.py` before
 the base release gate. These CPU contracts require no model SDK or weights.

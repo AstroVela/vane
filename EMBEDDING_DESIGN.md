@@ -583,8 +583,8 @@ vLLM's internal multimodal SHM cache does not implement this external ingress.
 
 ### Explicit service configuration
 
-Milestone 4 implements `runtime="service"` for the registered `sglang` and
-`vllm` providers. The existing default `runtime="native"` still constructs an
+Milestone 4 implements `runtime="service"` for the registered `sglang`,
+`vllm` and `litert` providers. The existing default `runtime="native"` still constructs an
 engine in each owning UDF worker; `runtime="http"` remains the separate encoded
 media protocol. There is no transport detection, local-engine startup by a
 service client, or fallback. A service client reserves zero worker GPUs.
@@ -593,6 +593,10 @@ Install `vane-ai[embedding_service]` in the service and client environments. The
 transport uses PyZMQ over loopback TCP and Python `SharedMemory` on Windows,
 macOS and Linux. Each native model SDK still determines which systems can host
 its engine; the transport does not make SGLang or vLLM engines portable.
+LiteRT clients preserve their native file-hash vector identity and send the
+retrieval role per request. The service owns one SDK thread and engine for all
+clients; file hash and encoding settings are checked before admission. See
+[the LiteRT service contract](LITERT_EMBEDDING.md#share-one-resident-engine).
 The generic Vane `subprocess_actor` / `subprocess_task` launcher still uses POSIX
 file-descriptor passing. This service transport replacement does not qualify
 those execution backends on Windows.
@@ -736,6 +740,10 @@ starting abort cleanup closes that gate before yielding. Accepted requests retai
 their buffers and credits until the model coroutine finishes. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
+Transport and runtime references are released only after their cleanup succeeds.
+A failed close retains unfinished resources for a later `aclose()` attempt;
+concurrent callers share the active attempt. Engine cleanup waits for successful
+transport drain, and LiteRT keeps its SDK thread alive until engine close succeeds.
 After receiving a complete terminal response, the client sends its signed
 receipt and waits for server EOF before returning or reporting the error.
 The server then returns the connection slot without waiting for client EOF.

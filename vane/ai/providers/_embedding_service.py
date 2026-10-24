@@ -29,7 +29,7 @@ from vane.ai.protocols import (
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
 )
-from vane.ai.provider import ProviderImportError
+from vane.ai.provider import ProviderImportError, _ProviderResultError
 from vane.ai.typing import UDFOptions
 from vane.execution._async_dispatch import map_async_ordered
 
@@ -91,6 +91,12 @@ class _ServiceDescriptor:
     def is_async(self) -> bool:
         return True
 
+    def get_service_spec(self) -> MultimodalInputSpec:
+        return ipc.input_spec(self.options)
+
+    def get_request_options(self) -> dict[str, Any] | None:
+        return None
+
     def instantiate(self) -> ServiceEmbedder:
         return ServiceEmbedder(self)
 
@@ -142,7 +148,7 @@ class ServiceMultimodalDescriptor(_ServiceDescriptor, MultimodalEmbedderDescript
 class ServiceEmbedder(ManagedEmbedder):
     def __init__(self, descriptor: _ServiceDescriptor):
         self.descriptor = descriptor
-        self.spec = ipc.input_spec(descriptor.options)
+        self.spec = descriptor.get_service_spec()
         self.options = descriptor.get_options()
         self.closed = False
         self.metrics = {"queue_seconds": 0.0, "copy_seconds": 0.0, "request_seconds": 0.0, "input_bytes": 0}
@@ -185,7 +191,7 @@ class ServiceEmbedder(ManagedEmbedder):
             try:
                 result = await asyncio.wait_for(self._request(plan), self.options["timeout"])
                 return getattr(self, "_validate_vector", lambda value: value)(result)
-            except (EmbeddingConfigurationError, MemoryError, ProviderImportError):
+            except (EmbeddingConfigurationError, MemoryError, ProviderImportError, _ProviderResultError):
                 raise
             except Exception as error:
                 _raise_if_resource_error(error)
@@ -213,11 +219,13 @@ class ServiceEmbedder(ManagedEmbedder):
             raise EmbeddingConfigurationError("Embedding service rejected input or model/service configuration")
         if response.get("error") == "resource":
             raise MemoryError("Embedding service exhausted model or host resources")
+        if response.get("error") == "result":
+            raise _ProviderResultError("Embedding service returned an invalid model result")
         if "error" in response:
             raise RuntimeError("Embedding service request failed")
 
     def _reservation(self, parts: Any, size: int, request_id: str) -> dict[str, Any]:
-        return {
+        reservation = {
             "version": ipc.VERSION,
             "service_id": self.options["service_id"],
             "family": self.descriptor.family,
@@ -227,3 +235,7 @@ class ServiceEmbedder(ManagedEmbedder):
             "parts": parts,
             "nbytes": size,
         }
+        encoding = self.descriptor.get_request_options()
+        if encoding is not None:
+            reservation["encoding"] = encoding
+        return reservation

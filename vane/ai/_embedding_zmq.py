@@ -512,7 +512,11 @@ class Server:
             ipc.describe(content, owner.spec)
             owner.metrics["accepted"] += 1
             started = time.monotonic()
-            inference = asyncio.create_task(owner._infer(content))
+            inference = asyncio.create_task(
+                owner._infer(content, input_type=message["encoding"]["input_type"])
+                if message["family"] == "litert"
+                else owner._infer(content)
+            )
             await _drain(inference)
             response = inference.result()
             owner.metrics["inference_seconds"] += time.monotonic() - started

@@ -4,8 +4,63 @@ Install `vane-ai[litert]` to use `provider="litert"` with the typed
 `vane.ai.embed` API. The adapter targets `litert-lm-api==0.18.0` and loads an
 explicit local `.litertlm` file in one persistent subprocess actor. Select
 `backend="cpu"` or `backend="gpu"`; initialization failures propagate directly.
-Use the `local` runner. This provider does not request CUDA resources or support
-Ray actors, task execution, automatic downloads, backend selection or model substitution.
+Use the `local` runner for native execution. Native execution requires one
+subprocess actor. This provider does not request CUDA resources, download
+models, choose a backend automatically or substitute another model.
+
+## Share one resident engine
+
+`runtime="service"` connects CPU-only clients to a separately started LiteRT
+engine. Ingestion, text queries and media clients share that engine. Install
+`vane-ai[litert,embedding_service]` in the service environment; clients only need
+`vane-ai[embedding_service]` for decoded inputs, without the LiteRT SDK, Pillow
+or model file. Decoding files still requires the usual media extras.
+Use [the service configuration](examples/litert_service.json) and
+[the authenticated transport contract](EMBEDDING_DESIGN.md#explicit-service-configuration).
+Set an absolute checkpoint path and its SHA-256 in the service configuration,
+create a user-private rendezvous directory, then run:
+
+```bash
+mkdir -m 700 /tmp/vane-litert
+python -m vane.ai.embedding_service --config examples/litert_service.json
+```
+
+On Windows replace the paths with absolute paths in a directory with a private
+user ACL. The service transport and direct asynchronous clients use portable
+PyZMQ/SharedMemory. The existing generic Vane subprocess UDF launcher still
+requires POSIX; this adapter does not qualify local Windows query execution.
+Existing Ray task/actor execution can use CPU-only service clients without
+reserving a GPU for each client. Model SDK requirements remain platform specific.
+
+Client calls pass the file hash and fixed encoding settings, without a model
+path, backend, thread count or engine cache directory:
+
+```python
+service = dict(
+    provider="litert", dimensions=256, runtime="service",
+    service_path="/tmp/vane-litert/engine.json", service_id="embeddinggemma2-v1",
+    model_sha256="e7a8a2204b91e0f96e92960e84a09a89212e1633dcb7575a9bf3378b4df77f4c",
+    max_length=2048, vision_tokens_per_image=70,
+)
+documents = embed(TextInput(vane.col("text")), input_type="document", **service)
+queries = embed(TextInput(vane.col("query")), input_type="query", **service)
+```
+
+The service checks model, dimensions, file SHA-256, `max_length` and
+`vision_tokens_per_image` before reserving input memory. Clients must match the
+service's encoding settings; a smaller client `max_input_bytes` only restricts
+that client's input. The query/document role belongs to each request. Media
+and composed inputs use document mode; query mode accepts one text part.
+Native and service descriptors retain the same hash-bound output space.
+
+One dedicated thread initializes, invokes and closes the SDK engine. Requests
+serialize on that thread while the network loop remains responsive. Committed
+requests drain through cancellation and service shutdown before buffers,
+credits and the engine are released. A client never starts a local engine or
+replays a request after uncertain completion.
+If shutdown fails, the service retains the runtime and its SDK thread. A later
+`aclose()` retries cleanup on that same thread; concurrent callers share the
+active attempt. Cleanup must succeed before the service can restart.
 
 | Model identifier | Native inputs |
 | --- | --- |
