@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
@@ -96,16 +97,108 @@ def media_sdk(monkeypatch, tmp_path):
     video = image | {"max_soft_tokens": 140, "add_timestamps": False}
 
     class Processor:
+        image_token, image_token_id = "<|image|>", 258880
+        video_token, audio_token = "<|video|>", "<|audio|>"
+        boi_token, eoi_token = "<|image>", "<image|>"
+        boa_token, eoa_token = "<|audio>", "<audio|>"
+        tokenizer = SimpleNamespace(
+            pad_token_id=0,
+            bos_token_id=2,
+            eos_token_id=1,
+            convert_tokens_to_ids=lambda token: {
+                "<|image|>": 258880,
+                "<|video|>": 258884,
+                "<|audio|>": 258881,
+                "<|image>": 255999,
+                "<image|>": 258882,
+                "<|audio>": 256000,
+                "<audio|>": 258883,
+            }.get(token, -1),
+        )
         audio_token_id = 258881
         video_token_id = 258884
         feature_extractor = SimpleNamespace(**extractor)
         video_processor = SimpleNamespace(**video)
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            assert tokenize is add_generation_prompt is False
+            return "".join(
+                message["content"]
+                if isinstance(message["content"], str)
+                else "".join(
+                    part["text"] if part["type"] == "text" else "<|" + part["type"] + "|>"
+                    for part in message["content"]
+                )
+                for message in messages
+            )
+
+        def joint_inputs(self, kwargs):
+            # Small authored grids/masks, independent of the production planner.
+            encoded = {}
+            images = [image for row in kwargs.get("images", []) for image in row]
+            videos = kwargs.get("videos", [])
+            audio = kwargs.get("audio", [])
+            replacements = {"image": [], "video": [], "audio": []}
+
+            def visual(items, key, positions, max_patches):
+                grids = [
+                    np.array([(x, y) for y in range(3) for x in range(6 if image.shape[0] == 6 else 3)])
+                    for image in items
+                ]
+                width = max(len(grid) for grid in grids)
+                encoded[key] = np.zeros((len(items), width, 768), dtype=np.float32)
+                encoded[positions] = np.array(
+                    [np.pad(grid, ((0, width - len(grid)), (0, 0)), constant_values=-1) for grid in grids]
+                )
+                return [
+                    [255999] + [258884 if key == "pixel_values_videos" else 258880] * (len(grid) // 9) + [258882]
+                    for grid in grids
+                ]
+
+            if images:
+                replacements["image"] = visual(images, "pixel_values", "image_position_ids", 2520)
+            if videos:
+                frame_replacements = visual(
+                    [frame for video in videos for frame in video], "pixel_values_videos", "video_position_ids", 1260
+                )
+                offset = 0
+                for video in videos:
+                    replacements["video"].append(
+                        [token for frame in frame_replacements[offset : offset + len(video)] for token in frame]
+                    )
+                    offset += len(video)
+                encoded["num_frames_per_video"] = np.array([len(video) for video in videos])
+            if audio:
+                masks = {161: [1], 321: [1, 1], 641: [1] * 4, 1281: [1] * 8, 4001: [1] * 25, 8001: [1] * 50}
+                valid = [masks[len(waveform)] for waveform in audio]
+                width = max(len(row) for row in valid)
+                encoded["input_features"] = np.zeros((len(audio), width, 128), np.float32)
+                encoded["input_features_mask"] = np.array([row + [0] * (width - len(row)) for row in valid], bool)
+                replacements["audio"] = [[256000] + [258881] * len(row[::4]) + [258883] for row in valid]
+            counters = dict(image=0, video=0, audio=0)
+            rows = []
+            for text in kwargs["text"]:
+                row = [2]
+                for fragment in re.split(r"(<\|(?:image|video|audio)\|>)", text):
+                    if fragment in {"<|image|>", "<|video|>", "<|audio|>"}:
+                        kind = fragment[2:-2]
+                        row.extend(replacements[kind][counters[kind]])
+                        counters[kind] += 1
+                    elif fragment:
+                        row.append(17 + len(fragment))
+                rows.append(row + [1])
+            width = max(map(len, rows))
+            encoded["input_ids"] = np.array([row + [0] * (width - len(row)) for row in rows])
+            encoded["attention_mask"] = np.array([[1] * len(row) + [0] * (width - len(row)) for row in rows])
+            return encoded
 
         def __call__(self, **kwargs):
             state.processor_calls.append(kwargs)
             fail("processor")
             assert kwargs["text_kwargs"] == {"padding": True, "truncation": False}
             assert kwargs["return_tensors"] == "np"
+            if "text" in kwargs:
+                return state.change(self.joint_inputs(kwargs))
             if "audio" in kwargs:
                 assert kwargs["audio_kwargs"] == dict(
                     sampling_rate=16000,
@@ -232,6 +325,7 @@ def media_sdk(monkeypatch, tmp_path):
                 model_type="embedding_gemma2",
                 text_config={"embedding_dim": 768},
                 dtype="bfloat16",
+                image_token_id=258880,
                 audio_token_id=258881,
                 video_token_id=258884,
                 audio_config=dict(

@@ -422,6 +422,15 @@ def _validate_mlx_video_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return _validate_mlx_common_options(options)
 
 
+def _validate_mlx_multimodal_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    prepared = _validate_mlx_common_options(options)
+    if prepared["revision"] != _MLX_COMMON_DEFAULTS["revision"]:
+        from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+        raise EmbeddingConfigurationError("MLX joint encoding requires the fixed checkpoint revision")
+    return prepared
+
+
 def validate_embed_options(
     provider_family: str | None,
     options: Mapping[str, Any],

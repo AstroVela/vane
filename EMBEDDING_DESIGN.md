@@ -121,7 +121,7 @@ An absent value does not explain whether extraction failed. Context records that
 state separately. A part declared in the plan must be supported even if its
 column happens to be all NULL. Optional data does not waive capability checking.
 
-The Apple Silicon `mlx` provider supports four independent decoded input kinds
+The Apple Silicon `mlx` provider supports four independent decoded input kinds and ordered joint inputs
 for `mlx-community/embeddinggemma-2-bf16` at revision
 `1a4ffddb7905d3f63486748deabe091a01fb6201`. Each produces one normalized
 768-dimensional vector in the paired checkpoint space. Descriptor construction
@@ -140,8 +140,13 @@ audio tails fail; valid silence remains an audio input.
 
 Context selects separate text/image/video/sound profiles, preserves source
 locators and saves the actual PNG/PCM used for retrieval. Text queries pair with
-audio/video, and image queries pair with video. This adapter supplies no joint
-encoding, ASR, OCR or Analyze model, and adds no query schema. Model failures
+audio/video, and image queries pair with video. Joint encoding accepts 1–16 ordered decoded/text parts, including repeated media,
+within 64 MiB per row and the expanded token budget. All parts enter one model
+forward and produce one 768-dimensional vector. Text adds the document prefix
+once and retains its original position; media-only rows have no prefix. Reserved
+media markers in text are rejected. Context joint profiles reuse video/audio/text
+assembly and preserve actual contributing channels and source locators. This
+adapter supplies no ASR, OCR or Analyze model and adds no query schema. Model failures
 follow the existing fatal/publication semantics. See [MLX qualification](DEVELOPMENT.md#incremental-package-build)
 for fixed dependencies, real SDK/Metal tests and input decoding extras.
 

@@ -290,11 +290,11 @@ def test_vane_distribution_owns_only_the_vane_import_namespace():
     assert files.isdisjoint(removed_runner_compatibility_modules)
 
 
-def _requirements_for_extra(extra):
+def _requirements_for_extra(extra, environment=None):
     selected = set()
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
-        if requirement.marker is not None and requirement.marker.evaluate({"extra": extra}):
+        if requirement.marker is not None and requirement.marker.evaluate({"extra": extra, **(environment or {})}):
             selected.add(canonicalize_name(requirement.name))
     return selected
 
@@ -328,7 +328,13 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
+    # These optional runtimes are published only for Linux x86_64.
     linux = {"sys_platform": "linux", "platform_system": "Linux", "platform_machine": "x86_64"}
+    assert "vllm" in _requirements_for_extra("vllm", linux)
+    assert "sglang" in _requirements_for_extra("sglang", linux)
+    darwin = {"sys_platform": "darwin", "platform_system": "Darwin", "platform_machine": "arm64"}
+    assert "vllm" not in _requirements_for_extra("vllm", darwin)
+    assert "sglang" not in _requirements_for_extra("sglang", darwin)
     assert _requirement_for_extra("vllm", "vllm", linux).marker is not None
     assert _requirement_for_extra("sglang", "sglang", linux).marker is not None
 
@@ -386,11 +392,11 @@ def test_mlx_release_and_sdist_include_all_modality_contracts_and_reference_help
     config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
     included = set(config["tool"]["scikit-build"]["sdist"]["include"])
     release = (REPOSITORY_ROOT / "scripts/run_release_tests.sh").read_text()
-    for name in ("provider", "image_provider", "audio_provider", "video_provider"):
+    for name in ("provider", "image_provider", "audio_provider", "video_provider", "multimodal_provider"):
         file = "tests/fast/test_mlx_" + name + ".py"
         assert "/" + file in included
         assert '"$project_root/' + file + '"' in release
-    for kind in ("text", "image", "audio", "video"):
+    for kind in ("text", "image", "audio", "video", "multimodal"):
         assert f"/tests/ai/test_mlx_{kind}_embedding.py" in included
     assert {"/tests/mlx_sdk_fixture.py", "/tests/mlx_metal_reference.py"} <= included
 

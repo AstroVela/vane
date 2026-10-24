@@ -170,7 +170,7 @@ def local_actor(monkeypatch):
         assert not ray.is_initialized()
 
 
-def traced_provider(kind, trace):
+def traced_provider(kind, trace, *, oom=False, gate=None):
     from vane.ai.providers import mlx as module
 
     descriptor_class = getattr(module, "MLX" + kind.title() + "EmbedderDescriptor")
@@ -221,8 +221,31 @@ def traced_provider(kind, trace):
             )
             return super().embed_video(clips)
 
+        def embed_multimodal(self, rows):
+            event("input", parts=[[part.spec.kind for part in row.parts] for row in rows])
+            return super().embed_multimodal(rows)
+
         def _infer(self, inputs, count):
-            event("forward", rows=count, model_keys=sorted(inputs))
+            event(
+                "forward",
+                rows=count,
+                model_keys=sorted(inputs),
+                tensors={
+                    key: {"shape": list(value.shape), "sha256": hashlib.sha256(value.tobytes()).hexdigest()}
+                    for key, value in inputs.items()
+                },
+            )
+            if oom:
+                raise RuntimeError("[METAL] Command buffer execution failed: Insufficient Memory")
+            if gate is not None:
+                import time
+
+                event("waiting")
+                deadline = time.monotonic() + 30
+                while not Path(gate).exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if not Path(gate).exists():
+                    raise TimeoutError("test forward gate was not released")
             return super()._infer(inputs, count)
 
         def close(self):
@@ -233,7 +256,19 @@ def traced_provider(kind, trace):
 
     class TracedDescriptor(descriptor_class):
         def instantiate(self):
-            actual = TracedEncoder(self.get_options())
+            import mlx_vlm.embedding_loader as loader
+
+            original = loader.load_embedding_model
+
+            def observed(*args, **kwargs):
+                event("checkpoint_load")
+                return original(*args, **kwargs)
+
+            loader.load_embedding_model = observed
+            try:
+                actual = TracedEncoder(self.get_options())
+            finally:
+                loader.load_embedding_model = original
             event("loaded", options=self.get_options())
             return actual
 
@@ -245,3 +280,60 @@ def traced_provider(kind, trace):
 
     setattr(TracedProvider, "get_" + kind + "_embedder", factory)
     return TracedProvider()
+
+
+def joint_inputs(processor, rows):
+    """Independent CHW reference: hand-compose ordered prompts, no runtime helper."""
+    prompts = []
+    for row in rows:
+        prefix = "title: none | text: " if any(part.spec.kind == "text" for part in row.parts) else ""
+        prompts.append(
+            prefix
+            + "".join(part.value if part.spec.kind == "text" else "<|" + part.spec.kind + "|>" for part in row.parts)
+        )
+    kwargs = {"text": prompts, "text_kwargs": {"padding": True, "truncation": False}, "return_tensors": "np"}
+    images = [[part.value.transpose(2, 0, 1) for part in row.parts if part.spec.kind == "image"] for row in rows]
+    videos = [
+        np.stack(part.value.frames).transpose(0, 3, 1, 2)
+        for row in rows
+        for part in row.parts
+        if part.spec.kind == "video"
+    ]
+    audios = [
+        np.array(part.value.samples[:, 0], dtype=np.float32, copy=True)
+        for row in rows
+        for part in row.parts
+        if part.spec.kind == "audio"
+    ]
+    if any(images):
+        kwargs.update(images=images, images_kwargs={"input_data_format": "channels_first"})
+    if videos:
+        kwargs.update(
+            videos=videos,
+            videos_kwargs={
+                "input_data_format": "channels_first",
+                "do_sample_frames": False,
+                "add_timestamps": False,
+                "return_metadata": False,
+            },
+        )
+    if audios:
+        kwargs.update(
+            audio=audios,
+            audio_kwargs={
+                "sampling_rate": 16000,
+                "padding": "longest",
+                "truncation": False,
+                "pad_to_multiple_of": 128,
+                "return_attention_mask": True,
+            },
+        )
+    return processor(**kwargs)
+
+
+def joint_parity(actual, expected, record_property, label):
+    metrics = parity(
+        np.asarray(actual, dtype=np.float32), np.asarray(expected, dtype=np.float32), record_property, label
+    )
+    assert metrics["max_absolute_difference"] <= 0.01, metrics
+    return metrics

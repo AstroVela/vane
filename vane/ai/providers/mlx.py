@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""EmbeddingGemma 2 text, image, audio and video encoding on worker-local Metal."""
+"""EmbeddingGemma 2 unary and ordered joint encoding on worker-local Metal."""
 
 from __future__ import annotations
 
 import gc
 import json
-import math
 import platform
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -17,33 +16,44 @@ from typing import Any
 import numpy as np
 
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
+from vane.ai._embedding_content import EmbeddingContent, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.options import (
     _validate_mlx_audio_options,
     _validate_mlx_image_options,
+    _validate_mlx_multimodal_options,
     _validate_mlx_text_options,
     _validate_mlx_video_options,
 )
 from vane.ai.protocols import (
     AudioEmbedderDescriptor,
     ImageEmbedderDescriptor,
+    MultimodalEmbedderDescriptor,
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
 )
 from vane.ai.provider import Provider, _translate_missing_provider_dependency
+from vane.ai.providers._mlx_media import (
+    AUDIO_SAMPLE_RATE,
+    MAX_AUDIO_INPUT_BYTES,
+    MAX_AUDIO_SAMPLES,
+    MAX_IMAGE_PIXELS,
+    MAX_VIDEO_FRAMES,
+    MAX_VIDEO_INPUT_BYTES,
+    audio_tokens,
+    patch_tokens,
+    validate_audio,
+    validate_frame_counts,
+    validate_image,
+    validate_video,
+)
+from vane.ai.providers._mlx_multimodal import MEDIA_TOKENS, JointPlan, joint_plan, validate_structure
 from vane.ai.typing import UDFOptions
 
 MODEL_ID = "mlx-community/embeddinggemma-2-bf16"
 DIMENSIONS = 768
-MAX_IMAGE_PIXELS = 16 * 1024 * 1024
-AUDIO_SAMPLE_RATE = 16000
-MIN_AUDIO_SAMPLES = 161
-MAX_AUDIO_SAMPLES = 480000
-MAX_AUDIO_INPUT_BYTES = 4 * 1024 * 1024
-MAX_VIDEO_FRAMES = 12
-MAX_VIDEO_INPUT_BYTES = 64 * 1024 * 1024
 _IMAGE_INPUT_KEYS = frozenset({"input_ids", "attention_mask", "pixel_values", "image_position_ids"})
 _AUDIO_INPUT_KEYS = frozenset({"input_ids", "attention_mask", "input_features", "input_features_mask"})
 _VIDEO_INPUT_KEYS = frozenset(
@@ -138,6 +148,41 @@ class MLXVideoEmbedderDescriptor(_MLXDescriptor, VideoEmbedderDescriptor):
         return MLXVideoEmbedder(self.get_options())
 
 
+class MLXMultimodalEmbedderDescriptor(_MLXDescriptor, MultimodalEmbedderDescriptor):
+    _validate_options = staticmethod(_validate_mlx_multimodal_options)
+
+    def get_input_spec(self) -> MultimodalInputSpec:
+        return MultimodalInputSpec(
+            supported_parts=frozenset(
+                {
+                    EmbeddingPartSpec("text"),
+                    EmbeddingPartSpec("image"),
+                    EmbeddingPartSpec("video"),
+                    EmbeddingPartSpec("audio"),
+                }
+            ),
+            video=VideoInputSpec(max_frames=MAX_VIDEO_FRAMES, max_input_bytes=MAX_VIDEO_INPUT_BYTES),
+            audio=AudioInputSpec(
+                sample_rate=AUDIO_SAMPLE_RATE,
+                max_samples=MAX_AUDIO_SAMPLES,
+                max_channels=1,
+                max_input_bytes=MAX_AUDIO_INPUT_BYTES,
+            ),
+            max_parts=16,
+            max_input_bytes=64 * 1024**2,
+        )
+
+    def get_output_spec(self, *, dimensions: int | None = None) -> EmbeddingOutputSpec:
+        if dimensions is not None and (type(dimensions) is not int or dimensions != DIMENSIONS):
+            raise EmbeddingConfigurationError("MLX EmbeddingGemma 2 requires dimensions=768")
+        return EmbeddingOutputSpec(
+            (EmbeddingOutput("embedding", DIMENSIONS, MODEL_ID, ("text", "image", "video", "audio")),)
+        )
+
+    def instantiate(self) -> MLXMultimodalEmbedder:
+        return MLXMultimodalEmbedder(self.get_options())
+
+
 class MLXProvider(Provider):
     def __init__(self, name: str | None = None) -> None:
         if name not in (None, "mlx"):
@@ -166,6 +211,11 @@ class MLXProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> MLXVideoEmbedderDescriptor:
         return MLXVideoEmbedderDescriptor(model, dimensions, options=options)
+
+    def get_multimodal_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> MLXMultimodalEmbedderDescriptor:
+        return MLXMultimodalEmbedderDescriptor(model, dimensions, options=options)
 
 
 class _MLXEmbedder:
@@ -352,42 +402,98 @@ class MLXTextEmbedder(_MLXEmbedder):
         return self._infer(self._prepare_text_inputs(texts), len(texts))
 
 
-class MLXImageEmbedder(_MLXEmbedder):
-    _validate_options = staticmethod(_validate_mlx_image_options)
+class _MLXMediaEmbedder(_MLXEmbedder):
+    """One processor factory and selected tower checks for every media encoder."""
+
+    _media_kinds: frozenset[str] = frozenset()
 
     def _load_processor(self, snapshot: Path, config: dict[str, Any], weights: dict[str, Any]) -> None:
-        vision = config.get("vision_config") or {}
-        if any(
-            vision.get(key) != value
-            for key, value in {
-                "model_type": "gemma4_vision",
-                "dtype": "bfloat16",
+        media_config = json.loads((snapshot / "processor_config.json").read_text())
+        if "image" in self._media_kinds:
+            vision = config.get("vision_config") or {}
+            if any(
+                vision.get(key) != value
+                for key, value in {
+                    "model_type": "gemma4_vision",
+                    "dtype": "bfloat16",
+                    "patch_size": 16,
+                    "pooling_kernel_size": 3,
+                    "default_output_length": 280,
+                }.items()
+            ):
+                raise EmbeddingConfigurationError(
+                    "MLX image encoding requires the fixed BF16 Gemma 4 vision configuration"
+                )
+            if self._model.vision_tower is None or self._model.embed_vision is None:
+                raise EmbeddingConfigurationError("MLX image encoding requires the vision tower and projection")
+            if not any(key.startswith("vision_tower.") for key in weights) or (
+                "embed_vision.embedding_projection.weight" not in weights
+                or weights["embed_vision.embedding_projection.weight"].dtype != self._mx.bfloat16
+            ):
+                raise EmbeddingConfigurationError(
+                    "MLX image encoding requires trained BF16 vision and projection weights"
+                )
+            processor_config = media_config.get("image_processor", {})
+            expected = {
+                "max_soft_tokens": 280,
                 "patch_size": 16,
                 "pooling_kernel_size": 3,
-                "default_output_length": 280,
-            }.items()
-        ):
-            raise EmbeddingConfigurationError("MLX image encoding requires the fixed BF16 Gemma 4 vision configuration")
-        if self._model.vision_tower is None or self._model.embed_vision is None:
-            raise EmbeddingConfigurationError("MLX image encoding requires the vision tower and projection")
-        if not any(key.startswith("vision_tower.") for key in weights) or (
-            "embed_vision.embedding_projection.weight" not in weights
-            or weights["embed_vision.embedding_projection.weight"].dtype != self._mx.bfloat16
-        ):
-            raise EmbeddingConfigurationError("MLX image encoding requires trained BF16 vision and projection weights")
-        processor_config = json.loads((snapshot / "processor_config.json").read_text()).get("image_processor", {})
-        expected = {
-            "max_soft_tokens": 280,
-            "patch_size": 16,
-            "pooling_kernel_size": 3,
-            "do_convert_rgb": True,
-            "do_resize": True,
-            "do_rescale": True,
-            "do_normalize": False,
-            "rescale_factor": 1 / 255,
-        }
-        if any(processor_config.get(key) != value for key, value in expected.items()):
-            raise EmbeddingConfigurationError("MLX image encoding requires the fixed checkpoint image processor")
+                "do_convert_rgb": True,
+                "do_resize": True,
+                "do_rescale": True,
+                "do_normalize": False,
+                "rescale_factor": 1 / 255,
+            }
+            if any(processor_config.get(key) != value for key, value in expected.items()):
+                raise EmbeddingConfigurationError("MLX image encoding requires the fixed checkpoint image processor")
+        if "audio" in self._media_kinds:
+            expected_audio = {
+                "model_type": "gemma4_audio",
+                "dtype": "bfloat16",
+                "hidden_size": 1024,
+                "num_hidden_layers": 12,
+                "output_proj_dims": 1536,
+                "subsampling_conv_channels": [128, 32],
+            }
+            audio = config.get("audio_config") or {}
+            if any(audio.get(key) != value for key, value in expected_audio.items()):
+                raise EmbeddingConfigurationError("MLX audio requires the fixed BF16 Gemma 4 audio configuration")
+            if getattr(self._model, "audio_tower", None) is None or getattr(self._model, "embed_audio", None) is None:
+                raise EmbeddingConfigurationError("MLX audio requires the audio tower and projection")
+            if not any(key.startswith("audio_tower.") for key in weights) or (
+                "embed_audio.embedding_projection.weight" not in weights
+                or weights["embed_audio.embedding_projection.weight"].dtype != self._mx.bfloat16
+            ):
+                raise EmbeddingConfigurationError("MLX audio requires trained BF16 audio and projection weights")
+            expected_extractor = {
+                "sampling_rate": AUDIO_SAMPLE_RATE,
+                "feature_size": 128,
+                "frame_length": 320,
+                "hop_length": 160,
+                "fft_length": 512,
+                "dither": 0,
+                "padding_side": "right",
+                "preemphasis": 0,
+                "input_scale_factor": 1,
+            }
+            extractor_config = media_config.get("feature_extractor", {})
+            if any(extractor_config.get(key) != value for key, value in expected_extractor.items()):
+                raise EmbeddingConfigurationError("MLX audio requires the fixed checkpoint feature extractor")
+        if "video" in self._media_kinds:
+            expected_video = {
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "max_soft_tokens": 140,
+                "do_resize": True,
+                "do_rescale": True,
+                "do_convert_rgb": True,
+                "do_normalize": False,
+                "rescale_factor": 1 / 255,
+                "add_timestamps": False,
+            }
+            video_config = media_config.get("video_processor", {})
+            if any(video_config.get(key) != value for key, value in expected_video.items()):
+                raise EmbeddingConfigurationError("MLX video requires the fixed checkpoint video processor")
         with (
             _translate_missing_provider_dependency("mlx", "mlx_vlm"),
             _translate_missing_provider_dependency("mlx", "PIL"),
@@ -399,6 +505,27 @@ class MLXImageEmbedder(_MLXEmbedder):
             self._processor = EmbeddingGemma2Processor.from_pretrained(
                 str(snapshot), local_files_only=True, trust_remote_code=False
             )
+        if "audio" in self._media_kinds:
+            if any(
+                getattr(self._processor.feature_extractor, key, None) != value
+                for key, value in expected_extractor.items()
+            ):
+                raise EmbeddingConfigurationError("MLX audio feature extractor differs from the fixed checkpoint")
+            if self._processor.audio_token_id != 258881 or config.get("audio_token_id") != 258881:
+                raise EmbeddingConfigurationError("MLX audio requires the fixed checkpoint audio token")
+        if "video" in self._media_kinds:
+            if any(
+                getattr(self._processor.video_processor, key, None) != value for key, value in expected_video.items()
+            ):
+                raise EmbeddingConfigurationError("MLX video processor differs from the fixed checkpoint")
+            if self._processor.video_token_id != 258884 or config.get("video_token_id") != 258884:
+                raise EmbeddingConfigurationError("MLX video requires the fixed checkpoint video token")
+
+
+class MLXImageEmbedder(_MLXMediaEmbedder):
+    _media_kinds = frozenset({"image"})
+
+    _validate_options = staticmethod(_validate_mlx_image_options)
 
     def _validate_image_inputs(self, encoded: Mapping[str, Any], count: int) -> dict[str, np.ndarray]:
         if set(encoded) != _IMAGE_INPUT_KEYS:
@@ -419,27 +546,14 @@ class MLXImageEmbedder(_MLXEmbedder):
             raise EmbeddingConfigurationError("MLX image processor must return aligned integer IDs and binary masks")
         if ids.shape[1] > self._options["max_length"]:
             raise EmbeddingConfigurationError("MLX image exceeds max_length after visual token expansion")
-        pixels, positions = inputs["pixel_values"], inputs["image_position_ids"]
-        if (
-            pixels.ndim != 3
-            or pixels.shape[0] != count
-            or not 0 < pixels.shape[1] <= 2520
-            or pixels.shape[2] != 16 * 16 * 3
-            or not np.issubdtype(pixels.dtype, np.floating)
-            or pixels.dtype == np.float16
-            or not np.isfinite(pixels).all()
-            or positions.shape != (*pixels.shape[:2], 2)
-            or not np.issubdtype(positions.dtype, np.integer)
-        ):
-            raise EmbeddingConfigurationError(
-                "MLX image processor must return finite floating patches and integer positions"
-            )
-        valid = (positions >= 0).all(axis=-1)
-        padding = (positions == -1).all(axis=-1)
-        if not (valid | padding).all() or not valid.any(axis=1).all() or np.any(positions[valid] >= 10240):
-            raise EmbeddingConfigurationError(
-                "MLX image patch positions must be valid coordinates or paired -1 padding"
-            )
+        patch_tokens(
+            inputs["pixel_values"],
+            inputs["image_position_ids"],
+            count,
+            max_patches=2520,
+            kind="image",
+            strict_grid=False,
+        )
         return inputs
 
     def embed_image(self, images: list[np.ndarray]) -> list[np.ndarray]:
@@ -448,18 +562,7 @@ class MLXImageEmbedder(_MLXEmbedder):
         if not isinstance(images, list):
             raise EmbeddingConfigurationError("MLX embed_image requires a list of RGB uint8 HWC arrays")
         for value in images:
-            if (
-                not isinstance(value, np.ndarray)
-                or value.dtype != np.uint8
-                or value.ndim != 3
-                or value.shape[2] != 3
-                or value.shape[0] <= 0
-                or value.shape[1] <= 0
-                or value.shape[0] * value.shape[1] > MAX_IMAGE_PIXELS
-            ):
-                raise EmbeddingConfigurationError(
-                    "MLX images require RGB uint8 HWC arrays within the 16 Mi pixel budget"
-                )
+            validate_image(value, max_pixels=MAX_IMAGE_PIXELS)
         if not images:
             return []
         with _translate_missing_provider_dependency("mlx", "PIL"):
@@ -483,81 +586,17 @@ class MLXImageEmbedder(_MLXEmbedder):
             return self._infer(self._validate_image_inputs(encoded, len(images)), len(images))
 
 
-class MLXAudioEmbedder(_MLXEmbedder):
+class MLXAudioEmbedder(_MLXMediaEmbedder):
+    _media_kinds = frozenset({"audio"})
+
     _validate_options = staticmethod(_validate_mlx_audio_options)
-
-    def _load_processor(self, snapshot: Path, config: dict[str, Any], weights: dict[str, Any]) -> None:
-        expected_audio = {
-            "model_type": "gemma4_audio",
-            "dtype": "bfloat16",
-            "hidden_size": 1024,
-            "num_hidden_layers": 12,
-            "output_proj_dims": 1536,
-            "subsampling_conv_channels": [128, 32],
-        }
-        audio = config.get("audio_config") or {}
-        if any(audio.get(key) != value for key, value in expected_audio.items()):
-            raise EmbeddingConfigurationError("MLX audio requires the fixed BF16 Gemma 4 audio configuration")
-        if getattr(self._model, "audio_tower", None) is None or getattr(self._model, "embed_audio", None) is None:
-            raise EmbeddingConfigurationError("MLX audio requires the audio tower and projection")
-        if not any(key.startswith("audio_tower.") for key in weights) or (
-            "embed_audio.embedding_projection.weight" not in weights
-            or weights["embed_audio.embedding_projection.weight"].dtype != self._mx.bfloat16
-        ):
-            raise EmbeddingConfigurationError("MLX audio requires trained BF16 audio and projection weights")
-        expected = {
-            "sampling_rate": AUDIO_SAMPLE_RATE,
-            "feature_size": 128,
-            "frame_length": 320,
-            "hop_length": 160,
-            "fft_length": 512,
-            "dither": 0,
-            "padding_side": "right",
-            "preemphasis": 0,
-            "input_scale_factor": 1,
-        }
-        extractor_config = json.loads((snapshot / "processor_config.json").read_text()).get("feature_extractor", {})
-        if any(extractor_config.get(key) != value for key, value in expected.items()):
-            raise EmbeddingConfigurationError("MLX audio requires the fixed checkpoint feature extractor")
-        with (
-            _translate_missing_provider_dependency("mlx", "mlx_vlm"),
-            _translate_missing_provider_dependency("mlx", "PIL"),
-        ):
-            from mlx_vlm.models.embedding_gemma2 import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                EmbeddingGemma2Processor,
-            )
-
-            self._processor = EmbeddingGemma2Processor.from_pretrained(
-                str(snapshot), local_files_only=True, trust_remote_code=False
-            )
-        if any(getattr(self._processor.feature_extractor, key, None) != value for key, value in expected.items()):
-            raise EmbeddingConfigurationError("MLX audio feature extractor differs from the fixed checkpoint")
-        if self._processor.audio_token_id != 258881 or config.get("audio_token_id") != 258881:
-            raise EmbeddingConfigurationError("MLX audio requires the fixed checkpoint audio token")
 
     def _validate_audio_inputs(self, encoded: Mapping[str, Any], lengths: list[int]) -> dict[str, np.ndarray]:
         inputs = self._validate_media_tokens(encoded, _AUDIO_INPUT_KEYS, len(lengths), "audio")
-        features, mask = inputs["input_features"], inputs["input_features_mask"]
-        # The fixed extractor pads the waveform to 128 samples, then unfolds
-        # 321-sample windows after 160 samples of left padding. Check T too:
-        # checking only the returned mask's prefix would miss a truncated tail.
-        padded_samples = ((max(lengths) + 127) // 128) * 128
-        feature_length = (padded_samples - 161) // 160 + 1
-        if (
-            features.shape != (len(lengths), feature_length, 128)
-            or features.dtype not in (np.dtype("float32"), np.dtype("float64"))
-            or not np.isfinite(features).all()
-            or mask.shape != features.shape[:2]
-            or not (np.issubdtype(mask.dtype, np.integer) or mask.dtype == np.bool_)
-            or not np.isin(mask, (0, 1)).all()
-        ):
-            raise EmbeddingConfigurationError("MLX audio requires complete finite mel features and binary masks")
-        expected = np.arange(feature_length)[None, :] * 160 + 160 < np.asarray(lengths)[:, None]
-        if not expected.any(axis=1).all() or not np.array_equal(mask, expected):
-            raise EmbeddingConfigurationError("MLX audio mask must preserve every original waveform's valid prefix")
+        expected_tokens = audio_tokens(inputs, lengths)
         token_positions = inputs["input_ids"] == self._processor.audio_token_id
         if (
-            not np.array_equal(token_positions.sum(axis=1), expected[:, ::4].sum(axis=1))
+            not np.array_equal(token_positions.sum(axis=1), expected_tokens)
             or not (inputs["attention_mask"][token_positions] == 1).all()
         ):
             raise EmbeddingConfigurationError("MLX audio tokens must match the twice-subsampled valid mel mask")
@@ -569,30 +608,7 @@ class MLXAudioEmbedder(_MLXEmbedder):
         if not isinstance(clips, list):
             raise EmbeddingConfigurationError("MLX embed_audio requires a list of AudioClip values")
         for clip in clips:
-            if not isinstance(clip, AudioClip):
-                raise EmbeddingConfigurationError("MLX embed_audio requires AudioClip values")
-            if (
-                isinstance(clip.sample_rate, (bool, np.bool_))
-                or not isinstance(clip.sample_rate, (int, np.integer))
-                or clip.sample_rate != AUDIO_SAMPLE_RATE
-            ):
-                raise EmbeddingConfigurationError("MLX audio requires sample_rate=16000; resample first")
-            samples = clip.samples
-            if (
-                not isinstance(samples, np.ndarray)
-                or samples.ndim != 2
-                or samples.shape[1] != 1
-                or samples.dtype not in (np.dtype("float32"), np.dtype("float64"))
-            ):
-                raise EmbeddingConfigurationError("MLX audio requires mono float32/float64 PCM shaped (samples, 1)")
-            if not MIN_AUDIO_SAMPLES <= len(samples) <= MAX_AUDIO_SAMPLES:
-                raise EmbeddingConfigurationError(
-                    "MLX audio requires 161 to 480000 samples; short tails and truncation are unsupported"
-                )
-            if samples.nbytes > MAX_AUDIO_INPUT_BYTES:
-                raise EmbeddingConfigurationError("MLX audio exceeds the 4 MiB decoded input budget")
-            if not np.isfinite(samples).all() or np.any(samples < -1) or np.any(samples > 1):
-                raise EmbeddingConfigurationError("MLX audio requires finite floating PCM in [-1, 1]")
+            validate_audio(clip, max_input_bytes=MAX_AUDIO_INPUT_BYTES)
         if not clips:
             return []
         # Validate the entire batch before allocating independent SDK waveforms.
@@ -615,70 +631,17 @@ class MLXAudioEmbedder(_MLXEmbedder):
 class MLXVideoEmbedder(MLXImageEmbedder):
     """Share fixed vision loading; encode clips through the SDK video processor."""
 
-    _validate_options = staticmethod(_validate_mlx_video_options)
+    _media_kinds = frozenset({"image", "video"})
 
-    def _load_processor(self, snapshot: Path, config: dict[str, Any], weights: dict[str, Any]) -> None:
-        super()._load_processor(snapshot, config, weights)
-        expected = {
-            "patch_size": 16,
-            "pooling_kernel_size": 3,
-            "max_soft_tokens": 140,
-            "do_resize": True,
-            "do_rescale": True,
-            "do_convert_rgb": True,
-            "do_normalize": False,
-            "rescale_factor": 1 / 255,
-            "add_timestamps": False,
-        }
-        video_config = json.loads((snapshot / "processor_config.json").read_text()).get("video_processor", {})
-        if any(video_config.get(key) != value for key, value in expected.items()):
-            raise EmbeddingConfigurationError("MLX video requires the fixed checkpoint video processor")
-        if any(getattr(self._processor.video_processor, key, None) != value for key, value in expected.items()):
-            raise EmbeddingConfigurationError("MLX video processor differs from the fixed checkpoint")
-        if self._processor.video_token_id != 258884 or config.get("video_token_id") != 258884:
-            raise EmbeddingConfigurationError("MLX video requires the fixed checkpoint video token")
+    _validate_options = staticmethod(_validate_mlx_video_options)
 
     def _validate_video_inputs(self, encoded: Mapping[str, Any], counts: list[int]) -> dict[str, np.ndarray]:
         inputs = self._validate_media_tokens(encoded, _VIDEO_INPUT_KEYS, len(counts), "video")
         frame_counts = inputs.pop("num_frames_per_video")
-        if (
-            frame_counts.shape != (len(counts),)
-            or not np.issubdtype(frame_counts.dtype, np.integer)
-            or not np.array_equal(frame_counts, counts)
-        ):
-            raise EmbeddingConfigurationError("MLX video processor must preserve each clip's frame count")
-        pixels, positions = inputs["pixel_values_videos"], inputs["video_position_ids"]
-        if (
-            pixels.ndim != 3
-            or pixels.shape[0] != sum(counts)
-            or not 0 < pixels.shape[1] <= 1260
-            or pixels.shape[2] != 768
-            or pixels.dtype not in (np.dtype("float32"), np.dtype("float64"))
-            or not np.isfinite(pixels).all()
-            or positions.shape != (*pixels.shape[:2], 2)
-            or not np.issubdtype(positions.dtype, np.integer)
-        ):
-            raise EmbeddingConfigurationError("MLX video requires finite patches and positions for every input frame")
-        valid, padding = (positions >= 0).all(axis=-1), (positions == -1).all(axis=-1)
-        if not (valid | padding).all() or not valid.any(axis=1).all() or np.any(positions[valid] >= 10240):
-            raise EmbeddingConfigurationError(
-                "MLX video patch positions must be valid coordinates or paired -1 padding"
-            )
-        per_frame_tokens = []
-        for frame_positions, frame_valid in zip(positions, valid):
-            coords = frame_positions[frame_valid]
-            if not np.array_equal(frame_valid, np.arange(len(frame_valid)) < len(coords)):
-                raise EmbeddingConfigurationError("MLX video patch padding must follow the complete frame grid")
-            width, height = (int(value) + 1 for value in coords.max(axis=0))
-            # Complete row-major 3x3 pooling grids prevent silently omitted or
-            # repeated patches from satisfying only a total-token check.
-            if height % 3 or width % 3 or len(coords) != height * width:
-                raise EmbeddingConfigurationError("MLX video patches must form complete 3x3 pooling grids")
-            # The SDK stores (x, y), with x advancing first in each row.
-            expected = np.column_stack((np.tile(np.arange(width), height), np.repeat(np.arange(height), width)))
-            if not np.array_equal(coords, expected):
-                raise EmbeddingConfigurationError("MLX video patch positions must preserve the ordered frame grid")
-            per_frame_tokens.append(height * width // 9)
+        validate_frame_counts(frame_counts, counts)
+        per_frame_tokens = patch_tokens(
+            inputs["pixel_values_videos"], inputs["video_position_ids"], sum(counts), max_patches=1260, kind="video"
+        )
         offset = 0
         for row, count in enumerate(counts):
             tokens = inputs["input_ids"][row] == self._processor.video_token_id
@@ -696,51 +659,7 @@ class MLXVideoEmbedder(MLXImageEmbedder):
         if not isinstance(clips, list):
             raise EmbeddingConfigurationError("MLX embed_video requires a list of VideoClip values")
         for clip in clips:
-            if not isinstance(clip, VideoClip):
-                raise EmbeddingConfigurationError("MLX embed_video requires VideoClip values")
-            if not all(
-                isinstance(value, (tuple, list)) for value in (clip.frames, clip.frame_times, clip.frame_indices)
-            ):
-                raise EmbeddingConfigurationError("MLX video requires frame, time and index sequences")
-            count = len(clip.frames)
-            if not 1 <= count <= MAX_VIDEO_FRAMES or len(clip.frame_times) != count or len(clip.frame_indices) != count:
-                raise EmbeddingConfigurationError("MLX video requires 1 to 12 frames with aligned times and indices")
-            if any(
-                isinstance(index, (bool, np.bool_)) or not isinstance(index, (int, np.integer)) or index < 0
-                for index in clip.frame_indices
-            ) or any(a >= b for a, b in zip(clip.frame_indices, clip.frame_indices[1:])):
-                raise EmbeddingConfigurationError(
-                    "MLX video frame indices must be nonnegative strictly increasing integers"
-                )
-            if any(
-                isinstance(t, (bool, np.bool_))
-                or not isinstance(t, (int, float, np.integer, np.floating))
-                or not math.isfinite(t)
-                or t < 0
-                for t in clip.frame_times
-            ) or any(a > b for a, b in zip(clip.frame_times, clip.frame_times[1:])):
-                raise EmbeddingConfigurationError("MLX video frame times must be finite nonnegative and nondecreasing")
-            total_bytes = 0
-            shape = None
-            for frame in clip.frames:
-                if (
-                    not isinstance(frame, np.ndarray)
-                    or frame.dtype != np.uint8
-                    or frame.ndim != 3
-                    or frame.shape[2] != 3
-                    or frame.shape[0] <= 0
-                    or frame.shape[1] <= 0
-                    or frame.shape[0] * frame.shape[1] > MAX_IMAGE_PIXELS
-                ):
-                    raise EmbeddingConfigurationError(
-                        "MLX video frames require RGB uint8 HWC within the 16 Mi pixel budget"
-                    )
-                if shape is not None and frame.shape != shape:
-                    raise EmbeddingConfigurationError("MLX video frames must have the same H/W within each clip")
-                shape = frame.shape
-                total_bytes += frame.nbytes
-            if total_bytes > MAX_VIDEO_INPUT_BYTES:
-                raise EmbeddingConfigurationError("MLX video exceeds the 64 MiB decoded clip budget")
+            validate_video(clip, max_pixels=MAX_IMAGE_PIXELS, max_input_bytes=MAX_VIDEO_INPUT_BYTES)
         if not clips:
             return []
         videos = [np.stack(clip.frames) for clip in clips]
@@ -756,3 +675,134 @@ class MLXVideoEmbedder(MLXImageEmbedder):
             return_tensors="np",
         )
         return self._infer(self._validate_video_inputs(encoded, [len(clip.frames) for clip in clips]), len(clips))
+
+
+class MLXMultimodalEmbedder(_MLXMediaEmbedder):
+    """One ordered document input per row, one shared model forward per batch."""
+
+    _validate_options = staticmethod(_validate_mlx_multimodal_options)
+    _media_kinds = frozenset({"image", "video", "audio"})
+
+    @staticmethod
+    def _validate_output(values: np.ndarray, count: int) -> list[np.ndarray]:
+        try:
+            return _MLXEmbedder._validate_output(values, count)
+        except ValueError:
+            # A broken joint output contract must not become nullable rows or
+            # recursive smaller forwards under the public ignore policy.
+            raise EmbeddingConfigurationError(
+                "MLX joint model outputs violate the finite float32[768] unit-vector contract"
+            ) from None
+
+    def _load_processor(self, snapshot: Path, config: dict[str, Any], weights: dict[str, Any]) -> None:
+        super()._load_processor(snapshot, config, weights)
+        self._tokenizer = self._processor.tokenizer
+        for name, (token, token_id) in MEDIA_TOKENS.items():
+            if (
+                getattr(self._processor, name, None) != token
+                or self._tokenizer.convert_tokens_to_ids(token) != token_id
+            ):
+                raise EmbeddingConfigurationError("MLX joint encoding requires the fixed processor media vocabulary")
+        if (
+            self._processor.image_token_id != 258880
+            or config.get("image_token_id") != 258880
+            or self._tokenizer.pad_token_id != 0
+            or self._tokenizer.bos_token_id != 2
+            or self._tokenizer.eos_token_id != 1
+        ):
+            raise EmbeddingConfigurationError("MLX joint encoding requires the fixed checkpoint token identities")
+
+    def _prepare_multimodal_inputs(self, plan: JointPlan) -> dict[str, np.ndarray]:
+        prompts = []
+        for row_index, row in enumerate(plan.rows):
+            has_text = any(part.kind == "text" for part in row)
+            content = [dict(type=part.kind, **({"text": part.text} if part.kind == "text" else {})) for part in row]
+            conversation: list[dict[str, object]] = []
+            if has_text:
+                conversation.append({"role": "system", "content": "title: none | text: "})
+            conversation.append({"role": "user", "content": content})
+            prompt = self._processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
+            expected = ("title: none | text: " if has_text else "") + "".join(
+                part.text if part.kind == "text" else MEDIA_TOKENS[part.kind + "_token"][0] for part in row
+            )
+            if not isinstance(prompt, str) or prompt != expected:
+                raise EmbeddingConfigurationError(f"MLX joint row {row_index} template changed the ordered parts")
+            prompts.append(prompt)
+        kwargs: dict[str, object] = dict(
+            text=prompts, return_tensors="np", text_kwargs={"padding": True, "truncation": False}
+        )
+        keys = {"input_ids", "attention_mask"}
+        if plan.images:
+            kwargs.update(
+                images=[list(row) for row in plan.images_by_row], images_kwargs={"input_data_format": "channels_last"}
+            )
+            keys.update(("pixel_values", "image_position_ids"))
+        if plan.videos:
+            kwargs.update(
+                videos=[np.stack(clip.frames) for clip in plan.videos],
+                videos_kwargs={
+                    "input_data_format": "channels_last",
+                    "do_sample_frames": False,
+                    "add_timestamps": False,
+                    "return_metadata": False,
+                },
+            )
+            keys.update(("pixel_values_videos", "video_position_ids", "num_frames_per_video"))
+        if plan.audios:
+            kwargs.update(
+                audio=[np.array(clip.samples[:, 0], dtype=np.float32, order="C", copy=True) for clip in plan.audios],
+                audio_kwargs={
+                    "sampling_rate": AUDIO_SAMPLE_RATE,
+                    "padding": "longest",
+                    "truncation": False,
+                    "pad_to_multiple_of": 128,
+                    "return_attention_mask": True,
+                },
+            )
+            keys.update(("input_features", "input_features_mask"))
+        encoded = self._processor(**kwargs)
+        try:
+            inputs = self._validate_media_tokens(encoded, frozenset(keys), len(plan.rows), "joint")
+        except EmbeddingConfigurationError:
+            raise
+        except (TypeError, ValueError):
+            # NumPy conversion can fail before shape/dtype validation, e.g.
+            # for ragged arrays. Preserve the same fatal contract policy.
+            raise EmbeddingConfigurationError("MLX joint processor returned invalid array data") from None
+        image_tokens = (
+            patch_tokens(
+                inputs["pixel_values"],
+                inputs["image_position_ids"],
+                len(plan.images),
+                max_patches=2520,
+                kind="joint image",
+            )
+            if plan.images
+            else []
+        )
+        video_tokens = []
+        if plan.videos:
+            counts = [len(clip.frames) for clip in plan.videos]
+            validate_frame_counts(inputs.pop("num_frames_per_video"), counts)
+            per_frame = patch_tokens(
+                inputs["pixel_values_videos"],
+                inputs["video_position_ids"],
+                sum(counts),
+                max_patches=1260,
+                kind="joint video",
+            )
+            offset = 0
+            for count in counts:
+                video_tokens.append(per_frame[offset : offset + count])
+                offset += count
+        audio_counts = audio_tokens(inputs, [len(clip.samples) for clip in plan.audios]) if plan.audios else []
+        validate_structure(inputs, plan, image_tokens, video_tokens, audio_counts)
+        return inputs
+
+    def embed_multimodal(self, inputs: list[EmbeddingContent]) -> list[np.ndarray]:
+        if self._closed:
+            raise RuntimeError("MLX embedder is closed")
+        plan = joint_plan(inputs, MLXMultimodalEmbedderDescriptor().get_input_spec())
+        if not plan.rows:
+            return []
+        return self._infer(self._prepare_multimodal_inputs(plan), len(plan.rows))
