@@ -70,7 +70,7 @@ active attempt. Cleanup must succeed before the service can restart.
 
 The official [LiteRT-LM embedding API](https://developers.google.com/edge/litert-lm/embedding_models)
 accepts ordered text, image and audio contents. Version 0.18's Python API has no
-video input type. Vane rejects video input and does not synthesize a video vector
+video input type. Native/service execution rejects video input and does not synthesize a video vector
 by averaging images. `MultimodalInput` sends each row's ordered, decoded parts in
 one native embedding request. Paths and encoded BLOB input are not media inputs;
 decode media through Vane before embedding.
@@ -139,3 +139,70 @@ The selected token budget can impose a lower effective limit on composed inputs.
 Run [the search example](examples/litert_embedding_search.py) outside the source
 checkout against an installed wheel. See [DEVELOPMENT.md](DEVELOPMENT.md) for
 installation and the CPU/real-model validation commands.
+
+## Official HTTP server
+
+`runtime="http"` connects to the official `litert-lm==0.18.0` CLI server's
+`/v1/embeddings` endpoint. Install `vane-ai[embedding_http]` in clients, with the
+usual decoding extras; they require neither the LiteRT SDK nor local weights.
+Install the CLI separately in the model service environment. Provision/import
+the reviewed model under its declared model ID, select its supported backends
+explicitly in the CLI configuration, then run `litert-lm serve`.
+See [the official HTTP contract](https://developers.google.com/edge/litert-lm/cli/openai_server).
+
+```python
+remote = dict(
+    provider="litert", runtime="http", base_url="http://127.0.0.1:9379/v1",
+    model="litert-community/embeddinggemma-2-740m-litert-lm", dimensions=768,
+    model_sha256="e7a8a2204b91e0f96e92960e84a09a89212e1633dcb7575a9bf3378b4df77f4c",
+    request_batch_size=8, max_concurrency_per_actor=1, timeout=300,
+)
+vectors = embed(
+    MultimodalInput([VideoInput(vane.col("frames")), AudioInput(vane.col("audio"))]),
+    **remote,
+)
+queries = embed(TextInput(vane.col("query")), input_type="query", **remote)
+```
+
+Use the usual `vane.ai` typed-input imports. The endpoint must serve the configured
+model artifact. The file hash declares the paired vector space; unlike the local
+worker or shared-memory service, the official HTTP API cannot attest that hash.
+Optional authentication uses `load_provider("litert", api_key=...)` or an
+application-side `LITERT_API_KEY` snapshot. HTTP key validation does not affect
+native/service initialization. The official CLI itself does not add authentication.
+
+The HTTP adapter accepts decoded text, RGB images, mono 16 kHz floating PCM and
+ordered clips. A clip expands to ordered lossless PNG image parts, alongside
+PCM16 WAV audio and optional text in one input row. The server computes one native
+joint vector for that row. This is an image-sequence encoding: LiteRT 0.18 has no
+native video/timestamp input, and timestamps are retained for validation/provenance
+rather than inserted into the model prompt. It does not average frame vectors.
+Text is prefixed once using the same document/query prefixes as native execution.
+Unary text preserves empty/whitespace semantics; absent/blank joint parts are omitted.
+Encoded BLOBs require upstream decoding for this HTTP adapter.
+
+The 270M model accepts text; the 440M model additionally accepts images and
+image-sequence clips; the 740M model also accepts audio. Clips contain 1–64 frames,
+indices increase and timestamps may repeat but cannot decrease. Model token limits
+can impose a substantially smaller effective limit. Media retain their input order.
+
+`request_batch_size` (default 8, maximum 256) bounds independent rows in one HTTP
+request; it does not declare a GPU execution batch. The official server retains
+one engine and its SDK owns execution scheduling. Client concurrency defaults to
+one. Decoded and encoded media/prefixes must fit `max_input_bytes` (default 16 MiB,
+maximum 64 MiB); Base64/JSON must also fit `max_request_bytes` (default 32 MiB,
+maximum 256 MiB). Every row is validated before client creation or dispatch,
+including under `on_error="ignore"`. Resource allocation failures remain fatal.
+Responses must preserve row indices and return finite unit vectors of the
+requested dimensions. The official CLI reports zero token usage; this adapter
+does not infer token throughput from those counters.
+
+The official HTTP endpoint does not expose `max_length`, `vision_tokens_per_image`,
+backend/thread/cache selection or overflow policy. These are rejected as HTTP client
+options. The server's default overflow policy is an error. Its supported signatures
+depend on the artifact and backend: the reviewed 740M artifact on an RTX 4080 SUPER
+selects at most 1,024 tokens for GPU execution, despite advertising longer CPU
+signatures. A 15-frame plus roughly 15-second audio input produced 2,223 tokens and
+failed; use an explicitly qualified shorter clip configuration. This artifact's
+vision and audio frontends support CPU, while the text backbone supports GPU.
+These observations do not qualify other devices, artifacts or retrieval quality.

@@ -146,6 +146,12 @@ it does not add image joint request fields. MLX HTTP/service and cross-request
 batching remain outside this adapter.
 
 For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
+For the official LiteRT HTTP adapter, complete two clean reviews before the noneditable
+package build. Run `tests/fast/test_litert_http.py`, the LiteRT native/service contracts
+and affected HTTP/request/media tests through the installed launcher. Context
+qualifies actual ingestion/search separately; fixture HTTP contracts do not qualify
+checkpoint throughput or device capacity. HTTP clients need no LiteRT SDK.
+
 For the persistent LiteRT service, run `tests/fast/test_litert_service.py`
 alongside the service transport tests. It exercises real PyZMQ and shared
 memory with an authored CPU SDK fixture, including fixed encoding identities,

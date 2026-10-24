@@ -647,7 +647,9 @@ def _prepare_embed_call(
     prepared = validator(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)
     execution_backend = prepared.pop("execution_backend", None)
-    if (family == "mlx" or family == "litert" and prepared.get("runtime") != "service") and execution_backend is None:
+    if (
+        family == "mlx" or family == "litert" and prepared.get("runtime") not in {"service", "http"}
+    ) and execution_backend is None:
         execution_backend = "subprocess_actor"
     max_chunk_chars = prepared.pop("max_chunk_chars", None)
     chunk_overlap_chars = prepared.pop("chunk_overlap_chars", 200)

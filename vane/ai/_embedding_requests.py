@@ -206,6 +206,9 @@ class ManagedTextEmbedder(ManagedEmbedder, ABC):
                             _log_substituted_failure(exc, on_error="ignore")
                     return
                 except Exception as exc:
+                    from vane.ai._errors import _raise_if_resource_error
+
+                    _raise_if_resource_error(exc)
                     failure = exc
                     if (
                         not isinstance(exc, (ProviderCapabilityError, _ProviderResultError))

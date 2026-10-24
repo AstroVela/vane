@@ -114,7 +114,7 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
-    # SGLang / vLLM: choose a remote service explicitly instead of an engine.
+    # Inference providers: choose a remote service explicitly instead of an engine.
     runtime: Literal["native", "http", "service"]
     service_path: str
     service_id: str
@@ -452,7 +452,7 @@ def validate_embed_options(
         allowed = _EMBED_COMMON_OPTIONS | _MLX_COMMON_DEFAULTS.keys()
     if family == "litert":
         allowed = _EMBED_COMMON_OPTIONS | litert_option_names(
-            text=_input_kind == "text", service=copied.get("runtime") == "service"
+            text=_input_kind == "text", service=copied.get("runtime") == "service", http=copied.get("runtime") == "http"
         )
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
@@ -467,19 +467,21 @@ def validate_embed_options(
 
         actor_number = copied.get("actor_number")
         service = copied.get("runtime") == "service"
-        if not service:
+        http = copied.get("runtime") == "http"
+        if not service and not http:
             if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
                 raise EmbeddingConfigurationError("LiteRT requires actor_number=1")
             if copied.get("execution_backend") not in (None, "subprocess_actor"):
                 raise EmbeddingConfigurationError("LiteRT requires execution_backend='subprocess_actor'")
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("LiteRT does not support character chunk averaging")
-        names = litert_option_names(text=_input_kind == "text", service=service)
+        names = litert_option_names(text=_input_kind == "text", service=service, http=http)
         copied.update(
             validate_litert_options(
                 {key: value for key, value in copied.items() if key in names},
                 text=_input_kind == "text",
                 service=service,
+                http=http,
             )
         )
         if actor_number is None:
@@ -647,7 +649,9 @@ def validate_embed_image_options(
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
-        allowed |= litert_option_names(text=False, service=options.get("runtime") == "service")
+        allowed |= litert_option_names(
+            text=False, service=options.get("runtime") == "service", http=options.get("runtime") == "http"
+        )
     if provider_family == "mlx":
         allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
@@ -685,7 +689,7 @@ def validate_embed_audio_options(
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
-        return validate_embed_options(provider_family, options, relation=relation, _input_kind="image")
+        return validate_embed_options(provider_family, options, relation=relation, _input_kind="audio")
     if provider_family == "mlx":
         allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
@@ -710,6 +714,10 @@ def validate_embed_video_options(
 ) -> dict[str, Any]:
     """Video providers cannot inherit text chunking or image loading policies."""
     allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "litert":
+        allowed |= litert_option_names(
+            text=False, service=options.get("runtime") == "service", http=options.get("runtime") == "http"
+        )
     if provider_family == "mlx":
         allowed |= _MLX_COMMON_DEFAULTS.keys()
     if provider_family == "google":
@@ -739,7 +747,10 @@ def validate_embed_video_options(
     if unknown:
         raise TypeError("Unsupported EmbedVideo option(s): " + ", ".join(unknown))
     return validate_embed_options(
-        provider_family, options, relation=relation, _input_kind="video" if provider_family == "mlx" else "text"
+        provider_family,
+        options,
+        relation=relation,
+        _input_kind="video" if provider_family in {"mlx", "litert"} else "text",
     )
 
 
