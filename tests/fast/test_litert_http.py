@@ -266,14 +266,14 @@ def test_model_specific_video_and_audio_contracts(model):
 
 
 @pytest.mark.parametrize("key", ["", " ", "bad\ncredential"])
-def test_http_auth_validation_does_not_block_native_and_service_metadata(monkeypatch, key):
+def test_http_auth_validation_does_not_block_native_and_service_metadata(monkeypatch, tmp_path, key):
     monkeypatch.setenv("LITERT_API_KEY", key)
     provider = load_provider("litert")
-    provider.get_text_embedder(options={"model_path": "/models/model.litertlm", "model_sha256": "a" * 64})
+    provider.get_text_embedder(options={"model_path": str(tmp_path / "model.litertlm"), "model_sha256": "a" * 64})
     provider.get_text_embedder(
         options={
             "runtime": "service",
-            "service_path": "/models/service.json",
+            "service_path": str(tmp_path / "service.json"),
             "service_id": "fixture",
             "model_sha256": "a" * 64,
         }
