@@ -158,6 +158,13 @@ for table operations.
 
 ## Validation
 
+Iceberg provider compatibility and native local REST reads have a separate
+[qualification record and Python read interface](GRAVITINO_ICEBERG.md).
+`vane.catalog.IcebergCatalog` attaches a READ_ONLY catalog and returns native
+local relations, optionally at an explicit snapshot ID. It uses an independently
+built Iceberg/Avro provider pair and the service's Iceberg REST endpoint; the
+Fileset catalog attachment and metadata tests below do not qualify that path.
+
 Tests use a local HTTP fixture implementing the Gravitino 1.3 REST shapes and
 actual native file reads. Run non-Ray and Ray tests in separate processes:
 

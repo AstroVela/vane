@@ -1,0 +1,4 @@
+# Test driver only; these packages do not enter the Ray runtime image.
+-r requirements-test.txt
+pytest==9.1.1
+pytest-timeout==2.4.0
