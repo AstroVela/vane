@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Canonical S3 locators for Vane frozen scans; apply after iceberg-vane-deletes.patch.
+# Upstream source: duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c (MIT).
+
+diff --git a/src/planning/vane_iceberg_delete_state.cpp b/src/planning/vane_iceberg_delete_state.cpp
+--- a/src/planning/vane_iceberg_delete_state.cpp
++++ b/src/planning/vane_iceberg_delete_state.cpp
+@@ -38,6 +38,25 @@
+ }
+ 
+ void VaneValidateIcebergPath(const string &path) {
++	if (StringUtil::StartsWith(path, "s3://")) {
++		auto separator = path.find('/', 5);
++		bool valid = separator != string::npos && separator > 5 && separator + 1 < path.size();
++		if (valid) {
++			auto bucket = path.substr(5, separator - 5);
++			valid = bucket.size() >= 3 && bucket.size() <= 63 && bucket.front() != '.' && bucket.front() != '-' &&
++			        bucket.back() != '.' && bucket.back() != '-' && bucket.find("..") == string::npos;
++			for (auto c : bucket) {
++				valid = valid && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-');
++			}
++		}
++		for (auto c : path) {
++			valid = valid && static_cast<uint8_t>(c) >= 32 && c != 127 && c != '?' && c != '#';
++		}
++		if (!valid) {
++			throw InvalidInputException("Frozen Iceberg transport requires canonical s3://bucket/object paths");
++		}
++		return;
++	}
+ 	const bool absolute = StringUtil::StartsWith(path, "/") || StringUtil::StartsWith(path, "\\\\") ||
+ 	                      (path.size() >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'));
+ 	if (path.empty() || path.find('\0') != string::npos || (!StringUtil::StartsWith(path, "file:///") && !absolute)) {

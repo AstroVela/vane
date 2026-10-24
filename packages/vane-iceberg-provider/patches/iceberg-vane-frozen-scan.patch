@@ -1,0 +1,606 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Iceberg-owned frozen v2 scan transport for Vane; apply after iceberg-vane-local.patch.
+# Upstream source: duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c (MIT).
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 78fc2265..83d84627 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -99,6 +99,7 @@ set(EXTENSION_SOURCES
+ 	src/iceberg_logging.cpp
+ 	src/planning/iceberg_multi_file_list.cpp
+ 	src/planning/iceberg_multi_file_reader.cpp
++	src/planning/vane_iceberg_frozen_scan.cpp
+ 	src/planning/iceberg_optimizer.cpp
+ 	src/planning/metadata_io/avro/avro_scan.cpp
+ 	src/planning/metadata_io/avro/iceberg_avro_multi_file_list.cpp
+@@ -128,6 +129,12 @@ endif()
+ 
+ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
+ 
++# Vane loadable extensions are self-contained and cannot import the native
++# module's private Parquet symbols. Include and link the pinned implementation.
++target_include_directories(${EXTENSION_NAME} PRIVATE $<TARGET_PROPERTY:parquet_extension,INCLUDE_DIRECTORIES>)
++target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE $<TARGET_PROPERTY:parquet_extension,INCLUDE_DIRECTORIES>)
++target_link_libraries(${TARGET_NAME}_loadable_extension parquet_extension)
++
+ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+     find_package(CURL REQUIRED)
+     find_package(AWSSDK REQUIRED COMPONENTS core sso sts)
+diff --git a/src/function/scan/iceberg_scan.cpp b/src/function/scan/iceberg_scan.cpp
+index 74bd5db6..23cbacf0 100644
+--- a/src/function/scan/iceberg_scan.cpp
++++ b/src/function/scan/iceberg_scan.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "common/iceberg_utils.hpp"
+ #include "planning/iceberg_multi_file_reader.hpp"
++#include "planning/vane_iceberg_frozen_scan.hpp"
+ #include "function/iceberg_functions.hpp"
+ #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+ 
+@@ -50,14 +51,17 @@ virtual_column_map_t IcebergVirtualColumns(ClientContext &context, optional_ptr<
+ 
+ static void IcebergScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                  const TableFunction &function) {
+-	throw NotImplementedException("IcebergScan serialization not implemented");
++	VaneIcebergScanSerialize(serializer, bind_data, function);
+ }
+ static unique_ptr<FunctionData> IcebergScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+-	throw NotImplementedException("IcebergScan deserialization not implemented");
++	return VaneIcebergScanDeserialize(deserializer, function);
+ }
+ 
+ BindInfo IcebergBindInfo(const optional_ptr<FunctionData> bind_data) {
+ 	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
++	if (VaneIsFrozenIcebergList(*multi_file_data.file_list)) {
++		return BindInfo(ScanType::EXTERNAL);
++	}
+ 	auto &file_list = multi_file_data.file_list->Cast<IcebergMultiFileList>();
+ 	auto table = file_list.GetTable();
+ 	if (!table) {
+@@ -93,6 +97,7 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction(ExtensionLoader &loade
+ 		// TODO: implement/fix these
+ 		function.serialize = IcebergScanSerialize;
+ 		function.deserialize = IcebergScanDeserialize;
++		function.SetDistributedScanCallbacks(VaneIcebergFrozenScanCallbacks());
+ 
+ 		function.statistics = nullptr;
+ 		function.table_scan_progress = nullptr;
+diff --git a/src/include/catalog/rest/iceberg_catalog.hpp b/src/include/catalog/rest/iceberg_catalog.hpp
+index 45fcde59..c6c9efd5 100644
+--- a/src/include/catalog/rest/iceberg_catalog.hpp
++++ b/src/include/catalog/rest/iceberg_catalog.hpp
+@@ -168,6 +168,9 @@ public:
+ 	bool SupportsTimeTravel() const override {
+ 		return true;
+ 	}
++	bool RequiresAttachmentForPlanDeserialization() const override {
++		return false;
++	}
+ 	void DropSchema(ClientContext &context, DropInfo &info) override;
+ 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
+ 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
+diff --git a/src/include/planning/iceberg_multi_file_list.hpp b/src/include/planning/iceberg_multi_file_list.hpp
+index 2e9fb11a..f205b04f 100644
+--- a/src/include/planning/iceberg_multi_file_list.hpp
++++ b/src/include/planning/iceberg_multi_file_list.hpp
+@@ -113,6 +113,7 @@ public:
+ 	string GetPath() const;
+ 	const IcebergTableMetadata &GetMetadata() const;
+ 	bool HasTransactionData() const;
++	bool HasDeleteManifestsForTransport() const;
+ 	const IcebergTransactionData &GetTransactionData() const;
+ 	const IcebergSnapshotScanInfo &GetSnapshot() const;
+ 	const IcebergTableSchema &GetSchema() const;
+diff --git a/src/include/planning/vane_iceberg_frozen_scan.hpp b/src/include/planning/vane_iceberg_frozen_scan.hpp
+new file mode 100644
+index 00000000..635c8ace
+--- /dev/null
++++ b/src/include/planning/vane_iceberg_frozen_scan.hpp
+@@ -0,0 +1,18 @@
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "duckdb/function/table_function.hpp"
++
++namespace duckdb {
++
++class MultiFileList;
++
++void VaneIcebergScanSerialize(Serializer &serializer, optional_ptr<FunctionData> bind_data,
++                              const TableFunction &function);
++unique_ptr<FunctionData> VaneIcebergScanDeserialize(Deserializer &deserializer, TableFunction &function);
++TableFunctionDistributedScanCallbacks VaneIcebergFrozenScanCallbacks();
++bool VaneIsFrozenIcebergList(const MultiFileList &files);
++
++} // namespace duckdb
+diff --git a/src/planning/iceberg_multi_file_list.cpp b/src/planning/iceberg_multi_file_list.cpp
+index 7f3bd4ad..555dd13d 100644
+--- a/src/planning/iceberg_multi_file_list.cpp
++++ b/src/planning/iceberg_multi_file_list.cpp
+@@ -146,6 +146,12 @@ bool IcebergMultiFileList::HasTransactionData() const {
+ 	return shared_state->scan_info->transaction_data;
+ }
+ 
++bool IcebergMultiFileList::HasDeleteManifestsForTransport() const {
++	lock_guard<mutex> guard(shared_state->lock);
++	InitializeSharedState(guard);
++	return !shared_state->committed_delete_manifests.empty() || !shared_state->transaction_delete_manifests.empty();
++}
++
+ const IcebergTransactionData &IcebergMultiFileList::GetTransactionData() const {
+ 	D_ASSERT(HasTransactionData());
+ 	return *shared_state->scan_info->transaction_data;
+diff --git a/src/planning/iceberg_multi_file_reader.cpp b/src/planning/iceberg_multi_file_reader.cpp
+index 45223e2c..ee402009 100644
+--- a/src/planning/iceberg_multi_file_reader.cpp
++++ b/src/planning/iceberg_multi_file_reader.cpp
+@@ -16,6 +16,7 @@
+ #include "common/iceberg_utils.hpp"
+ #include "iceberg_logging.hpp"
+ #include "planning/iceberg_multi_file_list.hpp"
++#include "planning/vane_iceberg_frozen_scan.hpp"
+ #include "planning/pruning/iceberg_predicate.hpp"
+ #include "core/expression/iceberg_value.hpp"
+ #include "core/expression/iceberg_predicate_stats.hpp"
+@@ -597,6 +598,9 @@ vector<PartitionStatistics> IcebergMultiFileReader::IcebergGetPartitionStats(Cli
+                                                                              GetPartitionStatsInput &input) {
+ 	auto &bind_data = input.bind_data->Cast<MultiFileBindData>();
+ 	vector<PartitionStatistics> result;
++	if (VaneIsFrozenIcebergList(*bind_data.file_list)) {
++		return result;
++	}
+ 	auto &multi_file_list = bind_data.file_list->Cast<IcebergMultiFileList>();
+ 	multi_file_list.GetStatistics(result);
+ 	return result;
+diff --git a/src/planning/vane_iceberg_frozen_scan.cpp b/src/planning/vane_iceberg_frozen_scan.cpp
+new file mode 100644
+index 00000000..19fe17a5
+--- /dev/null
++++ b/src/planning/vane_iceberg_frozen_scan.cpp
+@@ -0,0 +1,440 @@
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: Apache-2.0
++
++#include "planning/vane_iceberg_frozen_scan.hpp"
++
++#include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
++#include "planning/iceberg_multi_file_reader.hpp"
++#include "parquet_multi_file_info.hpp"
++
++#include "duckdb/common/multi_file/multi_file_states.hpp"
++#include "duckdb/common/serializer/binary_deserializer.hpp"
++#include "duckdb/common/serializer/binary_serializer.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
++#include "duckdb/function/distributed_table_function.hpp"
++#include "duckdb/parser/expression/constant_expression.hpp"
++
++namespace duckdb {
++namespace {
++
++static constexpr uint32_t FROZEN_BIND_VERSION = 1;
++static constexpr uint32_t FROZEN_ASSIGNMENT_VERSION = 1;
++static const char *WHOLE_SCAN_SPLIT_ID = "snapshot";
++
++enum class FrozenRole : uint8_t { SNAPSHOT = 0, UNASSIGNED_WORKER = 1, ASSIGNED_WORKER = 2 };
++
++struct FrozenIdentity {
++	string table_uuid;
++	bool has_snapshot = false;
++	int64_t snapshot_id = 0;
++	int32_t schema_id = 0;
++	FrozenRole role = FrozenRole::SNAPSHOT;
++};
++
++struct FrozenIcebergFileList : public SimpleMultiFileList {
++	FrozenIcebergFileList(FrozenIdentity identity, vector<OpenFileInfo> files)
++	    : SimpleMultiFileList(std::move(files)), identity(std::move(identity)) {
++	}
++	FrozenIdentity identity;
++};
++
++static void ValidatePath(const string &path) {
++	const bool absolute = StringUtil::StartsWith(path, "/") || StringUtil::StartsWith(path, "\\\\") ||
++	                      (path.size() >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'));
++	if (path.empty() || path.find('\0') != string::npos || (!StringUtil::StartsWith(path, "file:///") && !absolute)) {
++		throw NotImplementedException("Frozen Iceberg transport requires absolute local data-file paths");
++	}
++	if (path.find("://") != string::npos && !StringUtil::StartsWith(path, "file:///")) {
++		throw NotImplementedException("Frozen Iceberg transport currently supports local data files only");
++	}
++}
++
++static FrozenIdentity FreezeIdentity(const MultiFileBindData &bind) {
++	if (auto frozen = dynamic_cast<const FrozenIcebergFileList *>(bind.file_list.get())) {
++		return frozen->identity;
++	}
++	auto &files = bind.file_list->Cast<IcebergMultiFileList>();
++	auto &metadata = files.GetMetadata();
++	if (metadata.iceberg_version != 2) {
++		throw NotImplementedException("Frozen Iceberg transport currently requires format version 2");
++	}
++	if (files.HasTransactionData()) {
++		throw NotImplementedException("Frozen Iceberg transport does not support uncommitted transaction data");
++	}
++	for (auto &spec : metadata.partition_specs) {
++		if (!spec.second.fields.empty()) {
++			throw NotImplementedException("Frozen Iceberg transport does not yet support partitioned tables");
++		}
++	}
++	if (files.HasDeleteManifestsForTransport()) {
++		throw NotImplementedException("Frozen Iceberg transport does not yet support delete manifests");
++	}
++	if (!metadata.mappings.empty() || metadata.GetSchemas().size() != 1) {
++		throw NotImplementedException(
++		    "Frozen Iceberg transport does not yet support schema evolution or name mappings");
++	}
++	FrozenIdentity result;
++	result.table_uuid = metadata.table_uuid;
++	auto &selected = files.GetSnapshot();
++	result.has_snapshot = selected.snapshot != nullptr;
++	result.snapshot_id = selected.snapshot ? selected.snapshot->snapshot_id : 0;
++	result.schema_id = selected.schema_id;
++	return result;
++}
++
++static void ValidateSchema(const MultiFileBindData &bind) {
++	if (bind.names.empty() || bind.names.size() != bind.types.size()) {
++		throw NotImplementedException("Frozen Iceberg transport requires a nonempty consistent output schema");
++	}
++	if (bind.reader_bind.mapping != MultiFileColumnMappingMode::BY_FIELD_ID) {
++		throw NotImplementedException("Frozen Iceberg transport requires a field-ID-mapped table schema");
++	}
++	if (bind.reader_bind.schema.size() != bind.types.size()) {
++		throw NotImplementedException("Frozen Iceberg transport requires matching reader and output schemas");
++	}
++	if ((bind.reader_bind.filename_idx.IsValid() &&
++	     bind.reader_bind.filename_idx.GetIndex() != MultiFileReader::COLUMN_IDENTIFIER_FILENAME) ||
++	    !bind.reader_bind.hive_partitioning_indexes.empty()) {
++		throw NotImplementedException("Frozen Iceberg transport does not support filename or hive partition columns");
++	}
++	for (idx_t index = 0; index < bind.reader_bind.schema.size(); index++) {
++		auto &column = bind.reader_bind.schema[index];
++		if (column.name != bind.names[index] || column.type != bind.types[index]) {
++			throw NotImplementedException("Frozen Iceberg transport requires matching reader column definitions");
++		}
++		if (column.type.IsNested() || column.identifier.IsNull() ||
++		    column.identifier.type().id() != LogicalTypeId::INTEGER || column.identifier.GetValue<int32_t>() <= 0) {
++			throw NotImplementedException("Frozen Iceberg transport does not yet support nested or unmapped columns");
++		}
++		if (column.default_expression && column.default_expression->expression_class != ExpressionClass::CONSTANT) {
++			throw NotImplementedException("Frozen Iceberg transport requires constant column defaults");
++		}
++	}
++}
++
++static void WriteReaderSchema(Serializer &serializer, const MultiFileReaderBindData &reader) {
++	vector<int32_t> ids;
++	vector<uint8_t> has_defaults;
++	vector<Value> defaults;
++	for (auto &column : reader.schema) {
++		ids.push_back(column.identifier.GetValue<int32_t>());
++		has_defaults.push_back(column.default_expression ? 1 : 0);
++		defaults.push_back(column.default_expression ? column.GetDefaultValue() : Value());
++	}
++	serializer.WriteProperty(1, "field_ids", ids);
++	serializer.WriteProperty(2, "has_defaults", has_defaults);
++	serializer.WriteProperty(3, "defaults", defaults);
++}
++
++static MultiFileReaderBindData ReadReaderSchema(Deserializer &deserializer, const vector<LogicalType> &types,
++                                                const vector<string> &names) {
++	auto ids = deserializer.ReadProperty<vector<int32_t>>(1, "field_ids");
++	auto has_defaults = deserializer.ReadProperty<vector<uint8_t>>(2, "has_defaults");
++	auto defaults = deserializer.ReadProperty<vector<Value>>(3, "defaults");
++	if (names.size() != types.size() || ids.size() != types.size() || has_defaults.size() != types.size() ||
++	    defaults.size() != types.size()) {
++		throw SerializationException("Invalid frozen Iceberg field schema");
++	}
++	MultiFileReaderBindData reader;
++	reader.mapping = MultiFileColumnMappingMode::BY_FIELD_ID;
++	reader.filename_idx = MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
++	set<int32_t> seen;
++	for (idx_t index = 0; index < types.size(); index++) {
++		if (ids[index] <= 0 || !seen.insert(ids[index]).second || has_defaults[index] > 1) {
++			throw SerializationException("Invalid frozen Iceberg field definition");
++		}
++		MultiFileColumnDefinition column(names[index], types[index]);
++		column.identifier = Value::INTEGER(ids[index]);
++		if (has_defaults[index]) {
++			column.default_expression = make_uniq<ConstantExpression>(std::move(defaults[index]));
++		}
++		reader.schema.push_back(std::move(column));
++	}
++	return reader;
++}
++
++static vector<OpenFileInfo> FrozenFiles(const MultiFileBindData &bind) {
++	// Iceberg's GetAllFiles returns only entries already materialized. Fully
++	// expand the selected manifests first; an untouched live bind may otherwise
++	// serialize zero files even for a nonempty snapshot.
++	auto count = bind.file_list->GetTotalFileCount();
++	auto files = bind.file_list->GetAllFiles();
++	if (files.size() != count) {
++		throw SerializationException("Frozen Iceberg file enumeration is incomplete");
++	}
++	for (auto &file : files) {
++		ValidatePath(file.path);
++	}
++	return files;
++}
++
++static void WriteIdentity(Serializer &serializer, const FrozenIdentity &identity) {
++	serializer.WriteProperty(1, "table_uuid", identity.table_uuid);
++	serializer.WriteProperty(2, "has_snapshot", identity.has_snapshot);
++	serializer.WriteProperty(3, "snapshot_id", identity.snapshot_id);
++	serializer.WriteProperty(4, "schema_id", identity.schema_id);
++}
++
++static FrozenIdentity ReadIdentity(Deserializer &deserializer) {
++	FrozenIdentity result;
++	result.table_uuid = deserializer.ReadProperty<string>(1, "table_uuid");
++	result.has_snapshot = deserializer.ReadProperty<bool>(2, "has_snapshot");
++	result.snapshot_id = deserializer.ReadProperty<int64_t>(3, "snapshot_id");
++	result.schema_id = deserializer.ReadProperty<int32_t>(4, "schema_id");
++	if (result.table_uuid.empty() || result.schema_id < 0 || (!result.has_snapshot && result.snapshot_id != 0) ||
++	    (result.has_snapshot && result.snapshot_id <= 0)) {
++		throw SerializationException("Invalid frozen Iceberg snapshot identity");
++	}
++	return result;
++}
++
++static bool SameSnapshot(const FrozenIdentity &left, const FrozenIdentity &right) {
++	return left.table_uuid == right.table_uuid && left.has_snapshot == right.has_snapshot &&
++	       left.snapshot_id == right.snapshot_id && left.schema_id == right.schema_id;
++}
++
++static void WriteFiles(Serializer &serializer, field_id_t id, const vector<OpenFileInfo> &files) {
++	vector<string> paths;
++	for (auto &file : files) {
++		paths.push_back(file.path);
++	}
++	serializer.WriteProperty(id, "data_files", paths);
++}
++
++static vector<OpenFileInfo> ReadFiles(Deserializer &deserializer, field_id_t id) {
++	auto paths = deserializer.ReadProperty<vector<string>>(id, "data_files");
++	vector<OpenFileInfo> result;
++	for (auto &path : paths) {
++		ValidatePath(path);
++		result.emplace_back(std::move(path));
++	}
++	return result;
++}
++
++struct FrozenIcebergReader : public MultiFileReader {
++	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &) {
++		return make_uniq<FrozenIcebergReader>();
++	}
++	unique_ptr<MultiFileReader> Copy() const override {
++		return make_uniq<FrozenIcebergReader>();
++	}
++	shared_ptr<MultiFileList> CreateFileList(ClientContext &, const vector<string> &, const FileGlobInput &) override {
++		throw SerializationException("Frozen Iceberg scans cannot rebind metadata or expand paths");
++	}
++	unique_ptr<MultiFileList> ComplexFilterPushdown(ClientContext &, MultiFileList &, const MultiFileOptions &,
++	                                                MultiFilePushdownInfo &,
++	                                                vector<unique_ptr<Expression>> &) override {
++		return nullptr;
++	}
++	unique_ptr<MultiFileList> DynamicFilterPushdown(ClientContext &, const MultiFileList &, const MultiFileOptions &,
++	                                                const vector<string> &, const vector<LogicalType> &,
++	                                                const vector<column_t> &, TableFilterSet &) override {
++		return nullptr;
++	}
++	unique_ptr<MultiFileReaderGlobalState>
++	InitializeGlobalState(ClientContext &context, const MultiFileOptions &options, const MultiFileReaderBindData &bind,
++	                      const MultiFileList &files, const vector<MultiFileColumnDefinition> &columns,
++	                      const vector<ColumnIndex> &ids) override {
++		auto &frozen = files.Cast<FrozenIcebergFileList>();
++		if (frozen.identity.role == FrozenRole::UNASSIGNED_WORKER) {
++			throw InvalidInputException("Frozen Iceberg worker requires an explicit scan assignment");
++		}
++		return MultiFileReader::InitializeGlobalState(context, options, bind, files, columns, ids);
++	}
++	unique_ptr<Expression> GetVirtualColumnExpression(ClientContext &context, MultiFileReaderData &reader,
++	                                                  const vector<MultiFileColumnDefinition> &columns, idx_t &column,
++	                                                  const LogicalType &type, MultiFileLocalIndex local,
++	                                                  optional_ptr<MultiFileColumnDefinition> &reference) override {
++		if (column == COLUMN_IDENTIFIER_ROW_ID ||
++		    column == IcebergMultiFileReader::COLUMN_IDENTIFIER_LAST_SEQUENCE_NUMBER) {
++			throw NotImplementedException("Frozen Iceberg transport does not yet support row lineage virtual columns");
++		}
++		return MultiFileReader::GetVirtualColumnExpression(context, reader, columns, column, type, local, reference);
++	}
++};
++
++static unique_ptr<MultiFileBindData> RestoreBind(FrozenIdentity identity, vector<OpenFileInfo> files,
++                                                 vector<LogicalType> types, vector<string> names,
++                                                 vector<string> table_columns, MultiFileReaderBindData reader_bind,
++                                                 ParquetOptionsSerialization parquet_options, idx_t row_groups,
++                                                 idx_t cardinality) {
++	if (identity.role == FrozenRole::UNASSIGNED_WORKER && !files.empty()) {
++		throw SerializationException("Frozen Iceberg worker bind cannot retain coordinator files");
++	}
++	if (!identity.has_snapshot && !files.empty()) {
++		throw SerializationException("Frozen Iceberg data files require a selected snapshot");
++	}
++	if (parquet_options.file_options.union_by_name || parquet_options.file_options.hive_partitioning ||
++	    !parquet_options.parquet_options.schema.empty() || parquet_options.parquet_options.encryption_config) {
++		throw NotImplementedException(
++		    "Frozen Iceberg transport does not support alternate Parquet schemas or encryption");
++	}
++	auto result = make_uniq<MultiFileBindData>();
++	result->multi_file_reader = make_uniq<FrozenIcebergReader>();
++	result->file_list = make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files));
++	result->interface = make_uniq<ParquetMultiFileInfo>();
++	ParquetMultiFileInfo::DeserializeBindData(*result, std::move(parquet_options), row_groups, cardinality);
++	result->types = std::move(types);
++	result->names = std::move(names);
++	result->table_columns = std::move(table_columns);
++	result->reader_bind = std::move(reader_bind);
++	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
++	result->virtual_columns = IcebergTableEntry::VirtualColumns();
++	result->interface->FinalizeBindData(*result);
++	ValidateSchema(*result);
++	return result;
++}
++
++static unique_ptr<FunctionData> CreateWorkerBind(const TableFunctionDistributedScanInput &input) {
++	if (!input.bind_data) {
++		throw SerializationException("Frozen Iceberg worker bind requires coordinator state");
++	}
++	auto &source = input.bind_data->Cast<MultiFileBindData>();
++	auto identity = FreezeIdentity(source);
++	ValidateSchema(source);
++	identity.role = FrozenRole::UNASSIGNED_WORKER;
++	idx_t groups, cardinality;
++	auto options = ParquetMultiFileInfo::SerializeBindData(source, groups, cardinality);
++	// Select owned format/schema state only. No source context, catalog, cache,
++	// initial reader or coordinator file collection enters this worker bind.
++	return RestoreBind(std::move(identity), {}, source.types, source.names, source.table_columns, source.reader_bind,
++	                   std::move(options), groups, cardinality);
++}
++
++static vector<DistributedScanSplit> PlanWholeScan(const TableFunctionDistributedScanPlanningInput &input) {
++	if (!input.bind_data) {
++		throw SerializationException("Frozen Iceberg planning requires bind data");
++	}
++	auto &bind = input.bind_data->Cast<MultiFileBindData>();
++	auto identity = FreezeIdentity(bind);
++	ValidateSchema(bind);
++	auto files = FrozenFiles(bind);
++	if (files.empty()) {
++		return {};
++	}
++	MemoryStream stream(Allocator::DefaultAllocator());
++	BinarySerializer serializer(stream);
++	serializer.Begin();
++	serializer.WriteProperty(1, "assignment_version", FROZEN_ASSIGNMENT_VERSION);
++	serializer.WriteObject(2, "identity", [&](Serializer &object) { WriteIdentity(object, identity); });
++	WriteFiles(serializer, 3, files);
++	serializer.End();
++	DistributedScanSplit split;
++	split.split_id = WHOLE_SCAN_SPLIT_ID;
++	split.payload = string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
++	return {std::move(split)};
++}
++
++static void ApplyWholeScan(optional_ptr<FunctionData> bind_data, const vector<DistributedScanSplit> &splits) {
++	if (!bind_data) {
++		throw SerializationException("Frozen Iceberg assignment requires worker bind data");
++	}
++	auto &bind = bind_data->Cast<MultiFileBindData>();
++	auto &list = bind.file_list->Cast<FrozenIcebergFileList>();
++	// The native execution entry point also accepts an ordinary, independently
++	// restored frozen plan. Both forms require an explicit assignment; replace
++	// its paths only after complete validation, never use them as a fallback.
++	auto identity = list.identity;
++	vector<OpenFileInfo> files;
++	if (!splits.empty()) {
++		if (splits.size() != 1 || splits[0].split_id != WHOLE_SCAN_SPLIT_ID) {
++			throw InvalidInputException("Frozen Iceberg currently requires one complete snapshot assignment");
++		}
++		auto &payload = splits[0].payload;
++		if (payload.empty()) {
++			throw SerializationException("Frozen Iceberg assignment payload is empty");
++		}
++		auto data = reinterpret_cast<data_ptr_t>(const_cast<char *>(payload.data()));
++		MemoryStream stream(data, payload.size());
++		BinaryDeserializer deserializer(stream);
++		deserializer.Begin();
++		if (deserializer.ReadProperty<uint32_t>(1, "assignment_version") != FROZEN_ASSIGNMENT_VERSION) {
++			throw SerializationException("Unsupported frozen Iceberg assignment version");
++		}
++		FrozenIdentity assigned;
++		deserializer.ReadObject(2, "identity", [&](Deserializer &object) { assigned = ReadIdentity(object); });
++		if (!SameSnapshot(identity, assigned)) {
++			throw SerializationException("Frozen Iceberg assignment does not match the worker snapshot");
++		}
++		files = ReadFiles(deserializer, 3);
++		deserializer.End();
++		if (stream.GetPosition() != payload.size()) {
++			throw SerializationException("Frozen Iceberg assignment has trailing bytes");
++		}
++	}
++	identity.role = FrozenRole::ASSIGNED_WORKER;
++	bind.file_list = make_shared_ptr<FrozenIcebergFileList>(std::move(identity), std::move(files));
++}
++
++} // namespace
++
++bool VaneIsFrozenIcebergList(const MultiFileList &files) {
++	return dynamic_cast<const FrozenIcebergFileList *>(&files) != nullptr;
++}
++
++void VaneIcebergScanSerialize(Serializer &serializer, optional_ptr<FunctionData> data, const TableFunction &) {
++	if (!data) {
++		throw SerializationException("Frozen Iceberg serialization requires bind data");
++	}
++	auto &bind = data->Cast<MultiFileBindData>();
++	auto identity = FreezeIdentity(bind);
++	ValidateSchema(bind);
++	idx_t groups, cardinality;
++	auto options = ParquetMultiFileInfo::SerializeBindData(bind, groups, cardinality);
++	serializer.WriteProperty(1000, "frozen_bind_version", FROZEN_BIND_VERSION);
++	serializer.WriteObject(1001, "identity", [&](Serializer &object) { WriteIdentity(object, identity); });
++	serializer.WriteProperty(1002, "role", static_cast<uint8_t>(identity.role));
++	WriteFiles(serializer, 1003, FrozenFiles(bind));
++	serializer.WriteProperty(1004, "types", bind.types);
++	serializer.WriteProperty(1005, "names", bind.names);
++	serializer.WriteProperty(1006, "table_columns", bind.table_columns);
++	// Generic reader-bind serde omits schema and mapping. Iceberg owns these
++	// field IDs/defaults explicitly instead of silently restoring BY_NAME.
++	serializer.WriteObject(1007, "reader_schema",
++	                       [&](Serializer &object) { WriteReaderSchema(object, bind.reader_bind); });
++	serializer.WriteProperty(1008, "parquet_options", options);
++	serializer.WriteProperty(1009, "initial_row_groups", groups);
++	serializer.WriteProperty(1010, "initial_cardinality", cardinality);
++}
++
++unique_ptr<FunctionData> VaneIcebergScanDeserialize(Deserializer &deserializer, TableFunction &function) {
++	if (deserializer.ReadProperty<uint32_t>(1000, "frozen_bind_version") != FROZEN_BIND_VERSION) {
++		throw SerializationException("Unsupported frozen Iceberg bind version");
++	}
++	FrozenIdentity identity;
++	deserializer.ReadObject(1001, "identity", [&](Deserializer &object) { identity = ReadIdentity(object); });
++	auto role = deserializer.ReadProperty<uint8_t>(1002, "role");
++	if (role > static_cast<uint8_t>(FrozenRole::ASSIGNED_WORKER)) {
++		throw SerializationException("Invalid frozen Iceberg worker role");
++	}
++	identity.role = static_cast<FrozenRole>(role);
++	auto files = ReadFiles(deserializer, 1003);
++	auto types = deserializer.ReadProperty<vector<LogicalType>>(1004, "types");
++	auto names = deserializer.ReadProperty<vector<string>>(1005, "names");
++	auto columns = deserializer.ReadProperty<vector<string>>(1006, "table_columns");
++	MultiFileReaderBindData reader;
++	deserializer.ReadObject(1007, "reader_schema",
++	                        [&](Deserializer &object) { reader = ReadReaderSchema(object, types, names); });
++	auto options = deserializer.ReadProperty<ParquetOptionsSerialization>(1008, "parquet_options");
++	auto groups = deserializer.ReadProperty<idx_t>(1009, "initial_row_groups");
++	auto cardinality = deserializer.ReadProperty<idx_t>(1010, "initial_cardinality");
++	// LogicalGet owns this function copy. Mark it as the detached reader before
++	// reoptimization so live-catalog optimizers cannot interpret the frozen list
++	// as an IcebergMultiFileList or retain an old IcebergScanInfo.
++	function.get_multi_file_reader = FrozenIcebergReader::CreateInstance;
++	function.function_info.reset();
++	return RestoreBind(std::move(identity), std::move(files), std::move(types), std::move(names), std::move(columns),
++	                   std::move(reader), std::move(options), groups, cardinality);
++}
++
++TableFunctionDistributedScanCallbacks VaneIcebergFrozenScanCallbacks() {
++	TableFunctionDistributedScanCallbacks result;
++	result.protocol_version = 1;
++	result.split_codec = {"vane.iceberg.frozen-whole-scan", 1};
++	result.plan_splits = PlanWholeScan;
++	result.create_worker_bind = CreateWorkerBind;
++	result.apply_splits = ApplyWholeScan;
++	return result;
++}
++
++} // namespace duckdb

@@ -1,1 +1,5 @@
 /.git_archival.txt export-subst
+
+# Preserve copied notice bytes and the whitespace that forms unified-diff context.
+/LICENSES/iceberg-native-dependencies.txt -whitespace
+/packages/vane-iceberg-provider/patches/*.patch -whitespace
