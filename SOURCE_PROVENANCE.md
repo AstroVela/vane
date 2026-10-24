@@ -131,9 +131,12 @@ or SDK revision changes, copied upstream implementation, or new dependencies
 are introduced.
 The fifth patch, `iceberg-vane-transforms.patch`, extends known partition-spec
 admission in that Vane-owned Apache-2.0 adapter and freezes source constants
-only for identity transforms. It leaves all four predecessor patches and the
-version-2 wire structure unchanged, without modifying inherited source or
-introducing dependencies or additional license grants.
+only for identity transforms. Its inherited-reader adjustment also restricts
+the missing-column lookup to identity fields, preventing another transform on
+the same source from hiding a valid identity constant. That file retains the
+DuckDB and Vane attribution and MIT AND Apache-2.0 terms introduced by the fourth
+patch. All four predecessor patches and the version-2 wire structure stay
+unchanged, without new dependencies or additional license grants.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

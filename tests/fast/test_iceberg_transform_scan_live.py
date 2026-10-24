@@ -99,7 +99,7 @@ def test_transformed_values_survive_frozen_execution_without_metadata(transform_
         proxy.stop()
 
 
-@pytest.mark.parametrize("name", ["transform_bucket", "transform_truncate", "transform_specs"])
+@pytest.mark.parametrize("name", ["transform_bucket", "transform_truncate", "transform_mixed", "transform_specs"])
 def test_public_local_transformed_partition_relations(transform_tables, name):
     endpoint, tables, features = transform_tables
     with connection(tables) as con:

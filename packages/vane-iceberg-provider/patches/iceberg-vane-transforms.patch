@@ -39,3 +39,19 @@ diff --git a/src/planning/vane_iceberg_frozen_scan.cpp b/src/planning/vane_icebe
  			}
  			optional_ptr<const MultiFileColumnDefinition> column;
  			for (auto &candidate : bind.reader_bind.schema) {
+diff --git a/src/planning/iceberg_multi_file_reader.cpp b/src/planning/iceberg_multi_file_reader.cpp
+--- a/src/planning/iceberg_multi_file_reader.cpp
++++ b/src/planning/iceberg_multi_file_reader.cpp
+@@ -209,7 +209,11 @@
+ 	unordered_map<uint64_t, idx_t> identifier_to_field_index;
+ 	for (idx_t i = 0; i < partition_spec.fields.size(); i++) {
+ 		auto &field = partition_spec.fields[i];
+-		identifier_to_field_index[field.source_id] = i;
++		// A source may also have bucket/time/truncate fields. Only identity
++		// fields can supply its value when the physical column is absent.
++		if (field.transform == IcebergTransformType::IDENTITY) {
++			identifier_to_field_index[field.source_id] = i;
++		}
+ 	}
+ 
+ 	auto &local_columns = reader.columns;

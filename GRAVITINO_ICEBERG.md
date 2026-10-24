@@ -533,10 +533,12 @@ the existing boundaries.
 The fifth ordered patch, `iceberg-vane-transforms.patch`, admits the partition
 transforms already understood by the pinned provider: `year`, `month`, `day`,
 `hour`, `bucket[N]`, `truncate[W]` and `void`, alongside identity. Its SHA-256
-is `cef38197067271d2e5c4d5f9da880cb184d2ec916fb795d366e43f78c4d0f789`.
+is `674bbcb52d7c0bfdaf335e0e438ad8d036d69d1253a3f8d70428d6ac1286d1a7`.
 The four earlier patches, source/SDK pins, engine identities and dependency
-closure are unchanged. Only the Vane-owned frozen adapter is modified; no
-additional Local/Ray runner implementation is introduced.
+closure are unchanged. A small inherited-reader fix keeps a later bucket or
+time field from overwriting the identity lookup for the same source column.
+It retains the existing MIT AND Apache-2.0 attribution. No additional Local/Ray
+runner implementation is introduced.
 
 The coordinator still resolves each selected file through its own manifest's
 partition spec. It freezes only identity fields as source-column constants.
