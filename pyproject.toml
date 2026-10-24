@@ -87,14 +87,14 @@ transformers = [
 qwen3_vl = [ # Fixed BF16 / special-token encoding paired with SQR checkpoints
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
-    "transformers==5.12.1",
+    "transformers==5.20.1",
     "safetensors>=0.5,<1",
     "pillow>=11,<13",
 ]
 mlx = [ # EmbeddingGemma 2 BF16 text/image/audio/video inference on Apple Silicon Metal
     "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-vlm==0.7.8; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "transformers==5.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers==5.20.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "huggingface-hub>=1.31,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pillow>=10.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
@@ -102,11 +102,11 @@ litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inferenc
     "litert-lm-api==0.18.0",
     "pillow>=10.4",
 ]
-clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
+clap = ["torch>=2.6", "transformers>=4.51.3,<6"]
 cosmos = [
     "torch>=2.7",
     "torchvision>=0.22",
-    "transformers==4.51.3",
+    "transformers==5.20.1",
     "einops>=0.8",
     "pillow>=10.4",
 ]
