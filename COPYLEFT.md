@@ -19,6 +19,7 @@ delete upstream GPL text to change a component's apparent license.
 | libsndfile and libsoxr | LGPL-2.1-or-later; matching sources and replacement instructions accompany the shared runtime; static builds additionally require application relinking materials. |
 | mpg123 1.33.4 | LGPL-2.1-only, as specified by upstream COPYING and library headers. The pinned vcpkg SPDX `-or-later` conclusion is inaccurate. |
 | LAME 3.100 | LGPL-2.0-or-later, as granted in libmp3lame/mpglib headers. Preserve COPYING and those headers; the pinned vcpkg summary omits the later-version grant. |
+| liblzma 5.8.3 | 0BSD for the optional Avro provider's linked library. The retained XZ notice also describes GPL/LGPL utilities and build scripts; those programs are excluded from the provider wheels. |
 
 The libsndfile/SoXR audio profile is introduced by audio parity PR #787.
 This license change must be integrated with that profile before publishing
