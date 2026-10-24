@@ -146,6 +146,18 @@ it does not add image joint request fields. MLX HTTP and cross-request batching
 remain outside this adapter. Explicit service execution is described below.
 
 For local LiteRT-LM inference, see [the provider contract](LITERT_EMBEDDING.md).
+For the persistent LiteRT service, run `tests/fast/test_litert_service.py`
+alongside the service transport tests. It exercises real PyZMQ and shared
+memory with an authored CPU SDK fixture, including fixed encoding identities,
+per-request query/document roles, one SDK-owning thread and cancellation drain.
+Complete two consecutive clean reviews before building/installing the wheel.
+The opt-in `tests/ai/test_litert_embedding_service.py` uses the real checkpoint,
+public APIs and separate service/client processes. It requires the existing
+LiteRT model environment variables and the `embedding_service` extra. GPU cases
+also require `VANE_RUN_LITERT_GPU_TESTS=1` and `-m 'external_service and gpu'`;
+missing prerequisites after opt-in fail without CPU fallback. Run the Context
+service acceptance separately with Ray startup forbidden. No native source is
+changed by this adapter; platform simulation does not qualify a real Mac/Windows host.
 Install the optional `litert` extra, which pins `litert-lm-api==0.18.0`.
 Run `scripts/run_installed_pytest.sh tests/fast/test_litert_provider.py` before
 the base release gate. These CPU contracts require no model SDK or weights.
@@ -271,9 +283,26 @@ The Linux native unit suite also builds a signed, self-contained
 `loadable_extension_batch_demo` fixture. Its COPY rewrite recursively plans a
 UDF child from inside a private engine copy. After `scripts/run_native_tests.sh`,
 run its installed-Python regression with
-`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_copy`.
-This covers both local runner names, task and actor execution, empty input,
-multiple batches, nulls and fixed-size vectors while forbidding Ray startup.
+`VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$PWD/build/native-cxx20/test/extension/loadable_extension_batch_demo.duckdb_extension" scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_extension`.
+This covers COPY rewrites and connections created by the private engine, both
+local runner names, task and actor execution, empty input, multiple batches,
+nulls and fixed-size vectors while forbidding Ray startup. It also checks host
+vLLM/SGLang factory dispatch without loading models and restores DataSource bind
+data through the private engine's deserializer and scan callbacks.
+
+Executor factories and DataSource callbacks belong to `DatabaseInstance`.
+Python installs them once before exposing a connection, including cached databases,
+and all connections to that database share them. Native embedders must register
+their callbacks on the database they execute against. Do not add library-local
+runtime registries: self-contained extensions have their own copy of that static
+storage. External block readers travel with their descriptors and do not need a
+consumer-side registry lookup.
+The Python bridge also installs a database-owned connection callback for UDF
+resource preparation and teardown. Connections created inside an extension use
+that host callback, including actor pool and transport-capacity preparation.
+Schema-only native preparation does not create actor resources. Native
+Prepare/Execute calls prepare fresh query-owned resources when rebinding for
+execution, including repeated execution of the same prepared statement.
 Rebuild optional providers against the changed native SDK; a matching Python
 package version alone does not establish C++ compatibility.
 
@@ -670,3 +699,14 @@ before client creation, including ignore mode. Real-model acceptance uses the
 unchanged SGLang server with audio/video/subtitles and a matching Context catalog;
 CPU HTTP fixtures do not establish model quality. Only related tests are required;
 no native rebuild or Ray suite is needed for these Python-only HTTP changes.
+
+For vLLM HTTP tokenization options, review validation before client creation,
+explicit true/false versus omission, descriptor serialization and every split
+request, including text-only queries under the multimodal format. Complete two
+clean reviews before the noneditable Python wheel install, then run the affected
+`test_ai_embedding_http_runtime.py` and `test_ai_embedding_sglang_encode.py`
+through the installed launcher with Ray startup forbidden. The dependent Context
+preset/local gate checks model-owned tokenization for ingestion and search.
+Compare real token counts and vectors to an independent checkpoint processor;
+protocol fixtures alone do not qualify numerical behavior. Only related checks
+are required; no native rebuild, full/release suite or Ray tests.

@@ -780,14 +780,16 @@ py::dict DataSourceFactoryRegistryStateForTest() {
 	return result;
 }
 
-// ── RegisterDataSourceGlobalCallbacks ──────────────────────────────
-// Call once from Python module init to register the static callbacks.
+// ── RegisterDataSourceCallbacks ────────────────────────────────────
+// Called before a Python connection is exposed to queries or workers.
 
-void RegisterDataSourceGlobalCallbacks() {
-	DataSourceScanFunction::SetGlobalProduceStream(&DataSourceStreamFactory::ProduceStream);
-	DataSourceScanFunction::SetGlobalAcquireSource(&DataSourceStreamFactory::AcquireSource);
-	DataSourceScanFunction::SetGlobalReleaseSource(&DataSourceStreamFactory::ReleaseSource);
-	DataSourceScanFunction::SetGlobalGetSchema(&DataSourceStreamFactory::GetSchema);
+void RegisterDataSourceCallbacks(DatabaseInstance &db) {
+	DataSourceCallbacks callbacks;
+	callbacks.produce_stream = DataSourceStreamFactory::ProduceStream;
+	callbacks.acquire_source = DataSourceStreamFactory::AcquireSource;
+	callbacks.release_source = DataSourceStreamFactory::ReleaseSource;
+	callbacks.get_schema = DataSourceStreamFactory::GetSchema;
+	DataSourceScanFunction::SetCallbacks(db, callbacks);
 }
 
 } // namespace duckdb

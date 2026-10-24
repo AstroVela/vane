@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from typing import Any, Literal, TypeAlias, TypedDict
 from urllib.parse import parse_qsl, urlsplit
 
-from vane.ai._litert_options import LITERT_COMMON_OPTIONS, LITERT_TEXT_OPTIONS, validate_litert_options
+from vane.ai._litert_options import LITERT_TEXT_OPTIONS, litert_option_names, validate_litert_options
 from vane.ai._redaction import is_sensitive_option_key
 
 VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
@@ -120,6 +120,7 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     service_id: str
     http_input_format: Literal["text", "multimodal", "encode"]
     http_media_tokens: Mapping[str, str]
+    http_add_special_tokens: bool
     media_mime_types: list[str]
     max_request_bytes: int
 
@@ -187,6 +188,7 @@ _HTTP_EMBED_OPTIONS = _EMBED_REMOTE_OPTIONS | frozenset(
         "timeout",
         "http_input_format",
         "http_media_tokens",
+        "http_add_special_tokens",
         "media_mime_types",
         "max_input_bytes",
         "max_request_bytes",
@@ -494,8 +496,10 @@ def validate_embed_options(
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
     if family == "mlx":
         allowed = _EMBED_COMMON_OPTIONS | _mlx_embed_option_names(copied, text=_input_kind == "text")
-    if family == "litert" and _input_kind == "image":
-        allowed = _EMBED_COMMON_OPTIONS | LITERT_COMMON_OPTIONS
+    if family == "litert":
+        allowed = _EMBED_COMMON_OPTIONS | litert_option_names(
+            text=_input_kind == "text", service=copied.get("runtime") == "service"
+        )
     if relation:
         allowed |= _EMBED_RELATION_OPTIONS
     unknown = sorted(set(copied) - allowed)
@@ -508,16 +512,20 @@ def validate_embed_options(
         from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
         actor_number = copied.get("actor_number")
-        if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
-            raise EmbeddingConfigurationError("LiteRT requires actor_number=1")
-        if copied.get("execution_backend") not in (None, "subprocess_actor"):
-            raise EmbeddingConfigurationError("LiteRT requires execution_backend='subprocess_actor'")
+        service = copied.get("runtime") == "service"
+        if not service:
+            if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
+                raise EmbeddingConfigurationError("LiteRT requires actor_number=1")
+            if copied.get("execution_backend") not in (None, "subprocess_actor"):
+                raise EmbeddingConfigurationError("LiteRT requires execution_backend='subprocess_actor'")
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("LiteRT does not support character chunk averaging")
-        names = LITERT_TEXT_OPTIONS if _input_kind == "text" else LITERT_COMMON_OPTIONS
+        names = litert_option_names(text=_input_kind == "text", service=service)
         copied.update(
             validate_litert_options(
-                {key: value for key, value in copied.items() if key in names}, text=_input_kind == "text"
+                {key: value for key, value in copied.items() if key in names},
+                text=_input_kind == "text",
+                service=service,
             )
         )
         if actor_number is None:
@@ -583,6 +591,9 @@ def validate_embed_options(
             raise ValueError("http_input_format must be 'text', 'multimodal' or 'encode'")
         if wire_format == "encode" and family != "sglang":
             raise ValueError("http_input_format='encode' requires the SGLang provider")
+        if "http_add_special_tokens" in copied:
+            if family != "vllm" or not isinstance(copied["http_add_special_tokens"], bool):
+                raise ValueError("http_add_special_tokens requires the vLLM HTTP protocol and a bool")
         if "http_media_tokens" in copied:
             tokens = copied["http_media_tokens"]
             if wire_format != "encode" or not isinstance(tokens, Mapping):
@@ -697,7 +708,7 @@ def validate_embed_image_options(
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
-        allowed |= LITERT_COMMON_OPTIONS
+        allowed |= litert_option_names(text=False, service=options.get("runtime") == "service")
     if provider_family == "mlx":
         allowed |= _mlx_embed_option_names(options, text=False)
     if provider_family == "google":

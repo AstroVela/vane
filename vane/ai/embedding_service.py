@@ -23,6 +23,7 @@ from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._errors import _is_resource_error
+from vane.ai.provider import _ProviderResultError
 
 
 class _Credits:
@@ -108,6 +109,7 @@ class EmbeddingService:
         self.path, self.identity = path, service_id
         self._zmq_server: Any = None
         self._closing_task: asyncio.Task[None] | None = None
+        self._backend_started = False
         self.credits = _Credits(max_bytes, max_inflight)
         self.max_connections, self.publication_timeout = max_connections, publication_timeout
         self._tasks: set[asyncio.Task[None]] = set()
@@ -122,7 +124,7 @@ class EmbeddingService:
     async def start(self) -> None:
         from vane.ai._embedding_zmq import Server
 
-        if self._zmq_server is not None:
+        if self._zmq_server is not None or self._backend_started:
             raise RuntimeError("Embedding service is already started")
         if self._closing_task is not None:
             if not self._closing_task.done():
@@ -131,7 +133,10 @@ class EmbeddingService:
         self._zmq_server = Server(self)
         try:
             self._zmq_server.prepare()
+            self._backend_started = True
             await self.backend.start()
+            if self._closing_task is not None:
+                raise RuntimeError("Embedding service closed during startup")
             self._zmq_server.listen()
         except BaseException as error:
             try:
@@ -141,17 +146,26 @@ class EmbeddingService:
             raise
 
     async def aclose(self) -> None:
-        from vane.ai.providers._embedding_service_backend import owned_result
-
-        if self._closing_task is None or (self._closing_task.done() and self._closing_task.exception() is not None):
+        if (
+            self._closing_task is None
+            or self._closing_task.done()
+            and (self._closing_task.cancelled() or self._closing_task.exception() is not None)
+        ):
             self._closing_task = asyncio.create_task(self._close())
-        await owned_result(self._closing_task)
+        while True:
+            try:
+                await asyncio.shield(self._closing_task)
+                return
+            except asyncio.CancelledError:
+                if self._closing_task.cancelled():
+                    raise
 
     async def _close(self) -> None:
         if self._zmq_server is not None:
             await self._zmq_server.aclose()
             self._zmq_server = None
         await self.backend.aclose()
+        self._backend_started = False
 
     def _hello(self, message: Any) -> ipc.RequestContext:
         fields = {
@@ -193,6 +207,8 @@ class EmbeddingService:
             return {"vector": vector.tolist()}
         except EmbeddingConfigurationError:
             return {"error": "configuration"}
+        except _ProviderResultError:
+            return {"error": "result"}
         except Exception as error:
             return self._resource_context({"error": "resource" if _is_resource_error(error) else "execution"})
 

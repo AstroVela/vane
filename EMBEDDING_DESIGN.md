@@ -389,6 +389,15 @@ template on the server; declare supported media formats in `media_mime_types`.
 This declaration is an application contract, not model capability discovery.
 The server enforces its model's combinations, token counts and media limits.
 
+For vLLM HTTP, `http_add_special_tokens=True` or `False` explicitly sends its
+standard `add_special_tokens` request field, for both plain text and multimodal
+formats. Omitting the option retains the server default. Choose it according to
+the checkpoint tokenizer/template contract and use the same setting for queries
+and documents. For example, EmbeddingGemma 2's checkpoint template omits BOS/EOS;
+its multimodal messages require `http_add_special_tokens=True` to match the
+processor's reference inputs. This option is rejected for SGLang and for native
+or shared-memory execution. It does not modify the server template.
+
 SGLang also supports `http_input_format="encode"` for its native HTTP endpoint.
 It carries encoded video and raw audio together, including WAV/MP3 Base64 data
 URLs. This endpoint is separate from `/v1/embeddings`, whose schema still has no
@@ -583,7 +592,7 @@ vLLM's internal multimodal SHM cache does not implement this external ingress.
 
 ### Explicit service configuration
 
-The common service implements `runtime="service"` for `sglang`, `vllm` and `mlx`.
+The common service implements `runtime="service"` for `sglang`, `vllm`, `litert` and `mlx`.
 The existing default `runtime="native"` still constructs an
 engine in each owning UDF worker; `runtime="http"` remains the separate encoded
 media protocol. There is no transport detection, local-engine startup by a
@@ -593,6 +602,10 @@ Install `vane-ai[embedding_service]` in the service and client environments. The
 transport uses PyZMQ over loopback TCP and Python `SharedMemory` on Windows,
 macOS and Linux. Each native model SDK still determines which systems can host
 its engine; the transport does not make SGLang or vLLM engines portable.
+LiteRT clients preserve their native file-hash vector identity and send the
+retrieval role per request. The service owns one SDK thread and engine for all
+clients; file hash and encoding settings are checked before admission. See
+[the LiteRT service contract](LITERT_EMBEDDING.md#share-one-resident-engine).
 The generic Vane `subprocess_actor` / `subprocess_task` launcher still uses POSIX
 file-descriptor passing. This service transport replacement does not qualify
 those execution backends on Windows.
@@ -758,6 +771,10 @@ starting abort cleanup closes that gate before yielding. Accepted requests retai
 their buffers and credits until the model coroutine finishes. A stuck model retains
 credits because timeout does not prove reading stopped. Graceful shutdown drains
 accepted work before closing the engine and removing the rendezvous file.
+Transport and runtime references are released only after their cleanup succeeds.
+A failed close retains unfinished resources for a later `aclose()` attempt;
+concurrent callers share the active attempt. Engine cleanup waits for successful
+transport drain, and LiteRT keeps its SDK thread alive until engine close succeeds.
 After receiving a complete terminal response, the client sends its signed
 receipt and waits for server EOF before returning or reporting the error.
 The server then returns the connection slot without waiting for client EOF.

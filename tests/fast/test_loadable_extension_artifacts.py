@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import os
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -38,47 +40,203 @@ class _ReplannedActor:
         return batch
 
 
-@pytest.mark.parametrize("runner", ["local", "local-fast"])
-@pytest.mark.parametrize("backend", ["task", "actor"])
-@pytest.mark.parametrize("rows", [0, 4101])
-def test_private_copy_replanning_preserves_local_udf_execution(monkeypatch, runner, backend, rows):
+@pytest.fixture(params=["local", "local-fast"])
+def private_extension_connection(monkeypatch, request):
     artifact = _configured_artifact_path("VANE_TEST_LOADABLE_BATCH_DEMO_PATH")
-    monkeypatch.setenv("VANE_RUNNER", runner)
+    monkeypatch.setenv("VANE_RUNNER", request.param)
 
     import ray
 
     def forbid_ray(*_args, **_kwargs):
-        raise AssertionError("local COPY replanning must not initialize Ray")
+        raise AssertionError("local extension execution must not initialize Ray")
 
     monkeypatch.setattr(ray, "init", forbid_ray)
     with vane.connect(config={"autoinstall_known_extensions": "false", "autoload_known_extensions": "false"}) as con:
         con.load_extension(str(artifact))
-        source_sql = (
-            "SELECT i::BIGINT AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE 'row-' || i END AS payload, "
-            f"[i::FLOAT, NULL::FLOAT, (i + 1)::FLOAT]::FLOAT[3] AS vector FROM range({rows}) t(i)"
-        )
-        expected = con.sql(source_sql + " ORDER BY id").fetchall()
-        assert (
-            con.execute(f"COPY ({source_sql} ORDER BY id) TO 'unused' (FORMAT batch_demo_replan)").fetchall()
-            == expected
-        )
-        options = {
-            "schema": {"id": vane.sqltypes.BIGINT, "payload": vane.sqltypes.VARCHAR, "vector": "FLOAT[3]"},
-            "batch_size": 137,
-            "cpus": 1,
-            "gpus": 0,
-            "execution_backend": f"subprocess_{backend}",
-        }
-        if backend == "actor":
-            options["actor_number"] = 1
-        con.sql(source_sql).map_batches(
-            _ReplannedActor if backend == "actor" else _replanned_batch, **options
-        ).create_view("copy_input")
-        assert (
-            con.execute("COPY (SELECT * FROM copy_input ORDER BY id) TO 'unused' (FORMAT batch_demo_replan)").fetchall()
-            == expected
-        )
-        assert con.execute("SELECT 1").fetchone() == (1,)
+        yield con
+
+
+def _copy_query(sql):
+    return f"COPY ({sql}) TO 'unused' (FORMAT batch_demo_replan)"
+
+
+def _execute_private(con, sql, entry):
+    if entry == "copy":
+        return con.execute(_copy_query(sql))
+    if entry == "prepared_connection":
+        return con.execute("SELECT * FROM batch_demo_query(?, prepared := true)", [sql])
+    return con.execute("SELECT * FROM batch_demo_query(?)", [sql])
+
+
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
+@pytest.mark.parametrize("backend", ["task", "actor"])
+@pytest.mark.parametrize("rows", [0, 4101])
+def test_private_extension_preserves_local_udf_execution(private_extension_connection, entry, backend, rows):
+    con = private_extension_connection
+    source_sql = (
+        "SELECT i::BIGINT AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE 'row-' || i END AS payload, "
+        f"[i::FLOAT, NULL::FLOAT, (i + 1)::FLOAT]::FLOAT[3] AS vector FROM range({rows}) t(i)"
+    )
+    expected = con.sql(source_sql + " ORDER BY id").fetchall()
+    assert _execute_private(con, source_sql + " ORDER BY id", entry).fetchall() == expected
+    options = {
+        "schema": {"id": vane.sqltypes.BIGINT, "payload": vane.sqltypes.VARCHAR, "vector": "FLOAT[3]"},
+        "batch_size": 137,
+        "cpus": 1,
+        "gpus": 0,
+        "execution_backend": f"subprocess_{backend}",
+    }
+    if backend == "actor":
+        options["actor_number"] = 1
+    con.sql(source_sql).map_batches(_ReplannedActor if backend == "actor" else _replanned_batch, **options).create_view(
+        "copy_input"
+    )
+    assert _execute_private(con, "SELECT * FROM copy_input ORDER BY id", entry).fetchall() == expected
+    assert con.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("entry", ["connection", "prepared_connection"])
+def test_private_extension_cached_connections_share_runtime(monkeypatch, tmp_path, entry):
+    artifact = _configured_artifact_path("VANE_TEST_LOADABLE_BATCH_DEMO_PATH")
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    config = {"autoinstall_known_extensions": False, "autoload_known_extensions": False}
+    path = str(tmp_path / "runtime.duckdb")
+    with vane.connect(path, config=config) as first:
+        first.load_extension(str(artifact))
+        first.sql("SELECT 42::BIGINT AS id").map_batches(
+            _replanned_batch, schema={"id": "BIGINT"}, execution_backend="subprocess_task", cpus=1, gpus=0
+        ).create_view("runtime_input")
+        with vane.connect(path, config=config) as cached, cached.cursor() as sibling:
+            for con in (first, cached, sibling):
+                assert _execute_private(con, "SELECT * FROM runtime_input", entry).fetchall() == [(42,)]
+
+
+def test_private_extension_prepared_execution_renews_actor_resources(private_extension_connection, monkeypatch):
+    from vane.execution import udf_subprocess
+
+    pools = []
+    create_pool = udf_subprocess.LocalSubprocessActorPool
+
+    def track_pools(*args, **kwargs):
+        pool = create_pool(*args, **kwargs)
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", track_pools)
+    con = private_extension_connection
+    con.sql("SELECT i::BIGINT AS id FROM range(3) t(i)").map_batches(
+        _ReplannedActor,
+        schema={"id": "BIGINT"},
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        cpus=1,
+        gpus=0,
+    ).create_view("prepared_input")
+    relation = con.sql(
+        "SELECT * FROM batch_demo_query(?, prepared := true, executions := 2)",
+        params=["SELECT * FROM prepared_input ORDER BY id"],
+    )
+    assert relation.columns == ["id"]
+    assert pools == [], "schema-only native preparation must not create actor pools"
+    assert relation.fetchall() == [(0,), (1,), (2,)] * 2
+    assert len(pools) == 2, "each execution must prepare fresh query-owned resources"
+    assert all(not pool.cleanup_pending() for pool in pools)
+    assert all(pool.worker_pids() == [] for pool in pools)
+    assert con.execute("SELECT 1").fetchone() == (1,)
+
+
+class _ExtensionInferenceExecutor:
+    def __init__(self):
+        self.ready = deque()
+        self.finished = False
+        self.wakeups = []
+
+    def _notify(self):
+        callbacks, self.wakeups = self.wakeups, []
+        for callback in callbacks:
+            callback()
+
+    def submit(self, prefix, prompts, rows):
+        self.ready.append(([f"generated:{prefix or ''}{prompt}" for prompt in prompts], rows))
+        self._notify()
+
+    def take_ready_result(self):
+        return self.ready.popleft() if self.ready else None
+
+    def finished_submitting(self):
+        self.finished = True
+        self._notify()
+
+    def all_tasks_finished(self):
+        return self.finished and not self.ready
+
+    def register_wakeup_callback(self, callback):
+        if self.ready or self.all_tasks_finished():
+            return False
+        self.wakeups.append(callback)
+        return True
+
+    def wait_for_result(self):
+        assert self.ready or self.finished
+
+    def shutdown(self):
+        self.finished = True
+
+
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_private_extension_executes_host_inference_factory(private_extension_connection, monkeypatch, entry, engine):
+    module = importlib.import_module(f"vane.execution.{engine}")
+    calls = []
+
+    def build_host_executor(model, _options):
+        calls.append(model)
+        return _ExtensionInferenceExecutor()
+
+    monkeypatch.setattr(module, "build_executor", build_host_executor)
+    sql = f"""SELECT vllm('hello', 'extension-fixture-no-model', struct_pack(
+        __vane_vllm_payload_version := 1,
+        __vane_vllm_public_options_json := '{{}}',
+        __vane_vllm_secret_payload := encode('{{"payload_version":1,"values":[]}}'),
+        engine := '{engine}')) AS generated"""
+    assert _execute_private(private_extension_connection, sql, entry).fetchall() == [("generated:hello",)]
+    assert calls == ["extension-fixture-no-model"]
+    assert private_extension_connection.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("entry", ["copy", "connection", "prepared_connection"])
+def test_private_extension_restores_datasource_callbacks(private_extension_connection, entry):
+    import pyarrow as pa
+
+    from vane.datasource import DataSource, DataSourceTask
+
+    class SourceTask(DataSourceTask):
+        def execute(self):
+            yield pa.record_batch({"id": pa.array([1, None, 3], type=pa.int64())})
+
+    class Source(DataSource):
+        @property
+        def schema(self):
+            return {"id": "BIGINT"}
+
+        def get_tasks(self):
+            yield SourceTask()
+
+    con = private_extension_connection
+    before = dict(vane._native._datasource_factory_registry_state_for_test())
+    con.from_datasource(Source()).create_view("source_input")
+    sql = "SELECT * FROM source_input ORDER BY id"
+    expected = [(1,), (3,), (None,)]
+    assert con.execute(sql).fetchall() == expected
+    # The COPY fixture restores bind data and scan callbacks inside its DSO.
+    # Also exercise this from a connection created by that private engine.
+    if entry in ("connection", "prepared_connection"):
+        sql = _copy_query(sql)
+    assert _execute_private(con, sql, entry).fetchall() == expected
+    after = dict(vane._native._datasource_factory_registry_state_for_test())
+    for key in ("registry_size", "factory_count", "owner_count"):
+        assert after[key] == before[key]
+    assert con.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_staged_tpch_extension_loads_without_static_linkage(loadable_extension_path: Path):

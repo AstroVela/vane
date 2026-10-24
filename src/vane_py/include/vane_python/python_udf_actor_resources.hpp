@@ -11,10 +11,14 @@
 namespace duckdb {
 
 class ClientContext;
+class DatabaseInstance;
 class ClientContextState;
 class PythonUDFActorResourceState;
 class PreparedStatementData;
 struct UDFFunctionData;
+
+//! Prepare and retire local UDF resources on connections opened by native extensions too.
+void RegisterPythonUDFConnectionCallbacks(DatabaseInstance &db);
 
 //! Install opaque Python owners and native transport capacity together; requires the GIL.
 void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object &options);

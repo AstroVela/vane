@@ -30,7 +30,7 @@ from vane.ai.protocols import (
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
 )
-from vane.ai.provider import ProviderImportError
+from vane.ai.provider import ProviderImportError, _ProviderResultError
 from vane.ai.typing import UDFOptions
 from vane.execution._async_dispatch import map_async_ordered
 
@@ -117,6 +117,9 @@ class _ServiceDescriptor(EmbeddingDescriptor[Any]):
 
     def is_async(self) -> bool:
         return True
+
+    def get_request_options(self) -> dict[str, Any] | None:
+        return None
 
     def instantiate(self) -> ServiceEmbedder:
         return ServiceEmbedder(self)
@@ -246,6 +249,9 @@ class ServiceEmbedder(ManagedEmbedder):
     def _context(self, encoding: str | None = None) -> ipc.RequestContext:
         metadata = self.descriptor.metadata
         if metadata is None:
+            options = self.descriptor.get_request_options()
+            if options is not None:
+                return ipc.RequestContext.from_wire({"encoding": options, "model_contract": None})
             return ipc.RequestContext()
         return ipc.RequestContext(encoding or metadata.context.encoding, metadata.context.model_contract)
 
@@ -268,7 +274,7 @@ class ServiceEmbedder(ManagedEmbedder):
             try:
                 result = await asyncio.wait_for(self._request((plan, context)), self.options["timeout"])
                 return getattr(self, "_validate_vector", lambda value: value)(result)
-            except (EmbeddingConfigurationError, MemoryError, ProviderImportError):
+            except (EmbeddingConfigurationError, MemoryError, ProviderImportError, _ProviderResultError):
                 raise
             except Exception as error:
                 _raise_if_resource_error(error)
@@ -299,6 +305,8 @@ class ServiceEmbedder(ManagedEmbedder):
             if response.get("restart_required") is True:
                 raise MemoryError("Embedding service exhausted model or host resources; restart the embedding service")
             raise MemoryError("Embedding service exhausted model or host resources")
+        if response.get("error") == "result":
+            raise _ProviderResultError("Embedding service returned an invalid model result")
         if "error" in response:
             raise RuntimeError("Embedding service request failed")
 
@@ -315,6 +323,6 @@ class ServiceEmbedder(ManagedEmbedder):
             "request_id": request_id,
             "parts": parts,
             "nbytes": size,
-            "encoding": context.encoding,
+            "encoding": context.litert.to_wire() if context.litert is not None else context.encoding,
             "model_contract": context.model_contract.to_wire() if context.model_contract is not None else None,
         }

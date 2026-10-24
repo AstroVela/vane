@@ -42,6 +42,15 @@ typedef void (*datasource_acquire_source_t)(const char *pickled_source, idx_t pi
                                             idx_t query_id_len);
 typedef void (*datasource_release_source_t)(const char *pickled_source, idx_t pickled_len);
 
+//! Install the callbacks together so source acquisition and release always use
+//! the same runtime. They are owned by the executing DatabaseInstance.
+struct DataSourceCallbacks {
+	datasource_produce_stream_t produce_stream = nullptr;
+	datasource_acquire_source_t acquire_source = nullptr;
+	datasource_release_source_t release_source = nullptr;
+	datasource_get_schema_t get_schema = nullptr;
+};
+
 struct DataSourceScanBindData : public TableFunctionData {
 	//! Pickled DataSourceTask objects, one per task
 	vector<string> pickled_tasks;
@@ -116,16 +125,9 @@ struct DataSourceScanFunction {
 	static void RegisterFunction(BuiltinFunctions &set);
 	static void SetSnapshotTypes(DataSourceScanBindData &bind_data, const vector<LogicalType> &types);
 
-	//! Register a global produce_stream callback for use on distributed workers.
-	//! Should be called once when the Python module loads.
-	static void SetGlobalProduceStream(datasource_produce_stream_t callback);
-	//! Get the global produce_stream callback (returns nullptr if not set)
-	static datasource_produce_stream_t GetGlobalProduceStream();
-	//! Register global source ownership callbacks.
-	static void SetGlobalAcquireSource(datasource_acquire_source_t callback);
-	static void SetGlobalReleaseSource(datasource_release_source_t callback);
-	//! Register a global get_schema callback for worker schema restoration
-	static void SetGlobalGetSchema(datasource_get_schema_t callback);
+	//! Register callbacks when creating a database, including on workers.
+	static void SetCallbacks(DatabaseInstance &db, DataSourceCallbacks callbacks);
+	static DataSourceCallbacks GetCallbacks(ClientContext &context);
 };
 
 } // namespace duckdb

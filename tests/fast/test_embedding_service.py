@@ -1577,6 +1577,95 @@ def test_shutdown_drains_accepted_request_before_closing_engine(tmp_path, monkey
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
+@pytest.mark.parametrize("failure", [TimeoutError, asyncio.CancelledError])
+def test_failed_engine_close_keeps_runtime_for_shared_retry(tmp_path, monkeypatch, family, failure):
+    sdk = install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root, family)
+
+    async def run():
+        await service.start()
+        runtime = service.backend.runtime
+        engine = runtime.engine
+        finish = asyncio.Event()
+        attempts = 0
+        pending = []
+
+        async def shutdown():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise failure("authored shutdown failure")
+            await finish.wait()
+            engine.closed += 1
+
+        monkeypatch.setattr(engine, "shutdown", shutdown)
+        try:
+            with pytest.raises(failure):
+                await service.aclose()
+            assert service.backend.runtime is runtime and runtime.engine is engine
+            assert not (root / "engine.json").exists()
+            with pytest.raises(RuntimeError, match="already started"):
+                await service.start()
+            pending = [asyncio.create_task(service.aclose()) for _ in range(3)]
+            await until(lambda: attempts == 2)
+            pending[0].cancel()
+            await asyncio.sleep(0.02)
+            assert attempts == 2 and all(not task.done() for task in pending)
+            finish.set()
+            await asyncio.gather(*pending)
+            assert service.backend.runtime is None and engine.closed == 1
+            assert len(sdk.engines) == 1
+            await service.aclose()
+            assert attempts == 2
+        finally:
+            finish.set()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await runtime.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_transport_close_keeps_transport_and_engine_until_retry(tmp_path, monkeypatch):
+    install_sdk(monkeypatch.setitem)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = make_service(root)
+
+    async def run():
+        await service.start()
+        runtime, server = service.backend.runtime, service._zmq_server
+        engine = runtime.engine
+        close = server.aclose
+        attempts = 0
+
+        async def interrupted():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TimeoutError("authored transport shutdown failure")
+            await close()
+
+        monkeypatch.setattr(server, "aclose", interrupted)
+        try:
+            with pytest.raises(TimeoutError, match="transport shutdown"):
+                await service.aclose()
+            assert service._zmq_server is server and service.backend.runtime is runtime
+            assert engine.closed == 0
+            await service.aclose()
+            assert service._zmq_server is service.backend.runtime is None
+            assert engine.closed == 1 and attempts == 2
+            assert not (root / "engine.json").exists()
+        finally:
+            await close()
+            await runtime.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
 def test_empty_request_round_trip_needs_no_shared_memory(tmp_path, monkeypatch, family):
     sdk = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"

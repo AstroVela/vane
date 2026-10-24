@@ -18,7 +18,7 @@ from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
-from vane.ai._litert_options import LITERT_DEFAULT_MODEL, LITERT_DIMENSIONS, LITERT_MODELS, validate_litert_options
+from vane.ai._litert_options import LITERT_MODELS, validate_litert_model, validate_litert_options
 from vane.ai.protocols import (
     AudioEmbedderDescriptor,
     ImageEmbedderDescriptor,
@@ -41,14 +41,7 @@ class _LiteRTDescriptor:
     def __init__(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> None:
-        self._model = LITERT_DEFAULT_MODEL if model is None else model
-        if self._model not in LITERT_MODELS:
-            raise EmbeddingConfigurationError("LiteRT requires one of the declared EmbeddingGemma 2 LiteRT-LM models")
-        self._dimensions = 768 if dimensions is None else dimensions
-        if type(self._dimensions) is not int or self._dimensions not in LITERT_DIMENSIONS:
-            raise EmbeddingConfigurationError("LiteRT dimensions must be 128, 256, 512 or 768")
-        if self.kind != "multimodal" and self.kind not in LITERT_MODELS[self._model]:
-            raise EmbeddingConfigurationError("Selected LiteRT model does not support this input modality")
+        self._model, self._dimensions = validate_litert_model(model, dimensions, self.kind)
         self._options = validate_litert_options(options or {}, text=self.kind == "text")
 
     def get_provider(self) -> str:
@@ -132,22 +125,38 @@ class LiteRTProvider(Provider):
 
     def get_text_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> LiteRTTextEmbedderDescriptor:
+    ) -> TextEmbedderDescriptor:
+        if options is not None and options.get("runtime") == "service":
+            from vane.ai.providers._litert_service import LiteRTServiceTextDescriptor
+
+            return LiteRTServiceTextDescriptor(model, dimensions, options)
         return LiteRTTextEmbedderDescriptor(model, dimensions, options=options)
 
     def get_image_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> LiteRTImageEmbedderDescriptor:
+    ) -> ImageEmbedderDescriptor:
+        if options is not None and options.get("runtime") == "service":
+            from vane.ai.providers._litert_service import LiteRTServiceImageDescriptor
+
+            return LiteRTServiceImageDescriptor(model, dimensions, options)
         return LiteRTImageEmbedderDescriptor(model, dimensions, options=options)
 
     def get_audio_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> LiteRTAudioEmbedderDescriptor:
+    ) -> AudioEmbedderDescriptor:
+        if options is not None and options.get("runtime") == "service":
+            from vane.ai.providers._litert_service import LiteRTServiceAudioDescriptor
+
+            return LiteRTServiceAudioDescriptor(model, dimensions, options)
         return LiteRTAudioEmbedderDescriptor(model, dimensions, options=options)
 
     def get_multimodal_embedder(
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
-    ) -> LiteRTMultimodalEmbedderDescriptor:
+    ) -> MultimodalEmbedderDescriptor:
+        if options is not None and options.get("runtime") == "service":
+            from vane.ai.providers._litert_service import LiteRTServiceMultimodalDescriptor
+
+            return LiteRTServiceMultimodalDescriptor(model, dimensions, options)
         return LiteRTMultimodalEmbedderDescriptor(model, dimensions, options=options)
 
 

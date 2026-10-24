@@ -167,7 +167,9 @@ public:
 using udf_executor_factory_t = unique_ptr<UDFExecutor> (*)(ClientContext &context, const Value &payload,
                                                            UDFConfig &config, shared_ptr<void> actor_handles);
 
-DUCKDB_API void SetUDFExecutorFactory(udf_executor_factory_t factory);
-DUCKDB_API udf_executor_factory_t GetUDFExecutorFactory();
+//! Registration is scoped to a database and shared by all of its connections,
+//! including connections constructed by a self-contained extension.
+DUCKDB_API void SetUDFExecutorFactory(DatabaseInstance &db, udf_executor_factory_t factory);
+DUCKDB_API udf_executor_factory_t GetUDFExecutorFactory(ClientContext &context);
 
 } // namespace duckdb

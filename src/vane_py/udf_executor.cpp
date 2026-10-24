@@ -4177,8 +4177,13 @@ void PauseUDFDispatcherWaitForTesting() {
 	GlobalPythonDispatcher::Instance().NotifyWork();
 }
 
-void RegisterUDFExecutorFactory() {
-	SetUDFExecutorFactory(CreatePythonUDFExecutor);
+void RegisterUDFExecutorFactory(DatabaseInstance &db) {
+	SetUDFExecutorFactory(db, CreatePythonUDFExecutor);
+}
+
+void RegisterUDFExternalBlockBackend() {
+	// Only the Python producer uses this registry. Each descriptor retains its
+	// backend, so extension-side materialization never consults a global reader.
 	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, make_shared_ptr<PythonRayExternalBlockBackend>());
 }
 

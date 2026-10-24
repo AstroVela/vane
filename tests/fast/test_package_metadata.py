@@ -328,7 +328,13 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
+    # These optional runtimes are published only for Linux x86_64.
     linux = {"sys_platform": "linux", "platform_system": "Linux", "platform_machine": "x86_64"}
+    assert "vllm" in _requirements_for_extra("vllm", linux)
+    assert "sglang" in _requirements_for_extra("sglang", linux)
+    darwin = {"sys_platform": "darwin", "platform_system": "Darwin", "platform_machine": "arm64"}
+    assert "vllm" not in _requirements_for_extra("vllm", darwin)
+    assert "sglang" not in _requirements_for_extra("sglang", darwin)
     assert _requirement_for_extra("vllm", "vllm", linux).marker is not None
     assert _requirement_for_extra("sglang", "sglang", linux).marker is not None
     # These optional runtimes are published only for Linux x86_64.

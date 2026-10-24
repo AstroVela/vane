@@ -65,7 +65,7 @@ class NativeServiceBackend:
         return self.descriptor.get_input_spec()
 
     def validate_request(self, context: ipc.RequestContext, parts: list[dict[str, Any]]) -> None:
-        if context.encoding != "default" or context.model_contract is not None:
+        if context.encoding != "default" or context.model_contract is not None or context.litert is not None:
             raise EmbeddingConfigurationError(
                 "Native embedding service requires default encoding and no model contract"
             )
@@ -86,6 +86,54 @@ class NativeServiceBackend:
             self.runtime = None
 
 
+class LiteRTServiceBackend:
+    """Preserve the existing LiteRT descriptor, SDK thread and request encoder."""
+
+    restart_required = False
+
+    def __init__(self, model: str, dimensions: int, options: dict[str, Any]):
+        from vane.ai.providers.litert import LiteRTMultimodalEmbedderDescriptor
+
+        self.descriptor = LiteRTMultimodalEmbedderDescriptor(model, dimensions, options=options)
+        self.runtime: Any = None
+
+    def get_input_spec(self) -> MultimodalInputSpec:
+        return self.descriptor.get_input_spec()
+
+    def validate_request(self, context: ipc.RequestContext, parts: list[dict[str, Any]]) -> None:
+        from vane.ai.providers._litert_service import encoding_identity
+
+        expected = encoding_identity(self.descriptor.get_options())
+        encoding = context.litert
+        if (
+            encoding is None
+            or context.encoding != "default"
+            or context.model_contract is not None
+            or any(encoding.to_wire()[key] != value for key, value in expected.items())
+            or encoding.input_type == "query"
+            and (len(parts) != 1 or parts[0]["kind"] != "text")
+        ):
+            raise EmbeddingConfigurationError("LiteRT service encoding or retrieval-role mismatch")
+
+    async def start(self) -> None:
+        from vane.ai.providers._litert_service import LiteRTServiceRuntime
+
+        if self.runtime is not None:
+            raise RuntimeError("Embedding backend is already started")
+        self.runtime = LiteRTServiceRuntime(self.descriptor)
+        await self.runtime.start()
+
+    async def embed(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
+        self.validate_request(context, [{"kind": part.spec.kind} for part in content.parts])
+        assert context.litert is not None and self.runtime is not None
+        return await self.runtime._embed_content(content, input_type=context.litert.input_type)
+
+    async def aclose(self) -> None:
+        if self.runtime is not None:
+            await self.runtime.aclose()
+            self.runtime = None
+
+
 def create_service_backend(family: str, model: str, dimensions: int, options: dict[str, Any]) -> ServiceBackend:
     if family in {"sglang", "vllm"}:
         return NativeServiceBackend(family, model, dimensions, options)
@@ -93,4 +141,6 @@ def create_service_backend(family: str, model: str, dimensions: int, options: di
         from vane.ai.providers._mlx_service import MLXServiceBackend
 
         return MLXServiceBackend(model, dimensions, options)
-    raise EmbeddingConfigurationError("Embedding service family must be sglang, vllm or mlx")
+    if family == "litert":
+        return LiteRTServiceBackend(model, dimensions, options)
+    raise EmbeddingConfigurationError("Embedding service family must be sglang, vllm, mlx or litert")

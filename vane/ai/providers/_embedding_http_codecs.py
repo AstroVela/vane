@@ -56,6 +56,8 @@ class EmbeddingHTTPCodec:
             supported_parts=frozenset(parts), max_input_bytes=options.get("max_input_bytes", 16 * 1024**2)
         )
         metadata: dict[str, Any] = {"model": model, "encoding_format": "float"}
+        if "http_add_special_tokens" in options:
+            metadata["add_special_tokens"] = options["http_add_special_tokens"]
         if options.get("supports_overriding_dimensions", False):
             metadata["dimensions"] = dimensions
         field = "messages" if family == "vllm" and self.input_format == "multimodal" else "input"

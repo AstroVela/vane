@@ -373,6 +373,62 @@ def test_exact_media_bytes_batch_identity_and_dimensions(family, override):
     assert [len(payload.get("input", payload.get("messages"))) for payload in calls] == [2, 2, 1]
 
 
+@pytest.mark.parametrize("input_format", ["text", "multimodal"])
+@pytest.mark.parametrize("special_tokens", [None, False, True])
+def test_vllm_special_tokens_are_explicit_for_every_request_and_text_query(input_format, special_tokens):
+    calls = []
+
+    def handler(request):
+        payload, _, texts = _inputs(request)
+        if special_tokens is None:
+            assert "add_special_tokens" not in payload
+        else:
+            assert payload["add_special_tokens"] is special_tokens
+        calls.append(texts)
+        return _response(texts)
+
+    options = {} if special_tokens is None else {"http_add_special_tokens": special_tokens}
+    contents = [
+        _content(_part("text", str(i)), _part("video", b"MP4", "video/mp4"))
+        if input_format == "multimodal" and i % 2
+        else _text(str(i))
+        for i in range(5)
+    ]
+    descriptor = pickle.loads(
+        pickle.dumps(
+            _descriptor(
+                "vllm",
+                http_input_format=input_format,
+                media_mime_types=["video/mp4"] if input_format == "multimodal" else [],
+                request_batch_size=2,
+                **options,
+            )
+        )
+    )
+    result = asyncio.run(_run(descriptor, contents, handler))
+    assert sorted(map(len, calls)) == [1, 2, 2]
+    assert [vector.tolist() for vector in result] == [[i, 1] for i in range(5)]
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_vllm_special_tokens_reject_non_bools_before_client_creation(monkeypatch, value):
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: pytest.fail("client created before validation"))
+    with pytest.raises(ValueError, match="http_add_special_tokens"):
+        _descriptor("vllm", http_add_special_tokens=value)
+
+
+@pytest.mark.parametrize("input_format", ["text", "multimodal", "encode"])
+def test_sglang_rejects_vllm_special_token_option(input_format):
+    with pytest.raises(ValueError, match="http_add_special_tokens"):
+        _descriptor("sglang", http_input_format=input_format, http_add_special_tokens=True)
+
+
+@pytest.mark.parametrize("runtime", ["native", "service"])
+def test_native_and_service_reject_http_special_token_option(runtime):
+    with pytest.raises(TypeError, match="http_add_special_tokens"):
+        validate_embed_options("vllm", {"runtime": runtime, "http_add_special_tokens": True}, relation=False)
+
+
 def test_vllm_audio_and_ordered_multiple_parts():
     audio = b"unchanged WAV bytes"
 

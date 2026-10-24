@@ -327,8 +327,7 @@ def test_real_ipc_cancel_and_cancelled_shutdown_wait_for_actual_owner_work(fake_
             closing.cancel()
             assert not closing.done() and not fake_core.cores[0].closed
             fake_core.gate.set()
-            with pytest.raises(asyncio.CancelledError):
-                await closing
+            await closing
             assert service.credits.bytes == service.credits.inflight == 0
             assert not (root / "mlx.json").exists()
             await service.aclose()

@@ -48,10 +48,35 @@ class ModelContract:
 
 
 @dataclass(frozen=True)
+class LiteRTEncoding:
+    model_sha256: str
+    max_length: int
+    vision_tokens_per_image: int
+    input_type: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.model_sha256) is None
+            or type(self.max_length) is not int
+            or self.max_length not in (128, 256, 512, 1024, 2048, 8192)
+            or type(self.vision_tokens_per_image) is not int
+            or self.vision_tokens_per_image not in (70, 140)
+            or not isinstance(self.input_type, str)
+            or self.input_type not in {"query", "document"}
+        ):
+            raise EmbeddingConfigurationError("Invalid LiteRT service encoding")
+
+    def to_wire(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RequestContext:
     encoding: str = "default"
     model_contract: ModelContract | None = None
     request_id: str | None = None
+    litert: LiteRTEncoding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.encoding, str) or self.encoding not in {
@@ -77,7 +102,13 @@ class RequestContext:
             if not isinstance(value, dict) or set(value) != fields:
                 raise EmbeddingConfigurationError("Invalid embedding model contract fields")
             value = ModelContract(**value)
-        return cls(message["encoding"], value, message.get("request_id"))
+        encoding = message["encoding"]
+        if isinstance(encoding, dict):
+            fields = {"model_sha256", "max_length", "vision_tokens_per_image", "input_type"}
+            if set(encoding) != fields or value is not None:
+                raise EmbeddingConfigurationError("Invalid LiteRT service encoding fields")
+            return cls("default", None, message.get("request_id"), LiteRTEncoding(**encoding))
+        return cls(encoding, value, message.get("request_id"))
 
 
 def input_spec(options: dict[str, Any]) -> MultimodalInputSpec:

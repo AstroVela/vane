@@ -35,7 +35,6 @@
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/adbc/adbc-init.hpp"
 #include "vane_python/udf_executor.hpp"
-#include "vane_python/vllm_executor.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/execution/distributed/utils/stream.hpp"
@@ -1122,8 +1121,6 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	(void)keep_alive;
 	// END
 
-	// Register global callbacks for datasource_scan (needed for distributed workers)
-	duckdb::RegisterDataSourceGlobalCallbacks();
 	m.def("_datasource_factory_registry_state_for_test", &duckdb::DataSourceFactoryRegistryStateForTest);
 	m.def("_clear_datasource_factory_registry", &duckdb::ClearDataSourceFactoryRegistry);
 	m.def("_release_datasource_factories_for_query", &duckdb::ReleaseDataSourceFactoriesForQuery, py::arg("query_id"));
@@ -1170,8 +1167,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	DuckDBPyConnection::Initialize(m);
 	InitializeDynamicExtensionBindings(m);
 	PythonObject::Initialize();
-	RegisterUDFExecutorFactory();
-	RegisterVLLMExecutorFactory();
+	RegisterUDFExternalBlockBackend();
 	m.def("_udf_executor_debug_counters", &GetUDFExecutorDebugCounters);
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
