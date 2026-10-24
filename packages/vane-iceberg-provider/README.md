@@ -11,7 +11,7 @@ the base SDK and a noneditable Python environment first. This profile keeps the
 existing builtin baseline, adds the pinned DuckDB Avro C registry, and enables
 only AWS SDK core/SSO/STS instead of its default service set. These are build
 dependencies of the upstream provider; this qualification uses anonymous REST
-and local files.
+and local files or anonymous S3/MinIO reads.
 
 The Iceberg checkout must receive the Vane-owned
 `patches/iceberg-vane-local.patch` before compilation. It targets exactly
@@ -48,6 +48,10 @@ git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-deletes.patch"
 git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
   "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-deletes.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-s3.patch"
+git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
+  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-s3.patch"
 ```
 
 The second patch adds M5a's versioned frozen-snapshot transport on top of the
@@ -71,10 +75,15 @@ Parquet position/equality delete-file descriptors, retaining required equality
 fields through pruning and correcting local delete applicability/NULL matching.
 Workers read only those immutable files and retain decoded state per assignment.
 The added state requires frozen bind/assignment/file codec version 3; the
-generic distributed callback protocol stays at version 1. Keep all seven
-patches in order for the current build; the six predecessor patches are unchanged.
+generic distributed callback protocol stays at version 1. The eighth patch
+admits canonical `s3://bucket/object` paths without normalizing their keys.
+Data and delete reads use the existing httpfs provider and connection snapshot
+settings; the frozen codec and generic protocol stay at versions 3 and 1.
+Keep all eight patches in order for the current build; the seven predecessor
+patches are unchanged.
 See [the delete qualification and roadmap](../../GRAVITINO_ICEBERG.md#position-and-equality-deletes-m5c3)
-for the supported table semantics and shared-filesystem boundary.
+for the supported table semantics, and [S3 qualification](../../GRAVITINO_ICEBERG.md#anonymous-s3minio-m5d1)
+for the local/single-node Ray storage boundary.
 Provider-wheel packaging must retain the DuckDB and vendored dependency notice
 inputs listed in the root `pyproject.toml`'s `license-files`, including Parquet's
 dependencies, together with the pinned Iceberg/Avro and SDK notices.

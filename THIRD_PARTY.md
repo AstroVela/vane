@@ -73,6 +73,10 @@ preservation follow the pinned reader/optimizer contracts. These implementation
 files retain DuckDB/Vane attribution and MIT AND Apache-2.0 terms; the new
 portable-state header is Vane-owned Apache-2.0. All six predecessor patches and
 the source/SDK license grants remain unchanged.
+The S3-locator patch extends the same delete-state implementation, preserving
+its DuckDB/Vane attribution and MIT AND Apache-2.0 terms. The seven preceding
+patches and source/SDK grants remain unchanged. MinIO is used as an external
+test service; its binaries are not included in Vane or provider artifacts.
 Its self-contained Iceberg artifact links the pinned in-tree Parquet
 implementation and retains DuckDB's source and vendored dependency notices,
 using the same notice input set as the base Vane wheel.

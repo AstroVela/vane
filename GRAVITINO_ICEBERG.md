@@ -87,7 +87,8 @@ Check out the fixed Iceberg and Avro sources separately, then apply
 `packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
 Then apply `iceberg-vane-frozen-scan.patch`, `iceberg-vane-file-scan.patch`,
 `iceberg-vane-partitions.patch`, `iceberg-vane-transforms.patch` and
-`iceberg-vane-schema.patch` from the
+`iceberg-vane-schema.patch`, followed by `iceberg-vane-deletes.patch` and
+`iceberg-vane-s3.patch` from the
 same directory, in that order. The SDK
 instructions give the ordered commands and each patch is independently retained.
 
@@ -785,6 +786,115 @@ schemas/history. Nested/name mappings, Puffin/deletion vectors/v3, remote
 storage, authentication, writes and production provider delivery remain separate.
 Ray's existing Arrow result-type policy still applies.
 
+## Anonymous S3/MinIO (M5d1)
+
+The eighth ordered patch, `iceberg-vane-s3.patch`, admits canonical
+`s3://bucket/object` locators for frozen data, delete descriptors and position
+delete targets. Its SHA-256 is
+`cce75954d8b71d1109b09feec5b063a71e749923f846543d0d7e61c58809e73a`.
+All seven predecessor patches and the M5c3 engine/provider/SDK pins are
+unchanged. Frozen bind/assignment/file codec 3 and generic callback protocol 1
+are unchanged: the URI string already belongs to the frozen assignment.
+
+Paths retain their exact bucket/key bytes, including Unicode; no local path
+rewrite or Hive-directory inference occurs. The admitted subset requires a
+lowercase DNS-style bucket of 3–63 characters and a nonempty key. Control
+characters, userinfo, ports, query strings, fragments and other remote schemes
+are rejected before assignment I/O. Keys containing `?` or `#`, alternative
+S3 schemes and other cloud filesystems remain outside this qualification.
+
+`IcebergCatalog.attach` explicitly uses `ACCESS_DELEGATION_MODE 'none'` in
+addition to `AUTHORIZATION_TYPE 'none'` and `READ_ONLY`. This disables the
+pinned provider's default credential-vending request. Existing temporary or
+persistent DuckDB secrets are not imported into frozen worker state. Storage
+settings use the existing connection snapshot and worker database isolation;
+M5d1 adds no runner protocol or credential mechanism.
+
+For a bucket already readable anonymously, configure the connection explicitly:
+
+```python
+import vane
+from vane.catalog import IcebergCatalog
+
+with vane.connect(config={
+    "autoinstall_known_extensions": "false",
+    "autoload_known_extensions": "false",
+    "allow_persistent_secrets": "false",
+    "s3_endpoint": "minio.example.test:9000",
+    "s3_region": "us-east-1",
+    "s3_url_style": "path",
+    "s3_use_ssl": "false",  # Match the explicitly provisioned endpoint.
+    "s3_access_key_id": "",
+    "s3_secret_access_key": "",
+    "s3_session_token": "",
+}) as con:
+    vane.load_installed_extension("iceberg", connection=con)
+    lake = IcebergCatalog.attach(con, "lake", endpoint="http://catalog.example.test:9001/iceberg")
+    rows = lake.table("analytics", "events").project("id").fetchall()
+```
+
+Use `VANE_RUNNER=local` or `ray` before creating the connection. The installed
+signed Iceberg/Avro closure must be present for every executing worker. The
+endpoint and bucket must be reachable by those workers. This acceptance uses
+Linux x86-64 and a single-node Ray cluster; it does not establish multi-node
+reachability, deployment or throughput.
+
+The real-service fixture uses the same pinned Gravitino 1.3.0 image as M5c3,
+`minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
+and `minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727`.
+Provision an owned bucket with anonymous download access. The independent SDK
+and the REST server need fixture-only write credentials to author commits;
+those credentials are never supplied to Vane. Configure Gravitino's memory
+backend, `ResolvingFileIO`, S3 warehouse, endpoint, region and path-style access
+using the [1.3.0 service settings](https://gravitino.apache.org/docs/1.3.0/iceberg-rest-service/).
+The server's endpoint may use the container-network hostname while the test
+client uses a host-reachable endpoint. The SDK explicitly disables access
+delegation too, so no credential provider is required for the REST service.
+
+Set `VANE_TEST_GRAVITINO_ICEBERG_S3_CONFIG` to an untracked, private JSON file
+(mode 0600) with these fields:
+
+```json
+{
+  "endpoint": "http://127.0.0.1:9001/iceberg",
+  "s3_endpoint": "http://127.0.0.1:9000",
+  "s3_region": "us-east-1",
+  "bucket": "owned-test-bucket",
+  "admin_key": "fixture-writer-key",
+  "admin_secret": "fixture-writer-secret"
+}
+```
+
+Install the pinned test-only requirements from the provider SDK profile. Do
+not export fixture writer keys as AWS environment variables: Ray inherits its
+job environment. The fixture creates a unique namespace/object prefix and
+removes only that prefix and its catalog entries. Its local directory contains
+control/audit files, never a dataset mirror. PyIceberg commits all metadata,
+manifests, data and deletes directly to S3. Independent SDK scans check the
+supported matrix; the M5c3 manifest/field-ID Arrow evaluator checks equality
+deletes. The seven-table matrix includes unpartitioned and empty tables,
+identity partitions with omitted physical columns, flat schema evolution,
+position deletes, nullable multicolumn equality deletes and an all-deleted table.
+
+A separate HTTP forwarding process sends every Vane object request to real
+MinIO. It rejects signed requests and object listing, records range reads, and
+can deny metadata or selected data/delete objects. Tests cover public local and
+Ray rows/projection/filters/counts/history, detached replay after REST closure
+and later commits, disjoint file assignments, missing-object failures, worker
+replacement, cancellation, query/session cleanup and per-query endpoint
+isolation within one session. Frozen payloads exclude fixture writer keys.
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_s3_scan_live.py -m external_service
+scripts/run_installed_pytest.sh tests/fast/test_iceberg_s3_ray_live.py -m external_service
+```
+
+Run these in separate installed-package processes with normal Ray object-store
+sizing. Run affected local delete/path and connection snapshot regressions;
+the user's validation scope remains related tests only. Verify all eight
+ordered patches against the source pin and compiled bytes, license/SPDX,
+formatting, archive contents and the untouched original checkout.
+
 ### Remaining roadmap
 
 | Stage | Delivery gate |
@@ -795,7 +905,10 @@ Ray's existing Arrow result-type policy still applies.
 | M5c2a: transformed partitions | Known time/bucket/truncate/void specs, original-value reads, mixed historical specs and real-Ray lifecycle checks above |
 | M5c2b: schema evolution | Field-ID mapping for column add/drop/rename/reorder, supported type/default semantics and old-snapshot coverage |
 | M5c3: deletes | Committed v2 position/equality descriptors, exact applicability, hidden field-ID mapping, NULL-safe matching and native/real-Ray lifecycle coverage above |
-| Later optional work | Remote shared-storage qualification and production provider delivery; authentication/credential refresh and catalog writes remain separate |
+| M5d1: anonymous S3 | Canonical S3 data/delete locators, explicit connection-setting replay, real MinIO and local/single-node Ray qualification above |
+| M5d2: isolated nodes | Driver and multiple Ray nodes sharing only object storage; reachable endpoints, provider deployment, retry and cleanup without dataset mounts |
+| Later optional work | Production provider delivery; authentication/credential refresh and catalog writes remain separate |
 
-The current fixture does not qualify v1/v3 tables, remote storage, catalog
-writes, authentication extensions, credential vending or refresh.
+The current fixture does not qualify v1/v3 tables, other remote filesystems,
+multi-node deployment, catalog writes, authentication extensions, private S3,
+credential vending or refresh.

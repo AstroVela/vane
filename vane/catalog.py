@@ -46,11 +46,13 @@ class IcebergCatalog:
     it. Existing attachments can be wrapped only when they are Iceberg and
     READ_ONLY. A detached or replaced attachment invalidates the wrapper.
 
-    Anonymous Gravitino REST with local Parquet storage is qualified in
-    ``GRAVITINO_ICEBERG.md``. Ray supports frozen format-v2 snapshots
+    Anonymous Gravitino REST with local Parquet and anonymous S3/MinIO storage
+    is qualified in ``GRAVITINO_ICEBERG.md``. Ray supports frozen format-v2 snapshots
     with unpartitioned, identity or transformed partitions and supported flat
     schema evolution and committed v2 position/equality deletes, using shared
-    local Parquet for both data and delete files.
+    local Parquet or canonical S3 paths for data and delete files. The S3
+    qualification covers local and single-node Ray; multi-node deployment
+    remains a separate gate.
     """
 
     def __init__(self, connection: DuckDBPyConnection, name: str) -> None:
@@ -77,6 +79,8 @@ class IcebergCatalog:
         its service prefix. ``warehouse`` is passed to the native catalog's
         warehouse routing; an empty string selects the server default. Neither
         value is inferred from Gravitino's separate metadata API.
+        Credential vending is disabled; storage access uses the connection's
+        explicit filesystem settings.
         """
         alias = _identifier(name)
         _text(warehouse)
@@ -107,7 +111,8 @@ class IcebergCatalog:
             raise RuntimeError("load the matching Iceberg provider with vane.load_installed_extension before attaching")
         connection.execute(
             f"ATTACH {_literal(warehouse)} AS {alias} "
-            "(TYPE iceberg, ENDPOINT $endpoint, AUTHORIZATION_TYPE 'none', READ_ONLY)",
+            "(TYPE iceberg, ENDPOINT $endpoint, AUTHORIZATION_TYPE 'none', "
+            "ACCESS_DELEGATION_MODE 'none', READ_ONLY)",
             {"endpoint": endpoint},
         )
         return cls(connection, name)

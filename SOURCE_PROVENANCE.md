@@ -154,6 +154,13 @@ frozen reader's equality-column preservation follow the pinned upstream reader
 and optimizer contracts; those implementation files carry the same combined
 terms and attribution. The new portable-state header remains Vane-owned
 Apache-2.0. All six predecessor patches and source/SDK pins are unchanged.
+The eighth patch, `iceberg-vane-s3.patch`, admits canonical S3 data/delete
+locators in the owned frozen adapter without path normalization or new wire
+state. The touched delete-state implementation retains DuckDB/Vane attribution
+and MIT AND Apache-2.0 terms. All seven predecessor patches, source/SDK pins,
+frozen codec 3 and generic callback protocol 1 are unchanged. Anonymous MinIO
+is an external qualification service; its binaries and SDK clients are not
+bundled or linked into Vane or its providers.
 The self-contained loadable provider also links the pinned in-tree Parquet
 implementation, under DuckDB's existing source and dependency notices.
 The separate SDK manifest pins

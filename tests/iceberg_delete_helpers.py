@@ -51,13 +51,14 @@ def manifest_entries(table, snapshot_id=None):
     ]
 
 
-def file_rows(file):
+def file_rows(file, io):
     import pyarrow.parquet as pq
 
-    parquet = pq.ParquetFile(local_path(file.file_path))
-    fields = {field.name: int(field.metadata[b"PARQUET:field_id"]) for field in parquet.schema_arrow}
-    assert len(set(fields.values())) == len(fields)
-    rows = [{fields[name]: value for name, value in row.items()} for row in parquet.read().to_pylist()]
+    with io.new_input(file.file_path).open() as stream:
+        parquet = pq.ParquetFile(stream)
+        fields = {field.name: int(field.metadata[b"PARQUET:field_id"]) for field in parquet.schema_arrow}
+        assert len(set(fields.values())) == len(fields)
+        rows = [{fields[name]: value for name, value in row.items()} for row in parquet.read().to_pylist()]
     assert len(rows) == file.record_count
     return rows
 
@@ -87,7 +88,7 @@ def delete_reference(tables, name, *, snapshot_id=None):
     schema = table.schema() if snapshot_id is None else table.schemas()[snapshot.schema_id]
     entries = manifest_entries(table, snapshot_id)
     deletes = [
-        (manifest.partition_spec_id, entry, file_rows(entry.data_file))
+        (manifest.partition_spec_id, entry, file_rows(entry.data_file, table.io))
         for manifest, entry in entries
         if entry.data_file.content != 0
     ]
@@ -103,7 +104,7 @@ def delete_reference(tables, name, *, snapshot_id=None):
             for index, field in enumerate(spec.fields)
             if isinstance(field.transform, IdentityTransform)
         }
-        for position, raw in enumerate(file_rows(file)):
+        for position, raw in enumerate(file_rows(file, table.io)):
             values = {**constants, **raw}
             removed = False
             for delete_spec_id, delete, rows in deletes:
@@ -178,7 +179,7 @@ def commit_deletes(
     assert 0 <= delete_sequence <= sequence
     snapshot_id = uuid.uuid4().int >> 65
     token = uuid.uuid4().hex
-    directory = tables.directory / name
+    directory = table.location().rstrip("/")
     manifests = parent.manifests(table.io)
     if clear:
         assert not rows and not equality_ids
@@ -205,19 +206,20 @@ def commit_deletes(
                 NestedField(PATH_ID, "file_path", StringType(), required=True),
             )
             physical = [{"file_path": row[PATH_ID], "pos": row[POS_ID]} for row in rows]
-        path = directory / "data" / f"delete-{token}.parquet"
-        pq.write_table(pa.Table.from_pylist(physical, schema=schema_to_pyarrow(schema)), path, row_group_size=3)
+        path = f"{directory}/data/delete-{token}.parquet"
+        with table.io.new_output(path).create() as stream:
+            pq.write_table(pa.Table.from_pylist(physical, schema=schema_to_pyarrow(schema)), stream, row_group_size=3)
         deleted = DataFile.from_args(
             content=DataFileContent.EQUALITY_DELETES if equality_ids else DataFileContent.POSITION_DELETES,
-            file_path=path.as_uri(),
+            file_path=path,
             file_format=FileFormat.PARQUET,
             partition=Record(*partition),
             record_count=len(rows),
-            file_size_in_bytes=path.stat().st_size,
+            file_size_in_bytes=len(table.io.new_input(path)),
             equality_ids=list(equality_ids) if equality_ids else None,
         )
         deleted.spec_id = spec_id
-        manifest_path = (directory / "metadata" / f"delete-{token}.avro").as_uri()
+        manifest_path = f"{directory}/metadata/delete-{token}.avro"
         with DeleteWriter(spec, table.schema(), table.io.new_output(manifest_path), snapshot_id, "null") as writer:
             writer.add_entry(
                 ManifestEntry.from_args(
@@ -229,7 +231,7 @@ def commit_deletes(
                 )
             )
         manifests = [writer.to_manifest_file(), *manifests]
-    listing_path = (directory / "metadata" / f"delete-list-{token}.avro").as_uri()
+    listing_path = f"{directory}/metadata/delete-list-{token}.avro"
     with write_manifest_list(
         2, table.io.new_output(listing_path), snapshot_id, parent.snapshot_id, sequence, "null"
     ) as listing:
@@ -282,8 +284,10 @@ def commit_deletes(
         assert observed.sequence_number == delete_sequence and observed.file_sequence_number == sequence
         assert observed.data_file.content == deleted.content and observed.data_file.equality_ids == deleted.equality_ids
         assert tuple(observed.data_file.partition) == tuple(partition)
-        assert pq.read_schema(path).equals(schema_to_pyarrow(schema), check_metadata=True)
-        assert pq.ParquetFile(path).read().to_pylist() == physical
+        with table.io.new_input(path).open() as stream:
+            parquet = pq.ParquetFile(stream)
+            assert parquet.schema_arrow.equals(schema_to_pyarrow(schema), check_metadata=True)
+            assert parquet.read().to_pylist() == physical
     return table
 
 
