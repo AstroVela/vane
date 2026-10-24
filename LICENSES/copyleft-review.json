@@ -4,8 +4,9 @@
   "review_instructions": "See COPYLEFT.md. Re-review changed grants and delivery roles before updating these hashes; no automatic approval or regeneration command is provided.",
   "source_files": {
     "LICENSES/Bison-parser-notice.txt": "e755172808aff395b87b210a0b2e55ed7bcbd54c4a574e219a2deef56c3510f1",
+    "LICENSES/iceberg-native-dependencies.txt": "ac5c3bd17fe480becc24d75ef23cbcc94ac44fc9f24e610580906adaf6721b26",
     "LICENSES/vcpkg-binary-dependencies.txt": "0e6f9bc3ed4dc11cdf15dee1432314c8ed33a877f314c3471e51c39481637aa9",
-    "THIRD_PARTY.md": "0338208fad4dafc81913b548ad212635fe6cf6003aeb2c3f6b648d6c5119ad0a",
+    "THIRD_PARTY.md": "4b4c05a0bcaef25084e26e7d95faf1bab8cc84dee2748c6ae64a7fd9363cd256",
     "external/duckdb/third_party/libpg_query/include/parser/gram.hpp": "f0a028e4c71887ff30977fcc10d0bf2da83843f9142a4b83ac1fa4de520c8495",
     "external/duckdb/third_party/libpg_query/src_backend_parser_gram.cpp": "15417a1f7e77539c94fce811f2a5f9f0bf5cce598b51c7afe80ade8433d9ce15",
     "external/duckdb/third_party/mbedtls/LICENSE": "9b405ef4c89342f5eae1dd828882f931747f71001cfba7d114801039b52ad09b",
@@ -163,6 +164,9 @@
     "vane_packaging/extension_wheel.py": "96ad58a315c6faf88549d65bd8c8b9694af57046c502bfb12a03067c6af89fda"
   },
   "dependency_notices": {
+    "avro-c": [
+      "liblzma"
+    ],
     "arrow": [
       "arrow",
       "zstd"
@@ -183,6 +187,12 @@
     ]
   },
   "installed_notices": {
+    "liblzma": {
+      "version": "5.8.3",
+      "copyright_sha256": "616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8",
+      "selected_license": "0BSD",
+      "reason": "The upstream XZ licensing summary assigns liblzma to 0BSD. GPL/LGPL references cover separate utilities and build scripts, which are not included in the Iceberg/Avro provider wheels."
+    },
     "arrow": {
       "version": "24.0.0#1",
       "copyright_sha256": "d1c981370f1ffd4edcdd2fb3565c8939cc40c75e24e1f92d581d04e54f0dff81",
