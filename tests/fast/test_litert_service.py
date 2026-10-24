@@ -500,10 +500,14 @@ def test_public_ray_clients_share_the_external_litert_engine(tmp_path, options, 
                 .to_arrow_table()
                 .to_pylist()
             )
-        assert result[1]["embedding"] is None
-        for row in (result[0], result[2]):
-            assert len(row["embedding"]) == 128
-            np.testing.assert_allclose(np.linalg.norm(row["embedding"]), 1, atol=1e-5)
+        # Ray batches may complete in any order; match each output to its input.
+        assert len(result) == 3
+        embeddings = {row["text"]: row["embedding"] for row in result}
+        assert embeddings.keys() == {"document", None, "query"}
+        assert embeddings[None] is None
+        for text in ("document", "query"):
+            assert len(embeddings[text]) == 128
+            np.testing.assert_allclose(np.linalg.norm(embeddings[text]), 1, atol=1e-5)
     finally:
         vane.teardown_runner()
         ray.shutdown()
