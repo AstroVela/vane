@@ -14,4 +14,5 @@ public:
 void RegisterGravitinoCatalog(ExtensionLoader &loader);
 void RegisterGravitinoFunctions(ExtensionLoader &loader);
 void RegisterGravitinoFileSystem(ExtensionLoader &loader);
+void RegisterGravitinoDiscovery(ExtensionLoader &loader);
 } // namespace duckdb

@@ -84,10 +84,10 @@ GravitinoCatalog::~GravitinoCatalog() = default;
 void GravitinoCatalog::Initialize(bool) {
 }
 string GravitinoCatalog::GetCatalogType() {
-	return "gravitino";
+	return client.config.scope == GravitinoScope::METALAKE ? "gravitino_metalake" : "gravitino";
 }
 string GravitinoCatalog::GetDBPath() {
-	return client.config.catalog;
+	return client.config.scope == GravitinoScope::METALAKE ? client.config.metalake : client.config.catalog;
 }
 bool GravitinoCatalog::InMemory() {
 	return false;
@@ -118,7 +118,17 @@ GravitinoCatalog &GravitinoCatalog::Get(ClientContext &context, const string &al
 	}
 	return catalog.Cast<GravitinoCatalog>();
 }
+GravitinoCatalog &GravitinoCatalog::GetMetalake(ClientContext &context, const string &alias) {
+	auto &catalog = Catalog::GetCatalog(context, alias);
+	if (catalog.GetCatalogType() != "gravitino_metalake") {
+		throw InvalidInputException("Catalog '%s' is not a Gravitino metalake discovery connection", alias);
+	}
+	return catalog.Cast<GravitinoCatalog>();
+}
 void GravitinoCatalog::RequireMutation(ClientContext &context) const {
+	if (client.config.scope == GravitinoScope::METALAKE) {
+		throw PermissionException("Gravitino metalake discovery is read-only");
+	}
 	if (GetAttached().IsReadOnly()) {
 		throw PermissionException("Gravitino catalog is attached READ_ONLY");
 	}
@@ -146,6 +156,12 @@ SchemaCatalogEntry &GravitinoCatalog::Schema(const string &name) {
 optional_ptr<SchemaCatalogEntry> GravitinoCatalog::LookupSchema(CatalogTransaction transaction,
                                                                 const EntryLookupInfo &lookup,
                                                                 OnEntryNotFound if_not_found) {
+	if (client.config.scope == GravitinoScope::METALAKE) {
+		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+			throw CatalogException("Use Gravitino discovery functions to browse metalake metadata");
+		}
+		return nullptr;
+	}
 	auto name = lookup.GetEntryName();
 	auto response =
 	    client.Request(transaction.GetContext(), "GET", "/schemas/" + GravitinoClient::Encode(name), "", 404);
@@ -158,6 +174,9 @@ optional_ptr<SchemaCatalogEntry> GravitinoCatalog::LookupSchema(CatalogTransacti
 	return &Schema(name);
 }
 void GravitinoCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	if (client.config.scope == GravitinoScope::METALAKE) {
+		return;
+	}
 	for (const auto &name : client.List(context, "/schemas")) {
 		callback(Schema(name));
 	}
@@ -212,11 +231,18 @@ private:
 	unordered_map<Transaction *, unique_ptr<Transaction>> transactions;
 };
 
-static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, ClientContext &context,
-                                           AttachedDatabase &db, const string &, AttachInfo &info,
-                                           AttachOptions &options) {
+static unique_ptr<Catalog> AttachGravitinoScope(ClientContext &context, AttachedDatabase &db, AttachInfo &info,
+                                                AttachOptions &options, GravitinoScope scope) {
 	GravitinoConfig config;
-	config.catalog = info.path;
+	config.scope = scope;
+	if (scope == GravitinoScope::METALAKE) {
+		if (options.access_mode != AccessMode::READ_ONLY) {
+			throw BinderException("Gravitino metalake discovery must be attached READ_ONLY");
+		}
+		config.metalake = info.path;
+	} else {
+		config.catalog = info.path;
+	}
 	for (auto entry = options.options.begin(); entry != options.options.end();) {
 		const auto &option = *entry;
 		if (option.second.IsNull()) {
@@ -225,7 +251,7 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 		auto name = StringUtil::Lower(option.first);
 		if (name == "endpoint") {
 			config.endpoint = option.second.GetValue<string>();
-		} else if (name == "metalake") {
+		} else if (name == "metalake" && scope == GravitinoScope::CATALOG) {
 			config.metalake = option.second.GetValue<string>();
 		} else if (name == "token") {
 			config.token = option.second.GetValue<string>();
@@ -234,7 +260,7 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 			info.options.erase(option.first);
 			entry = options.options.erase(entry);
 			continue;
-		} else if (name == "location_name") {
+		} else if (name == "location_name" && scope == GravitinoScope::CATALOG) {
 			config.location_name = option.second.GetValue<string>();
 		} else if (name == "timeout_ms") {
 			config.timeout_ms = option.second.GetValue<idx_t>();
@@ -247,6 +273,16 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 	}
 	config.Validate();
 	auto catalog = make_uniq<GravitinoCatalog>(db, std::move(config));
+	if (scope == GravitinoScope::METALAKE) {
+		auto response = catalog->client.GetDiscovery(context);
+		auto data = yyjson_obj_get(response.Root(), "metalake");
+		auto name = yyjson_obj_get(data, "name");
+		if (!yyjson_is_obj(data) || !yyjson_is_str(name) ||
+		    string(yyjson_get_str(name), yyjson_get_len(name)) != catalog->client.config.metalake) {
+			throw IOException("Gravitino returned metadata for an unexpected metalake");
+		}
+		return std::move(catalog);
+	}
 	auto response = catalog->client.Get(context);
 	auto data = yyjson_obj_get(response.Root(), "catalog");
 	if (!StringUtil::CIEquals(GravitinoJson::String(data, "type"), "fileset")) {
@@ -254,6 +290,16 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 		                              "relational catalogs require their format-specific extension");
 	}
 	return std::move(catalog);
+}
+static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, ClientContext &context,
+                                           AttachedDatabase &db, const string &, AttachInfo &info,
+                                           AttachOptions &options) {
+	return AttachGravitinoScope(context, db, info, options, GravitinoScope::CATALOG);
+}
+static unique_ptr<Catalog> AttachGravitinoMetalake(optional_ptr<StorageExtensionInfo>, ClientContext &context,
+                                                   AttachedDatabase &db, const string &, AttachInfo &info,
+                                                   AttachOptions &options) {
+	return AttachGravitinoScope(context, db, info, options, GravitinoScope::METALAKE);
 }
 void RegisterGravitinoCatalog(ExtensionLoader &loader) {
 	auto storage = make_shared_ptr<StorageExtension>();
@@ -263,5 +309,13 @@ void RegisterGravitinoCatalog(ExtensionLoader &loader) {
 		return make_uniq<GravitinoTransactionManager>(db);
 	};
 	StorageExtension::Register(DBConfig::GetConfig(loader.GetDatabaseInstance()), "gravitino", std::move(storage));
+	auto metalake = make_shared_ptr<StorageExtension>();
+	metalake->attach = AttachGravitinoMetalake;
+	metalake->create_transaction_manager = [](optional_ptr<StorageExtensionInfo>, AttachedDatabase &db,
+	                                          Catalog &) -> unique_ptr<TransactionManager> {
+		return make_uniq<GravitinoTransactionManager>(db);
+	};
+	StorageExtension::Register(DBConfig::GetConfig(loader.GetDatabaseInstance()), "gravitino_metalake",
+	                           std::move(metalake));
 }
 } // namespace duckdb
