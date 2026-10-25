@@ -3,19 +3,23 @@
 
 """Python convenience APIs for native data catalogs.
 
-Gravitino operations execute through the C++ extension on the supplied Vane
-connection. Load the matching ``gravitino`` provider before attaching.
+Catalog operations execute through the native extension on the supplied Vane
+connection. Load the matching ``gravitino`` or ``iceberg`` provider before
+attaching.
 """
 
 from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from vane import DuckDBPyConnection, DuckDBPyRelation
+
+_IDENTIFIER_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
 def _text(value: str) -> str:
@@ -32,6 +36,118 @@ def _identifier(value: str) -> str:
     if not value:
         raise ValueError("catalog identifiers cannot be empty")
     return '"' + _text(value).replace('"', '""') + '"'
+
+
+class IcebergCatalog:
+    """A read-only Iceberg REST attachment on a Vane connection.
+
+    Load the matching Iceberg provider before :meth:`attach`. The connection
+    owns the attachment and the returned relations; this object never closes
+    it. Existing attachments can be wrapped only when they are Iceberg and
+    READ_ONLY. A detached or replaced attachment invalidates the wrapper.
+
+    Anonymous Gravitino REST with local Parquet storage is qualified in
+    ``GRAVITINO_ICEBERG.md``. Ray supports frozen format-v2 snapshots
+    with unpartitioned, identity or transformed partitions and supported flat
+    schema evolution and committed v2 position/equality deletes, using shared
+    local Parquet for both data and delete files.
+    """
+
+    def __init__(self, connection: DuckDBPyConnection, name: str) -> None:
+        _identifier(name)
+        self.connection = connection
+        self.name = name
+        row = self._attachment()
+        if row is None or row[1] != "iceberg" or not row[2]:
+            raise ValueError("IcebergCatalog requires an existing READ_ONLY Iceberg attachment")
+        self._database_oid = row[0]
+
+    @classmethod
+    def attach(
+        cls,
+        connection: DuckDBPyConnection,
+        name: str,
+        *,
+        endpoint: str,
+        warehouse: str = "",
+    ) -> IcebergCatalog:
+        """Attach an existing anonymous REST catalog, always READ_ONLY.
+
+        ``endpoint`` is the explicit HTTP(S) Iceberg REST service URL, including
+        its service prefix. ``warehouse`` is passed to the native catalog's
+        warehouse routing; an empty string selects the server default. Neither
+        value is inferred from Gravitino's separate metadata API.
+        """
+        alias = _identifier(name)
+        _text(warehouse)
+        endpoint = _text(endpoint)
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in endpoint):
+            raise ValueError("endpoint must be an HTTP(S) REST URL without credentials, query or fragment")
+        try:
+            parsed = urlsplit(endpoint)
+            valid = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.hostname)
+                and (parsed.port is None or parsed.port > 0)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and "?" not in endpoint
+                and "#" not in endpoint
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("endpoint must be an HTTP(S) REST URL without credentials, query or fragment")
+        loaded = connection.execute(
+            "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'iceberg'"
+        ).fetchone()
+        if loaded is None or not loaded[0]:
+            raise RuntimeError("load the matching Iceberg provider with vane.load_installed_extension before attaching")
+        connection.execute(
+            f"ATTACH {_literal(warehouse)} AS {alias} "
+            "(TYPE iceberg, ENDPOINT $endpoint, AUTHORIZATION_TYPE 'none', READ_ONLY)",
+            {"endpoint": endpoint},
+        )
+        return cls(connection, name)
+
+    def table(self, namespace: str, name: str, *, snapshot_id: int | None = None) -> DuckDBPyRelation:
+        """Bind an existing table as a composable native relation.
+
+        Names are individual native catalog/schema/table identifiers, never SQL
+        fragments. ``namespace`` is the schema name exposed by the provider.
+        With no snapshot ID, native transaction/snapshot selection applies.
+        A positive signed 64-bit snapshot ID selects that exact version.
+        """
+        qualified = ".".join(_identifier(part) for part in (self.name, namespace, name))
+        if snapshot_id is not None and (type(snapshot_id) is not int or not 0 < snapshot_id < 2**63):
+            raise ValueError("snapshot_id must be a positive signed 64-bit integer")
+        self._check_attachment()
+        at = "" if snapshot_id is None else f" AT (VERSION => {snapshot_id})"
+        return self.connection.sql(f"SELECT * FROM {qualified}{at}")
+
+    def detach(self) -> None:
+        """Detach this attachment, keeping the caller's connection open."""
+        self._check_attachment()
+        self.connection.execute(f"DETACH {_identifier(self.name)}")
+
+    def _attachment(self) -> tuple[int, str, bool] | None:
+        # Match the engine's ASCII-only identifier comparison. SQL lower() and
+        # Python casefold() would conflate distinct non-ASCII catalog names.
+        key = self.name.translate(_IDENTIFIER_LOWER)
+        rows = self.connection.execute(
+            "SELECT database_name, database_oid, type, readonly FROM duckdb_databases()"
+        ).fetchall()
+        for name, oid, kind, read_only in rows:
+            if name.translate(_IDENTIFIER_LOWER) == key:
+                return oid, kind, read_only
+        return None
+
+    def _check_attachment(self) -> None:
+        row = self._attachment()
+        if row is None or row[0] != self._database_oid or row[1] != "iceberg" or not row[2]:
+            raise ValueError("IcebergCatalog attachment has been detached or replaced")
 
 
 class GravitinoCatalog:

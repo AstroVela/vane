@@ -2044,10 +2044,11 @@ class FteFragmentExecution:
             self.fragment_id,
             scheduled.descriptor.fragment_plan,
         )
-        if registration_result is not None:
-            scheduled.request["fragment_registration_result"] = registration_result
-        if scheduled.request.get("fragment_registration_result") is not None:
-            scheduled.request["fragment_plan"] = None
+        # Registration dependencies belong to the selected worker. A cached
+        # registration returns None; retaining the descriptor's old ObjectRef
+        # would make replacement attempts wait on a failed worker forever.
+        scheduled.request["fragment_registration_result"] = registration_result
+        scheduled.request["fragment_plan"] = None
         command = FteCreateTaskCommand(
             query_id=self.query_id,
             fragment_id=self.fragment_id,
