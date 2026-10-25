@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
@@ -46,8 +48,23 @@ LITERT_SERVICE_OPTIONS = frozenset(
 )
 
 
-def litert_option_names(*, text: bool, service: bool) -> frozenset[str]:
-    names = LITERT_SERVICE_OPTIONS if service else LITERT_COMMON_OPTIONS
+LITERT_HTTP_OPTIONS = frozenset(
+    {
+        "runtime",
+        "base_url",
+        "model_sha256",
+        "http_input_format",
+        "max_input_bytes",
+        "max_request_bytes",
+        "timeout",
+        "request_batch_size",
+        "max_concurrency_per_actor",
+    }
+)
+
+
+def litert_option_names(*, text: bool, service: bool, http: bool = False) -> frozenset[str]:
+    names = LITERT_HTTP_OPTIONS if http else LITERT_SERVICE_OPTIONS if service else LITERT_COMMON_OPTIONS
     return names | {"input_type"} if text else names
 
 
@@ -63,11 +80,13 @@ def validate_litert_model(model: str | None, dimensions: int | None, kind: str) 
     return selected, width
 
 
-def validate_litert_options(options: Any, *, text: bool, service: bool = False) -> dict[str, Any]:
+def validate_litert_options(options: Any, *, text: bool, service: bool = False, http: bool = False) -> dict[str, Any]:
     copied = dict(options)
-    allowed = litert_option_names(text=text, service=service)
+    allowed = litert_option_names(text=text, service=service, http=http)
     if copied.keys() - allowed:
-        raise TypeError("LiteRT options accept only the declared local model encoding settings")
+        raise TypeError("LiteRT options accept only the declared runtime settings")
+    if http:
+        return _validate_http_options(copied, text=text)
     defaults = {"runtime": "service"} if service else {"backend": "cpu", "cache_dir": None, "num_threads": 2}
     prepared = (
         defaults
@@ -125,6 +144,53 @@ def validate_litert_options(options: Any, *, text: bool, service: bool = False) 
         )
     if type(prepared["vision_tokens_per_image"]) is not int or prepared["vision_tokens_per_image"] not in (70, 140):
         raise EmbeddingConfigurationError("LiteRT vision_tokens_per_image must be 70 or 140")
+    if text:
+        role = prepared.setdefault("input_type", "document")
+        if not isinstance(role, str) or role not in {"query", "document"}:
+            raise EmbeddingConfigurationError("LiteRT input_type must be query or document")
+    return prepared
+
+
+def _validate_http_options(options: dict[str, Any], *, text: bool) -> dict[str, Any]:
+    prepared = {"max_input_bytes": 16 * 1024**2, "http_input_format": "multimodal"} | options
+    if prepared.get("runtime") != "http" or prepared["http_input_format"] != "multimodal":
+        raise EmbeddingConfigurationError("LiteRT HTTP requires runtime='http' and http_input_format='multimodal'")
+    url = prepared.get("base_url")
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        valid = (
+            isinstance(url, str)
+            and parsed is not None
+            and parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.port != 0
+            and parsed.username is None
+            and parsed.password is None
+            and not (parsed.query or parsed.fragment)
+            and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise EmbeddingConfigurationError(
+            "LiteRT HTTP base_url requires an HTTP(S) API prefix without credentials, query or fragment"
+        )
+    digest = prepared.get("model_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+        raise EmbeddingConfigurationError("LiteRT model_sha256 requires the served model file's 64-character SHA-256")
+    prepared["model_sha256"] = digest.lower()
+    for name, default, maximum in (
+        ("max_input_bytes", 16 * 1024**2, 64 * 1024**2),
+        ("max_request_bytes", 32 * 1024**2, 256 * 1024**2),
+        ("request_batch_size", 8, 256),
+        ("max_concurrency_per_actor", 1, 1024),
+    ):
+        value = prepared.setdefault(name, default)
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise EmbeddingConfigurationError(f"LiteRT HTTP {name} must be an integer from 1 to {maximum}")
+    timeout = prepared.setdefault("timeout", 60.0)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise EmbeddingConfigurationError("LiteRT HTTP timeout must be finite and positive")
     if text:
         role = prepared.setdefault("input_type", "document")
         if not isinstance(role, str) or role not in {"query", "document"}:

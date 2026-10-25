@@ -209,10 +209,10 @@ def _load_mlx(name: str | None = None) -> Provider:
     return MLXProvider(name)
 
 
-def _load_litert(name: str | None = None) -> Provider:
+def _load_litert(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.litert import LiteRTProvider
 
-    return LiteRTProvider(name)
+    return LiteRTProvider(name, **client_options)
 
 
 def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
