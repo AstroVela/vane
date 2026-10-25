@@ -14,8 +14,7 @@ import vane
 from tests.fast.test_direct_exchange import collect, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
-from vane.execution.plan import Distribution
-from vane.execution.plan import FragmentGraph, SourceSpec
+from vane.execution.plan import Distribution, FragmentGraph, SourceSpec
 
 
 def disjoint_aggregate_query(directory, variant="disjoint"):
