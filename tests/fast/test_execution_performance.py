@@ -1503,6 +1503,55 @@ def test_bitmap_domain_preserves_partition_masks_and_duplicate_rows(
     assert not list((tmp_path / "spill").rglob("duckdb_temp*"))
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize(
+    "probe_estimate,seed,bitmap", [(100000000, False, False), (2000000000, False, True), (2000000000, True, False)]
+)
+def test_bitmap_domain_costs_only_unfiltered_exchange_traffic(tmp_path, threads, probe_estimate, seed, bitmap):
+    config = {"threads": threads, "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization"}
+    with vane.connect(backend="local", config=config) as connection:
+        fact, build = tmp_path / "fact.parquet", tmp_path / "build.parquet"
+        connection.execute(f"copy (select range i, range%65536 k from range(131099)) to '{fact}' (row_group_size 2048)")
+        connection.execute(
+            f"copy (select range%65536 k, range%17 v from range(131072)) to '{build}' (row_group_size 2048)"
+        )
+        suffix = (
+            " join (select (hash(range)%131099)::bigint i from range(16) where range%4=0) s on p.i=s.i" if seed else ""
+        )
+        sql = (
+            f"select count(*),sum(p.i),sum(b.v) "
+            f"from read_parquet('{fact}', explicit_cardinality={probe_estimate}) p join "
+            f"(select k,v from read_parquet('{build}', explicit_cardinality=30000000) where v<4) b "
+            f"on p.k=b.k{suffix}"
+        )
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=3)
+        # A marginal streaming domain must not add a blocking bitmap stage.
+        # An ancestor's selective seed also invalidates unfiltered traffic costs.
+        assert any(b"bit_or" in f.native_plan for f in spec.graph.fragments) is bitmap
+        sources = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(fact).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        fact_edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            if seed:
+                assert fact_edges
+                assert (
+                    sum(
+                        c.snapshot()["accepted_rows"]
+                        for name, c in service.channels.items()
+                        if name.split("/")[0] in fact_edges
+                    )
+                    <= 8
+                )
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
 @pytest.mark.parametrize("shape", ["single", "multiple", "narrow"])
 def test_join_output_filter_estimate_requires_single_key_and_traffic_savings(tmp_path, shape):
     with vane.connect(backend="local", config={"threads": 4}) as connection:

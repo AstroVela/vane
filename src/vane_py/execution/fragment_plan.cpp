@@ -1206,6 +1206,11 @@ private:
 			target.keys_only = !broadcast;
 			if (!broadcast && key_bytes > 8 * 1024 * 1024 &&
 			    (HasFilteredAggregate(build) || key_bytes > MaxValue<idx_t>(16 * 1024 * 1024, broadcast_limit))) {
+				// An ancestor's early filter already reduces this exchange. Its
+				// original cardinality cannot fund another blocking domain.
+				if (probe_filters.count(target.input)) {
+					continue;
+				}
 				// A filtered build can be overestimated. Bound the domain by its
 				// word count instead of broadcasting every key. Each word retains
 				// 64 hash positions; collisions only retain extra probes.
@@ -1247,7 +1252,11 @@ private:
 			// edge below. Complete-build broadcasts keep their smaller limits.
 			auto traffic = broadcast ? EstimatedExchangeBytes(build) * partitions
 			                         : EstimatedExchangeBytes(build) + key_bytes * partitions;
-			if (traffic < probe_bytes) {
+			// A streaming build adds a new complete-build barrier and bitmap
+			// hashing work. Require the same fourfold margin as full broadcasts.
+			// A filtered aggregate already blocks before producing its keys.
+			const auto margin = target.bitmap_words && !HasFilteredAggregate(build) ? 4 : 1;
+			if (traffic * margin < probe_bytes) {
 				target.build = &build;
 				target.build_column = condition.right->Cast<BoundReferenceExpression>().index;
 				return target;
