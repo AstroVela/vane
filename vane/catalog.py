@@ -10,10 +10,12 @@ connection. Load the matching ``gravitino`` provider before attaching.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
     from vane import DuckDBPyConnection, DuckDBPyRelation
 
@@ -32,6 +34,28 @@ def _identifier(value: str) -> str:
     if not value:
         raise ValueError("catalog identifiers cannot be empty")
     return '"' + _text(value).replace('"', '""') + '"'
+
+
+@dataclass(frozen=True)
+class FilesetWriteResult:
+    """Exact outputs of one successful Fileset batch, without a row-order guarantee.
+
+    Ray S3 results refer to a committed manifest. A local result does not
+    imply a durable manifest or atomic visibility to directory-listing readers.
+    """
+
+    logical_path: str
+    location_name: str
+    format: str
+    files: tuple[str, ...]
+    rows_written: int
+    bytes_written: int
+    operation_id: str
+    base_path: str
+    run_id: str | None
+    manifest_path: str | None
+    cleanup_state: Literal["complete", "pending"] = "complete"
+    cleanup_warnings: tuple[str, ...] = ()
 
 
 class GravitinoCatalog:
@@ -159,6 +183,63 @@ class GravitinoCatalog:
         return self.connection.sql(
             f"SELECT * FROM gravitino_files({args}, recursive={'true' if recursive else 'false'})"
         )
+
+    def write_files(
+        self,
+        relation: DuckDBPyRelation,
+        schema: str,
+        name: str,
+        path: str = "",
+        *,
+        format: Literal["parquet", "csv"] = "parquet",
+        compression: str | None = None,
+        partition_by: Sequence[str] | None = None,
+    ) -> FilesetWriteResult:
+        """Write a new immutable batch and return its exact physical files.
+
+        Requires auto-commit and a writable attachment. Supports local
+        and Ray with shared S3 storage. Each invocation creates a distinct batch;
+        repeating a call does not deduplicate data. Partition columns remain
+        in the files. CSV uses UTF-8, commas and a header.
+        """
+        from vane import DuckDBPyRelation
+
+        if not isinstance(relation, DuckDBPyRelation):
+            raise TypeError("relation must be a Vane relation")
+        if format not in ("parquet", "csv"):
+            raise ValueError("format must be parquet or csv")
+        if compression is not None and not isinstance(compression, str):
+            raise TypeError("compression must be a string or None")
+        columns: tuple[str, ...] = ()
+        if partition_by is not None:
+            if isinstance(partition_by, (str, bytes)) or not isinstance(partition_by, Sequence):
+                raise TypeError("partition_by must be a sequence of column names or None")
+            columns = tuple(partition_by)
+            if any(not _text(column) for column in columns):
+                raise ValueError("partition column names cannot be empty")
+            if len({column.lower() for column in columns}) != len(columns):
+                raise ValueError("partition column names must be unique")
+        parts = (self.name, schema, name)
+        for part in parts:
+            if not _text(part) or any(char in part for char in "/\\%") or part in (".", ".."):
+                raise ValueError("GVFS identifiers must be nonempty path components without slashes or percent escapes")
+        logical_path = "gvfs://fileset/" + "/".join(parts) + "/" + _text(path)
+        receipt = relation._write_file_batch(self.connection, logical_path, format, compression, columns)
+        try:
+            properties = receipt.pop("target_properties")
+            return FilesetWriteResult(location_name=properties["location_name"], **receipt)
+        except Exception as cause:
+            from vane.runners.copy_outcome import CopyResultUnavailableError
+
+            error = CopyResultUnavailableError(
+                receipt["operation_id"],
+                "Fileset result construction failed after COPY completed",
+                receipt.get("cleanup_warnings", ()),
+            )
+            error.base_path = receipt["base_path"]
+            error.run_id = receipt["run_id"]
+            error.manifest_path = receipt["manifest_path"]
+            raise error from cause
 
     def _list(self, function: str, *args: str) -> list[str]:
         rows = self._query(function, *args).fetchall()

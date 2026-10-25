@@ -880,6 +880,14 @@ class DuckDBPyRelation:
         write_partition_columns: bool | None = None,
     ) -> None: ...
     def write_file(self, file_name: str, *, format: str) -> None: ...
+    def _write_file_batch(
+        self,
+        connection: DuckDBPyConnection,
+        path: str,
+        format: str,
+        compression: str | None = None,
+        partition_by: typing.Sequence[str] = (),
+    ) -> dict[str, typing.Any]: ...
     def write_parquet(
         self,
         file_name: str,

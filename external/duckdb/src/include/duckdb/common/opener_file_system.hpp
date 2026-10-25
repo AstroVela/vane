@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -268,6 +274,12 @@ protected:
 	string CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener = nullptr) override {
 		VerifyNoOpener(opener);
 		return GetFileSystem().CanonicalizePath(path_p, GetOpener());
+	}
+
+	FileWriteTarget ResolveWriteTarget(const string &path, const CopyInfo &info,
+	                                   optional_ptr<FileOpener> opener = nullptr) override {
+		VerifyNoOpener(opener);
+		return GetFileSystem().ResolveWriteTarget(path, info, GetOpener());
 	}
 
 private:

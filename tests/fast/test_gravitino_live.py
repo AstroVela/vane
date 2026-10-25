@@ -17,7 +17,9 @@ from urllib.request import Request, urlopen
 import pytest
 
 import vane
+from tests.fast.test_gravitino import gravitino_http as gravitino_http
 from tests.fast.test_gravitino import load_gravitino
+from tests.fast.test_gravitino_write import configure_s3, read_literal_batch
 from vane.catalog import GravitinoCatalog
 
 pytestmark = pytest.mark.external_service
@@ -70,6 +72,72 @@ def live_gravitino():
 def attach_live(connection, endpoint, metalake):
     load_gravitino(connection)
     return GravitinoCatalog.attach(connection, "media", endpoint=endpoint, metalake=metalake, catalog="media")
+
+
+@pytest.mark.parametrize("format", ["parquet", "csv"])
+def test_live_gravitino_local_batch_write(live_gravitino, format):
+    endpoint, metalake, directory, _api = live_gravitino
+    output = directory / "output"
+    output.mkdir()
+    with vane.connect() as connection:
+        catalog = attach_live(connection, endpoint, metalake)
+        catalog.create_schema("features")
+        catalog.create_fileset("features", "vectors", storage_location=str(output))
+        result = catalog.write_files(
+            connection.sql("SELECT i, '中文' AS label FROM range(8) AS t(i)"),
+            "features",
+            "vectors",
+            format=format,
+        )
+        assert result.rows_written == 8
+        assert result.bytes_written == sum(Path(file).stat().st_size for file in result.files)
+        restored = (
+            connection.read_parquet(list(result.files))
+            if format == "parquet"
+            else connection.read_csv(list(result.files), header=True)
+        )
+        assert restored.order("i").fetchall() == [(i, "中文") for i in range(8)]
+
+
+@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
+@pytest.mark.parametrize("format", ["parquet", "csv"])
+def test_live_gravitino_s3_partitioned_batch(request, monkeypatch, live_gravitino, gravitino_http, runner, format):
+    if runner == "ray":
+        request.getfixturevalue("ray_local")
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    endpoint, metalake, _directory, api = live_gravitino
+    _state, storage_endpoint, _storage_directory = gravitino_http
+    # The real service owns metadata; only Vane accesses the object fixture.
+    # No test storage credentials or Docker-to-host networking are needed in
+    # Gravitino. Local Fileset acceptance still exercises its default FS ops.
+    api(
+        "POST",
+        f"/metalakes/{metalake}/catalogs",
+        {
+            "name": "objects",
+            "type": "FILESET",
+            "provider": "fileset",
+            "properties": {"disable-filesystem-ops": "true"},
+        },
+    )
+    with vane.connect() as connection:
+        configure_s3(connection, storage_endpoint)
+        load_gravitino(connection)
+        catalog = GravitinoCatalog.attach(connection, "media", endpoint=endpoint, metalake=metalake, catalog="objects")
+        catalog.create_schema("features")
+        catalog.create_fileset("features", "vectors", storage_location=f"s3a://bucket/{metalake}")
+        for empty in (False, True):
+            relation = connection.sql(
+                "SELECT i, CASE WHEN i%2=0 THEN '中文/路径' ELSE NULL END AS part FROM range(8) t(i)"
+            )
+            if empty:
+                relation = relation.filter("false")
+            result = catalog.write_files(relation, "features", "vectors", format=format, partition_by=["part"])
+            expected = [] if empty else [(i, "中文/路径" if i % 2 == 0 else None) for i in range(8)]
+            assert result.rows_written == len(expected)
+            assert result.files
+            assert read_literal_batch(connection, result) == expected
+            assert bool(result.manifest_path) == (runner == "ray")
 
 
 def test_live_gravitino_metadata_crud(live_gravitino):
