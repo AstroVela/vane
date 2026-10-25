@@ -5205,11 +5205,9 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
     request = create_calls[0][1]
     assert request["worker_runtime"] == "fte"
     assert request["fragment_plan"] is None
-    assert request["fragment_registration_result"].future().result() == {
-        "registered": 1,
-        "existing": 0,
-        "total": 1,
-    }
+    # The synchronous fake has already completed this worker's registration.
+    # Only a pending registration belongs in the task's dependency slot.
+    assert request["fragment_registration_result"] is None
     assert "scan_split_batch:7" not in request["context"]
     assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
