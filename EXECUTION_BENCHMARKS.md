@@ -3538,3 +3538,91 @@ compile-only diagnostics, JUnit reports and cleanup manifests. Compile-only
 logging is absent from the final binary. Owned temporary/oracle/duplicate
 baseline files are removed after processes stop; source inputs remain intact.
 Doris/HDFS is restored with requested file and Parquet page caches disabled.
+
+## SF100 correlated masks inside Parquet scanning (2026-10-25)
+
+The preceding correlated-key change filtered fact rows before their exchange,
+but its word/mask hash join ran after the Parquet source and date expressions.
+That left decoding and expression work for fact rows which the bounded domain
+would discard. This round moves the same necessary condition into the native
+Parquet filter interface for proven unchanged integral keys.
+
+A Vane-owned physical operator drains the complete global word/mask input
+before starting its unary Parquet probe pipeline. Its single-threaded sink ORs
+duplicate words into a zeroed buffer, rejects NULL or out-of-range domain rows,
+and publishes an immutable native ExpressionFilter only after successful
+finalization. The dense mask occupies 0.5–4 MiB and is pinned through the native
+BufferManager; expression bind data shares ownership, while thread-local hash
+scratch is reused. A fresh execution clears its prior runtime filter. Native
+pipeline dependencies order publication before scan initialization; failed or
+cancelled builds cannot publish partial domains. Retry attempts rebuild their
+own filter from the complete admitted domain.
+
+The compiler traces the exact key through unchanged projections and filters
+into a supported unsampled Parquet scan. Other operator boundaries do not gain
+this placement. Existing domain costing, global BIT_OR merging, exchanges,
+original SQL and exact correlated SEMI/ANTI joins remain in use. This changes
+no native Bloom implementation and adds no Local fallback. Both ordinary
+Pipeline and FTE load the same native fragment marker, whose implementation is
+included in the strict native build identity.
+
+Controlled SF100 results, relative to preceding head `f861a2355d`:
+
+| Query | Local | Pipeline before | Pipeline now | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| Q4 | 2.846 s | 5.926 s | 4.425 s | -25.33% |
+
+Pipeline remains **1.55× Local latency**.
+Each median has four steady samples, preceded by the first SQL execution in its
+process. Baseline phases bracket candidate runs and drift by
++0.85%. Separate diagnostic runs give mean summed
+two-worker CPU of **170.020 → 119.490 CPU seconds
+(-29.72%)**. Diagnostic wall times are excluded from
+the primary medians. The earlier owner-key-scan and ordinary join-domain gains
+above use separate baselines and timing windows.
+
+Only Q4 changes in an offline comparison of all 22 serialized graphs after
+normalizing the native build identity; Q4 retains seven fragments. The other
+21 graphs are identical. Separate regression screens each have one steady
+sample per variant and establish no small performance gain:
+
+| Query | Pipeline before | Pipeline now |
+| --- | ---: | ---: |
+| Q10 | 9.394 s | 9.598 s |
+| Q12 | 5.014 s | 4.858 s |
+| Q18 | 15.942 s | 15.893 s |
+
+Validation on the final installed Release binary:
+
+- **643 related tests passed**: 141 correlated/performance/lifecycle cases,
+  489 compiler and Parquet cases, and 13 real-Ray cases. Coverage includes
+  equality/NULL-safe equality, signed/unsigned keys, duplicate owners, SEMI/ANTI,
+  plain/Hive layouts, static predicates, constant/dictionary keys, repeated
+  execution, empty and duplicate domains, malformed domain rejection,
+  cancellation and both domain-worker and probe-worker FTE retry. The added
+  profiling assertion fails on the baseline (262,147 fact scan output rows)
+  and passes with filtering inside the scan. No full/GPU suite was run.
+- **37 result-checked SF100 executions**: 18 primary Q4 timing queries,
+  12 Q10/Q12/Q18 regression screens, three Local oracle preparations, and
+  four separate Q4 CPU diagnostics. Every result matched the Local oracle.
+- Same original SQL and 307 input files (37.5033 GiB). Local uses
+  36 threads/32 GiB; Pipeline uses two workers with 18 threads/16 GiB each,
+  128/256 MiB exchange/staging budgets, 64 KiB/2,048-row frames and
+  1 MiB/16-slot windows. Ray's object store is 1 GiB.
+- Run-owned Doris/HDFS processes were stopped during measured comparisons and
+  restored afterward with file and Parquet page caches disabled. No task-owned
+  build, test or profiling work overlapped primary timing. OS caches were kept;
+  the host remained shared with unrelated workloads.
+
+Frozen source `fa6f0b3c343c5a8cb8144d2b1a48ee4d852908ad`, package 0.3.0.dev120,
+native SHA-256 `4ed99cb62357f42aa9c7b9d6758dbd201e893c3af4035ff87f62be3419003999`. Baseline native SHA-256
+`5e10a642d1d72bae8b9bf3cb8b8b4af3c3fe5859a95ae1752683b37e262d21d3`. Loaded code identity is frozen separately
+from distribution metadata in the shared Python environment.
+
+Evidence is retained under `build/pipeline-sf100-parquet-mask-20261025/`: `audit.json`,
+`acceptance-summary.csv`, `cpu-final-summary.json`, `plan-comparison.json`,
+JUnit results, configurations, row counts, content hashes and cleanup manifests.
+Run-owned test data, oracle IPCs and duplicate installed baseline are removed
+after validation and process shutdown. Source Parquet files are preserved.
+This is a controlled Q4 improvement, not a refreshed full-22 score or an SF100
+FTE timing result.
