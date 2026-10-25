@@ -405,6 +405,7 @@ include = [
     "/examples/multimodal_providers.py",
     "/examples/qwen3_vl_sqr.py",
     "/examples/litert_embedding_search.py",
+    "/examples/litert_http_model_metadata.py",
     "/examples/litert_service.json",
     "src/**",
     "vane/**",

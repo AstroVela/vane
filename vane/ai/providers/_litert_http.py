@@ -9,7 +9,7 @@ import io
 import math
 import wave
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -21,6 +21,7 @@ from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
 from vane.ai._litert_options import LITERT_MODELS, validate_litert_model, validate_litert_options
 from vane.ai._redaction import unwrap_sensitive_options
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
+from vane.ai.embedding import Modality
 from vane.ai.protocols import (
     AudioEmbedderDescriptor,
     ImageEmbedderDescriptor,
@@ -34,17 +35,18 @@ from vane.ai.providers._embedding_http_codecs import EmbeddingHTTPCodec, json_by
 
 DOCUMENT_PREFIX = "title: none | text: "
 QUERY_PREFIX = "task: search result | query: "
+_HTTPInputKind = Literal["text", "image", "video", "audio", "multimodal"]
 
 
 class LiteRTHTTPCodec(EmbeddingHTTPCodec):
-    def __init__(self, model: str, dimensions: int, options: dict[str, Any], kind: str):
+    def __init__(self, model: str, dimensions: int, options: dict[str, Any], kind: _HTTPInputKind):
         self.input_format = "multimodal"
         self.kind = kind
         self.role = options.get("input_type", "document")
-        modalities = list(LITERT_MODELS[model])
+        modalities: list[Modality] = list(LITERT_MODELS[model])
         if "image" in modalities:
             modalities.append("video")
-        parts = modalities if kind == "multimodal" else [kind]
+        parts: list[Modality] = modalities if kind == "multimodal" else [kind]
         limit = options["max_input_bytes"]
         self.spec = MultimodalInputSpec(
             frozenset(EmbeddingPartSpec(part) for part in parts),
@@ -137,7 +139,7 @@ class LiteRTHTTPCodec(EmbeddingHTTPCodec):
         if not isinstance(content, EmbeddingContent):
             raise EmbeddingConfigurationError("LiteRT HTTP requires typed EmbeddingContent rows")
         self.spec.validate_layout(tuple(part.spec for part in content.parts))
-        active = []
+        active: list[tuple[Modality, Any]] = []
         raw_size = 0
         for part in content.parts:
             kind, value = part.spec.kind, part.value
@@ -185,7 +187,7 @@ class LiteRTHTTPCodec(EmbeddingHTTPCodec):
 
 
 class _LiteRTHTTPDescriptor(_HTTPEmbeddingDescriptor):
-    kind = "text"
+    kind: _HTTPInputKind = "text"
 
     def __init__(
         self, model: str | None, dimensions: int | None, options: Mapping[str, Any], client_options: dict[str, Any]
@@ -205,7 +207,7 @@ class _LiteRTHTTPDescriptor(_HTTPEmbeddingDescriptor):
     def get_output_spec(self, *, dimensions: int | None = None) -> EmbeddingOutputSpec:
         if dimensions is not None and (type(dimensions) is not int or dimensions != self.dimensions):
             raise EmbeddingConfigurationError("LiteRT output dimensions must match the descriptor")
-        kinds = list(LITERT_MODELS[self.model]) if self.kind == "multimodal" else [self.kind]
+        kinds: list[Modality] = list(LITERT_MODELS[self.model]) if self.kind == "multimodal" else [self.kind]
         if self.kind == "multimodal" and "image" in kinds:
             kinds.append("video")
         return EmbeddingOutputSpec(

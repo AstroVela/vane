@@ -159,7 +159,8 @@ def _validate_http_options(options: dict[str, Any], *, text: bool) -> dict[str, 
     try:
         parsed = urlsplit(url) if isinstance(url, str) else None
         valid = (
-            parsed is not None
+            isinstance(url, str)
+            and parsed is not None
             and parsed.scheme in {"http", "https"}
             and parsed.hostname
             and parsed.port != 0

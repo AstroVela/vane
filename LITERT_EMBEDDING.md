@@ -199,10 +199,116 @@ does not infer token throughput from those counters.
 
 The official HTTP endpoint does not expose `max_length`, `vision_tokens_per_image`,
 backend/thread/cache selection or overflow policy. These are rejected as HTTP client
-options. The server's default overflow policy is an error. Its supported signatures
-depend on the artifact and backend: the reviewed 740M artifact on an RTX 4080 SUPER
-selects at most 1,024 tokens for GPU execution, despite advertising longer CPU
-signatures. A 15-frame plus roughly 15-second audio input produced 2,223 tokens and
-failed; use an explicitly qualified shorter clip configuration. This artifact's
-vision and audio frontends support CPU, while the text backbone supports GPU.
-These observations do not qualify other devices, artifacts or retrieval quality.
+options. The server's default overflow policy is an error. Encoding settings belong
+to the serving deployment, not the client's HTTP payload.
+
+### Configure the embedded input-length default
+
+The reviewed file's `EmbeddingMetadata.max_input_length` is 1024. This is a
+Protobuf field inside the binary `.litertlm` model package, alongside its weights,
+graphs and tokenizer; it is not a separate JSON setting. The package already
+contains real 128/256/512/1024/2048/8192-token encoder signatures. The embedded
+default restricts signature selection when no explicit engine override is supplied;
+1024 is not a GPU hardware or exported-graph limit.
+
+The native Python API accepts `EmbeddingEngine(..., max_input_length=8192)`.
+The official 0.18 HTTP engine factory does not forward that setting, and adding
+`max_length` to Vane's HTTP options cannot configure the server.
+For the exact reviewed artifact, the offline
+[deployment-copy example](examples/litert_http_model_metadata.py) changes only that
+embedded default to 8192. Run it in the separately provisioned
+`litert-lm==0.18.0` environment:
+
+```bash
+export LITERT_LM_DIR="$PWD/litert-8192"
+python examples/litert_http_model_metadata.py \
+  /models/embeddinggemma-2-740m.litertlm \
+  "$LITERT_LM_DIR/models/litert-community--embeddinggemma-2-740m-litert-lm/model.litertlm"
+```
+
+The destination is the deployment copy that the official CLI reads under its
+declared model ID. The example refuses other source hashes and existing targets,
+verifies the resulting whole-file hash and publishes the new file only after
+verification. The two identities are:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Original reviewed file | `e7a8a2204b91e0f96e92960e84a09a89212e1633dcb7575a9bf3378b4df77f4c` |
+| 8192-default deployment copy | `6d738925f2686fa545e50dee7e26e0c4ee8af43b69e63833783ab463e92f63ba` |
+
+Exactly one metadata byte changes; every other section, including the weights,
+graphs and tokenizer, remains byte-identical. No model re-export, official source
+change or custom inference HTTP server is required. Set Vane's `model_sha256`
+to the deployment copy's hash explicitly, pair query/document encoders with that
+deployment and use a new index. HTTP still does not attest the declared hash.
+
+### Select encoder backends on the server
+
+In a CLI config file such as `litert-http-server.json`, the tested experimental
+configuration for the 740M model on an RTX 4080 SUPER is:
+
+```json
+{
+  "default": {
+    "backend": "gpu",
+    "vision_backend": "gpu",
+    "audio_backend": "gpu",
+    "cache": "disk"
+  }
+}
+```
+
+```bash
+litert-lm serve --config litert-http-server.json --host 127.0.0.1 --port 9379
+```
+
+All three main encoders ran on WebGPU, including the 8192-token encoder signature.
+Small adapters and media decoding/preprocessing still used CPU. This corrects the
+earlier description that vision/audio were CPU-only. A backend loading successfully
+does not establish numerical equivalence or retrieval quality; the experimental
+GPU results below do not qualify it as a default.
+
+The official 0.18
+[`ComputeEmbeddingBatch` implementation](https://github.com/google-ai-edge/LiteRT-LM/blob/v0.18.0/runtime/core/embedding_engine_impl.cc)
+processes the independent rows sequentially. Eight rows in one HTTP request
+therefore reduce transport calls but do not constitute one eight-row GPU tensor
+batch. Increasing HTTP concurrency does not establish concurrent SDK execution.
+
+### Recorded 100-video HTTP qualification
+
+An independently admitted single-video ingest and fresh 100-video batch completed
+on the local runner with official CLI/API/builder 0.18.0 and the metadata-only
+deployment copy. Both LiteRT and a fresh vLLM control produced 100 ready videos,
+zero failed/unknown jobs and 274 complete visual/raw-sound clips. Each 100-video
+case ran 20 actual flat/grouped vector queries and repeated them after reopening
+storage, with unchanged job reports and result-ID order.
+
+The fixed input corpus totals 3177.863 seconds. Both arms used windows of at most
+15 seconds, 1 FPS, 224-pixel Context previews, 12 local CPUs/SQL threads, two
+preprocessing workers, one embedding actor, invocation/HTTP batches of eight,
+observed HTTP concurrency one and a 256 MiB stage budget. A private benchmark
+observer applied the same 8 GiB memory-admission cap; it is not a public Vane or
+Context production setting. ASR/OCR/subtitles were not used.
+
+| Measurement | LiteRT, three encoders on GPU | vLLM CUDA control |
+| --- | ---: | ---: |
+| Batch submission to ready | 519.008 s | 174.911 s |
+| Model HTTP active union | 414.297 s | 122.852 s |
+| Full case including startup/search/reopen | 613.318 s | 268.811 s |
+| Fixed 10-query Recall@1 / Recall@10 | 0.6 / 0.9 | 0.9 / 1.0 |
+
+All 3226 LiteRT PNG images and the timeline-aligned PCM16 input samples matched
+retained evidence; every response vector matched its own stored vector. The vLLM
+arm's 274 MP4/WAV input fingerprints matched the frozen control and its minimum
+same-runtime reference cosine exceeded 0.9999. These are functional/input-ownership
+checks, not cross-provider equivalence.
+
+The LiteRT GPU probe's cosine against the CPU vision/audio reference was
+0.9956053, below this experiment's original 0.9999 gate. Same-GPU repetition and
+single-versus-two-row batch cosine was 1.0. Retrieval also failed the retained
+Recall@1 >= 0.9 / Recall@10 = 1.0 criterion, so the GPU candidate is not promoted
+to a default. Ten fixed queries are a small sample, not a full-corpus quality score.
+The two arms use different quantized/BF16 formats, PNG-sequence/MP4 representations,
+sampling/pixels and processors; the timings do not isolate runtime algorithms.
+HTTP-active time includes preprocessing, transfer, queueing and inference, not
+pure GPU compute. CPU vision/audio 100-video throughput was not measured.

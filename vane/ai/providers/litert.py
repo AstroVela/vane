@@ -126,24 +126,6 @@ class LiteRTProvider(Provider):
             {"api_key": api_key if api_key is not None else os.environ.get("LITERT_API_KEY")}
         )
 
-    def _http_descriptor(self, kind, model, dimensions, options):
-        from vane.ai.providers._litert_http import (
-            LiteRTHTTPAudioDescriptor,
-            LiteRTHTTPImageDescriptor,
-            LiteRTHTTPMultimodalDescriptor,
-            LiteRTHTTPTextDescriptor,
-            LiteRTHTTPVideoDescriptor,
-        )
-
-        factory = {
-            "text": LiteRTHTTPTextDescriptor,
-            "image": LiteRTHTTPImageDescriptor,
-            "video": LiteRTHTTPVideoDescriptor,
-            "audio": LiteRTHTTPAudioDescriptor,
-            "multimodal": LiteRTHTTPMultimodalDescriptor,
-        }[kind]
-        return factory(model, dimensions, options, self._http_client_options)
-
     @property
     def name(self) -> str:
         return "litert"
@@ -152,7 +134,9 @@ class LiteRTProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> TextEmbedderDescriptor:
         if options is not None and options.get("runtime") == "http":
-            return self._http_descriptor("text", model, dimensions, options)
+            from vane.ai.providers._litert_http import LiteRTHTTPTextDescriptor
+
+            return LiteRTHTTPTextDescriptor(model, dimensions, options, self._http_client_options)
         if options is not None and options.get("runtime") == "service":
             from vane.ai.providers._litert_service import LiteRTServiceTextDescriptor
 
@@ -163,7 +147,9 @@ class LiteRTProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> ImageEmbedderDescriptor:
         if options is not None and options.get("runtime") == "http":
-            return self._http_descriptor("image", model, dimensions, options)
+            from vane.ai.providers._litert_http import LiteRTHTTPImageDescriptor
+
+            return LiteRTHTTPImageDescriptor(model, dimensions, options, self._http_client_options)
         if options is not None and options.get("runtime") == "service":
             from vane.ai.providers._litert_service import LiteRTServiceImageDescriptor
 
@@ -174,7 +160,9 @@ class LiteRTProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> AudioEmbedderDescriptor:
         if options is not None and options.get("runtime") == "http":
-            return self._http_descriptor("audio", model, dimensions, options)
+            from vane.ai.providers._litert_http import LiteRTHTTPAudioDescriptor
+
+            return LiteRTHTTPAudioDescriptor(model, dimensions, options, self._http_client_options)
         if options is not None and options.get("runtime") == "service":
             from vane.ai.providers._litert_service import LiteRTServiceAudioDescriptor
 
@@ -185,7 +173,9 @@ class LiteRTProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> MultimodalEmbedderDescriptor:
         if options is not None and options.get("runtime") == "http":
-            return self._http_descriptor("multimodal", model, dimensions, options)
+            from vane.ai.providers._litert_http import LiteRTHTTPMultimodalDescriptor
+
+            return LiteRTHTTPMultimodalDescriptor(model, dimensions, options, self._http_client_options)
         if options is not None and options.get("runtime") == "service":
             from vane.ai.providers._litert_service import LiteRTServiceMultimodalDescriptor
 
@@ -196,7 +186,9 @@ class LiteRTProvider(Provider):
         self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
     ) -> VideoEmbedderDescriptor:
         if options is not None and options.get("runtime") == "http":
-            return self._http_descriptor("video", model, dimensions, options)
+            from vane.ai.providers._litert_http import LiteRTHTTPVideoDescriptor
+
+            return LiteRTHTTPVideoDescriptor(model, dimensions, options, self._http_client_options)
         raise NotImplementedError("LiteRT decoded video expansion requires runtime='http'")
 
 
