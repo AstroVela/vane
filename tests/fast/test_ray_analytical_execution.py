@@ -267,8 +267,11 @@ def test_correlated_bitmap_preserves_key_scan_and_domain_retry(tmp_path, monkeyp
         assert_idle(connection)
 
 
-@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
-@pytest.mark.parametrize("kind", ["owner", "hashed", "medium"])
+@pytest.mark.parametrize(
+    "kind,mode",
+    [(kind, mode) for kind in ("owner", "hashed", "medium") for mode in ("pipelined", "fte", "fte_retry")]
+    + [("hashed", "fte_probe_retry")],
+)
 def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypatch, mode, kind):
     import ray
 
@@ -281,13 +284,26 @@ def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypat
         admitted = dispatch(scheduler, index, partition, binding, upstream)
         producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
         shared = {p for p in producers if producers.count(p) > 1}
-        if admitted and not lost and shared.intersection(upstream):
+        if admitted and not lost:
             attempt = scheduler.active[index]
-            lost.append(attempt.reservation.token)
-            ray.kill(attempt.worker, no_restart=True)
+            target = bool(shared.intersection(upstream))
+            if mode == "fte_probe_retry":
+                fragment = next(
+                    f
+                    for f in scheduler.spec.graph.fragments
+                    if f.fragment_id == attempt.reservation.token.task_id.split("/")[0]
+                )
+                domains = {f.fragment_id for f in scheduler.spec.graph.fragments if b"bit_or" in f.native_plan}
+                target = bool(fragment.sources) and any(
+                    e.consumer_fragment_id == fragment.fragment_id and e.producer_fragment_id in domains
+                    for e in scheduler.spec.graph.exchanges
+                )
+            if target:
+                lost.append(attempt.reservation.token)
+                ray.kill(attempt.worker, no_restart=True)
         return admitted
 
-    if mode == "fte_retry":
+    if mode in ("fte_retry", "fte_probe_retry"):
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
     budget = (256 if kind == "owner" else 1024) << 20
     limits = resources(tmp_path, operator_memory_bytes=budget, task_contexts_per_worker=64, io_concurrency=256)
@@ -309,7 +325,7 @@ def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypat
             producers = [edge.producer_fragment_id for edge in scheduler.spec.graph.exchanges]
             assert len(producers) > len(set(producers))
             assert any(e.distribution is Distribution.BROADCAST for e in scheduler.spec.graph.exchanges)
-            if mode == "fte_retry":
+            if mode in ("fte_retry", "fte_probe_retry"):
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
                 assert len(attempts) == 2

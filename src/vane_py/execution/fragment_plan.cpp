@@ -1468,17 +1468,7 @@ private:
 						auto &scan = KeyScan(source, keys.column);
 						auto bitmap = BitmapDomain(Build(scan), scan, 0, words);
 						auto domain = Exchange(std::move(bitmap.first), count == 1 ? "gather" : "broadcast", count);
-						PlanNode node;
-						node.types = op.types;
-						node.parquet_mask_words = words;
-						node.parquet_mask_key = key;
-						node.children.push_back(std::move(input.fragment.root));
-						node.children.push_back(std::move(domain.fragment.root));
-						input.fragment.root = std::move(node);
-						for (auto &edge : domain.incoming) {
-							input.incoming.push_back(std::move(edge));
-						}
-						return input;
+						return ParquetBitmapFilter(op, std::move(input), key, std::move(domain), words);
 					}
 				}
 			}
@@ -1514,8 +1504,30 @@ private:
 		return SemiFilter(op, std::move(input), key, projection, std::move(domain), 0);
 	}
 
+	DistributedSubtree ParquetBitmapFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key,
+	                                       DistributedSubtree domain, idx_t words) {
+		PlanNode node;
+		node.types = op.types;
+		node.parquet_mask_words = words;
+		node.parquet_mask_key = key;
+		node.children.push_back(std::move(input.fragment.root));
+		node.children.push_back(std::move(domain.fragment.root));
+		input.fragment.root = std::move(node);
+		for (auto &edge : domain.incoming) {
+			input.incoming.push_back(std::move(edge));
+		}
+		return input;
+	}
+
 	DistributedSubtree BitmapFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
 	                                DistributedSubtree domain, idx_t words) {
+		if (input.incoming.empty() && input.fragment.sources.size() == 1 && CanFilterParquetKey(op, key)) {
+			// This source-only unary probe can consume the complete domain
+			// before scan initialization, using the same build dependency as
+			// the word join below. Do not move it across incoming exchanges or
+			// another already-installed filter's native fragment root.
+			return ParquetBitmapFilter(op, std::move(input), key, std::move(domain), words);
+		}
 		const auto columns = op.types.size();
 		vector<LogicalType> types = op.types;
 		vector<unique_ptr<Expression>> expressions;

@@ -101,7 +101,7 @@ def test_hash_partition_reuse_drops_null_extended_key():
             assert collect(service) == connection.execute(sql).fetchall()
 
 
-def profile_fragment_scans(connection, monkeypatch):
+def profile_fragment_scans(connection, monkeypatch, native_plans=None):
     scans = []
     execute = native._execute_fragment_for_test
 
@@ -113,7 +113,8 @@ def profile_fragment_scans(connection, monkeypatch):
 
     def profiled(*args):
         rows = execute(*args)
-        visit(json.loads(connection.get_profiling_information("json")))
+        if native_plans is None or args[1] in native_plans:
+            visit(json.loads(connection.get_profiling_information("json")))
         return rows
 
     monkeypatch.setattr(native, "_execute_fragment_for_test", profiled)
@@ -1564,6 +1565,38 @@ def test_hash_domain_uses_declared_memory_to_reduce_collisions(tmp_path, partiti
             )
             assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
         assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("static_filter", [False, True])
+def test_hash_domain_filters_inside_parquet_scan(tmp_path, monkeypatch, threads, partitions, comparison, static_filter):
+    config = {
+        "threads": threads,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization",
+    }
+    with vane.connect(backend="local", config=config) as connection:
+        sql = budgeted_hash_filter_query(connection, tmp_path, comparison)
+        if static_filter:
+            sql += " where f.v<3"
+        expected = connection.execute(sql).fetchall()
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="hash-domain-parquet-scan",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=1 << 30),
+        )
+        assert any(b"bit_or" in f.native_plan for f in graph.fragments)
+        fact_plans = {
+            f.native_plan
+            for f in graph.fragments
+            if any(str(tmp_path / "fact.parquet").encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        assert fact_plans
+        scans = profile_fragment_scans(connection, monkeypatch, fact_plans)
+        assert execute_graph(connection, graph) == expected
+        assert scans
+        assert sum(s["operator_cardinality"] for s in scans) < 4096
 
 
 @pytest.mark.parametrize("partitions", [2, 3])

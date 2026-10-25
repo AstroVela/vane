@@ -108,7 +108,7 @@ void ContainsMask(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &mask = *expr.bind_info->Cast<MaskBindData>().mask;
 	auto &local = ExecuteFunctionState::GetFunctionState(state)->Cast<MaskLocalState>();
-	// SQL hash() also hashes NULL. The original correlated join retains its
+	// SQL hash() also hashes NULL. The original join retains its
 	// equality/NULL semantics; this is only a necessary membership condition.
 	VectorOperations::Hash(args.data[0], local.hashes, args.size());
 	UnaryExecutor::Execute<hash_t, bool>(local.hashes, result, args.size(),
