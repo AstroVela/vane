@@ -432,7 +432,7 @@ def test_committed_publication_and_inference_keep_resources(tmp_path, monkeypatc
         server = service._zmq_server
         handle = server._handle
 
-        async def pause_publication(identity, message, size, queue):
+        async def pause_publication(identity, message, size, queue, request_context):
             get = queue.get
 
             async def paused_get():
@@ -442,7 +442,7 @@ def test_committed_publication_and_inference_keep_resources(tmp_path, monkeypatc
                 return publication
 
             queue.get = paused_get
-            await handle(identity, message, size, queue)
+            await handle(identity, message, size, queue, request_context)
 
         if pause_at == "publication":
             monkeypatch.setattr(server, "_handle", pause_publication)
@@ -582,7 +582,7 @@ def test_publication_outside_reservation_wait_is_rejected(tmp_path, monkeypatch,
         server = service._zmq_server
         handle = server._handle
 
-        async def observe_publication_wait(identity, message, size, queue):
+        async def observe_publication_wait(identity, message, size, queue, request_context):
             get = queue.get
 
             async def observed_get():
@@ -593,7 +593,7 @@ def test_publication_outside_reservation_wait_is_rejected(tmp_path, monkeypatch,
                     raise
 
             queue.get = observed_get
-            await handle(identity, message, size, queue)
+            await handle(identity, message, size, queue, request_context)
 
         monkeypatch.setattr(server, "_handle", observe_publication_wait)
         peer = RawClient(root)
@@ -1361,7 +1361,9 @@ def test_model_reads_private_snapshot_after_publication(tmp_path, monkeypatch):
     async def run():
         entered, finish = asyncio.Event(), asyncio.Event()
 
-        async def infer(value):
+        async def infer(value, request_context):
+            assert request_context.encoding == "default" and request_context.model_contract is None
+            assert len(request_context.request_id) == 32
             entered.set()
             await finish.wait()
             np.testing.assert_equal(value.parts[0].value.frames, original.frames)
@@ -1557,12 +1559,12 @@ def test_shutdown_drains_accepted_request_before_closing_engine(tmp_path, monkey
             closing = asyncio.create_task(service.aclose())
             await asyncio.sleep(0.05)
             assert not closing.done() and service.credits.bytes == 10
-            assert service.runtime is not None
+            assert service.backend.runtime is not None
             finish.set()
             np.testing.assert_equal(await pending, [[3, 4]])
             await closing
             assert service.credits.bytes == service.credits.inflight == 0
-            assert service.runtime is None and not (root / "engine.json").exists()
+            assert service.backend.runtime is None and not (root / "engine.json").exists()
         finally:
             finish.set()
             await instance.aclose()
@@ -1584,7 +1586,7 @@ def test_failed_engine_close_keeps_runtime_for_shared_retry(tmp_path, monkeypatc
 
     async def run():
         await service.start()
-        runtime = service.runtime
+        runtime = service.backend.runtime
         engine = runtime.engine
         finish = asyncio.Event()
         attempts = 0
@@ -1602,7 +1604,7 @@ def test_failed_engine_close_keeps_runtime_for_shared_retry(tmp_path, monkeypatc
         try:
             with pytest.raises(failure):
                 await service.aclose()
-            assert service.runtime is runtime and runtime.engine is engine
+            assert service.backend.runtime is runtime and runtime.engine is engine
             assert not (root / "engine.json").exists()
             with pytest.raises(RuntimeError, match="already started"):
                 await service.start()
@@ -1613,7 +1615,7 @@ def test_failed_engine_close_keeps_runtime_for_shared_retry(tmp_path, monkeypatc
             assert attempts == 2 and all(not task.done() for task in pending)
             finish.set()
             await asyncio.gather(*pending)
-            assert service.runtime is None and engine.closed == 1
+            assert service.backend.runtime is None and engine.closed == 1
             assert len(sdk.engines) == 1
             await service.aclose()
             assert attempts == 2
@@ -1634,7 +1636,7 @@ def test_failed_transport_close_keeps_transport_and_engine_until_retry(tmp_path,
 
     async def run():
         await service.start()
-        runtime, server = service.runtime, service._zmq_server
+        runtime, server = service.backend.runtime, service._zmq_server
         engine = runtime.engine
         close = server.aclose
         attempts = 0
@@ -1650,10 +1652,10 @@ def test_failed_transport_close_keeps_transport_and_engine_until_retry(tmp_path,
         try:
             with pytest.raises(TimeoutError, match="transport shutdown"):
                 await service.aclose()
-            assert service._zmq_server is server and service.runtime is runtime
+            assert service._zmq_server is server and service.backend.runtime is runtime
             assert engine.closed == 0
             await service.aclose()
-            assert service._zmq_server is service.runtime is None
+            assert service._zmq_server is service.backend.runtime is None
             assert engine.closed == 1 and attempts == 2
             assert not (root / "engine.json").exists()
         finally:
@@ -1767,7 +1769,7 @@ def test_missing_zmq_does_not_affect_planning_and_cleans_failed_start(tmp_path, 
         with pytest.raises(ProviderImportError, match="embedding_service"):
             await service.start()
         assert not (root / "engine.json").exists()
-        assert service._zmq_server is None and service.runtime is None
+        assert service._zmq_server is None and service.backend.runtime is None
         instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda value: value)
         with pytest.raises(ProviderImportError, match="embedding_service"):
             await instance.embed_text(["query"])
@@ -1799,6 +1801,8 @@ class RawClient:
                 "request_id": self.request_id,
                 "parts": parts,
                 "nbytes": size,
+                "encoding": "default",
+                "model_contract": None,
             }
         )
 

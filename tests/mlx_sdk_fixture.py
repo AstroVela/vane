@@ -195,6 +195,22 @@ def media_sdk(monkeypatch, tmp_path):
         def __call__(self, **kwargs):
             state.processor_calls.append(kwargs)
             fail("processor")
+            if "images" in kwargs and "text" not in kwargs:
+                # Unary image uses the SDK's top-level text padding arguments.
+                # Retain that existing API while sharing this authored processor
+                # fixture with the service's full-media owner.
+                assert set(kwargs) == {"images", "images_kwargs", "return_tensors", "padding", "truncation"}
+                assert kwargs["images_kwargs"] == {"input_data_format": "channels_last"}
+                assert kwargs["return_tensors"] == "np" and kwargs["padding"] is True
+                assert kwargs["truncation"] is False
+                return state.change(
+                    self.joint_inputs(
+                        {
+                            "text": ["<|image|>"] * len(kwargs["images"]),
+                            "images": [[np.asarray(image) for image in row] for row in kwargs["images"]],
+                        }
+                    )
+                )
             assert kwargs["text_kwargs"] == {"padding": True, "truncation": False}
             assert kwargs["return_tensors"] == "np"
             if "text" in kwargs:

@@ -212,6 +212,48 @@ _SERVICE_EMBED_OPTIONS = frozenset(
     }
 )
 
+_MLX_SERVICE_OPTIONS = frozenset(
+    {
+        "runtime",
+        "service_path",
+        "service_id",
+        "timeout",
+        "max_concurrency_per_actor",
+        "revision",
+        "dtype",
+        "max_length",
+        "overlength",
+    }
+)
+
+
+def _mlx_embed_option_names(options: Mapping[str, Any], *, text: bool) -> frozenset[str]:
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    runtime = options.get("runtime", "native")
+    if runtime == "service":
+        return _MLX_SERVICE_OPTIONS | ({"input_type"} if text else set())
+    if runtime != "native":
+        raise EmbeddingConfigurationError("MLX runtime must be native or service")
+    return frozenset(_MLX_TEXT_DEFAULTS if text else _MLX_COMMON_DEFAULTS) | {"runtime"}
+
+
+def _validate_mlx_service_options(options: Mapping[str, Any], *, text: bool) -> dict[str, Any]:
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    copied = dict(options)
+    _reject_sensitive_embed_options(copied)
+    if copied.get("runtime") != "service" or copied.keys() - _mlx_embed_option_names(copied, text=text):
+        raise TypeError(
+            "MLX service accepts connection and encoding settings; place loading settings in the service config"
+        )
+    names = {"revision", "dtype", "max_length", "overlength"} | ({"input_type"} if text else set())
+    validator = _validate_mlx_text_options if text else _validate_mlx_multimodal_options
+    native = validator({key: value for key, value in copied.items() if key in names})
+    if native["revision"] != _MLX_COMMON_DEFAULTS["revision"]:
+        raise EmbeddingConfigurationError("MLX service requires the fixed checkpoint revision")
+    return copied | {key: native[key] for key in names}
+
 
 def _inference_embed_options(options: Mapping[str, Any]) -> frozenset[str]:
     runtime = options.get("runtime", "native")
@@ -373,6 +415,8 @@ def _validate_mlx_common_options(options: Mapping[str, Any]) -> dict[str, Any]:
     from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
     copied = dict(options)
+    if copied.pop("runtime", "native") != "native":
+        raise EmbeddingConfigurationError("MLX native encoders require runtime=native")
     _reject_sensitive_embed_options(copied)
     if copied.keys() - _MLX_COMMON_DEFAULTS.keys():
         raise TypeError("MLX media options accept only the declared common model encoding settings")
@@ -403,6 +447,8 @@ def _validate_mlx_text_options(options: Mapping[str, Any]) -> dict[str, Any]:
     from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
     copied = dict(options)
+    if copied.pop("runtime", "native") != "native":
+        raise EmbeddingConfigurationError("MLX native encoders require runtime=native")
     _reject_sensitive_embed_options(copied)
     if copied.keys() - _MLX_TEXT_DEFAULTS.keys():
         raise TypeError("MLX text options accept only the declared model encoding settings")
@@ -438,7 +484,7 @@ def validate_embed_options(
     options: Mapping[str, Any],
     *,
     relation: bool,
-    _input_kind: Literal["text", "image", "audio", "video"] = "text",
+    _input_kind: Literal["text", "image", "audio", "video", "multimodal"] = "text",
 ) -> dict[str, Any]:
     """Validate and copy the closed Embed options for one entry point."""
 
@@ -448,8 +494,8 @@ def validate_embed_options(
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
     if family in {"sglang", "vllm"}:
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
-    if family == "mlx" and _input_kind != "text":
-        allowed = _EMBED_COMMON_OPTIONS | _MLX_COMMON_DEFAULTS.keys()
+    if family == "mlx":
+        allowed = _EMBED_COMMON_OPTIONS | _mlx_embed_option_names(copied, text=_input_kind == "text")
     if family == "litert":
         allowed = _EMBED_COMMON_OPTIONS | litert_option_names(
             text=_input_kind == "text", service=copied.get("runtime") == "service"
@@ -488,18 +534,33 @@ def validate_embed_options(
     if family == "mlx":
         from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
-        actor_number = copied.get("actor_number")
-        if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
-            raise EmbeddingConfigurationError("MLX requires actor_number=1")
-        if copied.get("execution_backend") not in (None, "subprocess_actor"):
-            raise EmbeddingConfigurationError("MLX requires execution_backend='subprocess_actor'")
         if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
             raise EmbeddingConfigurationError("MLX does not support character chunk averaging")
-        defaults = _MLX_TEXT_DEFAULTS if _input_kind == "text" else _MLX_COMMON_DEFAULTS
-        validator = _validate_mlx_text_options if _input_kind == "text" else _validate_mlx_common_options
-        copied.update(validator({k: v for k, v in copied.items() if k in defaults}))
-        if actor_number is None:
-            copied.pop("actor_number", None)
+        if copied.get("runtime", "native") == "service":
+            names = _mlx_embed_option_names(copied, text=_input_kind == "text")
+            copied.update(
+                _validate_mlx_service_options(
+                    {k: v for k, v in copied.items() if k in names}, text=_input_kind == "text"
+                )
+            )
+        else:
+            actor_number = copied.get("actor_number")
+            if actor_number is not None and (type(actor_number) is not int or actor_number != 1):
+                raise EmbeddingConfigurationError("MLX requires actor_number=1")
+            if copied.get("execution_backend") not in (None, "subprocess_actor"):
+                raise EmbeddingConfigurationError("MLX requires execution_backend='subprocess_actor'")
+            defaults = _MLX_TEXT_DEFAULTS if _input_kind == "text" else _MLX_COMMON_DEFAULTS
+            validator = (
+                _validate_mlx_text_options
+                if _input_kind == "text"
+                else _validate_mlx_multimodal_options
+                if _input_kind == "multimodal"
+                else _validate_mlx_common_options
+            )
+            copied.update(validator({k: v for k, v in copied.items() if k in defaults}))
+            copied.pop("runtime", None)
+            if actor_number is None:
+                copied.pop("actor_number", None)
 
     if "normalize" in copied and not isinstance(copied["normalize"], bool):
         raise ValueError("Embed option 'normalize' must be a bool")
@@ -649,7 +710,7 @@ def validate_embed_image_options(
     if provider_family == "litert":
         allowed |= litert_option_names(text=False, service=options.get("runtime") == "service")
     if provider_family == "mlx":
-        allowed |= _MLX_COMMON_DEFAULTS.keys()
+        allowed |= _mlx_embed_option_names(options, text=False)
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -687,7 +748,7 @@ def validate_embed_audio_options(
     if provider_family == "litert":
         return validate_embed_options(provider_family, options, relation=relation, _input_kind="image")
     if provider_family == "mlx":
-        allowed |= _MLX_COMMON_DEFAULTS.keys()
+        allowed |= _mlx_embed_option_names(options, text=False)
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -711,7 +772,7 @@ def validate_embed_video_options(
     """Video providers cannot inherit text chunking or image loading policies."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "mlx":
-        allowed |= _MLX_COMMON_DEFAULTS.keys()
+        allowed |= _mlx_embed_option_names(options, text=False)
     if provider_family == "google":
         allowed |= {"max_concurrency_per_actor"}
     if provider_family == "transformers":
@@ -741,6 +802,14 @@ def validate_embed_video_options(
     return validate_embed_options(
         provider_family, options, relation=relation, _input_kind="video" if provider_family == "mlx" else "text"
     )
+
+
+def validate_embed_multimodal_options(
+    provider_family: str | None, options: Mapping[str, Any], *, relation: bool
+) -> dict[str, Any]:
+    if provider_family == "mlx":
+        return validate_embed_options(provider_family, options, relation=relation, _input_kind="multimodal")
+    return validate_embed_image_options(provider_family, options, relation=relation)
 
 
 _PROMPT_SHARED_PROVIDER_OPTIONS = frozenset({"temperature"})

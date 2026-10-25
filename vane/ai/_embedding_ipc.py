@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -16,8 +18,97 @@ from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, Embeddin
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 
-VERSION = 1
+VERSION = 2
 MAX_CONTROL_BYTES = 1024**2
+
+
+@dataclass(frozen=True)
+class ModelContract:
+    encoding_version: int
+    revision: str
+    dtype: str
+    max_length: int
+    overlength: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.encoding_version) is not int
+            or self.encoding_version != 1
+            or not isinstance(self.revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", self.revision) is None
+            or self.dtype != "bfloat16"
+            or type(self.max_length) is not int
+            or not 1 <= self.max_length <= 2048
+            or self.overlength != "error"
+        ):
+            raise EmbeddingConfigurationError("Invalid embedding model contract")
+
+    def to_wire(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LiteRTEncoding:
+    model_sha256: str
+    max_length: int
+    vision_tokens_per_image: int
+    input_type: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.model_sha256) is None
+            or type(self.max_length) is not int
+            or self.max_length not in (128, 256, 512, 1024, 2048, 8192)
+            or type(self.vision_tokens_per_image) is not int
+            or self.vision_tokens_per_image not in (70, 140)
+            or not isinstance(self.input_type, str)
+            or self.input_type not in {"query", "document"}
+        ):
+            raise EmbeddingConfigurationError("Invalid LiteRT service encoding")
+
+    def to_wire(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    encoding: str = "default"
+    model_contract: ModelContract | None = None
+    request_id: str | None = None
+    litert: LiteRTEncoding | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.encoding, str) or self.encoding not in {
+            "default",
+            "text_document",
+            "text_query",
+            "image",
+            "video",
+            "audio",
+            "multimodal",
+        }:
+            raise EmbeddingConfigurationError("Invalid embedding request encoding")
+        if self.request_id is not None and (
+            not isinstance(self.request_id, str) or re.fullmatch(r"[0-9a-f]{32}", self.request_id) is None
+        ):
+            raise EmbeddingConfigurationError("Invalid embedding request identity")
+
+    @classmethod
+    def from_wire(cls, message: dict[str, Any]) -> RequestContext:
+        value = message["model_contract"]
+        if value is not None:
+            fields = {"encoding_version", "revision", "dtype", "max_length", "overlength"}
+            if not isinstance(value, dict) or set(value) != fields:
+                raise EmbeddingConfigurationError("Invalid embedding model contract fields")
+            value = ModelContract(**value)
+        encoding = message["encoding"]
+        if isinstance(encoding, dict):
+            fields = {"model_sha256", "max_length", "vision_tokens_per_image", "input_type"}
+            if set(encoding) != fields or value is not None:
+                raise EmbeddingConfigurationError("Invalid LiteRT service encoding fields")
+            return cls("default", None, message.get("request_id"), LiteRTEncoding(**encoding))
+        return cls(encoding, value, message.get("request_id"))
 
 
 def input_spec(options: dict[str, Any]) -> MultimodalInputSpec:
@@ -207,6 +298,7 @@ def validate_layout(parts: Any, size: Any, spec: MultimodalInputSpec) -> int:
                 type(part["sample_rate"]) is not int
                 or part["sample_rate"] != spec.audio.sample_rate
                 or buffers[0]["shape"][0] > spec.audio.max_samples
+                or buffers[0]["nbytes"] > spec.audio.max_input_bytes
             ):
                 raise EmbeddingConfigurationError("Invalid audio sample rate or length")
     if offset != size:
