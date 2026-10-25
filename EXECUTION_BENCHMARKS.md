@@ -3729,3 +3729,111 @@ hashes and cleanup manifests. Run-owned temporary data, spill, oracle IPCs and
 duplicate installed baseline are removed after validation and process shutdown;
 source inputs are preserved. Native domain cost estimates and the dense-mask
 payload bound do not bound total process RSS. No SF100 FTE timing claim is made.
+
+## SF100 complete groups from co-located Parquet ranges (2026-10-26)
+
+Q18's first aggregation still exported about 150 million partial states to a
+second aggregation before HAVING could discard nearly all groups. Fresh native
+profiles confirm the main source returned a mean of 150,009,075 state rows per
+execution. The native source files have overlapping row-group ranges, so the
+previous proof could not treat individual splits as complete groups.
+
+The 628 row groups across 144 lineitem files form four connected components of
+overlapping order-key intervals, with about 150 million input rows each. Those
+components are disjoint from one another. The compiler can now assign every
+split in a component to the same query partition and perform complete native
+aggregation and HAVING there. Two candidate native profiles confirm that the
+main source returns **6,398 qualifying keys**, preserving all 600,037,902 input
+rows while eliminating the 150-million-row aggregate-state exchange and merge.
+Profiles are separate diagnostics; their elapsed operator timers can include
+lock waits and are not OS CPU measurements or primary latency samples.
+
+This is a general footer-based proof. The given integral grouping key must have
+known non-null min/max bounds in the exact splits. Schema mappings and key
+transforms still need the existing exact/injective proof. Connected components
+include equality at a boundary and nested/transitive overlaps. Greedy assignment
+requires at least one component per partition and at most 25% estimated row
+imbalance relative to the mean. Row counts guide balance; only the interval
+proof establishes group completeness. Missing statistics, NULLs, unsafe casts,
+sampling or insufficient/badly skewed components do not acquire this placement.
+
+SourceSpec carries an explicit immutable split-to-partition map. Native
+serialization and the Python plan preserve it, and Pipeline, FTE and in-process
+execution use the same assignment method. Native loading rejects mixed or
+incomplete nonempty ownership buckets. Repeated file references keep their
+multiplicity and co-locate their overlapping keys. The existing native identity
+and source-version checks remain enforced. No query/table-specific rule,
+additional scan, runtime filter or Local fallback is introduced.
+
+Controlled result relative to preceding head `5115859656`:
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q18 | 7.186 s | 15.440 s | 8.360 s | -45.85% | 1.16× |
+
+Each cell is the median of four steady samples. Each process also retains its
+first SQL execution, excluded from medians. Baseline phases bracket candidate
+Local/Pipeline and Pipeline/Local phases; phase-median drift is
++0.19%. Steady ranges are Local
+7.139–7.340 s, baseline Pipeline
+15.282–15.540 s and candidate
+8.260–8.542 s.
+
+Separate diagnostic runs measure mean summed two-worker CPU of
+**395.255 → 252.180 CPU seconds
+(-36.20%)**, two executions per variant. Diagnostic wall
+times are excluded from the latency table. This selected Q18 improvement does
+not refresh the full-22-query score or establish SF100 FTE performance.
+
+All 22 serialized graphs were compared offline, normalizing only their native
+engine identities. Only Q18 changes, from 14 to 13 fragments; the other 21 are
+identical. Regression screens have one steady sample per variant, so they
+establish no small performance gain:
+
+| Query | Pipeline before | Pipeline now |
+| --- | ---: | ---: |
+| Q4 | 4.340 s | 4.322 s |
+| Q10 | 8.441 s | 8.502 s |
+| Q12 | 3.899 s | 3.938 s |
+
+Validation on the final installed Release binary:
+
+- **1041 distinct related tests passed**:
+  242 performance/domain/lifecycle,
+  555 compiler/Parquet/native join-filter,
+  217 submission/placement contracts, and
+  27 real-Ray. Tests cover overlapping/repeated files,
+  multi-file HAVING, explicit assignment round trips and malformed/partial
+  bucket rejection, skew and insufficient components, NULL/missing statistics,
+  key transformations, DISTINCT/ordered/wide aggregates, bounded channels,
+  source assignment preservation and FTE worker retry. No full/GPU suite.
+- **37 final SF100 executions matched Local**: 18 Q18 timing queries,
+  12 Q4/Q10/Q12 regression screens, three Local oracle preparations and four
+  separate CPU diagnostics. Earlier operator profiles and prototype timings
+  are retained separately and excluded from this count.
+- Same original SQL and 307 Parquet inputs/37.5033 GiB. Local uses
+  36 threads/32 GiB; Pipeline uses two workers at 18 threads/16 GiB each,
+  128/256 MiB exchange/staging budgets, 64 KiB/2,048-row frames,
+  1 MiB/16-slot windows and a 1 GiB Ray object store.
+- Intended Python changes are limited to compiler/source plan and assignment
+  code; their frozen hashes are validated separately. Remaining configuration,
+  packages, SQL and input identities match. All diagnostic native probes are
+  removed from the final binary.
+- The host is shared and OS caches are retained. No task-owned build/test or
+  profiling overlaps primary timing. Owned BE/HDFS services are stopped;
+  the owned FE is suspended with SIGSTOP to retain its inotify registration,
+  then resumed after the comparison. Both variants use the same policy.
+  All services are verified healthy afterward with file and Parquet page
+  caches disabled. Earlier diagnostic service-restoration failures due to
+  exhausted host inotify watches and a transient port collision are retained
+  in harness logs; no global host setting or unrelated process was changed.
+
+Source `1ad860bac1f7e4613b8c39c7095ee86c72f7b576`, package 0.3.0.dev124, native
+SHA-256 `97772ed832be74ac882648b0a38e2c852a18e3adfc7c488c10fb930571618228`. Baseline native SHA-256
+`080c06c98d3dda4635b2c3ba155e8d2cc618dd9228cf24b40d9360e9e20fdb7b`. Evidence in `build/pipeline-sf100-q18-aggregation-20261025/`
+retains raw samples, `audit.json`, CSV summaries, profile row counts, frozen
+code/configuration/SQL/input identities, output counts/hashes, JUnit records
+and cleanup manifests. Owned test data, spill, oracle IPCs and duplicate
+baseline are removed after validation and process shutdown. Source inputs are
+preserved. Configured native memory and footer row estimates are not peak-RSS
+guarantees.
