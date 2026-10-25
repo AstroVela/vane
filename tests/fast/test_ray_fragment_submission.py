@@ -5205,11 +5205,9 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
     request = create_calls[0][1]
     assert request["worker_runtime"] == "fte"
     assert request["fragment_plan"] is None
-    assert request["fragment_registration_result"].future().result() == {
-        "registered": 1,
-        "existing": 0,
-        "total": 1,
-    }
+    # The synchronous fake has already completed this worker's registration.
+    # Only a pending registration belongs in the task's dependency slot.
+    assert request["fragment_registration_result"] is None
     assert "scan_split_batch:7" not in request["context"]
     assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
@@ -10309,7 +10307,8 @@ def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
     assert kill_calls == []
 
 
-def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch):
+@pytest.mark.parametrize("transient_prepare", [False, True], ids=["direct-prepare", "unavailable-then-prepare"])
+def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch, transient_prepare):
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -10319,7 +10318,14 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
     quiescence_started = threading.Event()
 
     class _DeferredPrepare:
+        unavailable_sent = False
+
         def remote(self):
+            if transient_prepare and not self.unavailable_sent:
+                self.unavailable_sent = True
+                unavailable = Future()
+                unavailable.set_exception(ray.exceptions.ActorUnavailableError("node unavailable", b"\0" * 16))
+                return SimpleNamespace(future=lambda: unavailable)
             quiescence_started.set()
             return SimpleNamespace(future=lambda: quiescence)
 

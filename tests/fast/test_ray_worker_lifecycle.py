@@ -132,6 +132,90 @@ def test_failed_worker_prepare_does_not_publish_failure_recursively(monkeypatch)
     assert events == ["prepare-rpc", "prepare-resolved"]
 
 
+@pytest.mark.parametrize("terminal", [False, True], ids=["prepare-ack", "confirmed-death"])
+def test_unavailable_worker_prepare_waits_for_ack_or_confirmed_death(monkeypatch, terminal):
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
+
+    ray = lifecycle_module.ray
+    events = []
+    lifecycle = _lifecycle(SimpleNamespace(prepare_shutdown=_RemoteMethod(events, object(), "prepare")))
+    calls = []
+    elapsed = [0.0]
+    monkeypatch.setattr(
+        lifecycle_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed[0], sleep=lambda delay: elapsed.__setitem__(0, elapsed[0] + delay)),
+    )
+
+    def resolve(_ref, **options):
+        calls.append(options)
+        if len(calls) == 1:
+            raise ray.exceptions.ActorUnavailableError("node unavailable", b"\0" * 16)
+        if terminal:
+            raise ray.exceptions.ActorDiedError()
+
+    monkeypatch.setattr(lifecycle_module, "resolve_object_refs_blocking", resolve)
+    if terminal:
+        with pytest.raises(ray.exceptions.ActorDiedError):
+            lifecycle.prepare_failed_worker_shutdown()
+    else:
+        lifecycle.prepare_failed_worker_shutdown()
+    assert events == ["prepare", "prepare"]
+    assert [entry["timeout"] for entry in calls] == [30, 29.9]
+    assert all(entry["honor_query_deadline"] is False for entry in calls)
+
+
+def test_unavailable_worker_prepare_does_not_extend_its_deadline(monkeypatch):
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
+
+    events = []
+    lifecycle = _lifecycle(SimpleNamespace(prepare_shutdown=_RemoteMethod(events, object(), "prepare")))
+    elapsed = [0.0]
+    monkeypatch.setattr(
+        lifecycle_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed[0], sleep=lambda delay: elapsed.__setitem__(0, elapsed[0] + delay)),
+    )
+    unavailable = lifecycle_module.ray.exceptions.ActorUnavailableError("node remains unavailable", b"\0" * 16)
+
+    def resolve(_ref, **_options):
+        elapsed[0] += 29.95
+        raise unavailable
+
+    monkeypatch.setattr(lifecycle_module, "resolve_object_refs_blocking", resolve)
+    with pytest.raises(type(unavailable)) as caught:
+        lifecycle.prepare_failed_worker_shutdown()
+    assert caught.value is unavailable
+    assert events == ["prepare"]
+    assert elapsed[0] == 30
+
+
+@pytest.mark.parametrize("kind", ["application", "timeout", "nested-unavailable"])
+def test_worker_prepare_does_not_retry_unconfirmed_application_or_timeout_errors(monkeypatch, kind):
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
+
+    ray = lifecycle_module.ray
+    events = []
+    lifecycle = _lifecycle(SimpleNamespace(prepare_shutdown=_RemoteMethod(events, object(), "prepare")))
+    if kind == "nested-unavailable":
+        cause = ray.exceptions.ActorUnavailableError("child actor unavailable", b"\0" * 16)
+        error = ray.exceptions.RayTaskError("prepare_shutdown", "child failed", cause).as_instanceof_cause()
+    else:
+        error = TimeoutError("barrier timed out") if kind == "timeout" else RuntimeError("barrier failed")
+
+    def fail(_ref, **_options):
+        raise error
+
+    def forbidden(_delay):
+        raise AssertionError("An unconfirmed application failure must fail closed without another RPC")
+
+    monkeypatch.setattr(lifecycle_module, "resolve_object_refs_blocking", fail)
+    monkeypatch.setattr(lifecycle_module, "time", SimpleNamespace(monotonic=lambda: 0, sleep=forbidden))
+    with pytest.raises(type(error)) as caught:
+        lifecycle.prepare_failed_worker_shutdown()
+    assert caught.value is error and events == ["prepare"]
+
+
 def test_query_close_interrupts_only_owned_native_cursors():
     from vane.runners.ray import worker as worker_module
 

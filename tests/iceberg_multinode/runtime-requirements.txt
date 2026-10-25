@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+PyYAML==6.0.3
+attrs==26.1.0
+botocore==1.43.62
+certifi==2026.10.19
+charset-normalizer==3.4.9
+click==8.4.2
+cloudpickle==3.1.2
+filelock==4.2.1
+idna==3.18
+jmespath==1.1.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+msgpack==1.2.1
+numpy==2.5.1
+packaging==26.3
+protobuf==7.35.1
+psutil==7.2.2
+pyarrow==25.0.0
+pyelftools==0.33
+python-dateutil==2.9.0.post0
+ray==2.59.0
+referencing==0.37.0
+requests==2.34.2
+rpds-py==2026.6.3
+six==1.17.0
+typing_extensions==4.16.0
+urllib3==2.8.0
