@@ -45,6 +45,8 @@ def test_asr_rebases_times_resamples_and_caches_worker_model(monkeypatch, tmp_pa
         def transcribe(self, samples, **kwargs):
             assert samples.shape == (16000,)
             assert kwargs["temperature"] == 0.0
+            assert kwargs["vad_filter"] is True
+            assert kwargs["vad_parameters"] == {"speech_pad_ms": 800}
             return iter([SimpleNamespace(start=0.2, end=0.6, text="你好")]), None
 
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Whisper))
@@ -55,6 +57,64 @@ def test_asr_rebases_times_resamples_and_caches_worker_model(monkeypatch, tmp_pa
     assert calls == [{"device": "cpu", "compute_type": "int8", "local_files_only": True}]
     adapter.close()
     assert adapter._runtime is None
+
+
+@pytest.mark.parametrize("vad_filter, padding", [(True, 0), (True, 1200), (False, 400)])
+def test_asr_speech_detection_is_explicit_and_silence_can_be_empty(monkeypatch, tmp_path, vad_filter, padding):
+    for name in ("model.bin", "config.json", "tokenizer.json"):
+        (tmp_path / name).write_bytes(b"fixture")
+    calls = []
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            calls.append("load")
+
+        def transcribe(self, samples, **kwargs):
+            assert kwargs["vad_filter"] is vad_filter
+            assert kwargs["vad_parameters"] == {"speech_pad_ms": padding}
+            if kwargs["vad_filter"] and not samples.any():
+                return iter(()), None
+            return iter([SimpleNamespace(start=0.1, end=0.8, text="speech")]), None
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Whisper))
+    adapter = models.FasterWhisperASR(str(tmp_path), vad_filter=vad_filter, vad_speech_pad_ms=padding)
+    content = audio()
+    expected = [] if vad_filter else [TimedContent(10.1, 10.8, "speech")]
+    assert adapter(MediaWindow(10, 11), content) == expected
+    assert not content[0].value.samples.any()
+    spoken = [TimedContent(20, 21, AudioClip(samples=np.full((16000, 1), 0.2, np.float32), sample_rate=16000))]
+    assert adapter(MediaWindow(20, 21), spoken) == [TimedContent(20.1, 20.8, "speech")]
+    assert calls == ["load"]
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false", np.bool_(True)])
+def test_asr_rejects_nonboolean_vad_before_loading_sdk(tmp_path, invalid):
+    with pytest.raises(ValueError, match="vad_filter must be a bool"):
+        models.FasterWhisperASR(str(tmp_path), vad_filter=invalid)
+
+
+@pytest.mark.parametrize("invalid", [None, -1, 1.0, True, "800"])
+def test_asr_rejects_invalid_speech_padding_before_loading_sdk(tmp_path, invalid):
+    with pytest.raises(ValueError, match="vad_speech_pad_ms must be a nonnegative int"):
+        models.FasterWhisperASR(str(tmp_path), vad_speech_pad_ms=invalid)
+
+
+@pytest.mark.parametrize("error", [MemoryError("VAD resource failure"), RuntimeError("VAD execution failure")])
+def test_asr_vad_errors_remain_errors(monkeypatch, tmp_path, error):
+    for name in ("model.bin", "config.json", "tokenizer.json"):
+        (tmp_path / name).write_bytes(b"fixture")
+
+    class Whisper:
+        def __init__(self, path, **kwargs):
+            pass
+
+        def transcribe(self, samples, **kwargs):
+            assert kwargs["vad_filter"] is True
+            raise error
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Whisper))
+    with pytest.raises(type(error), match="VAD"):
+        models.FasterWhisperASR(str(tmp_path))(MediaWindow(10, 11), audio())
 
 
 def test_rapidocr_uses_local_models_and_rgb_conversion(monkeypatch, tmp_path):

@@ -107,13 +107,34 @@ def _png(frame: np.ndarray) -> bytes:
 
 
 class FasterWhisperASR:
-    """Local faster-whisper, with segment times rebased to the asset timeline."""
+    """Local faster-whisper with VAD enabled and times on the asset timeline.
 
-    def __init__(self, model: str, *, device: str = "cpu", compute_type: str = "int8", language: str | None = None):
+    ``vad_filter=False`` explicitly transcribes without speech detection. VAD
+    only filters the transcription input; it does not replace original sound.
+    ``vad_speech_pad_ms`` keeps context around detected speech, including quiet
+    word onsets that precede the detector's boundary.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        device: str = "cpu",
+        compute_type: str = "int8",
+        language: str | None = None,
+        vad_filter: bool = True,
+        vad_speech_pad_ms: int = 800,
+    ):
         self.model = _local_path(model)
         if device not in {"cpu", "cuda"} or compute_type not in {"int8", "float16", "float32", "int8_float16"}:
             raise ValueError("Select an explicit CPU/CUDA device and compute_type")
+        if not isinstance(vad_filter, bool):
+            raise ValueError("vad_filter must be a bool")
+        if type(vad_speech_pad_ms) is not int or vad_speech_pad_ms < 0:
+            raise ValueError("vad_speech_pad_ms must be a nonnegative int")
         self.device, self.compute_type, self.language = device, compute_type, language
+        self.vad_filter = vad_filter
+        self.vad_speech_pad_ms = vad_speech_pad_ms
         self._runtime: WhisperModel | None = None
 
     def identity(self) -> dict[str, str]:
@@ -138,7 +159,8 @@ class FasterWhisperASR:
                 language=self.language,
                 temperature=0.0,
                 condition_on_previous_text=False,
-                vad_filter=False,
+                vad_filter=self.vad_filter,
+                vad_parameters={"speech_pad_ms": self.vad_speech_pad_ms},
             )
             for segment in segments:
                 text = _segment(item, segment.start, segment.end, segment.text)
