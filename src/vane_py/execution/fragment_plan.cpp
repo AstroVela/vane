@@ -168,6 +168,9 @@ void SourceSpec::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(4, "codec", codec);
 	serializer.WriteProperty(5, "splits", splits);
 	serializer.WriteProperty(6, "requires_snapshot", requires_snapshot);
+	if (!split_partitions.empty()) {
+		serializer.WriteProperty(7, "split_partitions", split_partitions);
+	}
 }
 
 SourceSpec SourceSpec::Deserialize(Deserializer &deserializer) {
@@ -178,8 +181,14 @@ SourceSpec SourceSpec::Deserialize(Deserializer &deserializer) {
 	result.codec = deserializer.ReadProperty<string>(4, "codec");
 	result.splits = deserializer.ReadProperty<vector<DistributedScanSplit>>(5, "splits");
 	result.requires_snapshot = deserializer.ReadProperty<bool>(6, "requires_snapshot");
+	result.split_partitions = deserializer.ReadPropertyWithDefault<vector<idx_t>>(7, "split_partitions");
 	if (result.source_id.empty() || result.capability.empty() || result.codec.empty()) {
 		throw SerializationException("empty fragment source identity");
+	}
+	if (!result.split_partitions.empty() &&
+	    (result.split_partitions.size() != result.splits.size() ||
+	     (result.function_name != "read_parquet" && result.function_name != "parquet_scan"))) {
+		throw SerializationException("split partition assignment must cover every source split");
 	}
 	std::set<string> ids;
 	for (auto &split : result.splits) {
@@ -275,6 +284,18 @@ FragmentSpec FragmentSpec::Deserialize(const string &payload) {
 	CheckPartitions(result.partition_count);
 	if (result.fragment_id.empty() || result.names.size() != result.root.types.size()) {
 		throw SerializationException("invalid fragment identity or result names");
+	}
+	for (auto &source : result.sources) {
+		for (auto partition : source.split_partitions) {
+			if (partition >= result.partition_count) {
+				throw SerializationException("source split partition is out of range");
+			}
+		}
+	}
+	for (auto &source : result.source_dependencies) {
+		if (!source.split_partitions.empty()) {
+			throw SerializationException("source dependency cannot declare partition assignments");
+		}
 	}
 	return result;
 }
@@ -1962,7 +1983,7 @@ private:
 		}
 		return true;
 	}
-	bool CompleteParquetGroups(PhysicalOperator &input, const DistributedSubtree &child,
+	bool CompleteParquetGroups(PhysicalOperator &input, DistributedSubtree &child,
 	                           const vector<unique_ptr<Expression>> &groups) {
 		if (!child.local_scan || child.fragment.sources.size() != 1) {
 			return false;
@@ -2016,9 +2037,12 @@ private:
 				splits.push_back(DecodeFile(split.payload));
 			}
 			pair<Value, Value> bounds;
-			if (ParquetSplitRangesDisjoint(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
-			                               &bounds) &&
+			vector<idx_t> assignment;
+			if (PlanParquetGroupPartitions(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
+			                               child.fragment.partition_count, assignment, &bounds) &&
+			    (assignment.empty() || !scan.extra_info.sample_options) &&
 			    InjectiveGroupKey(std::move(bounds), transforms)) {
+				child.fragment.sources[0].split_partitions = std::move(assignment);
 				return true;
 			}
 		}
@@ -2562,12 +2586,24 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		}
 		vector<DistributedScanSplit> selected;
 		std::set<string> selected_ids;
+		optional_idx owner;
 		for (auto &id : assignment->second) {
 			auto found = known.find(id);
 			if (found == known.end() || !selected_ids.insert(id).second) {
 				throw InvalidInputException("unknown or duplicate assigned split %s", id);
 			}
+			if (!spec.split_partitions.empty()) {
+				auto partition = spec.split_partitions[idx_t(found->second - spec.splits.data())];
+				if (!parquet || (owner.IsValid() && owner.GetIndex() != partition)) {
+					throw InvalidInputException("owned Parquet splits must belong to one complete partition");
+				}
+				owner = partition;
+			}
 			selected.push_back(*found->second);
+		}
+		if (owner.IsValid() && idx_t(std::count(spec.split_partitions.begin(), spec.split_partitions.end(),
+		                                        owner.GetIndex())) != selected.size()) {
+			throw InvalidInputException("owned Parquet splits must cover the complete partition");
 		}
 		if (parquet) {
 			vector<OpenFileInfo> files;

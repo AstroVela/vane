@@ -19,10 +19,12 @@ DUCKDB_API vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, Mul
 // Cost joins from their row counts, respecting explicit cardinality overrides.
 DUCKDB_API idx_t ParquetScanCardinality(ClientContext &context, const MultiFileBindData &bind);
 
-// True only when the given integral column has known, non-null, disjoint ranges
-// across these exact splits. Every group containing this key is then complete
-// within one split, regardless of which worker receives it.
-DUCKDB_API bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
-                                           const vector<OpenFileInfo> &splits, idx_t column,
+// Prove complete groups from known non-null integral ranges. Disjoint splits
+// need no assignment constraint. Otherwise, co-locate each connected component
+// of overlapping ranges, provided all partitions can receive balanced work.
+// A nonempty assignment is authoritative and covers every split.
+DUCKDB_API bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind,
+                                           const vector<OpenFileInfo> &splits, idx_t column, idx_t partitions,
+                                           vector<idx_t> &assignment,
                                            optional_ptr<pair<Value, Value>> bounds = nullptr);
 } // namespace duckdb

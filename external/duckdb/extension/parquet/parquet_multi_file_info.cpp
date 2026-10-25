@@ -302,8 +302,10 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 	return result;
 }
 
-bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
-                                idx_t column, optional_ptr<pair<Value, Value>> bounds) {
+bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
+                                idx_t column, idx_t partitions, vector<idx_t> &assignment,
+                                optional_ptr<pair<Value, Value>> bounds) {
+	assignment.clear();
 	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
 	// Schema mappings, virtual columns and casts require a separate proof. In
 	// particular, comparing file statistics before a lossy cast is not sufficient.
@@ -312,8 +314,15 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 	    !bind.reader_bind.schema.empty()) {
 		return false;
 	}
-	vector<pair<Value, Value>> ranges;
-	for (auto &split : splits) {
+	struct KeyRange {
+		Value lower;
+		Value upper;
+		idx_t split;
+		double rows;
+	};
+	vector<KeyRange> ranges;
+	for (idx_t split_index = 0; split_index < splits.size(); split_index++) {
+		auto &split = splits[split_index];
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
@@ -337,6 +346,7 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			}
 		}
 		Value lower, upper;
+		double rows = 0;
 		auto &metadata = *reader.GetFileMetadata();
 		for (auto group : groups) {
 			if (group >= metadata.row_groups.size()) {
@@ -346,6 +356,7 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			if (row_group.num_rows == 0) {
 				continue;
 			}
+			rows += double(row_group.num_rows);
 			auto stats = schema->Stats(metadata, options, group, row_group.columns);
 			// NULL is one SQL group too, even when non-null ranges are disjoint.
 			if (!stats || stats->CanHaveNull() || !NumericStats::HasMinMax(*stats)) {
@@ -364,20 +375,66 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			}
 		}
 		if (!lower.IsNull()) {
-			ranges.emplace_back(std::move(lower), std::move(upper));
+			ranges.push_back({std::move(lower), std::move(upper), split_index, rows});
 		}
 	}
-	std::sort(ranges.begin(), ranges.end(),
-	          [](const pair<Value, Value> &a, const pair<Value, Value> &b) { return a.first < b.first; });
+	std::sort(ranges.begin(), ranges.end(), [](const KeyRange &a, const KeyRange &b) { return a.lower < b.lower; });
+	bool disjoint = true;
 	for (idx_t i = 1; i < ranges.size(); i++) {
 		// Equality at a boundary means a group may span both splits.
-		if (ranges[i - 1].second >= ranges[i].first) {
-			return false;
+		if (ranges[i - 1].upper >= ranges[i].lower) {
+			disjoint = false;
+			break;
 		}
 	}
-	if (bounds && !ranges.empty()) {
-		*bounds = {ranges.front().first, ranges.back().second};
+	if (ranges.empty()) {
+		return true;
 	}
+	struct Component {
+		Value upper;
+		double rows;
+		vector<idx_t> splits;
+	};
+	vector<Component> components;
+	for (auto &range : ranges) {
+		if (components.empty() || components.back().upper < range.lower) {
+			components.push_back({range.upper, 0, {}});
+		}
+		auto &component = components.back();
+		if (component.upper < range.upper) {
+			component.upper = range.upper;
+		}
+		component.rows += range.rows;
+		component.splits.push_back(range.split);
+	}
+	if (bounds) {
+		*bounds = {ranges.front().lower, components.back().upper};
+	}
+	if (disjoint) {
+		return true;
+	}
+	if (partitions <= 1 || components.size() < partitions) {
+		return false;
+	}
+	std::stable_sort(components.begin(), components.end(),
+	                 [](const Component &a, const Component &b) { return a.rows > b.rows; });
+	vector<double> loads(partitions, 0);
+	vector<idx_t> planned(splits.size(), 0);
+	double total_rows = 0;
+	for (auto &component : components) {
+		auto owner = idx_t(std::min_element(loads.begin(), loads.end()) - loads.begin());
+		loads[owner] += component.rows;
+		total_rows += component.rows;
+		for (auto split : component.splits) {
+			planned[split] = owner;
+		}
+	}
+	// Saving a merge must not concentrate the source on a few workers. Rows
+	// estimate the balance only; the interval proof establishes completeness.
+	if (*std::max_element(loads.begin(), loads.end()) * double(partitions) > total_rows * 1.25) {
+		return false;
+	}
+	assignment = std::move(planned);
 	return true;
 }
 

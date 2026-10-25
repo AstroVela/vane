@@ -44,7 +44,11 @@ from tests.fast.test_execution_performance import (
 from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source, large_join_key_query
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
 from tests.fast.test_join_build_filter import shared_join_build_query
-from tests.fast.test_parquet_aggregate_partitioning import broadcast_aggregate_query, disjoint_aggregate_query
+from tests.fast.test_parquet_aggregate_partitioning import (
+    broadcast_aggregate_query,
+    disjoint_aggregate_query,
+    overlapping_components_query,
+)
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -335,7 +339,8 @@ def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
-def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("layout", ["disjoint", "overlap"])
+def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, monkeypatch, mode, layout):
     import ray
 
     from vane.execution.recovery_runtime import RecoveryScheduler
@@ -353,7 +358,7 @@ def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, 
 
     if mode == "fte_retry":
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
-    sql = disjoint_aggregate_query(tmp_path)
+    sql = disjoint_aggregate_query(tmp_path) if layout == "disjoint" else overlapping_components_query(tmp_path)
     with (
         vane.connect(backend="local", config={"threads": 1}) as local,
         vane.Runtime(resources(tmp_path)) as application,
@@ -364,6 +369,9 @@ def test_complete_parquet_groups_preserve_source_assignments_on_retry(tmp_path, 
             scheduler = result.context._reader
             assert result.collect().to_pylist() == expected
             assert all(e.distribution.value == "gather" for e in scheduler.spec.graph.exchanges)
+            assert any(s.split_partitions for f in scheduler.spec.graph.fragments for s in f.sources) == (
+                layout == "overlap"
+            )
             if mode == "fte_retry":
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]

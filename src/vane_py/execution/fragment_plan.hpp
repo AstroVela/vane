@@ -21,6 +21,8 @@ struct SourceSpec {
 	string capability;
 	string codec;
 	vector<DistributedScanSplit> splits;
+	// Nonempty only when complete groups require co-locating split ranges.
+	vector<idx_t> split_partitions;
 	bool requires_snapshot = false;
 	void Serialize(Serializer &serializer) const;
 	static SourceSpec Deserialize(Deserializer &deserializer);

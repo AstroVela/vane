@@ -4,6 +4,7 @@
 """Complete groups proven from the exact Parquet split ranges."""
 
 from collections import Counter
+from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -14,6 +15,7 @@ from tests.fast.test_direct_exchange import collect, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 from vane.execution.plan import Distribution
+from vane.execution.plan import FragmentGraph, SourceSpec
 
 
 def disjoint_aggregate_query(directory, variant="disjoint"):
@@ -53,6 +55,115 @@ def disjoint_aggregate_query(directory, variant="disjoint"):
         f"select k, sum(v::decimal(15,2)) s, count(*) n from ({source}) "
         "group by k having sum(v::decimal(15,2)) > 300 order by k nulls last"
     )
+
+
+def overlapping_components_query(directory, variant="overlap"):
+    for component in range(6):
+        offset = component * 10**15 if variant != "one_component" else 0
+        count = 16384 * (12 if variant == "skewed" and component == 0 else 1)
+        for copy in range(2):
+            keys = [offset + i % 2048 for i in range(count)]
+            if variant == "nulls" and component == copy == 0:
+                keys[0] = None
+            table = pa.table(
+                {"k": pa.array(keys, type=pa.int64()), "v": [25 if i % 1024 == 0 else 1 for i in range(count)]}
+            )
+            pq.write_table(
+                table,
+                directory / f"component-{component}-{copy}.parquet",
+                row_group_size=2048,
+                write_statistics=variant != "missing_stats" or component != 0,
+            )
+    files = str(directory / "component-*.parquet")
+    source = f"['{files}', '{files}']" if variant == "repeated" else f"'{files}'"
+    key = {"computed": "k%2", "cast": "k::double"}.get(variant, "k")
+    return (
+        f"select {key} k, sum(v) s, count(*) n from read_parquet({source}) "
+        f"group by {key} having sum(v)>300 order by k nulls last"
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("threads", [1, 4])
+def test_overlapping_components_aggregate_before_exchange(tmp_path, partitions, threads):
+    sql = overlapping_components_query(tmp_path)
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        assert len(expected) == 12 and all(row[1:] == (400, 16) for row in expected)
+        graph = compile_sql(connection, sql, partitions)
+        assert all(edge.distribution is Distribution.GATHER for edge in graph.exchanges)
+        assert execute_graph(connection, graph) == expected
+        limits = DirectExchangeLimits(4096, 2048, 32, 2)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=partitions), limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert sum(c.snapshot()["accepted_rows"] for c in service.channels.values()) == 2 * len(expected)
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize(
+    "variant,complete",
+    [
+        ("repeated", True),
+        ("nulls", False),
+        ("missing_stats", False),
+        ("skewed", False),
+        ("one_component", False),
+        ("computed", False),
+        ("cast", False),
+    ],
+)
+def test_component_assignment_requires_complete_balanced_key_ranges(tmp_path, variant, complete):
+    sql = overlapping_components_query(tmp_path, variant)
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 2)
+        assert execute_graph(connection, graph) == expected
+        assert any(e.distribution is Distribution.HASH for e in graph.exchanges) is not complete
+        assert any(s.split_partitions for f in graph.fragments for s in f.sources) is complete
+        assert FragmentGraph.from_dict(graph.to_dict(), expected_engine_identity=graph.engine_identity) == graph
+
+
+def test_component_assignment_rejects_partial_or_mixed_native_partition(tmp_path):
+    sql = overlapping_components_query(tmp_path)
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        graph = compile_sql(connection, sql, 2)
+        fragment = next(f for f in graph.fragments if any(s.split_partitions for s in f.sources))
+        source = fragment.sources[0]
+        assert SourceSpec.from_dict(source.to_dict()) == source
+        owned = [source.assigned_split_ids(p, 2) for p in range(2)]
+        assert set(owned[0]).isdisjoint(owned[1])
+        assert set(owned[0] + owned[1]) == {s.split_id for s in source.splits}
+        from vane._native import execution_plan as native
+
+        for ids in (owned[0][:-1], [owned[0][0], owned[1][0]]):
+            with pytest.raises(vane.InvalidInputException, match="complete partition"):
+                native._execute_fragment_for_test(connection, fragment.native_plan, {}, {source.source_id: ids})
+        for owners in (source.split_partitions[:-1], (-1,) * len(source.splits), (True,) * len(source.splits)):
+            with pytest.raises(ValueError, match="split_partitions"):
+                replace(source, split_partitions=owners)
+        with pytest.raises(ValueError, match="out of range"):
+            replace(fragment, sources=(replace(source, split_partitions=(2,) * len(source.splits)),))
+
+
+@pytest.mark.parametrize(
+    "aggregates",
+    [
+        "count(distinct v), sum(distinct v), avg(v) filter(where v>1)",
+        "min(v,2), max(v,2), count(*) filter(where v<0)",
+        "sum(v::double order by v desc), avg(v::double order by v)",
+        "sum(v::decimal(38,2)) filter(where v>1), avg(v::hugeint)",
+    ],
+)
+def test_owned_component_groups_keep_complete_aggregate_semantics(tmp_path, aggregates):
+    sql = overlapping_components_query(tmp_path).replace("sum(v) s, count(*) n", aggregates)
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, 3)
+        assert all(e.distribution is Distribution.GATHER for e in graph.exchanges)
+        assert any(s.split_partitions for f in graph.fragments for s in f.sources)
+        assert execute_graph(connection, graph) == expected
 
 
 def broadcast_aggregate_query(directory, *, join="inner", key="a.k", variant="compressed"):
@@ -126,7 +237,9 @@ def test_join_groups_require_preserved_key_and_split_evidence(tmp_path, options)
         expected = connection.execute(sql).fetchall()
         graph = compile_sql(connection, sql, 3)
         assert execute_graph(connection, graph) == expected
-        assert any(edge.distribution is Distribution.HASH for edge in graph.exchanges)
+        assert any(edge.distribution is Distribution.HASH for edge in graph.exchanges) == (
+            options.get("variant") != "repeated"
+        )
 
 
 @pytest.mark.parametrize("build", ["select range from range(0)", "select * from (values (0), (null)) b(k)"])
@@ -187,7 +300,7 @@ def test_complete_parquet_groups_filter_before_exchange(tmp_path, partitions, th
         ("nulls", False),
         ("unsorted", False),
         ("missing_stats", False),
-        ("repeated", False),
+        ("repeated", True),
         ("computed", False),
         ("cast", False),
     ],

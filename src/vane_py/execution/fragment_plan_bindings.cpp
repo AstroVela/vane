@@ -45,6 +45,9 @@ py::list DescribeSources(const vector<SourceSpec> &specifications) {
 		spec["capability"] = source.capability;
 		spec["codec"] = source.codec;
 		spec["requires_snapshot"] = source.requires_snapshot;
+		if (!source.split_partitions.empty()) {
+			spec["split_partitions"] = source.split_partitions;
+		}
 		py::list splits;
 		for (auto &split : source.splits) {
 			py::dict item;
