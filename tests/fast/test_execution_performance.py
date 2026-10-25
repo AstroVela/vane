@@ -1432,6 +1432,77 @@ def test_key_domain_filters_large_build_before_hash_exchange(tmp_path, threads, 
         )
 
 
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("kind", ["inner", "semi"])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("key_type", ["bigint", "hugeint", "ubigint"])
+def test_bitmap_domain_preserves_partition_masks_and_duplicate_rows(
+    tmp_path, threads, partitions, kind, comparison, key_type
+):
+    config = {
+        "threads": threads,
+        "memory_limit": "256MiB",
+        "temp_directory": str(tmp_path / "spill"),
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization",
+    }
+    with vane.connect(backend="local", config=config) as connection:
+        offset = "9223372036854775808" if key_type == "ubigint" else "-65536"
+        if key_type == "hugeint":
+            offset = "-1267650600228229401496703205376"
+        # Parquet's default HUGEINT export is DOUBLE. Preserve the wide key
+        # exactly on disk and restore its integral type before joining.
+        stored_type = "decimal(38,0)" if key_type == "hugeint" else key_type
+        fact, build = tmp_path / "fact.parquet", tmp_path / "build.parquet"
+        connection.execute(
+            f"copy (select range i, (case when range%8192=0 then null else range+({offset}) end)::{stored_type} k, "
+            f"'fact-'||range::varchar payload from range(131099)) to '{fact}' (row_group_size 2048)"
+        )
+        connection.execute(
+            f"copy (select (case when range%4096=0 then null else (range%65536)*3+({offset}) end)::{stored_type} k, "
+            f"range%17 v from range(131072)) to '{build}' (row_group_size 2048)"
+        )
+        # No HAVING estimate is involved. The filtered build's conservative
+        # cardinality exceeds the exact-key budget. Runtime keys have duplicates
+        # and share bitmap words across independent row-group splits.
+        output = ", b.v" if kind == "inner" else ""
+        sql = (
+            f"select p.i, p.k, p.payload{output} "
+            f"from (select i,k::{key_type} k,payload "
+            f"from read_parquet('{fact}', explicit_cardinality=1000000000)) p {kind} join "
+            f"(select k::{key_type} k,v from read_parquet('{build}', explicit_cardinality=30000000) where v<4) b "
+            f"on p.k {comparison} b.k order by all"
+        )
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        sources = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(fact).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        fact_edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
+        broadcasts = {e.exchange_id for e in spec.graph.exchanges if e.distribution is Distribution.BROADCAST}
+        assert broadcasts and fact_edges
+        limits = DirectExchangeLimits(4096, 1024, 64, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"]
+                    for name, c in service.channels.items()
+                    if name.split("/")[0] in fact_edges
+                )
+                < 65536
+            )
+            for name, channel_state in service.channels.items():
+                snapshot = channel_state.snapshot()
+                assert snapshot["peak_bytes"] <= limits.window_bytes
+                if name.split("/")[0] in broadcasts:
+                    assert snapshot["accepted_rows"] <= 65536
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+    assert not list((tmp_path / "spill").rglob("duckdb_temp*"))
+
+
 @pytest.mark.parametrize("shape", ["single", "multiple", "narrow"])
 def test_join_output_filter_estimate_requires_single_key_and_traffic_savings(tmp_path, shape):
     with vane.connect(backend="local", config={"threads": 4}) as connection:
