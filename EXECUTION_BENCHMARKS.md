@@ -3439,3 +3439,102 @@ Q4's scoped correlated path is unchanged: earlier native profiles show about
 Local's dynamic scan filters. Q18 still exchanges about 150 million partial
 states. These are separate remaining targets; this change introduces no
 query-specific SQL rules or Local execution fallback.
+
+## SF100 correlated Parquet key filtering (2026-10-25)
+
+Q4's selective outer input could not filter the fact fragment before its hash
+exchange. Its estimated 30 million integral keys occupied 270 MB, exceeding the
+64 MiB exact-domain allowance. The native delimiter scope remains necessary:
+the optimizer deliberately retains this scope when selection can reduce its
+inner input, while process-local native dynamic filters cannot cross exchanges.
+
+For a direct Parquet owner with a single proven correlation key, the compiler
+can now create an independent key scan, preserving static predicates, required
+filter columns, file pruning and split metadata. Unrelated owner payload is
+removed from that scan. Its keys feed the existing globally merged word/mask
+domain; the fact fragment applies this necessary condition before its exchange.
+The original correlated join still determines exact matches, duplicate owners,
+NULL semantics and SEMI/ANTI output. No query-specific SQL rewrite is used.
+
+The additional scan, partial-domain gather and complete-domain replicas must
+fit estimated traffic savings. The path requires declared worker memory,
+estimated fourfold selectivity from the single-key join, the complete direct
+owner and a source-only probe without incoming exchanges. Sampled scans,
+residual/multi-key estimates and distribution boundaries do not gain this path.
+Smaller exact domains keep their existing planning. The row-domain bound is a
+planning bound; native memory/spill accounting still governs allocations.
+
+The final candidate is retained. Q4 median latency changes
+**8.878 → 5.936 seconds
+(-33.1%)**. Mean worker CPU changes
+**194.330 → 171.995 seconds
+(-11.49%)**. Local remains faster at
+2.855 seconds; pipeline is
+2.08× Local latency.
+This stage filters before exchange; applying the domain during fact Parquet
+decoding remains a separate optimization target.
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4 | 2.855 s | 8.878 s | 5.936 s | -33.1% | 2.08× |
+
+Original SQL reads the same 307 Parquet inputs / 37.5033 GiB. Local uses
+36 native threads / 32 GiB; pipeline uses two workers with 18 threads / 16 GiB
+each, 128/256 MiB exchange/staging, 64 KiB / 2048-row frames, 1 MiB / 16-slot
+windows and a specialized 1 GiB Ray object store. Baseline phases bracket
+candidate Local/pipeline and pipeline/Local phases. Three executions per
+query/mode/phase, excluding each first execution, give four steady observations
+per table cell. All scheduled samples are retained. Timing includes submission,
+full collection and successful close. Baseline phase medians drift by
+-0.44%; all observations remain in the retained log.
+
+OS caches remain enabled and unrelated host jobs continue. Owned builds/tests,
+diagnostics and Doris/HDFS do not overlap primary timing. CPU controls are
+separate OS user-plus-system deltas summed over both workers, excluding the
+coordinator/result service; both executions per variant are retained. Driver,
+installed Python files, packages, SQL, input identities and resource capacities
+match, apart from intended native binaries and validated temporary paths.
+These selected controls do not update the full 22-query score or establish
+SF100 FTE performance.
+
+All 22 serialized graphs were compared offline, normalizing only engine build
+identity strings and same-length embedded occurrences. Only Q4 changes
+(five to seven fragments); the remaining 21 graphs match. Raw hashes and engine
+identities are retained; execution identity guards remain enforced. Regression
+screens for the previously optimized queries are below. Each has one steady
+sample per variant, so small differences are not computation-gain claims.
+
+| Query | Pipeline before | Pipeline now |
+| --- | ---: | ---: |
+| Q10 | 9.830 s | 9.263 s |
+| Q12 | 4.823 s | 4.951 s |
+| Q18 | 15.867 s | 15.920 s |
+
+**628 distinct related tests pass** on the frozen final binary: 127 correlated
+performance/lifecycle cases, 489 compiler/Parquet cases and twelve real-Ray
+cases. New coverage includes 16 signed/unsigned, NULL-safe, SEMI/ANTI and
+thread/partition combinations; four native profiling cases verify key-only
+projection, retained key/boolean predicates and Hive file pruning; seven cost
+and source-boundary cases; two blocked-cancel cases; and three Pipeline/FTE/
+domain-worker retry cases. Real worker loss is injected into a bitmap-domain
+stage, and recovered attempts retain their input identity while changing fences.
+No full or GPU suite was run. Both changed test modules are already included
+in the sdist allowlist. No forced-spill or peak-RSS claim is made by the new tests.
+
+All **37 final SF100 executions** match independent Local references: eighteen
+Q4 timing queries, twelve Q10/Q12/Q18 regression screens, four separate Q4 CPU
+controls and three Local reference preparations. Eight earlier prototype
+executions also match and are retained separately. An initial screen stopped
+because reference files were not yet prepared; it yielded no accepted samples
+and is excluded from the final count. References were generated before restart.
+
+Candidate code: `573aa97c6749ba2092112e5b2bb12ceb16b9b023`; native SHA-256
+`5e10a642d1d72bae8b9bf3cb8b8b4af3c3fe5859a95ae1752683b37e262d21d3`.
+Baseline: `e69668fa400018989389aec9c4db784423745896`; native SHA-256
+`fb8806ff2635bcea258b2c77117d3c2f6741427800c15c1797e3f5c815f64d95`.
+Evidence in `build/pipeline-sf100-correlated-filter-20261025/` retains raw samples,
+frozen identities/configurations, graph/SQL/output hashes, row counts, CPU and
+compile-only diagnostics, JUnit reports and cleanup manifests. Compile-only
+logging is absent from the final binary. Owned temporary/oracle/duplicate
+baseline files are removed after processes stop; source inputs remain intact.
+Doris/HDFS is restored with requested file and Parquet page caches disabled.
