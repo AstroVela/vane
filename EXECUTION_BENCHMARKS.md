@@ -3315,3 +3315,127 @@ oracle files and the duplicate baseline package were removed after the runs
 stopped. Original inputs are preserved; Doris/HDFS is restored with the requested
 file and Parquet page caches disabled. Remaining Q18 exchange traffic and final
 consumer work still leave a substantial Local gap.
+
+## SF100 compact join-key domains (2026-10-25)
+
+Conservative filtered-build estimates previously prevented early exact-key
+broadcasts, leaving large probe inputs to cross hash exchanges. The compiler
+now builds bounded word/mask domains for oversized selective integral-key
+builds. A native hash selects a word and one of its 64 bits from disjoint hash
+bits. Partial and global BIT_OR aggregates produce exactly one mask per word.
+The probe matches populated words before extracting its bit, then the original
+join enforces exact keys, NULL behavior and residual predicates. This preserves
+probe duplicates and retains only false positives from hash collisions. Small
+exact-key domains retain their existing planning. Domain rows are two UBIGINT
+columns and use the existing native serialization and bounded channels.
+
+The cost rule accounts for existing early filters: an ancestor's reduced input
+cannot fund another blocking bitmap with its original cardinality. New streaming
+build domains require a fourfold traffic margin, including the extra build and
+broadcast edges, to cover hashing and the complete-build barrier. Existing
+filtered-aggregate domain costing is retained. The word count uses a 128-byte
+per-word cost estimate for grouping and lookup overhead; this bounds domain
+rows, not total allocation or process RSS. Native operator memory/spill limits
+still apply, including thread-local aggregate states.
+
+The selected four-query median sum changes **47.299 → 38.912 seconds (-17.7%)**.
+Q10 improves **27.0%**, Q12 **49.7%**; Q4 and Q18 are effectively unchanged.
+The remaining Local gaps are explicit below. These four controls do not update
+the full 22-query score or establish SF100 FTE performance.
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4 | 2.926 s | 8.872 s | 8.880 s | +0.1% | 3.03× |
+| Q10 | 4.351 s | 12.800 s | 9.342 s | -27.0% | 2.15× |
+| Q12 | 2.922 s | 9.598 s | 4.829 s | -49.7% | 1.65× |
+| Q18 | 7.059 s | 16.029 s | 15.861 s | -1.0% | 2.25× |
+
+The original SQL reads the same 307 Parquet inputs / 37.5033 GiB. Local uses
+36 native threads / 32 GiB; pipeline uses two workers with 18 threads / 16 GiB
+each. Per-worker exchange/staging budgets are 128/256 MiB, frames 64 KiB /
+2048 rows, windows 1 MiB / 16 slots, and the specialized Ray object store is
+1 GiB. Baseline phases bracket candidate Local/pipeline and pipeline/Local
+phases. Three executions per query/mode/phase, excluding each first execution,
+give four steady observations per table cell. All scheduled samples are retained.
+Timing includes submission, complete collection and successful close.
+
+Shared-host variation remains visible: Q12's baseline phase medians drift by
+-5.7%, with individual steady samples of 9.312–10.092 seconds; candidate samples
+are 4.793–5.120 seconds. Q4's 9.486-second candidate outlier is retained. OS
+caches remain enabled and unrelated jobs continue. Owned builds/tests,
+diagnostics and Doris/HDFS do not overlap primary timing windows. Driver,
+installed Python files, packages, SQL, input identities and resource capacities
+match across controls, apart from the intended native binary and validated
+per-run temporary paths.
+
+Separate diagnostics measure OS user-plus-system deltas summed over the two
+pipeline workers, excluding the coordinator/result service. Mean CPU seconds
+from two executions per variant, both retained, are:
+
+| Query | Baseline worker CPU | Candidate worker CPU | Change |
+| --- | ---: | ---: | ---: |
+| Q10 | 302.920 | 253.715 | -16.24% |
+| Q12 | 181.120 | 140.495 | -22.43% |
+| Q18 | 411.385 | 410.000 | -0.34% |
+
+Diagnostic wall times are excluded from latency. One late baseline status RPC
+reached an already cleaned query and logged KeyError. All baseline queries,
+result comparisons and resource checks succeeded, and every CPU observation
+has complete before/after counters for both workers. No production diagnostic
+handling was changed for this experiment.
+
+A superseded trial demonstrates why the cost checks are necessary: Q7/Q19/Q21
+regressed about 10–20% when additional bitmap barriers were costed against
+inputs already reduced by earlier filters, or had insufficient traffic margin.
+Its 65 returned results all matched; a final Q21 repetition was intentionally
+cancelled when rejecting the trial. Six new regressions reproduce four failures
+and two passing controls on that trial, then all pass with the cost correction.
+
+After correcting costs, all 22 serialized graphs were compared offline,
+normalizing only their native build identity strings and same-length embedded
+occurrences. Nineteen graphs, including Q7/Q19/Q21, match the baseline; only
+Q10/Q12/Q18 change. Raw hashes and engine identities are retained. Execution
+identity guards remain enforced; normalized payloads are never executed.
+Short regression screens confirm the three previously affected queries below.
+Each screen has one steady sample per variant, so small changes are not claimed
+as computation improvements.
+
+| Query | Pipeline before | Pipeline now |
+| --- | ---: | ---: |
+| Q7 | 5.670 s | 5.609 s |
+| Q19 | 6.000 s | 5.877 s |
+| Q21 | 14.827 s | 14.389 s |
+
+**650 distinct related tests pass** on the frozen final binary: 74 key-domain
+cases, 25 lifecycle/boundary cases, 539 compiler/Parquet/join cases, and twelve
+real-Ray cases. Coverage includes signed/wide keys, NULL-safe equality,
+duplicate rows, cross-partition mask merging, existing early filters, cost
+margins, residual/outer semantics, bounded channels, cancellation and shared
+producer/FTE retry. The wide-key fixture preserves HUGEINT with DECIMAL storage
+before restoring the integral type. The new fixtures do not claim forced-spill
+or a hard peak-memory guarantee. No full or GPU suite was run; both changed test
+functions live in a module already included in the sdist allowlist.
+
+All **96 final SF100 executions** match the independent Local references:
+72 primary timing queries, twelve regression screens and twelve separate CPU
+controls. Schemas are checked with the existing wide-integer Arrow normalization,
+row counts match, and values pass the frozen comparison policy. Superseded
+trials and earlier profiles are retained separately and are not added to this
+final-revision count.
+
+Candidate code: `0f4b8e4dc688d2ce3fb8eb9e787ce50b1e7164b6`; native SHA-256
+`fb8806ff2635bcea258b2c77117d3c2f6741427800c15c1797e3f5c815f64d95`.
+Baseline: `7723e7e97c99cec9e8a9ab87ed2bc2d113db0738`; native SHA-256
+`0eeda197744f3188dd92c8acc54fbec1272ac193a1848bb673e0f949111275e1`.
+Evidence in `build/pipeline-sf100-join-exchange-20261025/` retains raw samples,
+frozen identities/configurations, normalized/raw graph hashes, SQL/output hashes,
+row counts, CPU/operator diagnostics, rejected-trial evidence, JUnit reports and
+cleanup manifests. Owned temporary data, oracle outputs and duplicate baseline
+files are removed after all run-owned processes stop. Original inputs are
+preserved; Doris/HDFS is restored with file and Parquet page caches disabled.
+
+Q4's scoped correlated path is unchanged: earlier native profiles show about
+379 million fact rows before its delimiter join, versus about 24 million after
+Local's dynamic scan filters. Q18 still exchanges about 150 million partial
+states. These are separate remaining targets; this change introduces no
+query-specific SQL rules or Local execution fallback.
