@@ -3626,3 +3626,106 @@ Run-owned test data, oracle IPCs and duplicate installed baseline are removed
 after validation and process shutdown. Source Parquet files are preserved.
 This is a controlled Q4 improvement, not a refreshed full-22 score or an SF100
 FTE timing result.
+
+## SF100 ordinary join masks inside Parquet scanning (2026-10-25)
+
+Ordinary joins already had complete bounded word/mask domains, but their
+membership hash join ran after the Parquet source. Eligible ordinary probes now
+use the same native scan filter as the correlated path above. This changes
+placement rather than introducing another domain, scan or complete-build
+barrier: the original shared build still supplies the exact join and domain;
+the domain is fully merged before the fact scan starts.
+
+The compiler requires one source, no incoming exchanges or previously installed
+filter root, and an unchanged integral key traced through unary projections and
+filters into supported unsampled Parquet. It crosses no aggregation, join,
+cardinality or key-transformation boundary. The common fragment marker builder
+now serves ordinary and correlated paths. Existing costs, domain word limits,
+partial/global BIT_OR, exchanges and exact INNER/SEMI semantics remain in use.
+The native dense-mask implementation and its 0.5–4 MiB BufferManager-accounted
+payload, shared ownership, publication ordering and retry behavior are unchanged.
+There is no query-specific rule, new wire variant or Local fallback.
+
+Controlled results relative to preceding head `870d6a81e2`:
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 | 4.327 s | 9.331 s | 8.332 s | -10.71% | 1.93× |
+| Q12 | 2.944 s | 4.874 s | 3.917 s | -19.64% | 1.33× |
+| Q18 | 7.121 s | 15.893 s | 15.467 s | -2.68% | 2.17× |
+
+These are four-steady-sample medians per cell. Every phase also retains its
+first SQL execution, which is excluded from medians. Baseline phases bracket
+candidate Local/Pipeline and Pipeline/Local phases; baseline phase-median drifts
+are Q10 +0.16%, Q12 +6.83%, Q18 +0.75%. OS caches were retained on the shared host. Remaining Local gaps
+are explicit; this is not a new full-22-query score.
+
+| Query | Local steady range | Baseline Pipeline steady range | Candidate Pipeline steady range |
+| --- | ---: | ---: | ---: |
+| Q10 | 4.298–4.366 s | 9.251–9.383 s | 8.291–8.502 s |
+| Q12 | 2.914–3.061 s | 4.762–5.199 s | 3.850–4.157 s |
+| Q18 | 6.953–7.270 s | 15.700–15.921 s | 15.394–15.680 s |
+
+The main latency gains are in Q10/Q12. Q18's smaller wall-time change must be
+read with the shared-host variation; scanning does not remove its separate
+aggregate-state exchange work.
+
+Separate diagnostics measure user-plus-system CPU seconds summed over both
+workers. Each entry is the mean of two retained executions; diagnostic wall
+times are excluded from the latency table:
+
+| Query | Baseline worker CPU seconds | Candidate worker CPU seconds | Change |
+| --- | ---: | ---: | ---: |
+| Q10 | 252.395 | 218.730 | -13.34% |
+| Q12 | 140.760 | 111.425 | -20.84% |
+| Q18 | 415.295 | 392.070 | -5.59% |
+
+All 22 serialized graphs were compared offline, normalizing only native engine
+identity. Only Q10/Q12/Q18 change; their fragment counts remain 12/7/14. The
+other 19 graphs, including the prior Q4 optimization, are identical. The
+following regression screens have one steady sample per variant and establish
+no small performance gain:
+
+| Query | Pipeline before | Pipeline now |
+| --- | ---: | ---: |
+| Q4 | 4.361 s | 4.519 s |
+| Q7 | 5.680 s | 5.493 s |
+| Q19 | 5.798 s | 5.727 s |
+| Q21 | 14.813 s | 14.790 s |
+
+Validation on the frozen installed Release binary:
+
+- **795 related tests passed**: 242
+  performance/domain/lifecycle, 539 compiler/Parquet/native
+  join-filter, and 14 real-Ray. Eight new scan profiling cases
+  cover equality/NULL-safe equality, static predicates, threads and partition
+  counts. Their baseline regression fails at 196,580 scan output rows; the
+  candidate emits fewer than 4,096 in the same case. Existing cases cover
+  duplicates, signed/unsigned and wide-key casting boundaries, mask merging,
+  bounds, NULL and outer semantics, cancellation and repeated execution. Real
+  Ray includes ordinary fact-probe retry as well as shared-producer and
+  correlated-domain/probe retry. No full or GPU suite was run.
+- **86 final SF100 executions matched Local**: 54 primary timing queries,
+  16 Q4/Q7/Q19/Q21 regression screens, four Local oracle preparations and
+  12 separate CPU diagnostics. The earlier 24 diagnostic prototype queries
+  also matched; they are excluded from this final-revision count.
+- Same original SQL and 307 files/37.5033 GiB. Local uses 36 native
+  threads/32 GiB; Pipeline uses two workers at 18 threads/16 GiB each, with
+  128/256 MiB exchange/staging budgets, 64 KiB/2,048-row frames, 1 MiB/16-slot
+  windows and a 1 GiB Ray object store.
+- Owned Doris/HDFS services were paused during comparisons and restored with
+  file and Parquet page caches disabled. No task-owned build, test or profiling
+  overlapped primary timing. Unrelated shared-host jobs continued.
+
+Candidate source `f6abd3d634758b7fa817a5768774f5231261b396`, package 0.3.0.dev122,
+native SHA-256 `080c06c98d3dda4635b2c3ba155e8d2cc618dd9228cf24b40d9360e9e20fdb7b`. Baseline native SHA-256
+`4ed99cb62357f42aa9c7b9d6758dbd201e893c3af4035ff87f62be3419003999`. Loaded code identities are checked separately
+from shared-environment distribution metadata.
+
+Evidence in `build/pipeline-sf100-join-parquet-mask-20261025/` retains `audit.json`,
+`acceptance-summary.csv`, `cpu-final-summary.json`, normalized/raw graph hashes,
+frozen configuration/SQL/code identities, JUnit results, row counts, content
+hashes and cleanup manifests. Run-owned temporary data, spill, oracle IPCs and
+duplicate installed baseline are removed after validation and process shutdown;
+source inputs are preserved. Native domain cost estimates and the dense-mask
+payload bound do not bound total process RSS. No SF100 FTE timing claim is made.
