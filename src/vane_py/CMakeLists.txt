@@ -27,6 +27,7 @@ add_library(
   dynamic_extension.cpp
   execution/fragment_plan.cpp
   execution/correlated_partition.cpp
+  execution/parquet_mask.cpp
   execution/fragment_plan_bindings.cpp
   execution/local_query.cpp
   execution/direct_exchange.cpp
@@ -93,6 +94,8 @@ foreach(
   execution/fragment_plan.cpp
   execution/correlated_partition.hpp
   execution/correlated_partition.cpp
+  execution/parquet_mask.hpp
+  execution/parquet_mask.cpp
   execution/fragment_plan_bindings.cpp
   execution/exchange_types.hpp
   execution/arrow_frame.hpp

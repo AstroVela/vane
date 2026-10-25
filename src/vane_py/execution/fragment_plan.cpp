@@ -3,6 +3,7 @@
 
 #include "fragment_plan.hpp"
 #include "correlated_partition.hpp"
+#include "parquet_mask.hpp"
 #include "file_snapshot.hpp"
 #include "exchange_types.hpp"
 #include "parquet_split.hpp"
@@ -197,6 +198,10 @@ void PlanNode::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(4, "source_id", source_id);
 	serializer.WriteProperty(5, "children", children);
 	serializer.WriteProperty(6, "scoped", scoped);
+	if (parquet_mask_words) {
+		serializer.WriteProperty(7, "parquet_mask_words", parquet_mask_words);
+		serializer.WriteProperty(8, "parquet_mask_key", parquet_mask_key);
+	}
 }
 
 PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
@@ -207,7 +212,22 @@ PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
 	result.source_id = deserializer.ReadProperty<string>(4, "source_id");
 	result.children = deserializer.ReadProperty<vector<PlanNode>>(5, "children");
 	result.scoped = deserializer.ReadProperty<bool>(6, "scoped");
+	result.parquet_mask_words = deserializer.ReadPropertyWithDefault<idx_t>(7, "parquet_mask_words");
+	result.parquet_mask_key = deserializer.ReadPropertyWithDefault<idx_t>(8, "parquet_mask_key");
 	CheckTypes(result.types);
+	if (result.parquet_mask_words) {
+		if (!ValidParquetMaskSize(result.parquet_mask_words) || !result.input_port.empty() ||
+		    !result.native_operator.empty() || !result.source_id.empty() || result.scoped ||
+		    result.children.size() != 2 || result.children[0].types != result.types ||
+		    result.children[1].types != vector<LogicalType> {LogicalType::UBIGINT, LogicalType::UBIGINT} ||
+		    result.parquet_mask_key >= result.types.size() || !result.types[result.parquet_mask_key].IsIntegral()) {
+			throw SerializationException("invalid Parquet mask fragment node");
+		}
+		return result;
+	}
+	if (result.parquet_mask_key) {
+		throw SerializationException("Parquet mask key has no bounded mask");
+	}
 	if (!result.input_port.empty()) {
 		if (!result.native_operator.empty() || !result.source_id.empty() || !result.children.empty() || result.scoped) {
 			throw SerializationException("fragment input port contains operator state");
@@ -1428,7 +1448,8 @@ private:
 			if (!rescan && key_bytes > broadcast_limit && matches > 0 &&
 			    matches * 4 < double(op.estimated_cardinality) && op.types[key].IsIntegral() &&
 			    input.incoming.empty() && input.fragment.sources.size() == 1 && input.local_scan &&
-			    !probe_filters.count(&op) && probe_bytes != NumericLimits<double>::Maximum()) {
+			    !probe_filters.count(&op) && CanFilterParquetKey(op, key) &&
+			    probe_bytes != NumericLimits<double>::Maximum()) {
 				auto &source = keys.source->Cast<PhysicalTableScan>();
 				if (!source.extra_info.sample_options) {
 					// The proof above uses this scan's complete owner and a single
@@ -1447,7 +1468,17 @@ private:
 						auto &scan = KeyScan(source, keys.column);
 						auto bitmap = BitmapDomain(Build(scan), scan, 0, words);
 						auto domain = Exchange(std::move(bitmap.first), count == 1 ? "gather" : "broadcast", count);
-						return BitmapFilter(op, std::move(input), key, *bitmap.second, std::move(domain), words);
+						PlanNode node;
+						node.types = op.types;
+						node.parquet_mask_words = words;
+						node.parquet_mask_key = key;
+						node.children.push_back(std::move(input.fragment.root));
+						node.children.push_back(std::move(domain.fragment.root));
+						input.fragment.root = std::move(node);
+						for (auto &edge : domain.incoming) {
+							input.incoming.push_back(std::move(edge));
+						}
+						return input;
 					}
 				}
 			}
@@ -2418,6 +2449,13 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		auto &result = *input;
 		plan.TakeOwnership(std::move(input));
 		return result;
+	}
+	if (node.parquet_mask_words) {
+		auto &probe =
+		    LoadNode(context, plan, node.children[0], inputs, sources, assignments, used_sources, used_inputs, filters);
+		auto &domain =
+		    LoadNode(context, plan, node.children[1], inputs, sources, assignments, used_sources, used_inputs, filters);
+		return MakeParquetMask(plan, probe, domain, node.parquet_mask_key, node.parquet_mask_words);
 	}
 	unique_ptr<PhysicalOperator> op;
 	bound_parameter_map_t parameters;

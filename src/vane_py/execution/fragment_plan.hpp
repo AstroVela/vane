@@ -35,6 +35,9 @@ struct PlanNode {
 	// A native subtree with shared CTE/delimiter state. Its children declare
 	// external input ports, all bound within this one serialization scope.
 	bool scoped = false;
+	// A complete bounded word/mask input gates an unchanged Parquet probe key.
+	idx_t parquet_mask_words = 0;
+	idx_t parquet_mask_key = 0;
 	void Serialize(Serializer &serializer) const;
 	static PlanNode Deserialize(Deserializer &deserializer);
 };

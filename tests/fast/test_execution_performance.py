@@ -1254,8 +1254,83 @@ def test_correlated_bitmap_reads_only_keys_and_predicate_columns(tmp_path, monke
         key_scans = [s for s in scans if s["extra_info"].get("Projections") in ("owner_key", ["owner_key"])]
         assert key_scans
         assert sum(s["operator_cardinality"] for s in key_scans) == owner_rows
+        fact_scans = [s for s in scans if "fact_key" in s["extra_info"].get("Projections", [])]
+        assert fact_scans
+        assert sum(s["operator_cardinality"] for s in fact_scans) < 4096
         assert any("priority" in s["extra_info"].get("Projections", []) for s in scans)
         assert all("unused" not in s["extra_info"].get("Projections", []) for s in scans)
+
+
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("layout", ["constant", "dictionary"])
+def test_correlated_parquet_mask_handles_constant_and_dictionary_keys(tmp_path, comparison, layout):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = correlated_bitmap_scan_query(connection, tmp_path, comparison)
+        fact = tmp_path / "fact.parquet"
+        fact.unlink()
+        key = (
+            "-65439"
+            if layout == "constant"
+            else "case (range//2048)%3 when 0 then null when 1 then -65439 else 131072 end"
+        )
+        connection.execute(
+            f"copy (select ({key})::bigint fact_key,range%17 v,3::bigint w from range(196611)) "
+            f"to '{fact}' (row_group_size 2048)"
+        )
+        expected = connection.execute(sql).fetchall()
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="parquet-mask-vector-encodings",
+            options=FragmentCompileOptions(3, worker_operator_bytes=256 << 20),
+        )
+        assert any(b"bit_or" in f.native_plan for f in graph.fragments)
+        assert execute_graph(connection, graph) == expected
+        assert execute_graph(connection, graph) == expected
+
+
+@pytest.mark.parametrize("kind", ["semi", "anti"])
+@pytest.mark.parametrize("domain", ["empty", "duplicates", "invalid_word", "null_word", "null_mask"])
+def test_correlated_parquet_mask_requires_complete_valid_domain(tmp_path, monkeypatch, kind, domain):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql = correlated_bitmap_scan_query(connection, tmp_path, "is not distinct from", kind)
+        expected = connection.execute(sql.replace("f.v<f.w", "false") if domain == "empty" else sql).fetchall()
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="parquet-mask-domain",
+            options=FragmentCompileOptions(2, worker_operator_bytes=256 << 20),
+        )
+        complete = [f for f in graph.fragments if f.partition_count == 1 and b"bit_or" in f.native_plan]
+        assert len(complete) == 1
+        execute = native._execute_fragment_for_test
+
+        def supply_domain(*args):
+            rows = execute(*args)
+            if args[1] != complete[0].native_plan:
+                return rows
+            if domain == "empty":
+                return []
+            if domain == "duplicates":
+                return rows + rows
+            return {
+                "invalid_word": [(524288, 1)],
+                "null_word": [(None, 1)],
+                "null_mask": [(0, None)],
+            }[domain]
+
+        monkeypatch.setattr(native, "_execute_fragment_for_test", supply_domain)
+        scans = profile_fragment_scans(connection, monkeypatch)
+        if domain in ("empty", "duplicates"):
+            assert execute_graph(connection, graph) == expected
+            fact_scans = [s for s in scans if "fact_key" in s["extra_info"].get("Projections", [])]
+            assert fact_scans
+            rows = sum(s["operator_cardinality"] for s in fact_scans)
+            assert rows == 0 if domain == "empty" else 0 < rows < 16384
+        else:
+            with pytest.raises(vane.InvalidInputException, match="bounded word indices"):
+                execute_graph(connection, graph)
+            assert not any("fact_key" in s["extra_info"].get("Projections", []) for s in scans)
 
 
 @pytest.mark.parametrize(

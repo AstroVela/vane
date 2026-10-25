@@ -214,7 +214,7 @@ def test_shared_join_build_filter_preserves_consumer_retry(tmp_path, monkeypatch
         assert_idle(connection)
 
 
-@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry", "fte_probe_retry"])
 def test_correlated_bitmap_preserves_key_scan_and_domain_retry(tmp_path, monkeypatch, mode):
     import ray
 
@@ -232,12 +232,18 @@ def test_correlated_bitmap_preserves_key_scan_and_domain_retry(tmp_path, monkeyp
                 for f in scheduler.spec.graph.fragments
                 if f.fragment_id == attempt.reservation.token.task_id.split("/")[0]
             )
-            if b"bit_or" in fragment.native_plan:
+            domain = b"bit_or" in fragment.native_plan
+            domains = {f.fragment_id for f in scheduler.spec.graph.fragments if b"bit_or" in f.native_plan}
+            probe = bool(fragment.sources) and any(
+                e.consumer_fragment_id == fragment.fragment_id and e.producer_fragment_id in domains
+                for e in scheduler.spec.graph.exchanges
+            )
+            if (mode == "fte_retry" and domain) or (mode == "fte_probe_retry" and probe):
                 lost.append(attempt.reservation.token)
                 ray.kill(attempt.worker, no_restart=True)
         return admitted
 
-    if mode == "fte_retry":
+    if mode in ("fte_retry", "fte_probe_retry"):
         monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
     limits = resources(tmp_path, operator_memory_bytes=1 << 30, task_contexts_per_worker=64, io_concurrency=256)
     with (
@@ -252,7 +258,7 @@ def test_correlated_bitmap_preserves_key_scan_and_domain_retry(tmp_path, monkeyp
             assert result.collect().to_pylist() == expected
             assert any(b"bit_or" in f.native_plan for f in scheduler.spec.graph.fragments)
             assert sum(len(f.sources) for f in scheduler.spec.graph.fragments) == 3
-            if mode == "fte_retry":
+            if mode in ("fte_retry", "fte_probe_retry"):
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
                 assert len(attempts) == 2
