@@ -19,6 +19,42 @@ from tests.fast.test_gravitino import attach, load_gravitino
 from tests.fast.test_gravitino import gravitino_http as gravitino_http
 from vane.catalog import GravitinoCatalog, GravitinoIdentifier, GravitinoMetalake
 
+CREDENTIAL_PROPERTIES = {
+    "jdbc-password": "fake-discovery-password",
+    "S3_SECRET_ACCESS_KEY": "fake-discovery-secret-key",
+    "Authorization": "fake-discovery-authorization",
+    "access.key.id": "fake-discovery-access-key",
+    "credential": "fake-discovery-credential",
+    "private_key": "fake-discovery-private-key",
+    "azure-storage-account-key": "fake-discovery-azure-account-key",
+    "gravitino.bypass.fs.azure.account.key.example.dfs.core.windows.net": "fake-discovery-prefixed-account-key",
+    "api-key": "fake-discovery-api-key",
+    "client.API_KEY": "fake-discovery-prefixed-api-key",
+    "gravitino.bypass.header.Authorization": "fake-discovery-prefixed-authorization",
+    "http.headers.Proxy-Authorization": "fake-discovery-proxy-authorization",
+}
+
+
+def credential_detail(state, kind):
+    config = copy.deepcopy(state["discovery"])
+    details = {
+        "catalog": (config["catalogs"]["iceberg"], ("iceberg",)),
+        "schema": (config["schemas"]["iceberg"]["schema.点"], ("iceberg", "schema.点")),
+        "table": (
+            config["tables"][("iceberg", "schema.点")]["table.name"],
+            ("iceberg", "schema.点", "table.name"),
+        ),
+    }
+    detail, arguments = details[kind]
+    detail.setdefault("properties", {}).update(CREDENTIAL_PROPERTIES)
+    detail["properties"].update({"owner": "unit", "partition-key": "id", "public-key": "public-material"})
+    if kind == "table":
+        detail["columns"].append(
+            {"name": "api-key", "type": "string", "nullable": True, "properties": dict(CREDENTIAL_PROPERTIES)}
+        )
+    state["discovery"] = config
+    return arguments
+
 
 @pytest.fixture
 def discovery_http(request):
@@ -158,6 +194,19 @@ def test_unknown_provider_stays_unverified(discovery, discovery_http):
     assert discovery.load_catalog("iceberg").capabilities.table_read == "unverified"
 
 
+@pytest.mark.parametrize("kind", ["catalog", "schema", "table"])
+def test_hive_provider_metadata_has_unsupported_table_capabilities(discovery, discovery_http, kind):
+    state, _endpoint, _directory = discovery_http
+    config = copy.deepcopy(state["discovery"])
+    config["catalogs"]["iceberg"]["provider"] = "hive"
+    state["discovery"] = config
+    arguments = ("iceberg", "schema.点", "table.name")[: {"catalog": 1, "schema": 2, "table": 3}[kind]]
+    resource = getattr(discovery, "load_" + kind)(*arguments)
+    assert resource.provider == "hive"
+    assert resource.capabilities.metadata_read == "supported"
+    assert resource.capabilities.table_read == resource.capabilities.table_write == "unsupported"
+
+
 def test_concurrent_discovery_results_remain_owned_by_each_relation(discovery):
     names = ["iceberg", "postgres.db"] * 4
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -166,17 +215,19 @@ def test_concurrent_discovery_results_remain_owned_by_each_relation(discovery):
     assert all(result.metadata["name"] == name for result, name in zip(results, names, strict=True))
 
 
-def test_credential_properties_are_redacted_without_hiding_schema_fields(discovery, discovery_http):
+@pytest.mark.parametrize("kind", ["catalog", "schema", "table"])
+def test_credential_properties_are_redacted_without_hiding_schema_fields(discovery, discovery_http, kind):
     state, _endpoint, _directory = discovery_http
-    config = copy.deepcopy(state["discovery"])
-    properties = config["tables"][("iceberg", "schema.点")]["table.name"]["properties"]
-    keys = ["jdbc-password", "S3_SECRET_ACCESS_KEY", "Authorization", "access.key.id", "credential", "private_key"]
-    properties.update({key: "sensitive-test-value" for key in keys})
-    state["discovery"] = config
-    result = discovery.load_table("iceberg", "schema.点", "table.name")
-    assert all(result.metadata["properties"][key] == "[REDACTED]" for key in keys)
-    assert result.metadata["columns"][0]["name"] == "id"
+    arguments = credential_detail(state, kind)
+    result = getattr(discovery, "load_" + kind)(*arguments)
+    assert all(result.metadata["properties"][key] == "[REDACTED]" for key in CREDENTIAL_PROPERTIES)
+    if kind == "table":
+        assert result.metadata["columns"][0]["name"] == "id"
+        assert result.metadata["columns"][1]["name"] == "api-key"
+        assert all(value == "[REDACTED]" for value in result.metadata["columns"][1]["properties"].values())
     assert result.metadata["properties"]["owner"] == "unit"
+    assert result.metadata["properties"]["partition-key"] == "id"
+    assert result.metadata["properties"]["public-key"] == "public-material"
 
 
 def test_failed_connect_leaves_no_native_attachment(discovery_http):
@@ -397,10 +448,13 @@ def test_names_are_encoded_once_and_never_split_on_dots(discovery, discovery_htt
     assert state["requests"][-1][1].endswith("/catalogs/" + quote(name, safe=""))
 
 
-def test_serialized_discovery_contains_only_redacted_rows(discovery, discovery_http):
+@pytest.mark.parametrize("kind", ["catalog", "schema", "table"])
+def test_serialized_discovery_contains_only_redacted_rows(discovery, discovery_http, kind):
     state, _endpoint, _directory = discovery_http
+    arguments = credential_detail(state, kind)
+    parameters = ", ".join("?" for _ in range(len(arguments) + 1))
     relation = discovery.connection.sql(
-        f"SELECT * FROM gravitino_metalake_table('{discovery._name}', 'iceberg', 'schema.点', 'table.name')"
+        f"SELECT * FROM gravitino_metalake_{kind}({parameters})", params=[discovery._name, *arguments]
     )
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "gravitino-discovery")
     assert plan.__getstate__()[3]["attached_databases"] == []
@@ -408,6 +462,7 @@ def test_serialized_discovery_contains_only_redacted_rows(discovery, discovery_h
     assert b"fixture-token" not in payload
     assert b"catalog-secret" not in payload
     assert b"table-secret" not in payload
+    assert all(value.encode() not in payload for value in CREDENTIAL_PROPERTIES.values())
     assert _endpoint.encode() not in payload
     assert b"[REDACTED]" in payload
     transported = pickle.loads(payload)
@@ -437,6 +492,8 @@ def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
 
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     state, endpoint, _directory = discovery_http
+    if operation == "load_table":
+        credential_detail(state, "table")
     calls = []
     run = RayRunner.run_iter
 
@@ -445,6 +502,7 @@ def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
         assert b"fixture-token" not in payload
         assert b"catalog-secret" not in payload
         assert b"table-secret" not in payload
+        assert all(value.encode() not in payload for value in CREDENTIAL_PROPERTIES.values())
         assert endpoint.encode() not in payload
         assert plan.__getstate__()[3]["attached_databases"] == []
         calls.append(plan.idx())
@@ -464,3 +522,4 @@ def test_ray_discovery_uses_frozen_rows_without_worker_metadata_access(
             assert result == expected
         else:
             assert result.metadata["properties"]["access_token"] == "[REDACTED]"
+            assert all(result.metadata["properties"][key] == "[REDACTED]" for key in CREDENTIAL_PROPERTIES)

@@ -415,7 +415,7 @@ class GravitinoMetalake:
         # These flags describe relational table execution through Gravitino.
         # Fileset I/O has its own attached-catalog API and support matrix.
         known_non_table = catalog_type.upper() in {"FILESET", "MODEL", "MESSAGING"}
-        known_unsupported = provider in {"lakehouse-generic", "lakehouse-hive", "jdbc-postgresql", "jdbc-mysql"}
+        known_unsupported = provider in {"lakehouse-generic", "hive", "jdbc-postgresql", "jdbc-mysql"}
         table_state: CapabilityState = "unsupported" if known_non_table or known_unsupported else "unverified"
         return GravitinoResource(
             identifier=GravitinoIdentifier(tuple(namespace), name),

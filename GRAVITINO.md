@@ -117,9 +117,9 @@ Bind token values as parameters. Tokens remain private to the native client and
 are removed from public attachment options. Credential-like keys in returned
 `properties` maps are replaced with `[REDACTED]` **before** metadata enters a
 result or serialized plan. This includes password, secret, token, credential,
-access-key, private-key and authorization keys, including case/punctuation
-variants. Other server-supplied metadata is observational data, not trusted
-connection configuration.
+access-key, private-key, account-key, API-key and authorization keys, including
+case/punctuation variants and prefixed keys. Other server-supplied metadata is
+observational data, not trusted connection configuration.
 
 The existing HTTP response/timeout limits apply (`max_response_bytes` defaults
 to 2 MiB and allows at most 16 MiB). Each list is limited to 4096 identifiers;

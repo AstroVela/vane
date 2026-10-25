@@ -82,12 +82,13 @@ static bool SensitiveProperty(const string &key) {
 			normalized += c;
 		}
 	}
-	for (const auto *part : {"password", "secret", "token", "credential", "accesskey", "privatekey"}) {
+	for (const auto *part : {"password", "secret", "token", "credential", "accesskey", "privatekey", "accountkey",
+	                         "apikey", "authorization"}) {
 		if (normalized.find(part) != string::npos) {
 			return true;
 		}
 	}
-	return normalized == "authorization";
+	return false;
 }
 static yyjson_mut_val *CopyMetadata(yyjson_mut_doc *doc, yyjson_val *value, idx_t depth = 0, bool properties = false) {
 	if (depth > 64) {
