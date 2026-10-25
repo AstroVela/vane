@@ -288,6 +288,33 @@ def test_literal_root_and_selected_location(gravitino_connection, gravitino_http
     assert not (directory / "cold").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Backslashes are path separators on Windows")
+@pytest.mark.parametrize("format", ["parquet", "csv"])
+@pytest.mark.parametrize("path", ["", "nested/output"])
+@pytest.mark.parametrize("root_exists", [False, True])
+def test_local_batch_preserves_literal_backslash_root(gravitino_connection, gravitino_http, format, path, root_exists):
+    _state, endpoint, directory = gravitino_http
+    root = directory / r"literal\directory"
+    if root_exists:
+        root.mkdir()
+    catalog = attach(gravitino_connection, endpoint)
+    catalog.create_schema("clips")
+    catalog.create_fileset("clips", "demo", storage_location=str(root))
+    result = catalog.write_files(gravitino_connection.sql("SELECT 42 AS n"), "clips", "demo", path, format=format)
+    assert Path(result.base_path).parent == root / path
+    assert result.rows_written == 1
+    assert result.bytes_written == sum(Path(file).stat().st_size for file in result.files)
+    assert all(Path(file).is_relative_to(root / path) for file in result.files)
+    assert not (directory / "literal").exists()
+    for file in result.files:
+        with vane.open_file(file, "rb", connection=gravitino_connection) as stream:
+            contents = stream.read()
+        if format == "parquet":
+            assert pq.read_table(io.BytesIO(contents)).to_pylist() == [{"n": 42}]
+        else:
+            assert list(csv.reader(io.StringIO(contents.decode("utf-8")))) == [["n"], ["42"]]
+
+
 def test_prepared_copy_rebinds_without_planning_writes(gravitino_connection, gravitino_http):
     state, endpoint, directory = gravitino_http
     catalog = seed_fileset(gravitino_connection, endpoint, directory)
