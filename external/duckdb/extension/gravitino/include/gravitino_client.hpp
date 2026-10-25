@@ -50,7 +50,7 @@ public:
 	GravitinoJson Get(ClientContext &context, const string &suffix = "") const;
 	vector<string> List(ClientContext &context, const string &suffix) const;
 	string Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
-	               string *root = nullptr) const;
+	               string *root = nullptr, string *selected_location = nullptr) const;
 	vector<OpenFileInfo> Glob(ClientContext &context, const string &schema, const string &fileset,
 	                          const string &path) const;
 	static string Encode(const string &name);

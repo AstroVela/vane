@@ -71,6 +71,8 @@ static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	DefineMethod({"to_file", "write_file"}, m, &DuckDBPyRelation::ToFile,
 	             "Write the relation object with a registered DuckDB COPY format", py::arg("file_name"), py::kw_only(),
 	             py::arg("format"));
+	m.def("_write_file_batch", &DuckDBPyRelation::WriteFileBatch, py::arg("connection"), py::arg("path"),
+	      py::arg("format"), py::arg("compression") = py::none(), py::arg("partition_by") = vector<string> {});
 
 	m.def("fetchone", &DuckDBPyRelation::FetchOne, "Execute and fetch a single row as a tuple")
 	    .def("fetchmany", &DuckDBPyRelation::FetchMany, "Execute and fetch the next set of rows as a list of tuples",

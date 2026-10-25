@@ -32,6 +32,7 @@
 namespace duckdb {
 
 class DuckDBPyType;
+struct DuckDBPyConnection;
 
 struct DuckDBPyRelation {
 public:
@@ -268,6 +269,8 @@ public:
 	           const py::object &use_tmp_file = py::none(), const py::object &partition_by = py::none(),
 	           const py::object &write_partition_columns = py::none());
 	void ToFile(const string &filename, const string &format);
+	py::dict WriteFileBatch(DuckDBPyConnection &connection, const string &filename, const string &format,
+	                        const py::object &compression, const vector<string> &partition_by);
 
 	// should this return a rel with the new view?
 	unique_ptr<DuckDBPyRelation> CreateView(const string &view_name, bool replace = true);

@@ -24,6 +24,9 @@
 #include "duckdb/parser/statement/pragma_statement.hpp"
 #include "duckdb/common/box_renderer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -2536,6 +2539,186 @@ void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
 	}
 	auto write_file = rel->WriteFileRel(filename, format);
 	ExecuteWithRunner(write_file->context->GetContext(), nullptr, write_file, {}, connection_owner, py::object());
+}
+
+py::dict DuckDBPyRelation::WriteFileBatch(DuckDBPyConnection &connection, const string &filename, const string &format,
+                                          const py::object &compression, const vector<string> &partition_by) {
+	auto execution_lock = connection.LockForQuery();
+	if (!rel) {
+		throw InvalidInputException("This relation was created from a result");
+	}
+	auto context = rel->context->GetContext();
+	if (connection.con.GetConnection().context != context) {
+		throw InvalidInputException("The relation must belong to the catalog's connection");
+	}
+	auto interrupt_check = connection.CreateQueryInterruptCheck();
+	const auto runner = RunnerClientState::Get(*context);
+	const bool distributed = runner == "ray";
+	if (runner != "local" && !distributed) {
+		throw NotImplementedException("File batch writes require a local or ray connection");
+	}
+	if (!context->transaction.IsAutoCommit()) {
+		throw TransactionException("File batch writes require auto-commit; output files cannot be rolled back");
+	}
+	if (format != "parquet" && format != "csv") {
+		throw InvalidInputException("File batch writes support parquet and csv only");
+	}
+	CopyInfo info;
+	info.is_from = false;
+	info.format = format;
+	info.file_path = filename;
+	info.options["append"] = {Value::BOOLEAN(true)};
+	if (partition_by.empty()) {
+		info.options["per_thread_output"] = {Value::BOOLEAN(true)};
+	} else {
+		vector<Value> columns;
+		for (const auto &column : partition_by) {
+			columns.emplace_back(column);
+		}
+		info.options["partition_by"] = std::move(columns);
+		// Exact output files remain self-contained, including empty batches.
+		info.options["write_partition_columns"] = {Value::BOOLEAN(true)};
+	}
+	if (!distributed) {
+		info.options["return_stats"] = {Value::BOOLEAN(true)};
+	}
+	info.options["write_empty_file"] = {Value::BOOLEAN(true)};
+	if (format == "csv") {
+		info.options["header"] = {Value::BOOLEAN(true)};
+	}
+	if (!compression.is_none()) {
+		if (!py::isinstance<py::str>(compression)) {
+			throw InvalidInputException("compression must be a string or None");
+		}
+		info.options["compression"] = {Value(compression.cast<string>())};
+	}
+	FileWriteTarget target;
+	{
+		py::gil_scoped_release release;
+		context->RunFunctionInTransaction(
+		    [&]() { target = FileSystem::GetFileSystem(*context).ResolveWriteTarget(filename, info); });
+	}
+	if (target.path == filename) {
+		throw InvalidInputException(
+		    "File batch destination must resolve to a physical path; load and attach its catalog first");
+	}
+	if (distributed && !StringUtil::StartsWith(target.path, "s3://")) {
+		throw NotImplementedException("Ray Fileset batch writes require a shared S3 destination; "
+		                              "node-local output is unsupported");
+	}
+	auto operation_id = UUID::ToString(UUID::GenerateRandomUUID());
+	auto output = target.path;
+	if (output.empty() || output.back() != '/') {
+		output += '/';
+	}
+	output += "vane-run-" + operation_id;
+	// Construct the relation from the already validated physical destination.
+	// Its eager schema bind and the execution bind must not query the catalog again.
+	shared_ptr<Relation> write;
+	{
+		py::gil_scoped_release release;
+		write = rel->WriteFileRel(output, format, std::move(info.options));
+	}
+	{
+		// COPY creates its batch directory, but requires its parent to exist.
+		// Prepare local ancestors only after the eager format/source bind has
+		// validated the write. Object-store prefixes do not need directories.
+		py::gil_scoped_release release;
+		auto &fs = FileSystem::GetFileSystem(*context);
+		if (fs.HasDirectorySemantics(output)) {
+			fs.CreateDirectoriesRecursive(target.path);
+		}
+	}
+	RunnerExecutionResult execution;
+	try {
+		execution = ExecuteWithRunner(context, nullptr, write, {}, connection_owner, interrupt_check);
+	} catch (py::error_already_set &error) {
+		if (error.matches(py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError"))) {
+			error.value().attr("base_path") = output;
+		}
+		throw;
+	}
+	// COPY completed. Any conversion error from here on must preserve that fact.
+	py::object run_id = py::none();
+	py::object manifest_path = py::none();
+	string cleanup_state = "complete";
+	py::tuple cleanup_warnings;
+	try {
+		vector<string> files;
+		uint64_t rows_written = 0;
+		uint64_t bytes_written = 0;
+		if (distributed) {
+			auto outcome = execution.write_outcome.cast<py::dict>();
+			operation_id = outcome["copy_operation_id"].cast<string>();
+			output = outcome["copy_output_base_path"].cast<string>();
+			run_id = outcome["copy_output_run_id"];
+			manifest_path = outcome["copy_output_manifest_path"];
+			if (outcome.contains("copy_cleanup_state")) {
+				cleanup_state = outcome["copy_cleanup_state"].cast<string>();
+			}
+			if (outcome.contains("copy_cleanup_warnings")) {
+				cleanup_warnings = py::tuple(outcome["copy_cleanup_warnings"]);
+			}
+			// Read only the committed manifest's selected attempts. Never list a
+			// destination prefix or re-resolve its Gravitino metadata after commit.
+			auto committed = py::module_::import("vane._native.ray_cxx")
+			                     .attr("read_committed_copy_direct_write_result")(
+			                         output, run_id, py::cast(&connection, py::return_value_policy::reference))
+			                     .cast<py::dict>();
+			for (auto entry : committed["files"]) {
+				auto file = py::reinterpret_borrow<py::dict>(entry);
+				files.push_back(file["final_path"].cast<string>());
+				rows_written += file["row_count"].cast<uint64_t>();
+				bytes_written += file["file_size_bytes"].cast<uint64_t>();
+			}
+			if (rows_written != committed["rows_copied"].cast<uint64_t>() ||
+			    rows_written != outcome["rows_copied"].cast<uint64_t>()) {
+				throw InternalException("Committed COPY manifest row counts disagree");
+			}
+		} else {
+			py::gil_scoped_release release;
+			if (!execution.native_result || execution.native_result->types.size() != 6) {
+				throw InternalException("COPY returned invalid file statistics");
+			}
+			while (auto chunk = execution.native_result->Fetch()) {
+				for (idx_t row = 0; row < chunk->size(); row++) {
+					files.push_back(chunk->GetValue(0, row).GetValue<string>());
+					rows_written += chunk->GetValue(1, row).GetValue<uint64_t>();
+					bytes_written += chunk->GetValue(2, row).GetValue<uint64_t>();
+				}
+			}
+		}
+		if (files.empty()) {
+			throw InternalException("COPY returned no output file statistics");
+		}
+		std::sort(files.begin(), files.end());
+		if (std::adjacent_find(files.begin(), files.end()) != files.end()) {
+			throw InternalException("COPY returned duplicate output files");
+		}
+		py::dict receipt;
+		receipt["logical_path"] = filename;
+		receipt["target_properties"] = py::cast(target.properties);
+		receipt["format"] = format;
+		receipt["files"] = py::tuple(py::cast(files));
+		receipt["rows_written"] = rows_written;
+		receipt["bytes_written"] = bytes_written;
+		receipt["operation_id"] = operation_id;
+		receipt["base_path"] = output;
+		receipt["run_id"] = run_id;
+		receipt["manifest_path"] = manifest_path;
+		receipt["cleanup_state"] = cleanup_state;
+		receipt["cleanup_warnings"] = cleanup_warnings;
+		return receipt;
+	} catch (const std::exception &) {
+		auto error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
+		auto error =
+		    error_type(operation_id, "File batch result handling failed after COPY completed", cleanup_warnings);
+		error.attr("base_path") = output;
+		error.attr("run_id") = run_id;
+		error.attr("manifest_path") = manifest_path;
+		PyErr_SetObject(error_type.ptr(), error.ptr());
+		throw py::error_already_set();
+	}
 }
 
 // should this return a rel with the new view?
