@@ -1157,6 +1157,138 @@ def test_correlated_scan_filter_respects_budget_and_replica_traffic(tmp_path, bu
         assert any(e.distribution is Distribution.BROADCAST for e in graph.exchanges) is filtered
 
 
+def correlated_bitmap_scan_query(connection, directory, comparison="=", kind="semi", key_type="bigint"):
+    fact, owner = directory / "fact.parquet", directory / "owner.parquet"
+    offset = "9223372036854775808" if key_type == "ubigint" else "-65536"
+    connection.execute(
+        "copy (select repeat('priority-'||(range%5)::varchar,64) priority, "
+        "(case when range%8192=0 then null when range%4096=1024 then range-1024 "
+        f"else range end+({offset}))::{key_type} owner_key, (range%97=0 or range%4096 in (0,1024)) keep, "
+        f"repeat('unused',256) unused from range(131099)) to '{owner}' (row_group_size 2048)"
+    )
+    connection.execute(
+        f"copy (select (case when range%8192=0 then null else range%131072 end+({offset}))::{key_type} "
+        f"fact_key, range%17 v, 3::bigint w from range(262147)) to '{fact}' (row_group_size 2048)"
+    )
+    negate = "not " if kind == "anti" else ""
+    return (
+        f"select o.priority,count(*) from read_parquet('{owner}', explicit_cardinality=30000000) o "
+        f"where o.keep and {negate}exists "
+        f"(select 1 from read_parquet('{fact}', explicit_cardinality=1000000000) f "
+        f"where f.fact_key {comparison} o.owner_key and f.v<f.w) group by o.priority order by o.priority"
+    )
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("kind", ["semi", "anti"])
+@pytest.mark.parametrize("key_type", ["bigint", "ubigint"])
+def test_correlated_bitmap_filters_oversized_parquet_keys(tmp_path, threads, partitions, comparison, kind, key_type):
+    fact = tmp_path / "fact.parquet"
+    with vane.connect(backend="local", config={"threads": threads, "memory_limit": "256MiB"}) as connection:
+        sql = correlated_bitmap_scan_query(connection, tmp_path, comparison, kind, key_type)
+        expected = connection.execute(sql).fetchall()
+        spec = prepare_ray_query(
+            connection,
+            sql,
+            query_id="correlated-bitmap",
+            options=query_options(),
+            resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256 << 20)),
+            compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=256 << 20),
+        )
+        sources = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(fact).encode() in split.payload for s in f.sources for split in s.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in sources}
+        assert any(b"bit_or" in f.native_plan for f in spec.graph.fragments)
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            assert edges
+            assert (
+                sum(
+                    c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+                )
+                < 4096
+            )
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+        assert sum(s.function_name == "read_parquet" for f in spec.graph.fragments for s in f.sources) == 3
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("layout", ["plain", "hive"])
+def test_correlated_bitmap_reads_only_keys_and_predicate_columns(tmp_path, monkeypatch, threads, layout):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql = correlated_bitmap_scan_query(connection, tmp_path, "is not distinct from")
+        owner = tmp_path / "owner.parquet"
+        if layout == "hive":
+            dataset = tmp_path / "dataset"
+            connection.execute(
+                f"copy (select o.*, r.region from read_parquet('{owner}') o "
+                f"cross join (values (7),(11)) r(region)) to '{dataset}' (format parquet, partition_by(region))"
+            )
+            sql = sql.replace(str(owner), str(dataset / "region=*" / "*.parquet"))
+            sql = sql.replace("where o.keep", "where o.region=7 and o.keep")
+        predicate = "(owner_key>=-1000 or owner_key is null)"
+        sql = (
+            sql.replace("where o.keep", f"where {predicate} and o.keep")
+            if layout == "plain"
+            else sql.replace("where o.region=7", f"where {predicate} and o.region=7")
+        )
+        expected = connection.execute(sql).fetchall()
+        owner_rows = connection.execute(
+            f"select count(*) from read_parquet('{owner}') where keep and {predicate}"
+        ).fetchone()[0]
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="correlated-key-projection",
+            options=FragmentCompileOptions(2, worker_operator_bytes=256 << 20),
+        )
+        scans = profile_fragment_scans(connection, monkeypatch)
+        assert execute_graph(connection, graph) == expected
+        key_scans = [s for s in scans if s["extra_info"].get("Projections") in ("owner_key", ["owner_key"])]
+        assert key_scans
+        assert sum(s["operator_cardinality"] for s in key_scans) == owner_rows
+        assert any("priority" in s["extra_info"].get("Projections", []) for s in scans)
+        assert all("unused" not in s["extra_info"].get("Projections", []) for s in scans)
+
+
+@pytest.mark.parametrize(
+    "budget,partitions,shape,filtered",
+    [
+        (0, 2, "scan", False),
+        (128 << 20, 2, "scan", False),
+        (256 << 20, 2, "scan", True),
+        (256 << 20, 4096, "scan", False),
+        (256 << 20, 2, "residual", False),
+        (256 << 20, 2, "join", True),
+        (256 << 20, 2, "limit", False),
+    ],
+)
+def test_correlated_bitmap_respects_cost_and_source_boundaries(tmp_path, budget, partitions, shape, filtered):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        sql = correlated_bitmap_scan_query(connection, tmp_path)
+        if shape == "residual":
+            sql = sql.replace("f.v<f.w", "f.v<f.w and f.v<>o.owner_key")
+        elif shape == "join":
+            sql = sql.replace(" f where", " f join (select range v from range(3)) s on f.v=s.v where")
+        elif shape == "limit":
+            source = f"read_parquet('{tmp_path / 'fact.parquet'}', explicit_cardinality=1000000000)"
+            sql = sql.replace(source, f"(select * from {source} limit 500000000)")
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="correlated-bitmap-costs",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        assert any(b"bit_or" in f.native_plan for f in graph.fragments) is filtered
+
+
 def test_correlated_scan_filter_does_not_cost_residual_selectivity_as_one_key(tmp_path):
     with vane.connect(backend="local", config={"threads": 1}) as connection:
         sql = budgeted_correlated_scan_query(connection, tmp_path / "fact.parquet")
@@ -1645,7 +1777,9 @@ def test_selective_broadcast_filters_before_earlier_hash_exchange(tmp_path, thre
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("query_kind", ["correlated", "join", "exact", "hashed", "join_estimate", "cte", "build"])
+@pytest.mark.parametrize(
+    "query_kind", ["correlated", "correlated_bitmap", "join", "exact", "hashed", "join_estimate", "cte", "build"]
+)
 def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, threads, query_kind):
     # A native teardown deadlock must fail under an independent process deadline.
     script = textwrap.dedent(
@@ -1658,7 +1792,11 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
         from tests.fast.test_fragment_sql_coverage import (
             correlated_owner_queries, early_join_filter_query, large_join_key_query,
         )
-        from tests.fast.test_execution_performance import shared_cte_filter_query
+        from tests.fast.test_execution_performance import shared_cte_filter_query, correlated_bitmap_scan_query
+        from dataclasses import replace
+        from tests.fast.test_execution_submission import options as query_options, resources as query_resources
+        from vane.execution.compiler import FragmentCompileOptions
+        from vane.execution.submission import prepare_ray_query
         from tests.fast.test_join_build_filter import shared_join_build_query
         from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 
@@ -1671,13 +1809,23 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
                 sql, _, _ = shared_join_build_query(connection, path.parent)
             elif sys.argv[3] == "cte":
                 sql = shared_cte_filter_query(connection, path)
+            elif sys.argv[3] == "correlated_bitmap":
+                sql = correlated_bitmap_scan_query(connection, path.parent)
             elif sys.argv[3] in ("exact", "hashed", "join_estimate"):
                 sql = large_join_key_query(connection, path, sys.argv[3])
             else:
                 sql = (early_join_filter_query(connection, path) if sys.argv[3] == "join"
                        else correlated_owner_queries(connection, path)["nested"])
             limits = DirectExchangeLimits(4096, 1024, 4, 1)
-            spec = submission(connection, sql, partitions=3)
+            if sys.argv[3] == "correlated_bitmap":
+                spec = prepare_ray_query(
+                    connection, sql, query_id="cancel-correlated-bitmap", options=query_options(),
+                    resources=replace(query_resources(), memory=replace(query_resources().memory, operator_bytes=256<<20)),
+                    compile_options=FragmentCompileOptions(3, worker_operator_bytes=256<<20),
+                )
+                assert any(b"bit_or" in f.native_plan for f in spec.graph.fragments)
+            else:
+                spec = submission(connection, sql, partitions=3)
             with InProcessTaskService(connection, spec, limits) as service:
                 service.start()
                 deadline = time.monotonic() + 10
@@ -1685,7 +1833,7 @@ def test_shared_build_fanout_releases_blocked_branches_on_close(tmp_path, thread
                     assert time.monotonic() < deadline, service.snapshot()
                     service.pump(1)
                 service.cancel("cancel shared build branches")
-            assert all(c.snapshot()["bytes"] == 0 for c in service.channels.values())
+            assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
         """
     )
     subprocess.run(

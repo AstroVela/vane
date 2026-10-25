@@ -1375,10 +1375,42 @@ private:
 		return false;
 	}
 
+	PhysicalTableScan &KeyScan(PhysicalTableScan &scan, idx_t column) {
+		const auto key = scan.projection_ids.empty() ? column : scan.projection_ids[column];
+		vector<ColumnIndex> columns {scan.column_ids[key]};
+		unique_ptr<TableFilterSet> filters;
+		if (scan.table_filters) {
+			filters = make_uniq<TableFilterSet>();
+			for (auto &entry : scan.table_filters->filters) {
+				idx_t position = 0;
+				if (entry.first != key) {
+					position = columns.size();
+					columns.push_back(scan.column_ids[entry.first]);
+				}
+				filters->filters.emplace(position, entry.second->Copy());
+			}
+		}
+		ExtraOperatorInfo info;
+		info.file_filters = scan.extra_info.file_filters;
+		info.total_files = scan.extra_info.total_files;
+		info.filtered_files = scan.extra_info.filtered_files;
+		info.scan_node_id = scan.extra_info.scan_node_id;
+		info.scan_group_id = scan.extra_info.scan_group_id;
+		// Keep static predicates and their input columns, but do not share an
+		// original join's runtime filters with this independently bound scan.
+		return plan
+		    .Make<PhysicalTableScan>(vector<LogicalType> {scan.types[column]}, scan.function, scan.bind_data->Copy(),
+		                             scan.returned_types, std::move(columns), vector<idx_t> {0}, scan.names,
+		                             std::move(filters), scan.estimated_cardinality, std::move(info), scan.parameters,
+		                             scan.virtual_columns)
+		    .Cast<PhysicalTableScan>();
+	}
+
 	DistributedSubtree FilterCorrelatedInput(PhysicalOperator &op, DistributedSubtree input, idx_t key,
 	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
 		auto keys = filter.scan;
+
 		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= broadcast_limit &&
 		              double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
 		              double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
@@ -1393,6 +1425,32 @@ private:
 			rescan = key_bytes <= broadcast_limit && matches > 0 && matches * 4 < double(op.estimated_cardinality) &&
 			         probe_bytes != NumericLimits<double>::Maximum() &&
 			         key_bytes * count < probe_bytes * (1 - matches / double(op.estimated_cardinality));
+			if (!rescan && key_bytes > broadcast_limit && matches > 0 &&
+			    matches * 4 < double(op.estimated_cardinality) && op.types[key].IsIntegral() &&
+			    input.incoming.empty() && input.fragment.sources.size() == 1 && input.local_scan &&
+			    !probe_filters.count(&op) && probe_bytes != NumericLimits<double>::Maximum()) {
+				auto &source = keys.source->Cast<PhysicalTableScan>();
+				if (!source.extra_info.sample_options) {
+					// The proof above uses this scan's complete owner and a single
+					// correlation key. Bound its domain instead of trusting the key
+					// cardinality estimate, and read no unrelated owner payload.
+					auto saved = probe_bytes * (1 - matches / double(op.estimated_cardinality));
+					idx_t words = 65536;
+					while (words < max_bitmap_words && 16 * words < op.estimated_cardinality &&
+					       key_bytes + double(words * 2) * 18 * (partitions + count) < saved) {
+						words *= 2;
+					}
+					// Charge the extra key scan, partial-domain gather and complete
+					// domain replicas against traffic estimated to disappear.
+					if (op.estimated_cardinality > 8 * words &&
+					    key_bytes + double(words) * 18 * (partitions + count) < saved) {
+						auto &scan = KeyScan(source, keys.column);
+						auto bitmap = BitmapDomain(Build(scan), scan, 0, words);
+						auto domain = Exchange(std::move(bitmap.first), count == 1 ? "gather" : "broadcast", count);
+						return BitmapFilter(op, std::move(input), key, *bitmap.second, std::move(domain), words);
+					}
+				}
+			}
 		}
 		DistributedSubtree domain;
 		if (rescan) {
