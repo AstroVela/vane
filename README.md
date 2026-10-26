@@ -7,6 +7,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/vane-ai/">
     <img src="https://img.shields.io/pypi/v/vane-ai?logo=pypi" alt="PyPI">
   </a>
